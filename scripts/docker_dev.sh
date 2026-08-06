@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="grainlegumes-pino-airflow"
-CONTAINER_NAME="grainlegumes-pino-airflow-dev"
+IMAGE_NAME="grainlegumes-pino-drying"
+CONTAINER_NAME="grainlegumes-pino-drying-dev"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"

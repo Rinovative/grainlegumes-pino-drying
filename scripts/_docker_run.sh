@@ -90,7 +90,7 @@ while (( INDEX < ${#SEMANTIC_ARGS[@]} )); do
 done
 CLI_ARGS+=("--device" "cuda")
 
-IMAGE_NAME="grainlegumes-pino-airflow"
+IMAGE_NAME="grainlegumes-pino-drying"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 mkdir -p "${HOST_STORAGE_ROOT}"

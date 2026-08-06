@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="grainlegumes-pino-airflow"
+IMAGE_NAME="grainlegumes-pino-drying"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 
 if ! command -v docker >/dev/null 2>&1; then
