@@ -2,10 +2,9 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
-MODEL_DIR="${PROJECT_DIR}/model_training"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
-HOST_GENERATED_DATA_ROOT="${HOST_STORAGE_ROOT}/data_generation"
-HOST_MODEL_TRAINING_DATA_ROOT="${HOST_STORAGE_ROOT}/data_training"
+mkdir -p "${HOST_STORAGE_ROOT}"
+STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 IMAGE_NAME="grainlegumes-pino-drying"
 PREFLIGHT_RUNTIME="/workspace/repo/scripts/config_preflight_runtime.py"
 PROJECT_PYTHON_MINIMUM="3.11"
@@ -97,8 +96,6 @@ resolve_host_config_argument() {
     candidate="${PWD}/${requested}"
   elif [[ -e "${PROJECT_DIR}/${requested}" ]]; then
     candidate="${PROJECT_DIR}/${requested}"
-  elif [[ -e "${MODEL_DIR}/${requested}" ]]; then
-    candidate="${MODEL_DIR}/${requested}"
   else
     fail 2 "Config path does not exist: ${requested}"
   fi
@@ -115,40 +112,27 @@ resolve_host_config_argument() {
 
 translate_config_argument() {
   local resolved="$1"
-  local generated_dir=""
-  local training_dir=""
+  local project_root
+  local storage_root
 
-  if [[ "${resolved}" == "${MODEL_DIR}/"* ]]; then
-    printf '%s' "${resolved#"${MODEL_DIR}/"}"
+  project_root="$(realpath -m -- "${PROJECT_DIR}")"
+  storage_root="$(realpath -m -- "${STORAGE_DIR}")"
+  if [[ "${resolved}" == "${project_root}/"* ]]; then
+    printf '/workspace/repo/%s' "${resolved#"${project_root}/"}"
     return
   fi
-  if [[ "${resolved}" == "${PROJECT_DIR}/"* ]]; then
-    printf '/workspace/repo/%s' "${resolved#"${PROJECT_DIR}/"}"
+  if [[ "${resolved}" == "${storage_root}/"* ]]; then
+    printf '/workspace/storage/%s' "${resolved#"${storage_root}/"}"
     return
   fi
-  if [[ -d "${HOST_GENERATED_DATA_ROOT}" ]]; then
-    generated_dir="$(cd "${HOST_GENERATED_DATA_ROOT}" && pwd -P)"
-  fi
-  if [[ -n "${generated_dir}" && "${resolved}" == "${generated_dir}/"* ]]; then
-    printf '/workspace/repo/data_generation/data/%s' "${resolved#"${generated_dir}/"}"
-    return
-  fi
-  if [[ -d "${HOST_MODEL_TRAINING_DATA_ROOT}" ]]; then
-    training_dir="$(cd "${HOST_MODEL_TRAINING_DATA_ROOT}" && pwd -P)"
-  fi
-  if [[ -n "${training_dir}" && "${resolved}" == "${training_dir}/"* ]]; then
-    printf '/workspace/repo/model_training/data/%s' "${resolved#"${training_dir}/"}"
-    return
-  fi
-  fail 2 "Config path must be inside the repository or one configured data domain: ${resolved}"
+  fail 2 "Config path must be inside the repository or configured storage root: ${resolved}"
 }
 
 translate_semantic_path() {
   local requested="$1"
   local resolved
-  local generated_root
-  local training_root
   local project_root
+  local storage_root
 
   if [[ -z "${requested}" ]]; then
     fail 2 "Path-valued semantic options require a non-empty value."
@@ -157,7 +141,7 @@ translate_semantic_path() {
     printf '%s' "${requested}"
     return
   fi
-  if [[ "${requested}" == "/workspace/repo" || "${requested}" == "/workspace/repo/"* ]]; then
+  if [[ "${requested}" == "/workspace/repo" || "${requested}" == "/workspace/repo/"* || "${requested}" == "/workspace/storage" || "${requested}" == "/workspace/storage/"* ]]; then
     printf '%s' "${requested}"
     return
   fi
@@ -166,18 +150,13 @@ translate_semantic_path() {
   fi
 
   resolved="$(realpath -m -- "${requested}")"
-  generated_root="$(realpath -m -- "${HOST_GENERATED_DATA_ROOT}")"
-  training_root="$(realpath -m -- "${HOST_MODEL_TRAINING_DATA_ROOT}")"
+  storage_root="$(realpath -m -- "${STORAGE_DIR}")"
   project_root="$(realpath -m -- "${PROJECT_DIR}")"
 
-  if [[ "${resolved}" == "${generated_root}" ]]; then
-    printf '/workspace/repo/data_generation/data'
-  elif [[ "${resolved}" == "${generated_root}/"* ]]; then
-    printf '/workspace/repo/data_generation/data/%s' "${resolved#"${generated_root}/"}"
-  elif [[ "${resolved}" == "${training_root}" ]]; then
-    printf '/workspace/repo/model_training/data'
-  elif [[ "${resolved}" == "${training_root}/"* ]]; then
-    printf '/workspace/repo/model_training/data/%s' "${resolved#"${training_root}/"}"
+  if [[ "${resolved}" == "${storage_root}" ]]; then
+    printf '/workspace/storage'
+  elif [[ "${resolved}" == "${storage_root}/"* ]]; then
+    printf '/workspace/storage/%s' "${resolved#"${storage_root}/"}"
   elif [[ "${resolved}" == "${project_root}" ]]; then
     printf '/workspace/repo'
   elif [[ "${resolved}" == "${project_root}/"* ]]; then
@@ -198,14 +177,9 @@ run_config_preflight() {
   local command=()
 
   case "${container_config}" in
-    /workspace/repo/data_generation/data/*)
+    /workspace/storage/*)
       mount_args+=(
-        --mount "type=bind,source=${HOST_GENERATED_DATA_ROOT},target=/workspace/repo/data_generation/data,readonly"
-      )
-      ;;
-    /workspace/repo/model_training/data/*)
-      mount_args+=(
-        --mount "type=bind,source=${HOST_MODEL_TRAINING_DATA_ROOT},target=/workspace/repo/model_training/data,readonly"
+        --mount "type=bind,source=${STORAGE_DIR},target=/workspace/storage,readonly"
       )
       ;;
   esac
@@ -230,15 +204,13 @@ run_config_preflight() {
   command=(
     docker run --rm
     --network none
-    --workdir /workspace/repo/model_training
+    --workdir /workspace/repo
     --tmpfs /tmp:rw,nosuid,nodev,size=64m
     -e HOME=/tmp
     -e PYTHONDONTWRITEBYTECODE=1
     -e PYTHONNOUSERSITE=1
-    -e PYTHONPATH=/workspace/repo/model_training
     -e PROJECT_ROOT=/workspace/repo
-    -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data
-    -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data
+    -e STORAGE_ROOT=/workspace/storage
     "${mount_args[@]}"
     "${IMAGE_NAME}"
     python "${PREFLIGHT_RUNTIME}" "${workflow}" "${container_config}"
@@ -254,6 +226,48 @@ run_config_preflight() {
   fi
   return "${status}"
 }
+
+resolve_host_queue_log_dir() {
+  local scope="$1"
+  local output=""
+  local status=0
+  local container_root="/workspace/storage"
+  local command=(
+    docker run --rm
+    --network none
+    --workdir /workspace/repo
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m
+    -e HOME=/tmp
+    -e PYTHONDONTWRITEBYTECODE=1
+    -e PYTHONNOUSERSITE=1
+    -e PROJECT_ROOT=/workspace/repo
+    -e STORAGE_ROOT="${container_root}"
+    --mount "type=bind,source=${PROJECT_DIR},target=/workspace/repo,readonly"
+    "${IMAGE_NAME}"
+    python -m src.common.common_queue_log_cli "${scope}"
+  )
+
+  if ! command -v docker >/dev/null 2>&1; then
+    fail 1 "Queue-log path resolution requires Docker, but Docker was not found on PATH."
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    fail 1 "Queue-log path resolution requires the Docker daemon."
+  fi
+  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+    fail 1 "Queue-log path resolution requires image '${IMAGE_NAME}'. Build it with ./scripts/docker_build.sh."
+  fi
+  if output="$("${command[@]}")"; then
+    :
+  else
+    status=$?
+    fail "${status}" "Authoritative queue-log path resolution failed."
+  fi
+  if [[ -z "${output}" || "${output}" == *$'\n'* || "${output}" != "${container_root}/"* ]]; then
+    fail 1 "Authoritative queue-log path resolution returned an invalid container path."
+  fi
+  printf '%s/%s' "${STORAGE_DIR}" "${output#"${container_root}/"}"
+}
+
 
 is_semantic_path_option() {
   local job_type="$1"
@@ -690,11 +704,10 @@ case "${QUEUE_GPU_REQUEST}" in
 esac
 
 TASK_SPOOLER_SOCKET="/etc/ts/socket_${GPU_ID}"
-LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${LOG_SCOPE}/logs/queue"
+LOG_DIR="$(resolve_host_queue_log_dir "${LOG_SCOPE}")"
 mkdir -p "${LOG_DIR}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_PATH="$(mktemp --suffix=.log "${LOG_DIR}/${TIMESTAMP}__${JOB_TYPE}__gpu${GPU_ID}__XXXXXX")"
-LOG_BASENAME="$(basename "${LOG_PATH}")"
 QUEUE_COMMAND=(
   runTSGPU.py
   "-g${GPU_ID}"
@@ -702,8 +715,7 @@ QUEUE_COMMAND=(
   "${PROJECT_DIR}/scripts/_docker_run.sh"
   "${GPU_ID}"
   "${JOB_TYPE}"
-  "${LOG_SCOPE}"
-  "${LOG_BASENAME}"
+  "${LOG_PATH}"
   "${SEMANTIC_ARGS[@]}"
 )
 

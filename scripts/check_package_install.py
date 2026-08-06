@@ -6,8 +6,8 @@ Verify editable and wheel installation contracts from unrelated directories.
 
 Responsibilities:
   - Build isolated editable and wheel installations from a scoped source copy
-  - Probe both package roots and all six public ``src`` packages off-checkout
-  - Reject missing Python modules and unintended generation payloads
+  - Probe the sole ``src`` package and all six public domains off-checkout
+  - Reject missing Python modules and unintended non-package payloads
 
 Design principles:
   - Every build, install, and probe artifact lives in one temporary directory
@@ -55,19 +55,15 @@ def _run(
 
 
 def _copy_source(destination: Path) -> None:
-    """Copy only files needed to build both maintained package roots."""
+    """Copy only files needed to build the maintained root package."""
     destination.mkdir()
-    for name in ("pyproject.toml", "setup.py", "README.md", "LICENSE.md"):
+    for name in ("pyproject.toml", "README.md", "LICENSE.md"):
         shutil.copy2(_REPOSITORY_ROOT / name, destination / name)
     shutil.copytree(
-        _REPOSITORY_ROOT / "model_training" / "src",
-        destination / "model_training" / "src",
+        _REPOSITORY_ROOT / "src",
+        destination / "src",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    generation_destination = destination / "data_generation"
-    generation_destination.mkdir()
-    for source in sorted((_REPOSITORY_ROOT / "data_generation").glob("*.py")):
-        shutil.copy2(source, generation_destination / source.name)
 
 
 def _bootstrap(editable_target: Path | None) -> str:
@@ -85,7 +81,7 @@ def _probe_install(
     editable_target: Path | None,
     wheel_target: Path | None,
 ) -> None:
-    """Import both domains, the reader, builder, and EDA from one install root."""
+    """Import every public domain and dataset service from one install root."""
     bootstrap = _bootstrap(editable_target)
     if wheel_target is not None:
         bootstrap += f"sys.path.insert(0, {str(wheel_target)!r}); "
@@ -93,12 +89,10 @@ def _probe_install(
         bootstrap
         + f"""
 from pathlib import Path
-import data_generation
 import src
-from data_generation import build_training_dataset, load_generated_batch
-from data_generation import generated_batch
 from src import analysis, common, datasets, domain, experiments, learning
 from src.analysis.eda import eda_dataframe
+from src.datasets import dataset_build, dataset_generated_batch
 
 expected = Path({str(expected_root)!r}).resolve()
 modules = (
@@ -109,19 +103,19 @@ modules = (
     domain,
     experiments,
     learning,
-    data_generation,
-    generated_batch,
-    build_training_dataset,
+    dataset_build,
+    dataset_generated_batch,
     eda_dataframe,
 )
 for module in modules:
     path = Path(module.__file__).resolve()
     assert path.is_relative_to(expected), (module.__name__, path, expected)
-assert load_generated_batch is generated_batch.load_generated_batch
+assert datasets.build is dataset_build
+assert datasets.generated_batch is dataset_generated_batch
+assert datasets.generated_batch.load_generated_batch is dataset_generated_batch.load_generated_batch
 print(src.__file__)
-print(data_generation.__file__)
-print(generated_batch.__file__)
-print(build_training_dataset.__file__)
+print(dataset_generated_batch.__file__)
+print(dataset_build.__file__)
 print(eda_dataframe.__file__)
 """
     )
@@ -131,9 +125,7 @@ print(eda_dataframe.__file__)
     if wheel_target is not None:
         help_probe += f"sys.path.insert(0, {str(wheel_target)!r}); "
     help_probe += (
-        "import runpy, sys; "
-        "sys.argv=['data_generation.build_training_dataset', '--help']; "
-        "runpy.run_module('data_generation.build_training_dataset', run_name='__main__')"
+        "import runpy, sys; sys.argv=['src.datasets.dataset_build', '--help']; runpy.run_module('src.datasets.dataset_build', run_name='__main__')"
     )
     completed = _run([str(python), "-S", "-B", "-c", help_probe], cwd=cwd)
     if "Completed generated batch and final dataset identifier" not in completed.stdout:
@@ -201,22 +193,19 @@ def main() -> int:
             names = set(archive.namelist())
             top_level_path = next(name for name in names if name.endswith(".dist-info/top_level.txt"))
             top_levels = set(archive.read(top_level_path).decode("utf-8").splitlines())
-            if top_levels != {"src", "data_generation"}:
+            if top_levels != {"src"}:
                 message = f"Wheel top-level packages are incomplete: {sorted(top_levels)!r}."
                 raise RuntimeError(message)
-            expected_python = {path.relative_to(source / "model_training").as_posix() for path in (source / "model_training" / "src").rglob("*.py")}
-            expected_python.update(path.relative_to(source).as_posix() for path in (source / "data_generation").glob("*.py"))
-            missing = sorted(expected_python.difference(names))
-            if missing:
-                message = f"Wheel is missing maintained Python modules: {missing!r}."
+            expected_python = {path.relative_to(source).as_posix() for path in (source / "src").rglob("*.py")}
+            wheel_python = {name for name in names if name.startswith("src/") and name.endswith(".py")}
+            missing = sorted(expected_python.difference(wheel_python))
+            unexpected = sorted(wheel_python.difference(expected_python))
+            if missing or unexpected:
+                message = f"Wheel Python inventory mismatch: missing={missing!r}, unexpected={unexpected!r}."
                 raise RuntimeError(message)
-            unintended = sorted(
-                name
-                for name in names
-                if name.startswith("data_generation/") and ("/data/" in name or "/matlab/" in name or "/comsol/" in name or not name.endswith(".py"))
-            )
+            unintended = sorted(name for name in names if name.startswith(("configs/", "notebooks/", "simulation/", "tests/")))
             if unintended:
-                message = f"Wheel contains unintended generation payloads: {unintended!r}."
+                message = f"Wheel contains unintended repository payloads: {unintended!r}."
                 raise RuntimeError(message)
 
         wheel_target = scratch / "wheel-install"
@@ -242,8 +231,8 @@ def main() -> int:
             wheel_target=wheel_target,
         )
 
-        print("Editable install: all six src packages, data_generation, reader, builder, and EDA passed.")
-        print("Wheel install: both package roots, six public packages, inventory, imports, and builder help passed.")
+        print("Editable install: root src, all six public domains, dataset services, and EDA passed.")
+        print("Wheel install: sole src package, inventory, imports, and dataset-builder help passed.")
     return 0
 
 

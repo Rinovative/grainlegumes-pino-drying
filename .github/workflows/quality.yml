@@ -28,21 +28,21 @@ jobs:
 
       - name: Lint
         shell: bash -l {0}
-        run: ruff check setup.py model_training/src model_training/tests data_generation scripts/check_notebooks.py scripts/check_package_install.py
+        run: ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
 
       - name: Check formatting
         shell: bash -l {0}
-        run: ruff format --check setup.py model_training/src model_training/tests data_generation scripts/check_notebooks.py scripts/check_package_install.py --exclude '*.ipynb'
+        run: ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py --exclude '*.ipynb'
 
       - name: Validate maintained notebooks
         shell: bash -l {0}
         run: |
           python scripts/check_notebooks.py
-          ruff check model_training/notebooks
+          ruff check notebooks
 
       - name: Type-check with Mypy
         shell: bash -l {0}
-        run: PYTHONPATH=model_training mypy model_training/src data_generation
+        run: mypy src
 
       - name: Type-check with BasedPyright
         shell: bash -l {0}
@@ -85,9 +85,8 @@ jobs:
                   "radon",
                   "cc",
                   "-j",
-                  "model_training/src",
-                  "model_training/tests",
-                  "data_generation",
+                  "src",
+                  "tests",
                   "scripts/check_notebooks.py",
               ],
               capture_output=True,
@@ -173,19 +172,19 @@ jobs:
           EOF
       - name: Compile maintained Python
         shell: bash -l {0}
-        run: python -m compileall -q setup.py model_training/src data_generation scripts/check_notebooks.py scripts/check_package_install.py
+        run: python -m compileall -q src scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
 
       - name: Run CPU tests
         shell: bash -l {0}
-        run: PYTHONPATH=model_training python -m pytest -q -m "not real_data" model_training/tests
+        run: python -m pytest -q -m "not real_data" tests
 
       - name: Smoke-test imports and command-line interfaces
         shell: bash -l {0}
         run: |
-          cd model_training
           python -c "from src import analysis, common, datasets, domain, experiments, learning"
+          python -m src.common.common_queue_log_cli --help
+          python -m src.datasets.dataset_build --help
           python -m src.experiments.cli.cli_train --help
           python -m src.experiments.cli.cli_optuna --help
           python -m src.experiments.cli.cli_config_preflight --help
           python -m src.experiments.cli.cli_build_artifacts --help
-          cd ..

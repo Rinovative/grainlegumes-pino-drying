@@ -57,8 +57,6 @@ dist/
 # ================================
 # Generated data
 # ================================
-/data_generation/data/
-/model_training/data/
 
 # ================================
 # Logs, temporary & system files

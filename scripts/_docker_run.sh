@@ -1,30 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# < 4 )); then
-  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-scope> <log-basename> [semantic CLI arguments...]" >&2
+if (( $# < 3 )); then
+  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <host-log-file> [semantic CLI arguments...]" >&2
   exit 2
 fi
 
 GPU_ID="$1"
 JOB_TYPE="$2"
-LOG_SCOPE="$3"
-LOG_BASENAME="$4"
-shift 4
+HOST_LOG_FILE="$3"
+shift 3
 SEMANTIC_ARGS=("$@")
 
 if [[ ! "${GPU_ID}" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "GPU ID must be a non-negative integer, got: ${GPU_ID@Q}" >&2
   exit 2
 fi
-TRIMMED_LOG_SCOPE="${LOG_SCOPE#"${LOG_SCOPE%%[![:space:]]*}"}"
-TRIMMED_LOG_SCOPE="${TRIMMED_LOG_SCOPE%"${TRIMMED_LOG_SCOPE##*[![:space:]]}"}"
-if [[ -z "${LOG_SCOPE}" || "${TRIMMED_LOG_SCOPE}" != "${LOG_SCOPE}" || "${LOG_SCOPE}" == */* || "${LOG_SCOPE}" == *\\* || "${LOG_SCOPE}" == "." || "${LOG_SCOPE}" == ".." ]]; then
-  echo "Log scope must be one safe non-empty path component, got: ${LOG_SCOPE@Q}" >&2
-  exit 2
-fi
-if [[ -z "${LOG_BASENAME}" || "${LOG_BASENAME}" == */* || "${LOG_BASENAME}" == "." || "${LOG_BASENAME}" == ".." ]]; then
-  echo "Log name must be one non-empty basename, got: ${LOG_BASENAME@Q}" >&2
+if [[ "${HOST_LOG_FILE}" != /* ]]; then
+  echo "Host log file must be an absolute path, got: ${HOST_LOG_FILE@Q}" >&2
   exit 2
 fi
 
@@ -95,18 +88,17 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
-HOST_GENERATED_DATA_ROOT="${STORAGE_DIR}/data_generation"
-HOST_MODEL_TRAINING_DATA_ROOT="${STORAGE_DIR}/data_training"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-QUEUE_LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${LOG_SCOPE}/logs/queue"
-LOG_FILE="${QUEUE_LOG_DIR}/${LOG_BASENAME}"
-mkdir -p \
-  "${PROJECT_DIR}/data_generation/data" \
-  "${PROJECT_DIR}/model_training/data" \
-  "${HOST_GENERATED_DATA_ROOT}" \
-  "${HOST_MODEL_TRAINING_DATA_ROOT}" \
-  "${DOCKER_HOME}" \
-  "${QUEUE_LOG_DIR}"
+LOG_FILE="$(realpath -m -- "${HOST_LOG_FILE}")"
+if [[ "${LOG_FILE}" != "${STORAGE_DIR}/"* ]]; then
+  echo "Host log file must remain inside the configured storage root: ${LOG_FILE@Q}" >&2
+  exit 2
+fi
+if [[ -L "${LOG_FILE}" || ! -f "${LOG_FILE}" ]]; then
+  echo "Host log file must be an existing non-symlink regular file: ${LOG_FILE@Q}" >&2
+  exit 2
+fi
+mkdir -p "${DOCKER_HOME}"
 
 # Capture both streams and the final Docker status in the unique host-visible log.
 exec > "${LOG_FILE}" 2>&1
@@ -166,19 +158,16 @@ docker run --rm \
   --gpus "device=${GPU_ID}" \
   --user "$(id -u):$(id -g)" \
   --shm-size=16G \
-  --workdir /workspace/repo/model_training \
+  --workdir /workspace/repo \
   -e HOME=/workspace/storage/.docker_home \
   -e PROJECT_ROOT=/workspace/repo \
-  -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data \
-  -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data \
+  -e STORAGE_ROOT=/workspace/storage \
   "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
   -v "${DOCKER_HOME}/group:/etc/group:ro" \
   -v "${PROJECT_DIR}:/workspace/repo:rw" \
-  -v "${HOST_GENERATED_DATA_ROOT}:/workspace/repo/data_generation/data:ro" \
-  -v "${HOST_MODEL_TRAINING_DATA_ROOT}:/workspace/repo/model_training/data:rw" \
-  -v "${DOCKER_HOME}:/workspace/storage/.docker_home:rw" \
+  -v "${STORAGE_DIR}:/workspace/storage:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
   python -m "${MODULE}" "${CLI_ARGS[@]}"

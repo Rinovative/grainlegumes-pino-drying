@@ -8,15 +8,8 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
-HOST_GENERATED_DATA_ROOT="${STORAGE_DIR}/data_generation"
-HOST_MODEL_TRAINING_DATA_ROOT="${STORAGE_DIR}/data_training"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-mkdir -p \
-  "${PROJECT_DIR}/data_generation/data" \
-  "${PROJECT_DIR}/model_training/data" \
-  "${HOST_GENERATED_DATA_ROOT}" \
-  "${HOST_MODEL_TRAINING_DATA_ROOT}" \
-  "${DOCKER_HOME}"
+mkdir -p "${DOCKER_HOME}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required but was not found on PATH. Install Docker and retry." >&2
@@ -102,23 +95,19 @@ docker run -d --rm \
   --workdir /workspace/repo \
   -e HOME=/workspace/storage/.docker_home \
   -e PROJECT_ROOT=/workspace/repo \
-  -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data \
-  -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data \
+  -e STORAGE_ROOT=/workspace/storage \
   "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
   -v "${DOCKER_HOME}/group:/etc/group:ro" \
   -v "${PROJECT_DIR}:/workspace/repo:rw" \
-  -v "${HOST_GENERATED_DATA_ROOT}:/workspace/repo/data_generation/data:ro" \
-  -v "${HOST_MODEL_TRAINING_DATA_ROOT}:/workspace/repo/model_training/data:rw" \
-  -v "${DOCKER_HOME}:/workspace/storage/.docker_home:rw" \
+  -v "${STORAGE_DIR}:/workspace/storage:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
   bash -lc "sleep infinity"
 
 echo "Container started: ${CONTAINER_NAME}"
-echo "Repository mount:          /workspace/repo"
-echo "Generated data mount (ro): /workspace/repo/data_generation/data"
-echo "Training data mount (rw):  /workspace/repo/model_training/data"
+echo "Repository mount: /workspace/repo"
+echo "Storage mount:    /workspace/storage"
 echo "Attach with VS Code: Remote Explorer -> Containers -> ${CONTAINER_NAME}"
 echo "Stop with: docker stop ${CONTAINER_NAME}"

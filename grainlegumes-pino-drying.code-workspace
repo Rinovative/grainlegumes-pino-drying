@@ -1,0 +1,20 @@
+{
+  "folders": [
+    {
+      "name": "Repository",
+      "path": "."
+    },
+    {
+      "name": "Storage",
+      "path": "../storage"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.docker_home": true
+    },
+    "search.exclude": {
+      "**/.docker_home": true
+    }
+  }
+}

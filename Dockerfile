@@ -1,5 +1,5 @@
 # ==========================================
-# GrainLegumes PINO Airflow
+# GrainLegumes PINO Drying
 # CUDA 12.1 + cuDNN8 + Micromamba
 # ==========================================
 
@@ -43,9 +43,7 @@ RUN micromamba env create -f /tmp/environment.yml -y && \
 # ----------------------------------------------------------------------
 # Workspace layout
 # ----------------------------------------------------------------------
-RUN mkdir -p /workspace/repo/data_generation/data \
-    /workspace/repo/model_training/data \
-    /workspace/storage/.docker_home
+RUN mkdir -p /workspace/storage/.docker_home
 
 WORKDIR /workspace/repo
 
@@ -61,8 +59,7 @@ RUN micromamba run -n ${ENV_NAME} pip install -e /workspace/repo
 # ----------------------------------------------------------------------
 ENV PATH=/opt/micromamba/envs/${ENV_NAME}/bin:$PATH
 ENV PROJECT_ROOT=/workspace/repo
-ENV GENERATED_DATA_ROOT=/workspace/repo/data_generation/data
-ENV MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data
+ENV STORAGE_ROOT=/workspace/storage
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash"]

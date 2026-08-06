@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-_NOTEBOOK_ROOT = _REPOSITORY_ROOT / "model_training" / "notebooks"
+_NOTEBOOK_ROOT = _REPOSITORY_ROOT / "notebooks"
 _NOTEBOOK_FORMAT = 4
 
 
