@@ -6,7 +6,7 @@ Verify editable and wheel installation contracts from unrelated directories.
 
 Responsibilities:
   - Build isolated editable and wheel installations from a scoped source copy
-  - Probe the sole ``src`` package and all six public domains off-checkout
+  - Probe the sole ``src`` package and all seven public domains off-checkout
   - Reject missing Python modules and unintended non-package payloads
 
 Design principles:
@@ -90,7 +90,7 @@ def _probe_install(
         + f"""
 from pathlib import Path
 import src
-from src import analysis, common, datasets, domain, experiments, learning
+from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
 from src.datasets import dataset_build, dataset_generated_batch
 
@@ -102,6 +102,7 @@ modules = (
     datasets,
     domain,
     experiments,
+    generation,
     learning,
     dataset_build,
     dataset_generated_batch,
@@ -128,7 +129,7 @@ print(eda_dataframe.__file__)
         "import runpy, sys; sys.argv=['src.datasets.dataset_build', '--help']; runpy.run_module('src.datasets.dataset_build', run_name='__main__')"
     )
     completed = _run([str(python), "-S", "-B", "-c", help_probe], cwd=cwd)
-    if "Completed generated batch and final dataset identifier" not in completed.stdout:
+    if "Completed source simulation batch identifier" not in completed.stdout:
         message = "Builder help did not expose the maintained positional batch contract."
         raise RuntimeError(message)
 
@@ -231,7 +232,7 @@ def main() -> int:
             wheel_target=wheel_target,
         )
 
-        print("Editable install: root src, all six public domains, dataset services, and EDA passed.")
+        print("Editable install: root src, all seven public domains, dataset services, and EDA passed.")
         print("Wheel install: sole src package, inventory, imports, and dataset-builder help passed.")
     return 0
 

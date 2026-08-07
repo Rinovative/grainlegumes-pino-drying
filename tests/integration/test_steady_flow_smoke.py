@@ -124,7 +124,7 @@ def _training_dataset_payload(
         dataset_id=dataset_id,
         sample_ids=sample_ids,
         generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_name=dataset_id,
+            batch_id=dataset_id,
             sample_ids=sample_ids,
         ),
         source_identities=[case[2] for case in cases],
@@ -137,82 +137,51 @@ def _training_dataset_payload(
 
 
 def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> Path:
-    """Publish one final dataset and its self-contained metadata test package."""
+    """Publish one current synthetic dataset and terminal-manifest metadata package."""
     dataset_id = str(payload["dataset_id"])
     task = domain.tasks.registry.get_task(str(payload["task"]))
-    metadata_dir = metadata_root / dataset_id
-    metadata_dir.mkdir(parents=True)
-    sample_csv_path = metadata_dir / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
-    sample_csv_path.write_text(
-        "case_id;synthetic_parameter\n" + "\n".join(f"{int(str(sample_id).removeprefix('case_'))};1.0" for sample_id in payload["sample_ids"]) + "\n",
-        encoding="utf-8",
-    )
     generated_identity = payload["generated_batch_identity"]
-    configuration = {
-        **generated_identity["configuration"],
-        "sample_sha256": common.serialization.file_sha256(sample_csv_path),
-    }
-    manifest_cases = []
-    for source in generated_identity["scientific_case_sources"]:
-        case_id = str(source["case_id"])
-        manifest_cases.append(
-            {
-                "case_id": case_id,
-                "status": "complete",
-                "stage": "simulation",
-                "message": "",
-                "files": {
-                    "raw_csv_sha256": source["raw_csv_sha256"],
-                    "raw_json_sha256": common.serialization.canonical_json_sha256({"batch_name": dataset_id, "case_id": case_id}),
-                    "solution_csv_sha256": source["solution_csv_sha256"],
-                    "solution_model_sha256": source["solution_model_sha256"],
-                },
-            }
-        )
+    case_records = []
+    case_indices = []
+    for case in generated_identity["cases"]:
+        case_id = str(case["case_id"])
+        case_index = int(case_id.removeprefix("case_"))
+        case_indices.append(case_index)
+        case_records.append({"case_index": case_index, **case})
     manifest = {
         "schema_kind": datasets.metadata.SOURCE_MANIFEST_SCHEMA_KIND,
         "schema_version": datasets.metadata.SOURCE_MANIFEST_SCHEMA_VERSION,
-        "batch_name": dataset_id,
         "status": "complete",
-        "configuration": configuration,
-        "field_schema": generated_identity["field_schema"],
-        "intended_case_ids": list(payload["sample_ids"]),
-        "cases": manifest_cases,
+        "simulation_profile": generated_identity["simulation_profile"],
+        "available_learning_views": generated_identity["available_learning_views"],
+        "airflow_source": generated_identity["airflow_source"],
+        "batch_id": generated_identity["batch_id"],
+        "batch_identity": generated_identity["batch_identity"],
+        "template": generated_identity["template"],
+        "export_contract_sha256": generated_identity["export_contract_sha256"],
+        "intended_case_indices": case_indices,
+        "cases": case_records,
     }
-    common.serialization.atomic_write_json(metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME, manifest)
+    metadata_dir = metadata_root / dataset_id
+    metadata_dir.mkdir(parents=True)
     manifest_path = metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME
+    common.serialization.atomic_write_json(manifest_path, manifest)
     manifest_sha256 = common.serialization.file_sha256(manifest_path)
     payload["source_provenance"]["batch_manifest_sha256"] = manifest_sha256
-    sample_json_path = metadata_dir / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME
-    common.serialization.atomic_write_json(
-        sample_json_path,
-        {
-            "meta": {
-                **generated_identity["sampling"],
-                "timestamp": "synthetic-test-snapshot",
-            },
-            "n_cases": int(payload["sample_count"]),
-        },
-    )
-    payload["source_provenance"]["source_sample_csv_sha256"] = common.serialization.file_sha256(sample_csv_path)
-    payload["source_provenance"]["source_sample_json_sha256"] = common.serialization.file_sha256(sample_json_path)
     destination = root / dataset_id / f"{dataset_id}.pt"
     common.serialization.atomic_torch_save(payload, destination)
-    identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
-    timing_summary = {"status": "missing", "measured_case_count": 0, "intended_case_count": identity.sample_count}
-    snapshot_roles = {
-        datasets.metadata.SOURCE_MANIFEST_FILENAME: "validated_generation_manifest",
-        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME: "validated_parameter_sample_csv",
-        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME: "validated_parameter_sample_json",
-    }
+    identity = datasets.identity.validate_training_dataset_payload(
+        payload,
+        task=task,
+        verify_content=True,
+    )
     snapshots = {
-        filename: {
-            "sha256": common.serialization.file_sha256(metadata_dir / filename),
-            "size_bytes": (metadata_dir / filename).stat().st_size,
+        datasets.metadata.SOURCE_MANIFEST_FILENAME: {
+            "sha256": manifest_sha256,
+            "size_bytes": manifest_path.stat().st_size,
             "required": True,
-            "role": role,
+            "role": "validated_generation_manifest",
         }
-        for filename, role in snapshot_roles.items()
     }
     common.serialization.atomic_write_json(
         metadata_dir / datasets.metadata.METADATA_FILENAME,
@@ -225,8 +194,11 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
                 "dataset_fingerprint": identity.fingerprint,
                 "task_id": task.id,
                 "data_contract_digest": identity.data_contract_digest,
-                "source_batch_id": dataset_id,
-                "generated_batch_identity_sha256": str(payload["generated_batch_identity"]["batch_manifest_identity_sha256"]),
+                "source_batch_id": generated_identity["batch_id"],
+                "source_simulation_profile": generated_identity["simulation_profile"],
+                "source_template_sha256": generated_identity["template"]["sha256"],
+                "airflow_source": generated_identity["airflow_source"],
+                "generated_batch_identity_sha256": generated_identity["batch_manifest_identity_sha256"],
                 "sample_count": identity.sample_count,
                 "spatial_shape": list(identity.spatial_shape),
                 "tensors": payload["tensor_metadata"],
@@ -243,7 +215,11 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
                 "builder_module": datasets.metadata.BUILDER_MODULE,
                 "publication_method": datasets.metadata.PUBLICATION_METHOD,
                 "source_manifest_sha256": manifest_sha256,
-                "timing": timing_summary,
+                "timing": {
+                    "status": "unavailable",
+                    "measured_case_count": 0,
+                    "intended_case_count": identity.sample_count,
+                },
             },
         },
     )

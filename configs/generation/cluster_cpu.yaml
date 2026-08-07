@@ -1,0 +1,5 @@
+schema_kind: generation_cluster_execution
+schema_version: 1
+cores_per_node: 32
+scheduler_kind: slurm
+scheduler_options: []

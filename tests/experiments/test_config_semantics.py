@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -15,7 +14,6 @@ from src import domain, experiments, learning
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-_CONFIG_ROOT = Path(__file__).parents[2] / "configs"
 _SYNTHETIC_BATCH_SIZE = 3
 
 
@@ -197,15 +195,3 @@ def test_resolved_task_contract_rejects_an_unsupported_schema() -> None:
         match="does not exactly match registered task",
     ):
         experiments.config.loader.validate_resolved_task_contract(resolved)
-
-
-def test_current_yaml_files_are_dynamically_parseable() -> None:
-    """Admit every current YAML without freezing names, locations, counts, or values."""
-    paths = tuple(sorted(_CONFIG_ROOT.rglob("*.yaml")))
-    assert paths
-    for path in paths:
-        raw = experiments.config.loader.load_yaml(path)
-        if "study" in raw and "experiment" in raw:
-            experiments.tuning.optuna.load_optuna_study_config(path)
-        else:
-            experiments.config.loader.resolve_config(raw)

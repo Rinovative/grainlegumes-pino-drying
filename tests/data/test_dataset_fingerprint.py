@@ -4,7 +4,7 @@ Protect deterministic, content-bound dataset and saved-membership identity.
 
 The tests vary case order, tensors, metadata, sample IDs, and split indices to
 show that equivalent content is stable and tampering fails strict verification.
-Direct-builder transactions belong to ``test_dataset_contract``. Large
+Direct-builder transactions are protected by the profile integration smoke. Large
 production tensors are deliberately not loaded.
 """
 
@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-from src import datasets, domain
 from support.synthetic_task import build_synthetic_generated_batch_identity
+
+from src import datasets, domain
 
 _EXPECTED_DISTINCT_FINGERPRINTS = 4
 _SHA256_HEX_LENGTH = 64
@@ -43,7 +44,7 @@ def _reordered_payload(
         dataset_id=payload["dataset_id"],
         sample_ids=[payload["sample_ids"][index] for index in order],
         generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_name=payload["generated_batch_identity"]["batch_name"],
+            batch_id=payload["generated_batch_identity"]["batch_id"],
             sample_ids=[payload["sample_ids"][index] for index in order],
         ),
         source_identities=[payload["source_identities"][index] for index in order],
@@ -198,7 +199,7 @@ def test_ordered_membership_changes_fingerprint(
         dataset_id="tiny",
         sample_ids=original["sample_ids"][:-1],
         generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_name=original["generated_batch_identity"]["batch_name"],
+            batch_id=original["generated_batch_identity"]["batch_id"],
             sample_ids=original["sample_ids"][:-1],
         ),
         source_identities=original["source_identities"][:-1],
@@ -237,7 +238,7 @@ def test_strict_verification_rejects_reordered_samples_with_stale_fingerprint(
         payload["sample_ids"][0],
     )
     payload["generated_batch_identity"] = build_synthetic_generated_batch_identity(
-        batch_name=payload["generated_batch_identity"]["batch_name"],
+        batch_id=payload["generated_batch_identity"]["batch_id"],
         sample_ids=payload["sample_ids"],
     )
     with pytest.raises(ValueError, match="fingerprint mismatch"):

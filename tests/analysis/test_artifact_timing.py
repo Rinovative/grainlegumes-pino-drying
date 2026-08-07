@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from src import analysis
-from src.datasets.dataset_metadata import DatasetMetadata, validate_comsol_timing_snapshot
+from src.datasets.dataset_metadata import DatasetMetadata
 
 
 class _IdentityNormalizer:
@@ -88,21 +88,14 @@ def _neural_cases() -> list[dict[str, Any]]:
 
 def _comsol_payload(*, digest: str = "a" * 64) -> dict[str, Any]:
     return {
-        "schema_kind": analysis.artifacts.timing.COMSOL_SOLVE_SCHEMA_KIND,
+        "schema_kind": analysis.artifacts.timing.SIMULATION_TIMING_SCHEMA_KIND,
         "schema_version": 1,
-        "batch_name": "batch-a",
+        "simulation_profile": "steady_flow",
+        "batch_id": "batch-a",
         "batch_manifest_sha256": digest,
-        "runtime": {
-            "matlab_version": "test",
-            "comsol_version": "6.4",
-            "os": "test-os",
-            "hostname": "comsol-host",
-            "processor": "test-cpu",
-            "case_execution": "sequential",
-        },
         "cases": [
-            {"case_id": "case_0001", "comsol_solve_s": 20.0},
-            {"case_id": "case_0003", "comsol_solve_s": 30.0},
+            {"case_id": "case_0001", "elapsed_seconds": 20.0},
+            {"case_id": "case_0003", "elapsed_seconds": 30.0},
         ],
         "aggregates": {
             "measured_case_count": 2,
@@ -192,7 +185,7 @@ def test_missing_training_timing_snapshot_is_nonfatal() -> None:
     payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
     assert payload is None
     assert digest is None
-    assert reason == "validated model-training COMSOL timing snapshot is missing"
+    assert reason == "validated model-training simulation timing snapshot is missing"
 
 
 def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
@@ -218,7 +211,7 @@ def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
 
     assert payload is None
     assert digest is None
-    assert reason == "validated model-training COMSOL timing snapshot is missing"
+    assert reason == "validated model-training simulation timing snapshot is missing"
 
 
 def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,7 +343,7 @@ def test_timing_payloads_require_integer_schema_version_one(schema_version: obje
     comsol = _comsol_payload()
     comsol["schema_version"] = schema_version
     with pytest.raises(ValueError, match="invalid schema"):
-        analysis.artifacts.timing.validate_comsol_solve_timing(comsol)
+        analysis.artifacts.timing.validate_simulation_batch_timing(comsol)
 
     comparison = _comparison()
     comparison["schema_version"] = schema_version
@@ -358,30 +351,8 @@ def test_timing_payloads_require_integer_schema_version_one(schema_version: obje
         analysis.artifacts.timing.validate_runtime_comparison(comparison)
 
 
-def test_metadata_timing_normalizes_one_current_matlab_case_object() -> None:
-    """Normalize MATLAB's scalar timing record to the maintained in-memory list."""
-    payload = _comsol_payload()
-    payload["cases"] = payload["cases"][0]
-    payload["aggregates"] = {
-        "measured_case_count": 1,
-        "mean_s": 20.0,
-        "median_s": 20.0,
-        "p10_s": 20.0,
-        "p90_s": 20.0,
-    }
-
-    validated = validate_comsol_timing_snapshot(
-        payload,
-        batch_name="batch-a",
-        manifest_sha256="a" * 64,
-        intended_case_ids=["case_0001"],
-    )
-
-    assert validated["cases"] == [{"case_id": "case_0001", "comsol_solve_s": 20.0}]
-
-
 @pytest.mark.parametrize("measured_case_count", [True, 1.0], ids=("boolean-one", "floating-one"))
-def test_metadata_timing_aggregate_count_requires_an_integer(measured_case_count: object) -> None:
+def test_simulation_timing_aggregate_count_requires_an_integer(measured_case_count: object) -> None:
     """Reject numeric values that compare equal to the one-case aggregate count."""
     payload = _comsol_payload()
     payload["cases"] = [payload["cases"][0]]
@@ -394,23 +365,18 @@ def test_metadata_timing_aggregate_count_requires_an_integer(measured_case_count
     }
 
     with pytest.raises(ValueError, match="measured_case_count"):
-        validate_comsol_timing_snapshot(
-            payload,
-            batch_name="batch-a",
-            manifest_sha256="a" * 64,
-            intended_case_ids=["case_0001"],
-        )
+        analysis.artifacts.timing.validate_simulation_batch_timing(payload)
 
 
 def test_comsol_timing_accepts_nonlexicographic_manifest_order() -> None:
     """Verify that comsol timing accepts nonlexicographic manifest order."""
     payload = _comsol_payload()
     payload["cases"] = list(reversed(payload["cases"]))
-    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_simulation_batch_timing(payload) == payload
 
 
-def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
-    """Verify that empty comsol sidecar uses matlab empty aggregates."""
+def test_empty_comsol_sidecar_uses_source_schema_empty_aggregates() -> None:
+    """Verify that an empty COMSOL sidecar preserves source-schema aggregates."""
     payload = _comsol_payload()
     payload["cases"] = []
     payload["aggregates"] = {
@@ -420,34 +386,34 @@ def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
         "p10_s": [],
         "p90_s": [],
     }
-    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_simulation_batch_timing(payload) == payload
 
 
 def test_comsol_aggregates_allow_only_machine_roundoff() -> None:
     """Verify that comsol aggregates allow only machine roundoff."""
     payload = _comsol_payload()
     payload["aggregates"]["mean_s"] += 5e-15
-    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_simulation_batch_timing(payload) == payload
     payload["aggregates"]["mean_s"] += 1e-3
     with pytest.raises(ValueError, match="derived from valid case records"):
-        analysis.artifacts.timing.validate_comsol_solve_timing(payload)
+        analysis.artifacts.timing.validate_simulation_batch_timing(payload)
 
 
 def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() -> None:
     """Verify that comsol timing rejects zero nonfinite malformed and duplicate records."""
     for value in (0.0, -1.0, float("inf")):
         payload = _comsol_payload()
-        payload["cases"][0]["comsol_solve_s"] = value
+        payload["cases"][0]["elapsed_seconds"] = value
         with pytest.raises((TypeError, ValueError)):
-            analysis.artifacts.timing.validate_comsol_solve_timing(payload)
+            analysis.artifacts.timing.validate_simulation_batch_timing(payload)
     malformed = _comsol_payload()
     malformed["cases"][0].pop("case_id")
     with pytest.raises(ValueError, match="invalid fields"):
-        analysis.artifacts.timing.validate_comsol_solve_timing(malformed)
+        analysis.artifacts.timing.validate_simulation_batch_timing(malformed)
     duplicate = _comsol_payload()
     duplicate["cases"][1]["case_id"] = "case_0001"
     with pytest.raises(ValueError, match="unique"):
-        analysis.artifacts.timing.validate_comsol_solve_timing(duplicate)
+        analysis.artifacts.timing.validate_simulation_batch_timing(duplicate)
 
 
 def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> None:

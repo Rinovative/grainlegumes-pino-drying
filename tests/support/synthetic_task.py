@@ -17,63 +17,33 @@ from src import domain
 
 def build_synthetic_generated_batch_identity(
     *,
-    batch_name: str,
+    batch_id: str,
     sample_ids: Sequence[str],
 ) -> dict[str, Any]:
-    """Return one complete deterministic version-1 generated-batch identity."""
+    """Return one deterministic current profile-qualified batch identity."""
     case_ids = list(sample_ids)
-    configuration = {
-        "method": "lhs",
-        "variation": 0.8,
-        "N": len(case_ids),
-        "seed": 17,
-        "Lx": 2.0,
-        "Ly": 1.0,
-        "res": 0.5,
-        "save_model": False,
-        "template_name": "synthetic_template.mph",
-        "template_sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
-    }
-    sources = [
-        {
-            "case_id": case_id,
-            "raw_csv_sha256": hashlib.sha256(f"{batch_name}:{case_id}:raw".encode()).hexdigest(),
-            "solution_csv_sha256": hashlib.sha256(f"{batch_name}:{case_id}:solution".encode()).hexdigest(),
-            "solution_model_sha256": "",
-        }
-        for case_id in case_ids
-    ]
     content: dict[str, Any] = {
         "schema_version": 1,
-        "batch_name": batch_name,
-        "configuration": configuration,
-        "field_schema": {
-            "input_columns": ["x", "y", "Kxx", "Kxy", "Kyy", "eps", "p_bc"],
-            "solution_columns": [
-                "x",
-                "y",
-                "kappaxx",
-                "kappayx",
-                "kappaxy",
-                "kappayy",
-                "eps",
-                "p_bc",
-                "p",
-                "u",
-                "v",
-                "U",
-            ],
+        "batch_id": batch_id,
+        "simulation_profile": "steady_flow",
+        "batch_identity": hashlib.sha256(f"{batch_id}:batch".encode()).hexdigest(),
+        "template": {
+            "relative_path": "simulation/steady_flow/template_brinkman.mph",
+            "sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
         },
+        "export_contract_sha256": hashlib.sha256(b"synthetic-exports").hexdigest(),
+        "available_learning_views": ["steady_flow"],
+        "airflow_source": "comsol_steady_reference",
         "intended_case_ids": case_ids,
-        "scientific_case_sources": sources,
-        "sampling": {
-            "method": configuration["method"],
-            "variation": configuration["variation"],
-            "N": configuration["N"],
-            "seed": configuration["seed"],
-            "base": {"synthetic_parameter": 1.0},
-            "param_names": ["synthetic_parameter"],
-        },
+        "cases": [
+            {
+                "case_id": case_id,
+                "case_identity": hashlib.sha256(f"{batch_id}:{case_id}:case".encode()).hexdigest(),
+                "success_sha256": hashlib.sha256(f"{batch_id}:{case_id}:success".encode()).hexdigest(),
+                "provenance_sha256": hashlib.sha256(f"{batch_id}:{case_id}:provenance".encode()).hexdigest(),
+            }
+            for case_id in case_ids
+        ],
     }
     encoded = json.dumps(
         content,

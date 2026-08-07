@@ -25,10 +25,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,32 +48,31 @@ _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
 _GENERATED_BATCH_IDENTITY_KEYS = frozenset(
     {
         "schema_version",
-        "batch_name",
-        "configuration",
-        "field_schema",
+        "batch_id",
+        "simulation_profile",
+        "batch_identity",
+        "template",
+        "export_contract_sha256",
+        "available_learning_views",
+        "airflow_source",
         "intended_case_ids",
-        "scientific_case_sources",
-        "sampling",
+        "cases",
         "batch_manifest_identity_sha256",
     }
 )
-_GENERATED_CONFIGURATION_KEYS = frozenset(
+_GENERATED_TEMPLATE_KEYS = frozenset({"relative_path", "sha256"})
+_GENERATED_CASE_KEYS = frozenset(
     {
-        "method",
-        "variation",
-        "N",
-        "seed",
-        "Lx",
-        "Ly",
-        "res",
-        "save_model",
-        "template_name",
-        "template_sha256",
+        "case_id",
+        "case_identity",
+        "success_sha256",
+        "provenance_sha256",
     }
 )
-_GENERATED_FIELD_SCHEMA_KEYS = frozenset({"input_columns", "solution_columns"})
-_GENERATED_CASE_SOURCE_KEYS = frozenset({"case_id", "raw_csv_sha256", "solution_csv_sha256", "solution_model_sha256"})
-_GENERATED_SAMPLING_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names"})
+_PROFILE_METADATA = {
+    "steady_flow": (("steady_flow",), "comsol_steady_reference"),
+    "transient_drying": (("steady_flow", "transient_drying"), "comsol_coupled_reference"),
+}
 
 _REQUIRED_KEYS = frozenset(
     {
@@ -251,254 +248,128 @@ def _require_exact_mapping(
     return normalized
 
 
-def _require_manifest_number(value: Any, *, label: str, positive: bool) -> float:
-    """Validate one finite manifest number without accepting booleans."""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        msg = f"{label} must be a real number."
-        raise TypeError(msg)
-    result = float(value)
-    if not math.isfinite(result) or (result <= 0.0 if positive else result < 0.0):
-        relation = "positive" if positive else "non-negative"
-        msg = f"{label} must be finite and {relation}."
-        raise ValueError(msg)
-    return result
-
-
-def _validate_generated_configuration(value: Any, *, label: str) -> dict[str, Any]:
-    """Validate the scientific subset of one admitted manifest configuration."""
-    configuration = _require_exact_mapping(value, _GENERATED_CONFIGURATION_KEYS, label=label)
-    if configuration["method"] not in {"uniform", "lhs", "sobol"}:
-        msg = f"{label}.method is invalid."
-        raise ValueError(msg)
-    for name in ("N", "seed"):
-        numeric = configuration[name]
-        if isinstance(numeric, bool) or not isinstance(numeric, int):
-            msg = f"{label}.{name} must be an integer."
-            raise TypeError(msg)
-    if configuration["N"] <= 0 or configuration["seed"] < 0:
-        msg = f"{label} N and seed must be non-negative with positive N."
-        raise ValueError(msg)
-    _require_manifest_number(
-        configuration["variation"],
-        label=f"{label}.variation",
-        positive=False,
-    )
-    lengths = {
-        name: _require_manifest_number(
-            configuration[name],
-            label=f"{label}.{name}",
-            positive=True,
-        )
-        for name in ("Lx", "Ly", "res")
-    }
-    if lengths["res"] > min(lengths["Lx"], lengths["Ly"]):
-        msg = f"{label}.res cannot exceed the shorter domain length."
-        raise ValueError(msg)
-    if not isinstance(configuration["save_model"], bool):
-        msg = f"{label}.save_model must be boolean."
-        raise TypeError(msg)
-    template_name = _require_non_empty_string(
-        configuration["template_name"],
-        label=f"{label}.template_name",
-    )
-    if Path(template_name).name != template_name or "/" in template_name or "\\" in template_name or not template_name.endswith(".mph"):
-        msg = f"{label}.template_name must be an .mph basename."
-        raise ValueError(msg)
-    _require_sha256(configuration["template_sha256"], label=f"{label}.template_sha256")
-    return configuration
-
-
-def _validate_generated_field_schema(value: Any, *, label: str) -> dict[str, Any]:
-    """Validate exact generated source-column declarations."""
-    field_schema = _require_exact_mapping(value, _GENERATED_FIELD_SCHEMA_KEYS, label=label)
-    for name in ("input_columns", "solution_columns"):
-        columns = _require_string_sequence(
-            field_schema[name],
-            label=f"{label}.{name}",
-            unique=True,
-        )
-        if not columns:
-            msg = f"{label}.{name} must not be empty."
-            raise ValueError(msg)
-    return field_schema
-
-
-def _validate_generated_case_sources(
-    value: Any,
-    *,
-    intended: Sequence[str],
-    save_model: bool,
-    label: str,
-) -> list[dict[str, Any]]:
-    """Validate ordered scientific source digests for every intended case."""
-    if not isinstance(value, list) or len(value) != len(intended):
-        msg = f"{label} must align one-to-one with intended_case_ids."
-        raise ValueError(msg)
-    normalized: list[dict[str, Any]] = []
-    for index, (case_id, source_value) in enumerate(zip(intended, value, strict=True)):
-        item_label = f"{label}[{index}]"
-        source = _require_exact_mapping(
-            source_value,
-            _GENERATED_CASE_SOURCE_KEYS,
-            label=item_label,
-        )
-        if source["case_id"] != case_id:
-            msg = f"{label} must follow intended_case_ids exactly."
-            raise ValueError(msg)
-        _require_sha256(source["raw_csv_sha256"], label=f"{item_label}.raw_csv_sha256")
-        _require_sha256(
-            source["solution_csv_sha256"],
-            label=f"{item_label}.solution_csv_sha256",
-        )
-        model_digest = source["solution_model_sha256"]
-        if save_model:
-            _require_sha256(model_digest, label=f"{item_label}.solution_model_sha256")
-        elif model_digest != "":
-            msg = f"{item_label}.solution_model_sha256 must be empty when save_model is false."
-            raise ValueError(msg)
-        normalized.append(source)
-    return normalized
-
-
-def _validate_generated_sampling(
-    value: Any,
-    *,
-    configuration: Mapping[str, Any],
-    label: str,
-) -> dict[str, Any]:
-    """Validate portable parameter-sampling identity against the manifest."""
-    sampling = _require_exact_mapping(value, _GENERATED_SAMPLING_KEYS, label=label)
-    for name in ("N", "seed"):
-        numeric = sampling[name]
-        if isinstance(numeric, bool) or not isinstance(numeric, int):
-            msg = f"{label}.{name} must be an integer."
-            raise TypeError(msg)
-    _require_manifest_number(
-        sampling["variation"],
-        label=f"{label}.variation",
-        positive=False,
-    )
-    for name in ("method", "variation", "N", "seed"):
-        if sampling[name] != configuration[name]:
-            msg = f"{label}.{name} must match the generated configuration."
-            raise ValueError(msg)
-    sampling["base"] = _json_mapping_copy(sampling["base"], label=f"{label}.base")
-    parameter_names = _require_string_sequence(
-        sampling["param_names"],
-        label=f"{label}.param_names",
-        unique=True,
-    )
-    if not parameter_names:
-        msg = f"{label}.param_names must not be empty."
-        raise ValueError(msg)
-    return sampling
-
-
 def _validate_generated_batch_identity(
     value: Any,
     *,
     sample_ids: Sequence[str],
     label: str,
 ) -> dict[str, Any]:
-    """Validate the complete version-1 scientific generated-batch identity."""
-    identity = _require_exact_mapping(value, _GENERATED_BATCH_IDENTITY_KEYS, label=label)
-    schema_version = identity["schema_version"]
+    """Validate the current profile-qualified generated-batch identity."""
+    batch_identity = _require_exact_mapping(value, _GENERATED_BATCH_IDENTITY_KEYS, label=label)
+    schema_version = batch_identity["schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != GENERATED_BATCH_IDENTITY_SCHEMA_VERSION:
         msg = f"{label}.schema_version must be integer {GENERATED_BATCH_IDENTITY_SCHEMA_VERSION}."
         raise ValueError(msg)
-    _require_non_empty_string(identity["batch_name"], label=f"{label}.batch_name")
-    configuration = _validate_generated_configuration(
-        identity["configuration"],
-        label=f"{label}.configuration",
+    _require_non_empty_string(batch_identity["batch_id"], label=f"{label}.batch_id")
+    profile = _require_non_empty_string(
+        batch_identity["simulation_profile"],
+        label=f"{label}.simulation_profile",
     )
-    identity["field_schema"] = _validate_generated_field_schema(
-        identity["field_schema"],
-        label=f"{label}.field_schema",
+    if profile not in _PROFILE_METADATA:
+        msg = f"{label}.simulation_profile is unsupported: {profile!r}."
+        raise ValueError(msg)
+    _require_sha256(batch_identity["batch_identity"], label=f"{label}.batch_identity")
+    _require_sha256(
+        batch_identity["export_contract_sha256"],
+        label=f"{label}.export_contract_sha256",
     )
+    template = _require_exact_mapping(
+        batch_identity["template"],
+        _GENERATED_TEMPLATE_KEYS,
+        label=f"{label}.template",
+    )
+    relative_path = _require_non_empty_string(
+        template["relative_path"],
+        label=f"{label}.template.relative_path",
+    )
+    if Path(relative_path).is_absolute() or ".." in Path(relative_path).parts or not relative_path.endswith(".mph"):
+        msg = f"{label}.template.relative_path must be one safe relative .mph path."
+        raise ValueError(msg)
+    _require_sha256(template["sha256"], label=f"{label}.template.sha256")
+    expected_views, expected_source = _PROFILE_METADATA[profile]
+    views = _require_string_sequence(
+        batch_identity["available_learning_views"],
+        label=f"{label}.available_learning_views",
+        unique=True,
+    )
+    if views != expected_views or batch_identity["airflow_source"] != expected_source:
+        msg = f"{label} has learning-view or airflow provenance inconsistent with {profile!r}."
+        raise ValueError(msg)
     intended = _require_string_sequence(
-        identity["intended_case_ids"],
+        batch_identity["intended_case_ids"],
         label=f"{label}.intended_case_ids",
         unique=True,
     )
     if intended != tuple(sample_ids):
         msg = f"{label}.intended_case_ids must equal the dataset sample_ids in order."
         raise ValueError(msg)
-    if len(intended) != configuration["N"]:
-        msg = f"{label}.intended_case_ids must contain exactly configuration.N cases."
+    raw_cases = batch_identity["cases"]
+    if not isinstance(raw_cases, list) or len(raw_cases) != len(intended):
+        msg = f"{label}.cases must align one-to-one with intended_case_ids."
         raise ValueError(msg)
-    identity["scientific_case_sources"] = _validate_generated_case_sources(
-        identity["scientific_case_sources"],
-        intended=intended,
-        save_model=configuration["save_model"],
-        label=f"{label}.scientific_case_sources",
-    )
-    identity["sampling"] = _validate_generated_sampling(
-        identity["sampling"],
-        configuration=configuration,
-        label=f"{label}.sampling",
-    )
-    expected_digest = hashlib.sha256(
-        _canonical_json(
-            {key: identity[key] for key in identity if key != "batch_manifest_identity_sha256"},
-            label=label,
-        )
-    ).hexdigest()
+    normalized_cases: list[dict[str, Any]] = []
+    for index, (case_id, raw_case) in enumerate(zip(intended, raw_cases, strict=True)):
+        case_label = f"{label}.cases[{index}]"
+        case = _require_exact_mapping(raw_case, _GENERATED_CASE_KEYS, label=case_label)
+        if case["case_id"] != case_id:
+            msg = f"{label}.cases must follow intended_case_ids exactly."
+            raise ValueError(msg)
+        for key in ("case_identity", "success_sha256", "provenance_sha256"):
+            _require_sha256(case[key], label=f"{case_label}.{key}")
+        normalized_cases.append(case)
+    batch_identity["template"] = template
+    batch_identity["cases"] = normalized_cases
+    content = {key: batch_identity[key] for key in batch_identity if key != "batch_manifest_identity_sha256"}
+    expected_digest = hashlib.sha256(_canonical_json(content, label=label)).hexdigest()
     actual_digest = _require_sha256(
-        identity["batch_manifest_identity_sha256"],
+        batch_identity["batch_manifest_identity_sha256"],
         label=f"{label}.batch_manifest_identity_sha256",
     )
     if actual_digest != expected_digest:
-        msg = f"{label}.batch_manifest_identity_sha256 does not match its scientific content."
+        msg = f"{label}.batch_manifest_identity_sha256 does not match its content."
         raise ValueError(msg)
-    return identity
+    return batch_identity
 
 
-def build_generated_batch_identity(
-    source_manifest: Mapping[str, Any],
-    *,
-    sampling: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Build and validate the version-1 scientific identity from admitted sources."""
+def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the current scientific identity from one admitted terminal manifest."""
     manifest = _require_mapping(source_manifest, label="Source manifest")
-    configuration = _require_mapping(
-        manifest.get("configuration"),
-        label="Source manifest.configuration",
-    )
-    intended = _require_string_sequence(
-        manifest.get("intended_case_ids"),
-        label="Source manifest.intended_case_ids",
-        unique=True,
-    )
-    records = manifest.get("cases")
-    if not isinstance(records, (list, tuple)):
-        msg = "Source manifest.cases must be a list or tuple."
+    indices = manifest.get("intended_case_indices")
+    if not isinstance(indices, list):
+        msg = "Source manifest.intended_case_indices must be a list."
         raise TypeError(msg)
-    scientific_records: list[dict[str, Any]] = []
+    intended = [f"case_{index:04d}" for index in indices]
+    records = manifest.get("cases")
+    if not isinstance(records, list):
+        msg = "Source manifest.cases must be a list."
+        raise TypeError(msg)
+    cases: list[dict[str, Any]] = []
     for index, record_value in enumerate(records):
         record = _require_mapping(record_value, label=f"Source manifest.cases[{index}]")
-        files = _require_mapping(record.get("files"), label=f"Source manifest.cases[{index}].files")
-        scientific_records.append(
+        cases.append(
             {
                 "case_id": record.get("case_id"),
-                "raw_csv_sha256": files.get("raw_csv_sha256"),
-                "solution_csv_sha256": files.get("solution_csv_sha256"),
-                "solution_model_sha256": files.get("solution_model_sha256"),
+                "case_identity": record.get("case_identity"),
+                "success_sha256": record.get("success_sha256"),
+                "provenance_sha256": record.get("provenance_sha256"),
             }
         )
-    scientific_configuration = {key: value for key, value in configuration.items() if key != "sample_sha256"}
-    content = {
-        "schema_version": manifest.get("schema_version"),
-        "batch_name": manifest.get("batch_name"),
-        "configuration": scientific_configuration,
-        "field_schema": manifest.get("field_schema"),
-        "intended_case_ids": list(intended),
-        "scientific_case_sources": scientific_records,
-        "sampling": dict(sampling),
+    content: dict[str, Any] = {
+        "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
+        "batch_id": manifest.get("batch_id"),
+        "simulation_profile": manifest.get("simulation_profile"),
+        "batch_identity": manifest.get("batch_identity"),
+        "template": manifest.get("template"),
+        "export_contract_sha256": manifest.get("export_contract_sha256"),
+        "available_learning_views": manifest.get("available_learning_views"),
+        "airflow_source": manifest.get("airflow_source"),
+        "intended_case_ids": intended,
+        "cases": cases,
     }
-    identity = dict(content)
-    identity["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated batch identity")).hexdigest()
+    result = dict(content)
+    result["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated batch identity")).hexdigest()
     return _validate_generated_batch_identity(
-        identity,
+        result,
         sample_ids=intended,
         label="Generated batch identity",
     )

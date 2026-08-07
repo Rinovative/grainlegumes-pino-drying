@@ -119,7 +119,7 @@ def training_dataset_payload_factory(
             dataset_id=dataset_id,
             sample_ids=sample_ids,
             generated_batch_identity=build_synthetic_generated_batch_identity(
-                batch_name="synthetic_source",
+                batch_id="synthetic_source",
                 sample_ids=sample_ids,
             ),
             source_identities=identities,

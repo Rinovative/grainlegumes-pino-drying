@@ -684,7 +684,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         dataset_id="synthetic_train",
         sample_ids=("case_0000",),
         generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_name="synthetic_train",
+            batch_id="synthetic_train",
             sample_ids=("case_0000",),
         ),
         source_identities=(source_identity,),

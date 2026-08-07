@@ -7,6 +7,7 @@ Provides:
 - datasets: dataset contracts, metadata, loaders, and simulation readers
 - domain: scientific fields, physics, permeability, and task contracts
 - experiments: configuration, execution, tracking, tuning, and validation services
+- generation: profile-qualified Python generation and COMSOL execution services
 - learning: device, inference, loss, metric, model, and training services
 """
 
@@ -16,7 +17,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import analysis, common, datasets, domain, experiments, learning
+    from . import analysis, common, datasets, domain, experiments, generation, learning
 
 __all__ = [
     "analysis",
@@ -24,6 +25,7 @@ __all__ = [
     "datasets",
     "domain",
     "experiments",
+    "generation",
     "learning",
 ]
 

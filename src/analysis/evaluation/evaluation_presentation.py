@@ -62,7 +62,7 @@ _MINIMUM_VARIATION_VALUES = 2
 
 @dataclass(frozen=True, slots=True)
 class ParameterPresentation:
-    """Describe one sampled input in MATLAB generation/application order."""
+    """Describe one sampled input in canonical source-generation order."""
 
     column: str
     label: str
@@ -271,7 +271,7 @@ def metadata_parameter_selection(
     *,
     max_cases: int | None = None,
 ) -> ParameterSelection:
-    """Filter and order parameters through one MATLAB-derived contract."""
+    """Filter and order parameters through one source-generation contract."""
     if not frames:
         msg = "At least one evaluation frame is required."
         raise ValueError(msg)
@@ -315,7 +315,7 @@ def metadata_parameters(
     sorted_labels: bool = False,
     max_cases: int | None = None,
 ) -> tuple[str, ...]:
-    """Return shared variable inputs in canonical MATLAB application order."""
+    """Return shared variable inputs in canonical source-application order."""
     del sorted_labels  # retained for source compatibility; canonical order always wins.
     return metadata_parameter_selection(frames, max_cases=max_cases).included
 

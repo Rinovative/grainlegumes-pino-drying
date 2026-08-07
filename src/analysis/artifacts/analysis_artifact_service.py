@@ -965,15 +965,15 @@ def _resolve_comsol_timing(
     timing_payload = package.timing
     if timing_payload is None:
         status = package.timing_summary["status"]
-        return None, None, f"validated model-training COMSOL timing snapshot is {status}"
+        return None, None, f"validated model-training simulation timing snapshot is {status}"
     try:
-        validated = timing.validate_comsol_solve_timing(timing_payload)
+        validated = timing.validate_simulation_batch_timing(timing_payload)
     except (TypeError, ValueError) as error:
-        return None, None, f"COMSOL timing snapshot is incompatible: {error}"
+        return None, None, f"Simulation timing snapshot is incompatible: {error}"
     if validated["batch_manifest_sha256"] != manifest_sha256:
-        return None, None, "COMSOL timing snapshot does not bind the dataset metadata manifest"
+        return None, None, "Simulation timing snapshot does not bind the dataset metadata manifest"
     if not validated["cases"]:
-        return None, None, "validated model-training COMSOL timing snapshot is missing"
+        return None, None, "validated model-training simulation timing snapshot is missing"
     return validated, manifest_sha256, None
 
 

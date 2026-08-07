@@ -38,9 +38,8 @@ import torch
 
 from src import common
 
-COMSOL_SOLVE_TIMING_FILENAME = "comsol_solve_timing.json"
 RUNTIME_COMPARISON_FILENAME = "runtime_comparison.json"
-COMSOL_SOLVE_SCHEMA_KIND = "comsol_solve_timing"
+SIMULATION_TIMING_SCHEMA_KIND = "simulation_batch_timing"
 RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
 SCHEMA_VERSION = 1
 WARMUP_PASSES = 1
@@ -66,12 +65,10 @@ def _duration(value: Any, *, label: str, positive: bool = True) -> float:
     return result
 
 
-def _require_sha256(value: Any, *, label: str, allow_empty: bool = False) -> str:
+def _require_sha256(value: Any, *, label: str) -> str:
     if not isinstance(value, str):
         msg = f"{label} must be text."
         raise TypeError(msg)
-    if allow_empty and not value:
-        return value
     if len(value) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in value):
         msg = f"{label} must be a lowercase SHA-256."
         raise ValueError(msg)
@@ -251,71 +248,72 @@ def _validate_neural_runtime(value: Any) -> dict[str, Any]:
     return runtime
 
 
-def validate_comsol_solve_timing(value: Any) -> dict[str, Any]:
-    """Validate the compact MATLAB COMSOL solve-timing sidecar."""
+def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
+    """Validate current profile-qualified simulation-batch timing evidence."""
     if not isinstance(value, Mapping):
-        msg = "COMSOL solve timing must be a mapping."
+        msg = "Simulation batch timing must be a mapping."
         raise TypeError(msg)
     payload = dict(value)
     required = {
         "schema_kind",
         "schema_version",
-        "batch_name",
+        "simulation_profile",
+        "batch_id",
         "batch_manifest_sha256",
-        "runtime",
         "cases",
         "aggregates",
     }
-    if set(payload) != required or payload.get("schema_kind") != COMSOL_SOLVE_SCHEMA_KIND or not _is_schema_version(payload.get("schema_version")):
-        msg = "COMSOL solve timing has an invalid schema."
+    if (
+        set(payload) != required
+        or payload.get("schema_kind") != SIMULATION_TIMING_SCHEMA_KIND
+        or not _is_schema_version(payload.get("schema_version"))
+    ):
+        msg = "Simulation batch timing has an invalid schema."
         raise ValueError(msg)
-    _require_text(payload.get("batch_name"), label="COMSOL batch_name")
-    _require_sha256(payload.get("batch_manifest_sha256"), label="COMSOL batch_manifest_sha256", allow_empty=True)
-    runtime = payload.get("runtime")
-    runtime_fields = {"matlab_version", "comsol_version", "os", "hostname", "processor", "case_execution"}
-    if not isinstance(runtime, Mapping) or set(runtime) != runtime_fields:
-        msg = "COMSOL runtime provenance has invalid fields."
+    if payload.get("simulation_profile") not in {"steady_flow", "transient_drying"}:
+        msg = "Simulation batch timing has an unsupported simulation_profile."
         raise ValueError(msg)
-    for field in runtime_fields:
-        _require_text(runtime.get(field), label=f"COMSOL runtime.{field}")
-    if runtime.get("case_execution") != "sequential":
-        msg = "COMSOL runtime.case_execution must be sequential."
-        raise ValueError(msg)
+    _require_text(payload.get("batch_id"), label="simulation batch_id")
+    _require_sha256(
+        payload.get("batch_manifest_sha256"),
+        label="simulation batch_manifest_sha256",
+    )
     raw_cases = payload.get("cases")
     if not isinstance(raw_cases, list):
-        msg = "COMSOL solve timing cases must be a JSON array."
+        msg = "Simulation batch timing cases must be a JSON array."
         raise TypeError(msg)
     cases: list[dict[str, Any]] = []
     case_ids: list[str] = []
     for position, value_case in enumerate(raw_cases):
-        if not isinstance(value_case, Mapping) or set(value_case) != {"case_id", "comsol_solve_s"}:
-            msg = f"COMSOL solve timing case {position} has invalid fields."
+        if not isinstance(value_case, Mapping) or set(value_case) != {"case_id", "elapsed_seconds"}:
+            msg = f"Simulation batch timing case {position} has invalid fields."
             raise ValueError(msg)
-        case_id = _require_text(value_case.get("case_id"), label=f"COMSOL case {position} case_id")
-        duration = _duration(value_case.get("comsol_solve_s"), label=f"COMSOL case {position} solve duration")
+        case_id = _require_text(value_case.get("case_id"), label=f"simulation case {position} case_id")
+        duration = _duration(value_case.get("elapsed_seconds"), label=f"simulation case {position} elapsed duration")
         case_ids.append(case_id)
-        cases.append({"case_id": case_id, "comsol_solve_s": duration})
+        cases.append({"case_id": case_id, "elapsed_seconds": duration})
     if len(case_ids) != len(set(case_ids)):
-        msg = "COMSOL solve timing case IDs must be unique."
+        msg = "Simulation batch timing case IDs must be unique."
         raise ValueError(msg)
-    summary = _summary([case["comsol_solve_s"] for case in cases])
+    summary = _summary([case["elapsed_seconds"] for case in cases])
 
-    def matlab_optional(value: float | None) -> float | list[Any]:
+    def source_optional(value: float | None) -> float | list[Any]:
         return [] if value is None else value
 
     expected_aggregates = {
         "measured_case_count": summary["count"],
-        "mean_s": matlab_optional(summary["mean"]),
-        "median_s": matlab_optional(summary["median"]),
-        "p10_s": matlab_optional(summary["p10"]),
-        "p90_s": matlab_optional(summary["p90"]),
+        "mean_s": source_optional(summary["mean"]),
+        "median_s": source_optional(summary["median"]),
+        "p10_s": source_optional(summary["p10"]),
+        "p90_s": source_optional(summary["p90"]),
     }
     aggregates = payload.get("aggregates")
     if not isinstance(aggregates, Mapping) or set(aggregates) != set(expected_aggregates):
-        msg = "COMSOL solve aggregates must be derived from valid case records."
+        msg = "Simulation timing aggregates must be derived from valid case records."
         raise ValueError(msg)
-    if aggregates["measured_case_count"] != expected_aggregates["measured_case_count"]:
-        msg = "COMSOL solve aggregates must be derived from valid case records."
+    measured_count = aggregates["measured_case_count"]
+    if isinstance(measured_count, bool) or not isinstance(measured_count, int) or measured_count != expected_aggregates["measured_case_count"]:
+        msg = "Simulation timing aggregates.measured_case_count must equal the validated case count as an integer."
         raise ValueError(msg)
     for field in ("mean_s", "median_s", "p10_s", "p90_s"):
         actual = aggregates[field]
@@ -331,7 +329,7 @@ def validate_comsol_solve_timing(value: Any) -> dict[str, Any]:
                 and math.isclose(float(actual), float(expected_value), rel_tol=1e-12, abs_tol=1e-12)
             )
         if not valid:
-            msg = "COMSOL solve aggregates must be derived from valid case records."
+            msg = "Simulation timing aggregates must be derived from valid case records."
             raise ValueError(msg)
     return payload
 
@@ -408,17 +406,17 @@ def build_runtime_comparison(
         if unavailable_reason is not None or batch_manifest_sha256 is None:
             msg = "Available comparison requires a manifest digest and no unavailable reason."
             raise ValueError(msg)
-        comsol = validate_comsol_solve_timing(comsol_timing)
+        simulation_timing = validate_simulation_batch_timing(comsol_timing)
         expected_digest = _require_sha256(batch_manifest_sha256, label="batch_manifest_sha256")
-        if comsol["batch_manifest_sha256"] != expected_digest:
-            msg = "COMSOL solve timing does not bind the dataset-authoritative batch manifest."
+        if simulation_timing["batch_manifest_sha256"] != expected_digest:
+            msg = "Simulation timing does not bind the dataset-authoritative batch manifest."
             raise ValueError(msg)
-        comsol_by_id = {case["case_id"]: float(case["comsol_solve_s"]) for case in comsol["cases"]}
+        comsol_by_id = {case["case_id"]: float(case["elapsed_seconds"]) for case in simulation_timing["cases"]}
         comparison = {
             "status": "available",
-            "batch_name": comsol["batch_name"],
+            "simulation_profile": simulation_timing["simulation_profile"],
+            "batch_id": simulation_timing["batch_id"],
             "batch_manifest_sha256": expected_digest,
-            "runtime": dict(comsol["runtime"]),
         }
 
     records: list[dict[str, Any]] = []
@@ -547,28 +545,14 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
             raise ValueError(msg)
         _require_text(comparison.get("reason"), label="comparison.reason")
     elif status == "available":
-        if set(comparison) != {"status", "batch_name", "batch_manifest_sha256", "runtime"}:
+        if set(comparison) != {"status", "simulation_profile", "batch_id", "batch_manifest_sha256"}:
             msg = "Available comparison descriptor has invalid fields."
             raise ValueError(msg)
-        _require_text(comparison.get("batch_name"), label="comparison.batch_name")
+        if comparison.get("simulation_profile") not in {"steady_flow", "transient_drying"}:
+            msg = "Available comparison simulation_profile is unsupported."
+            raise ValueError(msg)
+        _require_text(comparison.get("batch_id"), label="comparison.batch_id")
         _require_sha256(comparison.get("batch_manifest_sha256"), label="comparison.batch_manifest_sha256")
-        comsol_runtime = comparison.get("runtime")
-        comsol_runtime_fields = {
-            "matlab_version",
-            "comsol_version",
-            "os",
-            "hostname",
-            "processor",
-            "case_execution",
-        }
-        if not isinstance(comsol_runtime, Mapping) or set(comsol_runtime) != comsol_runtime_fields:
-            msg = "Available comparison COMSOL runtime has invalid fields."
-            raise ValueError(msg)
-        for field in comsol_runtime_fields:
-            _require_text(comsol_runtime.get(field), label=f"comparison.runtime.{field}")
-        if comsol_runtime.get("case_execution") != "sequential":
-            msg = "Available comparison COMSOL runtime must describe sequential cases."
-            raise ValueError(msg)
     else:
         msg = "Runtime comparison status must be available or unavailable."
         raise ValueError(msg)
