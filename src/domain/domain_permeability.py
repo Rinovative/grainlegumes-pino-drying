@@ -57,18 +57,18 @@ COMSOL_KAPPA_3D_ORDER: list[str] = [
 # =============================================================================
 
 INTERNAL_KAPPA_2D_ORDER: list[str] = [
-    "kxx",
-    "kxy",
-    "kyy",
+    "Kxx",
+    "Kxy",
+    "Kyy",
 ]
 
 INTERNAL_KAPPA_3D_ORDER: list[str] = [
-    "kxx",
-    "kxy",
-    "kxz",
-    "kyy",
-    "kyz",
-    "kzz",
+    "Kxx",
+    "Kxy",
+    "Kxz",
+    "Kyy",
+    "Kyz",
+    "Kzz",
 ]
 
 # =============================================================================
@@ -79,12 +79,12 @@ INTERNAL_KAPPA_3D_ORDER: list[str] = [
 # =============================================================================
 
 INTERNAL_TO_COMSOL: dict[str, list[str]] = {
-    "kxx": ["kappaxx"],
-    "kyy": ["kappayy"],
-    "kzz": ["kappazz"],
-    "kxy": ["kappaxy", "kappayx"],
-    "kxz": ["kappaxz", "kappazx"],
-    "kyz": ["kappayz", "kappazy"],
+    "Kxx": ["kappaxx"],
+    "Kyy": ["kappayy"],
+    "Kzz": ["kappazz"],
+    "Kxy": ["kappaxy", "kappayx"],
+    "Kxz": ["kappaxz", "kappazx"],
+    "Kyz": ["kappayz", "kappazy"],
 }
 
 

@@ -105,7 +105,7 @@ def matching_optuna_configs(result: ConfigPreflight) -> tuple[ConfigPreflight, .
     """Return valid task/model-family wrappers matching one normal experiment."""
     if result.family != EXPERIMENT_FAMILY:
         return ()
-    root = common.paths.get_project_root().expanduser().resolve() / "configs/tasks"
+    root = common.paths.get_project_root().expanduser().resolve() / "configs/learning"
     candidates: list[ConfigPreflight] = []
     for path in sorted(root.glob(f"{result.task}/optuna/**/*.yaml")):
         try:

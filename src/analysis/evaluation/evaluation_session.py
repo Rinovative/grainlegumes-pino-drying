@@ -39,7 +39,7 @@ from itertools import pairwise
 from numbers import Integral
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Self, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -96,16 +96,6 @@ _BOUNDARY_BIN_COUNT = 10
 _BOUNDARY_REGION_EDGES = (0.0, 0.05, 0.10, 0.20, 0.40, 1.0)
 _REFERENCE_ENERGY_FLOOR = 1e-12
 _MIN_SPECTRAL_SIZE = 2
-
-
-class _SessionLimits(TypedDict, total=False):
-    """Type supported keyword-only resource limits for one session."""
-
-    max_case_entries: int
-    max_case_bytes: int
-    max_aggregate_bytes: int
-    max_spill_bytes: int
-    working_bytes: int
 
 
 class EvaluationSessionClosedError(RuntimeError):
@@ -1298,8 +1288,8 @@ class EvaluationSession:
     def from_loaded_runs(
         cls,
         loaded_runs: Iterable[LoadedRunArtifacts],
-        **limits: Unpack[_SessionLimits],
-    ) -> Self:
+        **limits: Any,
+    ) -> EvaluationSession:
         """
         Build one session from strict load-only completed-run results.
 
@@ -1428,7 +1418,7 @@ class EvaluationSession:
         """
         return self
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> EvaluationSession:  # noqa: PYI034 -- Python 3.10 has no typing.Self
         """
         Return this live session for context-managed use.
 

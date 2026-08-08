@@ -31,10 +31,10 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -50,7 +50,6 @@ from . import contracts, generation, timing
 
 if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_artifact_loader import LoadedRunArtifacts
-    from src.datasets.dataset_identity import DatasetIdentity
     from src.datasets.dataset_metadata import DatasetMetadata
     from src.learning.learning_device import DeviceResolution
 
@@ -324,11 +323,6 @@ def _split_metadata(split_contract: Mapping[str, Any], *, run_dir: Path) -> Mapp
     return metadata
 
 
-def _load_split_metadata(run_dir: Path) -> Mapping[str, Any]:
-    """Load split_indices.pt metadata for artifact output naming."""
-    return _split_metadata(_load_split_contract(run_dir), run_dir=run_dir)
-
-
 def _load_run_config(run_dir: Path) -> Mapping[str, Any]:
     """Load and validate the top-level mapping in current config.yaml."""
     config_path = common.paths.resolve_run_config_path(run_dir)
@@ -355,13 +349,19 @@ def _required_config_dataset_name(data_cfg: Mapping[str, Any], key: str) -> str:
     return common.paths.validate_logical_name(value, label=f"config.yaml data.{key}")
 
 
-def _required_config_ood_dataset_name(data_cfg: Mapping[str, Any]) -> str:
-    """Return the sole current-contract OOD dataset name from config data."""
+def _required_config_ood_dataset_names(data_cfg: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the ordered non-empty OOD package selection from config data."""
     value = data_cfg.get("ood_datasets")
-    if not isinstance(value, list) or len(value) != 1:
-        msg = "config.yaml data.ood_datasets must contain exactly one logical dataset id."
+    if not isinstance(value, list) or not value:
+        msg = "config.yaml data.ood_datasets must contain one or more logical dataset ids."
         raise TypeError(msg)
-    return common.paths.validate_logical_name(value[0], label="config.yaml data.ood_datasets[0]")
+    names = tuple(
+        common.paths.validate_logical_name(dataset_id, label=f"config.yaml data.ood_datasets[{index}]") for index, dataset_id in enumerate(value)
+    )
+    if len(names) != len(set(names)):
+        msg = "config.yaml data.ood_datasets must not contain duplicates."
+        raise ValueError(msg)
+    return names
 
 
 def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
@@ -394,13 +394,20 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     run_dir = Path(run_dir).expanduser().resolve()
     admitted = experiments.run.validate_evaluable_run(run_dir)
     data_cfg = _load_data_config(run_dir)
-    split_metadata = _load_split_metadata(run_dir)
+    split_contract = admitted["split_indices"]
+    if not isinstance(split_contract, Mapping):
+        msg = "Evaluable run split_indices must be a mapping."
+        raise TypeError(msg)
+    split_metadata = _split_metadata(split_contract, run_dir=run_dir)
 
     id_dataset_name = _dataset_name_from_identity(split_metadata, identity_key="train")
     ood_dataset_name = _dataset_name_from_identity(split_metadata, identity_key="ood")
 
     configured_id_dataset = _required_config_dataset_name(data_cfg, "train_dataset")
-    configured_ood_dataset = _required_config_ood_dataset_name(data_cfg)
+    configured_ood_datasets = _required_config_ood_dataset_names(data_cfg)
+    from src import datasets  # noqa: PLC0415
+
+    configured_ood_identity = datasets.base.combined_dataset_id(configured_ood_datasets)
 
     if configured_id_dataset != id_dataset_name:
         msg = (
@@ -410,11 +417,11 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
         )
         raise RuntimeError(msg)
 
-    if ood_dataset_name != configured_ood_dataset:
+    if ood_dataset_name != configured_ood_identity:
         msg = (
-            "config.yaml data.ood_datasets[0] does not match split_indices.pt metadata.\n"
-            f"config:   {configured_ood_dataset}\n"
-            f"metadata: {ood_dataset_name}"
+            "config.yaml data.ood_datasets do not match split_indices.pt metadata.\n"
+            f"config identity:   {configured_ood_identity}\n"
+            f"metadata identity: {ood_dataset_name}"
         )
         raise RuntimeError(msg)
 
@@ -500,33 +507,50 @@ def _indices_sha256(indices: Iterable[int]) -> str:
 
 
 def _load_bound_dataset_metadata(
-    source_dataset: Any,
+    source_datasets: Sequence[Any],
     *,
-    dataset_name: str,
-    dataset_identity: DatasetIdentity,
+    dataset_names: Sequence[str],
     metadata_root: Path,
-) -> DatasetMetadata:
-    """Load metadata and bind its exact manifest digest to the final payload."""
+) -> DatasetMetadata | None:
+    """Validate every source package metadata contract and return sole timing metadata."""
     from src import datasets  # noqa: PLC0415
 
-    package = datasets.metadata.load_dataset_metadata(
-        dataset_name,
-        dataset_identity=dataset_identity,
-        metadata_root=metadata_root,
-        dataset_path=source_dataset.path,
-    )
-    source_payload = getattr(source_dataset, "data", None)
-    source_provenance = source_payload.get("source_provenance") if isinstance(source_payload, Mapping) else None
-    if not isinstance(source_provenance, Mapping):
-        msg = "Final dataset must expose source-batch provenance."
-        raise TypeError(msg)
-    if source_provenance.get("batch_manifest_sha256") != package.source_manifest_sha256:
-        msg = "Dataset metadata source manifest does not match the final dataset's operational provenance."
+    if not source_datasets or len(source_datasets) != len(dataset_names):
+        msg = "Artifact source datasets and names must be non-empty and aligned."
         raise ValueError(msg)
-    return package
+    timing_packages: list[DatasetMetadata] = []
+    for source_dataset, dataset_name in zip(source_datasets, dataset_names, strict=True):
+        dataset_identity = getattr(source_dataset, "identity", None)
+        if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
+            msg = f"Dataset package {dataset_name!r} must expose a verified identity."
+            raise TypeError(msg)
+        source_payload = getattr(source_dataset, "data", None)
+        source_provenance = source_payload.get("source_provenance") if isinstance(source_payload, Mapping) else None
+        if not isinstance(source_provenance, Mapping):
+            msg = f"Dataset package {dataset_name!r} must expose source provenance."
+            raise TypeError(msg)
+        if source_provenance.get("schema_kind") == datasets.packages.DATASET_PACKAGE_SCHEMA_KIND:
+            datasets.packages.load_dataset_package_manifest(
+                dataset_name,
+                dataset_identity=dataset_identity,
+                dataset_path=source_dataset.path,
+                metadata_root=metadata_root,
+            )
+            continue
+        package = datasets.metadata.load_dataset_metadata(
+            dataset_name,
+            dataset_identity=dataset_identity,
+            metadata_root=metadata_root,
+            dataset_path=source_dataset.path,
+        )
+        if source_provenance.get("batch_manifest_sha256") != package.source_manifest_sha256:
+            msg = "Dataset metadata source manifest does not match the final dataset's operational provenance."
+            raise ValueError(msg)
+        timing_packages.append(package)
+    return timing_packages[0] if len(source_datasets) == 1 and timing_packages else None
 
 
-def _build_artifact_request(  # noqa: C901, PLR0915
+def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     *,
     run_dir: Path,
     dataset_name: str,
@@ -613,9 +637,25 @@ def _build_artifact_request(  # noqa: C901, PLR0915
     )
     from src import datasets  # noqa: PLC0415
 
-    dataset_path = common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root)
-    source_dataset = datasets.simulation.create_task_dataset(dataset_path, task=task)
-    expected_identity = source_dataset.identity
+    source_dataset_names = (
+        (_required_config_dataset_name(data_cfg, "train_dataset"),) if split == "eval" else _required_config_ood_dataset_names(data_cfg)
+    )
+    expected_dataset_name = datasets.base.combined_dataset_id(source_dataset_names)
+    if expected_dataset_name != dataset_name:
+        msg = f"Requested dataset {dataset_name!r} does not match configured source identity {expected_dataset_name!r}."
+        raise RuntimeError(msg)
+    source_datasets = [
+        datasets.simulation.create_task_dataset(
+            common.paths.resolve_dataset_path(source_name, dataset_root=dataset_root),
+            task=task,
+        )
+        for source_name in source_dataset_names
+    ]
+    source_dataset = datasets.base.combine_identity_datasets(source_datasets)
+    expected_identity = getattr(source_dataset, "identity", None)
+    if not isinstance(expected_identity, datasets.identity.DatasetIdentity):
+        msg = "Combined artifact source must expose a verified DatasetIdentity."
+        raise TypeError(msg)
     validated_indices = datasets.base.validate_split_info(
         split_contract,
         train_identity=expected_identity if split == "eval" else None,
@@ -647,9 +687,8 @@ def _build_artifact_request(  # noqa: C901, PLR0915
     effective_source_indices = full_source_indices
     effective_case_ids = tuple(expected_identity.sample_ids[index] for index in full_source_indices)
     dataset_metadata = _load_bound_dataset_metadata(
-        source_dataset,
-        dataset_name=dataset_name,
-        dataset_identity=expected_identity,
+        source_datasets,
+        dataset_names=source_dataset_names,
         metadata_root=metadata_root,
     )
     membership_digests = metadata.get("membership_digests")
@@ -692,9 +731,9 @@ def _build_artifact_request(  # noqa: C901, PLR0915
                 "permeability_cross_ratio_clip": domain.physics.brinkman.PERMEABILITY_CROSS_RATIO_CLIP,
             },
             "permeability_representation": {
-                "kxx": "10**stored_log10_ratio_to_1_m2",
-                "kxy": "stored_dimensionless_ratio_times_sqrt(kxx*kyy)",
-                "kyy": "10**stored_log10_ratio_to_1_m2",
+                "Kxx": "10**stored_log10_ratio_to_1_m2",
+                "Kxy": "stored_dimensionless_ratio_times_sqrt(Kxx*Kyy)",
+                "Kyy": "10**stored_log10_ratio_to_1_m2",
                 "inverse": "normalized_symmetric_2x2_inverse_with_declared_floors",
             },
             "derivatives": {
@@ -2172,7 +2211,7 @@ def _upload_published_artifacts(
     if settings.get("mode") == "disabled" or not isinstance(upload, Mapping) or not bool(upload.get("evaluation_artifacts")):
         return
 
-    started_at = datetime.now(UTC)
+    started_at = datetime.now(timezone.utc)
     runtime_session_id = uuid4().hex
     experiments.run.append_runtime_session(
         plan.run_dir,

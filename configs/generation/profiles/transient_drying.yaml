@@ -1,0 +1,66 @@
+schema_kind: generation_profile
+schema_version: 1
+simulation_profile: transient_drying
+template_ready: false
+exports:
+- role: steady_flow_fields
+  pattern: null
+  delimiter: ;
+  columns:
+    x: null
+    y: null
+    Kxx: null
+    Kxy: null
+    Kyy: null
+    eps_bed: null
+    p_bc: null
+    X_0_db_field: null
+    u: null
+    v: null
+    p: null
+    rho_bu_dry: null
+  time_column: null
+- role: transient_fields
+  pattern: null
+  delimiter: ;
+  columns:
+    x: null
+    y: null
+    t: null
+    T: null
+    phi: null
+    w_surf: null
+    w_int: null
+  time_column: null
+- role: global_time_series
+  pattern: null
+  delimiter: ;
+  columns:
+    t: null
+    X_wb_bulk: null
+    X_wb_max: null
+    X_wb_q95_mass: null
+    f_wet_dm: null
+    T_out_mean: null
+    phi_out_mean: null
+    m_w_gr: null
+    m_v_gas: null
+    m_dot_evap: null
+    m_dot_v_in: null
+    m_dot_v_out: null
+  time_column: null
+- role: final_status
+  pattern: null
+  delimiter: ;
+  columns:
+    t_final: null
+    f_wet_dm_final: null
+    X_target_wb: null
+    X_wb_bulk: null
+    X_wb_max: null
+    X_wb_q95_mass: null
+    T_min_final: null
+    T_max_final: null
+    phi_min_final: null
+    phi_max_final: null
+  time_column: null

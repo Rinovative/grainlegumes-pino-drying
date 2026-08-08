@@ -40,9 +40,9 @@ import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from src import common
 
@@ -382,28 +382,10 @@ class _WandbArtifact(Protocol):
         """Add one explicit prebuilt table object."""
 
 
-class _WandbInitKwargs(TypedDict):
-    """Type the exact W&B initialization keywords used by this adapter."""
-
-    project: str
-    entity: str | None
-    tags: list[str] | None
-    group: str | None
-    job_type: str
-    mode: str
-    name: str
-    id: str
-    resume: str | None
-    dir: str
-    config: Mapping[str, Any]
-    save_code: bool
-    settings: Mapping[str, Any]
-
-
 class _WandbModule(Protocol):
     """Describe the lazily imported W&B module surface."""
 
-    def init(self, **kwargs: Unpack[_WandbInitKwargs]) -> _WandbRun | None:
+    def init(self, **kwargs: Any) -> _WandbRun | None:
         """Initialize one W&B run."""
 
     def Table(self, *, columns: Sequence[str], data: Sequence[Sequence[object]]) -> Any:  # noqa: N802
@@ -420,7 +402,7 @@ def _require_initialized_run(run: _WandbRun | None) -> _WandbRun:
 
 def _utc_now() -> str:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _safe_error(error: BaseException) -> dict[str, str]:
@@ -537,10 +519,9 @@ def _package_versions() -> dict[str, str | None]:
         ("optuna", "optuna"),
         ("wandb", "wandb"),
     ):
-        try:
+        versions[label] = None
+        with suppress(importlib.metadata.PackageNotFoundError):
             versions[label] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            versions[label] = None
     return versions
 
 

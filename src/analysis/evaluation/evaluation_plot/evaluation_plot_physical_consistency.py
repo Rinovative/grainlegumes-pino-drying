@@ -67,7 +67,7 @@ def _physics_provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
 
 def _values(frame: pd.DataFrame, column: str, max_cases: int) -> np.ndarray:
     """Return finite non-negative scalar evidence from one saved prefix."""
-    values = pd.to_numeric(frame.iloc[:max_cases][column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame.iloc[:max_cases][column], errors="raise"), dtype=float)
     if values.size == 0 or not np.isfinite(values).all() or np.any(values < 0.0):
         msg = f"Physical metric {column!r} must be finite and non-negative."
         raise ValueError(msg)
@@ -136,7 +136,7 @@ def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     cmap = plt.get_cmap("Blues")
     for column in table.columns:
-        values = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
+        values = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             continue
@@ -162,7 +162,9 @@ def plot_physical_consistency_summary_table(*, datasets: Mapping[str, pd.DataFra
     )
     if any(count_headings.values()):
         summary = summary.rename(index={label: count_headings[label] for label in datasets})
-    styler = summary.style.format("{:.4g}").apply(lambda _table: _blue_style(summary), axis=None)
+    styler = summary.style
+    styler.format("{:.4g}")
+    styler.apply(lambda _table: _blue_style(summary), axis=None)
     return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HTML(styler.to_html())))
 
 

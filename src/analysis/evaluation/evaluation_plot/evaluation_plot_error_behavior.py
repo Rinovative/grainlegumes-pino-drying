@@ -54,7 +54,7 @@ _BAND_LABELS = ("0-5 %", "5-10 %", "10-20 %", "20-40 %", ">40 %")
 def _finite(frame: pd.DataFrame, column: str, *, limit: int | None = None) -> np.ndarray:
     """Return finite non-negative current metric values in saved order."""
     selected = frame if limit is None else frame.iloc[:limit]
-    values = pd.to_numeric(selected[column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(selected[column], errors="raise"), dtype=float)
     if values.size == 0 or not np.isfinite(values).all() or np.any(values < 0.0):
         msg = f"{column} must contain finite non-negative values."
         raise ValueError(msg)

@@ -27,7 +27,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 from src import common
 
@@ -36,7 +37,8 @@ from . import generation_runtime as runtime_service
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
-    from pathlib import Path
+
+_MAX_SCHEDULER_JOB_NAME_LENGTH: Final = 48
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,37 +171,35 @@ def _attempt_case(
     storage_root: Path | str | None,
     work_root: Path | str | None,
 ) -> runtime_service.CaseRunOutcome | None:
-    """Claim and run one case once, returning none when another worker owns it."""
-    lock_path = runtime_service.case_lock_path(config, case_index, storage_root=storage_root)
+    """Run or claim one case while the authoritative runtime owns its lock."""
+    if runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root):
+        try:
+            return runtime_service.run_case(
+                config,
+                case_index,
+                cores_per_case=plan.cores_per_case,
+                worker_slot=worker_slot,
+                scheduler_kind=scheduler_kind,
+                allocated_node=hostname,
+                storage_root=storage_root,
+                work_root=work_root,
+                blocking_lock=False,
+            )
+        except common.locking.FileLockUnavailableError:
+            return None
     try:
-        with common.locking.exclusive_file_lock(lock_path, blocking=False):
-            if runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root):
-                return runtime_service.run_case(
-                    config,
-                    case_index,
-                    cores_per_case=plan.cores_per_case,
-                    worker_slot=worker_slot,
-                    scheduler_kind=scheduler_kind,
-                    allocated_node=hostname,
-                    storage_root=storage_root,
-                    work_root=work_root,
-                    blocking_lock=False,
-                )
-            try:
-                with _global_case_slot(config, plan, storage_root=storage_root) as global_slot:
-                    return runtime_service.run_case(
-                        config,
-                        case_index,
-                        cores_per_case=plan.cores_per_case,
-                        worker_slot=global_slot,
-                        scheduler_kind=scheduler_kind,
-                        allocated_node=hostname,
-                        storage_root=storage_root,
-                        work_root=work_root,
-                        blocking_lock=False,
-                    )
-            except common.locking.FileLockUnavailableError:
-                return None
+        with _global_case_slot(config, plan, storage_root=storage_root) as global_slot:
+            return runtime_service.run_case(
+                config,
+                case_index,
+                cores_per_case=plan.cores_per_case,
+                worker_slot=global_slot,
+                scheduler_kind=scheduler_kind,
+                allocated_node=hostname,
+                storage_root=storage_root,
+                work_root=work_root,
+                blocking_lock=False,
+            )
     except common.locking.FileLockUnavailableError:
         return None
 
@@ -274,9 +274,10 @@ def run_node_worker(
                 claimed.append(config.case_id(case_index))
             else:
                 outcomes_by_index[case_index] = outcome
-    if failures:
+    failure_limit = int(config.execution_values["runtime"]["maximum_failures"])
+    if len(failures) >= failure_limit:
         details = "; ".join(f"{config.case_id(index)}: {error}" for index, error in sorted(failures))
-        message = f"Node worker {worker_index} failed {len(failures)} case(s): {details}"
+        message = f"Node worker {worker_index} reached its failure limit after {len(failures)} case(s): {details}"
         raise RuntimeError(message) from failures[0][1]
     if selected == config.case_indices and all(
         runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root) for case_index in config.case_indices
@@ -342,7 +343,7 @@ def build_slurm_submission_command(
     plan: ResourcePlan,
 ) -> list[str]:
     """Build one dry-run Slurm submission argument vector for node-owned workers."""
-    if config.values["cluster"]["scheduler_kind"] != "slurm":
+    if config.execution_values["cluster"]["scheduler_kind"] != "slurm":
         message = "Slurm command generation requires cluster.scheduler_kind='slurm'."
         raise ValueError(message)
     if plan.effective_nodes < 1:
@@ -381,6 +382,266 @@ def build_slurm_submission_command(
         f"--array=0-{plan.effective_nodes - 1}%{plan.effective_nodes}",
         f"--chdir={repository}",
         f"--job-name={config.batch_id[:48]}",
-        *config.values["cluster"]["scheduler_options"],
+        *config.execution_values["cluster"]["scheduler_options"],
         f"--wrap={wrapped}",
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignTask:
+    """One case task identified inside a predeclared campaign batch."""
+
+    batch_name: str
+    case_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignWorkerResult:
+    """One campaign worker's outcomes across material/regime batches."""
+
+    worker_index: int
+    hostname: str
+    completed_tasks: tuple[CampaignTask, ...]
+    claimed_elsewhere: tuple[CampaignTask, ...]
+
+
+def campaign_tasks(campaign: config_contract.CampaignConfig) -> tuple[CampaignTask, ...]:
+    """Return all campaign cases in declarative batch and case order."""
+    return tuple(CampaignTask(batch_name=batch.batch_name, case_index=case_index) for batch in campaign.batches for case_index in batch.case_indices)
+
+
+def _campaign_state_root(
+    campaign: config_contract.CampaignConfig,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return one persistent state root shared by every campaign subbatch."""
+    return common.paths.get_generation_state_root(storage_root=storage_root) / "campaigns" / campaign.campaign_id
+
+
+@contextmanager
+def _campaign_global_case_slot(
+    campaign: config_contract.CampaignConfig,
+    plan: ResourcePlan,
+    *,
+    storage_root: Path | str | None,
+) -> Iterator[int]:
+    """Hold one campaign-wide concurrent-case slot across all subbatches."""
+    slots_root = _campaign_state_root(campaign, storage_root=storage_root) / "slots"
+    slots_root.mkdir(parents=True, exist_ok=True)
+    while True:
+        for slot in range(plan.max_parallel_cases):
+            manager = common.locking.exclusive_file_lock(
+                slots_root / f"slot_{slot:04d}.lock",
+                blocking=False,
+            )
+            try:
+                manager.__enter__()
+            except common.locking.FileLockUnavailableError:
+                continue
+            try:
+                yield slot
+            finally:
+                manager.__exit__(None, None, None)
+            return
+        time.sleep(0.05)
+
+
+def _attempt_campaign_task(
+    campaign: config_contract.CampaignConfig,
+    task: CampaignTask,
+    *,
+    plan: ResourcePlan,
+    scheduler_kind: str,
+    hostname: str,
+    storage_root: Path | str | None,
+    work_root: Path | str | None,
+) -> runtime_service.CaseRunOutcome | None:
+    """Run one campaign task while the runtime owns its authoritative lock."""
+    config = campaign.batch(task.batch_name)
+    if runtime_service.completed_case_is_valid(
+        config,
+        task.case_index,
+        storage_root=storage_root,
+    ):
+        try:
+            return runtime_service.run_case(
+                config,
+                task.case_index,
+                cores_per_case=plan.cores_per_case,
+                scheduler_kind=scheduler_kind,
+                allocated_node=hostname,
+                storage_root=storage_root,
+                work_root=work_root,
+                blocking_lock=False,
+            )
+        except common.locking.FileLockUnavailableError:
+            return None
+    try:
+        with _campaign_global_case_slot(
+            campaign,
+            plan,
+            storage_root=storage_root,
+        ) as campaign_slot:
+            return runtime_service.run_case(
+                config,
+                task.case_index,
+                cores_per_case=plan.cores_per_case,
+                worker_slot=campaign_slot,
+                scheduler_kind=scheduler_kind,
+                allocated_node=hostname,
+                storage_root=storage_root,
+                work_root=work_root,
+                blocking_lock=False,
+            )
+    except common.locking.FileLockUnavailableError:
+        return None
+
+
+def run_campaign_worker(
+    campaign: config_contract.CampaignConfig,
+    *,
+    plan: ResourcePlan,
+    worker_index: int,
+    worker_count: int,
+    scheduler_kind: str = "slurm",
+    storage_root: Path | str | None = None,
+    work_root: Path | str | None = None,
+) -> CampaignWorkerResult:
+    """Run one node-confined worker from the shared campaign case pool."""
+    if worker_count != plan.effective_nodes or not 0 <= worker_index < worker_count:
+        message = "Campaign worker index/count must match the effective campaign node plan."
+        raise ValueError(message)
+    if worker_count > plan.max_nodes:
+        message = "Campaign worker count exceeds the campaign-wide max_nodes cap."
+        raise ValueError(message)
+    tasks = campaign_tasks(campaign)
+    hostname = socket.gethostname()
+    node_lock = _campaign_state_root(campaign, storage_root=storage_root) / "nodes" / f"worker_{worker_index:04d}.lock"
+    completed: list[CampaignTask] = []
+    claimed: list[CampaignTask] = []
+    failures: list[tuple[CampaignTask, BaseException]] = []
+    with (
+        common.locking.exclusive_file_lock(node_lock, blocking=False),
+        ThreadPoolExecutor(
+            max_workers=plan.cases_per_node,
+            thread_name_prefix=f"campaign-node-{worker_index}",
+        ) as executor,
+    ):
+        futures = {
+            executor.submit(
+                _attempt_campaign_task,
+                campaign,
+                task,
+                plan=plan,
+                scheduler_kind=scheduler_kind,
+                hostname=hostname,
+                storage_root=storage_root,
+                work_root=work_root,
+            ): task
+            for task in tasks
+        }
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                outcome = future.result()
+            except Exception as error:  # noqa: BLE001 -- aggregate independent task failures
+                failures.append((task, error))
+                continue
+            if outcome is None:
+                claimed.append(task)
+            else:
+                completed.append(task)
+    failure_limit = int(campaign.execution_values["runtime"]["maximum_failures"])
+    if len(failures) >= failure_limit:
+        details = "; ".join(f"{task.batch_name}/{task.case_index}: {error}" for task, error in failures)
+        message = f"Campaign worker {worker_index} reached its failure limit after {len(failures)} task(s): {details}"
+        raise RuntimeError(message) from failures[0][1]
+    for config in campaign.batches:
+        if config.case_indices and all(
+            runtime_service.completed_case_is_valid(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            for case_index in config.case_indices
+        ):
+            runtime_service.finalize_batch(config, storage_root=storage_root)
+    return CampaignWorkerResult(
+        worker_index=worker_index,
+        hostname=hostname,
+        completed_tasks=tuple(completed),
+        claimed_elsewhere=tuple(claimed),
+    )
+
+
+def build_campaign_slurm_submission_command(
+    campaign: config_contract.CampaignConfig,
+    *,
+    plan: ResourcePlan,
+    scheduler_log_directory: Path | None = None,
+    scheduler_job_name: str | None = None,
+) -> list[str]:
+    """Build the one shared Slurm worker-pool submission for a campaign."""
+    if campaign.execution_values["cluster"]["scheduler_kind"] != "slurm":
+        message = "Campaign Slurm submission requires scheduler_kind='slurm'."
+        raise ValueError(message)
+    if plan.effective_nodes < 1:
+        message = "No Slurm nodes are required for an empty or completed campaign."
+        raise ValueError(message)
+    repository = common.paths.get_project_root().resolve()
+    launcher = repository / "scripts" / "generation_campaign_node.sh"
+    worker_command = [
+        str(launcher),
+        str(campaign.source_path),
+        "--max-nodes",
+        str(plan.max_nodes),
+        "--cases-per-node",
+        str(plan.cases_per_node),
+        "--cores-per-case",
+        str(plan.cores_per_case),
+        "--max-parallel-cases",
+        str(plan.max_parallel_cases),
+        "--cores-per-node",
+        str(plan.cores_per_node),
+        "--remaining-cases",
+        str(plan.remaining_cases),
+    ]
+    if len(campaign.batches) == 1:
+        worker_command.extend(["--only-batch", campaign.batches[0].batch_name])
+    wrapped = f"CAMPAIGN_WORKER_COUNT={plan.effective_nodes} {shlex.join(worker_command)}"
+    cluster = campaign.execution_values["cluster"]
+    job_name = campaign.campaign_name[:_MAX_SCHEDULER_JOB_NAME_LENGTH] if scheduler_job_name is None else scheduler_job_name
+    common.paths.validate_logical_name(job_name, label="scheduler_job_name")
+    if len(job_name) > _MAX_SCHEDULER_JOB_NAME_LENGTH:
+        message = "scheduler_job_name must contain at most 48 characters."
+        raise ValueError(message)
+    command = [
+        "sbatch",
+        "--parsable",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--cpus-per-task={plan.cases_per_node * plan.cores_per_case}",
+        f"--array=0-{plan.effective_nodes - 1}%{plan.effective_nodes}",
+        f"--chdir={repository}",
+        f"--job-name={job_name}",
+        "--export=ALL",
+    ]
+    if scheduler_log_directory is not None:
+        log_directory = Path(scheduler_log_directory)
+        if not log_directory.is_absolute() or not log_directory.is_dir() or log_directory.is_symlink():
+            message = f"Scheduler log directory must be one existing safe absolute directory: {log_directory}."
+            raise ValueError(message)
+        command.extend(
+            [
+                f"--output={log_directory}/slurm-%A_%a.out",
+                f"--error={log_directory}/slurm-%A_%a.err",
+            ]
+        )
+    if cluster["partition"] is not None:
+        command.append(f"--partition={cluster['partition']}")
+    if cluster["wall_time"] is not None:
+        command.append(f"--time={cluster['wall_time']}")
+    command.extend(cluster["scheduler_options"])
+    command.append(f"--wrap={wrapped}")
+    return command

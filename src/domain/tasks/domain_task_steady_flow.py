@@ -44,24 +44,24 @@ STEADY_FLOW = TaskSpec(
         FieldSpec("x", "coordinate", "m", "identity"),
         FieldSpec("y", "coordinate", "m", "identity"),
         FieldSpec(
-            "kxx",
+            "Kxx",
             "permeability",
             "m^2",
             "dimensionless_log10_ratio_to_1_m2",
         ),
         FieldSpec(
-            "kxy",
+            "Kxy",
             "permeability",
             "m^2",
             "dimensionless_cross_component_ratio_to_geometric_mean",
         ),
         FieldSpec(
-            "kyy",
+            "Kyy",
             "permeability",
             "m^2",
             "dimensionless_log10_ratio_to_1_m2",
         ),
-        FieldSpec("eps", "porosity", "1", "identity", source_name="int4(x,y)"),
+        FieldSpec("eps_bed", "porosity", "1", "identity", source_name="int4(x,y)"),
         FieldSpec("p_bc", "boundary", "Pa", "identity", source_name="int5(x,y)"),
     ),
     outputs=(

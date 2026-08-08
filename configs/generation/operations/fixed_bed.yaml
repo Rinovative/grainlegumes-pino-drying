@@ -1,0 +1,120 @@
+schema_kind: generation_operations
+schema_version: 1
+operation_id: fixed_bed
+executable: false
+parameter_values:
+  pressure_bc.mean:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.sin_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.sin_freq:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.sin_phase:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.gauss_count:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.gauss_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.gauss_width:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.gauss_jitter:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  pressure_bc.linear_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  T_in_base:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  T_in_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  omega_in_base:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  omega_in_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  schedule.corr:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  schedule.timescale_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  schedule.component_weights: {}
+  schedule.event_count:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  schedule.event_duration_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  schedule.event_width_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  T_amb:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null

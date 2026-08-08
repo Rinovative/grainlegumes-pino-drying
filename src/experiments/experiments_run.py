@@ -34,7 +34,7 @@ import random
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -172,7 +172,7 @@ def run_writer_lease(
 
 def _utc_now() -> str:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def derive_subseed(seed: int, label: str) -> int:
@@ -1108,7 +1108,7 @@ def _execute_prepared_run_locked(
     digests, observer finalization, and best-effort failure publication while its
     caller retains the exclusive writer lease.
     """
-    start_time = datetime.now(UTC)
+    start_time = datetime.now(timezone.utc)
     runtime_session_id = uuid.uuid4().hex
     tracker: tracking.WandbSession | None = None
     tracking_status = "failed"
@@ -1281,7 +1281,7 @@ def _execute_prepared_run_locked(
             max_physics_cases=int(config["tracking"]["wandb"]["monitor"]["max_cases"]),
         )
         result.update(selected)
-        end_time = datetime.now(UTC)
+        end_time = datetime.now(timezone.utc)
         console_reporter.final(result, total_wall_seconds=(end_time - start_time).total_seconds())
         completed_updates = {
             "task": config["task"],

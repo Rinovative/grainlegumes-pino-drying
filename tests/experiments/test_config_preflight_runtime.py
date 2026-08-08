@@ -53,7 +53,7 @@ def test_supported_project_runtime_delegates_to_authoritative_module(monkeypatch
     def capture_import(module: str, *, run_name: str) -> None:
         calls.append((module, run_name))
 
-    monkeypatch.setattr(runtime.sys, "version_info", (3, 11, 0))
+    monkeypatch.setattr(runtime.sys, "version_info", (3, 10, 0))
     monkeypatch.setattr(runtime.runpy, "run_module", capture_import)
 
     assert runtime.main() == 0

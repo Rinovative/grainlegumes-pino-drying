@@ -664,7 +664,14 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
 
     # infer fields dynamically from first dataset
     sample_df = next(iter(datasets.values()))
-    field_names = [c for c in sample_df.columns if c not in {"meta", "x", "y"}]
+    field_names: list[str] = []
+    for column in sample_df.columns:
+        if column in {"meta", "x", "y"}:
+            continue
+        if not isinstance(column, str):
+            msg = "Field-distribution columns must use string names."
+            raise TypeError(msg)
+        field_names.append(column)
     cache: dict[str, _FieldCache] = {
         n: {
             "loaded": 0,
@@ -770,10 +777,10 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
                             except LinAlgError:
                                 pass
                 FIELD_LABELS: dict[str, str] = {
-                    "kxx": r"log10($k_{xx}$)",
-                    "kyy": r"log10($k_{yy}$)",
-                    "kxy": r"$\hat{k}_{xy}$ [-]",
-                    "eps": r"$\varepsilon$ [-]",
+                    "Kxx": r"log10($k_{xx}$)",
+                    "Kyy": r"log10($k_{yy}$)",
+                    "Kxy": r"$\hat{k}_{xy}$ [-]",
+                    "eps_bed": r"$\varepsilon$ [-]",
                     "p_bc": r"$p_{\mathrm{bc}}$ [Pa]",
                     "p": r"$p$ [Pa]",
                     "u": r"$u$ [m/s]",

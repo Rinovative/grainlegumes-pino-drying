@@ -1035,7 +1035,14 @@ def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:
     for column in frame.columns:
         if column in reserved:
             continue
-        values = pd.to_numeric(frame[column], errors="coerce")
+        source = frame[column]
+        if not isinstance(source, pd.Series):
+            msg = "Numeric metadata discovery requires unique scalar-valued columns."
+            raise TypeError(msg)
+        values = pd.to_numeric(source, errors="coerce")
+        if not isinstance(values, pd.Series):
+            msg = "Numeric metadata discovery requires a pandas Series."
+            raise TypeError(msg)
         if values.notna().any():
             columns.append(str(column))
     return tuple(columns)

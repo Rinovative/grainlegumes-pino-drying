@@ -154,7 +154,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     }
     selection = context.SplitSelection(
         role="eval",
-        dataset_path=tmp_path / "unused.pt",
+        dataset_paths=(tmp_path / "unused.pt",),
         indices=torch.tensor([0]),
     )
     dataset = _SyntheticDataset()
@@ -184,6 +184,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     monkeypatch.setattr(context, "_build_model_from_config", build_model)
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
     monkeypatch.setattr(context.datasets.simulation, "create_task_dataset", create_dataset)
+    monkeypatch.setattr(context.datasets.base, "combine_identity_datasets", lambda _sources: dataset)
     monkeypatch.setattr(context, "_validate_split_indices_for_dataset", lambda **_kwargs: None)
 
     def unexpected_torch_load(*_args: Any, **_kwargs: Any) -> Any:

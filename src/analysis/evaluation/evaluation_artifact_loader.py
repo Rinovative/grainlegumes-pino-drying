@@ -34,7 +34,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from src import common, domain, experiments
+from src import common, datasets, domain, experiments
 from src.analysis.artifacts import contracts
 
 from . import evaluation_dataframe as dataframe
@@ -488,7 +488,7 @@ def _saved_roles(
     Returns
     -------
     tuple[_SavedRole, _SavedRole]
-        ID evaluation role followed by the sole named OOD role.
+        ID evaluation role followed by the configured OOD package combination.
 
     Raises
     ------
@@ -520,9 +520,16 @@ def _saved_roles(
     if data_config.get("train_dataset") != id_name:
         msg = "config.yaml data.train_dataset contradicts saved ID dataset identity."
         raise ValueError(msg)
-    configured_ood = data_config.get("ood_datasets")
-    if not isinstance(configured_ood, list) or configured_ood != [ood_name]:
-        msg = "config.yaml data.ood_datasets must exactly match the sole saved OOD dataset identity."
+    raw_configured_ood = data_config.get("ood_datasets")
+    if not isinstance(raw_configured_ood, list) or not raw_configured_ood:
+        msg = "config.yaml data.ood_datasets must contain one or more logical dataset ids."
+        raise ValueError(msg)
+    configured_ood = tuple(
+        common.paths.validate_logical_name(dataset_id, label=f"config.yaml data.ood_datasets[{index}]")
+        for index, dataset_id in enumerate(raw_configured_ood)
+    )
+    if len(configured_ood) != len(set(configured_ood)) or datasets.base.combined_dataset_id(configured_ood) != ood_name:
+        msg = "config.yaml data.ood_datasets do not match the saved OOD package-combination identity."
         raise ValueError(msg)
 
     role_specs: tuple[tuple[ArtifactRole, str, Mapping[str, Any], str, str, str, str, Path], ...] = (
@@ -799,9 +806,9 @@ def _expected_physics_provenance(
             "permeability_cross_ratio_clip": domain.physics.brinkman.PERMEABILITY_CROSS_RATIO_CLIP,
         },
         "permeability_representation": {
-            "kxx": "10**stored_log10_ratio_to_1_m2",
-            "kxy": "stored_dimensionless_ratio_times_sqrt(kxx*kyy)",
-            "kyy": "10**stored_log10_ratio_to_1_m2",
+            "Kxx": "10**stored_log10_ratio_to_1_m2",
+            "Kxy": "stored_dimensionless_ratio_times_sqrt(Kxx*Kyy)",
+            "Kyy": "10**stored_log10_ratio_to_1_m2",
             "inverse": "normalized_symmetric_2x2_inverse_with_declared_floors",
         },
         "derivatives": {

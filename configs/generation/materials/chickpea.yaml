@@ -1,0 +1,560 @@
+schema_kind: generation_material
+schema_version: 1
+material_family: chickpea
+executable: false
+taxonomy:
+  common_name: Chickpea
+  species: null
+  market_class: Kabuli
+  cultivar: null
+  specificity_status: unresolved
+product_form:
+  whole_or_split: whole
+  shell_state: null
+  skin_or_seed_coat_state: null
+  description: Whole chickpea of the intended Kabuli market class; cultivar and seed-coat
+    condition unresolved.
+  specificity_status: unresolved
+parameter_values:
+  initial_moisture_bounds:
+    lower: null
+    upper: null
+  kappa_mean:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  kappa_cv:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.coarse_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.fine_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.coarse_weight:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.fine_ani_x:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.fine_ani_y:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.structure.cross_scale_corr:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.perturbations.amplitude:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.perturbations.granularity:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  bed.perturbations.sign_bias:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  permeability.anisotropy.max_ratio:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  permeability.anisotropy.exponent:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  permeability.anisotropy.strength:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  permeability.orientation.jitter:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  permeability.orientation.smooth_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  porosity.anchor_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  porosity.smooth_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  porosity.texture_amp:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.mean_db:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.amplitude_db:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.coarse_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.fine_len_rel:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.coarse_weight:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.fine_ani_x:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.fine_ani_y:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  initial_moisture.structure.cross_scale_corr:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  rho_bu_dry_ref:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  k_gr:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  cp_gr_dry:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  r_surf_0:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  r_int_surf:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  f_surf:
+    lower: null
+    upper: null
+    ood:
+      lower: null
+      upper: null
+  eps_bed_cal_ref:
+    value: null
+  X_target_wb:
+    value: null
+  oswin:
+    sets: null
+    ood_sets: null
+evidence:
+  kappa_mean:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  kappa_cv:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.coarse_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.fine_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.coarse_weight:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.fine_ani_x:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.fine_ani_y:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.structure.cross_scale_corr:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.perturbations.amplitude:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.perturbations.granularity:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  bed.perturbations.sign_bias:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  permeability.anisotropy.max_ratio:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  permeability.anisotropy.exponent:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  permeability.anisotropy.strength:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  permeability.orientation.jitter:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  permeability.orientation.smooth_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  porosity.anchor_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  porosity.smooth_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  porosity.texture_amp:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.mean_db:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.amplitude_db:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.coarse_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.fine_len_rel:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.coarse_weight:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.fine_ani_x:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.fine_ani_y:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture.structure.cross_scale_corr:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  rho_bu_dry_ref:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  k_gr:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  cp_gr_dry:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  r_surf_0:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  r_int_surf:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  f_surf:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  eps_bed_cal_ref:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  X_target_wb:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  oswin:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved
+  initial_moisture_bounds:
+    source: null
+    evidence_type: unresolved
+    confidence: unresolved
+    temperature_range: null
+    humidity_range: null
+    cultivar_or_market_class: null
+    product_form: null
+    status: unresolved

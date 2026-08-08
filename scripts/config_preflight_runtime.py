@@ -5,7 +5,7 @@ import runpy
 import sys
 from typing import Any
 
-MINIMUM_PYTHON = (3, 11)
+MINIMUM_PYTHON = (3, 10)
 PREFLIGHT_MODULE = "src.experiments.cli.cli_config_preflight"
 
 
@@ -22,7 +22,7 @@ def main() -> int:
             f"Project runtime Python: {_version_text(sys.version_info)} ({sys.executable})",
             file=sys.stderr,
         )
-        print("Required Python: >=3.11", file=sys.stderr)
+        print("Required Python: >=3.10", file=sys.stderr)
         print(
             "The maintained project image must be rebuilt with the declared project runtime.",
             file=sys.stderr,

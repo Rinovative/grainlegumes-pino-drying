@@ -7,7 +7,7 @@ mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 IMAGE_NAME="grainlegumes-pino-drying"
 PREFLIGHT_RUNTIME="/workspace/repo/scripts/config_preflight_runtime.py"
-PROJECT_PYTHON_MINIMUM="3.11"
+PROJECT_PYTHON_MINIMUM="3.10"
 DETECTED_HOST_PYTHON_EXECUTABLE="not found"
 DETECTED_HOST_PYTHON_VERSION="unavailable"
 
@@ -17,6 +17,7 @@ Usage:
   $0 train <experiment_config> [training options...] [--queue-gpu auto|INDEX] [--follow]
   $0 optuna <optuna_config> [Optuna options...] [--queue-gpu auto|INDEX] [--follow]
   $0 artifacts (--task TASK | --runs-root PATH) [artifact options...] [--queue-gpu auto|INDEX]
+  $0 build-datasets <generation_campaign_config>
 
 Workflows:
   train <experiment_config>
@@ -27,6 +28,9 @@ Workflows:
       Submit one Optuna study and return immediately. Persistent continuation uses study storage.
   artifacts (--task TASK | --runs-root PATH)
       Generate or validate analysis artifacts for completed runs and return immediately.
+  build-datasets <generation_campaign_config>
+      Build or exactly reuse every declared dataset package in the maintained container.
+      This synchronous CPU-only path does not use a GPU or the GPU task queue.
 
 GPU selection:
   omit --queue-gpu  in an interactive TTY, show usage, and prompt for one host GPU.
@@ -66,7 +70,7 @@ host_python_is_below_project_minimum() {
   if [[ ! "${DETECTED_HOST_PYTHON_VERSION}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
     return 1
   fi
-  (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 11) ))
+  (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 10) ))
 }
 
 preflight_runtime_failure() {
@@ -463,7 +467,7 @@ while (( $# > 0 )); do
       --queue-gpu=*)
         fail 2 "Use the documented form: --queue-gpu auto|INDEX."
         ;;
-      train|optuna|artifacts)
+      train|optuna|artifacts|build-datasets)
         JOB_TYPE="${argument}"
         shift
         ;;
@@ -552,7 +556,43 @@ case "${JOB_TYPE}" in
     fi
     resolve_artifact_selection "${SEMANTIC_ARGS[@]}"
     ;;
+  build-datasets)
+    if [[ "${FOLLOW_LOG}" == true || "${QUEUE_GPU_SEEN}" == true ]]; then
+      fail 2 "build-datasets is synchronous and does not accept --follow or --queue-gpu."
+    fi
+    if (( ${#SEMANTIC_ARGS[@]} != 1 )); then
+      fail 2 "build-datasets requires exactly one generation campaign config path."
+    fi
+    HOST_CONFIG_PATH="$(resolve_host_config_argument "${SEMANTIC_ARGS[0]}")"
+    SEMANTIC_ARGS[0]="$(translate_config_argument "${HOST_CONFIG_PATH}")"
+    CANONICAL_CONFIG_PATH="${SEMANTIC_ARGS[0]}"
+    ;;
 esac
+
+if [[ "${JOB_TYPE}" == build-datasets ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    fail 1 "Dataset construction requires Docker on the GPU host."
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    fail 1 "Dataset construction requires the Docker daemon."
+  fi
+  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+    fail 1 "Dataset construction requires image '${IMAGE_NAME}'. Build it with ./scripts/docker_build.sh."
+  fi
+  exec docker run --rm \
+    --network none \
+    --user "$(id -u):$(id -g)" \
+    --workdir /workspace/repo \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -e HOME=/tmp \
+    -e PROJECT_ROOT=/workspace/repo \
+    -e STORAGE_ROOT=/workspace/storage \
+    -v "${PROJECT_DIR}:/workspace/repo:ro" \
+    -v "${STORAGE_DIR}:/workspace/storage:rw" \
+    "${IMAGE_NAME}" \
+    python -m src.datasets.dataset_packages \
+    "${SEMANTIC_ARGS[0]}" --storage-root /workspace/storage
+fi
 
 if [[ "${FOLLOW_LOG}" == true ]] && ! command -v tail >/dev/null 2>&1; then
   fail 1 "tail is required for --follow but was not found on PATH."

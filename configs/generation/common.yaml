@@ -1,0 +1,82 @@
+schema_kind: generation_common
+schema_version: 1
+generator_version: python_multiscale_v2
+executable: false
+scientific_fixed_values:
+  p_ref: null
+  T_in_max: 308.15
+  omega_min: null
+  omega_max: null
+  phi_clip_min: null
+  phi_clip_max: null
+  f_wet_dm_max: 0.05
+  schedule_interpolation: linear
+grid:
+  nx: 401
+  ny: 251
+  Lx: 1.2
+  Ly: 0.75
+  dx: 0.003
+  dy: 0.003
+  boundaries_included: true
+time:
+  start: 0.0
+  stop: 168.0
+  interval: 1.0
+  internal_steps: adaptive
+  irregular_stop_state: diagnostic_only
+input_contract:
+  spatial:
+    filename: fields.csv
+    delimiter: ;
+    columns:
+    - x
+    - y
+    - Kxx
+    - Kxy
+    - Kyy
+    - eps_bed
+    - p_bc
+    - X_0_db_field
+  scalar:
+    filename: scalars.csv
+    delimiter: ;
+    columns:
+    - name
+    - value
+    - unit
+  schedule:
+    filename: schedule.csv
+    delimiter: ;
+    columns:
+    - t
+    - T_in
+    - omega_in
+    - phi_in
+storage:
+  schema_version: 2
+  converter_version: vp2_hdf5_v2
+  compression: gzip
+  compression_level: 4
+  shuffle: true
+  float32_rtol: 1.0e-06
+  float32_atol: 1.0e-12
+  chunk_time: 1
+  chunk_y: 64
+  chunk_x: 64
+parameter_values:
+  eps_min_global:
+    value: null
+  eps_max_global:
+    value: null
+physical_formulas:
+  w_gr: w_surf + w_int
+  X_db: w_gr / rho_bu_dry
+  X_wb: w_gr / (rho_bu_dry + w_gr)
+  X_wb_from_X_db: X_db / (1 + X_db)
+  X_db_from_X_wb: X_wb / (1 - X_wb)
+  X_wb_bulk: integral(w_gr) / (integral(rho_bu_dry) + integral(w_gr))
+  rho_bu_dry: rho_bu_dry_ref * (1 - eps_bed) / (1 - eps_bed_cal_ref)
+  w_gr_0: rho_bu_dry * X_0_db_field
+  cp_gr_eff: cp_gr_dry plus the manually confirmed COMSOL moisture contribution
+  f_wet_dm: integral(rho_bu_dry * indicator(X_wb > X_target_wb)) / integral(rho_bu_dry)

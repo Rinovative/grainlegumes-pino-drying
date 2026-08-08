@@ -101,7 +101,7 @@ def build_outlier_table(
     rows: list[dict[str, Any]] = []
     for label, frame in datasets.items():
         for metric in _metric_columns(frame):
-            values = pd.to_numeric(frame[metric], errors="raise").to_numpy(dtype=float)
+            values = np.asarray(pd.to_numeric(frame[metric], errors="raise"), dtype=float)
             for rank, position in enumerate(_rank_positions(frame, values, descending=True)[:top_k], start=1):
                 source = frame.iloc[int(position)]
                 rows.append(
@@ -132,7 +132,7 @@ def build_input_extremes_table(
     rows: list[dict[str, Any]] = []
     for label, frame in datasets.items():
         for parameter in parameters:
-            values = pd.to_numeric(frame[parameter], errors="raise").to_numpy(dtype=float)
+            values = np.asarray(pd.to_numeric(frame[parameter], errors="raise"), dtype=float)
             for extreme, order in (
                 ("low", _rank_positions(frame, values, descending=False)),
                 ("high", _rank_positions(frame, values, descending=True)),
@@ -175,7 +175,14 @@ def _rank_style(table: pd.DataFrame, *, reference_row: int) -> pd.DataFrame:
     blue = colormaps["Blues"]
     purple = colormaps["Purples"]
     for column in table.columns:
-        numeric = pd.to_numeric(table[column], errors="coerce")
+        source = table[column]
+        if not isinstance(source, pd.Series):
+            msg = "Rank styling requires unique scalar-valued table columns."
+            raise TypeError(msg)
+        numeric = pd.to_numeric(source, errors="coerce")
+        if not isinstance(numeric, pd.Series):
+            msg = "Rank styling requires a numeric pandas Series."
+            raise TypeError(msg)
         if numeric.notna().sum() < _MINIMUM_TABLE_NUMERIC_ROWS or pd.isna(numeric.iloc[reference_row]):
             continue
         reference = float(numeric.iloc[reference_row])
@@ -183,6 +190,9 @@ def _rank_style(table: pd.DataFrame, *, reference_row: int) -> pd.DataFrame:
         higher = numeric > reference
         for mask, cmap in ((lower, blue), (higher, purple)):
             selected = numeric[mask]
+            if not isinstance(selected, pd.Series):
+                msg = "Rank styling requires a pandas Series after boolean selection."
+                raise TypeError(msg)
             if selected.empty:
                 continue
             ranks = selected.rank(method="average", pct=True)
@@ -195,7 +205,7 @@ def _rank_style(table: pd.DataFrame, *, reference_row: int) -> pd.DataFrame:
 
 def _channel_outlier_styler(frame: pd.DataFrame, field: presentation.DisplayField, *, top_k: int) -> Styler:
     """Build one historical worst-five-plus-reference channel table."""
-    values = pd.to_numeric(frame[field.metric_column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame[field.metric_column], errors="raise"), dtype=float)
     positions = list(_rank_positions(frame, values, descending=True)[:top_k])
     reference_position = presentation.reference_case_position(frame)
     parameters = presentation.metadata_parameters((frame,))
@@ -212,7 +222,10 @@ def _channel_outlier_styler(frame: pd.DataFrame, field: presentation.DisplayFiel
         rows.append(row)
     table = pd.DataFrame(rows)
     reference_row = len(table) - 1
-    return table.style.format(_fmt_number).apply(_rank_style, axis=None, reference_row=reference_row)
+    styler = table.style
+    styler.format(_fmt_number)
+    styler.apply(_rank_style, axis=None, reference_row=reference_row)
+    return styler
 
 
 def plot_outlier_table(
@@ -253,7 +266,7 @@ def plot_input_extremes_table(*, datasets: Mapping[str, pd.DataFrame]) -> widget
         reference = frame.iloc[presentation.reference_case_position(frame, parameters)]
         rows = []
         for parameter in parameters:
-            values = pd.to_numeric(frame[parameter], errors="raise").to_numpy(dtype=float)
+            values = np.asarray(pd.to_numeric(frame[parameter], errors="raise"), dtype=float)
             reference_value = float(reference[parameter])
             minimum = float(np.min(values))
             maximum = float(np.max(values))
@@ -269,7 +282,9 @@ def plot_input_extremes_table(*, datasets: Mapping[str, pd.DataFrame]) -> widget
             )
         table = pd.DataFrame(rows).set_index("Parameter")
         heading = count_headings[label] or label
-        tables.append(widgets.HTML(f"<h3>{escape(heading)}</h3>{table.style.format(_fmt_number).to_html()}"))
+        styler = table.style
+        styler.format(_fmt_number)
+        tables.append(widgets.HTML(f"<h3>{escape(heading)}</h3>{styler.to_html()}"))
     return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HBox(tables)))
 
 
@@ -383,7 +398,7 @@ def _aggregate_diagonal_permeability(case: cases.EvaluationCase) -> np.ndarray:
         msg = "Permeability context is unavailable."
         raise dataframe.ComparisonCompatibilityError(msg)
     by_name = dict(zip(case.permeability_names, case.permeability, strict=True))
-    diagonals = [by_name[name] for name in ("kxx", "kyy", "kzz") if name in by_name]
+    diagonals = [by_name[name] for name in ("Kxx", "Kyy", "Kzz") if name in by_name]
     if not diagonals:
         msg = "No diagonal permeability components are available."
         raise dataframe.ComparisonCompatibilityError(msg)
@@ -595,10 +610,10 @@ def plot_permeability_error_overlay(
     contour_levels = np.unique(np.quantile(displayed_error, (0.75, 0.95)))
     _x, _y, x_grid, y_grid = presentation.display_grid(case)
     by_name = dict(zip(case.permeability_names, case.permeability, strict=True))
-    if not {"kxx", "kxy", "kyy"}.issubset(by_name):
+    if not {"Kxx", "Kxy", "Kyy"}.issubset(by_name):
         msg = "The tensor overlay requires kxx, kxy, and kyy."
         raise dataframe.ComparisonCompatibilityError(msg)
-    components = (("kxx", by_name["kxx"]), ("kxy", by_name["kxy"]), ("kyx", by_name["kxy"]), ("kyy", by_name["kyy"]))
+    components = (("Kxx", by_name["Kxx"]), ("Kxy", by_name["Kxy"]), ("Kyx", by_name["Kxy"]), ("Kyy", by_name["Kyy"]))
     if kappa_scale not in {"kappa", "log10(kappa)"}:
         msg = "kappa_scale must be 'kappa' or 'log10(kappa)'."
         raise ValueError(msg)
@@ -607,7 +622,7 @@ def plot_permeability_error_overlay(
         row, column = divmod(index, 2)
         shown = values
         title = f"{name} [m²]"
-        if kappa_scale == "log10(kappa)" and name in {"kxx", "kyy"}:
+        if kappa_scale == "log10(kappa)" and name in {"Kxx", "Kyy"}:
             positive = values[values > 0.0]
             if positive.size == 0:
                 msg = f"{name} must be positive for logarithmic display."
@@ -808,7 +823,7 @@ def plot_task_aware_sample_at_position(
 
 def _outlier_positions(frame: pd.DataFrame, field: presentation.DisplayField, *, top_k: int) -> tuple[int, ...]:
     """Return worst channel positions followed by the parameter-centre reference."""
-    values = pd.to_numeric(frame[field.metric_column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame[field.metric_column], errors="raise"), dtype=float)
     worst = tuple(int(position) for position in _rank_positions(frame, values, descending=True)[:top_k])
     return (*worst, presentation.reference_case_position(frame))
 
@@ -856,7 +871,7 @@ def plot_linked_input_extreme_cases(
     if selection_index not in {0, 1}:
         msg = "selection_index must be 0 (minimum) or 1 (maximum)."
         raise IndexError(msg)
-    values = pd.to_numeric(frame[parameter], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame[parameter], errors="raise"), dtype=float)
     order = _rank_positions(frame, values, descending=selection_index == 1)
     title = f"Input extreme: {presentation.metadata_label(parameter)} {'minimum' if selection_index == 0 else 'maximum'}"
     return _plot_prediction_overview(

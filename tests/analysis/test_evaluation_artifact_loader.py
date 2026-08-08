@@ -200,7 +200,7 @@ def _artifact_row(
         "rel_l2": 0.1,
         "rel_h1": 0.2,
         "physical_rmse_speed_magnitude": 0.3,
-        "kappa_names": ["kxx", "kxy", "kyy"],
+        "kappa_names": ["Kxx", "Kxy", "Kyy"],
         "momentum_residual_mse": 0.4,
         "div_velocity_mse": 0.5,
         "div_eps_velocity_mse": 0.6,

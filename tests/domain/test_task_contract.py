@@ -112,7 +112,7 @@ def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:
     assert domain.tasks.spec.TaskSpec is type(domain.tasks.steady_flow.STEADY_FLOW)
     assert domain.tasks.registry.get_task("steady_flow") is domain.tasks.steady_flow.STEADY_FLOW
     assert domain.tasks.steady_flow.STEADY_FLOW.id == "steady_flow"
-    assert domain.fields.require_known_field("eps") == "eps"
+    assert domain.fields.require_known_field("eps_bed") == "eps_bed"
     with pytest.raises(ValueError, match="Unknown task"):
         domain.tasks.registry.get_task("unregistered_task")
     with pytest.raises(ValueError, match="Unknown field"):

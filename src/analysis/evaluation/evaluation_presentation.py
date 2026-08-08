@@ -81,38 +81,38 @@ class ParameterSelection:
 
 _PARAMETER_PRESENTATION = (
     # gen_structure_field: correlated background, then multiscale combination.
-    ParameterPresentation("parameters_base_len_rel", "Base correlation length", "Spatial background", 10),
-    ParameterPresentation("parameters_smooth_len_rel", "Smooth correlation length", "Spatial background", 20),
-    ParameterPresentation("parameters_msW_c", "Coarse-scale weight", "Spatial background", 30),
-    ParameterPresentation("parameters_msW_f", "Fine-scale weight", "Spatial background", 40),
-    ParameterPresentation("parameters_ani_x", "Smooth anisotropy x", "Spatial background", 50),
-    ParameterPresentation("parameters_ani_y", "Smooth anisotropy y", "Spatial background", 60),
-    ParameterPresentation("parameters_coupling", "Cross-scale coupling", "Spatial background", 70),
+    ParameterPresentation("parameters_bed.structure.coarse_len_rel", "Coarse correlation length", "Spatial background", 10),
+    ParameterPresentation("parameters_bed.structure.fine_len_rel", "Fine correlation length", "Spatial background", 20),
+    ParameterPresentation("parameters_bed.structure.coarse_weight", "Coarse-scale weight", "Spatial background", 30),
+    ParameterPresentation("parameters_bed.structure.fine_weight", "Fine-scale weight", "Spatial background", 40),
+    ParameterPresentation("parameters_bed.structure.fine_ani_x", "Fine anisotropy x", "Spatial background", 50),
+    ParameterPresentation("parameters_bed.structure.fine_ani_y", "Fine anisotropy y", "Spatial background", 60),
+    ParameterPresentation("parameters_bed.structure.cross_scale_corr", "Cross-scale correlation", "Spatial background", 70),
     # Localized structures are applied after the background field.
-    ParameterPresentation("parameters_noise_level", "Noise level", "Structures and texture", 110),
-    ParameterPresentation("parameters_noise_granularity", "Noise granularity", "Structures and texture", 120),
-    ParameterPresentation("parameters_noise_bias", "Noise sign bias", "Structures and texture", 130),
+    ParameterPresentation("parameters_bed.perturbations.amplitude", "Perturbation amplitude", "Structures and texture", 110),
+    ParameterPresentation("parameters_bed.perturbations.granularity", "Perturbation granularity", "Structures and texture", 120),
+    ParameterPresentation("parameters_bed.perturbations.sign_bias", "Perturbation sign bias", "Structures and texture", 130),
     # Permeability mapping/tensor construction precedes porosity construction.
-    ParameterPresentation("parameters_k_mean", "Mean permeability", "Material and properties", 210, "m²"),
-    ParameterPresentation("parameters_var_rel", "Relative permeability variation", "Material and properties", 220),
-    ParameterPresentation("parameters_a_max", "Maximum anisotropy ratio", "Material and properties", 230),
-    ParameterPresentation("parameters_a_gamma", "Anisotropy exponent", "Material and properties", 240),
-    ParameterPresentation("parameters_tensor_strength", "Tensor strength", "Material and properties", 250),
-    ParameterPresentation("parameters_theta_smooth_rel", "Orientation smoothing length", "Material and properties", 260),
-    ParameterPresentation("parameters_theta_jitter", "Orientation jitter", "Material and properties", 270),
-    ParameterPresentation("parameters_eps_smooth_rel", "Porosity smoothing length", "Material and properties", 280),
-    ParameterPresentation("parameters_A_rel", "Porosity material factor", "Material and properties", 290),
-    ParameterPresentation("parameters_texture_amp", "Porosity texture amplitude", "Material and properties", 300),
-    # gen_pressure_bc builds shape terms in this order, then applies p_inlet_mean.
-    ParameterPresentation("parameters_a_sin", "Inlet sinusoid amplitude", "Boundary conditions", 410),
-    ParameterPresentation("parameters_f_sin", "Inlet sinusoid frequency", "Boundary conditions", 420),
-    ParameterPresentation("parameters_phi_sin", "Inlet sinusoid phase", "Boundary conditions", 430, "rad"),
-    ParameterPresentation("parameters_k_gauss", "Inlet Gaussian count", "Boundary conditions", 440),
-    ParameterPresentation("parameters_a_gauss", "Inlet Gaussian amplitude", "Boundary conditions", 450),
-    ParameterPresentation("parameters_sigma_gauss", "Inlet Gaussian width", "Boundary conditions", 460),
-    ParameterPresentation("parameters_gauss_jitter", "Inlet Gaussian jitter", "Boundary conditions", 470),
-    ParameterPresentation("parameters_a_lin", "Inlet linear-gradient amplitude", "Boundary conditions", 480),
-    ParameterPresentation("parameters_p_inlet_mean", "Mean inlet pressure", "Boundary conditions", 490, "Pa"),
+    ParameterPresentation("parameters_kappa_mean", "Mean permeability", "Material and properties", 210, "m²"),
+    ParameterPresentation("parameters_kappa_cv", "Relative permeability variation", "Material and properties", 220),
+    ParameterPresentation("parameters_permeability.anisotropy.max_ratio", "Maximum anisotropy ratio", "Material and properties", 230),
+    ParameterPresentation("parameters_permeability.anisotropy.exponent", "Anisotropy exponent", "Material and properties", 240),
+    ParameterPresentation("parameters_permeability.anisotropy.strength", "Tensor strength", "Material and properties", 250),
+    ParameterPresentation("parameters_permeability.orientation.smooth_len_rel", "Orientation smoothing length", "Material and properties", 260),
+    ParameterPresentation("parameters_permeability.orientation.jitter", "Orientation jitter", "Material and properties", 270),
+    ParameterPresentation("parameters_porosity.smooth_len_rel", "Porosity smoothing length", "Material and properties", 280),
+    ParameterPresentation("parameters_porosity.anchor_rel", "Porosity material factor", "Material and properties", 290),
+    ParameterPresentation("parameters_porosity.texture_amp", "Porosity texture amplitude", "Material and properties", 300),
+    # gen_pressure_bc builds shape terms in this order, then applies pressure_bc.mean.
+    ParameterPresentation("parameters_pressure_bc.sin_amp", "Inlet sinusoid amplitude", "Boundary conditions", 410),
+    ParameterPresentation("parameters_pressure_bc.sin_freq", "Inlet sinusoid frequency", "Boundary conditions", 420),
+    ParameterPresentation("parameters_pressure_bc.sin_phase", "Inlet sinusoid phase", "Boundary conditions", 430, "rad"),
+    ParameterPresentation("parameters_pressure_bc.gauss_count", "Inlet Gaussian count", "Boundary conditions", 440),
+    ParameterPresentation("parameters_pressure_bc.gauss_amp", "Inlet Gaussian amplitude", "Boundary conditions", 450),
+    ParameterPresentation("parameters_pressure_bc.gauss_width", "Inlet Gaussian width", "Boundary conditions", 460),
+    ParameterPresentation("parameters_pressure_bc.gauss_jitter", "Inlet Gaussian jitter", "Boundary conditions", 470),
+    ParameterPresentation("parameters_pressure_bc.linear_amp", "Inlet linear-gradient amplitude", "Boundary conditions", 480),
+    ParameterPresentation("parameters_pressure_bc.mean", "Mean inlet pressure", "Boundary conditions", 490, "Pa"),
 )
 _PARAMETER_BY_COLUMN = {spec.column: spec for spec in _PARAMETER_PRESENTATION}
 _STRUCTURAL_METADATA_LEAVES = frozenset({"dx", "dy", "lx", "ly", "nx", "ny", "res"})
@@ -255,7 +255,7 @@ def effectively_constant(values: np.ndarray) -> tuple[bool, float]:
 def _finite_variable(frame: pd.DataFrame, column: str, *, max_cases: int | None) -> tuple[bool, str]:
     """Apply the shared finite and near-constant policy to one admitted prefix."""
     selected = frame if max_cases is None else frame.iloc[:max_cases]
-    values = pd.to_numeric(selected[column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(selected[column], errors="raise"), dtype=float)
     if values.size < _MINIMUM_VARIATION_VALUES:
         return False, "fewer than two admitted finite values"
     if not np.isfinite(values).all():

@@ -859,15 +859,15 @@ def extract_kappa(
     name_to_pos = {name: i for i, name in enumerate(kappa_names)}
 
     # kxx, kyy (always log10-physical)
-    kxx = torch.pow(10.0, kappa_encoded[:, name_to_pos["kxx"]])
-    kyy = torch.pow(10.0, kappa_encoded[:, name_to_pos["kyy"]])
-    kappa_phys[:, name_to_pos["kxx"]] = kxx
-    kappa_phys[:, name_to_pos["kyy"]] = kyy
+    kxx = torch.pow(10.0, kappa_encoded[:, name_to_pos["Kxx"]])
+    kyy = torch.pow(10.0, kappa_encoded[:, name_to_pos["Kyy"]])
+    kappa_phys[:, name_to_pos["Kxx"]] = kxx
+    kappa_phys[:, name_to_pos["Kyy"]] = kyy
 
     # kxy is a dimensionless ratio to sqrt(kxx * kyy).
-    if "kxy" in name_to_pos:
-        kxy_ratio = kappa_encoded[:, name_to_pos["kxy"]]
-        kappa_phys[:, name_to_pos["kxy"]] = kxy_ratio * torch.sqrt(kxx * kyy)
+    if "Kxy" in name_to_pos:
+        kxy_ratio = kappa_encoded[:, name_to_pos["Kxy"]]
+        kappa_phys[:, name_to_pos["Kxy"]] = kxy_ratio * torch.sqrt(kxx * kyy)
 
     return {
         "kappa_encoded": kappa_encoded,

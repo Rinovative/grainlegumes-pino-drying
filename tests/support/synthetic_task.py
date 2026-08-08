@@ -23,10 +23,11 @@ def build_synthetic_generated_batch_identity(
     """Return one deterministic current profile-qualified batch identity."""
     case_ids = list(sample_ids)
     content: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "batch_id": batch_id,
         "simulation_profile": "steady_flow",
         "batch_identity": hashlib.sha256(f"{batch_id}:batch".encode()).hexdigest(),
+        "scientific_config_digest": hashlib.sha256(f"{batch_id}:scientific".encode()).hexdigest(),
         "template": {
             "relative_path": "simulation/steady_flow/template_brinkman.mph",
             "sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
@@ -38,7 +39,10 @@ def build_synthetic_generated_batch_identity(
         "cases": [
             {
                 "case_id": case_id,
-                "case_identity": hashlib.sha256(f"{batch_id}:{case_id}:case".encode()).hexdigest(),
+                "material_family": "lentil",
+                "case_input_id": hashlib.sha256(f"{batch_id}:{case_id}:input".encode()).hexdigest(),
+                "simulation_case_id": hashlib.sha256(f"{batch_id}:{case_id}:simulation".encode()).hexdigest(),
+                "case_hdf5_sha256": hashlib.sha256(f"{batch_id}:{case_id}:hdf5".encode()).hexdigest(),
                 "success_sha256": hashlib.sha256(f"{batch_id}:{case_id}:success".encode()).hexdigest(),
                 "provenance_sha256": hashlib.sha256(f"{batch_id}:{case_id}:provenance".encode()).hexdigest(),
             }

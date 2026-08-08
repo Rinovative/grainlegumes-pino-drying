@@ -7,8 +7,16 @@ name = "grainlegumes-pino-drying"
 version = "0.1.0"
 description = "Physics-informed neural-operator pipeline for steady 2D airflow through heterogeneous porous media, motivated by grain-legume drying applications."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [{ name = "Rino M. Albertin" }]
+
+[project.optional-dependencies]
+generation-cpu = [
+  "h5py",
+  "numpy",
+  "PyYAML",
+  "scipy",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -26,7 +34,7 @@ markers = [
 
 [tool.ruff]
 line-length = 150
-target-version = "py311"
+target-version = "py310"
 extend-exclude = [
   "venv",
   ".venv",
@@ -107,11 +115,11 @@ max-returns = 10
 [tool.basedpyright]
 include = ["src", "tests"]
 extraPaths = [".", "tests"]
-pythonVersion = "3.11"
+pythonVersion = "3.10"
 typeCheckingMode = "basic"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 warn_unused_configs = true
 strict_optional = true
 
@@ -122,10 +130,12 @@ exclude = [
 
 [[tool.mypy.overrides]]
 module = [
+  "h5py",
   "ipywidgets",
   "neuralop",
   "neuralop.*",
   "pandas",
+  "pandas.*",
   "scipy",
   "scipy.*",
   "tqdm",

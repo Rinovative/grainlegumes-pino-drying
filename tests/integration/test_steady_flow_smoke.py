@@ -84,10 +84,10 @@ def _case_components(
     input_fields = {
         "x": x,
         "y": y,
-        "kxx": -12.0 + 0.02 * offset + 0.01 * x,
-        "kxy": 0.01 * offset + 0.02 * x * y,
-        "kyy": -11.8 + 0.015 * offset + 0.01 * y,
-        "eps": 0.25 + 0.005 * offset + 0.02 * x + 0.01 * y,
+        "Kxx": -12.0 + 0.02 * offset + 0.01 * x,
+        "Kxy": 0.01 * offset + 0.02 * x * y,
+        "Kyy": -11.8 + 0.015 * offset + 0.01 * y,
+        "eps_bed": 0.25 + 0.005 * offset + 0.02 * x + 0.01 * y,
         "p_bc": (1.0 - x) * (1.0 + 0.02 * offset) + 0.01 * y,
     }
     output_fields = {
@@ -157,6 +157,7 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
         "airflow_source": generated_identity["airflow_source"],
         "batch_id": generated_identity["batch_id"],
         "batch_identity": generated_identity["batch_identity"],
+        "scientific_config_digest": generated_identity["scientific_config_digest"],
         "template": generated_identity["template"],
         "export_contract_sha256": generated_identity["export_contract_sha256"],
         "intended_case_indices": case_indices,
@@ -521,7 +522,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         dim=(0, 2, 3),
         keepdim=True,
     )
-    eps_index = domain.tasks.registry.get_task("steady_flow").input_names.index("eps")
+    eps_index = domain.tasks.registry.get_task("steady_flow").input_names.index("eps_bed")
     assert not torch.isclose(
         normalizer["in_normalizer.mean"][0, eps_index, 0, 0],
         full_input_mean[0, eps_index, 0, 0],

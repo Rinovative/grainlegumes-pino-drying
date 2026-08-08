@@ -37,7 +37,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -899,10 +899,13 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     data = _as_mapping(config.get("data"), label="experiment.data")
     train_dataset = _require_nonempty_string(data.get("train_dataset"), label="data.train_dataset")
     raw_ood = data.get("ood_datasets")
-    if not isinstance(raw_ood, list) or len(raw_ood) != 1:
-        msg = "data.ood_datasets must contain exactly one configured dataset id."
+    if not isinstance(raw_ood, list) or not raw_ood:
+        msg = "data.ood_datasets must contain one or more configured dataset ids."
         raise ValueError(msg)
-    ood_dataset = _require_nonempty_string(raw_ood[0], label="data.ood_datasets[0]")
+    ood_datasets = [_require_nonempty_string(dataset_id, label=f"data.ood_datasets[{index}]") for index, dataset_id in enumerate(raw_ood)]
+    if len(ood_datasets) != len(set(ood_datasets)):
+        msg = "data.ood_datasets must not contain duplicates."
+        raise ValueError(msg)
 
     task = experiments.config.loader.validate_resolved_task_contract(config)
     paths = _as_mapping(config.get("paths"), label="experiment.paths")
@@ -930,7 +933,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         "id": summarize(train_dataset),
-        "ood": [summarize(ood_dataset)],
+        "ood": [summarize(dataset_id) for dataset_id in ood_datasets],
     }
 
 
@@ -1191,7 +1194,7 @@ def _write_summary(
     if status not in _TRIAL_OUTCOMES:
         msg = f"Unsupported Optuna trial outcome {status!r}."
         raise ValueError(msg)
-    end_time = datetime.now(UTC)
+    end_time = datetime.now(timezone.utc)
     result = result or {}
     objective = experiments.config.loader.get_resolved_objective(config)
     summary: dict[str, Any] = {
@@ -1334,7 +1337,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         study_name=str(context["study_name"]),
         trial_number=int(context["trial_number"]),
     )
-    start_time = datetime.now(UTC)
+    start_time = datetime.now(timezone.utc)
     experiments.console.optuna_trial_event(
         "started",
         study=str(context["study_name"]),
@@ -1563,7 +1566,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         _validate_completed_reporting(reporter, result)
         tracking_status = "completed"
         tracking_result = result
-        console_reporter.final(result, total_wall_seconds=(datetime.now(UTC) - start_time).total_seconds())
+        console_reporter.final(result, total_wall_seconds=(datetime.now(timezone.utc) - start_time).total_seconds())
 
     except (KeyboardInterrupt, SystemExit) as error:
         tracking_status = "interrupted"
@@ -1789,7 +1792,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             pruning="complete",
             selected_best_epoch=int(result["best_epoch"]),
             final_state="completed",
-            duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
+            duration_seconds=(datetime.now(timezone.utc) - start_time).total_seconds(),
             checkpoint_state="best_and_last_published",
             run_dir=run_dir,
             wandb_url=tracker.url if tracker is not None else None,
@@ -1812,7 +1815,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
                 pruner=str(study_config.study["pruner"]["kind"]) if tracking_status.endswith("pruned") else None,
                 selected_best_epoch=reporter.best_epoch,
                 final_state=tracking_status,
-                duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
+                duration_seconds=(datetime.now(timezone.utc) - start_time).total_seconds(),
                 checkpoint_state="durable_report_checkpoint" if reporter.last_reported_epoch is not None else "none",
                 run_dir=run_dir,
                 wandb_url=tracker.url if tracker is not None else None,

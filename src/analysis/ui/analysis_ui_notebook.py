@@ -21,7 +21,7 @@ This module does NOT:
 """
 
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from inspect import signature
 from pathlib import Path
 from typing import Any
@@ -342,7 +342,7 @@ def make_lazy_panel_with_tabs(
             out_dir.mkdir(parents=True, exist_ok=True)
 
             stem = export_state.get("plot_name") or "plot"
-            ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             out_path = out_dir / f"{stem}_{ts}.pdf"
 
             fig.savefig(out_path, bbox_inches="tight")

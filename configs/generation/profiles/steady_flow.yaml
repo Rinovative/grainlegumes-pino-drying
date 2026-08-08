@@ -1,0 +1,22 @@
+schema_kind: generation_profile
+schema_version: 1
+simulation_profile: steady_flow
+template_ready: false
+exports:
+- role: steady_flow_fields
+  pattern: null
+  delimiter: ;
+  columns:
+    x: null
+    y: null
+    Kxx: null
+    Kxy: null
+    Kyy: null
+    eps_bed: null
+    p_bc: null
+    X_0_db_field: null
+    u: null
+    v: null
+    p: null
+    rho_bu_dry: null
+  time_column: null

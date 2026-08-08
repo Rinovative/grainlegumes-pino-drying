@@ -1,0 +1,533 @@
+schema_kind: generation_parameter_registry
+schema_version: 1
+parameters:
+  kappa_mean:
+    kind: interval
+    unit: m^2
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \bar{\kappa}
+    description: Mean scalar bed permeability used by the lognormal permeability field.
+  kappa_cv:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: c_{\kappa}
+    description: Coefficient of variation used to derive the lognormal permeability
+      spread.
+  bed.structure.coarse_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{b,c}/L_x
+    description: Coarse bed correlation length divided by bed length.
+  bed.structure.fine_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{b,f}/L_x
+    description: Fine bed correlation length divided by bed length.
+  bed.structure.coarse_weight:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: airflow
+    ood_group: bed
+    report_symbol: \alpha_{b,c}
+    description: Independent coarse contribution to the bed multiscale field.
+  bed.structure.fine_ani_x:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{b,x}
+    description: Fine bed correlation-length multiplier along x.
+  bed.structure.fine_ani_y:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{b,y}
+    description: Fine bed correlation-length multiplier along y.
+  bed.structure.cross_scale_corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \rho_b
+    description: Correlation between coarse and fine bed latent seeds.
+  bed.perturbations.amplitude:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \eta_b
+    description: Root-mean-square amplitude of bed-only local perturbations.
+  bed.perturbations.granularity:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: g_b
+    description: Scale selector for bed-only local perturbations.
+  bed.perturbations.sign_bias:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: q_b
+    description: Positive-sign probability for bed-only local perturbations.
+  permeability.anisotropy.max_ratio:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{\max}
+    description: Maximum permeability anisotropy ratio.
+  permeability.anisotropy.exponent:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \gamma_a
+    description: Exponent mapping bed structure magnitude to anisotropy.
+  permeability.anisotropy.strength:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: s_K
+    description: Multiplier controlling permeability-tensor anisotropy.
+  permeability.orientation.jitter:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: j_{\theta}
+    description: Random perturbation amplitude for permeability orientation.
+  permeability.orientation.smooth_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{\theta}/L_x
+    description: Relative smoothing length for permeability orientation.
+  porosity.anchor_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: A_K/\bar{\kappa}
+    description: Relative Kozeny-Carman anchoring factor for the porosity map.
+  porosity.smooth_len_rel:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{\varepsilon}/L_x
+    description: Relative smoothing length for the porosity latent field.
+  porosity.texture_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \Delta\varepsilon
+    description: Porosity texture amplitude around the calibrated reference.
+  pressure_bc.mean:
+    kind: interval
+    unit: Pa
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: \bar{p}_{\mathrm{in}}
+    description: Mean inlet pressure boundary magnitude.
+  pressure_bc.sin_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,\sin}
+    description: Relative sinusoidal inlet-pressure amplitude.
+  pressure_bc.sin_freq:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: f_{p,\sin}
+    description: Sinusoidal inlet-pressure spatial frequency.
+  pressure_bc.sin_phase:
+    kind: interval
+    unit: rad
+    transform: phase
+    block: airflow
+    ood_group: operation
+    report_symbol: \varphi_{p,\sin}
+    description: Sinusoidal inlet-pressure phase.
+  pressure_bc.gauss_count:
+    kind: integer
+    unit: '1'
+    block: airflow
+    ood_group: operation
+    report_symbol: n_{p,G}
+    description: Number of Gaussian inlet-pressure components.
+  pressure_bc.gauss_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,G}
+    description: Combined relative amplitude of Gaussian pressure components.
+  pressure_bc.gauss_width:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: operation
+    report_symbol: \sigma_{p,G}
+    description: Reference width of Gaussian pressure components.
+  pressure_bc.gauss_jitter:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: j_{p,G}
+    description: Relative Gaussian pressure-width jitter.
+  pressure_bc.linear_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,\mathrm{lin}}
+    description: Relative linear inlet-pressure trend.
+  initial_moisture.mean_db:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \bar{X}_{0,db}
+    description: Mean initial dry-basis moisture of the generated field.
+  initial_moisture.amplitude_db:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \Delta X_{0,db}
+    description: Maximum dry-basis deviation from the configured initial mean.
+  initial_moisture.structure.coarse_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \ell_{X,c}/L_x
+    description: Coarse initial-moisture correlation length divided by bed length.
+  initial_moisture.structure.fine_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \ell_{X,f}/L_x
+    description: Fine initial-moisture correlation length divided by bed length.
+  initial_moisture.structure.coarse_weight:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \alpha_{X,c}
+    description: Independent coarse contribution to the initial-moisture multiscale
+      field.
+  initial_moisture.structure.fine_ani_x:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: a_{X,x}
+    description: Fine initial-moisture correlation-length multiplier along x.
+  initial_moisture.structure.fine_ani_y:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: a_{X,y}
+    description: Fine initial-moisture correlation-length multiplier along y.
+  initial_moisture.structure.cross_scale_corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \rho_X
+    description: Correlation between coarse and fine initial-moisture latent seeds.
+  T_in_base:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: T_{\mathrm{in},0}
+    description: Baseline inlet-air temperature.
+  T_in_amp:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \Delta T_{\mathrm{in}}
+    description: Inlet-temperature schedule amplitude.
+  omega_in_base:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \omega_{\mathrm{in},0}
+    description: Baseline inlet humidity ratio.
+  omega_in_amp:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \Delta\omega_{\mathrm{in}}
+    description: Inlet humidity-ratio schedule amplitude.
+  schedule.corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \rho_{T,\omega}
+    description: Cross-correlation of temperature and humidity schedule latent processes.
+  schedule.timescale_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: \tau_{\mathrm{sched}}/t_{\max}
+    description: Schedule correlation timescale divided by total duration.
+  schedule.component_weights:
+    kind: simplex
+    unit: '1'
+    components:
+    - smooth
+    - event
+    - trend
+    block: operation
+    ood_group: operation
+    report_symbol: \boldsymbol{\lambda}_{\mathrm{sched}}
+    description: Smooth, event, and trend schedule simplex.
+  schedule.event_count:
+    kind: integer
+    unit: '1'
+    block: operation
+    ood_group: operation
+    report_symbol: n_{\mathrm{event}}
+    description: Number of generated schedule events.
+  schedule.event_duration_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: d_{\mathrm{event}}/t_{\max}
+    description: Event duration divided by total schedule duration.
+  schedule.event_width_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: w_{\mathrm{event}}/t_{\max}
+    description: Event-edge width divided by total schedule duration.
+  rho_bu_dry_ref:
+    kind: interval
+    unit: kg/m^3
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: \rho_{\mathrm{bu,dry,ref}}
+    description: Reference dry bulk density at calibration porosity.
+  k_gr:
+    kind: interval
+    unit: W/(m*K)
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: k_{\mathrm{gr}}
+    description: Dry granular-phase thermal conductivity.
+  cp_gr_dry:
+    kind: interval
+    unit: J/(kg*K)
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: c_{p,\mathrm{gr,dry}}
+    description: Dry granular-phase specific heat capacity.
+  r_surf_0:
+    kind: interval
+    unit: 1/s
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: r_{\mathrm{surf},0}
+    description: Reference surface-moisture transfer rate.
+  r_int_surf:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: r_{\mathrm{int/surf}}
+    description: Internal-to-surface transfer-rate ratio.
+  f_surf:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: f_{\mathrm{surf}}
+    description: Initial surface-water fraction.
+  T_amb:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: T_{\mathrm{amb}}
+    description: Ambient temperature and initial granular-phase temperature source.
+  density_calibration:
+    kind: paired_parameter_set
+    components:
+    - rho_bu_dry_ref
+    - eps_bed_cal_ref
+    units:
+      rho_bu_dry_ref: kg/m^3
+      eps_bed_cal_ref: '1'
+    ood_group: material_properties
+    report_symbol: (\rho_{\mathrm{bu,dry,ref}},\varepsilon_{\mathrm{bed,cal,ref}})
+    description: Optional evidence-preserving paired dry-bulk-density and calibration-porosity
+      records.
+  bed.structure.fine_weight:
+    kind: derived
+    unit: '1'
+    derivation: complement_of_one
+    sources:
+    - bed.structure.coarse_weight
+    report_symbol: \alpha_{b,f}
+    description: Derived complementary fine contribution to the bed multiscale field.
+  initial_moisture.structure.fine_weight:
+    kind: derived
+    unit: '1'
+    derivation: complement_of_one
+    sources:
+    - initial_moisture.structure.coarse_weight
+    report_symbol: \alpha_{X,f}
+    description: Derived complementary fine contribution to initial-moisture structure.
+  eps_min_global:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\min}
+    description: Universal lower porosity bound.
+  eps_max_global:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\max}
+    description: Universal upper porosity bound.
+  eps_bed_cal_ref:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\mathrm{bed,cal,ref}}
+    description: Material calibration porosity for dry bulk density.
+  X_target_wb:
+    kind: fixed
+    unit: '1'
+    report_symbol: X_{\mathrm{target,wb}}
+    description: Material wet-basis target moisture.
+  oswin:
+    kind: parameter_set
+    components:
+    - A_osw
+    - B_osw
+    - C_osw
+    units:
+      A_osw: '1'
+      B_osw: '1'
+      C_osw: '1'
+    ood_group: material_properties
+    report_symbol: \boldsymbol{\theta}_{\mathrm{Oswin}}
+    description: Coupled Oswin A, B, and C equilibrium-isotherm record.
+  T_init:
+    kind: derived
+    unit: K
+    derivation: copy
+    sources:
+    - T_amb
+    report_symbol: T_{\mathrm{init}}
+    description: Initial temperature derived from ambient temperature.
+  r_surf:
+    kind: derived
+    unit: 1/s
+    derivation: copy
+    sources:
+    - r_surf_0
+    report_symbol: r_{\mathrm{surf}}
+    description: Surface rate copied from its reference value.
+  r_int:
+    kind: derived
+    unit: 1/s
+    derivation: product
+    sources:
+    - r_int_surf
+    - r_surf
+    report_symbol: r_{\mathrm{int}}
+    description: Internal rate derived from r_int_surf and r_surf.
+  T_in_ref:
+    kind: derived
+    unit: K
+    derivation: schedule_time_average
+    sources:
+    - schedule
+    report_symbol: \bar{T}_{\mathrm{in}}
+    description: Time-average inlet temperature derived from the schedule.
+  T_flow_ref:
+    kind: derived
+    unit: K
+    derivation: mean
+    sources:
+    - T_in_ref
+    - T_init
+    report_symbol: T_{\mathrm{flow,ref}}
+    description: Mean of inlet-reference and initial temperatures.

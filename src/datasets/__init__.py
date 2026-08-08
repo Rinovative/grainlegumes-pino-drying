@@ -8,7 +8,10 @@ Provides:
 - identity: deterministic dataset identity and fingerprint contracts
 - metadata: dataset metadata admission and summary services
 - modules: model-ready task dataset modules
+- packages: campaign-owned multi-batch dataset assembly
 - simulation: persisted simulation-dataset access
+- transient: physical-unit one-hour transition builder and loader
+- transient_contract: unregistered transient step-data schema
 """
 
 from __future__ import annotations
@@ -23,7 +26,10 @@ if TYPE_CHECKING:
     from . import dataset_identity as identity
     from . import dataset_metadata as metadata
     from . import dataset_modules as modules
+    from . import dataset_packages as packages
     from . import dataset_simulation as simulation
+    from . import dataset_transient as transient
+    from . import dataset_transient_contract as transient_contract
 
 _MODULES = {
     "base": "dataset_base",
@@ -32,9 +38,12 @@ _MODULES = {
     "identity": "dataset_identity",
     "metadata": "dataset_metadata",
     "modules": "dataset_modules",
+    "packages": "dataset_packages",
     "simulation": "dataset_simulation",
+    "transient": "dataset_transient",
+    "transient_contract": "dataset_transient_contract",
 }
-__all__ = ["base", "build", "generated_batch", "identity", "metadata", "modules", "simulation"]
+__all__ = ["base", "build", "generated_batch", "identity", "metadata", "modules", "packages", "simulation", "transient", "transient_contract"]
 
 
 def __getattr__(name: str) -> object:

@@ -516,7 +516,7 @@ def evaluate_steady_2d_brinkman(
     input_values = _field_mapping(
         inputs,
         input_fields,
-        ("x", "y", "kxx", "kxy", "kyy", "eps", "p_bc"),
+        ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_bc"),
         label="input",
     )
     output_values = _field_mapping(
@@ -530,15 +530,15 @@ def evaluate_steady_2d_brinkman(
         input_values["y"],
         axes=spatial_axes,
     )
-    permeability_xx = torch.pow(10.0, input_values["kxx"])
-    permeability_yy = torch.pow(10.0, input_values["kyy"])
+    permeability_xx = torch.pow(10.0, input_values["Kxx"])
+    permeability_yy = torch.pow(10.0, input_values["Kyy"])
     momentum = brinkman_momentum_residuals(
         output_values["p"],
         output_values["u"],
         output_values["v"],
-        input_values["eps"],
+        input_values["eps_bed"],
         permeability_xx,
-        input_values["kxy"],
+        input_values["Kxy"],
         permeability_yy,
         derivatives,
         spacing_x,
@@ -547,7 +547,7 @@ def evaluate_steady_2d_brinkman(
     continuity_residual = continuity_residuals(
         output_values["u"],
         output_values["v"],
-        input_values["eps"].clamp_min(POROSITY_FLOOR),
+        input_values["eps_bed"].clamp_min(POROSITY_FLOOR),
         derivatives,
         spacing_x,
         spacing_y,

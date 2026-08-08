@@ -219,7 +219,7 @@ class ConsoleReporter:
                 run_name=self.config["run"]["name"],
                 epoch=epoch,
                 membership="ood",
-                dataset=self.config["data"]["ood_datasets"][0],
+                dataset="+".join(self.config["data"]["ood_datasets"]),
                 cases=int(metrics.get("system/ood_evaluation_case_count", 0.0)),
                 objective_id=self.objective_id,
                 objective=metrics[ood_key],

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 TRAINING_DATASET_SCHEMA_VERSION = 1
 TRAINING_DATASET_SCHEMA_KIND = "training_dataset"
-GENERATED_BATCH_IDENTITY_SCHEMA_VERSION = 1
+GENERATED_BATCH_IDENTITY_SCHEMA_VERSION = 2
 CASE_FINGERPRINT_VERSION = 1
 SPLIT_SCHEMA_VERSION = 1
 _SHA256_HEX_LENGTH = 64
@@ -51,6 +51,7 @@ _GENERATED_BATCH_IDENTITY_KEYS = frozenset(
         "batch_id",
         "simulation_profile",
         "batch_identity",
+        "scientific_config_digest",
         "template",
         "export_contract_sha256",
         "available_learning_views",
@@ -64,7 +65,10 @@ _GENERATED_TEMPLATE_KEYS = frozenset({"relative_path", "sha256"})
 _GENERATED_CASE_KEYS = frozenset(
     {
         "case_id",
-        "case_identity",
+        "material_family",
+        "case_input_id",
+        "simulation_case_id",
+        "case_hdf5_sha256",
         "success_sha256",
         "provenance_sha256",
     }
@@ -269,6 +273,7 @@ def _validate_generated_batch_identity(
         msg = f"{label}.simulation_profile is unsupported: {profile!r}."
         raise ValueError(msg)
     _require_sha256(batch_identity["batch_identity"], label=f"{label}.batch_identity")
+    _require_sha256(batch_identity["scientific_config_digest"], label=f"{label}.scientific_config_digest")
     _require_sha256(
         batch_identity["export_contract_sha256"],
         label=f"{label}.export_contract_sha256",
@@ -314,7 +319,8 @@ def _validate_generated_batch_identity(
         if case["case_id"] != case_id:
             msg = f"{label}.cases must follow intended_case_ids exactly."
             raise ValueError(msg)
-        for key in ("case_identity", "success_sha256", "provenance_sha256"):
+        _require_non_empty_string(case["material_family"], label=f"{case_label}.material_family")
+        for key in ("case_input_id", "simulation_case_id", "case_hdf5_sha256", "success_sha256", "provenance_sha256"):
             _require_sha256(case[key], label=f"{case_label}.{key}")
         normalized_cases.append(case)
     batch_identity["template"] = template
@@ -349,7 +355,10 @@ def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[s
         cases.append(
             {
                 "case_id": record.get("case_id"),
-                "case_identity": record.get("case_identity"),
+                "material_family": record.get("material_family"),
+                "case_input_id": record.get("case_input_id"),
+                "simulation_case_id": record.get("simulation_case_id"),
+                "case_hdf5_sha256": record.get("case_hdf5_sha256"),
                 "success_sha256": record.get("success_sha256"),
                 "provenance_sha256": record.get("provenance_sha256"),
             }
@@ -359,6 +368,7 @@ def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[s
         "batch_id": manifest.get("batch_id"),
         "simulation_profile": manifest.get("simulation_profile"),
         "batch_identity": manifest.get("batch_identity"),
+        "scientific_config_digest": manifest.get("scientific_config_digest"),
         "template": manifest.get("template"),
         "export_contract_sha256": manifest.get("export_contract_sha256"),
         "available_learning_views": manifest.get("available_learning_views"),
@@ -372,6 +382,53 @@ def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[s
         result,
         sample_ids=intended,
         label="Generated batch identity",
+    )
+
+
+def build_generated_package_identity(
+    *,
+    dataset_name: str,
+    simulation_profile: str,
+    campaign_digest: str,
+    template: Mapping[str, Any],
+    export_contract_sha256: str,
+    available_learning_views: Sequence[str],
+    airflow_source: str,
+    cases: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build one aggregate generated-source identity for a multi-batch package."""
+    normalized_cases = [_json_mapping_copy(case, label=f"Package cases[{index}]") for index, case in enumerate(cases)]
+    sample_ids = [str(case.get("case_id")) for case in normalized_cases]
+    source_digest_payload = {
+        "dataset_name": dataset_name,
+        "simulation_profile": simulation_profile,
+        "campaign_digest": campaign_digest,
+        "template": dict(template),
+        "export_contract_sha256": export_contract_sha256,
+        "available_learning_views": list(available_learning_views),
+        "airflow_source": airflow_source,
+        "cases": normalized_cases,
+    }
+    source_digest = hashlib.sha256(_canonical_json(source_digest_payload, label="Generated package source identity")).hexdigest()
+    content: dict[str, Any] = {
+        "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
+        "batch_id": dataset_name,
+        "simulation_profile": simulation_profile,
+        "batch_identity": source_digest,
+        "scientific_config_digest": campaign_digest,
+        "template": dict(template),
+        "export_contract_sha256": export_contract_sha256,
+        "available_learning_views": list(available_learning_views),
+        "airflow_source": airflow_source,
+        "intended_case_ids": sample_ids,
+        "cases": normalized_cases,
+    }
+    result = dict(content)
+    result["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated package identity")).hexdigest()
+    return _validate_generated_batch_identity(
+        result,
+        sample_ids=sample_ids,
+        label="Generated package identity",
     )
 
 

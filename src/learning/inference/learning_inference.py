@@ -43,7 +43,7 @@ Saved-run contract:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -83,15 +83,15 @@ class SplitSelection:
     ----------
     role : {"train", "eval", "ood"}
         Semantic saved membership being reconstructed.
-    dataset_path : pathlib.Path
-        Current dataset file resolved for the saved logical dataset identity.
+    dataset_paths : tuple[pathlib.Path, ...]
+        Current package files resolved for the saved logical dataset selection.
     indices : torch.Tensor
         Ordered saved source indices for ``role``.
 
     """
 
     role: SplitRole
-    dataset_path: Path
+    dataset_paths: tuple[Path, ...]
     indices: torch.Tensor
 
 
@@ -201,25 +201,29 @@ def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     return data_cfg
 
 
-def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, str]:
+def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, tuple[str, ...]]:
     """
-    Resolve logical train, evaluation, and OOD dataset IDs from ``config.yaml``.
+    Resolve ordered train, evaluation, and OOD package IDs from ``config.yaml``.
 
-    Train and evaluation intentionally share the saved training dataset. OOD
-    requires the sole current-contract logical ID. All names pass central path
-    validation before they can participate in filesystem resolution.
+    Train and evaluation share one package. OOD may combine multiple independent
+    packages in configured order. Every name passes central path validation.
     """
     data_cfg = _data_section(config)
     train_dataset = common.paths.validate_logical_name(
         data_cfg.get("train_dataset"),
         label="data.train_dataset",
     )
-    ood_datasets = data_cfg.get("ood_datasets")
-    if not isinstance(ood_datasets, list) or len(ood_datasets) != 1:
-        msg = "Run config data.ood_datasets must contain exactly one logical dataset id."
+    raw_ood = data_cfg.get("ood_datasets")
+    if not isinstance(raw_ood, list) or not raw_ood:
+        msg = "Run config data.ood_datasets must contain one or more logical dataset ids."
         raise TypeError(msg)
-    ood_dataset = common.paths.validate_logical_name(ood_datasets[0], label="data.ood_datasets[0]")
-    return {"train": train_dataset, "eval": train_dataset, "ood": ood_dataset}
+    ood_datasets = tuple(
+        common.paths.validate_logical_name(dataset_id, label=f"data.ood_datasets[{index}]") for index, dataset_id in enumerate(raw_ood)
+    )
+    if len(ood_datasets) != len(set(ood_datasets)):
+        msg = "Run config data.ood_datasets must not contain duplicates."
+        raise ValueError(msg)
+    return {"train": (train_dataset,), "eval": (train_dataset,), "ood": ood_datasets}
 
 
 def _split_metadata(split_indices: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -288,20 +292,33 @@ def _split_settings(config: Mapping[str, Any]) -> tuple[float, float, int]:
     )
 
 
+def _normalize_dataset_paths(
+    value: str | Path | Sequence[str | Path] | None,
+) -> tuple[Path, ...] | None:
+    """Normalize an optional one-or-more-package path override."""
+    if value is None:
+        return None
+    raw = (value,) if isinstance(value, (str, Path)) else tuple(value)
+    if not raw or any(not isinstance(item, (str, Path)) for item in raw):
+        msg = "dataset_path must contain one or more string or Path values."
+        raise TypeError(msg)
+    return tuple(Path(item).expanduser() for item in raw)
+
+
 def _select_split(
     *,
     config: Mapping[str, Any],
     split_indices: Mapping[str, Any],
     split: str,
     dataset_root: Path,
-    dataset_path: Path | None,
+    dataset_paths: tuple[Path, ...] | None,
 ) -> SplitSelection:
     """
-    Bind one requested split role to saved membership and a current dataset path.
+    Bind one requested split role to saved membership and current package paths.
 
-    Saved split ratios, subseed, and logical dataset identity must agree with
-    ``config.yaml``. An explicit ``dataset_path`` changes location only. Later
-    fingerprint validation still prevents it from substituting different data.
+    Saved split ratios, subseed, and combined logical identity must agree with
+    ``config.yaml``. Explicit paths change location only; later fingerprint
+    validation still prevents substitution of different package content.
     """
     role = _validate_split_role(split)
     train_ratio, ood_fraction, split_seed = _split_settings(config)
@@ -311,18 +328,21 @@ def _select_split(
         expected_ood_fraction=ood_fraction,
         expected_split_seed=split_seed,
     )
-    configured_dataset_id = _configured_dataset_ids(config)[role]
+    configured_dataset_ids = _configured_dataset_ids(config)[role]
     saved_dataset_id = _saved_dataset_id(split_indices, role=role)
-    if saved_dataset_id != configured_dataset_id:
-        msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {configured_dataset_id!r}."
+    expected_dataset_id = datasets.base.combined_dataset_id(configured_dataset_ids)
+    if saved_dataset_id != expected_dataset_id:
+        msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {expected_dataset_id!r}."
         raise RuntimeError(msg)
-    selected_path = dataset_path or common.paths.resolve_dataset_path(
-        configured_dataset_id,
-        dataset_root=dataset_root,
+    selected_paths = dataset_paths or tuple(
+        common.paths.resolve_dataset_path(dataset_id, dataset_root=dataset_root) for dataset_id in configured_dataset_ids
     )
+    if len(selected_paths) != len(configured_dataset_ids):
+        msg = "Explicit dataset paths must align with the configured package selection."
+        raise ValueError(msg)
     return SplitSelection(
         role=role,
-        dataset_path=selected_path,
+        dataset_paths=selected_paths,
         indices=validated_indices[_SPLIT_INDEX_KEYS[role]],
     )
 
@@ -451,7 +471,7 @@ def load_inference_context_with_resolution(
     *,
     run_dir: str | Path,
     device_resolution: learning_device.DeviceResolution,
-    dataset_path: str | Path | None = None,
+    dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "eval",
     batch_size: int = 1,
@@ -472,9 +492,9 @@ def load_inference_context_with_resolution(
         `normalizer.pt`, `best_checkpoint.pt`, and `split_indices.pt`.
     device_resolution : learning_device.DeviceResolution
         Immutable runtime decision resolved by the inference or artifact boundary.
-    dataset_path : str | Path | None, optional
-        Optional exact final-dataset file. Its fingerprint and ordered sample
-        identity must match the saved split.
+    dataset_path : str | Path | Sequence[str | Path] | None, optional
+        Optional exact final-dataset package path or ordered package paths.
+        Fingerprints and ordered identity must match the saved split.
     dataset_root : str | Path | None, optional
         Current explicit dataset root used with the saved logical dataset id.
         Defaults to the current central dataset-root resolution.
@@ -514,7 +534,7 @@ def load_inference_context_with_resolution(
         raise TypeError(msg)
     device = device_resolution.device
     run_dir = Path(run_dir)
-    requested_dataset_path = Path(dataset_path).expanduser() if dataset_path is not None else None
+    requested_dataset_paths = _normalize_dataset_paths(dataset_path)
     current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_payload_root()
     evaluable_run = experiments.run.validate_evaluable_run(run_dir)
 
@@ -527,7 +547,7 @@ def load_inference_context_with_resolution(
         split_indices=split_indices,
         split=str(split),
         dataset_root=current_dataset_root,
-        dataset_path=requested_dataset_path,
+        dataset_paths=requested_dataset_paths,
     )
 
     experiments.run.seed_process(seed_plan["model_init"], device=device)
@@ -550,10 +570,8 @@ def load_inference_context_with_resolution(
     processor = datasets.base.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
 
     task = experiments.config.loader.validate_resolved_task_contract(cfg)
-    source_dataset = datasets.simulation.create_task_dataset(
-        split_selection.dataset_path,
-        task=task,
-    )
+    source_packages = [datasets.simulation.create_task_dataset(path, task=task) for path in split_selection.dataset_paths]
+    source_dataset = datasets.base.combine_identity_datasets(source_packages)
     _validate_split_indices_for_dataset(
         selection=split_selection,
         dataset=source_dataset,
@@ -563,8 +581,8 @@ def load_inference_context_with_resolution(
     # ------------------------------
     # HARD GUARDS: field contract <-> dataset
     # ------------------------------
-    ds_in = source_dataset.input_fields
-    ds_out = source_dataset.output_fields
+    ds_in = getattr(source_dataset, "input_fields", None)
+    ds_out = getattr(source_dataset, "output_fields", None)
 
     if ds_in is not None and list(ds_in) != list(input_channels):
         msg = f"Dataset input field contract mismatch.\nExpected: {input_channels}\nGot: {list(ds_in)}"
@@ -583,7 +601,7 @@ def load_inference_context_with_resolution(
 def load_inference_context(
     *,
     run_dir: str | Path,
-    dataset_path: str | Path | None = None,
+    dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "eval",
     batch_size: int = 1,
@@ -596,8 +614,8 @@ def load_inference_context(
     ----------
     run_dir : str | Path
         Completed saved run directory.
-    dataset_path : str | Path | None, optional
-        Optional exact dataset file bound to saved identity.
+    dataset_path : str | Path | Sequence[str | Path] | None, optional
+        Optional exact dataset package path or ordered package paths bound to saved identity.
     dataset_root : str | Path | None, optional
         Current independent dataset root.
     split : {"train", "eval", "ood"}, optional

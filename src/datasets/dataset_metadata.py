@@ -47,7 +47,7 @@ METADATA_SCHEMA_VERSION = 1
 BUILDER_MODULE = "src.datasets.dataset_build"
 PUBLICATION_METHOD = "atomic_directory_rename"
 SOURCE_MANIFEST_SCHEMA_KIND = "simulation_batch_manifest"
-SOURCE_MANIFEST_SCHEMA_VERSION = 1
+SOURCE_MANIFEST_SCHEMA_VERSION = 2
 _SHA256_LENGTH = 64
 _SPATIAL_DIMENSIONS = 2
 _MANIFEST_KEYS = frozenset(
@@ -60,6 +60,7 @@ _MANIFEST_KEYS = frozenset(
         "airflow_source",
         "batch_id",
         "batch_identity",
+        "scientific_config_digest",
         "template",
         "export_contract_sha256",
         "intended_case_indices",

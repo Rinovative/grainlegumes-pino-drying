@@ -241,10 +241,10 @@ def _stored_representation_label(frame: pd.DataFrame, field: str) -> str:
 def _field_display_label(field: str) -> str:
     """Return the canonical Matplotlib field label without changing internal keys."""
     scientific_labels = {
-        "kxx": r"$\kappa_{xx}$",
-        "kxy": r"$\kappa_{xy}$",
-        "kyy": r"$\kappa_{yy}$",
-        "eps": r"$\varepsilon$",
+        "Kxx": r"$\kappa_{xx}$",
+        "Kxy": r"$\kappa_{xy}$",
+        "Kyy": r"$\kappa_{yy}$",
+        "eps_bed": r"$\varepsilon$",
         "p_bc": r"$p_{\mathrm{bc}}$",
     }
     return scientific_labels.get(field, field_label(field, mathtext=True))

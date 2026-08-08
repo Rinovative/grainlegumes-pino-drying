@@ -60,7 +60,7 @@ def _provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
 
 def _finite_quantile(frame: pd.DataFrame, column: str, quantile: float) -> float:
     """Return one finite per-case metric quantile."""
-    values = pd.to_numeric(frame[column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame[column], errors="raise"), dtype=float)
     if values.size == 0 or not np.isfinite(values).all():
         msg = f"Metric {column!r} must contain finite values."
         raise ValueError(msg)
@@ -192,7 +192,7 @@ def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     cmap = plt.get_cmap("Blues")
     for column in table.columns:
-        numeric = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
+        numeric = np.asarray(pd.to_numeric(table[column], errors="coerce"), dtype=float)
         finite = numeric[np.isfinite(numeric)]
         if finite.size == 0:
             continue
@@ -211,7 +211,9 @@ def _styled_table(table: pd.DataFrame, *, title: str) -> widgets.VBox:
     """Render one automatically displayed historical blue table."""
     styles = _blue_style(table)
     formats: dict[Any, Any] = {column: "{:.4g}" for column in table.columns if pd.api.types.is_numeric_dtype(table[column])}
-    styler = table.style.format(formats).apply(lambda _table: styles, axis=None)
+    styler = table.style
+    styler.format(formats)
+    styler.apply(lambda _table: styles, axis=None)
     return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HTML(styler.to_html())))
 
 
@@ -226,6 +228,9 @@ def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.V
         "checkpoint_digest",
     }
     visible = summary[[column for column in summary.columns if column not in hidden_identity]]
+    if not isinstance(visible, pd.DataFrame):
+        msg = "Run-summary list-column selection must produce a DataFrame."
+        raise TypeError(msg)
     title, count_headings = layout.aggregate_title_context(
         "Global summary",
         layout.effective_case_counts(datasets),

@@ -1,0 +1,73 @@
+schema_kind: generation_campaign
+schema_version: 1
+campaign_name: transient_drying_family_generalization
+executable: false
+registry_config: configs/generation/registry.yaml
+common_config: configs/generation/common.yaml
+operations_config: configs/generation/operations/fixed_bed.yaml
+profile_config: configs/generation/profiles/transient_drying.yaml
+execution_config: configs/generation/execution/cluster_cpu.yaml
+materials:
+- lentil
+- chickpea
+- kidney_bean
+- field_pea
+- almond
+roles:
+  seen:
+  - lentil
+  - chickpea
+  - kidney_bean
+  near_family_ood:
+  - field_pea
+  far_family_ood:
+  - almond
+sampling:
+  method: lhs
+  seed_base: null
+  counts:
+    natural:
+      lentil: null
+      chickpea: null
+      kidney_bean: null
+      field_pea: null
+      almond: null
+    parameter_ood:
+      lentil: null
+      chickpea: null
+      kidney_bean: null
+  parameter_ood:
+    groups:
+    - bed
+    - operation
+    - initial_moisture
+    - material_properties
+    units_per_case: 1
+    balance_groups: true
+    balance_parameters: true
+dataset_packages:
+- learning_task: transient_drying
+  evaluation_regime: id
+  materials:
+  - lentil
+  - chickpea
+  - kidney_bean
+  membership_seed: null
+  membership_counts_per_material:
+    train: null
+    validation: null
+    id_test: null
+- learning_task: transient_drying
+  evaluation_regime: parameter_ood
+  materials:
+  - lentil
+  - chickpea
+  - kidney_bean
+- learning_task: transient_drying
+  evaluation_regime: near_family_ood
+  materials:
+  - field_pea
+- learning_task: transient_drying
+  evaluation_regime: far_family_ood
+  materials:
+  - almond

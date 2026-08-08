@@ -68,7 +68,7 @@ CANONICAL_EXPERIMENT_SECTION_ORDER = (
 )
 _ROOT_KEYS = frozenset(CANONICAL_EXPERIMENT_SECTION_ORDER)
 EXPERIMENT_ROOT_KEYS = _ROOT_KEYS
-_TASK_CONFIG_MARKER = ("configs", "tasks")
+_TASK_CONFIG_MARKER = ("configs", "learning")
 _TASK_FIXED_KEYS = frozenset(
     {
         "input_fields",
@@ -279,17 +279,17 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
 
 
 def task_directory_from_config_path(yaml_path: Path | str) -> str | None:
-    """Return the task owned by a ``configs/tasks/<task>/`` source path."""
+    """Return the task owned by a ``configs/learning/<task>/`` source path."""
     parts = Path(yaml_path).expanduser().parts
     matches = [index for index in range(len(parts) - 1) if tuple(parts[index : index + len(_TASK_CONFIG_MARKER)]) == _TASK_CONFIG_MARKER]
     if not matches:
         return None
     if len(matches) != 1:
-        msg = f"Config path contains an ambiguous repeated configs/tasks marker: {yaml_path}"
+        msg = f"Config path contains an ambiguous repeated configs/learning marker: {yaml_path}"
         raise ConfigError(msg)
     task_index = matches[0] + len(_TASK_CONFIG_MARKER)
     if task_index >= len(parts) - 1:
-        msg = f"Task-first config path must include configs/tasks/<task>/<workflow>/...: {yaml_path}"
+        msg = f"Task-first config path must include configs/learning/<task>/<workflow>/...: {yaml_path}"
         raise ConfigError(msg)
     try:
         return common.paths.validate_logical_name(parts[task_index], label="config directory task")
@@ -702,17 +702,22 @@ def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(objective)
 
 
-def _single_ood_dataset(data: Mapping[str, Any], *, path: str) -> str:
-    """Return the sole current-contract OOD dataset identifier."""
+def _ood_datasets(data: Mapping[str, Any], *, path: str) -> tuple[str, ...]:
+    """Return one or more independently configured OOD dataset identifiers."""
     value = data.get("ood_datasets")
-    if not isinstance(value, list) or len(value) != 1:
-        msg = f"{path}.ood_datasets must contain exactly one logical dataset id."
+    if not isinstance(value, list) or not value:
+        msg = f"{path}.ood_datasets must contain one or more logical dataset ids."
         raise ConfigError(msg)
-    dataset_id = value[0]
     try:
-        return common.paths.validate_logical_name(dataset_id, label=f"{path}.ood_datasets[0]")
+        dataset_ids = tuple(
+            common.paths.validate_logical_name(dataset_id, label=f"{path}.ood_datasets[{index}]") for index, dataset_id in enumerate(value)
+        )
     except ValueError as error:
         raise ConfigError(str(error)) from error
+    if len(dataset_ids) != len(set(dataset_ids)):
+        msg = f"{path}.ood_datasets must not contain duplicates."
+        raise ConfigError(msg)
+    return dataset_ids
 
 
 def _model_variant(config: Mapping[str, Any]) -> str:
@@ -1151,7 +1156,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    _single_ood_dataset(data, path="data")
+    _ood_datasets(data, path="data")
 
     _validate_tracking(config, require_derived=require_derived_tracking)
 
@@ -1522,19 +1527,19 @@ def create_dataloaders_from_config(
     dataset_root = Path(config["paths"]["dataset_root"])
 
     train_dataset_name = common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset")
-    ood_dataset_name = _single_ood_dataset(data_cfg, path="data")
+    ood_dataset_names = _ood_datasets(data_cfg, path="data")
 
     path_train = common.paths.resolve_dataset_path(train_dataset_name, dataset_root=dataset_root)
-    path_test_ood = common.paths.resolve_dataset_path(ood_dataset_name, dataset_root=dataset_root)
+    paths_test_ood = tuple(common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root) for dataset_name in ood_dataset_names)
     seeds = dict(seed_plan or {})
     run_seed = int(config["run"]["seed"])
     train_loader, test_loaders, normalizer, split_indices = datasets.base.create_dataloaders(
         dataset_factory=datasets.simulation.create_task_dataset,
         path_train=str(path_train),
-        path_test_ood=str(path_test_ood),
+        path_test_ood=tuple(str(path) for path in paths_test_ood),
         task=task,
         train_dataset_id=train_dataset_name,
-        ood_dataset_id=ood_dataset_name,
+        ood_dataset_id=ood_dataset_names,
         train_ratio=data_cfg["train_ratio"],
         ood_fraction=data_cfg["ood_fraction"],
         batch_size=data_cfg["batch_size"],
@@ -1551,10 +1556,13 @@ def create_dataloaders_from_config(
     if eval_loader is None:
         msg = "No evaluation dataloader was created."
         raise ConfigError(msg)
-    return {
+    result = {
         "train": train_loader,
         "eval": eval_loader,
         "ood": test_loaders["ood"],
         "data_processor": normalizer,
         "split_indices": split_indices,
     }
+    if "id_test" in test_loaders:
+        result["id_test"] = test_loaders["id_test"]
+    return result

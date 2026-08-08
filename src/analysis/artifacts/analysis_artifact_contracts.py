@@ -97,8 +97,11 @@ def resolve_case_payload_path(
 
 def _file_sha256(path: Path) -> str:
     """Return the lowercase SHA-256 digest of one artifact payload file."""
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:

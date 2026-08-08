@@ -24,8 +24,8 @@ This module does NOT:
 from __future__ import annotations
 
 COORDINATE_FIELDS = ("x", "y")
-PERMEABILITY_FIELDS = ("kxx", "kxy", "kyy")
-POROSITY_FIELDS = ("eps",)
+PERMEABILITY_FIELDS = ("Kxx", "Kxy", "Kyy")
+POROSITY_FIELDS = ("eps_bed",)
 BOUNDARY_FIELDS = ("p_bc",)
 STATE_FIELDS = ("p", "u", "v")
 DERIVED_ANALYSIS_FIELDS = ("U",)

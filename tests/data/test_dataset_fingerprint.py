@@ -20,6 +20,7 @@ from support.synthetic_task import build_synthetic_generated_batch_identity
 from src import datasets, domain
 
 _EXPECTED_DISTINCT_FINGERPRINTS = 4
+_COMBINED_OOD_SAMPLE_COUNT = 8
 _SHA256_HEX_LENGTH = 64
 
 if TYPE_CHECKING:
@@ -94,26 +95,25 @@ def test_creation_computes_stable_content_identity(
     assert strict_identity.fingerprint == first["dataset_fingerprint"]
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
-)
-def test_dataset_and_generated_identity_require_integer_version_one(
-    schema_version: object,
+def test_dataset_and_generated_identity_require_exact_integer_versions(
     steady_task: domain.tasks.spec.TaskSpec,
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Reject alternate representations in both persisted dataset version fields."""
+    """Reject alternate representations of both current persisted schema versions."""
     payload = training_dataset_payload_factory()
-    for path in (("schema_version",), ("generated_batch_identity", "schema_version")):
-        invalid = copy.deepcopy(payload)
-        target = invalid
-        for key in path[:-1]:
-            target = target[key]
-        target[path[-1]] = schema_version
-        with pytest.raises(ValueError, match="schema_version"):
-            datasets.identity.validate_training_dataset_payload(invalid, task=steady_task)
+    invalid_versions = (
+        (("schema_version",), (True, 1.0, 2)),
+        (("generated_batch_identity", "schema_version"), (True, 2.0, 1)),
+    )
+    for path, versions in invalid_versions:
+        for schema_version in versions:
+            invalid = copy.deepcopy(payload)
+            target = invalid
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = schema_version
+            with pytest.raises(ValueError, match="schema_version"):
+                datasets.identity.validate_training_dataset_payload(invalid, task=steady_task)
 
 
 def test_dataset_reader_requires_actual_float32_tensors(
@@ -317,6 +317,38 @@ def test_membership_digest_binds_indices_and_order(
     assert len(direct) == _SHA256_HEX_LENGTH
     assert direct != reordered
     assert direct != changed_role
+
+
+def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    training_dataset_payload_factory: Callable[..., dict[str, Any]],
+) -> None:
+    """Combine independent OOD packages without losing their exact ordered identities."""
+    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("combined_train"))
+    first_path = _save_dataset(tmp_path, training_dataset_payload_factory("parameter_ood"))
+    second_path = _save_dataset(tmp_path, training_dataset_payload_factory("family_ood"))
+    _train_loader, test_loaders, _processor, split_info = datasets.base.create_dataloaders(
+        dataset_factory=datasets.simulation.create_task_dataset,
+        path_train=str(train_path),
+        path_test_ood=(str(first_path), str(second_path)),
+        task=steady_task,
+        train_dataset_id="combined_train",
+        ood_dataset_id=("parameter_ood", "family_ood"),
+        batch_size=2,
+        train_ratio=0.5,
+        ood_fraction=1.0,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        split_seed=9,
+    )
+
+    expected_id = datasets.base.combined_dataset_id(("parameter_ood", "family_ood"))
+    assert split_info["metadata"]["datasets"]["ood"]["dataset_id"] == expected_id
+    assert expected_id != datasets.base.combined_dataset_id(("family_ood", "parameter_ood"))
+    assert split_info["ood_indices"].numel() == _COMBINED_OOD_SAMPLE_COUNT
+    assert len(set(split_info["metadata"]["datasets"]["ood"]["sample_ids"])) == _COMBINED_OOD_SAMPLE_COUNT
 
 
 def test_saved_split_rejects_replaced_same_name_count_dataset(

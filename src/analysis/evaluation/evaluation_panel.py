@@ -102,7 +102,7 @@ def _physics_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
 
 def _permeability_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
     """Return whether every frame declares the historical permeability tensor inputs."""
-    required = {"kxx", "kxy", "kyy"}
+    required = {"Kxx", "Kxy", "Kyy"}
     return all(required.issubset(frame.attrs.get("input_fields", ())) for frame in datasets.values())
 
 

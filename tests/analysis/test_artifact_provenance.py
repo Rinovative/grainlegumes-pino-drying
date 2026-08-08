@@ -606,8 +606,8 @@ def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
     encoded = torch.tensor([[[[-2.0]], [[0.25]], [[-4.0]]]])
     permeability = analysis.artifacts.generation.extract_kappa(
         encoded,
-        input_fields=["kxx", "kxy", "kyy"],
-        kappa_names=["kxx", "kxy", "kyy"],
+        input_fields=["Kxx", "Kxy", "Kyy"],
+        kappa_names=["Kxx", "Kxy", "Kyy"],
     )
 
     assert torch.equal(permeability["kappa_encoded"], encoded)

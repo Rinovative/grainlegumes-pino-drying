@@ -24,6 +24,8 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 from collections.abc import Mapping
@@ -41,7 +43,7 @@ from src import domain
 from . import dataset_identity as identity
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sized
+    from collections.abc import Callable, Sequence, Sized
 
     from src.domain.tasks.domain_task_spec import TaskSpec
 
@@ -61,6 +63,182 @@ _REQUIRED_NORMALIZER_STATE_KEYS = (
 )
 _NORMALIZER_STATE_RANK = 4
 _NORMALIZER_DENOMINATOR_FLOOR = 1e-7
+
+
+class _IdentityDatasetView(Dataset[dict[str, Any]]):
+    """Expose one identity-bound ordered view without copying tensor payloads."""
+
+    def __init__(self, source: Dataset[dict[str, Any]], indices: list[int], *, label: str) -> None:
+        """Bind an ordered subset to a deterministic derived identity."""
+        source_identity = getattr(source, "identity", None)
+        if not isinstance(source_identity, identity.DatasetIdentity):
+            msg = f"{label} source must expose a verified DatasetIdentity."
+            raise TypeError(msg)
+        if not indices or len(indices) != len(set(indices)) or min(indices) < 0 or max(indices) >= len(cast("Sized", source)):
+            msg = f"{label} indices must be a non-empty unique in-range selection."
+            raise ValueError(msg)
+        self.source = source
+        self.indices = tuple(indices)
+        sample_ids = tuple(source_identity.sample_ids[index] for index in indices)
+        fingerprint_payload = json.dumps(
+            {
+                "source_fingerprint": source_identity.fingerprint,
+                "label": label,
+                "sample_ids": sample_ids,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        source_metadata = source_identity.source_metadata
+        self.identity = identity.DatasetIdentity(
+            dataset_id=source_identity.dataset_id,
+            task=source_identity.task,
+            data_contract_digest=source_identity.data_contract_digest,
+            fingerprint=hashlib.sha256(fingerprint_payload).hexdigest(),
+            sample_ids=sample_ids,
+            sample_count=len(sample_ids),
+            spatial_shape=source_identity.spatial_shape,
+            source_metadata=(None if source_metadata is None else tuple(source_metadata[index] for index in indices)),
+            source_provenance=source_identity.source_provenance,
+        )
+
+    def __len__(self) -> int:
+        """Return selected sample count."""
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one source sample in view order."""
+        return self.source[self.indices[index]]
+
+
+def combined_dataset_id(dataset_ids: Sequence[str]) -> str:
+    """Return the stable logical identity for one ordered OOD package selection."""
+    identifiers = tuple(dataset_ids)
+    if not identifiers or any(not isinstance(item, str) or not item for item in identifiers):
+        msg = "Combined OOD package identifiers must be non-empty strings."
+        raise ValueError(msg)
+    if len(identifiers) != len(set(identifiers)):
+        msg = "Combined OOD package identifiers must be unique."
+        raise ValueError(msg)
+    if len(identifiers) == 1:
+        return identifiers[0]
+    payload = json.dumps(
+        list(identifiers),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"combined_ood__{hashlib.sha256(payload).hexdigest()[:16]}"
+
+
+class _CombinedIdentityDataset(Dataset[dict[str, Any]]):
+    """Concatenate independent OOD packages under one derived loader identity."""
+
+    def __init__(self, sources: list[Dataset[dict[str, Any]]]) -> None:
+        """Validate compatible component identities and bind ordered membership."""
+        if not sources:
+            msg = "Combined OOD dataset requires at least one component."
+            raise ValueError(msg)
+        identities = [getattr(source, "identity", None) for source in sources]
+        if not all(isinstance(item, identity.DatasetIdentity) for item in identities):
+            msg = "Every combined OOD component must expose a verified DatasetIdentity."
+            raise TypeError(msg)
+        typed = cast("list[identity.DatasetIdentity]", identities)
+        first = typed[0]
+        if any(
+            item.task != first.task or item.data_contract_digest != first.data_contract_digest or item.spatial_shape != first.spatial_shape
+            for item in typed[1:]
+        ):
+            msg = "Combined OOD packages must share task, learned-data contract, and spatial shape."
+            raise ValueError(msg)
+        input_fields = [getattr(source, "input_fields", None) for source in sources]
+        output_fields = [getattr(source, "output_fields", None) for source in sources]
+        if any(value != input_fields[0] for value in input_fields[1:]) or any(value != output_fields[0] for value in output_fields[1:]):
+            msg = "Combined OOD packages must share input and output field order."
+            raise ValueError(msg)
+        self.input_fields = input_fields[0]
+        self.output_fields = output_fields[0]
+        self.sources = tuple(sources)
+        self.offsets: list[tuple[int, int]] = []
+        sample_ids: list[str] = []
+        metadata: list[dict[str, Any]] = []
+        total = 0
+        for source, item in zip(sources, typed, strict=True):
+            start = total
+            total += len(cast("Sized", source))
+            self.offsets.append((start, total))
+            sample_ids.extend(f"{item.dataset_id}::{sample_id}" for sample_id in item.sample_ids)
+            if item.source_metadata is not None:
+                metadata.extend(item.source_metadata)
+        payload = json.dumps(
+            {
+                "components": [
+                    {
+                        "dataset_id": item.dataset_id,
+                        "fingerprint": item.fingerprint,
+                        "sample_ids": item.sample_ids,
+                    }
+                    for item in typed
+                ]
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self.identity = identity.DatasetIdentity(
+            dataset_id=combined_dataset_id(tuple(item.dataset_id for item in typed)),
+            task=first.task,
+            data_contract_digest=first.data_contract_digest,
+            fingerprint=hashlib.sha256(payload).hexdigest(),
+            sample_ids=tuple(sample_ids),
+            sample_count=len(sample_ids),
+            spatial_shape=first.spatial_shape,
+            source_metadata=tuple(metadata) if len(metadata) == len(sample_ids) else None,
+            source_provenance={"component_dataset_ids": [item.dataset_id for item in typed]},
+        )
+
+    def __len__(self) -> int:
+        """Return combined OOD sample count."""
+        return self.identity.sample_count
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one component sample in configured package order."""
+        if index < 0:
+            index += len(self)
+        for source, (start, stop) in zip(self.sources, self.offsets, strict=True):
+            if start <= index < stop:
+                return source[index - start]
+        raise IndexError(index)
+
+
+def combine_identity_datasets(sources: Sequence[Dataset[dict[str, Any]]]) -> Dataset[dict[str, Any]]:
+    """Return one verified dataset or an identity-bound ordered combination."""
+    normalized = list(sources)
+    if not normalized:
+        msg = "At least one dataset package is required."
+        raise ValueError(msg)
+    if not all(isinstance(getattr(source, "identity", None), identity.DatasetIdentity) for source in normalized):
+        msg = "Every dataset package must expose a verified DatasetIdentity."
+        raise TypeError(msg)
+    return normalized[0] if len(normalized) == 1 else _CombinedIdentityDataset(normalized)
+
+
+def _package_id_membership(dataset: Dataset[dict[str, Any]]) -> dict[str, list[int]] | None:
+    """Return exact package-owned ID membership when present."""
+    dataset_identity = getattr(dataset, "identity", None)
+    if not isinstance(dataset_identity, identity.DatasetIdentity) or dataset_identity.source_metadata is None:
+        return None
+    values = [metadata.get("dataset_membership") for metadata in dataset_identity.source_metadata]
+    if all(value is None for value in values):
+        return None
+    if any(value not in {"train", "validation", "id_test"} for value in values):
+        msg = "Package-owned ID membership must label every sample train, validation, or id_test."
+        raise ValueError(msg)
+    membership = {role: [index for index, value in enumerate(values) if value == role] for role in ("train", "validation", "id_test")}
+    if any(not indices for indices in membership.values()):
+        msg = "Package-owned train, validation, and id_test memberships must all be non-empty."
+        raise ValueError(msg)
+    return membership
 
 
 def _required_metadata_count(metadata: Mapping[str, Any], key: str) -> int:
@@ -557,11 +735,11 @@ def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
 def create_dataloaders(
     dataset_factory: Callable[..., Dataset[dict[str, Any]]],
     path_train: str,
-    path_test_ood: str,
+    path_test_ood: str | Sequence[str],
     *,
     task: TaskSpec,
     train_dataset_id: str,
-    ood_dataset_id: str,
+    ood_dataset_id: str | Sequence[str],
     batch_size: int = 16,
     train_ratio: float = 0.8,
     ood_fraction: float = 0.2,
@@ -583,14 +761,14 @@ def create_dataloaders(
         Shared training/inference dataset factory.
     path_train : str
         Current resolved training dataset path.
-    path_test_ood : str
-        Current resolved OOD dataset path.
+    path_test_ood : str or Sequence[str]
+        One or more independently resolved OOD package paths.
     task : TaskSpec
         Authoritative task contract.
     train_dataset_id : str
         Expected logical training dataset identifier.
-    ood_dataset_id : str
-        Expected logical OOD dataset identifier.
+    ood_dataset_id : str or Sequence[str]
+        Expected logical OOD package identifiers in path order.
     batch_size : int, optional
         Batch size for all loaders.
     train_ratio : float, optional
@@ -652,21 +830,57 @@ def create_dataloaders(
     if num_workers == 0:
         persistent_workers = False
 
-    full_train = dataset_factory(path_train, task=task)
-    ood_full = dataset_factory(path_test_ood, task=task)
-    train_identity = getattr(full_train, "identity", None)
-    ood_identity = getattr(ood_full, "identity", None)
-    if not isinstance(train_identity, identity.DatasetIdentity) or not isinstance(ood_identity, identity.DatasetIdentity):
+    raw_train = dataset_factory(path_train, task=task)
+    raw_train_identity = getattr(raw_train, "identity", None)
+    if not isinstance(raw_train_identity, identity.DatasetIdentity):
         msg = "Task dataset factory must expose a verified DatasetIdentity."
         raise TypeError(msg)
-    if train_identity.dataset_id != train_dataset_id or ood_identity.dataset_id != ood_dataset_id:
-        msg = (
-            "Resolved logical dataset identifiers do not match payloads: "
-            f"train={train_identity.dataset_id!r}/{train_dataset_id!r}, "
-            f"ood={ood_identity.dataset_id!r}/{ood_dataset_id!r}."
-        )
+    if raw_train_identity.dataset_id != train_dataset_id:
+        msg = f"Resolved training dataset identifier does not match its payload: {raw_train_identity.dataset_id!r}/{train_dataset_id!r}."
         raise ValueError(msg)
 
+    ood_paths = (path_test_ood,) if isinstance(path_test_ood, str) else tuple(path_test_ood)
+    ood_ids = (ood_dataset_id,) if isinstance(ood_dataset_id, str) else tuple(ood_dataset_id)
+    if not ood_paths or len(ood_paths) != len(ood_ids):
+        msg = "OOD package paths and identifiers must be non-empty and aligned."
+        raise ValueError(msg)
+    ood_sources = [dataset_factory(path, task=task) for path in ood_paths]
+    for expected_id, source_dataset in zip(ood_ids, ood_sources, strict=True):
+        source_identity = getattr(source_dataset, "identity", None)
+        if not isinstance(source_identity, identity.DatasetIdentity) or source_identity.dataset_id != expected_id:
+            msg = f"Resolved OOD package identifier does not match its payload: {expected_id!r}."
+            raise ValueError(msg)
+    ood_full = combine_identity_datasets(ood_sources)
+    ood_identity = getattr(ood_full, "identity", None)
+    if not isinstance(ood_identity, identity.DatasetIdentity):
+        msg = "Combined OOD packages did not expose a verified DatasetIdentity."
+        raise TypeError(msg)
+
+    package_membership = _package_id_membership(raw_train)
+    id_test_set: Dataset[dict[str, Any]] | None = None
+    if package_membership is None:
+        full_train: Dataset[dict[str, Any]] = raw_train
+        explicit_train_count = None
+    else:
+        train_positions = package_membership["train"]
+        validation_positions = package_membership["validation"]
+        full_train = _IdentityDatasetView(
+            raw_train,
+            [*train_positions, *validation_positions],
+            label="package train+validation",
+        )
+        id_test_set = _IdentityDatasetView(
+            raw_train,
+            package_membership["id_test"],
+            label="package id_test",
+        )
+        explicit_train_count = len(train_positions)
+        train_ratio = explicit_train_count / len(cast("Sized", full_train))
+
+    train_identity = getattr(full_train, "identity", None)
+    if not isinstance(train_identity, identity.DatasetIdentity):
+        msg = "Resolved training view did not expose a verified DatasetIdentity."
+        raise TypeError(msg)
     n_train_full = len(cast("Sized", full_train))
     n_ood_full = len(cast("Sized", ood_full))
     if split_indices is None:
@@ -676,18 +890,24 @@ def create_dataloaders(
         if min(n_train, n_eval, n_ood) <= 0:
             msg = f"Split settings must select non-empty train/eval/OOD sets. Received train={n_train}, eval={n_eval}, ood={n_ood}."
             raise ValueError(msg)
-        train_random, eval_random = random_split(
-            full_train,
-            [n_train, n_eval],
-            generator=torch.Generator().manual_seed(split_seed),
-        )
+        if explicit_train_count is None:
+            train_random, eval_random = random_split(
+                full_train,
+                [n_train, n_eval],
+                generator=torch.Generator().manual_seed(split_seed),
+            )
+            train_indices = torch.tensor(train_random.indices, dtype=torch.long)
+            eval_indices = torch.tensor(eval_random.indices, dtype=torch.long)
+        else:
+            n_train = explicit_train_count
+            n_eval = n_train_full - n_train
+            train_indices = torch.arange(n_train, dtype=torch.long)
+            eval_indices = torch.arange(n_train, n_train_full, dtype=torch.long)
         ood_random, _ = random_split(
             ood_full,
             [n_ood, n_ood_full - n_ood],
             generator=torch.Generator().manual_seed(split_seed),
         )
-        train_indices = torch.tensor(train_random.indices, dtype=torch.long)
-        eval_indices = torch.tensor(eval_random.indices, dtype=torch.long)
         ood_indices = torch.tensor(ood_random.indices, dtype=torch.long)
         membership_digests = {
             "train": identity.membership_digest(
@@ -778,4 +998,14 @@ def create_dataloaders(
     )
     eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False)
     ood_loader = DataLoader(ood_subset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False)
-    return train_loader, {"eval": eval_loader, "ood": ood_loader}, cast("DefaultDataProcessor", data_processor), split_info
+    test_loaders = {"eval": eval_loader, "ood": ood_loader}
+    if id_test_set is not None:
+        test_loaders["id_test"] = DataLoader(
+            id_test_set,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+        )
+    return train_loader, test_loaders, cast("DefaultDataProcessor", data_processor), split_info

@@ -89,6 +89,7 @@ def _probe_install(
         bootstrap
         + f"""
 from pathlib import Path
+import h5py
 import src
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
@@ -114,6 +115,7 @@ for module in modules:
 assert datasets.build is dataset_build
 assert datasets.generated_batch is dataset_generated_batch
 assert datasets.generated_batch.load_generated_batch is dataset_generated_batch.load_generated_batch
+assert h5py.version.version
 print(src.__file__)
 print(dataset_generated_batch.__file__)
 print(dataset_build.__file__)

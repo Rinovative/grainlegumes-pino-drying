@@ -261,7 +261,7 @@ def plot_capacity_accuracy(
 
 def _finite_numeric(frame: pd.DataFrame, column: str, *, max_cases: int) -> np.ndarray:
     """Return one finite numeric saved prefix."""
-    values = pd.to_numeric(frame.iloc[:max_cases][column], errors="raise").to_numpy(dtype=float)
+    values = np.asarray(pd.to_numeric(frame.iloc[:max_cases][column], errors="raise"), dtype=float)
     if values.size == 0 or not np.isfinite(values).all():
         msg = f"Sensitivity column {column!r} must be finite numeric."
         raise ValueError(msg)

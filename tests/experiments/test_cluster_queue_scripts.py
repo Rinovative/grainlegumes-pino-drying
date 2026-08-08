@@ -21,9 +21,10 @@ import pytest
 from support import configs
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
-_DIRECT_CONFIG_RELATIVE = "configs/tasks/steady_flow/experiments/synthetic/direct.yaml"
+_DIRECT_CONFIG_RELATIVE = "configs/learning/steady_flow/experiments/synthetic/direct.yaml"
 _DIRECT_REPOSITORY_RELATIVE = _DIRECT_CONFIG_RELATIVE
-_OPTUNA_CONFIG_RELATIVE = "configs/tasks/steady_flow/optuna/synthetic.yaml"
+_OPTUNA_CONFIG_RELATIVE = "configs/learning/steady_flow/optuna/synthetic.yaml"
+_CAMPAIGN_CONFIG_RELATIVE = "configs/generation/campaigns/test_support/docker_wrapper.yaml"
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,10 @@ def _harness(
     configs.write_yaml(
         repository / _OPTUNA_CONFIG_RELATIVE,
         optuna_payload,
+    )
+    configs.write_yaml(
+        repository / _CAMPAIGN_CONFIG_RELATIVE,
+        {"schema_kind": "generation_campaign", "schema_version": 1},
     )
 
     binary_dir = tmp_path / "stub commands"
@@ -526,6 +531,40 @@ def _assert_submission(
     assert "captured Docker stdout with spaces" in log_text
     assert "captured Docker stderr with spaces" in log_text
     return log_path
+
+
+def test_dataset_builder_runs_synchronously_without_gpu_queue(
+    tmp_path: Path,
+) -> None:
+    """Run the dataset builder in the bounded CPU-only container path."""
+    harness = _harness(tmp_path)
+
+    result = _run_job(
+        harness,
+        "build-datasets",
+        _CAMPAIGN_CONFIG_RELATIVE,
+    )
+
+    assert result.returncode == 0, result.stderr
+    docker = _capture_arguments(harness.docker_capture)
+    assert docker[:2] == ["run", "--rm"]
+    assert docker[docker.index("--network") + 1] == "none"
+    assert docker[docker.index("--user") + 1] == (f"{os.getuid()}:{os.getgid()}")
+    assert docker[docker.index("--workdir") + 1] == "/workspace/repo"
+    assert "--gpus" not in docker
+    assert f"{harness.repository}:/workspace/repo:ro" in docker
+    assert f"{harness.environment['STORAGE_ROOT']}:/workspace/storage:rw" in docker
+    assert docker[-6:] == [
+        "python",
+        "-m",
+        "src.datasets.dataset_packages",
+        f"/workspace/repo/{_CAMPAIGN_CONFIG_RELATIVE}",
+        "--storage-root",
+        "/workspace/storage",
+    ]
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.path_docker_capture.exists()
 
 
 def test_direct_submission_uses_automatic_gpu_and_forwards_arguments(

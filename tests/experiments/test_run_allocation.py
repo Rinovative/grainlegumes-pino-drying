@@ -14,7 +14,7 @@ import copy
 import multiprocessing as mp
 import queue
 import threading
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -457,7 +457,7 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
     experiments.run.transition_run_status(run_dir, "initializing")
     monkeypatch.setattr(experiments.run.learning.device.torch.cuda, "is_available", lambda: False)
     first_resolution = experiments.run.learning.device.resolve_device("auto")
-    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
+    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=timezone.utc)
     experiments.run.transition_run_status(
         run_dir,
         "running",
@@ -471,7 +471,7 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
 
     experiments.run.transition_run_status(run_dir, "interrupted")
     second_resolution = experiments.run.learning.device.resolve_device("cpu")
-    second_started = datetime(2025, 1, 2, 5, 6, tzinfo=UTC)
+    second_started = datetime(2025, 1, 2, 5, 6, tzinfo=timezone.utc)
     summary = experiments.run.transition_run_status(
         run_dir,
         "running",
@@ -503,7 +503,7 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
     run_dir = experiments.run.allocate_run_directory(tmp_path / "tracking-sessions")
     experiments.run.transition_run_status(run_dir, "initializing")
     resolution = experiments.run.learning.device.resolve_device("cpu")
-    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
+    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=timezone.utc)
     experiments.run.transition_run_status(
         run_dir,
         "running",
@@ -534,7 +534,7 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
     appended = experiments.run.append_runtime_session(
         run_dir,
         resolution,
-        started_at=datetime(2025, 1, 2, 5, 6, tzinfo=UTC),
+        started_at=datetime(2025, 1, 2, 5, 6, tzinfo=timezone.utc),
         session_id="resume-session",
         tracking_state={
             "requested_mode": "online",
