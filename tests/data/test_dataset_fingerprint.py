@@ -103,7 +103,7 @@ def test_dataset_and_generated_identity_require_exact_integer_versions(
     payload = training_dataset_payload_factory()
     invalid_versions = (
         (("schema_version",), (True, 1.0, 2)),
-        (("generated_batch_identity", "schema_version"), (True, 2.0, 1)),
+        (("generated_batch_identity", "schema_version"), (True, 1.0, 2)),
     )
     for path, versions in invalid_versions:
         for schema_version in versions:

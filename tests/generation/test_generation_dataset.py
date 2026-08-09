@@ -65,24 +65,29 @@ def test_steady_flow_publishes_unchanged_task_and_reusable_id_package(
     assert sorted(path.relative_to(raw).as_posix() for path in raw.rglob("*.csv")) == [
         "raw_csv/exports/airflow.csv",
         "raw_csv/inputs/fields.csv",
-        "raw_csv/inputs/scalars.csv",
-        "raw_csv/inputs/schedule.csv",
     ]
     identity = generation.storage.validate_case_hdf5(completed / "case.h5", expected_profile="steady_flow")
     assert identity["git_commit"] == "a" * 40
     with h5py.File(completed / "case.h5", "r") as handle:
-        assert set(handle) == {"coords", "scalar", "static"}
+        assert set(handle) == {
+            "coords",
+            "provenance",
+            "stationary_fixed",
+            "static",
+        }
         assert _dataset(handle, "coords/x").shape == (401,)
         assert _dataset(handle, "coords/x").attrs["unit"] == "m"
         assert _dataset(handle, "coords/y").shape == (251,)
         assert _dataset(handle, "coords/y").attrs["unit"] == "m"
         static = _dataset(handle, "static/fields")
-        assert static.shape == (10, 251, 401)
+        assert static.shape == (8, 251, 401)
         assert static.dtype.name == "float32"
         assert static.compression == "gzip"
         assert static.compression_opts == 4
         assert static.shuffle
-        assert _dataset(handle, "scalar/values").shape == (15,)
+        fixed = _dataset(handle, "stationary_fixed/values")
+        assert fixed.shape == (3,)
+        assert fixed.attrs["runtime_source"] == "canonical_template"
     case = json.loads((completed / "case.json").read_text(encoding="utf-8"))
     assert identity["case_input_id"] == case["case_input_id"]
     assert identity["simulation_case_id"] == case["simulation_case_id"]
@@ -138,8 +143,12 @@ def test_steady_flow_publishes_unchanged_task_and_reusable_id_package(
     assert manifest["source_git_commits"] == ["a" * 40]
     conditioning = manifest["steady_flow_conditioning"]
     assert conditioning["hidden_conditioning"] is False
-    assert conditioning["T_flow_ref_owner"] == "not_used"
-    assert conditioning["package_fixed_physics"] == [{"name": "air_dynamic_viscosity", "unit": "Pa*s", "value": 1.8139e-5}]
+    assert conditioning["T_flow_ref_owner"] == "package_fixed"
+    assert conditioning["package_fixed_physics"] == [
+        {"name": "T_flow_ref", "unit": "K", "value": 300.65},
+        {"name": "p_ref", "unit": "Pa", "value": 101325.0},
+        {"name": "p_out", "unit": "Pa", "value": 0.0},
+    ]
 
     inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
     assert inspection["dataset_view"] == "steady_flow"

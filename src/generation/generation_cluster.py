@@ -336,57 +336,6 @@ def run_local_batch(
     return results
 
 
-def build_slurm_submission_command(
-    config: config_contract.GenerationConfig,
-    selected_indices: Sequence[int],
-    *,
-    plan: ResourcePlan,
-) -> list[str]:
-    """Build one dry-run Slurm submission argument vector for node-owned workers."""
-    if config.execution_values["cluster"]["scheduler_kind"] != "slurm":
-        message = "Slurm command generation requires cluster.scheduler_kind='slurm'."
-        raise ValueError(message)
-    if plan.effective_nodes < 1:
-        message = "No Slurm nodes are required because the selected cases are already complete or empty."
-        raise ValueError(message)
-    selected = tuple(selected_indices)
-    repository = common.paths.get_project_root().resolve()
-    cpus_per_worker = plan.cases_per_node * plan.cores_per_case
-    launcher = repository / "scripts" / "generation_node.sh"
-    worker_command = [
-        str(launcher),
-        str(config.source_path),
-        "--max-nodes",
-        str(plan.max_nodes),
-        "--cases-per-node",
-        str(plan.cases_per_node),
-        "--cores-per-case",
-        str(plan.cores_per_case),
-        "--max-parallel-cases",
-        str(plan.max_parallel_cases),
-        "--cores-per-node",
-        str(plan.cores_per_node),
-        "--remaining-cases",
-        str(plan.remaining_cases),
-        "--case-start",
-        str(selected[0]),
-        "--case-stop",
-        str(selected[-1]),
-    ]
-    wrapped = f"NODE_WORKER_COUNT={plan.effective_nodes} {shlex.join(worker_command)}"
-    return [
-        "sbatch",
-        "--nodes=1",
-        "--ntasks=1",
-        f"--cpus-per-task={cpus_per_worker}",
-        f"--array=0-{plan.effective_nodes - 1}%{plan.effective_nodes}",
-        f"--chdir={repository}",
-        f"--job-name={config.batch_id[:48]}",
-        *config.execution_values["cluster"]["scheduler_options"],
-        f"--wrap={wrapped}",
-    ]
-
-
 @dataclass(frozen=True, slots=True)
 class CampaignTask:
     """One case task identified inside a predeclared campaign batch."""
@@ -459,6 +408,8 @@ def _attempt_campaign_task(
 ) -> runtime_service.CaseRunOutcome | None:
     """Run one campaign task while the runtime owns its authoritative lock."""
     config = campaign.batch(task.batch_name)
+    if runtime_service.runtime_cancellation_requested():
+        return None
     if runtime_service.completed_case_is_valid(
         config,
         task.case_index,
@@ -515,6 +466,7 @@ def run_campaign_worker(
     if worker_count > plan.max_nodes:
         message = "Campaign worker count exceeds the campaign-wide max_nodes cap."
         raise ValueError(message)
+    runtime_service.reset_runtime_cancellation()
     tasks = campaign_tasks(campaign)
     hostname = socket.gethostname()
     node_lock = _campaign_state_root(campaign, storage_root=storage_root) / "nodes" / f"worker_{worker_index:04d}.lock"
@@ -552,6 +504,9 @@ def run_campaign_worker(
                 claimed.append(task)
             else:
                 completed.append(task)
+    if runtime_service.runtime_cancellation_requested():
+        message = f"Campaign worker {worker_index} was interrupted and remains resumable."
+        raise InterruptedError(message)
     failure_limit = int(campaign.execution_values["runtime"]["maximum_failures"])
     if len(failures) >= failure_limit:
         details = "; ".join(f"{task.batch_name}/{task.case_index}: {error}" for task, error in failures)
@@ -629,8 +584,8 @@ def build_campaign_slurm_submission_command(
     ]
     if scheduler_log_directory is not None:
         log_directory = Path(scheduler_log_directory)
-        if not log_directory.is_absolute() or not log_directory.is_dir() or log_directory.is_symlink():
-            message = f"Scheduler log directory must be one existing safe absolute directory: {log_directory}."
+        if not log_directory.is_absolute() or log_directory.is_symlink() or (log_directory.exists() and not log_directory.is_dir()):
+            message = f"Scheduler log directory must be one safe absolute directory: {log_directory}."
             raise ValueError(message)
         command.extend(
             [

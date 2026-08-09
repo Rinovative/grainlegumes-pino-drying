@@ -484,7 +484,7 @@ parameters:
     - C_osw
     units:
       A_osw: '1'
-      B_osw: '1'
+      B_osw: 1/K
       C_osw: '1'
     ood_group: material_properties
     report_symbol: \boldsymbol{\theta}_{\mathrm{Oswin}}
@@ -522,12 +522,3 @@ parameters:
     - schedule
     report_symbol: \bar{T}_{\mathrm{in}}
     description: Time-average inlet temperature derived from the schedule.
-  T_flow_ref:
-    kind: derived
-    unit: K
-    derivation: mean
-    sources:
-    - T_in_ref
-    - T_init
-    report_symbol: T_{\mathrm{flow,ref}}
-    description: Mean of inlet-reference and initial temperatures.

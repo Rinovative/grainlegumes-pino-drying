@@ -5,7 +5,7 @@ generation_case.py
 Create deterministic scientific inputs and isolated COMSOL work directories.
 Responsibilities:
   - Resolve one typed sample into spatial, scalar, and schedule adapter tables
-  - Derive distinct profile-neutral case-input and profile-bound simulation IDs
+  - Derive exact adapter-input and profile-bound simulation identities
   - Copy one immutable template into a fresh disposable work directory
 Design principles:
   - Adapter bytes are deterministic, case-local, and identity-bound
@@ -22,9 +22,7 @@ from __future__ import annotations
 import csv
 import io
 import math
-import os
 import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,13 +35,14 @@ from . import generation_profiles as profiles
 from . import generation_sampling as sampling_service
 from . import generation_schedule as schedule_service
 from . import generation_source as source_service
+from . import generation_workspace as workspace_service
 
 CASE_SCHEMA_KIND = "simulation_case"
-CASE_SCHEMA_VERSION = 4
+CASE_SCHEMA_VERSION = 1
 
 
 def compute_case_input_id(payload: dict[str, Any]) -> str:
-    """Compute the profile-neutral scientific input identity from persisted evidence."""
+    """Compute the exact generated-input identity from persisted evidence."""
     try:
         identity_payload = {
             "schema_version": payload["schema_version"],
@@ -99,9 +98,30 @@ class PreparedCase:
 
     bundle: CaseBundle
     work_directory: Path
+    work_root: Path
+    workspace_run_id: str
+    workspace_marker: Path
     model_path: Path
     exports_directory: Path
     runtime_directory: Path
+
+
+class CasePreparationError(RuntimeError):
+    """Report preparation failure while preserving marked-workspace identity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        work_directory: Path,
+        work_root: Path,
+        workspace_run_id: str,
+    ) -> None:
+        """Initialize one preparation error with its cleanup boundaries."""
+        super().__init__(message)
+        self.work_directory = work_directory
+        self.work_root = work_root
+        self.workspace_run_id = workspace_run_id
 
 
 def _format_number(value: float) -> str:
@@ -138,12 +158,16 @@ def _write_spatial_file(destination: Path, fields: fields_service.SpatialFields,
 def _write_scalar_file(
     destination: Path,
     spec: dict[str, Any],
+    profile_id: str,
     values: dict[str, Any],
     units: dict[str, str],
 ) -> tuple[Path, list[dict[str, Any]]]:
-    """Write the exact generic long-form scalar adapter."""
+    """Write and validate the sole profile-owned long-form scalar handoff."""
+    field_names = profiles.scalar_input_fields(profile_id)
+    expected_units = profiles.scalar_input_units(profile_id)
+    package_fixed = {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
     entries: list[dict[str, Any]] = []
-    for name in profiles.SCALAR_INPUT_FIELDS:
+    for name, expected_unit in zip(field_names, expected_units, strict=True):
         if name not in values:
             msg = f"Required scalar adapter value {name!r} is unresolved."
             raise ValueError(msg)
@@ -152,10 +176,17 @@ def _write_scalar_file(
             msg = f"Required scalar adapter value {name!r} is non-finite."
             raise ValueError(msg)
         unit = units.get(name)
-        if not isinstance(unit, str) or not unit:
-            msg = f"Required scalar adapter unit {name!r} is unresolved."
+        if unit != expected_unit:
+            msg = f"Scalar adapter unit for {name!r} must be {expected_unit!r}, got {unit!r}."
             raise ValueError(msg)
-        entries.append({"name": name, "value": number, "unit": unit})
+        entries.append(
+            {
+                "name": name,
+                "value": number,
+                "unit": unit,
+                "owner": "package_fixed" if name in package_fixed else "case_dependent",
+            }
+        )
     rows = [["name", "value", "unit"]]
     rows.extend([[entry["name"], _format_number(entry["value"]), entry["unit"]] for entry in entries])
     path = destination / spec["filename"]
@@ -176,67 +207,132 @@ def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: sche
     return path
 
 
-def _require_empty_destination(destination: Path) -> None:
-    """Create one new bundle destination or require an existing empty directory."""
+def _require_empty_destination(
+    destination: Path,
+    *,
+    allow_workspace_marker: bool,
+) -> None:
+    """Create one new bundle destination or require only its ownership marker."""
     if destination.exists() and not destination.is_dir():
         msg = f"Case bundle destination is not a directory: {destination}"
         raise FileExistsError(msg)
     destination.mkdir(parents=True, exist_ok=True)
-    if any(destination.iterdir()):
-        msg = f"Case bundle destination must be empty: {destination}"
+    allowed = {workspace_service.CASE_WORKSPACE_MARKER} if allow_workspace_marker else set()
+    actual = {entry.name for entry in destination.iterdir()}
+    if actual != allowed:
+        msg = f"Case bundle destination must contain exactly {sorted(allowed)} before generation: {destination}"
         raise FileExistsError(msg)
 
 
 def _subseeds(config: config_contract.GenerationConfig, case_index: int) -> dict[str, int]:
-    """Return stable case-owned field and schedule sub-seeds."""
+    """Return only the profile-owned stable case sub-seeds."""
     seed_base = config.seed_base
     if seed_base is None:
         message = f"Batch {config.batch_name!r} has no resolved seed."
         raise ValueError(message)
-    return {
-        label: config_contract.derive_seed(seed_base, "case", str(case_index), label)
-        for label in ("bed", "pressure_bc", "initial_moisture", "schedule_shared", "schedule_independent")
-    }
+    labels = ["bed", "pressure_bc"]
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        labels.extend(("initial_moisture", "schedule_shared", "schedule_independent"))
+    return {label: config_contract.derive_seed(seed_base, "case", str(case_index), label) for label in labels}
 
 
 def generate_case_input_bundle(
     config: config_contract.GenerationConfig,
     case_index: int,
     destination: Path | str,
+    *,
+    _allow_workspace_marker: bool = False,
 ) -> CaseBundle:
-    """Generate one deterministic, profile-pairable scientific input bundle."""
+    """Generate one deterministic profile-specific scientific input bundle."""
     case_id = config.case_id(case_index)
     case_seed = config.case_seed(case_index)
     assignment = config.case_assignment(case_index)
     bundle_dir = Path(destination).expanduser().resolve()
-    _require_empty_destination(bundle_dir)
+    _require_empty_destination(
+        bundle_dir,
+        allow_workspace_marker=_allow_workspace_marker,
+    )
     sample = sampling_service.sample_case(config, case_index)
     values = dict(sample.values)
-    subseeds = _subseeds(config, case_index)
-    schedule = schedule_service.generate_schedule(
-        values,
-        config.scientific_values["time"],
-        config.scientific_values["scientific_fixed_values"],
-        seeds={name: subseeds[name] for name in ("schedule_shared", "schedule_independent")},
-    )
-    values.update(schedule.derived_scalars)
-    values["T_flow_ref"] = 0.5 * (float(values["T_in_ref"]) + float(values["T_init"]))
-    values["f_wet_dm_max"] = config.scientific_values["scientific_fixed_values"]["f_wet_dm_max"]
     units = dict(sample.units)
-    units.update({"f_wet_dm_max": "1", "T_in_ref": "K", "T_flow_ref": "K"})
+    fixed = config.scientific_values["scientific_fixed_values"]
+    stationary_fixed_entries: list[dict[str, Any]] = []
+    for name, unit in zip(
+        profiles.STATIONARY_FIXED_FIELDS,
+        profiles.STATIONARY_FIXED_UNITS,
+        strict=True,
+    ):
+        value = fixed[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            msg = f"Package-fixed stationary scalar {name!r} is unresolved."
+            raise ValueError(msg)
+        number = float(value)
+        expected = profiles.STATIONARY_FIXED_VALUES[name]
+        if number != expected:
+            msg = f"Package-fixed stationary value {name!r} does not match the canonical template contract."
+            raise ValueError(msg)
+        values[name] = number
+        units[name] = unit
+        stationary_fixed_entries.append(
+            {
+                "name": name,
+                "value": number,
+                "unit": unit,
+                "owner": "package_fixed",
+                "runtime_source": "canonical_template",
+            }
+        )
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        values["f_wet_dm_max"] = fixed["f_wet_dm_max"]
+        units["f_wet_dm_max"] = "1"
+    subseeds = _subseeds(config, case_index)
+
+    schedule: schedule_service.Schedule | None = None
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        schedule = schedule_service.generate_schedule(
+            values,
+            config.scientific_values["time"],
+            fixed,
+            seeds={name: subseeds[name] for name in ("schedule_shared", "schedule_independent")},
+        )
+        values.update(schedule.derived_scalars)
+        units["T_in_ref"] = "K"
+
     family_contract = config.scientific_values["material"]
+    spatial_seed_names: tuple[str, ...] = ("bed", "pressure_bc")
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        spatial_seed_names = (*spatial_seed_names, "initial_moisture")
     fields = fields_service.generate_spatial_fields(
+        config.profile.id,
         config.scientific_values["grid"],
         values,
-        seeds={name: subseeds[name] for name in ("bed", "pressure_bc", "initial_moisture")},
-        family_bounds=family_contract["initial_moisture_bounds"],
+        seeds={name: subseeds[name] for name in spatial_seed_names},
+        family_bounds=(family_contract["initial_moisture_bounds"] if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE else None),
     )
     input_contract = config.scientific_values["input_contract"]
     spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
-    scalar_path, scalar_entries = _write_scalar_file(bundle_dir, input_contract["scalar"], values, units)
-    schedule_path = _write_schedule_file(bundle_dir, input_contract["schedule"], schedule)
-    input_paths = tuple(sorted((spatial_path, scalar_path, schedule_path), key=lambda item: item.name))
-    input_files = {path.name: {"sha256": common.serialization.file_sha256(path), "size_bytes": path.stat().st_size} for path in input_paths}
+    input_paths_list = [spatial_path]
+    scalar_path: Path | None = None
+    scalar_entries: list[dict[str, Any]] | None = None
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        scalar_path, scalar_entries = _write_scalar_file(
+            bundle_dir,
+            input_contract["scalar"],
+            config.profile.id,
+            values,
+            units,
+        )
+        input_paths_list.append(scalar_path)
+    if schedule is not None:
+        input_paths_list.append(_write_schedule_file(bundle_dir, input_contract["schedule"], schedule))
+    input_paths = tuple(sorted(input_paths_list, key=lambda item: item.name))
+    input_files = {
+        path.name: {
+            "sha256": common.serialization.file_sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
+        for path in input_paths
+    }
     export_contract_sha256 = common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
     steady_flow_conditioning = config.scientific_values["steady_flow_conditioning"]
     steady_flow_conditioning_digest = common.serialization.canonical_json_sha256(steady_flow_conditioning)
@@ -265,14 +361,14 @@ def generate_case_input_bundle(
         "airflow_source": config.profile.airflow_source,
         "steady_flow_conditioning": steady_flow_conditioning,
         "steady_flow_conditioning_digest": steady_flow_conditioning_digest,
+        "stationary_fixed_ownership": config.scientific_values["stationary_fixed_ownership"],
+        "stationary_fixed_values": stationary_fixed_entries,
         "seed_evidence": seed_evidence,
         "block_provenance": sample.block_provenance,
         "sampled_values": values,
         "sampled_units": units,
         "coupled_selections": sample.coupled_selections,
         "spatial_diagnostics": fields.metadata,
-        "schedule_diagnostics": schedule.metadata,
-        "scalars": scalar_entries,
         "input_contract": input_contract,
         "template": {
             "relative_path": config.profile.template_relative_path,
@@ -282,6 +378,17 @@ def generate_case_input_bundle(
         "export_contract_sha256": export_contract_sha256,
         "input_files": input_files,
     }
+    if scalar_path is not None and scalar_entries is not None:
+        case_payload["scalar_handoff"] = {
+            "mechanism": "case_local_long_form_csv",
+            "filename": scalar_path.name,
+            "fresh_per_case": True,
+            "runtime_validation": "required",
+            "entries": scalar_entries,
+        }
+        case_payload["scalars"] = scalar_entries
+    if schedule is not None:
+        case_payload["schedule_diagnostics"] = schedule.metadata
     case_payload["case_input_id"] = compute_case_input_id(case_payload)
     case_payload["simulation_case_id"] = compute_simulation_case_id(case_payload)
     common.serialization.atomic_write_json(bundle_dir / "case.json", case_payload)
@@ -293,28 +400,6 @@ def generate_case_input_bundle(
         case_payload=case_payload,
         input_paths=input_paths,
     )
-
-
-def _resolve_work_root(
-    config: config_contract.GenerationConfig,
-    *,
-    storage_root: Path | str | None,
-    work_root: Path | str | None,
-) -> Path:
-    """Resolve a node-local work root, falling back to private generation state."""
-    if work_root is not None:
-        root = Path(work_root).expanduser()
-    elif os.environ.get("TMPDIR"):
-        root = Path(os.environ["TMPDIR"]).expanduser()
-    else:
-        root = common.paths.get_generation_state_root(storage_root=storage_root) / config.profile.id / config.batch_id / "work"
-    root.mkdir(parents=True, exist_ok=True)
-    canonical = root.resolve()
-    project_root = common.paths.get_project_root().resolve()
-    if canonical == project_root or canonical.is_relative_to(project_root):
-        msg = f"Case work directories cannot be created inside the repository: {canonical}"
-        raise ValueError(msg)
-    return canonical
 
 
 def _require_template_digest(path: Path, expected_sha256: str, *, message: str) -> None:
@@ -337,11 +422,22 @@ def prepare_case_work_directory(
         config.template_sha256,
         message=f"COMSOL template changed after configuration preflight: {config.template_path}",
     )
-    root = _resolve_work_root(config, storage_root=storage_root, work_root=work_root)
-    work_directory = Path(tempfile.mkdtemp(prefix=f"{case_id}_work_", dir=root)).resolve()
+    storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    work_directory, root, marker_path = workspace_service.create_case_workspace(
+        config,
+        case_id=case_id,
+        storage_root=storage,
+        work_root=work_root,
+    )
+    run_id = workspace_service.workspace_run_id(config)
     model_path = work_directory / "model.mph"
     try:
-        bundle = generate_case_input_bundle(config, case_index, work_directory)
+        bundle = generate_case_input_bundle(
+            config,
+            case_index,
+            work_directory,
+            _allow_workspace_marker=True,
+        )
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(
             model_path,
@@ -357,12 +453,20 @@ def prepare_case_work_directory(
             config.template_sha256,
             message=f"Source COMSOL template changed during case preparation: {config.template_path}",
         )
-    except BaseException:
-        shutil.rmtree(work_directory, ignore_errors=True)
-        raise
+    except BaseException as error:
+        message = f"Could not prepare isolated case workspace {work_directory}: {error}"
+        raise CasePreparationError(
+            message,
+            work_directory=work_directory,
+            work_root=root,
+            workspace_run_id=run_id,
+        ) from error
     return PreparedCase(
         bundle=bundle,
         work_directory=work_directory,
+        work_root=root,
+        workspace_run_id=run_id,
+        workspace_marker=marker_path,
         model_path=model_path,
         exports_directory=exports_directory,
         runtime_directory=runtime_directory,

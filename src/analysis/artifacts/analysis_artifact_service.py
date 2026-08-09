@@ -760,7 +760,7 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
                     "formula": "pressure_inlet_mse + pressure_outlet_mean_square",
                     "unit": "Pa^2",
                 },
-                "pressure_inlet_mse": {"formula": "mean_inlet((p-p_bc)**2)", "unit": "Pa^2"},
+                "pressure_inlet_mse": {"formula": "mean_inlet((p-p_in_bc)**2)", "unit": "Pa^2"},
                 "pressure_outlet_mean_square": {"formula": "mean_outlet(p)**2", "unit": "Pa^2"},
             },
             "array_definitions": {
@@ -1279,7 +1279,7 @@ def _validate_npz_payload(
         "kappa_encoded",
         "kappa",
         "kappa_names",
-        "p_bc",
+        "p_in_bc",
         "coordinates",
         "Rx",
         "Ry",
@@ -1391,9 +1391,9 @@ def _validate_npz_payload(
         if kappa.shape != kappa_encoded.shape or kappa.shape != (len(kappa_names), *spatial_shape):
             msg = f"Cached NPZ permeability arrays do not match kappa_names or spatial shape: {path}"
             raise ArtifactCacheError(msg)
-        p_bc = _require_finite_npz_array(payload["p_bc"], label=f"Cached NPZ {path} p_bc", rank=3)
-        if p_bc.shape != (1, *spatial_shape):
-            msg = f"Cached NPZ p_bc shape does not match the task grid: {path}"
+        p_in_bc = _require_finite_npz_array(payload["p_in_bc"], label=f"Cached NPZ {path} p_in_bc", rank=3)
+        if p_in_bc.shape != (1, *spatial_shape):
+            msg = f"Cached NPZ p_in_bc shape does not match the task grid: {path}"
             raise ArtifactCacheError(msg)
         coordinates = _require_finite_npz_array(
             payload["coordinates"],

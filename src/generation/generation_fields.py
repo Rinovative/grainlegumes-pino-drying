@@ -28,6 +28,7 @@ import numpy as np
 from scipy import signal
 
 from . import generation_config as config_contract
+from . import generation_profiles as profiles
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -430,20 +431,30 @@ def _initial_moisture(
 
 
 def generate_spatial_fields(
+    simulation_profile: str,
     grid: Mapping[str, Any],
     values: Mapping[str, Any],
     *,
     seeds: Mapping[str, int],
-    family_bounds: Mapping[str, float],
+    family_bounds: Mapping[str, float] | None,
 ) -> SpatialFields:
-    """Generate one deterministic field set from physically independent streams."""
-    if set(seeds) != {"bed", "pressure_bc", "initial_moisture"} or any(
+    """Generate one deterministic profile-owned spatial input set."""
+    if simulation_profile == profiles.STEADY_FLOW_PROFILE:
+        required_seeds = {"bed", "pressure_bc"}
+    elif simulation_profile == profiles.TRANSIENT_DRYING_PROFILE:
+        required_seeds = {"bed", "pressure_bc", "initial_moisture"}
+    else:
+        available = ", ".join(profiles.available_profiles())
+        msg = f"Unknown simulation_profile {simulation_profile!r}. Available profiles: {available}."
+        raise ValueError(msg)
+    if set(seeds) != required_seeds or any(
         isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**32 - 1 for seed in seeds.values()
     ):
-        msg = "Spatial generation requires exact uint32 bed, pressure_bc, and initial_moisture seeds."
+        msg = f"Spatial generation for {simulation_profile!r} requires exact uint32 seeds {sorted(required_seeds)}."
         raise ValueError(msg)
     length_x = float(grid["Lx"])
     length_y = float(grid["Ly"])
+    length_z = float(grid["Lz"])
     resolution_x = float(grid["dx"])
     resolution_y = float(grid["dy"])
     count_x = int(grid["nx"])
@@ -486,20 +497,6 @@ def generate_spatial_fields(
         values=values,
         random=np.random.default_rng(seeds["pressure_bc"]),
     )
-    moisture, moisture_metadata = _initial_moisture(
-        x_grid.shape,
-        resolution=resolution_x,
-        length_x=length_x,
-        values=values,
-        family_bounds=family_bounds,
-        random=np.random.default_rng(seeds["initial_moisture"]),
-    )
-    calibration_porosity = _finite(values, "eps_bed_cal_ref")
-    if not 0 < calibration_porosity < 1:
-        msg = "eps_bed_cal_ref must lie strictly inside (0, 1)."
-        raise ValueError(msg)
-    dry_bulk_density = _finite(values, "rho_bu_dry_ref") * (1.0 - porosity) / (1.0 - calibration_porosity)
-    initial_water = dry_bulk_density * moisture
     columns = {
         "x": x_grid,
         "y": y_grid,
@@ -507,53 +504,89 @@ def generate_spatial_fields(
         "Kxy": kxy,
         "Kyy": kyy,
         "eps_bed": porosity,
-        "p_bc": pressure,
-        "X_0_db_field": moisture,
-        "rho_bu_dry": dry_bulk_density,
-        "w_gr_0": initial_water,
+        "p_in_bc": pressure,
     }
-    if not all(array.shape == x_grid.shape and np.isfinite(array).all() for array in columns.values()):
-        msg = "Generated spatial fields must share one finite Cartesian shape."
-        raise ValueError(msg)
-    return SpatialFields(
-        shape=x_grid.shape,
-        columns=columns,
-        metadata={
-            "generator_version": config_contract.GENERATOR_VERSION,
-            "random_stream": "numpy.default_rng",
-            "seeds": dict(seeds),
-            "geometry": {
-                "Lx": length_x,
-                "Ly": length_y,
-                "dx": resolution_x,
-                "dy": resolution_y,
-                "nx": count_x,
-                "ny": count_y,
-                "boundaries_included": True,
-                "units": {"Lx": "m", "Ly": "m", "dx": "m", "dy": "m", "nx": "1", "ny": "1"},
+    metadata: dict[str, Any] = {
+        "generator_version": config_contract.GENERATOR_VERSION,
+        "simulation_profile": simulation_profile,
+        "random_stream": "numpy.default_rng",
+        "seeds": dict(seeds),
+        "geometry": {
+            "Lx": length_x,
+            "Ly": length_y,
+            "Lz": length_z,
+            "dx": resolution_x,
+            "dy": resolution_y,
+            "nx": count_x,
+            "ny": count_y,
+            "mesh_elements_x": count_x - 1,
+            "mesh_elements_y": count_y - 1,
+            "boundaries_included": True,
+            "units": {
+                "Lx": "m",
+                "Ly": "m",
+                "Lz": "m",
+                "dx": "m",
+                "dy": "m",
+                "nx": "1",
+                "ny": "1",
+                "mesh_elements_x": "1",
+                "mesh_elements_y": "1",
             },
-            "structure": structure_metadata,
-            "permeability": permeability_metadata,
-            "porosity": porosity_metadata,
-            "pressure_boundary": pressure_metadata,
-            "initial_moisture": moisture_metadata,
-            "field_units": {
-                "x": "m",
-                "y": "m",
-                "Kxx": "m^2",
-                "Kxy": "m^2",
-                "Kyy": "m^2",
-                "eps_bed": "1",
-                "p_bc": "Pa",
+        },
+        "structure": structure_metadata,
+        "permeability": permeability_metadata,
+        "porosity": porosity_metadata,
+        "pressure_boundary": pressure_metadata,
+        "field_units": {
+            "x": "m",
+            "y": "m",
+            "Kxx": "m^2",
+            "Kxy": "m^2",
+            "Kyy": "m^2",
+            "eps_bed": "1",
+            "p_in_bc": "Pa",
+        },
+    }
+    if simulation_profile == profiles.TRANSIENT_DRYING_PROFILE:
+        if family_bounds is None:
+            msg = "Transient spatial generation requires material-family initial-moisture bounds."
+            raise ValueError(msg)
+        moisture, moisture_metadata = _initial_moisture(
+            x_grid.shape,
+            resolution=resolution_x,
+            length_x=length_x,
+            values=values,
+            family_bounds=family_bounds,
+            random=np.random.default_rng(seeds["initial_moisture"]),
+        )
+        calibration_porosity = _finite(values, "eps_bed_cal_ref")
+        if not 0 < calibration_porosity < 1:
+            msg = "eps_bed_cal_ref must lie strictly inside (0, 1)."
+            raise ValueError(msg)
+        dry_bulk_density = _finite(values, "rho_bu_dry_ref") * (1.0 - porosity) / (1.0 - calibration_porosity)
+        initial_water = dry_bulk_density * moisture
+        columns["X_0_db_field"] = moisture
+        metadata["initial_moisture"] = moisture_metadata
+        metadata["field_units"].update(
+            {
                 "X_0_db_field": "kg/kg",
                 "rho_bu_dry": "kg/m^3",
                 "w_gr_0": "kg/m^3",
-            },
-            "derived_fields": {
-                "rho_bu_dry_formula": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
-                "w_gr_0_formula": "rho_bu_dry*X_0_db_field",
-                "rho_bu_dry_sha256": _array_sha256(dry_bulk_density),
-                "w_gr_0_sha256": _array_sha256(initial_water),
-            },
-        },
-    )
+            }
+        )
+        metadata["derived_fields"] = {
+            "rho_bu_dry_formula": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
+            "w_gr_0_formula": "rho_bu_dry*X_0_db_field",
+            "initial_compartment_values": "w_surf(0)=w_int(0)=w_gr_0",
+            "rho_bu_dry_sha256": _array_sha256(dry_bulk_density),
+            "w_gr_0_sha256": _array_sha256(initial_water),
+        }
+    expected_columns = profiles.spatial_input_fields(simulation_profile)
+    if tuple(columns) != expected_columns:
+        msg = f"Generated spatial columns do not match the {simulation_profile!r} contract."
+        raise RuntimeError(msg)
+    if not all(array.shape == x_grid.shape and np.isfinite(array).all() for array in columns.values()):
+        msg = "Generated spatial fields must share one finite Cartesian shape."
+        raise ValueError(msg)
+    return SpatialFields(shape=x_grid.shape, columns=columns, metadata=metadata)

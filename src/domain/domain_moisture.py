@@ -42,17 +42,27 @@ def wet_basis_to_dry_basis(X_wb: Any) -> np.ndarray:
     return wet_basis / (1.0 - wet_basis)
 
 
-def granular_water_content(w_surf: Any, w_int: Any) -> np.ndarray:
-    """Return granular-phase water mass density ``w_gr = w_surf + w_int``."""
+def granular_water_content(w_surf: Any, w_int: Any, f_surf: Any) -> np.ndarray:
+    """Return weighted granular water f_surf*w_surf + (1-f_surf)*w_int."""
     surface = np.asarray(w_surf)
     internal = np.asarray(w_int)
-    if surface.shape != internal.shape:
-        message = "w_surf and w_int must have identical shapes."
+    fraction = np.asarray(f_surf)
+    try:
+        surface, internal, fraction = np.broadcast_arrays(surface, internal, fraction)
+    except ValueError as error:
+        message = "w_surf, w_int, and f_surf must be broadcast-compatible."
+        raise ValueError(message) from error
+    if (
+        not np.isfinite(surface).all()
+        or not np.isfinite(internal).all()
+        or not np.isfinite(fraction).all()
+        or np.any(surface < 0)
+        or np.any(internal < 0)
+        or np.any((fraction <= 0) | (fraction >= 1))
+    ):
+        message = "Water states must be finite and non-negative and f_surf must lie strictly inside (0, 1)."
         raise ValueError(message)
-    if not np.isfinite(surface).all() or not np.isfinite(internal).all() or np.any(surface < 0) or np.any(internal < 0):
-        message = "w_surf and w_int must contain finite non-negative mass densities."
-        raise ValueError(message)
-    return surface + internal
+    return fraction * surface + (1.0 - fraction) * internal
 
 
 def dry_basis_moisture(w_gr: Any, rho_bu_dry: Any) -> np.ndarray:

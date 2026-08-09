@@ -86,8 +86,8 @@ def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     x_grid = x_grid.unsqueeze(0)
     y_grid = y_grid.unsqueeze(0)
     zeros = torch.zeros_like(x_grid)
-    p_bc = zeros.clone()
-    p_bc[:, 0, :] = 1.0
+    p_in_bc = zeros.clone()
+    p_in_bc[:, 0, :] = 1.0
 
     coordinate_values = iter((x_grid, y_grid))
     input_by_field: dict[str, torch.Tensor] = {}
@@ -99,7 +99,7 @@ def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         elif field.role == "porosity":
             input_by_field[field.name] = torch.full_like(x_grid, 0.5)
         elif field.role == "boundary":
-            input_by_field[field.name] = p_bc
+            input_by_field[field.name] = p_in_bc
         else:
             msg = f"unsupported steady-flow fixture role: {field.role}"
             raise AssertionError(msg)

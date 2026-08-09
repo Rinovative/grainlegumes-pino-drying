@@ -50,7 +50,7 @@ Artifact contract:
         - div_eps_velocity_mse  : mean(div(eps*u)**2), unit 1/s^2
 
         # Boundary metrics (full-grid inlet/outlet masks, unit Pa^2)
-        - pressure_inlet_mse            : mean_inlet((p-p_bc)**2)
+        - pressure_inlet_mse            : mean_inlet((p-p_in_bc)**2)
         - pressure_outlet_mean_square   : mean_outlet(p)**2
         - pressure_boundary_mse         : sum of the preceding two terms
 
@@ -79,7 +79,7 @@ Artifact contract:
         - kappa_encoded: (C_kappa, H, W) task-stored permeability representations
         - kappa        : (C_kappa, H, W) physical permeability components
         - kappa_names  : list[str], same order as kappa channels
-        - p_bc         : (1, H, W) pressure boundary condition
+        - p_in_bc         : (1, H, W) pressure boundary condition
         - coordinates  : (2, H, W) physical x/y coordinate fields
 
         # Declared inputs and targets retained for downstream analysis
@@ -1107,8 +1107,8 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             msg = f"Source metadata contains reserved artifact identity keys and cannot be preserved unambiguously: {sorted(reserved_meta_keys)}."
             raise KeyError(msg)
         # Pressure boundary condition (stored for diagnostics)
-        p_bc_idx = task.input_names.index("p_bc")
-        p_bc = x[:, p_bc_idx : p_bc_idx + 1].detach().cpu()
+        p_bc_idx = task.input_names.index("p_in_bc")
+        p_in_bc = x[:, p_bc_idx : p_bc_idx + 1].detach().cpu()
 
         # Permeability fields (no scalar stats here)
         kappa_info = extract_kappa(
@@ -1274,7 +1274,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             "kappa_encoded": kappa_info["kappa_encoded"].squeeze(0).cpu().numpy(),
             "kappa": kappa_info["kappa"].squeeze(0).cpu().numpy(),
             "kappa_names": np.asarray(kappa_names),
-            "p_bc": p_bc.squeeze(0).numpy(),
+            "p_in_bc": p_in_bc.squeeze(0).numpy(),
             "coordinates": x_raw[[task.input_names.index("x"), task.input_names.index("y")]],
             "meta": json.dumps(meta_clean),
             "x_raw": x_raw,

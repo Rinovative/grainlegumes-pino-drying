@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 BATCH_MANIFEST_SCHEMA_KIND = "simulation_batch_manifest"
-BATCH_MANIFEST_SCHEMA_VERSION = 2
+BATCH_MANIFEST_SCHEMA_VERSION = 1
 _CASE_ID_PATTERN = re.compile(r"case_[0-9]{4,}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -428,7 +428,7 @@ def _steady_flow_fields(
         "Kxy": raw_kxy / np.sqrt(raw_kxx * raw_kyy),
         "Kyy": np.log10(raw_kyy),
         "eps_bed": static["eps_bed"],
-        "p_bc": static["p_bc"],
+        "p_in_bc": static["p_in_bc"],
         "p": static["p"],
         "u": static["u"],
         "v": static["v"],
@@ -484,7 +484,7 @@ def interpret_generated_case(
         static_dataset = _hdf5_dataset(handle, "static/fields")
         static_values = np.asarray(static_dataset, dtype=np.float32)
         names = _string_list_attribute(static_dataset, "field_names")
-    if names != list(generation_profiles.STATIC_FIELD_NAMES):
+    if names != list(generation_profiles.static_field_names(str(manifest["simulation_profile"]))):
         msg = f"Canonical static HDF5 field order is invalid for {case_id}."
         raise ValueError(msg)
     static = {name: static_values[index] for index, name in enumerate(names)}
@@ -507,7 +507,7 @@ def interpret_generated_case(
         "seed": raw_case["seed_evidence"]["case_seed"],
         "parameters": raw_case["sampled_values"],
         "geometry": raw_case["spatial_diagnostics"]["geometry"],
-        "schedule_class": raw_case["schedule_diagnostics"]["schedule_class"],
+        "schedule_class": (raw_case["schedule_diagnostics"]["schedule_class"] if "schedule_diagnostics" in raw_case else None),
     }
     source = {
         "case_id": case_id,

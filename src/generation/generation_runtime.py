@@ -10,7 +10,7 @@ Responsibilities:
 Design principles:
   - Scientific configuration and execution provenance are physically separate
   - Successful CSV and solved-model retention is explicit and off by default
-  - Failed work directories retain adapters and solver evidence for inspection
+  - Failed scratch is removed only after compact persistent evidence is complete
 This module does NOT:
   - Modify COMSOL templates or infer internal tags, expressions, or signs
   - Publish a parallel canonical CSV learning view
@@ -25,8 +25,11 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,14 +41,16 @@ from . import generation_case as case_service
 from . import generation_config as config_contract
 from . import generation_source as source_service
 from . import generation_storage as storage_service
+from . import generation_workspace as workspace_service
 
-PUBLICATION_SCHEMA_VERSION = 2
+PUBLICATION_SCHEMA_VERSION = 1
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
 CASE_FAILURE_SCHEMA_VERSION = 1
 _CASE_FAILURE_KEYS = frozenset(
     {
         "schema_kind",
         "schema_version",
+        "state",
         "simulation_profile",
         "batch_id",
         "batch_identity",
@@ -57,17 +62,142 @@ _CASE_FAILURE_KEYS = frozenset(
         "execution",
         "error",
         "work_directory",
+        "input_files",
+        "template_sha256",
+        "missing_or_invalid_artifacts",
+        "log_tail",
+        "scratch_cleanup",
+    }
+)
+_FAILURE_EXECUTION_KEYS = frozenset(
+    {
+        "worker_slot",
+        "scheduler_kind",
+        "allocated_node",
+        "hostname",
+        "scheduler_job_id",
+        "scheduler_array_job_id",
+        "scheduler_array_task_id",
+        "scheduler_step_id",
+        "command",
+        "cwd",
+        "exit_code",
+        "timed_out",
+        "configured_modules",
+        "loaded_modules",
     }
 )
 
 
 class CaseExecutionError(RuntimeError):
-    """Report one failed case while preserving its work-directory location."""
+    """Report one failed case with structured execution evidence."""
 
-    def __init__(self, message: str, *, work_directory: Path) -> None:
-        """Initialize one retained-work failure."""
-        super().__init__(f"{message} Work directory retained at: {work_directory}")
+    def __init__(
+        self,
+        message: str,
+        *,
+        work_directory: Path,
+        command: tuple[str, ...] = (),
+        exit_code: int | None = None,
+        timed_out: bool = False,
+        missing_or_invalid_artifacts: tuple[str, ...] = (),
+    ) -> None:
+        """Initialize one structured case-execution failure."""
+        super().__init__(message)
         self.work_directory = work_directory
+        self.command = command
+        self.cwd = work_directory
+        self.exit_code = exit_code
+        self.timed_out = timed_out
+        self.missing_or_invalid_artifacts = missing_or_invalid_artifacts
+
+
+class CaseCleanupError(RuntimeError):
+    """Report cleanup failure after persistent outcome evidence exists."""
+
+
+class CaseInterruptedError(InterruptedError):
+    """Report cooperative campaign cancellation with solver evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        work_directory: Path,
+        command: tuple[str, ...],
+        exit_code: int | None,
+    ) -> None:
+        """Initialize one structured cancellation error."""
+        super().__init__(message)
+        self.work_directory = work_directory
+        self.cwd = work_directory
+        self.command = command
+        self.exit_code = exit_code
+        self.timed_out = False
+        self.missing_or_invalid_artifacts: tuple[str, ...] = ()
+
+
+_ACTIVE_SOLVER_LOCK = threading.Lock()
+_ACTIVE_SOLVERS: dict[int, subprocess.Popen[str]] = {}
+_RUNTIME_CANCELLATION = threading.Event()
+
+
+def reset_runtime_cancellation() -> None:
+    """Clear cooperative cancellation before one campaign worker starts."""
+    with _ACTIVE_SOLVER_LOCK:
+        if _ACTIVE_SOLVERS:
+            message = "Cannot reset runtime cancellation while solvers remain active."
+            raise RuntimeError(message)
+        _RUNTIME_CANCELLATION.clear()
+
+
+def runtime_cancellation_requested() -> bool:
+    """Return whether the current campaign worker received cancellation."""
+    return _RUNTIME_CANCELLATION.is_set()
+
+
+def _signal_solver_termination(process: subprocess.Popen[str]) -> None:
+    """Best-effort TERM one solver-owned process group."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+
+def request_runtime_cancellation() -> None:
+    """Request cancellation and TERM every currently registered solver group."""
+    _RUNTIME_CANCELLATION.set()
+    with _ACTIVE_SOLVER_LOCK:
+        processes = tuple(_ACTIVE_SOLVERS.values())
+    for process in processes:
+        _signal_solver_termination(process)
+
+
+def _register_solver(process: subprocess.Popen[str]) -> None:
+    """Register one solver and close the signal-before-registration race."""
+    with _ACTIVE_SOLVER_LOCK:
+        _ACTIVE_SOLVERS[process.pid] = process
+    if runtime_cancellation_requested():
+        _signal_solver_termination(process)
+
+
+def _unregister_solver(process: subprocess.Popen[str]) -> None:
+    """Remove one completed or terminated solver from cancellation tracking."""
+    with _ACTIVE_SOLVER_LOCK:
+        _ACTIVE_SOLVERS.pop(process.pid, None)
+
+
+def _terminate_solver_and_wait(process: subprocess.Popen[str]) -> int:
+    """TERM then KILL one solver group and return its final status."""
+    _signal_solver_termination(process)
+    try:
+        return process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        return process.wait()
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +301,8 @@ def initialize_batch_metadata(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Publish the immutable scientific config and separate execution provenance."""
-    directory = batch_meta_directory(config, storage_root=storage_root)
+    storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    directory = batch_meta_directory(config, storage_root=storage)
     directory.mkdir(parents=True, exist_ok=True)
     scientific_path = _immutable_json(
         directory / "resolved_generation_config.json",
@@ -341,14 +472,72 @@ def _execution_provenance(
         "execution_config": config.execution_values,
         "invocation": {
             "arguments": command,
+            "working_directory": str(prepared.work_directory),
+            "executable_path": shutil.which(resolve_comsol_executable(config)),
             "requested_cores": cores_per_case,
             "worker_slot": worker_slot,
             "scheduler_kind": scheduler_kind,
             "allocated_node": allocated_node,
+            "hostname": socket.gethostname(),
+            "python_version": sys.version,
+            "configured_modules": list(config.execution_values["runtime"]["module_initialization"]),
+            "loaded_modules": os.environ.get("LOADEDMODULES"),
             "scheduler_job_id": os.environ.get("SLURM_JOB_ID"),
+            "scheduler_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+            "scheduler_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+            "scheduler_step_id": os.environ.get("SLURM_STEP_ID"),
+            "scheduler_cpus_on_node": os.environ.get("SLURM_CPUS_ON_NODE"),
+            "scheduler_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
+        },
+        "result": {
+            "state": "starting",
+            "exit_code": None,
+            "timed_out": False,
+            "started_at": None,
+            "ended_at": None,
+            "runtime_s": None,
         },
     }
     return common.serialization.atomic_write_json(prepared.runtime_directory / "execution_provenance.json", payload)
+
+
+def _complete_execution_provenance(
+    path: Path,
+    *,
+    state: str,
+    exit_code: int | None,
+    timed_out: bool,
+    started_at: str | None,
+    ended_at: str,
+    runtime_seconds: float | None,
+) -> None:
+    """Complete one execution record with the observed process outcome."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        message = f"Execution provenance became malformed before completion: {path}"
+        raise TypeError(message)
+    payload["result"] = {
+        "state": state,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "runtime_s": runtime_seconds,
+    }
+    common.serialization.atomic_write_json(path, payload)
+
+
+def _solver_environment(prepared: case_service.PreparedCase) -> dict[str, str]:
+    """Return the inherited solver environment plus exact case identities."""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GENERATION_CASE_ID": prepared.bundle.case_id,
+            "GENERATION_SIMULATION_PROFILE": prepared.bundle.case_payload["simulation_profile"],
+            "GENERATION_WORK_DIRECTORY": str(prepared.work_directory),
+        }
+    )
+    return environment
 
 
 def execute_prepared_case(
@@ -370,7 +559,11 @@ def execute_prepared_case(
     try:
         _require_executable(command, comsol_executable=resolve_comsol_executable(config))
     except FileNotFoundError as error:
-        raise CaseExecutionError(str(error), work_directory=prepared.work_directory) from error
+        raise CaseExecutionError(
+            str(error),
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+        ) from error
     execution_provenance = _execution_provenance(
         config,
         prepared,
@@ -388,6 +581,14 @@ def execute_prepared_case(
     process: subprocess.Popen[str] | None = None
     timed_out = False
     exit_code: int | None = None
+    if runtime_cancellation_requested():
+        message = "Campaign cancellation was requested before COMSOL launch."
+        raise CaseInterruptedError(
+            message,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=None,
+        )
     with (
         stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
         stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
@@ -401,20 +602,37 @@ def execute_prepared_case(
                 stderr=stderr_stream,
                 text=True,
                 start_new_session=True,
+                env=_solver_environment(prepared),
             )
+            _register_solver(process)
             try:
-                exit_code = process.wait(timeout=float(config.execution_values["runtime"]["timeout_seconds"]))
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                os.killpg(process.pid, signal.SIGTERM)
                 try:
-                    exit_code = process.wait(timeout=5.0)
+                    exit_code = process.wait(timeout=float(config.execution_values["runtime"]["timeout_seconds"]))
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    exit_code = process.wait()
+                    timed_out = True
+                    exit_code = _terminate_solver_and_wait(process)
+                except BaseException:
+                    _terminate_solver_and_wait(process)
+                    raise
+            finally:
+                _unregister_solver(process)
         except OSError as error:
+            ended_at = _utc_now()
+            _complete_execution_provenance(
+                execution_provenance,
+                state="start_failed",
+                exit_code=None,
+                timed_out=False,
+                started_at=started_at,
+                ended_at=ended_at,
+                runtime_seconds=time.monotonic() - monotonic_start,
+            )
             msg = f"Could not start COMSOL command {command!r}: {error}"
-            raise CaseExecutionError(msg, work_directory=prepared.work_directory) from error
+            raise CaseExecutionError(
+                msg,
+                work_directory=prepared.work_directory,
+                command=tuple(command),
+            ) from error
     elapsed = time.monotonic() - monotonic_start
     timing = {
         "schema_kind": "simulation_case_timing",
@@ -427,6 +645,7 @@ def execute_prepared_case(
         "git_commit": prepared.bundle.case_payload["git_commit"],
         "executable": resolve_comsol_executable(config),
         "arguments": command,
+        "working_directory": str(prepared.work_directory),
         "hostname": hostname,
         "process_id": None if process is None else process.pid,
         "started_at": started_at,
@@ -437,22 +656,63 @@ def execute_prepared_case(
         "allocated_node": allocated_node,
         "scheduler_kind": scheduler_kind,
         "scheduler_job_id": os.environ.get("SLURM_JOB_ID"),
+        "scheduler_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+        "scheduler_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "scheduler_step_id": os.environ.get("SLURM_STEP_ID"),
+        "configured_modules": list(config.execution_values["runtime"]["module_initialization"]),
+        "loaded_modules": os.environ.get("LOADEDMODULES"),
+        "python_version": sys.version,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "template_sha256": config.template_sha256,
     }
     common.serialization.atomic_write_json(prepared.runtime_directory / "timing.json", timing)
+    cancelled = runtime_cancellation_requested()
+    _complete_execution_provenance(
+        execution_provenance,
+        state=("cancelled" if cancelled else "timed_out" if timed_out else "succeeded" if exit_code == 0 else "failed"),
+        exit_code=exit_code,
+        timed_out=timed_out,
+        started_at=started_at,
+        ended_at=timing["ended_at"],
+        runtime_seconds=elapsed,
+    )
     solver_log = _write_solver_log(prepared)
+    if cancelled:
+        message = "Campaign cancellation terminated the COMSOL process."
+        raise CaseInterruptedError(
+            message,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+        )
     if timed_out:
         msg = "COMSOL case exceeded its configured timeout."
-        raise CaseExecutionError(msg, work_directory=prepared.work_directory)
+        raise CaseExecutionError(
+            msg,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+            timed_out=True,
+        )
     if exit_code != 0:
         msg = f"COMSOL case exited with status {exit_code}."
-        raise CaseExecutionError(msg, work_directory=prepared.work_directory)
+        raise CaseExecutionError(
+            msg,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+        )
     solved_model = prepared.work_directory / "solved.mph"
     if not solved_model.is_file() or solved_model.stat().st_size <= 0:
         msg = "COMSOL completed without a non-empty solved.mph output."
-        raise CaseExecutionError(msg, work_directory=prepared.work_directory)
+        raise CaseExecutionError(
+            msg,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+            missing_or_invalid_artifacts=("solved.mph",),
+        )
     try:
         exports = collect_exports(config, prepared)
         canonical_case = storage_service.convert_exports_to_hdf5(
@@ -464,7 +724,13 @@ def execute_prepared_case(
             runtime_seconds=elapsed,
         )
     except Exception as error:
-        raise CaseExecutionError(str(error), work_directory=prepared.work_directory) from error
+        raise CaseExecutionError(
+            str(error),
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+            missing_or_invalid_artifacts=(str(error),),
+        ) from error
     return ExecutionResult(
         prepared=prepared,
         command=tuple(command),
@@ -585,6 +851,138 @@ def case_failure_path(
     return _state_batch_root(config, storage_root=storage_root) / "failures" / f"{config.case_id(case_index)}.json"
 
 
+def _optional_json_object(path: Path) -> dict[str, Any] | None:
+    """Load one optional non-symlink JSON object for failure evidence."""
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _failure_input_evidence(
+    config: config_contract.GenerationConfig,
+    work_directory: Path | None,
+) -> dict[str, Any]:
+    """Return declared and observed exact input identities."""
+    if work_directory is None:
+        return {"declared": {}, "observed": {}}
+    case_payload = _optional_json_object(work_directory / "case.json")
+    declared = case_payload.get("input_files", {}) if isinstance(case_payload, dict) else {}
+    if not isinstance(declared, dict):
+        declared = {}
+    observed: dict[str, dict[str, Any]] = {}
+    expected_names = {"fields.csv"}
+    if config.profile.id == "transient_drying":
+        expected_names.update({"scalars.csv", "schedule.csv"})
+    for name in sorted(expected_names | set(declared)):
+        path = work_directory / name
+        if path.is_file() and not path.is_symlink():
+            observed[name] = {
+                "sha256": common.serialization.file_sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+    return {"declared": declared, "observed": observed}
+
+
+def _failure_log_tail(work_directory: Path | None) -> dict[str, str] | None:
+    """Return a compact UTF-8 tail from the best available case-local log."""
+    if work_directory is None:
+        return None
+    candidates = (
+        work_directory / "runtime" / "solver.log",
+        work_directory / "runtime" / "stderr.log",
+        work_directory / "runtime" / "stdout.log",
+    )
+    for path in candidates:
+        if not path.is_file() or path.is_symlink():
+            continue
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = "\n".join(lines[-80:])
+        return {"source": path.name, "text": tail[-16384:]}
+    return None
+
+
+def _failure_missing_artifacts(
+    config: config_contract.GenerationConfig,
+    error: BaseException,
+    work_directory: Path | None,
+) -> list[str]:
+    """Return exact missing or invalid runtime artifacts known at failure."""
+    declared = getattr(error, "missing_or_invalid_artifacts", ())
+    missing = {str(item) for item in declared if str(item)}
+    if work_directory is None:
+        missing.add("case_workspace")
+        return sorted(missing)
+    required = {"model.mph", "case.json", "fields.csv"}
+    if config.profile.id == "transient_drying":
+        required.update({"scalars.csv", "schedule.csv"})
+    for name in required:
+        path = work_directory / name
+        if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
+            missing.add(name)
+    solved = work_directory / "solved.mph"
+    if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
+        missing.add("solved.mph")
+    exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
+    for contract in config.scientific_values["output_contract"]["exports"]:
+        pattern = contract.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            missing.add(f"export:{contract['role']}:unresolved_mapping")
+            continue
+        matches = [path for path in exports_root.glob(pattern) if path.is_file() and not path.is_symlink() and path.stat().st_size > 0]
+        if contract["required"] and not matches:
+            missing.add(f"export:{contract['role']}")
+    return sorted(missing)
+
+
+def _failure_execution_evidence(
+    config: config_contract.GenerationConfig,
+    error: BaseException,
+    *,
+    worker_slot: int,
+    scheduler_kind: str,
+    allocated_node: str | None,
+    work_directory: Path | None,
+) -> dict[str, Any]:
+    """Return command, cwd, scheduler, module, and exit evidence."""
+    runtime = None
+    if work_directory is not None:
+        runtime = _optional_json_object(work_directory / "runtime" / "execution_provenance.json")
+    invocation = runtime.get("invocation", {}) if isinstance(runtime, dict) else {}
+    result = runtime.get("result", {}) if isinstance(runtime, dict) else {}
+    command = getattr(error, "command", ())
+    if not command and isinstance(invocation, dict):
+        command = invocation.get("arguments", ())
+    cwd = getattr(error, "cwd", None)
+    if cwd is None and isinstance(invocation, dict):
+        cwd = invocation.get("working_directory")
+    exit_code = getattr(error, "exit_code", None)
+    if exit_code is None and isinstance(result, dict):
+        exit_code = result.get("exit_code")
+    timed_out = bool(getattr(error, "timed_out", False))
+    if not timed_out and isinstance(result, dict):
+        timed_out = result.get("timed_out") is True
+    return {
+        "worker_slot": worker_slot,
+        "scheduler_kind": scheduler_kind,
+        "allocated_node": allocated_node,
+        "hostname": socket.gethostname(),
+        "scheduler_job_id": os.environ.get("SLURM_JOB_ID"),
+        "scheduler_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+        "scheduler_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "scheduler_step_id": os.environ.get("SLURM_STEP_ID"),
+        "command": list(command) if isinstance(command, (list, tuple)) else [],
+        "cwd": None if cwd is None else str(cwd),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "configured_modules": list(config.execution_values["runtime"]["module_initialization"]),
+        "loaded_modules": os.environ.get("LOADEDMODULES"),
+    }
+
+
 def record_case_failure(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -595,13 +993,20 @@ def record_case_failure(
     allocated_node: str | None,
     work_directory: Path | None,
     storage_root: Path | str | None = None,
+    scratch_cleanup_status: str = "pending",
 ) -> Path:
-    """Persist the latest failed attempt so status survives node-local cleanup."""
-    path = case_failure_path(config, case_index, storage_root=storage_root)
+    """Persist compact failure evidence before node-local scratch cleanup."""
+    if scratch_cleanup_status not in {"pending", "not_created"}:
+        message = f"Initial scratch cleanup status is invalid: {scratch_cleanup_status!r}"
+        raise ValueError(message)
+    storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    path = case_failure_path(config, case_index, storage_root=storage)
     path.parent.mkdir(parents=True, exist_ok=True)
+    state = "cancelled" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "failed"
     payload = {
         "schema_kind": CASE_FAILURE_SCHEMA_KIND,
         "schema_version": CASE_FAILURE_SCHEMA_VERSION,
+        "state": state,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -610,20 +1015,55 @@ def record_case_failure(
         "case_index": case_index,
         "git_commit": source_service.required_git_commit(),
         "recorded_at": _utc_now(),
-        "execution": {
-            "worker_slot": worker_slot,
-            "scheduler_kind": scheduler_kind,
-            "allocated_node": allocated_node,
-            "scheduler_job_id": os.environ.get("SLURM_JOB_ID"),
-        },
+        "execution": _failure_execution_evidence(
+            config,
+            error,
+            worker_slot=worker_slot,
+            scheduler_kind=scheduler_kind,
+            allocated_node=allocated_node,
+            work_directory=work_directory,
+        ),
         "error": {
             "type": type(error).__name__,
             "message": str(error),
         },
         "work_directory": None if work_directory is None else str(work_directory),
+        "input_files": _failure_input_evidence(config, work_directory),
+        "template_sha256": config.template_sha256,
+        "missing_or_invalid_artifacts": _failure_missing_artifacts(
+            config,
+            error,
+            work_directory,
+        ),
+        "log_tail": _failure_log_tail(work_directory),
+        "scratch_cleanup": {
+            "status": scratch_cleanup_status,
+            "reclaimed_bytes": 0,
+            "error": None,
+        },
     }
     common.serialization.atomic_write_json(path, payload)
     return path
+
+
+def _complete_failure_cleanup(
+    path: Path,
+    *,
+    status: str,
+    reclaimed_bytes: int,
+    error: str | None,
+) -> None:
+    """Atomically complete one previously persisted scratch-cleanup receipt."""
+    if status not in {"complete", "failed", "not_created"}:
+        message = f"Completed scratch cleanup status is invalid: {status!r}"
+        raise ValueError(message)
+    payload = _load_json_object(path, label="case failure evidence")
+    payload["scratch_cleanup"] = {
+        "status": status,
+        "reclaimed_bytes": reclaimed_bytes,
+        "error": error,
+    }
+    common.serialization.atomic_write_json(path, payload)
 
 
 def clear_case_failure(
@@ -654,19 +1094,32 @@ def case_failure_is_recorded(
         set(payload) != _CASE_FAILURE_KEYS
         or payload.get("schema_kind") != CASE_FAILURE_SCHEMA_KIND
         or payload.get("schema_version") != CASE_FAILURE_SCHEMA_VERSION
+        or payload.get("state") not in {"failed", "cancelled"}
         or payload.get("simulation_profile") != config.profile.id
         or payload.get("batch_id") != config.batch_id
         or payload.get("batch_identity") != config.batch_identity
         or payload.get("scientific_config_digest") != config.scientific_config_digest
         or payload.get("case_id") != config.case_id(case_index)
         or payload.get("case_index") != case_index
+        or payload.get("template_sha256") != config.template_sha256
     ):
         msg = f"Case failure evidence identity is invalid: {path}"
         raise ValueError(msg)
     source_service.validate_git_commit(payload.get("git_commit"))
     execution = payload.get("execution")
     error = payload.get("error")
-    if not isinstance(execution, dict) or set(execution) != {"worker_slot", "scheduler_kind", "allocated_node", "scheduler_job_id"}:
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != _FAILURE_EXECUTION_KEYS
+        or not isinstance(execution.get("worker_slot"), int)
+        or isinstance(execution.get("worker_slot"), bool)
+        or not isinstance(execution.get("scheduler_kind"), str)
+        or not isinstance(execution.get("hostname"), str)
+        or not isinstance(execution.get("command"), list)
+        or not all(isinstance(argument, str) for argument in execution.get("command", []))
+        or not isinstance(execution.get("timed_out"), bool)
+        or not isinstance(execution.get("configured_modules"), list)
+    ):
         msg = f"Case failure execution evidence is invalid: {path}"
         raise ValueError(msg)
     if (
@@ -678,8 +1131,39 @@ def case_failure_is_recorded(
         msg = f"Case failure error evidence is invalid: {path}"
         raise ValueError(msg)
     work_directory = payload.get("work_directory")
-    if work_directory is not None and (not isinstance(work_directory, str) or not work_directory):
+    if work_directory is not None and (not isinstance(work_directory, str) or not work_directory or not Path(work_directory).is_absolute()):
         msg = f"Case failure work-directory evidence is invalid: {path}"
+        raise ValueError(msg)
+    inputs = payload.get("input_files")
+    if (
+        not isinstance(inputs, dict)
+        or set(inputs) != {"declared", "observed"}
+        or not isinstance(inputs["declared"], dict)
+        or not isinstance(inputs["observed"], dict)
+    ):
+        msg = f"Case failure input identity evidence is invalid: {path}"
+        raise ValueError(msg)
+    missing = payload.get("missing_or_invalid_artifacts")
+    if not isinstance(missing, list) or not all(isinstance(item, str) and item for item in missing):
+        msg = f"Case failure artifact evidence is invalid: {path}"
+        raise ValueError(msg)
+    log_tail = payload.get("log_tail")
+    if log_tail is not None and (
+        not isinstance(log_tail, dict) or set(log_tail) != {"source", "text"} or not all(isinstance(value, str) for value in log_tail.values())
+    ):
+        msg = f"Case failure log-tail evidence is invalid: {path}"
+        raise ValueError(msg)
+    cleanup = payload.get("scratch_cleanup")
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup) != {"status", "reclaimed_bytes", "error"}
+        or cleanup.get("status") not in {"pending", "complete", "failed", "not_created"}
+        or not isinstance(cleanup.get("reclaimed_bytes"), int)
+        or isinstance(cleanup.get("reclaimed_bytes"), bool)
+        or cleanup.get("reclaimed_bytes", -1) < 0
+        or (cleanup.get("error") is not None and not isinstance(cleanup.get("error"), str))
+    ):
+        msg = f"Case failure scratch-cleanup evidence is invalid: {path}"
         raise ValueError(msg)
     return True
 
@@ -863,14 +1347,24 @@ def publish_completed_case(
 ) -> Path:
     """Atomically publish raw and processed directories without overwriting completion."""
     case_index = int(result.prepared.bundle.case_payload["case_index"])
-    state_root = _state_batch_root(config, storage_root=storage_root)
+    storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    state_root = _state_batch_root(config, storage_root=storage)
     publication_root = state_root / "publications"
     publication_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f"{result.prepared.bundle.case_id}_", dir=publication_root))
+    staging = workspace_service.create_publication_staging(
+        storage_root=storage,
+        publication_root=publication_root,
+        run_id=result.prepared.workspace_run_id,
+        case_id=result.prepared.bundle.case_id,
+    )
     raw_stage = staging / "raw"
     processed_stage = staging / "processed"
-    raw_destination = raw_case_directory(config, case_index, storage_root=storage_root)
-    processed_destination = processed_case_directory(config, case_index, storage_root=storage_root)
+    raw_destination = raw_case_directory(config, case_index, storage_root=storage)
+    processed_destination = processed_case_directory(
+        config,
+        case_index,
+        storage_root=storage,
+    )
     try:
         _stage_raw_case(config, result, raw_stage)
         _stage_processed_case(config, result, processed_stage)
@@ -879,7 +1373,7 @@ def publish_completed_case(
             if existing["simulation_case_id"] != result.prepared.bundle.simulation_case_id:
                 msg = f"Existing raw case belongs to another simulation identity: {raw_destination}"
                 raise RuntimeError(msg)
-            shutil.rmtree(raw_stage)
+            # The marked publication root owns this redundant stage until cleanup.
         else:
             _quarantine_incomplete(raw_destination, state_root=state_root)
             raw_destination.parent.mkdir(parents=True, exist_ok=True)
@@ -890,10 +1384,106 @@ def publish_completed_case(
         _quarantine_incomplete(processed_destination, state_root=state_root)
         processed_destination.parent.mkdir(parents=True, exist_ok=True)
         processed_stage.replace(processed_destination)
-        validate_completed_case(config, case_index, storage_root=storage_root)
+        validate_completed_case(config, case_index, storage_root=storage)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        workspace_service.cleanup_publication_staging(
+            staging,
+            storage_root=storage,
+            publication_root=publication_root,
+            run_id=result.prepared.workspace_run_id,
+            case_id=result.prepared.bundle.case_id,
+            allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
+        )
     return processed_destination
+
+
+def _case_cleanup_failure_path(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path,
+) -> Path:
+    """Return persistent evidence for cleanup after completed publication."""
+    root = _state_batch_root(config, storage_root=storage_root)
+    return root / "cleanup_failures" / f"{config.case_id(case_index)}.json"
+
+
+def _record_case_cleanup_failure(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    error: BaseException,
+    *,
+    work_directory: Path | None,
+    storage_root: Path,
+) -> Path:
+    """Persist a cleanup error without reclassifying valid publication."""
+    path = _case_cleanup_failure_path(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_kind": "simulation_case_cleanup_failure",
+        "schema_version": 1,
+        "publication_complete": completed_case_is_valid(
+            config,
+            case_index,
+            storage_root=storage_root,
+        ),
+        "simulation_profile": config.profile.id,
+        "batch_id": config.batch_id,
+        "case_id": config.case_id(case_index),
+        "case_index": case_index,
+        "recorded_at": _utc_now(),
+        "work_directory": (None if work_directory is None else str(work_directory)),
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+        },
+    }
+    return common.serialization.atomic_write_json(path, payload)
+
+
+def _workspace_from_attempt(
+    prepared: case_service.PreparedCase | None,
+    error: BaseException,
+) -> tuple[Path | None, Path | None, str | None]:
+    """Return cleanup boundaries from a prepared case or preparation failure."""
+    if prepared is not None:
+        return (
+            prepared.work_directory,
+            prepared.work_root,
+            prepared.workspace_run_id,
+        )
+    work_directory = getattr(error, "work_directory", None)
+    work_root = getattr(error, "work_root", None)
+    run_id = getattr(error, "workspace_run_id", None)
+    return (
+        work_directory if isinstance(work_directory, Path) else None,
+        work_root if isinstance(work_root, Path) else None,
+        run_id if isinstance(run_id, str) else None,
+    )
+
+
+def _cleanup_case_attempt(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    work_directory: Path,
+    work_root: Path,
+    run_id: str,
+    storage_root: Path,
+) -> int:
+    """Remove one marked case attempt under the exact current identity."""
+    return workspace_service.cleanup_case_workspace(
+        work_directory,
+        allowed_root=work_root,
+        storage_root=storage_root,
+        expected_run_id=run_id,
+        expected_case_id=config.case_id(case_index),
+        allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
+    )
 
 
 def run_case(
@@ -906,19 +1496,23 @@ def run_case(
     allocated_node: str | None = None,
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
-    cleanup_failed: bool = False,
     blocking_lock: bool = True,
 ) -> CaseRunOutcome:
-    """Run or integrity-skip one case under its authoritative filesystem lock."""
-    initialize_batch_metadata(config, storage_root=storage_root)
-    lock_path = case_lock_path(config, case_index, storage_root=storage_root)
+    """Run or integrity-skip one case and always close marked scratch."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    initialize_batch_metadata(config, storage_root=storage)
+    lock_path = case_lock_path(config, case_index, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=blocking_lock):
-        if completed_case_is_valid(config, case_index, storage_root=storage_root):
-            clear_case_failure(config, case_index, storage_root=storage_root)
+        if completed_case_is_valid(config, case_index, storage_root=storage):
+            clear_case_failure(config, case_index, storage_root=storage)
             return CaseRunOutcome(
                 status="skipped",
                 case_id=config.case_id(case_index),
-                processed_directory=processed_case_directory(config, case_index, storage_root=storage_root),
+                processed_directory=processed_case_directory(
+                    config,
+                    case_index,
+                    storage_root=storage,
+                ),
                 work_directory=None,
             )
         prepared: case_service.PreparedCase | None = None
@@ -926,7 +1520,7 @@ def run_case(
             prepared = case_service.prepare_case_work_directory(
                 config,
                 case_index,
-                storage_root=storage_root,
+                storage_root=storage,
                 work_root=work_root,
             )
             result = execute_prepared_case(
@@ -937,24 +1531,98 @@ def run_case(
                 scheduler_kind=scheduler_kind,
                 allocated_node=allocated_node,
             )
-            destination = publish_completed_case(config, result, storage_root=storage_root)
+            destination = publish_completed_case(
+                config,
+                result,
+                storage_root=storage,
+            )
         except BaseException as error:
-            work_directory = None if prepared is None else prepared.work_directory
-            record_case_failure(
+            attempt_directory, attempt_root, attempt_run_id = _workspace_from_attempt(prepared, error)
+            try:
+                publication_complete = completed_case_is_valid(
+                    config,
+                    case_index,
+                    storage_root=storage,
+                )
+            except Exception:  # noqa: BLE001 -- corruption remains failed, but scratch still closes
+                publication_complete = False
+            failure_path: Path | None = None
+            if publication_complete:
+                _record_case_cleanup_failure(
+                    config,
+                    case_index,
+                    error,
+                    work_directory=attempt_directory,
+                    storage_root=storage,
+                )
+            else:
+                failure_path = record_case_failure(
+                    config,
+                    case_index,
+                    error,
+                    worker_slot=worker_slot,
+                    scheduler_kind=scheduler_kind,
+                    allocated_node=allocated_node,
+                    work_directory=attempt_directory,
+                    storage_root=storage,
+                    scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
+                )
+            if attempt_directory is not None and attempt_root is not None and attempt_run_id is not None:
+                try:
+                    reclaimed = _cleanup_case_attempt(
+                        config,
+                        case_index,
+                        work_directory=attempt_directory,
+                        work_root=attempt_root,
+                        run_id=attempt_run_id,
+                        storage_root=storage,
+                    )
+                except BaseException as cleanup_error:  # noqa: BLE001 -- cleanup evidence must survive interruption
+                    if failure_path is not None:
+                        _complete_failure_cleanup(
+                            failure_path,
+                            status="failed",
+                            reclaimed_bytes=0,
+                            error=str(cleanup_error),
+                        )
+                    else:
+                        _record_case_cleanup_failure(
+                            config,
+                            case_index,
+                            cleanup_error,
+                            work_directory=attempt_directory,
+                            storage_root=storage,
+                        )
+                    message = f"Persistent outcome evidence exists, but marked case scratch cleanup failed: {cleanup_error}"
+                    raise CaseCleanupError(message) from error
+                if failure_path is not None:
+                    _complete_failure_cleanup(
+                        failure_path,
+                        status="complete",
+                        reclaimed_bytes=reclaimed,
+                        error=None,
+                    )
+            raise
+        clear_case_failure(config, case_index, storage_root=storage)
+        try:
+            _cleanup_case_attempt(
                 config,
                 case_index,
-                error,
-                worker_slot=worker_slot,
-                scheduler_kind=scheduler_kind,
-                allocated_node=allocated_node,
-                work_directory=work_directory,
-                storage_root=storage_root,
+                work_directory=prepared.work_directory,
+                work_root=prepared.work_root,
+                run_id=prepared.workspace_run_id,
+                storage_root=storage,
             )
-            if cleanup_failed and work_directory is not None:
-                shutil.rmtree(work_directory, ignore_errors=True)
-            raise
-        clear_case_failure(config, case_index, storage_root=storage_root)
-        shutil.rmtree(prepared.work_directory)
+        except BaseException as cleanup_error:
+            _record_case_cleanup_failure(
+                config,
+                case_index,
+                cleanup_error,
+                work_directory=prepared.work_directory,
+                storage_root=storage,
+            )
+            message = f"Case publication is valid, but marked scratch cleanup failed: {cleanup_error}"
+            raise CaseCleanupError(message) from cleanup_error
         return CaseRunOutcome(
             status="completed",
             case_id=config.case_id(case_index),

@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from src import common
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 STEADY_FLOW_PROFILE = "steady_flow"
 TRANSIENT_DRYING_PROFILE = "transient_drying"
@@ -38,21 +40,35 @@ FINAL_STATUS_EXPORT_ROLE = "final_status"
 STEADY_FLOW_LEARNING_VIEW = "steady_flow"
 TRANSIENT_DRYING_LEARNING_VIEW = "transient_drying"
 STATIONARITY_TOLERANCE = 1e-10
+STATIONARY_FLOW_REFERENCE_TEMPERATURE = 300.65
+STATIONARY_FLOW_REFERENCE_PRESSURE = 101325.0
+STATIONARY_FLOW_OUTLET_PRESSURE = 0.0
 _SIDECAR_PART_COUNT = 2
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
-SPATIAL_INPUT_FIELDS: Final = (
+STEADY_SPATIAL_INPUT_FIELDS: Final = (
     "x",
     "y",
     "Kxx",
     "Kxy",
     "Kyy",
     "eps_bed",
-    "p_bc",
-    "X_0_db_field",
+    "p_in_bc",
 )
-SCHEDULE_FIELDS: Final = ("t", "T_in", "omega_in", "phi_in")
-SCALAR_INPUT_FIELDS: Final = (
+TRANSIENT_SPATIAL_INPUT_FIELDS: Final = (*STEADY_SPATIAL_INPUT_FIELDS, "X_0_db_field")
+SCHEDULE_FIELDS: Final = ("t", "T_in_bc", "omega_in_bc", "phi_in_bc")
+SCHEDULE_UNITS: Final = ("h", "K", "kg/kg", "1")
+STATIONARY_FIXED_FIELDS: Final = ("T_flow_ref", "p_ref", "p_out")
+STATIONARY_FIXED_UNITS: Final = ("K", "Pa", "Pa")
+STATIONARY_FIXED_VALUES: Final = MappingProxyType(
+    {
+        "T_flow_ref": STATIONARY_FLOW_REFERENCE_TEMPERATURE,
+        "p_ref": STATIONARY_FLOW_REFERENCE_PRESSURE,
+        "p_out": STATIONARY_FLOW_OUTLET_PRESSURE,
+    }
+)
+TRANSIENT_SCALAR_INPUT_FIELDS: Final = (
+    *STATIONARY_FIXED_FIELDS,
     "T_init",
     "T_amb",
     "T_in_ref",
@@ -69,7 +85,8 @@ SCALAR_INPUT_FIELDS: Final = (
     "C_osw",
     "f_wet_dm_max",
 )
-SCALAR_INPUT_UNITS: Final = (
+TRANSIENT_SCALAR_INPUT_UNITS: Final = (
+    *STATIONARY_FIXED_UNITS,
     "K",
     "K",
     "K",
@@ -82,24 +99,34 @@ SCALAR_INPUT_UNITS: Final = (
     "1",
     "1",
     "1",
-    "1",
+    "1/K",
     "1",
     "1",
 )
-SCHEDULE_UNITS: Final = ("h", "K", "kg/kg", "1")
-STATIC_FIELD_NAMES: Final = (
+STEADY_STATIC_FIELD_NAMES: Final = (
     "Kxx",
     "Kxy",
     "Kyy",
     "eps_bed",
-    "p_bc",
+    "p_in_bc",
+    "u",
+    "v",
+    "p",
+)
+STEADY_STATIC_FIELD_UNITS: Final = ("m^2", "m^2", "m^2", "1", "Pa", "m/s", "m/s", "Pa")
+TRANSIENT_STATIC_FIELD_NAMES: Final = (
+    "Kxx",
+    "Kxy",
+    "Kyy",
+    "eps_bed",
+    "p_in_bc",
     "X_0_db_field",
     "u",
     "v",
     "p",
     "rho_bu_dry",
 )
-STATIC_FIELD_UNITS: Final = (
+TRANSIENT_STATIC_FIELD_UNITS: Final = (
     "m^2",
     "m^2",
     "m^2",
@@ -116,31 +143,28 @@ TRANSIENT_FIELD_UNITS: Final = ("K", "1", "kg/m^3", "kg/m^3")
 GLOBAL_FIELD_NAMES: Final = (
     "t",
     "X_wb_bulk",
-    "X_wb_max",
-    "X_wb_q95_mass",
     "f_wet_dm",
-    "T_out_mean",
-    "phi_out_mean",
     "m_w_gr",
     "m_v_gas",
     "m_dot_evap",
     "m_dot_v_in",
     "m_dot_v_out",
+    "mt_mass_balance",
+    "T_out_mean",
+    "phi_out_mean",
 )
-GLOBAL_FIELD_UNITS: Final = ("h", "1", "1", "1", "1", "K", "1", "kg", "kg", "kg/s", "kg/s", "kg/s")
+GLOBAL_FIELD_UNITS: Final = ("h", "1", "1", "kg", "kg", "kg/s", "kg/s", "kg/s", "kg/s", "K", "1")
 FINAL_STATUS_FIELDS: Final = (
     "t_final",
     "f_wet_dm_final",
-    "X_target_wb",
-    "X_wb_bulk",
-    "X_wb_max",
-    "X_wb_q95_mass",
+    "X_wb_bulk_final",
+    "X_wb_max_final",
     "T_min_final",
     "T_max_final",
     "phi_min_final",
     "phi_max_final",
 )
-FINAL_STATUS_UNITS: Final = ("h", "1", "1", "1", "1", "1", "K", "K", "1", "1")
+FINAL_STATUS_UNITS: Final = ("h", "1", "1", "1", "K", "K", "1", "1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,8 +208,7 @@ class SimulationProfile:
             message = f"Could not read template identity sidecar for profile {self.id!r}: {sidecar}"
             raise ValueError(message) from error
         parts = line.split()
-        expected_name = Path(self.template_relative_path).name
-        if len(parts) != _SIDECAR_PART_COUNT or _SHA256_PATTERN.fullmatch(parts[0]) is None or Path(parts[1]).name != expected_name:
+        if len(parts) != _SIDECAR_PART_COUNT or _SHA256_PATTERN.fullmatch(parts[0]) is None or parts[1] != self.template_relative_path:
             message = f"Template identity sidecar is malformed for profile {self.id!r}: {sidecar}"
             raise ValueError(message)
         return parts[0]
@@ -205,30 +228,38 @@ class SimulationProfile:
         raise ValueError(message)
 
 
-_STEADY_ROLE = ExportRoleSpec(
+_STANDALONE_STEADY_ROLE = ExportRoleSpec(
     role=STEADY_FLOW_EXPORT_ROLE,
     required=True,
     allow_multiple=False,
-    logical_fields=("x", "y", *STATIC_FIELD_NAMES),
-    units=("m", "m", *STATIC_FIELD_UNITS),
+    logical_fields=("x", "y", *STEADY_STATIC_FIELD_NAMES),
+    units=("m", "m", *STEADY_STATIC_FIELD_UNITS),
+    learning_view=STEADY_FLOW_LEARNING_VIEW,
+)
+_TRANSIENT_STEADY_ROLE = ExportRoleSpec(
+    role=STEADY_FLOW_EXPORT_ROLE,
+    required=True,
+    allow_multiple=False,
+    logical_fields=("x", "y", *TRANSIENT_STATIC_FIELD_NAMES),
+    units=("m", "m", *TRANSIENT_STATIC_FIELD_UNITS),
     learning_view=STEADY_FLOW_LEARNING_VIEW,
 )
 _PROFILES: Final = MappingProxyType(
     {
         STEADY_FLOW_PROFILE: SimulationProfile(
             id=STEADY_FLOW_PROFILE,
-            template_relative_path="simulation/steady_flow/template_brinkman.mph",
-            template_sha256_source="c3363528f49a29774cbf7f48948d5216022f1bac14f4f6c635e7b912985ba976",
-            export_roles=(_STEADY_ROLE,),
+            template_relative_path="simulation/steady_flow/steady_flow_template.mph",
+            template_sha256_source="simulation/steady_flow/steady_flow_template.sha256",
+            export_roles=(_STANDALONE_STEADY_ROLE,),
             available_learning_views=(STEADY_FLOW_LEARNING_VIEW,),
             airflow_source=STEADY_AIRFLOW_SOURCE,
         ),
         TRANSIENT_DRYING_PROFILE: SimulationProfile(
             id=TRANSIENT_DRYING_PROFILE,
-            template_relative_path="simulation/transient_drying/template_brinkman_temp_moist.mph",
-            template_sha256_source="simulation/transient_drying/template.sha256",
+            template_relative_path="simulation/transient_drying/transient_drying_template.mph",
+            template_sha256_source="simulation/transient_drying/transient_drying_template.sha256",
             export_roles=(
-                _STEADY_ROLE,
+                _TRANSIENT_STEADY_ROLE,
                 ExportRoleSpec(
                     role=TRANSIENT_RAW_EXPORT_ROLE,
                     required=True,
@@ -259,6 +290,61 @@ _PROFILES: Final = MappingProxyType(
         ),
     }
 )
+
+
+def spatial_input_fields(profile_id: str) -> tuple[str, ...]:
+    """Return the exact profile-owned spatial adapter fields."""
+    if profile_id == STEADY_FLOW_PROFILE:
+        return STEADY_SPATIAL_INPUT_FIELDS
+    if profile_id == TRANSIENT_DRYING_PROFILE:
+        return TRANSIENT_SPATIAL_INPUT_FIELDS
+    available = ", ".join(available_profiles())
+    message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
+    raise ValueError(message)
+
+
+def scalar_input_fields(profile_id: str) -> tuple[str, ...]:
+    """Return the exact profile-owned scalar adapter fields."""
+    if profile_id == STEADY_FLOW_PROFILE:
+        return ()
+    if profile_id == TRANSIENT_DRYING_PROFILE:
+        return TRANSIENT_SCALAR_INPUT_FIELDS
+    available = ", ".join(available_profiles())
+    message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
+    raise ValueError(message)
+
+
+def scalar_input_units(profile_id: str) -> tuple[str, ...]:
+    """Return units for the exact profile-owned scalar adapter fields."""
+    if profile_id == STEADY_FLOW_PROFILE:
+        return ()
+    if profile_id == TRANSIENT_DRYING_PROFILE:
+        return TRANSIENT_SCALAR_INPUT_UNITS
+    available = ", ".join(available_profiles())
+    message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
+    raise ValueError(message)
+
+
+def static_field_names(profile_id: str) -> tuple[str, ...]:
+    """Return the exact profile-owned canonical static fields."""
+    if profile_id == STEADY_FLOW_PROFILE:
+        return STEADY_STATIC_FIELD_NAMES
+    if profile_id == TRANSIENT_DRYING_PROFILE:
+        return TRANSIENT_STATIC_FIELD_NAMES
+    available = ", ".join(available_profiles())
+    message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
+    raise ValueError(message)
+
+
+def static_field_units(profile_id: str) -> tuple[str, ...]:
+    """Return units for the exact profile-owned canonical static fields."""
+    if profile_id == STEADY_FLOW_PROFILE:
+        return STEADY_STATIC_FIELD_UNITS
+    if profile_id == TRANSIENT_DRYING_PROFILE:
+        return TRANSIENT_STATIC_FIELD_UNITS
+    available = ", ".join(available_profiles())
+    message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
+    raise ValueError(message)
 
 
 def available_profiles() -> tuple[str, ...]:

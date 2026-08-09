@@ -121,7 +121,6 @@ DERIVED_PARAMETERS: Final = (
     "r_surf",
     "r_int",
     "T_in_ref",
-    "T_flow_ref",
 )
 SUPPORT_PARAMETERS: Final = (
     "eps_min_global",
@@ -403,7 +402,6 @@ def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
     _require_derivation(registry, "r_surf", "copy", ("r_surf_0",))
     _require_derivation(registry, "r_int", "product", ("r_int_surf", "r_surf"))
     _require_derivation(registry, "T_in_ref", "schedule_time_average", ("schedule",))
-    _require_derivation(registry, "T_flow_ref", "mean", ("T_in_ref", "T_init"))
     return density_mode
 
 

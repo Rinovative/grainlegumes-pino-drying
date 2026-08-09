@@ -61,7 +61,7 @@ class PressureBoundaryResiduals:
     """
     Hold unreduced pressure-boundary values and per-sample diagnostics.
 
-    ``inlet_error`` is ``p-p_bc`` flattened over selected inlet cells and
+    ``inlet_error`` is ``p-p_in_bc`` flattened over selected inlet cells and
     ``outlet_pressure`` retains flattened outlet gauge values, both in Pa.
     Spatial inlet MSE and outlet mean are retained per sample before batch
     aggregation so opposite outlet gauges cannot cancel each other.

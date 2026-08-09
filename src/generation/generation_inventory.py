@@ -115,7 +115,9 @@ OPERATION_CONSUMED_PARAMETERS: Final = frozenset(
         "schedule.event_width_rel",
     }
 )
-SCALAR_ADAPTER_PARAMETERS: Final = frozenset(profiles.SCALAR_INPUT_FIELDS).difference({"f_wet_dm_max", "A_osw", "B_osw", "C_osw"})
+SCALAR_ADAPTER_PARAMETERS: Final = frozenset(profiles.TRANSIENT_SCALAR_INPUT_FIELDS).difference(
+    {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max", "A_osw", "B_osw", "C_osw"}
+)
 DERIVATION_CONSUMED_PARAMETERS: Final = frozenset(materials.DERIVED_PARAMETERS)
 COUPLED_SELECTION_PARAMETERS: Final = frozenset({"oswin"})
 ACTIVE_CONSUMED_PARAMETERS: Final = (
@@ -149,11 +151,15 @@ COMSOL_INPUT_SOURCES: Final = MappingProxyType(
         "Kxy": "generation_fields permeability tensor",
         "Kyy": "generation_fields permeability tensor",
         "eps_bed": "generation_fields porosity map",
-        "p_bc": "generation_fields inlet-pressure boundary",
+        "p_in_bc": "generation_fields inlet-pressure boundary",
         "X_0_db_field": "generation_fields initial-moisture field",
         **{
-            name: ("common.scientific_fixed_values" if name == "f_wet_dm_max" else "typed parameter registry or deterministic derivation")
-            for name in profiles.SCALAR_INPUT_FIELDS
+            name: (
+                "common.scientific_fixed_values"
+                if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
+                else "typed parameter registry or deterministic derivation"
+            )
+            for name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS
         },
         **dict.fromkeys(profiles.SCHEDULE_FIELDS, "generation_schedule regular hourly nodes"),
     }
@@ -185,7 +191,8 @@ EXECUTION_ONLY_VALUES: Final = (
 OUTPUT_ONLY_VALUES: Final = tuple(
     dict.fromkeys(
         (
-            *profiles.STATIC_FIELD_NAMES,
+            *profiles.STEADY_STATIC_FIELD_NAMES,
+            *profiles.TRANSIENT_STATIC_FIELD_NAMES,
             *profiles.TRANSIENT_FIELD_NAMES,
             *profiles.GLOBAL_FIELD_NAMES,
             *profiles.FINAL_STATUS_FIELDS,
@@ -250,7 +257,12 @@ def audit_parameter_registry(registry: Mapping[str, Mapping[str, Any]]) -> Inven
         if missing_sources:
             message = f"Derived parameter {name!r} has undeclared sources {sorted(missing_sources)}."
             raise ValueError(message)
-    adapter_names = set(profiles.SPATIAL_INPUT_FIELDS) | set(profiles.SCALAR_INPUT_FIELDS) | set(profiles.SCHEDULE_FIELDS)
+    adapter_names = (
+        set(profiles.STEADY_SPATIAL_INPUT_FIELDS)
+        | set(profiles.TRANSIENT_SPATIAL_INPUT_FIELDS)
+        | set(profiles.TRANSIENT_SCALAR_INPUT_FIELDS)
+        | set(profiles.SCHEDULE_FIELDS)
+    )
     if adapter_names != set(COMSOL_INPUT_SOURCES):
         message = "Every COMSOL input adapter value must have one explicit source."
         raise ValueError(message)

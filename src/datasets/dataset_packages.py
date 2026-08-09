@@ -45,9 +45,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
 DATASET_PACKAGE_SCHEMA_KIND: Final = "vp2_dataset_package_manifest"
-DATASET_PACKAGE_SCHEMA_VERSION: Final = 2
+DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
 _ID_MEMBERSHIP_ROLES: Final = views.ID_MEMBERSHIPS
-_STEADY_SOLVER_INPUTS: Final = ("Kxx", "Kxy", "Kyy", "eps_bed", "p_bc")
+_STEADY_SOLVER_INPUTS: Final = ("Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc")
 _PACKAGE_PROVENANCE_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -415,6 +415,17 @@ def audit_steady_flow_conditioning(
         for dependency in dependencies
         if dependency["owner"] == "package_fixed"
     ]
+    fixed_by_name = {item["name"]: item for item in fixed}
+    if set(fixed_by_name) != {"T_flow_ref", "p_ref", "p_out"}:
+        message = "Steady-flow package-fixed physics must be exactly T_flow_ref, p_ref, and p_out."
+        raise ValueError(message)
+    if (
+        fixed_by_name["T_flow_ref"] != {"name": "T_flow_ref", "unit": "K", "value": profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE}
+        or fixed_by_name["p_ref"]["unit"] != "Pa"
+        or fixed_by_name["p_out"]["unit"] != "Pa"
+    ):
+        message = "Steady-flow package-fixed values or units violate the frozen stationary contract."
+        raise ValueError(message)
     unused = [dependency["name"] for dependency in dependencies if dependency["owner"] == "not_used"]
     return {
         "audit_schema_version": 1,

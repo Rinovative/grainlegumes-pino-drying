@@ -43,8 +43,8 @@ from .dataset_transient_contract import TRANSIENT_STEP_CONTRACT
 from .dataset_views import ID_MEMBERSHIPS, PACKAGE_REGIMES
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
-TRANSIENT_INDEX_SCHEMA_VERSION: Final = 2
-_TIME_TOLERANCE: Final = 1e-12
+TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
+_TIME_TOLERANCE: Final = storage.TIME_CLASSIFICATION_ATOL
 
 
 class TransientDataContractError(ValueError):
@@ -152,69 +152,68 @@ def transient_contract_payload() -> dict[str, Any]:
     }
 
 
-def _regular_time_contract(time: np.ndarray, *, path: Path) -> tuple[int, float | None]:
-    """Return regular-prefix length and an optional final irregular diagnostic."""
+def _regular_time_contract(time: np.ndarray, *, path: Path) -> int:
+    """Require the canonical HDF5 time dataset to contain regular states only."""
     if time.ndim != 1 or time.size < 1 or not np.isfinite(time).all():
-        message = f"Transient time must be one non-empty finite sequence: {path}."
+        message = f"Transient regular time must be one non-empty finite sequence: {path}."
         raise TransientDataContractError(message)
-    if np.any(np.diff(time) <= 0.0):
-        message = f"Transient time must be strictly increasing: {path}."
+    expected = np.arange(time.size, dtype=np.float64) * TRANSIENT_STEP_CONTRACT.time_step
+    if not np.allclose(time, expected, rtol=0.0, atol=_TIME_TOLERANCE):
+        message = f"Transient regular states must be the contiguous one-hour prefix 0..N: {path}."
         raise TransientDataContractError(message)
-    regular_count = 0
-    irregular_stop: float | None = None
-    for index, raw_value in enumerate(time):
-        value = float(raw_value)
-        expected = index * TRANSIENT_STEP_CONTRACT.time_step
-        if math.isclose(value, expected, rel_tol=0.0, abs_tol=_TIME_TOLERANCE):
-            regular_count += 1
-            continue
-        previous = (index - 1) * TRANSIENT_STEP_CONTRACT.time_step
-        if index == time.size - 1 and index > 0 and previous < value < expected:
-            irregular_stop = value
-            break
-        message = (
-            f"Transient states must form a regular 0..N one-hour prefix with at most one final "
-            f"irregular diagnostic state; index={index}, time={value}, source={path}."
-        )
-        raise TransientDataContractError(message)
-    return regular_count, irregular_stop
+    return int(time.size)
 
 
-def _status_evidence(path: Path, time: np.ndarray, regular_count: int) -> dict[str, Any]:
+def _status_evidence(path: Path, time: np.ndarray, exact_stop: float | None) -> dict[str, Any]:
     """Validate an adjacent canonical status sidecar when it is available."""
     status_path = path.with_name("status.json")
+    last_regular = float(time[-1])
+    expected_stop = last_regular if exact_stop is None else exact_stop
     if not status_path.exists():
         return {
             "status_sha256": None,
-            "t_stop_exact": None,
-            "t_last_regular": float(time[regular_count - 1]),
+            "t_stop_exact": expected_stop,
+            "t_last_regular": last_regular,
         }
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         message = f"Transient status sidecar is unreadable: {status_path}."
         raise TransientDataContractError(message) from error
-    if not isinstance(status, dict) or status.get("schema_kind") != "simulation_case_status" or status.get("schema_version") != 1:
+    if (
+        not isinstance(status, dict)
+        or status.get("schema_kind") != "simulation_case_status"
+        or status.get("schema_version") != storage.STATUS_SCHEMA_VERSION
+    ):
         message = f"Transient status sidecar schema is invalid: {status_path}."
         raise TransientDataContractError(message)
-    last_regular = float(time[regular_count - 1])
     if (
         status.get("solver_success") is not True
         or status.get("contains_nan_or_inf") is not False
         or status.get("field_shape_valid") is not True
         or status.get("schedule_valid") is not True
-        or status.get("n_regular_states") != regular_count
+        or status.get("n_regular_states") != time.size
+        or status.get("has_exact_stop_state") is not (exact_stop is not None)
         or not math.isclose(float(status.get("t_last_regular", math.nan)), last_regular, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
+        or not math.isclose(float(status.get("t_stop_exact", math.nan)), expected_stop, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
     ):
-        message = f"Transient status sidecar disagrees with its regular HDF5 sequence: {status_path}."
+        message = f"Transient status sidecar disagrees with its regular/exact-stop HDF5 sequence: {status_path}."
         raise TransientDataContractError(message)
-    stop = float(status.get("t_stop_exact", math.nan))
-    if not math.isfinite(stop) or stop < last_regular - _TIME_TOLERANCE:
-        message = f"Transient exact stop precedes the last regular state: {status_path}."
+    observed_exact = status.get("exact_stop_state_time")
+    if exact_stop is None:
+        if observed_exact is not None:
+            message = f"Transient status records an unexpected exact-stop state: {status_path}."
+            raise TransientDataContractError(message)
+    elif (
+        isinstance(observed_exact, bool)
+        or not isinstance(observed_exact, (int, float))
+        or not math.isclose(float(observed_exact), exact_stop, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
+    ):
+        message = f"Transient exact-stop status disagrees with HDF5: {status_path}."
         raise TransientDataContractError(message)
     return {
         "status_sha256": common.serialization.file_sha256(status_path),
-        "t_stop_exact": stop,
+        "t_stop_exact": expected_stop,
         "t_last_regular": last_regular,
     }
 
@@ -275,7 +274,18 @@ def _case_record(
     with h5py.File(path, "r") as handle:
         profile = _validate_source_metadata(source, handle)
         time = np.asarray(_hdf5_dataset(handle, "time"), dtype=np.float64)
-        regular_count, irregular_stop = _regular_time_contract(time, path=path)
+        regular_count = _regular_time_contract(time, path=path)
+        exact_stop_dataset = handle.get("exact_stop/time")
+        exact_stop = None
+        if exact_stop_dataset is not None:
+            if not isinstance(exact_stop_dataset, h5py.Dataset):
+                message = f"Transient exact-stop time must be a dataset: {path}."
+                raise TransientDataContractError(message)
+            exact_values = np.asarray(exact_stop_dataset, dtype=np.float64)
+            if exact_values.shape != (1,):
+                message = f"Transient exact-stop time must contain one value: {path}."
+                raise TransientDataContractError(message)
+            exact_stop = float(exact_values[0])
         transient_dataset = _hdf5_dataset(handle, "transient/fields")
         static_dataset = _hdf5_dataset(handle, "static/fields")
         schedule_dataset = _hdf5_dataset(handle, "schedule/values")
@@ -291,7 +301,7 @@ def _case_record(
         if not required_static.issubset(static_names):
             message = f"Transient static conditioning is incomplete: {path}."
             raise TransientDataContractError(message)
-        if schedule_names != list(profiles.SCHEDULE_FIELDS) or scalar_names != list(profiles.SCALAR_INPUT_FIELDS):
+        if schedule_names != list(profiles.SCHEDULE_FIELDS) or scalar_names != list(profiles.TRANSIENT_SCALAR_INPUT_FIELDS):
             message = f"Transient boundary or scalar conditioning is not canonical: {path}."
             raise TransientDataContractError(message)
         schedule_time = np.asarray(schedule_dataset[:, schedule_names.index("t")], dtype=np.float64)
@@ -317,7 +327,7 @@ def _case_record(
     if not samples:
         message = f"Transient source has no complete one-hour transition: {path}."
         raise TransientDataContractError(message)
-    status = _status_evidence(path, time, regular_count)
+    status = _status_evidence(path, time, exact_stop)
     record = {
         "package_case_id": source.package_case_id,
         "source_relative_path": _safe_relative_source(path, source_root),
@@ -334,10 +344,10 @@ def _case_record(
         "ood_parameters": list(source.ood_parameters),
         "ood_evidence": deepcopy(source.ood_evidence),
         "sequence_length": regular_count,
-        "stored_state_count": int(time.size),
+        "stored_state_count": int(time.size + (exact_stop is not None)),
         "transition_count": len(samples),
         "t_stop_exact": status["t_stop_exact"],
-        "irregular_stop_time": irregular_stop,
+        "irregular_stop_time": exact_stop,
     }
     return record, samples
 
@@ -640,10 +650,10 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             }
             scalar_lookup["T_amb"] = float(scalar_dataset[scalar_names.index("T_amb")])
             boundary_values = {
-                "T_in_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in")]),
-                "T_in_t_np1": float(schedule_dataset[schedule_np1, schedule_names.index("T_in")]),
-                "phi_in_t_n": float(schedule_dataset[schedule_n, schedule_names.index("phi_in")]),
-                "phi_in_t_np1": float(schedule_dataset[schedule_np1, schedule_names.index("phi_in")]),
+                "T_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in_bc")]),
+                "T_in_bc_t_np1": float(schedule_dataset[schedule_np1, schedule_names.index("T_in_bc")]),
+                "phi_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("phi_in_bc")]),
+                "phi_in_bc_t_np1": float(schedule_dataset[schedule_np1, schedule_names.index("phi_in_bc")]),
                 "T_amb": scalar_lookup["T_amb"],
             }
             boundary_array = np.asarray(

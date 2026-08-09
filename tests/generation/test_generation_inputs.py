@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import numpy as np
 import pytest
 import yaml
 
-from src import datasets, domain, generation
+from src import common, datasets, domain, generation
 
 
 def test_production_templates_are_role_neutral_fail_closed_campaigns() -> None:
@@ -64,6 +65,34 @@ def test_production_templates_are_role_neutral_fail_closed_campaigns() -> None:
         assert product_form["skin_or_seed_coat_state"] is None
         assert taxonomy["specificity_status"] == "unresolved"
         assert product_form["specificity_status"] == "unresolved"
+
+
+def test_generation_and_hdf5_versions_are_integer_one(
+    generation_config_factory: Any,
+) -> None:
+    """Reject pre-dataset named version strings at the owning config loader."""
+    config_path, _template = generation_config_factory()
+    batch = generation.config.load_campaign_config(config_path).batches[0]
+    versions = (
+        batch.scientific_values["generator_version"],
+        batch.scientific_values["storage"]["schema_version"],
+        batch.scientific_values["storage"]["converter_version"],
+    )
+    assert versions == (1, 1, 1)
+    assert all(type(version) is int for version in versions)
+
+    common_path = config_path.parent / "common.yaml"
+    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    common["generator_version"] = "named-version"
+    common_path.write_text(yaml.safe_dump(common, sort_keys=False), encoding="utf-8")
+    with pytest.raises(generation.config.GenerationConfigError, match="generator_version must be an integer"):
+        generation.config.load_campaign_config(config_path)
+
+    common["generator_version"] = 1
+    common["storage"]["converter_version"] = "named-version"
+    common_path.write_text(yaml.safe_dump(common, sort_keys=False), encoding="utf-8")
+    with pytest.raises(generation.config.GenerationConfigError, match="converter_version must be an integer"):
+        generation.config.load_campaign_config(config_path)
 
 
 def test_final_names_dimensions_inventory_and_profile_pairing(
@@ -256,17 +285,22 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
 
     canonical_scientific_names = (
         set(registry)
-        | set(generation.profiles.SPATIAL_INPUT_FIELDS)
-        | set(generation.profiles.SCALAR_INPUT_FIELDS)
+        | set(generation.profiles.STEADY_SPATIAL_INPUT_FIELDS)
+        | set(generation.profiles.TRANSIENT_SPATIAL_INPUT_FIELDS)
+        | set(generation.profiles.STATIONARY_FIXED_FIELDS)
+        | set(generation.profiles.TRANSIENT_SCALAR_INPUT_FIELDS)
         | set(generation.profiles.SCHEDULE_FIELDS)
-        | set(generation.profiles.STATIC_FIELD_NAMES)
+        | set(generation.profiles.STEADY_STATIC_FIELD_NAMES)
+        | set(generation.profiles.TRANSIENT_STATIC_FIELD_NAMES)
         | set(generation.profiles.TRANSIENT_FIELD_NAMES)
         | set(generation.profiles.GLOBAL_FIELD_NAMES)
         | set(generation.profiles.FINAL_STATUS_FIELDS)
     )
     assert not {name for name in canonical_scientific_names if name.endswith(("_K", "_Pa", "_m", "_h"))}
     common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
-    assert common["physical_formulas"]["f_wet_dm"] == ("integral(rho_bu_dry * indicator(X_wb > X_target_wb)) / integral(rho_bu_dry)")
+    assert common["physical_formulas"]["w_gr"] == "f_surf*w_surf + (1-f_surf)*w_int"
+    assert common["physical_formulas"]["f_wet_dm"] == ("integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)")
+    assert common["scientific_fixed_values"]["T_flow_ref"] == 300.65
     assert common["scientific_fixed_values"]["f_wet_dm_max"] == 0.05
     assert {"f_wet_dm", "m_w_gr", "m_v_gas", "m_dot_evap", "m_dot_v_in", "m_dot_v_out"}.issubset(generation.profiles.GLOBAL_FIELD_NAMES)
     assert "f_wet_dm_final" in generation.profiles.FINAL_STATUS_FIELDS
@@ -278,14 +312,75 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
         transient_path,
         only_batch="transient_drying__lentil__natural",
     )
-    assert steady.case_input_config_digest == transient.case_input_config_digest
+    assert steady.case_input_config_digest != transient.case_input_config_digest
     assert steady.scientific_config_digest != transient.scientific_config_digest
     steady_bundle = generation.case.generate_case_input_bundle(steady, 1, tmp_path / "steady")
     transient_bundle = generation.case.generate_case_input_bundle(transient, 1, tmp_path / "transient")
-    assert steady_bundle.case_input_id == transient_bundle.case_input_id
+    assert steady_bundle.case_input_id != transient_bundle.case_input_id
     assert steady_bundle.simulation_case_id != transient_bundle.simulation_case_id
-    for filename in ("fields.csv", "scalars.csv", "schedule.csv"):
-        assert (steady_bundle.directory / filename).read_bytes() == (transient_bundle.directory / filename).read_bytes()
+    assert {path.name for path in steady_bundle.input_paths} == {"fields.csv"}
+    assert {path.name for path in transient_bundle.input_paths} == {"fields.csv", "scalars.csv", "schedule.csv"}
+    assert transient_bundle.case_payload["schedule_diagnostics"]["generator_kind"] == "compositional_mixed"
+    assert transient_bundle.case_payload["schedule_diagnostics"]["generator_version"] == 1
+    assert not (steady_bundle.directory / "scalars.csv").exists()
+    assert not (steady_bundle.directory / "schedule.csv").exists()
+    assert "scalar_handoff" not in steady_bundle.case_payload
+    assert "scalars" not in steady_bundle.case_payload
+    assert steady_bundle.case_payload["stationary_fixed_values"] == [
+        {
+            "name": name,
+            "value": generation.profiles.STATIONARY_FIXED_VALUES[name],
+            "unit": unit,
+            "owner": "package_fixed",
+            "runtime_source": "canonical_template",
+        }
+        for name, unit in zip(
+            generation.profiles.STATIONARY_FIXED_FIELDS,
+            generation.profiles.STATIONARY_FIXED_UNITS,
+            strict=True,
+        )
+    ]
+    with (steady_bundle.directory / "fields.csv").open(encoding="utf-8", newline="") as stream:
+        steady_fields = list(csv.reader(stream, delimiter=";"))
+    with (transient_bundle.directory / "fields.csv").open(encoding="utf-8", newline="") as stream:
+        transient_fields = list(csv.reader(stream, delimiter=";"))
+    assert tuple(steady_fields[0]) == generation.profiles.STEADY_SPATIAL_INPUT_FIELDS
+    assert tuple(transient_fields[0]) == generation.profiles.TRANSIENT_SPATIAL_INPUT_FIELDS
+    assert [row[:7] for row in transient_fields[1:]] == steady_fields[1:]
+    with (transient_bundle.directory / "scalars.csv").open(
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        transient_scalars = list(csv.DictReader(stream, delimiter=";"))
+    assert tuple(row["name"] for row in transient_scalars) == generation.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+
+
+def test_scalar_handoff_rejects_an_obsolete_name(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Protect exact scalar names even when modified bytes have a fresh hash record."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    config = generation.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    bundle = generation.case.generate_case_input_bundle(config, 1, tmp_path / "case")
+    scalar_path = bundle.directory / "scalars.csv"
+    content = scalar_path.read_text(encoding="utf-8")
+    old = "T_flow_ref;"
+    assert content.count(old) == 1
+    scalar_path.write_text(content.replace(old, "obsolete_flow_temperature;"), encoding="utf-8")
+    payload = copy.deepcopy(bundle.case_payload)
+    payload["input_files"]["scalars.csv"] = {
+        "sha256": common.serialization.file_sha256(scalar_path),
+        "size_bytes": scalar_path.stat().st_size,
+    }
+    with pytest.raises(ValueError, match="missing, duplicate, unknown, obsolete"):
+        generation.storage._transient_scalar_values(
+            payload,
+            bundle.directory,
+        )
 
 
 def test_each_sampled_morphology_control_changes_its_owned_field(generation_config_factory: Any) -> None:
@@ -296,10 +391,10 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     sample = generation.sampling.sample_case(batch, 1)
     values = sample.values
     registry = batch.scientific_values["material"]["parameter_registry"]
-    grid = {"Lx": 1.2, "Ly": 0.75, "dx": 0.015, "dy": 0.015, "nx": 81, "ny": 51}
+    grid = {"Lx": 1.2, "Ly": 0.75, "Lz": 0.8, "dx": 0.015, "dy": 0.015, "nx": 81, "ny": 51}
     seeds = {"bed": 101, "pressure_bc": 202, "initial_moisture": 303}
     family_bounds = batch.scientific_values["material"]["initial_moisture_bounds"]
-    baseline = generation.fields.generate_spatial_fields(grid, values, seeds=seeds, family_bounds=family_bounds)
+    baseline = generation.fields.generate_spatial_fields("transient_drying", grid, values, seeds=seeds, family_bounds=family_bounds)
     bed_names = (
         "bed.structure.coarse_len_rel",
         "bed.structure.fine_len_rel",
@@ -330,7 +425,7 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
             variant["bed.structure.fine_weight"] = 1.0 - variant[name]
         elif name == "initial_moisture.structure.coarse_weight":
             variant["initial_moisture.structure.fine_weight"] = 1.0 - variant[name]
-        generated = generation.fields.generate_spatial_fields(grid, variant, seeds=seeds, family_bounds=family_bounds)
+        generated = generation.fields.generate_spatial_fields("transient_drying", grid, variant, seeds=seeds, family_bounds=family_bounds)
         fields = ("Kxx", "Kxy", "Kyy", "eps_bed") if name in bed_names else ("X_0_db_field",)
         difference = max(float(np.max(np.abs(generated.columns[field] - baseline.columns[field]))) for field in fields)
         scale = max(float(np.max(np.abs(baseline.columns[field]))) for field in fields)
@@ -386,9 +481,10 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
     wet_basis = domain.moisture.dry_basis_to_wet_basis(dry_basis)
     np.testing.assert_allclose(wet_basis, [0.0, 0.2, 0.5])
     np.testing.assert_allclose(domain.moisture.wet_basis_to_dry_basis(wet_basis), dry_basis)
-    water = domain.moisture.granular_water_content([1.0, 2.0], [3.0, 4.0])
-    np.testing.assert_allclose(domain.moisture.dry_basis_moisture(water, [20.0, 30.0]), [0.2, 0.2])
-    assert domain.moisture.bulk_wet_basis_moisture(water, [20.0, 30.0]) == pytest.approx(10.0 / 60.0)
+    water = domain.moisture.granular_water_content([1.0, 2.0], [3.0, 4.0], 0.5)
+    np.testing.assert_allclose(water, [2.0, 3.0])
+    np.testing.assert_allclose(domain.moisture.dry_basis_moisture(water, [20.0, 30.0]), [0.1, 0.1])
+    assert domain.moisture.bulk_wet_basis_moisture(water, [20.0, 30.0]) == pytest.approx(5.0 / 55.0)
 
     candidates = [
         {
@@ -413,7 +509,7 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
     assert list(membership_a.values()).count("id_test") == 1
 
     task = domain.tasks.registry.get_task("steady_flow")
-    assert task.input_names == ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_bc")
+    assert task.input_names == ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc")
     assert task.output_names == ("p", "u", "v")
     assert task.tensor_layout == ("batch", "channel", "y", "x")
     assert task.default_datasets.train == "lhs_var80_seed3001"
@@ -434,10 +530,10 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
         "rho_bu_dry",
     )
     assert tuple(field.name for field in contract.step_boundary_conditioning) == (
-        "T_in_t_n",
-        "T_in_t_np1",
-        "phi_in_t_n",
-        "phi_in_t_np1",
+        "T_in_bc_t_n",
+        "T_in_bc_t_np1",
+        "phi_in_bc_t_n",
+        "phi_in_bc_t_np1",
         "T_amb",
     )
     assert tuple(field.name for field in contract.scalar_conditioning) == (
@@ -454,7 +550,7 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
         "Kxx",
         "Kxy",
         "Kyy",
-        "p_bc",
+        "p_in_bc",
         "X_0_db_field",
     )
     assert contract.time_step == 1.0
@@ -477,7 +573,7 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
 
     accepted = datasets.packages.audit_steady_flow_conditioning([record])
     assert accepted["hidden_conditioning"] is False
-    assert accepted["T_flow_ref_owner"] == "not_used"
+    assert accepted["T_flow_ref_owner"] == "package_fixed"
     coupled_record = copy.deepcopy(record)
     coupled_record["simulation_profile"] = "transient_drying"
     mixed = datasets.packages.audit_steady_flow_conditioning([record, coupled_record])

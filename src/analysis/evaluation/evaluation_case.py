@@ -58,7 +58,7 @@ _STEADY_ARRAY_NAMES = frozenset(
         "kappa_encoded",
         "kappa",
         "kappa_names",
-        "p_bc",
+        "p_in_bc",
         "coordinates",
         "Rx",
         "Ry",
@@ -506,10 +506,10 @@ def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCas
             raise ValueError(msg)
 
     pressure_boundary = None
-    if "p_bc" in payload:
-        pressure_boundary = _finite_array(payload["p_bc"], label="p_bc", rank=3)
+    if "p_in_bc" in payload:
+        pressure_boundary = _finite_array(payload["p_in_bc"], label="p_in_bc", rank=3)
         if pressure_boundary.shape[0] != 1 or pressure_boundary.shape[-2:] != prediction.shape[-2:]:
-            msg = "p_bc must have shape (1, y, x) on the learned-output grid."
+            msg = "p_in_bc must have shape (1, y, x) on the learned-output grid."
             raise ValueError(msg)
 
     return EvaluationCase(

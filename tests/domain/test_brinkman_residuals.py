@@ -190,7 +190,7 @@ def test_pressure_boundary_residual_and_field_map_invariance() -> None:
     inputs, outputs, input_fields, output_fields = _steady_tensors()
     y_grid = inputs[:, input_fields.index("y")]
     inlet = y_grid == y_grid.amin()
-    inputs[:, input_fields.index("p_bc")][inlet] = 3.0
+    inputs[:, input_fields.index("p_in_bc")][inlet] = 3.0
     outputs[:, output_fields.index("p")][inlet] = 3.0
     reference = domain.physics.brinkman.evaluate_steady_2d_brinkman(
         inputs,

@@ -835,7 +835,7 @@ def _expected_physics_provenance(
                 "formula": "pressure_inlet_mse + pressure_outlet_mean_square",
                 "unit": "Pa^2",
             },
-            "pressure_inlet_mse": {"formula": "mean_inlet((p-p_bc)**2)", "unit": "Pa^2"},
+            "pressure_inlet_mse": {"formula": "mean_inlet((p-p_in_bc)**2)", "unit": "Pa^2"},
             "pressure_outlet_mean_square": {"formula": "mean_outlet(p)**2", "unit": "Pa^2"},
         },
         "array_definitions": {

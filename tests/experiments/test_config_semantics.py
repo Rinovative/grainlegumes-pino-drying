@@ -142,7 +142,7 @@ def test_objective_change_is_resume_incompatible() -> None:
             "integer",
         ),
         (
-            lambda config: config["data"].update({"ood_datasets": ["../escape"]}),
+            lambda config: config["data"].update({"train_dataset": "01_generation/raw/batch/case.h5"}),
             "single non-empty path component",
         ),
     ],

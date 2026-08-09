@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,24 +33,34 @@ import numpy as np
 
 from src import common, domain
 
+from . import generation_config as config_contract
 from . import generation_profiles as profiles
+from . import generation_schedule as schedule_service
 from . import generation_source as source_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
     from .generation_config import GenerationConfig
 
 HDF5_SCHEMA_KIND = "vp2_canonical_case"
-HDF5_SCHEMA_VERSION = 2
+HDF5_SCHEMA_VERSION = config_contract.CANONICAL_HDF5_SCHEMA_VERSION
+HDF5_CONVERTER_VERSION = config_contract.CANONICAL_HDF5_CONVERTER_VERSION
 _MINIMUM_TABLE_ROWS = 2
 _MINIMUM_AXIS_POINTS = 2
 _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
 _STATIONARITY_RTOL = profiles.STATIONARITY_TOLERANCE
 _TIME_HORIZON = 168.0
+_TIME_INTERVAL = 1.0
+TIME_CLASSIFICATION_ATOL = 16.0 * np.finfo(np.float64).eps * _TIME_HORIZON
+_THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
 _HDF5_COMPRESSION_LEVEL = 4
 _SHA256_HEX_LENGTH = 64
+_SHA256_CHARACTERS = frozenset("0123456789abcdef")
+_SCALAR_COLUMN_COUNT = 3
+_TIME_CLASSIFICATION_BASIS = "16*float64_epsilon*168h; numerical classification only"
+STATUS_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +173,8 @@ def _static_fields(
         msg = "Static export does not contain one complete Cartesian grid."
         raise ValueError(msg)
     repeated_allowed = contract.get("time_column") is not None
-    arrays: np.ndarray = np.empty((len(profiles.STATIC_FIELD_NAMES), y_axis.size, x_axis.size), dtype=np.float64)
+    field_names = profiles.static_field_names(config.profile.id)
+    arrays: np.ndarray = np.empty((len(field_names), y_axis.size, x_axis.size), dtype=np.float64)
     x_lookup = {float(value): index for index, value in enumerate(actual_x)}
     y_lookup = {float(value): index for index, value in enumerate(actual_y)}
     for coordinate, rows in coordinate_rows.items():
@@ -172,7 +183,7 @@ def _static_fields(
             raise ValueError(msg)
         y_index = y_lookup[coordinate[1]]
         x_index = x_lookup[coordinate[0]]
-        for field_index, name in enumerate(profiles.STATIC_FIELD_NAMES):
+        for field_index, name in enumerate(field_names):
             candidates = mapped[name][rows]
             if not np.allclose(candidates, candidates[0], rtol=_STATIONARITY_RTOL, atol=_STATIONARITY_RTOL):
                 msg = f"Supposedly stationary field {name!r} varies beyond tolerance at {coordinate}."
@@ -182,11 +193,57 @@ def _static_fields(
     if np.any(arrays[0] <= 0) or np.any(arrays[2] <= 0) or np.any(determinant <= 0):
         msg = "Canonical static permeability tensor is not positive definite."
         raise ValueError(msg)
-    porosity = arrays[profiles.STATIC_FIELD_NAMES.index("eps_bed")]
+    porosity = arrays[field_names.index("eps_bed")]
     if np.any((porosity <= 0) | (porosity >= 1)):
         msg = "Canonical static porosity must lie strictly inside (0, 1)."
         raise ValueError(msg)
     return x_axis, y_axis, arrays
+
+
+def _classify_transient_times(times: np.ndarray) -> tuple[np.ndarray, np.ndarray, int | None]:
+    """Classify float64 solver times as regular hours plus one optional exact stop."""
+    values = np.asarray(times, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or values.size < 1
+        or not np.isfinite(values).all()
+        or np.any(np.diff(values) <= 0.0)
+        or abs(float(values[0])) > TIME_CLASSIFICATION_ATOL
+        or float(values[-1]) > _TIME_HORIZON + TIME_CLASSIFICATION_ATOL
+    ):
+        msg = "Transient state times must be finite, increasing, begin at zero, and not exceed 168 h."
+        raise ValueError(msg)
+    regular_by_index: dict[int, int] = {}
+    irregular_positions: list[int] = []
+    for position, value in enumerate(values):
+        regular_index = round(float(value) / _TIME_INTERVAL)
+        regular_value = regular_index * _TIME_INTERVAL
+        if 0 <= regular_index <= int(_TIME_HORIZON / _TIME_INTERVAL) and abs(float(value) - regular_value) <= TIME_CLASSIFICATION_ATOL:
+            if regular_index in regular_by_index:
+                msg = f"Transient export contains duplicate regular state index {regular_index}."
+                raise ValueError(msg)
+            regular_by_index[regular_index] = position
+        else:
+            irregular_positions.append(position)
+    if len(irregular_positions) > 1:
+        msg = "Transient export may contain at most one exact irregular stop state."
+        raise ValueError(msg)
+    if not regular_by_index:
+        msg = "Transient export must contain at least the regular t=0 state."
+        raise ValueError(msg)
+    regular_indices = sorted(regular_by_index)
+    if regular_indices != list(range(regular_indices[-1] + 1)):
+        msg = "Regular transient states must form a contiguous hourly prefix beginning at t=0."
+        raise ValueError(msg)
+    regular_positions = np.asarray([regular_by_index[index] for index in regular_indices], dtype=np.int64)
+    regular_times = np.asarray(regular_indices, dtype=np.float64) * _TIME_INTERVAL
+    irregular_position = irregular_positions[0] if irregular_positions else None
+    if irregular_position is not None:
+        irregular_time = float(values[irregular_position])
+        if irregular_position != values.size - 1 or irregular_time <= float(regular_times[-1]) + TIME_CLASSIFICATION_ATOL:
+            msg = "The optional irregular state must be the final state after the last regular hour."
+            raise ValueError(msg)
+    return regular_times, regular_positions, irregular_position
 
 
 def _transient_fields(
@@ -195,17 +252,15 @@ def _transient_fields(
     *,
     x_axis: np.ndarray,
     y_axis: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Canonicalize regular transient states onto time-channel-y-x arrays."""
+) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray | None]:
+    """Canonicalize regular states and one optional diagnostic exact-stop state."""
     contract = _contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)
     mapped = _mapped_table(_role_paths(exports, profiles.TRANSIENT_RAW_EXPORT_ROLE), contract)
-    times = np.unique(mapped["t"])
-    if times.size < 1 or times[0] != 0.0 or np.any(np.diff(times) != 1.0) or times[-1] > _TIME_HORIZON:
-        msg = "Transient export times must be a contiguous regular hourly prefix of 0..168 h."
-        raise ValueError(msg)
+    raw_times = np.unique(mapped["t"])
+    regular_times, regular_positions, irregular_position = _classify_transient_times(raw_times)
     actual_x = np.unique(mapped["x"])
     actual_y = np.unique(mapped["y"])
-    expected_rows = times.size * x_axis.size * y_axis.size
+    expected_rows = raw_times.size * x_axis.size * y_axis.size
     if (
         mapped["x"].size != expected_rows
         or actual_x.size != x_axis.size
@@ -213,14 +268,14 @@ def _transient_fields(
         or not np.allclose(actual_x, x_axis, rtol=0.0, atol=_COORDINATE_ATOL)
         or not np.allclose(actual_y, y_axis, rtol=0.0, atol=_COORDINATE_ATOL)
     ):
-        msg = "Transient export does not contain one complete authoritative Cartesian state per regular time."
+        msg = "Transient export must contain one complete authoritative Cartesian grid per state time."
         raise ValueError(msg)
-    arrays = np.full(
-        (times.size, len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
+    all_fields = np.full(
+        (raw_times.size, len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
         np.nan,
         dtype=np.float64,
     )
-    time_lookup = {float(value): index for index, value in enumerate(times)}
+    time_lookup = {float(value): index for index, value in enumerate(raw_times)}
     x_lookup = {float(value): index for index, value in enumerate(actual_x)}
     y_lookup = {float(value): index for index, value in enumerate(actual_y)}
     occupied: set[tuple[int, int, int]] = set()
@@ -235,11 +290,14 @@ def _transient_fields(
             raise ValueError(msg)
         occupied.add(coordinate)
         for field_index, name in enumerate(profiles.TRANSIENT_FIELD_NAMES):
-            arrays[coordinate[0], field_index, coordinate[1], coordinate[2]] = mapped[name][row]
-    if not np.isfinite(arrays).all():
+            all_fields[coordinate[0], field_index, coordinate[1], coordinate[2]] = mapped[name][row]
+    if not np.isfinite(all_fields).all():
         msg = "Transient export contains missing or non-finite canonical fields."
         raise ValueError(msg)
-    return times, arrays
+    regular_fields = all_fields[regular_positions]
+    if irregular_position is None:
+        return regular_times, regular_fields, None, None
+    return regular_times, regular_fields, float(raw_times[irregular_position]), all_fields[irregular_position]
 
 
 def _ordered_values(config: GenerationConfig, exports: Sequence[Any], role: str, names: tuple[str, ...]) -> np.ndarray:
@@ -257,17 +315,38 @@ def _ordered_values(config: GenerationConfig, exports: Sequence[Any], role: str,
     return values
 
 
+def _combined_state_axis(
+    regular_time: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_time: float | None,
+    exact_stop_fields: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the complete state axis without blurring regular/exact ownership."""
+    if (exact_stop_time is None) != (exact_stop_fields is None):
+        msg = "Exact-stop time and fields must either both be present or both be absent."
+        raise ValueError(msg)
+    if exact_stop_time is None or exact_stop_fields is None:
+        return regular_time, regular_fields
+    return (
+        np.concatenate((regular_time, np.asarray([exact_stop_time], dtype=np.float64))),
+        np.concatenate((regular_fields, exact_stop_fields[np.newaxis, ...]), axis=0),
+    )
+
+
 def _validate_global_bulk_moisture(
     static_fields: np.ndarray,
-    transient_time: np.ndarray,
-    transient_fields: np.ndarray,
+    state_time: np.ndarray,
+    state_fields: np.ndarray,
     global_values: np.ndarray,
+    *,
+    f_surf: float,
 ) -> None:
-    """Validate exported X_wb_bulk against integrated dry and water mass."""
-    rho_bu_dry = static_fields[profiles.STATIC_FIELD_NAMES.index("rho_bu_dry")]
+    """Validate exported bulk moisture against the weighted two-state contract."""
+    rho_bu_dry = static_fields[profiles.TRANSIENT_STATIC_FIELD_NAMES.index("rho_bu_dry")]
     water = domain.moisture.granular_water_content(
-        transient_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_surf")],
-        transient_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_int")],
+        state_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_surf")],
+        state_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_int")],
+        f_surf,
     )
     weights = np.ones_like(rho_bu_dry, dtype=np.float64)
     weights[[0, -1], :] *= 0.5
@@ -277,19 +356,119 @@ def _validate_global_bulk_moisture(
         dtype=np.float64,
     )
     global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
-    positions = [np.flatnonzero(np.isclose(global_time, time, rtol=0.0, atol=1e-12)) for time in transient_time]
-    if any(position.size != 1 for position in positions):
-        message = "Global diagnostics must contain one X_wb_bulk value for every regular transient state."
+    if global_time.shape != state_time.shape or not np.allclose(
+        global_time,
+        state_time,
+        rtol=0.0,
+        atol=TIME_CLASSIFICATION_ATOL,
+    ):
+        message = "Global diagnostics must contain exactly one row for every regular and optional exact-stop state."
         raise ValueError(message)
-    column = global_values[[int(position[0]) for position in positions], profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]
-    if column.shape != expected.shape or not np.allclose(column, expected, rtol=1e-6, atol=1e-9):
-        maximum = math.inf if column.shape != expected.shape else float(np.max(np.abs(column - expected)))
-        message = f"Exported X_wb_bulk disagrees with integrated dry and water mass; maximum error={maximum}."
+    column = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]
+    if not np.allclose(column, expected, rtol=1e-6, atol=1e-9):
+        maximum = float(np.max(np.abs(column - expected)))
+        message = f"Exported X_wb_bulk disagrees with weighted integrated dry and water mass; maximum error={maximum}."
         raise ValueError(message)
 
 
-def _schedule_values(case_payload: Mapping[str, Any], work_directory: Path) -> np.ndarray:
-    """Read and revalidate the generated schedule adapter bound by case.json."""
+def _stationary_fixed_values(case_payload: Mapping[str, Any]) -> np.ndarray:
+    """Validate package-fixed template conditioning without claiming file input."""
+    entries = case_payload.get("stationary_fixed_values")
+    ownership = case_payload.get("stationary_fixed_ownership")
+    expected_entries = [
+        {
+            "name": name,
+            "value": profiles.STATIONARY_FIXED_VALUES[name],
+            "unit": unit,
+            "owner": "package_fixed",
+            "runtime_source": "canonical_template",
+        }
+        for name, unit in zip(
+            profiles.STATIONARY_FIXED_FIELDS,
+            profiles.STATIONARY_FIXED_UNITS,
+            strict=True,
+        )
+    ]
+    expected_ownership = {
+        name: {
+            "owner": "package_fixed",
+            "unit": unit,
+            "fixed_value": profiles.STATIONARY_FIXED_VALUES[name],
+        }
+        for name, unit in zip(
+            profiles.STATIONARY_FIXED_FIELDS,
+            profiles.STATIONARY_FIXED_UNITS,
+            strict=True,
+        )
+    }
+    if entries != expected_entries or ownership != expected_ownership:
+        msg = "Stationary package-fixed provenance disagrees with the canonical template contract."
+        raise ValueError(msg)
+    sampled = case_payload.get("sampled_values")
+    if not isinstance(sampled, Mapping) or any(
+        sampled.get(name) != profiles.STATIONARY_FIXED_VALUES[name] for name in profiles.STATIONARY_FIXED_FIELDS
+    ):
+        msg = "Stationary package-fixed values are missing from case identity provenance."
+        raise ValueError(msg)
+    return np.asarray(
+        [profiles.STATIONARY_FIXED_VALUES[name] for name in profiles.STATIONARY_FIXED_FIELDS],
+        dtype=np.float64,
+    )
+
+
+def _transient_scalar_values(
+    case_payload: Mapping[str, Any],
+    work_directory: Path,
+) -> np.ndarray:
+    """Read and revalidate the transient case-local scalar handoff."""
+    spec = case_payload["input_contract"]["scalar"]
+    path = work_directory / spec["filename"]
+    identity = case_payload["input_files"][path.name]
+    if common.serialization.file_sha256(path) != identity["sha256"] or path.stat().st_size != identity["size_bytes"]:
+        msg = "Scalar adapter bytes changed after case-input identity was computed."
+        raise RuntimeError(msg)
+    try:
+        rows = list(csv.reader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=spec["delimiter"]))
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        msg = f"Scalar adapter is not readable deterministic CSV: {path}"
+        raise ValueError(msg) from error
+    names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
+    if not rows or rows[0] != ["name", "value", "unit"] or len(rows) != len(names) + 1:
+        msg = "Scalar adapter header or row count does not match its profile contract."
+        raise ValueError(msg)
+    observed_names = [row[0] for row in rows[1:] if len(row) == _SCALAR_COLUMN_COUNT]
+    observed_units = [row[2] for row in rows[1:] if len(row) == _SCALAR_COLUMN_COUNT]
+    if len(observed_names) != len(names) or tuple(observed_names) != names or tuple(observed_units) != units:
+        msg = "Scalar adapter contains missing, duplicate, unknown, obsolete, or mis-unitized entries."
+        raise ValueError(msg)
+    try:
+        values = np.asarray([float(row[1]) for row in rows[1:]], dtype=np.float64)
+    except ValueError as error:
+        msg = "Scalar adapter contains a malformed numeric value."
+        raise ValueError(msg) from error
+    if not np.isfinite(values).all():
+        msg = "Scalar adapter values must be finite."
+        raise ValueError(msg)
+    entries = case_payload.get("scalars")
+    if (
+        not isinstance(entries, list)
+        or [entry.get("name") for entry in entries if isinstance(entry, dict)] != list(names)
+        or [entry.get("unit") for entry in entries if isinstance(entry, dict)] != list(units)
+        or [entry.get("owner") for entry in entries if isinstance(entry, dict)]
+        != ["package_fixed" if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"} else "case_dependent" for name in names]
+    ):
+        msg = "Case scalar provenance does not match the exact names, units, and ownership classes."
+        raise ValueError(msg)
+    recorded = np.asarray([entry["value"] for entry in entries], dtype=np.float64)
+    if not np.array_equal(values, recorded):
+        msg = "Scalar adapter values disagree with case.json provenance."
+        raise ValueError(msg)
+    return values
+
+
+def _schedule_values(case_payload: Mapping[str, Any], work_directory: Path, *, p_ref: float) -> np.ndarray:
+    """Read and thermodynamically revalidate the schedule bound by case.json."""
     spec = case_payload["input_contract"]["schedule"]
     path = work_directory / spec["filename"]
     identity = case_payload["input_files"][path.name]
@@ -303,7 +482,109 @@ def _schedule_values(case_payload: Mapping[str, Any], work_directory: Path) -> n
     if not np.array_equal(values[:, 0], np.arange(169, dtype=np.float64)):
         msg = "Schedule adapter time must be the exact hourly 0..168 sequence."
         raise ValueError(msg)
+    if np.any((values[:, 3] < 0.0) | (values[:, 3] > 1.0)):
+        msg = "Schedule relative humidity must lie in [0, 1]."
+        raise ValueError(msg)
+    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(values[:, 2], values[:, 1], pressure=p_ref)
+    if not np.allclose(
+        values[:, 3],
+        expected_phi,
+        rtol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
+        atol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
+    ):
+        msg = "Schedule phi_in_bc is inconsistent with omega_in_bc, T_in_bc, and package-fixed p_ref."
+        raise ValueError(msg)
+    metadata = case_payload.get("schedule_diagnostics")
+    conversion = metadata.get("conversion_pressure") if isinstance(metadata, dict) else None
+    if conversion != {"name": "p_ref", "value": p_ref, "unit": "Pa", "owner": "package_fixed"}:
+        msg = "Schedule conversion-pressure provenance is missing or inconsistent."
+        raise ValueError(msg)
     return values
+
+
+def _validate_transient_outputs(
+    config: GenerationConfig,
+    static_fields: np.ndarray,
+    state_time: np.ndarray,
+    state_fields: np.ndarray,
+    global_values: np.ndarray,
+    final_status: np.ndarray,
+    *,
+    f_surf: float,
+) -> None:
+    """Validate final weighted moisture, diagnostic signs, and exact-stop alignment."""
+    if global_values.shape != (state_time.size, len(profiles.GLOBAL_FIELD_NAMES)):
+        msg = "Global diagnostics must contain one complete row per exported solution state."
+        raise ValueError(msg)
+    global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
+    if not np.allclose(global_time, state_time, rtol=0.0, atol=TIME_CLASSIFICATION_ATOL):
+        msg = "Global diagnostic times do not align with the complete exported state axis."
+        raise ValueError(msg)
+    f_wet = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]
+    evaporation = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_evap")]
+    vapor_in = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_in")]
+    vapor_out = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_out")]
+    if np.any((f_wet < 0.0) | (f_wet > 1.0)):
+        msg = "Global f_wet_dm must lie in [0, 1]."
+        raise ValueError(msg)
+    if np.any(evaporation < 0.0) or np.any(vapor_in < 0.0) or np.any(vapor_out < 0.0):
+        msg = "Canonical evaporation, inlet, and outlet mass-flow signs must be externally non-negative."
+        raise ValueError(msg)
+    if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
+        msg = "Final status export must contain exactly one complete row."
+        raise ValueError(msg)
+    final = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
+    if abs(float(final["t_final"]) - float(state_time[-1])) > TIME_CLASSIFICATION_ATOL:
+        msg = "Final Status t_final must identify the actual last exported solution state."
+        raise ValueError(msg)
+    if not np.isclose(float(final["f_wet_dm_final"]), float(f_wet[-1]), rtol=1e-6, atol=1e-9):
+        msg = "Final Status f_wet_dm_final disagrees with the complete global series."
+        raise ValueError(msg)
+    if not np.isclose(
+        float(final["X_wb_bulk_final"]),
+        float(global_values[-1, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]),
+        rtol=1e-6,
+        atol=1e-9,
+    ):
+        msg = "Final Status X_wb_bulk_final disagrees with the complete global series."
+        raise ValueError(msg)
+    static_names = profiles.TRANSIENT_STATIC_FIELD_NAMES
+    rho_bu_dry = static_fields[static_names.index("rho_bu_dry")]
+    x_initial = static_fields[static_names.index("X_0_db_field")]
+    initial_water = rho_bu_dry * x_initial
+    state_names = profiles.TRANSIENT_FIELD_NAMES
+    rtol = float(config.scientific_values["storage"]["float32_rtol"])
+    atol = float(config.scientific_values["storage"]["float32_atol"])
+    for name in ("w_surf", "w_int"):
+        if not np.allclose(state_fields[0, state_names.index(name)], initial_water, rtol=rtol, atol=atol):
+            msg = f"Initial {name} must equal rho_bu_dry*X_0_db_field without compartment splitting."
+            raise ValueError(msg)
+    final_water = domain.moisture.granular_water_content(
+        state_fields[-1, state_names.index("w_surf")],
+        state_fields[-1, state_names.index("w_int")],
+        f_surf,
+    )
+    final_x_wb = domain.moisture.wet_basis_moisture(final_water, rho_bu_dry)
+    if not np.isclose(float(final["X_wb_max_final"]), float(np.max(final_x_wb)), rtol=1e-6, atol=1e-9):
+        msg = "Final Status X_wb_max_final disagrees with the weighted Python-derived field."
+        raise ValueError(msg)
+    final_temperature = state_fields[-1, state_names.index("T")]
+    final_phi = state_fields[-1, state_names.index("phi")]
+    extrema = {
+        "T_min_final": float(np.min(final_temperature)),
+        "T_max_final": float(np.max(final_temperature)),
+        "phi_min_final": float(np.min(final_phi)),
+        "phi_max_final": float(np.max(final_phi)),
+    }
+    if (
+        not np.isclose(float(final["T_min_final"]), extrema["T_min_final"], rtol=1e-6, atol=1e-9)
+        or not np.isclose(float(final["T_max_final"]), extrema["T_max_final"], rtol=1e-6, atol=1e-9)
+        or not np.isclose(float(final["phi_min_final"]), extrema["phi_min_final"], rtol=1e-6, atol=1e-9)
+        or not np.isclose(float(final["phi_max_final"]), extrema["phi_max_final"], rtol=1e-6, atol=1e-9)
+    ):
+        msg = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
+        raise ValueError(msg)
+    _validate_global_bulk_moisture(static_fields, state_time, state_fields, global_values, f_surf=f_surf)
 
 
 def validate_float32_conversion(values: np.ndarray, *, rtol: float, atol: float, label: str) -> np.ndarray:
@@ -343,17 +624,20 @@ def _status(
     case_payload: Mapping[str, Any],
     *,
     transient_time: np.ndarray | None,
+    exact_stop_time: float | None,
     final_status: np.ndarray | None,
+    global_values: np.ndarray | None,
     runtime_seconds: float,
 ) -> dict[str, Any]:
-    """Derive the maintained Python status schema without guessing mass-flow signs."""
-    if transient_time is None or final_status is None:
+    """Derive status while retaining observed QA without a pass tolerance."""
+    if transient_time is None or final_status is None or global_values is None:
         t_final = None
         wet_final = None
         target_reached = None
         hit_t_max = None
         regular_states = 0
         last_regular = None
+        mass_balance = None
     else:
         values = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
         t_final = float(values["t_final"])
@@ -363,24 +647,46 @@ def _status(
         hit_t_max = t_final >= float(config.scientific_values["time"]["stop"])
         regular_states = int(transient_time.size)
         last_regular = float(transient_time[-1])
+        residual = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("mt_mass_balance")]
+        maximum_position = int(np.argmax(np.abs(residual)))
+        mass_balance = {
+            "maximum_absolute": float(abs(residual[maximum_position])),
+            "time_of_maximum_absolute": float(global_values[maximum_position, 0]),
+            "final": float(residual[-1]),
+            "unit": "kg/s",
+            "acceptance_tolerance": None,
+        }
     return {
         "schema_kind": "simulation_case_status",
-        "schema_version": 1,
+        "schema_version": STATUS_SCHEMA_VERSION,
         "solver_success": True,
         "target_reached": target_reached,
         "hit_t_max": hit_t_max,
         "t_stop_exact": t_final,
         "t_last_regular": last_regular,
+        "has_exact_stop_state": exact_stop_time is not None,
+        "exact_stop_state_time": exact_stop_time,
         "n_regular_states": regular_states,
         "n_regular_steps": max(regular_states - 1, 0),
         "f_wet_dm_final": wet_final,
         "runtime_s": float(runtime_seconds),
-        "units": {"t_stop_exact": "h", "t_last_regular": "h", "f_wet_dm_final": "1", "runtime_s": "s"},
-        "mass_balance_error": None,
+        "units": {
+            "t_stop_exact": "h",
+            "t_last_regular": "h",
+            "exact_stop_state_time": "h",
+            "f_wet_dm_final": "1",
+            "runtime_s": "s",
+        },
+        "mass_balance_qa": mass_balance,
         "contains_nan_or_inf": False,
         "field_shape_valid": True,
-        "schedule_valid": True,
+        "schedule_valid": None if transient_time is None else True,
     }
+
+
+def _write_json_dataset(group: h5py.Group, name: str, value: Any) -> None:
+    """Write one canonical JSON provenance record as UTF-8 text."""
+    group.create_dataset(name, data=_json_attribute(value), dtype=h5py.string_dtype(encoding="utf-8"))
 
 
 def _write_hdf5(
@@ -391,13 +697,17 @@ def _write_hdf5(
     x_axis: np.ndarray,
     y_axis: np.ndarray,
     static_fields: np.ndarray,
+    scalar_values: np.ndarray,
     transient_time: np.ndarray | None,
     transient_fields: np.ndarray | None,
+    exact_stop_time: float | None,
+    exact_stop_fields: np.ndarray | None,
     schedule_values: np.ndarray | None,
     global_values: np.ndarray | None,
+    final_status: np.ndarray | None,
     source_hashes: Mapping[str, Any],
 ) -> None:
-    """Write one complete case payload to a private temporary path."""
+    """Write one complete schema-v1 case payload to a private temporary path."""
     storage = config.scientific_values["storage"]
     static_float32 = validate_float32_conversion(
         static_fields,
@@ -411,13 +721,31 @@ def _write_hdf5(
             transient_fields,
             rtol=float(storage["float32_rtol"]),
             atol=float(storage["float32_atol"]),
-            label="transient fields",
+            label="regular transient fields",
+        )
+    exact_stop_float32 = None
+    if exact_stop_fields is not None:
+        exact_stop_float32 = validate_float32_conversion(
+            exact_stop_fields,
+            rtol=float(storage["float32_rtol"]),
+            atol=float(storage["float32_atol"]),
+            label="exact-stop transient fields",
         )
     compression = {
         "compression": storage["compression"],
         "compression_opts": int(storage["compression_level"]),
         "shuffle": bool(storage["shuffle"]),
     }
+    static_names = profiles.static_field_names(config.profile.id)
+    static_units = profiles.static_field_units(config.profile.id)
+    scalar_names: tuple[str, ...]
+    scalar_units: tuple[str, ...]
+    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+        scalar_names = profiles.STATIONARY_FIXED_FIELDS
+        scalar_units = profiles.STATIONARY_FIXED_UNITS
+    else:
+        scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+        scalar_units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
     with h5py.File(path, "w") as handle:
         handle.attrs["schema_kind"] = HDF5_SCHEMA_KIND
         handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
@@ -434,9 +762,33 @@ def _write_hdf5(
             "git_commit",
         ):
             handle.attrs[key] = case_payload[key]
+        handle.attrs["template_relative_path"] = case_payload["template"]["relative_path"]
         handle.attrs["template_sha256"] = case_payload["template"]["sha256"]
         handle.attrs["available_learning_views"] = _json_attribute(case_payload["available_learning_views"])
-        handle.attrs["source_export_hashes"] = _json_attribute(source_hashes)
+        provenance = handle.create_group("provenance")
+        _write_json_dataset(provenance, "scientific_config_json", config.scientific_values)
+        _write_json_dataset(provenance, "input_files_json", case_payload["input_files"])
+        _write_json_dataset(provenance, "source_exports_json", source_hashes)
+        _write_json_dataset(
+            provenance,
+            "template_json",
+            {
+                **case_payload["template"],
+                "sha256_validation": "pass",
+                "comsol_internal_contract": "runtime_validation_required",
+            },
+        )
+        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+            _write_json_dataset(
+                provenance,
+                "scalar_handoff_json",
+                case_payload["scalar_handoff"],
+            )
+        _write_json_dataset(
+            provenance,
+            "stationary_fixed_ownership_json",
+            case_payload["stationary_fixed_ownership"],
+        )
         coordinates = handle.create_group("coords")
         x_dataset = coordinates.create_dataset("x", data=np.asarray(x_axis, dtype=np.float64))
         y_dataset = coordinates.create_dataset("y", data=np.asarray(y_axis, dtype=np.float64))
@@ -449,26 +801,29 @@ def _write_hdf5(
             chunks=(1, min(int(storage["chunk_y"]), y_axis.size), min(int(storage["chunk_x"]), x_axis.size)),
             **compression,
         )
-        static_dataset.attrs["field_names"] = _json_attribute(list(profiles.STATIC_FIELD_NAMES))
-        static_dataset.attrs["units"] = _json_attribute(list(profiles.STATIC_FIELD_UNITS))
-        scalar_entries = case_payload["scalars"]
-        if (
-            not isinstance(scalar_entries, list)
-            or [entry.get("name") for entry in scalar_entries] != list(profiles.SCALAR_INPUT_FIELDS)
-            or [entry.get("unit") for entry in scalar_entries] != list(profiles.SCALAR_INPUT_UNITS)
-        ):
-            msg = "Case scalar provenance does not match the canonical scalar adapter contract."
-            raise ValueError(msg)
-        scalar_group = handle.create_group("scalar")
+        static_dataset.attrs["field_names"] = _json_attribute(list(static_names))
+        static_dataset.attrs["units"] = _json_attribute(list(static_units))
+        parameter_group_name = "stationary_fixed" if config.profile.id == profiles.STEADY_FLOW_PROFILE else "scalar"
+        scalar_group = handle.create_group(parameter_group_name)
         scalar_dataset = scalar_group.create_dataset(
             "values",
-            data=np.asarray([entry["value"] for entry in scalar_entries], dtype=np.float64),
+            data=np.asarray(scalar_values, dtype=np.float64),
         )
-        scalar_dataset.attrs["field_names"] = _json_attribute(list(profiles.SCALAR_INPUT_FIELDS))
-        scalar_dataset.attrs["units"] = _json_attribute([entry["unit"] for entry in scalar_entries])
-        if transient_float32 is not None and transient_time is not None and schedule_values is not None and global_values is not None:
+        scalar_dataset.attrs["field_names"] = _json_attribute(list(scalar_names))
+        scalar_dataset.attrs["units"] = _json_attribute(list(scalar_units))
+        if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+            scalar_dataset.attrs["ownership"] = _json_attribute(["package_fixed"] * len(scalar_names))
+            scalar_dataset.attrs["runtime_source"] = "canonical_template"
+        else:
+            scalar_dataset.attrs["ownership"] = _json_attribute([entry["owner"] for entry in case_payload["scalars"]])
+        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+            if transient_time is None or transient_float32 is None or schedule_values is None or global_values is None or final_status is None:
+                msg = "Transient HDF5 publication requires every regular, schedule, global, and final-status value."
+                raise ValueError(msg)
             time_dataset = handle.create_dataset("time", data=np.asarray(transient_time, dtype=np.float64))
             time_dataset.attrs["unit"] = "h"
+            time_dataset.attrs["classification_atol"] = TIME_CLASSIFICATION_ATOL
+            time_dataset.attrs["classification_basis"] = _TIME_CLASSIFICATION_BASIS
             transient = handle.create_group("transient")
             transient_dataset = transient.create_dataset(
                 "fields",
@@ -483,14 +838,33 @@ def _write_hdf5(
             )
             transient_dataset.attrs["field_names"] = _json_attribute(list(profiles.TRANSIENT_FIELD_NAMES))
             transient_dataset.attrs["units"] = _json_attribute(list(profiles.TRANSIENT_FIELD_UNITS))
+            if exact_stop_time is not None and exact_stop_float32 is not None:
+                exact_stop = handle.create_group("exact_stop")
+                exact_time_dataset = exact_stop.create_dataset("time", data=np.asarray([exact_stop_time], dtype=np.float64))
+                exact_time_dataset.attrs["unit"] = "h"
+                exact_fields_dataset = exact_stop.create_dataset(
+                    "fields",
+                    data=exact_stop_float32,
+                    chunks=(1, min(int(storage["chunk_y"]), y_axis.size), min(int(storage["chunk_x"]), x_axis.size)),
+                    **compression,
+                )
+                exact_fields_dataset.attrs["field_names"] = _json_attribute(list(profiles.TRANSIENT_FIELD_NAMES))
+                exact_fields_dataset.attrs["units"] = _json_attribute(list(profiles.TRANSIENT_FIELD_UNITS))
+                exact_stop.attrs["usage"] = "diagnostic_only_no_training_transition"
             schedule = handle.create_group("schedule")
             schedule_dataset = schedule.create_dataset("values", data=np.asarray(schedule_values, dtype=np.float64), **compression)
             schedule_dataset.attrs["field_names"] = _json_attribute(list(profiles.SCHEDULE_FIELDS))
             schedule_dataset.attrs["units"] = _json_attribute(list(profiles.SCHEDULE_UNITS))
+            schedule_dataset.attrs["conversion_pressure"] = _json_attribute(case_payload["schedule_diagnostics"]["conversion_pressure"])
+            schedule_dataset.attrs["humidity_conversion_owner"] = "generation_schedule"
             global_group = handle.create_group("global")
             global_dataset = global_group.create_dataset("values", data=np.asarray(global_values, dtype=np.float64), **compression)
             global_dataset.attrs["field_names"] = _json_attribute(list(profiles.GLOBAL_FIELD_NAMES))
             global_dataset.attrs["units"] = _json_attribute(list(profiles.GLOBAL_FIELD_UNITS))
+            final_group = handle.create_group("final_status")
+            final_dataset = final_group.create_dataset("values", data=np.asarray(final_status[0], dtype=np.float64))
+            final_dataset.attrs["field_names"] = _json_attribute(list(profiles.FINAL_STATUS_FIELDS))
+            final_dataset.attrs["units"] = _json_attribute(list(profiles.FINAL_STATUS_UNITS))
         handle.flush()
 
 
@@ -513,140 +887,570 @@ def _hdf5_text_attribute(value: Any, *, label: str) -> str:
     return value
 
 
+def _hdf5_json_dataset(handle: h5py.File, name: str) -> Any:
+    """Load one canonical JSON text dataset."""
+    dataset = _hdf5_dataset(handle, name)
+    if dataset.shape != ():
+        msg = f"Canonical JSON provenance member {name!r} must be scalar text."
+        raise ValueError(msg)
+    return json.loads(_hdf5_text_attribute(dataset[()], label=name))
+
+
+def _is_sha256(value: Any) -> bool:
+    """Return whether a value is one canonical lowercase SHA-256 digest."""
+    return isinstance(value, str) and len(value) == _SHA256_HEX_LENGTH and set(value).issubset(_SHA256_CHARACTERS)
+
+
+def _safe_relative_path(value: Any, *, label: str) -> str:
+    """Validate one portable repository- or artifact-relative path."""
+    if not isinstance(value, str) or not value or "\\" in value:
+        msg = f"{label} must be a non-empty POSIX relative path."
+        raise ValueError(msg)
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts or candidate.as_posix() != value:
+        msg = f"{label} must be a safe normalized POSIX relative path."
+        raise ValueError(msg)
+    return value
+
+
+def _validate_hash_record(value: Any, *, label: str, include_role: bool) -> str | None:
+    """Validate one exact portable file hash/size record and return its role."""
+    expected = {"sha256", "size_bytes", "role"} if include_role else {"sha256", "size_bytes"}
+    if not isinstance(value, dict) or set(value) != expected or not _is_sha256(value.get("sha256")):
+        msg = f"{label} has an invalid hash record."
+        raise ValueError(msg)
+    size = value.get("size_bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        msg = f"{label}.size_bytes must be a positive integer."
+        raise ValueError(msg)
+    role = value.get("role")
+    if include_role and (not isinstance(role, str) or not role):
+        msg = f"{label}.role must be non-empty text."
+        raise ValueError(msg)
+    return role if isinstance(role, str) else None
+
+
+def _validate_input_file_provenance(value: Any, *, profile: str) -> None:
+    """Validate exact profile-specific input-file identities."""
+    expected = {"fields.csv"}
+    if profile == profiles.TRANSIENT_DRYING_PROFILE:
+        expected.update({"scalars.csv", "schedule.csv"})
+    if not isinstance(value, dict) or set(value) != expected:
+        msg = f"Canonical input-file provenance must contain exactly {sorted(expected)}."
+        raise ValueError(msg)
+    for filename, record in value.items():
+        _validate_hash_record(record, label=f"input_files[{filename!r}]", include_role=False)
+
+
+def _validate_source_export_provenance(
+    value: Any,
+    *,
+    profile_contract: profiles.SimulationProfile,
+) -> None:
+    """Validate exact source-export roles with portable hashes and multiplicity."""
+    if not isinstance(value, dict) or not value:
+        msg = "Canonical source-export provenance must be one non-empty mapping."
+        raise ValueError(msg)
+    role_counts = {spec.role: 0 for spec in profile_contract.export_roles}
+    for relative_path, record in value.items():
+        _safe_relative_path(relative_path, label="source export path")
+        role = _validate_hash_record(record, label=f"source_exports[{relative_path!r}]", include_role=True)
+        if role not in role_counts:
+            msg = f"Canonical source export declares an unknown role {role!r}."
+            raise ValueError(msg)
+        role_counts[role] += 1
+    for spec in profile_contract.export_roles:
+        count = role_counts[spec.role]
+        if (spec.required and count < 1) or (not spec.allow_multiple and count != 1):
+            msg = f"Canonical source-export multiplicity is invalid for role {spec.role!r}: {count}."
+            raise ValueError(msg)
+
+
+def _dataset_is_finite(dataset: h5py.Dataset) -> bool:
+    """Check a field dataset incrementally without materializing a trajectory."""
+    if not dataset.shape:
+        return bool(np.isfinite(np.asarray(dataset)).all())
+    return all(np.isfinite(np.asarray(dataset[index])).all() for index in range(dataset.shape[0]))
+
+
+def _require_group_members(handle: h5py.File, name: str, expected: set[str]) -> h5py.Group:
+    """Return one group only when its direct membership is exact."""
+    group = handle.get(name)
+    if not isinstance(group, h5py.Group) or set(group) != expected:
+        msg = f"Canonical HDF5 group {name!r} must contain exactly {sorted(expected)}."
+        raise ValueError(msg)
+    return group
+
+
+def _dataset_contract(dataset: h5py.Dataset, *, names: tuple[str, ...], units: tuple[str, ...], label: str) -> None:
+    """Validate exact ordered name and unit metadata for one dataset."""
+    observed_names = json.loads(_hdf5_text_attribute(dataset.attrs.get("field_names", ""), label=f"{label}.field_names"))
+    observed_units = json.loads(_hdf5_text_attribute(dataset.attrs.get("units", ""), label=f"{label}.units"))
+    if observed_names != list(names) or observed_units != list(units):
+        msg = f"Canonical {label} field-name or unit metadata is invalid."
+        raise ValueError(msg)
+
+
+def _validate_hdf5_members(handle: h5py.File, profile: str) -> None:
+    """Require exact root membership for one source profile."""
+    expected = {"coords", "static", "provenance"}
+    if profile == profiles.STEADY_FLOW_PROFILE:
+        expected.add("stationary_fixed")
+    if profile == profiles.TRANSIENT_DRYING_PROFILE:
+        expected |= {"scalar", "time", "transient", "schedule", "global", "final_status"}
+        if "exact_stop" in handle:
+            expected.add("exact_stop")
+    if set(handle) != expected:
+        msg = f"Canonical HDF5 group membership mismatch for profile {profile!r}: {sorted(handle)}"
+        raise ValueError(msg)
+
+
+def _validate_hdf5_provenance(
+    handle: h5py.File,
+    profile: str,
+    profile_contract: profiles.SimulationProfile,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None, dict[str, Any]]:
+    """Validate complete scientific, input, conditioning, and template provenance."""
+    expected = {
+        "scientific_config_json",
+        "input_files_json",
+        "source_exports_json",
+        "template_json",
+        "stationary_fixed_ownership_json",
+    }
+    if profile == profiles.TRANSIENT_DRYING_PROFILE:
+        expected.add("scalar_handoff_json")
+    _require_group_members(handle, "provenance", expected)
+    scientific = _hdf5_json_dataset(handle, "provenance/scientific_config_json")
+    input_files = _hdf5_json_dataset(handle, "provenance/input_files_json")
+    source_exports = _hdf5_json_dataset(handle, "provenance/source_exports_json")
+    template = _hdf5_json_dataset(handle, "provenance/template_json")
+    fixed_ownership = _hdf5_json_dataset(
+        handle,
+        "provenance/stationary_fixed_ownership_json",
+    )
+    expected_fixed = {
+        name: {
+            "owner": "package_fixed",
+            "unit": unit,
+            "fixed_value": profiles.STATIONARY_FIXED_VALUES[name],
+        }
+        for name, unit in zip(
+            profiles.STATIONARY_FIXED_FIELDS,
+            profiles.STATIONARY_FIXED_UNITS,
+            strict=True,
+        )
+    }
+    if (
+        not isinstance(scientific, dict)
+        or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
+        or scientific.get("simulation_profile") != profile
+        or fixed_ownership != expected_fixed
+    ):
+        msg = "Canonical HDF5 scientific or stationary-conditioning provenance is invalid."
+        raise ValueError(msg)
+    scalar_handoff: dict[str, Any] | None = None
+    if profile == profiles.TRANSIENT_DRYING_PROFILE:
+        raw_handoff = _hdf5_json_dataset(
+            handle,
+            "provenance/scalar_handoff_json",
+        )
+        if (
+            not isinstance(raw_handoff, dict)
+            or set(raw_handoff)
+            != {
+                "mechanism",
+                "filename",
+                "fresh_per_case",
+                "runtime_validation",
+                "entries",
+            }
+            or raw_handoff.get("mechanism") != "case_local_long_form_csv"
+            or raw_handoff.get("filename") != "scalars.csv"
+            or raw_handoff.get("fresh_per_case") is not True
+            or raw_handoff.get("runtime_validation") != "required"
+        ):
+            msg = "Canonical transient scalar-handoff provenance is invalid."
+            raise ValueError(msg)
+        scalar_handoff = raw_handoff
+    _validate_input_file_provenance(input_files, profile=profile)
+    _validate_source_export_provenance(
+        source_exports,
+        profile_contract=profile_contract,
+    )
+    relative_path = _hdf5_text_attribute(
+        handle.attrs.get("template_relative_path", ""),
+        label="template_relative_path",
+    )
+    template_sha256 = _hdf5_text_attribute(
+        handle.attrs.get("template_sha256", ""),
+        label="template_sha256",
+    )
+    expected_template = {
+        "relative_path": profile_contract.template_relative_path,
+        "filename": profile_contract.template_path.name,
+        "sha256": profile_contract.template_sha256,
+        "sha256_validation": "pass",
+        "comsol_internal_contract": "runtime_validation_required",
+    }
+    if (
+        relative_path != profile_contract.template_relative_path
+        or template_sha256 != profile_contract.template_sha256
+        or template != expected_template
+    ):
+        msg = "Canonical HDF5 template path, sidecar digest, or runtime-validation provenance is invalid."
+        raise ValueError(msg)
+    return scientific, relative_path, scalar_handoff, fixed_ownership
+
+
+def _validate_hdf5_static_and_parameters(
+    handle: h5py.File,
+    profile: str,
+    scalar_handoff: Mapping[str, Any] | None,
+) -> tuple[h5py.Dataset, tuple[str, ...]]:
+    """Validate the frozen grid, static fields, and profile parameter provenance."""
+    _require_group_members(handle, "coords", {"x", "y"})
+    _require_group_members(handle, "static", {"fields"})
+    x_axis = _hdf5_dataset(handle, "coords/x")
+    y_axis = _hdf5_dataset(handle, "coords/y")
+    static = _hdf5_dataset(handle, "static/fields")
+    if x_axis.dtype != np.float64 or y_axis.dtype != np.float64 or static.dtype != np.float32:
+        msg = "Canonical coordinate/static dtypes are invalid."
+        raise ValueError(msg)
+    x_unit = _hdf5_text_attribute(x_axis.attrs.get("unit", ""), label="coords.x.unit")
+    y_unit = _hdf5_text_attribute(y_axis.attrs.get("unit", ""), label="coords.y.unit")
+    if x_unit != "m" or y_unit != "m":
+        msg = "Canonical coordinate units must be explicit metres."
+        raise ValueError(msg)
+    x_values = np.asarray(x_axis, dtype=np.float64)
+    y_values = np.asarray(y_axis, dtype=np.float64)
+    if (
+        x_values.shape != (401,)
+        or y_values.shape != (251,)
+        or not np.isfinite(x_values).all()
+        or not np.isfinite(y_values).all()
+        or not np.allclose(x_values, np.linspace(0.0, 1.2, 401), rtol=0.0, atol=_COORDINATE_ATOL)
+        or not np.allclose(y_values, np.linspace(0.0, 0.75, 251), rtol=0.0, atol=_COORDINATE_ATOL)
+    ):
+        msg = "Canonical coordinate axes must satisfy the frozen 401x251 boundary-inclusive grid."
+        raise ValueError(msg)
+    static_names = profiles.static_field_names(profile)
+    static_units = profiles.static_field_units(profile)
+    if static.shape != (len(static_names), 251, 401) or not _dataset_is_finite(static):
+        msg = "Canonical static field shape or finiteness is invalid."
+        raise ValueError(msg)
+    if static.compression != "gzip" or static.compression_opts != _HDF5_COMPRESSION_LEVEL or not static.shuffle or static.chunks != (1, 64, 64):
+        msg = "Canonical static compression or chunking contract is invalid."
+        raise ValueError(msg)
+    _dataset_contract(static, names=static_names, units=static_units, label="static")
+    scalar_names: tuple[str, ...]
+    scalar_units: tuple[str, ...]
+    if profile == profiles.STEADY_FLOW_PROFILE:
+        _require_group_members(handle, "stationary_fixed", {"values"})
+        scalar = _hdf5_dataset(handle, "stationary_fixed/values")
+        scalar_names = profiles.STATIONARY_FIXED_FIELDS
+        scalar_units = profiles.STATIONARY_FIXED_UNITS
+        scalar_values = np.asarray(scalar, dtype=np.float64)
+        ownership = json.loads(
+            _hdf5_text_attribute(
+                scalar.attrs.get("ownership", ""),
+                label="stationary_fixed.ownership",
+            )
+        )
+        runtime_source = _hdf5_text_attribute(
+            scalar.attrs.get("runtime_source", ""),
+            label="stationary_fixed.runtime_source",
+        )
+        expected_values = np.asarray(
+            [profiles.STATIONARY_FIXED_VALUES[name] for name in scalar_names],
+            dtype=np.float64,
+        )
+        if (
+            scalar_handoff is not None
+            or scalar.dtype != np.float64
+            or scalar.shape != (len(scalar_names),)
+            or ownership != ["package_fixed"] * len(scalar_names)
+            or runtime_source != "canonical_template"
+            or not np.array_equal(scalar_values, expected_values)
+        ):
+            msg = "Canonical stationary template-fixed values or provenance are invalid."
+            raise ValueError(msg)
+        _dataset_contract(
+            scalar,
+            names=scalar_names,
+            units=scalar_units,
+            label="stationary_fixed",
+        )
+        return scalar, scalar_names
+
+    _require_group_members(handle, "scalar", {"values"})
+    scalar = _hdf5_dataset(handle, "scalar/values")
+    scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    scalar_units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
+    scalar_values = np.asarray(scalar, dtype=np.float64)
+    ownership = json.loads(
+        _hdf5_text_attribute(
+            scalar.attrs.get("ownership", ""),
+            label="scalar.ownership",
+        )
+    )
+    expected_ownership = ["package_fixed" if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"} else "case_dependent" for name in scalar_names]
+    entries = None if scalar_handoff is None else scalar_handoff.get("entries")
+    expected_entries = [
+        {"name": name, "value": float(value), "unit": unit, "owner": owner}
+        for name, value, unit, owner in zip(
+            scalar_names,
+            scalar_values,
+            scalar_units,
+            expected_ownership,
+            strict=True,
+        )
+    ]
+    if (
+        scalar.dtype != np.float64
+        or scalar.shape != (len(scalar_names),)
+        or ownership != expected_ownership
+        or not np.isfinite(scalar_values).all()
+        or entries != expected_entries
+        or scalar_values[scalar_names.index("T_flow_ref")] != profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE
+        or scalar_values[scalar_names.index("p_ref")] != profiles.STATIONARY_FLOW_REFERENCE_PRESSURE
+        or scalar_values[scalar_names.index("p_out")] != profiles.STATIONARY_FLOW_OUTLET_PRESSURE
+    ):
+        msg = "Canonical transient scalar values or handoff provenance are invalid."
+        raise ValueError(msg)
+    _dataset_contract(
+        scalar,
+        names=scalar_names,
+        units=scalar_units,
+        label="scalar",
+    )
+    return scalar, scalar_names
+
+
+def _validate_hdf5_regular_trajectory(handle: h5py.File) -> np.ndarray:
+    """Validate the regular-only time axis and absolute physical trajectory."""
+    _require_group_members(handle, "transient", {"fields"})
+    time = _hdf5_dataset(handle, "time")
+    transient = _hdf5_dataset(handle, "transient/fields")
+    time_values = np.asarray(time, dtype=np.float64)
+    if (
+        time.dtype != np.float64
+        or transient.dtype != np.float32
+        or time_values.ndim != 1
+        or time_values.size < 1
+        or not np.array_equal(time_values, np.arange(time_values.size, dtype=np.float64))
+        or time_values[-1] > _TIME_HORIZON
+        or _hdf5_text_attribute(time.attrs.get("unit", ""), label="time.unit") != "h"
+        or float(time.attrs.get("classification_atol", -1.0)) != TIME_CLASSIFICATION_ATOL
+        or _hdf5_text_attribute(time.attrs.get("classification_basis", ""), label="time.classification_basis") != _TIME_CLASSIFICATION_BASIS
+        or not _dataset_is_finite(transient)
+    ):
+        msg = "Canonical regular time axis, dtypes, or classification provenance is invalid."
+        raise ValueError(msg)
+    if transient.shape != (time.size, len(profiles.TRANSIENT_FIELD_NAMES), 251, 401):
+        msg = "Canonical regular transient field shape is invalid."
+        raise ValueError(msg)
+    _dataset_contract(
+        transient,
+        names=profiles.TRANSIENT_FIELD_NAMES,
+        units=profiles.TRANSIENT_FIELD_UNITS,
+        label="transient",
+    )
+    if (
+        transient.compression != "gzip"
+        or transient.compression_opts != _HDF5_COMPRESSION_LEVEL
+        or not transient.shuffle
+        or transient.chunks != (1, 1, 64, 64)
+    ):
+        msg = "Canonical transient compression or chunking contract is invalid."
+        raise ValueError(msg)
+    return time_values
+
+
+def _validate_hdf5_schedule(handle: h5py.File, scalar: h5py.Dataset, scalar_names: tuple[str, ...]) -> None:
+    """Validate exact schedule fields and the sole thermodynamic conversion owner."""
+    _require_group_members(handle, "schedule", {"values"})
+    schedule = _hdf5_dataset(handle, "schedule/values")
+    values = np.asarray(schedule, dtype=np.float64)
+    if (
+        schedule.dtype != np.float64
+        or schedule.shape != (169, len(profiles.SCHEDULE_FIELDS))
+        or not np.isfinite(values).all()
+        or schedule.compression != "gzip"
+        or schedule.compression_opts != _HDF5_COMPRESSION_LEVEL
+        or not schedule.shuffle
+    ):
+        msg = "Canonical schedule dtype, shape, finiteness, or compression is invalid."
+        raise ValueError(msg)
+    if not np.array_equal(values[:, 0], np.arange(169, dtype=np.float64)):
+        msg = "Canonical schedule time coverage is invalid."
+        raise ValueError(msg)
+    _dataset_contract(schedule, names=profiles.SCHEDULE_FIELDS, units=profiles.SCHEDULE_UNITS, label="schedule")
+    p_ref = float(np.asarray(scalar, dtype=np.float64)[scalar_names.index("p_ref")])
+    conversion = json.loads(_hdf5_text_attribute(schedule.attrs.get("conversion_pressure", ""), label="schedule.conversion_pressure"))
+    conversion_owner = _hdf5_text_attribute(
+        schedule.attrs.get("humidity_conversion_owner", ""),
+        label="schedule.humidity_conversion_owner",
+    )
+    if conversion != {"name": "p_ref", "value": p_ref, "unit": "Pa", "owner": "package_fixed"} or conversion_owner != "generation_schedule":
+        msg = "Canonical schedule conversion-pressure provenance is invalid."
+        raise ValueError(msg)
+    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(values[:, 2], values[:, 1], pressure=p_ref)
+    if not np.allclose(
+        values[:, 3],
+        expected_phi,
+        rtol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
+        atol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
+    ):
+        msg = "Canonical schedule thermodynamic conversion is inconsistent."
+        raise ValueError(msg)
+
+
+def _complete_hdf5_time(handle: h5py.File, regular_time: np.ndarray) -> np.ndarray:
+    """Validate and append one optional diagnostic exact-stop time."""
+    if "exact_stop" not in handle:
+        return regular_time
+    exact_group = _require_group_members(handle, "exact_stop", {"time", "fields"})
+    exact_time = _hdf5_dataset(handle, "exact_stop/time")
+    exact_fields = _hdf5_dataset(handle, "exact_stop/fields")
+    values = np.asarray(exact_time, dtype=np.float64)
+    unit = _hdf5_text_attribute(exact_time.attrs.get("unit", ""), label="exact_stop.time.unit")
+    if (
+        exact_time.dtype != np.float64
+        or values.shape != (1,)
+        or values[0] <= regular_time[-1] + TIME_CLASSIFICATION_ATOL
+        or values[0] > _TIME_HORIZON + TIME_CLASSIFICATION_ATOL
+        or abs(values[0] - round(float(values[0]))) <= TIME_CLASSIFICATION_ATOL
+        or exact_fields.dtype != np.float32
+        or exact_fields.shape != (len(profiles.TRANSIENT_FIELD_NAMES), 251, 401)
+        or exact_fields.compression != "gzip"
+        or exact_fields.compression_opts != _HDF5_COMPRESSION_LEVEL
+        or not exact_fields.shuffle
+        or exact_fields.chunks != (1, 64, 64)
+        or not _dataset_is_finite(exact_fields)
+        or unit != "h"
+        or exact_group.attrs.get("usage") != "diagnostic_only_no_training_transition"
+    ):
+        msg = "Canonical exact-stop diagnostic contract is invalid."
+        raise ValueError(msg)
+    _dataset_contract(
+        exact_fields,
+        names=profiles.TRANSIENT_FIELD_NAMES,
+        units=profiles.TRANSIENT_FIELD_UNITS,
+        label="exact_stop.fields",
+    )
+    return np.concatenate((regular_time, values))
+
+
+def _validate_hdf5_diagnostics(handle: h5py.File, complete_time: np.ndarray) -> None:
+    """Validate complete global diagnostics and actual Final Status."""
+    _require_group_members(handle, "global", {"values"})
+    _require_group_members(handle, "final_status", {"values"})
+    global_values = _hdf5_dataset(handle, "global/values")
+    final_status = _hdf5_dataset(handle, "final_status/values")
+    global_array = np.asarray(global_values, dtype=np.float64)
+    final_array = np.asarray(final_status, dtype=np.float64)
+    if (
+        global_values.dtype != np.float64
+        or global_array.shape != (complete_time.size, len(profiles.GLOBAL_FIELD_NAMES))
+        or not np.isfinite(global_array).all()
+        or global_values.compression != "gzip"
+        or global_values.compression_opts != _HDF5_COMPRESSION_LEVEL
+        or not global_values.shuffle
+        or not np.allclose(global_array[:, 0], complete_time, rtol=0.0, atol=TIME_CLASSIFICATION_ATOL)
+    ):
+        msg = "Canonical complete global diagnostic values or time semantics are invalid."
+        raise ValueError(msg)
+    _dataset_contract(global_values, names=profiles.GLOBAL_FIELD_NAMES, units=profiles.GLOBAL_FIELD_UNITS, label="global")
+    if (
+        final_status.dtype != np.float64
+        or final_array.shape != (len(profiles.FINAL_STATUS_FIELDS),)
+        or not np.isfinite(final_array).all()
+        or abs(final_array[0] - complete_time[-1]) > TIME_CLASSIFICATION_ATOL
+    ):
+        msg = "Canonical final-status values or actual final time are invalid."
+        raise ValueError(msg)
+    _dataset_contract(
+        final_status,
+        names=profiles.FINAL_STATUS_FIELDS,
+        units=profiles.FINAL_STATUS_UNITS,
+        label="final_status",
+    )
+
+
+def _validate_hdf5_transient(handle: h5py.File, scalar: h5py.Dataset, scalar_names: tuple[str, ...]) -> None:
+    """Validate all transient-only schema-v1 members."""
+    regular_time = _validate_hdf5_regular_trajectory(handle)
+    _validate_hdf5_schedule(handle, scalar, scalar_names)
+    _validate_hdf5_diagnostics(handle, _complete_hdf5_time(handle, regular_time))
+
+
 def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> dict[str, Any]:
-    """Validate canonical case layout, dtypes, compression, chunks, and identities."""
+    """Validate exact schema-v1 layout, provenance, units, shapes, and identities."""
     if not path.is_file() or path.is_symlink():
         msg = f"Canonical case HDF5 is missing or unsafe: {path}"
         raise FileNotFoundError(msg)
     with h5py.File(path, "r") as handle:
-        if handle.attrs.get("schema_kind") != HDF5_SCHEMA_KIND or int(handle.attrs.get("schema_version", -1)) != HDF5_SCHEMA_VERSION:
-            msg = f"Unsupported canonical case HDF5 schema: {path}"
+        if (
+            handle.attrs.get("schema_kind") != HDF5_SCHEMA_KIND
+            or int(handle.attrs.get("schema_version", -1)) != HDF5_SCHEMA_VERSION
+            or handle.attrs.get("converter_version") != HDF5_CONVERTER_VERSION
+        ):
+            msg = f"Unsupported canonical case HDF5 schema or converter identity: {path}"
             raise ValueError(msg)
         profile = _hdf5_text_attribute(handle.attrs.get("simulation_profile", ""), label="simulation_profile")
         if expected_profile is not None and profile != expected_profile:
             msg = f"Canonical case profile mismatch: expected {expected_profile!r}, got {profile!r}."
             raise ValueError(msg)
-        expected_keys = {"coords", "static", "scalar"}
+        profile_contract = profiles.get_profile(profile)
+        _validate_hdf5_members(handle, profile)
+        (
+            scientific,
+            template_relative_path,
+            scalar_handoff,
+            _fixed_ownership,
+        ) = _validate_hdf5_provenance(
+            handle,
+            profile,
+            profile_contract,
+        )
+        scalar, scalar_names = _validate_hdf5_static_and_parameters(
+            handle,
+            profile,
+            scalar_handoff,
+        )
         if profile == profiles.TRANSIENT_DRYING_PROFILE:
-            expected_keys |= {"time", "transient", "schedule", "global"}
-        if set(handle) != expected_keys:
-            msg = f"Canonical HDF5 group membership mismatch for profile {profile!r}: {sorted(handle)}"
-            raise ValueError(msg)
-        x_axis = _hdf5_dataset(handle, "coords/x")
-        y_axis = _hdf5_dataset(handle, "coords/y")
-        static = _hdf5_dataset(handle, "static/fields")
-        if x_axis.dtype != np.float64 or y_axis.dtype != np.float64 or static.dtype != np.float32:
-            msg = "Canonical coordinate/static dtypes are invalid."
-            raise ValueError(msg)
-        if (
-            _hdf5_text_attribute(x_axis.attrs.get("unit", ""), label="coords.x.unit") != "m"
-            or _hdf5_text_attribute(y_axis.attrs.get("unit", ""), label="coords.y.unit") != "m"
-        ):
-            msg = "Canonical coordinate units must be explicit metres."
-            raise ValueError(msg)
-        x_values = np.asarray(x_axis, dtype=np.float64)
-        y_values = np.asarray(y_axis, dtype=np.float64)
-        if (
-            x_values.ndim != 1
-            or y_values.ndim != 1
-            or x_values.size < _MINIMUM_AXIS_POINTS
-            or y_values.size < _MINIMUM_AXIS_POINTS
-            or not np.isfinite(x_values).all()
-            or not np.isfinite(y_values).all()
-            or np.any(np.diff(x_values) <= 0.0)
-            or np.any(np.diff(y_values) <= 0.0)
-        ):
-            msg = "Canonical coordinate axes must be finite and strictly increasing."
-            raise ValueError(msg)
-        if static.shape != (len(profiles.STATIC_FIELD_NAMES), y_axis.size, x_axis.size):
-            msg = "Canonical static field shape is invalid."
-            raise ValueError(msg)
-        if static.compression != "gzip" or static.compression_opts != _HDF5_COMPRESSION_LEVEL or not static.shuffle or static.chunks is None:
-            msg = "Canonical static compression or chunking contract is invalid."
-            raise ValueError(msg)
-        static_names = json.loads(_hdf5_text_attribute(static.attrs["field_names"], label="static.field_names"))
-        static_units = json.loads(_hdf5_text_attribute(static.attrs["units"], label="static.units"))
-        if static_names != list(profiles.STATIC_FIELD_NAMES) or static_units != list(profiles.STATIC_FIELD_UNITS):
-            msg = "Canonical static field-name or unit metadata is invalid."
-            raise ValueError(msg)
-        scalar = _hdf5_dataset(handle, "scalar/values")
-        scalar_names = json.loads(_hdf5_text_attribute(scalar.attrs["field_names"], label="scalar.field_names"))
-        scalar_units = json.loads(_hdf5_text_attribute(scalar.attrs["units"], label="scalar.units"))
-        if (
-            scalar.dtype != np.float64
-            or scalar.shape != (len(profiles.SCALAR_INPUT_FIELDS),)
-            or scalar_names != list(profiles.SCALAR_INPUT_FIELDS)
-            or scalar_units != list(profiles.SCALAR_INPUT_UNITS)
-            or not np.isfinite(np.asarray(scalar, dtype=np.float64)).all()
-        ):
-            msg = "Canonical scalar values, names, or units are invalid."
-            raise ValueError(msg)
-        if profile == profiles.TRANSIENT_DRYING_PROFILE:
-            time = _hdf5_dataset(handle, "time")
-            transient = _hdf5_dataset(handle, "transient/fields")
-            schedule = _hdf5_dataset(handle, "schedule/values")
-            global_values = _hdf5_dataset(handle, "global/values")
-            if time.dtype != np.float64 or schedule.dtype != np.float64 or global_values.dtype != np.float64 or transient.dtype != np.float32:
-                msg = "Canonical transient, schedule, or global dtypes are invalid."
-                raise ValueError(msg)
-            transient_names = json.loads(_hdf5_text_attribute(transient.attrs["field_names"], label="transient.field_names"))
-            transient_units = json.loads(_hdf5_text_attribute(transient.attrs["units"], label="transient.units"))
-            schedule_names = json.loads(_hdf5_text_attribute(schedule.attrs["field_names"], label="schedule.field_names"))
-            schedule_units = json.loads(_hdf5_text_attribute(schedule.attrs["units"], label="schedule.units"))
-            global_names = json.loads(_hdf5_text_attribute(global_values.attrs["field_names"], label="global.field_names"))
-            global_units = json.loads(_hdf5_text_attribute(global_values.attrs["units"], label="global.units"))
-            time_values = np.asarray(time, dtype=np.float64)
-            schedule_values = np.asarray(schedule, dtype=np.float64)
-            global_array = np.asarray(global_values, dtype=np.float64)
-            if (
-                transient.shape != (time.size, len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size)
-                or transient_names != list(profiles.TRANSIENT_FIELD_NAMES)
-                or transient_units != list(profiles.TRANSIENT_FIELD_UNITS)
-                or _hdf5_text_attribute(time.attrs.get("unit", ""), label="time.unit") != "h"
-                or time_values.ndim != 1
-                or time_values.size < 1
-                or not np.isfinite(time_values).all()
-                or np.any(np.diff(time_values) <= 0.0)
-            ):
-                msg = "Canonical transient field, time, name, or unit contract is invalid."
-                raise ValueError(msg)
-            if (
-                schedule.shape != (169, len(profiles.SCHEDULE_FIELDS))
-                or schedule_names != list(profiles.SCHEDULE_FIELDS)
-                or schedule_units != list(profiles.SCHEDULE_UNITS)
-                or not np.isfinite(schedule_values).all()
-                or not np.array_equal(schedule_values[:, 0], np.arange(169, dtype=np.float64))
-            ):
-                msg = "Canonical schedule shape, values, names, or units are invalid."
-                raise ValueError(msg)
-            if (
-                global_array.ndim != _TABLE_RANK
-                or global_array.shape[0] < 1
-                or global_array.shape[1] != len(profiles.GLOBAL_FIELD_NAMES)
-                or global_names != list(profiles.GLOBAL_FIELD_NAMES)
-                or global_units != list(profiles.GLOBAL_FIELD_UNITS)
-                or not np.isfinite(global_array).all()
-                or np.any(np.diff(global_array[:, 0]) <= 0.0)
-            ):
-                msg = "Canonical global diagnostic shape, values, names, or units are invalid."
-                raise ValueError(msg)
-            if (
-                transient.compression != "gzip"
-                or transient.compression_opts != _HDF5_COMPRESSION_LEVEL
-                or not transient.shuffle
-                or transient.chunks is None
-            ):
-                msg = "Canonical transient compression or chunking contract is invalid."
-                raise ValueError(msg)
+            _validate_hdf5_transient(handle, scalar, scalar_names)
         identities = {
             name: _hdf5_text_attribute(handle.attrs[name], label=name)
             for name in ("case_input_id", "simulation_case_id", "scientific_config_digest", "template_sha256")
         }
-        if any(len(value) != _SHA256_HEX_LENGTH for value in identities.values()):
+        if any(not _is_sha256(value) for value in identities.values()):
             msg = "Canonical HDF5 identity attributes are malformed."
             raise ValueError(msg)
+        export_contract_sha256 = _hdf5_text_attribute(
+            handle.attrs.get("export_contract_sha256", ""),
+            label="export_contract_sha256",
+        )
+        available_views = json.loads(_hdf5_text_attribute(handle.attrs.get("available_learning_views", ""), label="available_learning_views"))
+        airflow_source = _hdf5_text_attribute(handle.attrs.get("airflow_source", ""), label="airflow_source")
+        if (
+            not _is_sha256(export_contract_sha256)
+            or available_views != list(profile_contract.available_learning_views)
+            or airflow_source != profile_contract.airflow_source
+        ):
+            msg = "Canonical HDF5 export, learning-view, or airflow provenance is invalid."
+            raise ValueError(msg)
+        if common.serialization.canonical_json_sha256(scientific) != identities["scientific_config_digest"]:
+            msg = "Canonical HDF5 scientific provenance digest is inconsistent."
+            raise ValueError(msg)
         git_commit = source_service.validate_git_commit(_hdf5_text_attribute(handle.attrs.get("git_commit", ""), label="git_commit"))
-        return {"simulation_profile": profile, "git_commit": git_commit, **identities}
+        return {
+            "simulation_profile": profile,
+            "git_commit": git_commit,
+            "template_relative_path": template_relative_path,
+            **identities,
+        }
 
 
 def convert_exports_to_hdf5(
@@ -658,25 +1462,48 @@ def convert_exports_to_hdf5(
     runtime_directory: Path,
     runtime_seconds: float,
 ) -> CanonicalCase:
-    """Validate all raw adapters and atomically create the sole canonical payload."""
+    """Validate all adapters and atomically create the sole canonical payload."""
     x_axis, y_axis, static_fields = _static_fields(config, exports)
+    stationary_values = _stationary_fixed_values(case_payload)
+    scalar_values = stationary_values if config.profile.id == profiles.STEADY_FLOW_PROFILE else _transient_scalar_values(case_payload, work_directory)
     transient_time: np.ndarray | None = None
     transient_fields: np.ndarray | None = None
+    exact_stop_time: float | None = None
+    exact_stop_fields: np.ndarray | None = None
     schedule_values: np.ndarray | None = None
     global_values: np.ndarray | None = None
     final_status: np.ndarray | None = None
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-        transient_time, transient_fields = _transient_fields(config, exports, x_axis=x_axis, y_axis=y_axis)
-        schedule_values = _schedule_values(case_payload, work_directory)
+        transient_time, transient_fields, exact_stop_time, exact_stop_fields = _transient_fields(
+            config,
+            exports,
+            x_axis=x_axis,
+            y_axis=y_axis,
+        )
+        scalar_names = profiles.scalar_input_fields(config.profile.id)
+        p_ref = float(scalar_values[scalar_names.index("p_ref")])
+        f_surf = float(scalar_values[scalar_names.index("f_surf")])
+        schedule_values = _schedule_values(case_payload, work_directory, p_ref=p_ref)
         global_values = _ordered_values(config, exports, profiles.GLOBAL_EXPORT_ROLE, profiles.GLOBAL_FIELD_NAMES)
         if np.any(np.diff(global_values[:, 0]) <= 0):
             msg = "Global diagnostic time must be strictly increasing."
             raise ValueError(msg)
-        _validate_global_bulk_moisture(static_fields, transient_time, transient_fields, global_values)
         final_status = _ordered_values(config, exports, profiles.FINAL_STATUS_EXPORT_ROLE, profiles.FINAL_STATUS_FIELDS)
-        if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
-            msg = "Final status export must contain exactly one complete row."
-            raise ValueError(msg)
+        state_time, state_fields = _combined_state_axis(
+            transient_time,
+            transient_fields,
+            exact_stop_time,
+            exact_stop_fields,
+        )
+        _validate_transient_outputs(
+            config,
+            static_fields,
+            state_time,
+            state_fields,
+            global_values,
+            final_status,
+            f_surf=f_surf,
+        )
     source_hashes = _source_hashes(exports)
     runtime_directory.mkdir(parents=True, exist_ok=True)
     destination = runtime_directory / "case.h5"
@@ -691,10 +1518,14 @@ def convert_exports_to_hdf5(
             x_axis=x_axis,
             y_axis=y_axis,
             static_fields=static_fields,
+            scalar_values=scalar_values,
             transient_time=transient_time,
             transient_fields=transient_fields,
+            exact_stop_time=exact_stop_time,
+            exact_stop_fields=exact_stop_fields,
             schedule_values=schedule_values,
             global_values=global_values,
+            final_status=final_status,
             source_hashes=source_hashes,
         )
         validate_case_hdf5(temporary, expected_profile=config.profile.id)
@@ -706,7 +1537,9 @@ def convert_exports_to_hdf5(
         config,
         case_payload,
         transient_time=transient_time,
+        exact_stop_time=exact_stop_time,
         final_status=final_status,
+        global_values=global_values,
         runtime_seconds=runtime_seconds,
     )
     status_path = common.serialization.atomic_write_json(runtime_directory / "status.json", status)

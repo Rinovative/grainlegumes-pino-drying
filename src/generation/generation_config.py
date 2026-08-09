@@ -6,7 +6,7 @@ Resolve and validate layered scientific and execution generation configurations.
 Responsibilities:
   - Resolve common, material-family, profile, dataset, and execution YAML owners
   - Validate authoritative grid, time, adapter, storage, split, and runtime contracts
-  - Derive deterministic scientific identities and profile-neutral input identity
+  - Derive deterministic scientific and exact case-input identities
 Design principles:
   - Scientific and execution settings remain physically and cryptographically separate
   - Resolved scientific configuration contains no inheritance or unresolved defaults
@@ -34,24 +34,53 @@ from src import common
 from . import generation_materials as materials
 from . import generation_profiles as profiles
 
-CONFIG_SCHEMA_VERSION = 2
-GENERATOR_VERSION = "python_multiscale_v2"
+CONFIG_SCHEMA_VERSION = 1
+GENERATOR_VERSION = 1
+CANONICAL_HDF5_SCHEMA_VERSION = 1
+CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
 UINT32_MAX = 2**32 - 1
 _EXPECTED_T_IN_MAX = 308.15
 _EXPECTED_F_WET_DM_MAX = 0.05
 _EXPECTED_HDF5_COMPRESSION_LEVEL = 4
 _MAXIMUM_TIME_CHUNK = 2
+_FINAL_PHYSICAL_FORMULAS = {
+    "w_surf_balance": "f_surf*d(w_surf)/dt = j_int - m_evap",
+    "w_int_balance": "(1-f_surf)*d(w_int)/dt = -j_int",
+    "w_gr": "f_surf*w_surf + (1-f_surf)*w_int",
+    "w_gr_0": "rho_bu_dry*X_0_db_field; w_surf(0)=w_int(0)=w_gr_0",
+    "r_surf": "r_surf_0",
+    "r_int": "r_int_surf*r_surf",
+    "j_int": "(1-f_surf)*r_int*(w_int-w_surf)",
+    "m_evap": "f_surf*r_surf*max(w_surf-w_eq,0)",
+    "X_db": "w_gr/rho_bu_dry",
+    "X_wb": "w_gr/(rho_bu_dry+w_gr)",
+    "X_wb_from_X_db": "X_db/(1+X_db)",
+    "X_db_from_X_wb": "X_wb/(1-X_wb)",
+    "X_wb_bulk": "integral(w_gr)/(integral(rho_bu_dry)+integral(w_gr))",
+    "rho_bu_dry": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
+    "solid_phase_density": "rho_bu_dry/(1-eps_bed)",
+    "cp_gr_eff": "cp_gr_dry + X_db*cp_w",
+    "volumetric_heat_capacity": "rho_bu_dry*cp_gr_eff",
+    "k_eff": "k_gr*(2*k_gr+k_air-2*eps_bed*(k_gr-k_air))/(2*k_gr+k_air+eps_bed*(k_gr-k_air))",
+    "phi_eff": "min(max(phi,1e-6),0.999)",
+    "X_eq_db": "0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw",
+    "w_eq": "rho_bu_dry*X_eq_db",
+    "osw_ratio_0": "(100*X_0_db_field/(A_osw+B_osw*(T_init-273.15[K])))^(1/C_osw)",
+    "phi_init": "osw_ratio_0/(1+osw_ratio_0)",
+    "Q_evap": "-h_fg*m_evap",
+    "f_wet_dm": "integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)",
+    "total_water_balance": "d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out",
+}
 _STEADY_FLOW_AUDIT_DEPENDENCIES = (
     "Kxx",
     "Kxy",
     "Kyy",
     "eps_bed",
-    "p_bc",
-    "air_dynamic_viscosity",
-    "air_density",
+    "p_in_bc",
     "T_flow_ref",
-    "profile_reference_temperature",
+    "p_ref",
+    "p_out",
 )
 SPLIT_NAMES = (
     "train",
@@ -270,13 +299,14 @@ def _reference_path(value: Any, *, source_path: Path, label: str) -> Path:
 def _validate_grid(value: Any) -> dict[str, Any]:
     """Validate the authoritative 401-by-251 boundary-inclusive grid."""
     grid = _mapping(value, label="common.grid")
-    expected = {"nx", "ny", "Lx", "Ly", "dx", "dy", "boundaries_included"}
+    expected = {"nx", "ny", "Lx", "Ly", "Lz", "dx", "dy", "boundaries_included"}
     _exact_keys(grid, required=expected, optional=set(), label="common.grid")
     required = {
         "nx": 401,
         "ny": 251,
         "Lx": 1.2,
         "Ly": 0.75,
+        "Lz": 0.8,
         "dx": 0.003,
         "dy": 0.003,
         "boundaries_included": True,
@@ -286,6 +316,7 @@ def _validate_grid(value: Any) -> dict[str, Any]:
         "ny": _integer(grid["ny"], label="common.grid.ny", minimum=2),
         "Lx": _finite(grid["Lx"], label="common.grid.Lx"),
         "Ly": _finite(grid["Ly"], label="common.grid.Ly"),
+        "Lz": _finite(grid["Lz"], label="common.grid.Lz"),
         "dx": _finite(grid["dx"], label="common.grid.dx"),
         "dy": _finite(grid["dy"], label="common.grid.dy"),
         "boundaries_included": grid["boundaries_included"],
@@ -326,7 +357,9 @@ def _validate_scientific_fixed(value: Any, *, allow_unresolved: bool) -> dict[st
     """Validate fixed thermodynamic, humidity, and stopping values."""
     fixed = _mapping(value, label="common.scientific_fixed_values")
     expected = {
+        "T_flow_ref",
         "p_ref",
+        "p_out",
         "T_in_max",
         "omega_min",
         "omega_max",
@@ -336,13 +369,19 @@ def _validate_scientific_fixed(value: Any, *, allow_unresolved: bool) -> dict[st
         "schedule_interpolation",
     }
     _exact_keys(fixed, required=expected, optional=set(), label="common.scientific_fixed_values")
-    unresolved_allowed = {"p_ref", "omega_min", "omega_max", "phi_clip_min", "phi_clip_max"}
+    unresolved_allowed = {"omega_min", "omega_max", "phi_clip_min", "phi_clip_max"}
     for key in expected.difference({"schedule_interpolation"}):
         if fixed[key] is None and allow_unresolved and key in unresolved_allowed:
             continue
         fixed[key] = _finite(fixed[key], label=f"common.scientific_fixed_values.{key}")
-    if fixed["p_ref"] is not None and fixed["p_ref"] <= 0:
-        msg = "common.scientific_fixed_values.p_ref must be positive."
+    if fixed["T_flow_ref"] != profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE:
+        msg = "common.scientific_fixed_values.T_flow_ref must be the package-fixed 300.65 K."
+        raise GenerationConfigError(msg)
+    if fixed["p_ref"] != profiles.STATIONARY_FLOW_REFERENCE_PRESSURE:
+        msg = "common.scientific_fixed_values.p_ref must match the package-fixed 101325 Pa template contract."
+        raise GenerationConfigError(msg)
+    if fixed["p_out"] != profiles.STATIONARY_FLOW_OUTLET_PRESSURE:
+        msg = "common.scientific_fixed_values.p_out must match the package-fixed 0 Pa template contract."
         raise GenerationConfigError(msg)
     if fixed["T_in_max"] != _EXPECTED_T_IN_MAX or fixed["f_wet_dm_max"] != _EXPECTED_F_WET_DM_MAX:
         msg = "Temperature maximum and dry-mass-weighted stop limit must be 308.15 K and 0.05."
@@ -358,14 +397,9 @@ def _validate_scientific_fixed(value: Any, *, allow_unresolved: bool) -> dict[st
 
 
 def _validate_input_contract(value: Any) -> dict[str, Any]:
-    """Validate canonical spatial, scalar, and schedule adapters."""
+    """Validate canonical profile-specific spatial, scalar, and schedule adapters."""
     contract = _mapping(value, label="common.input_contract")
     _exact_keys(contract, required={"spatial", "scalar", "schedule"}, optional=set(), label="common.input_contract")
-    expected_columns = {
-        "spatial": list(profiles.SPATIAL_INPUT_FIELDS),
-        "scalar": ["name", "value", "unit"],
-        "schedule": list(profiles.SCHEDULE_FIELDS),
-    }
     expected_filenames = {"spatial": "fields.csv", "scalar": "scalars.csv", "schedule": "schedule.csv"}
     filenames: set[str] = set()
     normalized: dict[str, Any] = {}
@@ -373,9 +407,8 @@ def _validate_input_contract(value: Any) -> dict[str, Any]:
         adapter = _mapping(contract[name], label=f"common.input_contract.{name}")
         _exact_keys(adapter, required={"filename", "delimiter", "columns"}, optional=set(), label=f"common.input_contract.{name}")
         filename = validate_relative_file(adapter["filename"], label=f"common.input_contract.{name}.filename", suffix=".csv")
-        columns = adapter["columns"]
-        if filename != expected_filenames[name] or columns != expected_columns[name]:
-            message = f"{name} adapter must use {expected_filenames[name]!r} with columns {expected_columns[name]}."
+        if filename != expected_filenames[name]:
+            message = f"{name} adapter must use canonical filename {expected_filenames[name]!r}."
             raise GenerationConfigError(message)
         if filename in filenames:
             msg = "Input adapter filenames must be unique."
@@ -384,8 +417,25 @@ def _validate_input_contract(value: Any) -> dict[str, Any]:
         normalized[name] = {
             "filename": filename,
             "delimiter": _delimiter(adapter["delimiter"], label=f"common.input_contract.{name}.delimiter"),
-            "columns": list(columns),
         }
+        columns = adapter["columns"]
+        if name == "spatial":
+            by_profile = _mapping(columns, label="common.input_contract.spatial.columns")
+            expected_profiles = set(profiles.available_profiles())
+            _exact_keys(by_profile, required=expected_profiles, optional=set(), label="common.input_contract.spatial.columns")
+            normalized["spatial"]["columns_by_profile"] = {}
+            for profile_id in profiles.available_profiles():
+                expected = list(profiles.spatial_input_fields(profile_id))
+                if by_profile[profile_id] != expected:
+                    message = f"Spatial adapter for {profile_id!r} must use exact columns {expected}."
+                    raise GenerationConfigError(message)
+                normalized["spatial"]["columns_by_profile"][profile_id] = expected
+        else:
+            expected = ["name", "value", "unit"] if name == "scalar" else list(profiles.SCHEDULE_FIELDS)
+            if columns != expected:
+                message = f"{name} adapter must use exact columns {expected}."
+                raise GenerationConfigError(message)
+            normalized[name]["columns"] = list(columns)
     return normalized
 
 
@@ -406,8 +456,13 @@ def _validate_storage(value: Any) -> dict[str, Any]:
     }
     _exact_keys(storage, required=expected, optional=set(), label="common.storage")
     storage["schema_version"] = _integer(storage["schema_version"], label="common.storage.schema_version", minimum=1)
-    if not isinstance(storage["converter_version"], str) or not storage["converter_version"]:
-        msg = "common.storage.converter_version must be non-empty text."
+    storage["converter_version"] = _integer(
+        storage["converter_version"],
+        label="common.storage.converter_version",
+        minimum=1,
+    )
+    if storage["schema_version"] != CANONICAL_HDF5_SCHEMA_VERSION or storage["converter_version"] != CANONICAL_HDF5_CONVERTER_VERSION:
+        msg = f"Canonical storage must use schema {CANONICAL_HDF5_SCHEMA_VERSION} and converter {CANONICAL_HDF5_CONVERTER_VERSION!r}."
         raise GenerationConfigError(msg)
     if storage["compression"] != "gzip" or storage["compression_level"] != _EXPECTED_HDF5_COMPRESSION_LEVEL or storage["shuffle"] is not True:
         msg = "Canonical case fields require gzip level 4 with shuffle enabled."
@@ -445,6 +500,11 @@ def _validate_common(value: Any, *, require_executable: bool) -> dict[str, Any]:
     if common_config["schema_kind"] != "generation_common" or common_config["schema_version"] != 1:
         msg = "Unsupported generation common configuration schema."
         raise GenerationConfigError(msg)
+    common_config["generator_version"] = _integer(
+        common_config["generator_version"],
+        label="generation common generator_version",
+        minimum=1,
+    )
     if common_config["generator_version"] != GENERATOR_VERSION:
         msg = f"generator_version must be {GENERATOR_VERSION!r}."
         raise GenerationConfigError(msg)
@@ -456,21 +516,14 @@ def _validate_common(value: Any, *, require_executable: bool) -> dict[str, Any]:
         raise GenerationConfigError(msg)
     common_config["parameter_values"] = _mapping(common_config["parameter_values"], label="common.parameter_values")
     formulas = _mapping(common_config["physical_formulas"], label="common.physical_formulas")
-    required_formulas = {
-        "w_gr",
-        "X_db",
-        "X_wb",
-        "X_wb_from_X_db",
-        "X_db_from_X_wb",
-        "X_wb_bulk",
-        "rho_bu_dry",
-        "w_gr_0",
-        "cp_gr_eff",
-        "f_wet_dm",
-    }
-    _exact_keys(formulas, required=required_formulas, optional=set(), label="common.physical_formulas")
-    if any(not isinstance(formula, str) or not formula for formula in formulas.values()):
-        msg = "Every common physical formula must be explicit non-empty text."
+    _exact_keys(
+        formulas,
+        required=set(_FINAL_PHYSICAL_FORMULAS),
+        optional=set(),
+        label="common.physical_formulas",
+    )
+    if formulas != _FINAL_PHYSICAL_FORMULAS:
+        msg = "common.physical_formulas must match the frozen final VP2 formula contract exactly."
         raise GenerationConfigError(msg)
     common_config["physical_formulas"] = formulas
     common_config["scientific_fixed_values"] = _validate_scientific_fixed(
@@ -484,7 +537,12 @@ def _validate_common(value: Any, *, require_executable: bool) -> dict[str, Any]:
     return common_config
 
 
-def _validate_steady_flow_conditioning(value: Any, *, require_executable: bool) -> dict[str, Any] | None:
+def _validate_steady_flow_conditioning(  # noqa: C901, PLR0912 -- exhaustive scientific ownership contract
+    value: Any,
+    *,
+    fixed_values: Mapping[str, Any],
+    require_executable: bool,
+) -> dict[str, Any] | None:
     """Validate one exhaustive source-owned stationary-airflow dependency audit."""
     if value is None:
         if require_executable:
@@ -570,16 +628,56 @@ def _validate_steady_flow_conditioning(value: Any, *, require_executable: bool) 
         label="steady_flow_conditioning.additional_case_varying_solver_scalars",
         allow_empty=True,
     )
-    unknown_additional = sorted(set(additional).difference(names))
-    if unknown_additional:
-        message = f"Additional steady-flow solver scalars lack dependency declarations: {unknown_additional}."
+    if additional:
+        message = "The canonical steady template permits no additional case-varying solver scalars."
         raise GenerationConfigError(message)
+    declared = {dependency["name"]: dependency for dependency in validated}
+    expected_model_inputs = {
+        "Kxx": "m^2",
+        "Kxy": "m^2",
+        "Kyy": "m^2",
+        "eps_bed": "1",
+        "p_in_bc": "Pa",
+    }
+    for name, unit in expected_model_inputs.items():
+        if declared[name] != {
+            "name": name,
+            "affects_stationary_solution": True,
+            "owner": "model_input",
+            "unit": unit,
+            "fixed_value": None,
+        }:
+            message = f"Steady-flow conditioning for {name!r} must be owned only by fields.csv."
+            raise GenerationConfigError(message)
+    for name, unit in zip(profiles.STATIONARY_FIXED_FIELDS, profiles.STATIONARY_FIXED_UNITS, strict=True):
+        value = fixed_values.get(name)
+        if value is None:
+            if require_executable:
+                message = f"Steady-flow package-fixed value {name!r} is unresolved."
+                raise GenerationConfigError(message)
+            continue
+        expected_value = profiles.STATIONARY_FIXED_VALUES[name]
+        if float(value) != expected_value or declared[name] != {
+            "name": name,
+            "affects_stationary_solution": True,
+            "owner": "package_fixed",
+            "unit": unit,
+            "fixed_value": expected_value,
+        }:
+            message = f"Steady-flow conditioning for {name!r} disagrees with the canonical template contract."
+            raise GenerationConfigError(message)
     conditioning["dependencies"] = validated
-    conditioning["additional_case_varying_solver_scalars"] = list(additional)
+    conditioning["additional_case_varying_solver_scalars"] = []
     return conditioning
 
 
-def _validate_profile_config(value: Any, *, profile: profiles.SimulationProfile, require_executable: bool) -> dict[str, Any]:
+def _validate_profile_config(
+    value: Any,
+    *,
+    profile: profiles.SimulationProfile,
+    fixed_values: Mapping[str, Any],
+    require_executable: bool,
+) -> dict[str, Any]:
     """Validate explicit profile mappings without inferring binary template internals."""
     config = _mapping(value, label="generation profile configuration")
     expected = {
@@ -602,6 +700,7 @@ def _validate_profile_config(value: Any, *, profile: profiles.SimulationProfile,
         raise GenerationConfigError(message)
     config["steady_flow_conditioning"] = _validate_steady_flow_conditioning(
         config["steady_flow_conditioning"],
+        fixed_values=fixed_values,
         require_executable=require_executable,
     )
     exports = config["exports"]
@@ -1052,7 +1151,7 @@ def _validate_execution(value: Any) -> dict[str, Any]:
 
 
 def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the profile-neutral scientific subset that determines case inputs."""
+    """Return science that determines adapter inputs, excluding output behavior."""
     value = copy.deepcopy(dict(scientific))
     for key in (
         "simulation_profile",
@@ -1224,11 +1323,17 @@ def _build_batch(
             seed_base=batch_seed,
             method=sampling_method,
         )
+    input_contract = copy.deepcopy(dict(common_config["input_contract"]))
+    spatial_contract = input_contract["spatial"]
+    spatial_contract["columns"] = spatial_contract.pop("columns_by_profile")[profile.id]
+    if profile.id == profiles.STEADY_FLOW_PROFILE:
+        input_contract.pop("scalar")
+        input_contract.pop("schedule")
     output_contract = {
         "exports_root": "exports",
         "exports": common_config["_profile_exports"],
-        "static_field_names": list(profiles.STATIC_FIELD_NAMES),
-        "static_field_units": list(profiles.STATIC_FIELD_UNITS),
+        "static_field_names": list(profiles.static_field_names(profile.id)),
+        "static_field_units": list(profiles.static_field_units(profile.id)),
         "transient_field_names": (list(profiles.TRANSIENT_FIELD_NAMES) if profile.id == profiles.TRANSIENT_DRYING_PROFILE else []),
         "transient_field_units": (list(profiles.TRANSIENT_FIELD_UNITS) if profile.id == profiles.TRANSIENT_DRYING_PROFILE else []),
         "global_field_names": (list(profiles.GLOBAL_FIELD_NAMES) if profile.id == profiles.TRANSIENT_DRYING_PROFILE else []),
@@ -1254,10 +1359,22 @@ def _build_batch(
         "assignments": [assignments[index] for index in case_indices],
         "registry_metadata": copy.deepcopy(dict(registry_metadata)),
         "scientific_fixed_values": copy.deepcopy(dict(common_config["scientific_fixed_values"])),
+        "stationary_fixed_ownership": {
+            name: {
+                "owner": "package_fixed",
+                "unit": unit,
+                "fixed_value": float(common_config["scientific_fixed_values"][name]),
+            }
+            for name, unit in zip(
+                profiles.STATIONARY_FIXED_FIELDS,
+                profiles.STATIONARY_FIXED_UNITS,
+                strict=True,
+            )
+        },
         "physical_formulas": copy.deepcopy(dict(common_config["physical_formulas"])),
         "grid": copy.deepcopy(dict(common_config["grid"])),
         "time": copy.deepcopy(dict(common_config["time"])),
-        "input_contract": copy.deepcopy(dict(common_config["input_contract"])),
+        "input_contract": input_contract,
         "output_contract": output_contract,
         "storage": copy.deepcopy(dict(common_config["storage"])),
         "available_learning_views": list(profile.available_learning_views),
@@ -1315,6 +1432,7 @@ def load_campaign_config(path: Path | str, *, require_executable: bool = True) -
     profile_config = _validate_profile_config(
         profile_raw,
         profile=profile,
+        fixed_values=common_config["scientific_fixed_values"],
         require_executable=require_executable,
     )
     execution = _validate_execution(_load_yaml(campaign["execution_config"], label="generation execution configuration"))

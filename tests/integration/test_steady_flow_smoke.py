@@ -88,7 +88,7 @@ def _case_components(
         "Kxy": 0.01 * offset + 0.02 * x * y,
         "Kyy": -11.8 + 0.015 * offset + 0.01 * y,
         "eps_bed": 0.25 + 0.005 * offset + 0.02 * x + 0.01 * y,
-        "p_bc": (1.0 - x) * (1.0 + 0.02 * offset) + 0.01 * y,
+        "p_in_bc": (1.0 - x) * (1.0 + 0.02 * offset) + 0.01 * y,
     }
     output_fields = {
         "p": (1.0 - x) * (1.0 + 0.01 * offset) + 0.02 * y,

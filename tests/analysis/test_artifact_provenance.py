@@ -545,7 +545,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             np.testing.assert_allclose(payload["pred"][-1], expected_speed)
             assert payload["artifact_units"][-1] == velocity_unit
             pressure = payload["pred"][pressure_index]
-            pressure_boundary = payload["p_bc"][0]
+            pressure_boundary = payload["p_in_bc"][0]
             expected_inlet = float(np.mean((pressure[0] - pressure_boundary[0]) ** 2))
             expected_outlet_mean_square = float(np.mean(pressure[-1]) ** 2)
             outlet_pointwise_mse = float(np.mean(pressure[-1] ** 2))

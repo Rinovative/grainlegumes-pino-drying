@@ -14,10 +14,8 @@ exports:
     Kxy: null
     Kyy: null
     eps_bed: null
-    p_bc: null
-    X_0_db_field: null
+    p_in_bc: null
     u: null
     v: null
     p: null
-    rho_bu_dry: null
   time_column: null

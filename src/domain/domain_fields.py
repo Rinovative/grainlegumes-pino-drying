@@ -26,7 +26,7 @@ from __future__ import annotations
 COORDINATE_FIELDS = ("x", "y")
 PERMEABILITY_FIELDS = ("Kxx", "Kxy", "Kyy")
 POROSITY_FIELDS = ("eps_bed",)
-BOUNDARY_FIELDS = ("p_bc",)
+BOUNDARY_FIELDS = ("p_in_bc",)
 STATE_FIELDS = ("p", "u", "v")
 DERIVED_ANALYSIS_FIELDS = ("U",)
 ANALYSIS_FIELDS = (*STATE_FIELDS, *DERIVED_ANALYSIS_FIELDS)

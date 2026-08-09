@@ -245,7 +245,7 @@ def _field_display_label(field: str) -> str:
         "Kxy": r"$\kappa_{xy}$",
         "Kyy": r"$\kappa_{yy}$",
         "eps_bed": r"$\varepsilon$",
-        "p_bc": r"$p_{\mathrm{bc}}$",
+        "p_in_bc": r"$p_{\mathrm{bc}}$",
     }
     return scientific_labels.get(field, field_label(field, mathtext=True))
 

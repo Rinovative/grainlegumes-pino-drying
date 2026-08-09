@@ -153,7 +153,7 @@ def _frame(
         error = bias * (position + 1) * pattern
         prediction = reference + error
         errors.append(error)
-        p_bc = 2.0 - y_grid
+        p_in_bc = 2.0 - y_grid
         coordinate_values = iter((x_grid, y_grid))
         diagonal_permeability_values = iter((1e-4, 2e-4))
         input_by_field: dict[str, np.ndarray] = {}
@@ -167,7 +167,7 @@ def _frame(
             elif field_spec.role == "porosity":
                 input_by_field[field_spec.name] = 0.35 + 0.05 * x_grid
             elif field_spec.role == "boundary":
-                input_by_field[field_spec.name] = p_bc
+                input_by_field[field_spec.name] = p_in_bc
             else:
                 msg = f"unsupported fixture input role: {field_spec.role}"
                 raise AssertionError(msg)
@@ -205,7 +205,7 @@ def _frame(
             kappa_encoded=permeability,
             kappa=permeability,
             kappa_names=np.asarray(permeability_fields),
-            p_bc=p_bc[None],
+            p_in_bc=p_in_bc[None],
             coordinates=np.stack((x_grid, y_grid)),
             Rx=residuals["Rx"],
             Ry=residuals["Ry"],

@@ -23,13 +23,13 @@ def build_synthetic_generated_batch_identity(
     """Return one deterministic current profile-qualified batch identity."""
     case_ids = list(sample_ids)
     content: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 1,
         "batch_id": batch_id,
         "simulation_profile": "steady_flow",
         "batch_identity": hashlib.sha256(f"{batch_id}:batch".encode()).hexdigest(),
         "scientific_config_digest": hashlib.sha256(f"{batch_id}:scientific".encode()).hexdigest(),
         "template": {
-            "relative_path": "simulation/steady_flow/template_brinkman.mph",
+            "relative_path": "simulation/steady_flow/steady_flow_template.mph",
             "sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
         },
         "export_contract_sha256": hashlib.sha256(b"synthetic-exports").hexdigest(),

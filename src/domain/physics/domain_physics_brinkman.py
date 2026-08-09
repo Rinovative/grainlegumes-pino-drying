@@ -469,7 +469,7 @@ def evaluate_steady_2d_brinkman(
     ----------
     inputs, outputs : torch.Tensor
         Task-ordered BCHW tensors. Output channels are physical ``p``/``u``/``v``
-        values. Input ``x``, ``y``, ``eps``, and ``p_bc`` retain physical/stored
+        values. Input ``x``, ``y``, ``eps``, and ``p_in_bc`` retain physical/stored
         values. Diagonal permeability channels are log10 ratios to 1 m² and are
         exponentiated, while ``kxy`` is the dimensionless geometric-mean ratio.
     input_fields, output_fields : Sequence[str]
@@ -516,7 +516,7 @@ def evaluate_steady_2d_brinkman(
     input_values = _field_mapping(
         inputs,
         input_fields,
-        ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_bc"),
+        ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc"),
         label="input",
     )
     output_values = _field_mapping(
@@ -555,7 +555,7 @@ def evaluate_steady_2d_brinkman(
     )
     pressure_boundary = pressure_boundary_residuals(
         output_values["p"],
-        input_values["p_bc"],
+        input_values["p_in_bc"],
         input_values["y"],
         spacing_y,
         spatial_axes=spatial_axes,

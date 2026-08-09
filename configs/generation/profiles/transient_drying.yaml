@@ -14,7 +14,7 @@ exports:
     Kxy: null
     Kyy: null
     eps_bed: null
-    p_bc: null
+    p_in_bc: null
     X_0_db_field: null
     u: null
     v: null
@@ -39,16 +39,15 @@ exports:
   columns:
     t: null
     X_wb_bulk: null
-    X_wb_max: null
-    X_wb_q95_mass: null
     f_wet_dm: null
-    T_out_mean: null
-    phi_out_mean: null
     m_w_gr: null
     m_v_gas: null
     m_dot_evap: null
     m_dot_v_in: null
     m_dot_v_out: null
+    mt_mass_balance: null
+    T_out_mean: null
+    phi_out_mean: null
   time_column: null
 - role: final_status
   pattern: null
@@ -56,10 +55,8 @@ exports:
   columns:
     t_final: null
     f_wet_dm_final: null
-    X_target_wb: null
-    X_wb_bulk: null
-    X_wb_max: null
-    X_wb_q95_mass: null
+    X_wb_bulk_final: null
+    X_wb_max_final: null
     T_min_final: null
     T_max_final: null
     phi_min_final: null

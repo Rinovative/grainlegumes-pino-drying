@@ -183,7 +183,7 @@ jobs:
         run: |
           python -c "from src import analysis, common, datasets, domain, experiments, learning"
           python -m src.common.common_queue_log_cli --help
-          python -m src.datasets.dataset_build --help
+          python -m src.datasets.dataset_packages --help
           python -m src.experiments.cli.cli_train --help
           python -m src.experiments.cli.cli_optuna --help
           python -m src.experiments.cli.cli_config_preflight --help

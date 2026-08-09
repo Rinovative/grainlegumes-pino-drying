@@ -26,6 +26,8 @@ from typing import Any
 
 import numpy as np
 
+from . import generation_config as config_contract
+
 _EVENT_SELECTION_THRESHOLD = 0.5
 
 
@@ -277,7 +279,8 @@ def generate_schedule(
     return Schedule(
         values=values_array,
         metadata={
-            "generator": "compositional_mixed_v1",
+            "generator_kind": "compositional_mixed",
+            "generator_version": config_contract.GENERATOR_VERSION,
             "interpolation": "linear",
             "schedule_class": _schedule_class(
                 active,
@@ -291,11 +294,19 @@ def generate_schedule(
             "seeds": dict(seeds),
             "shared_realization": shared_details,
             "independent_realization": independent_details,
-            "humidity_formula": "phi=p_ref*omega/(0.621945+omega)/p_sat(T)",
+            "column_order": ["t", "T_in_bc", "omega_in_bc", "phi_in_bc"],
+            "humidity_formula": "phi_in_bc=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_in_bc)",
+            "humidity_conversion_owner": "generation_schedule",
+            "conversion_pressure": {
+                "name": "p_ref",
+                "value": float(fixed["p_ref"]),
+                "unit": "Pa",
+                "owner": "package_fixed",
+            },
             "saturation_pressure_formula": "Magnus_610.94_17.625_243.04",
             "planned_interval": [float(time[0]), float(time[-1])],
             "units": {
-                "values": {"t": "h", "T_in": "K", "omega_in": "kg/kg", "phi_in": "1"},
+                "values": {"t": "h", "T_in_bc": "K", "omega_in_bc": "kg/kg", "phi_in_bc": "1"},
                 "diagnostics": {
                     "smooth.phases": "rad",
                     "smooth.timescale": "h",
