@@ -42,6 +42,17 @@ _EXPECTED_T_IN_MAX = 308.15
 _EXPECTED_F_WET_DM_MAX = 0.05
 _EXPECTED_HDF5_COMPRESSION_LEVEL = 4
 _MAXIMUM_TIME_CHUNK = 2
+_STEADY_FLOW_AUDIT_DEPENDENCIES = (
+    "Kxx",
+    "Kxy",
+    "Kyy",
+    "eps_bed",
+    "p_bc",
+    "air_dynamic_viscosity",
+    "air_density",
+    "T_flow_ref",
+    "profile_reference_temperature",
+)
 SPLIT_NAMES = (
     "train",
     "validation",
@@ -124,6 +135,7 @@ class CampaignConfig:
     roles: dict[str, tuple[str, ...]]
     batches: tuple[GenerationConfig, ...]
     dataset_packages: tuple[dict[str, Any], ...]
+    duplicate_case_input_policy: str
     execution_values: dict[str, Any]
 
     def batch(self, batch_name: str) -> GenerationConfig:
@@ -472,10 +484,112 @@ def _validate_common(value: Any, *, require_executable: bool) -> dict[str, Any]:
     return common_config
 
 
+def _validate_steady_flow_conditioning(value: Any, *, require_executable: bool) -> dict[str, Any] | None:
+    """Validate one exhaustive source-owned stationary-airflow dependency audit."""
+    if value is None:
+        if require_executable:
+            message = "Executable generation profiles must resolve steady_flow_conditioning."
+            raise GenerationConfigError(message)
+        return None
+    conditioning = _mapping(value, label="generation profile steady_flow_conditioning")
+    _exact_keys(
+        conditioning,
+        required={
+            "schema_kind",
+            "schema_version",
+            "exhaustive",
+            "stationary_solution_contract_id",
+            "dependencies",
+            "additional_case_varying_solver_scalars",
+        },
+        optional=set(),
+        label="generation profile steady_flow_conditioning",
+    )
+    if conditioning["schema_kind"] != "steady_flow_conditioning" or conditioning["schema_version"] != 1:
+        message = "Unsupported steady-flow conditioning schema."
+        raise GenerationConfigError(message)
+    if conditioning["exhaustive"] is not True:
+        message = "steady_flow_conditioning.exhaustive must be true before steady-flow publication."
+        raise GenerationConfigError(message)
+    contract_id = conditioning["stationary_solution_contract_id"]
+    if not isinstance(contract_id, str) or not contract_id:
+        message = "steady_flow_conditioning.stationary_solution_contract_id must be non-empty text."
+        raise GenerationConfigError(message)
+    dependencies = conditioning["dependencies"]
+    if not isinstance(dependencies, list):
+        message = "steady_flow_conditioning.dependencies must be an ordered list."
+        raise TypeError(message)
+    validated: list[dict[str, Any]] = []
+    for index, raw in enumerate(dependencies):
+        label = f"steady_flow_conditioning.dependencies[{index}]"
+        dependency = _mapping(raw, label=label)
+        _exact_keys(
+            dependency,
+            required={"name", "affects_stationary_solution", "owner", "unit", "fixed_value"},
+            optional=set(),
+            label=label,
+        )
+        name = dependency["name"]
+        if not isinstance(name, str) or not name:
+            message = f"{label}.name must be non-empty text."
+            raise TypeError(message)
+        affects = dependency["affects_stationary_solution"]
+        if not isinstance(affects, bool):
+            message = f"{label}.affects_stationary_solution must be boolean."
+            raise TypeError(message)
+        owner = dependency["owner"]
+        if owner not in {"model_input", "package_fixed", "not_used"}:
+            message = f"{label}.owner must be model_input, package_fixed, or not_used."
+            raise GenerationConfigError(message)
+        unit = dependency["unit"]
+        if unit is not None and (not isinstance(unit, str) or not unit):
+            message = f"{label}.unit must be null or non-empty text."
+            raise TypeError(message)
+        fixed_value = dependency["fixed_value"]
+        if owner == "not_used" and (affects or fixed_value is not None):
+            message = f"{label} cannot affect stationary airflow when its owner is not_used."
+            raise GenerationConfigError(message)
+        if owner == "model_input" and (not affects or fixed_value is not None):
+            message = f"{label} model-input dependencies must affect airflow and have no fixed value."
+            raise GenerationConfigError(message)
+        if owner == "package_fixed":
+            if not affects or isinstance(fixed_value, bool) or not isinstance(fixed_value, (int, float)):
+                message = f"{label} package-fixed dependencies require one finite numeric fixed value."
+                raise GenerationConfigError(message)
+            dependency["fixed_value"] = _finite(fixed_value, label=f"{label}.fixed_value")
+        validated.append(dependency)
+    names = tuple(str(dependency["name"]) for dependency in validated)
+    if names[: len(_STEADY_FLOW_AUDIT_DEPENDENCIES)] != _STEADY_FLOW_AUDIT_DEPENDENCIES or len(names) != len(set(names)):
+        message = (
+            "steady_flow_conditioning.dependencies must begin with the unique required audit dependencies "
+            f"{list(_STEADY_FLOW_AUDIT_DEPENDENCIES)} in order."
+        )
+        raise GenerationConfigError(message)
+    additional = _name_list(
+        conditioning["additional_case_varying_solver_scalars"],
+        label="steady_flow_conditioning.additional_case_varying_solver_scalars",
+        allow_empty=True,
+    )
+    unknown_additional = sorted(set(additional).difference(names))
+    if unknown_additional:
+        message = f"Additional steady-flow solver scalars lack dependency declarations: {unknown_additional}."
+        raise GenerationConfigError(message)
+    conditioning["dependencies"] = validated
+    conditioning["additional_case_varying_solver_scalars"] = list(additional)
+    return conditioning
+
+
 def _validate_profile_config(value: Any, *, profile: profiles.SimulationProfile, require_executable: bool) -> dict[str, Any]:
     """Validate explicit profile mappings without inferring binary template internals."""
     config = _mapping(value, label="generation profile configuration")
-    expected = {"schema_kind", "schema_version", "simulation_profile", "template_ready", "exports"}
+    expected = {
+        "schema_kind",
+        "schema_version",
+        "simulation_profile",
+        "template_ready",
+        "steady_flow_conditioning",
+        "exports",
+    }
     _exact_keys(config, required=expected, optional=set(), label="generation profile configuration")
     if config["schema_kind"] != "generation_profile" or config["schema_version"] != 1 or config["simulation_profile"] != profile.id:
         msg = "Generation profile configuration schema or profile identity is invalid."
@@ -486,6 +600,10 @@ def _validate_profile_config(value: Any, *, profile: profiles.SimulationProfile,
     if require_executable and not config["template_ready"]:
         message = f"Profile {profile.id!r} is fail-closed until its COMSOL template mappings are manually updated and confirmed."
         raise GenerationConfigError(message)
+    config["steady_flow_conditioning"] = _validate_steady_flow_conditioning(
+        config["steady_flow_conditioning"],
+        require_executable=require_executable,
+    )
     exports = config["exports"]
     if not isinstance(exports, list):
         msg = "generation profile exports must be an ordered list."
@@ -670,10 +788,10 @@ def _validate_parameter_ood_policy(
     return policy
 
 
-def dataset_package_name(learning_task: str, material_families: tuple[str, ...], evaluation_regime: str) -> str:
+def dataset_package_name(dataset_view: str, material_families: tuple[str, ...], evaluation_regime: str) -> str:
     """Return the canonical human-readable dataset package name."""
     if (
-        not learning_task
+        not dataset_view
         or not material_families
         or evaluation_regime
         not in {
@@ -685,7 +803,7 @@ def dataset_package_name(learning_task: str, material_families: tuple[str, ...],
     ):
         message = "Dataset package naming inputs are invalid."
         raise GenerationConfigError(message)
-    return f"{learning_task}__{'+'.join(material_families)}__{evaluation_regime}"
+    return f"{dataset_view}__{'+'.join(material_families)}__{evaluation_regime}"
 
 
 def _validate_dataset_packages(
@@ -700,7 +818,7 @@ def _validate_dataset_packages(
         message = "campaign.dataset_packages must be a non-empty list."
         raise GenerationConfigError(message)
     packages: list[dict[str, Any]] = []
-    seen_regimes: set[str] = set()
+    seen_packages: set[tuple[str, str]] = set()
     expected_materials = {
         "id": roles["seen"],
         "parameter_ood": roles["seen"],
@@ -710,17 +828,18 @@ def _validate_dataset_packages(
     for index, raw in enumerate(value):
         package = _mapping(raw, label=f"campaign.dataset_packages[{index}]")
         regime = package.get("evaluation_regime")
-        required = {"learning_task", "evaluation_regime", "materials"}
+        required = {"dataset_view", "evaluation_regime", "materials"}
         if regime == "id":
             required |= {"membership_seed", "membership_counts_per_material"}
         _exact_keys(package, required=required, optional=set(), label=f"campaign.dataset_packages[{index}]")
-        if regime in seen_regimes or regime not in expected_materials:
-            message = f"Dataset evaluation regime {regime!r} is invalid or duplicated."
+        dataset_view = package["dataset_view"]
+        package_key = (str(dataset_view), str(regime))
+        if package_key in seen_packages or regime not in expected_materials:
+            message = f"Dataset view/regime declaration {package_key!r} is invalid or duplicated."
             raise GenerationConfigError(message)
-        seen_regimes.add(str(regime))
-        learning_task = package["learning_task"]
-        if learning_task not in profile.available_learning_views:
-            message = f"Learning view {learning_task!r} is unavailable from profile {profile.id!r}."
+        seen_packages.add(package_key)
+        if dataset_view not in profile.available_learning_views:
+            message = f"Dataset view {dataset_view!r} is unavailable from profile {profile.id!r}."
             raise GenerationConfigError(message)
         package_materials = _name_list(package["materials"], label=f"campaign.dataset_packages[{index}].materials")
         if package_materials != expected_materials[str(regime)]:
@@ -749,8 +868,32 @@ def _validate_dataset_packages(
                     minimum=1,
                 )
             package["membership_counts_per_material"] = membership
-        package["dataset_name"] = dataset_package_name(str(learning_task), package_materials, str(regime))
+        package["dataset_name"] = dataset_package_name(str(dataset_view), package_materials, str(regime))
         packages.append(package)
+    views = {str(package["dataset_view"]) for package in packages}
+    expected_regimes = {"id", "parameter_ood"}
+    if roles["near_family_ood"]:
+        expected_regimes.add("near_family_ood")
+    if roles["far_family_ood"]:
+        expected_regimes.add("far_family_ood")
+    for dataset_view in views:
+        actual = {str(package["evaluation_regime"]) for package in packages if package["dataset_view"] == dataset_view}
+        if actual != expected_regimes:
+            message = f"Dataset view {dataset_view!r} packages must cover exactly {sorted(expected_regimes)}."
+            raise GenerationConfigError(message)
+    id_plans = [package for package in packages if package["evaluation_regime"] == "id"]
+    membership_contracts = {
+        common.serialization.canonical_json_sha256(
+            {
+                "membership_seed": package["membership_seed"],
+                "membership_counts_per_material": package["membership_counts_per_material"],
+            }
+        )
+        for package in id_plans
+    }
+    if len(membership_contracts) != 1:
+        message = "All declared dataset views must share one case-level ID membership contract."
+        raise GenerationConfigError(message)
     return tuple(packages)
 
 
@@ -911,7 +1054,13 @@ def _validate_execution(value: Any) -> dict[str, Any]:
 def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
     """Return the profile-neutral scientific subset that determines case inputs."""
     value = copy.deepcopy(dict(scientific))
-    for key in ("simulation_profile", "output_contract", "available_learning_views", "airflow_source"):
+    for key in (
+        "simulation_profile",
+        "output_contract",
+        "available_learning_views",
+        "airflow_source",
+        "steady_flow_conditioning",
+    ):
         value.pop(key, None)
     return value
 
@@ -965,6 +1114,7 @@ def _validate_campaign_header(
         "roles",
         "sampling",
         "dataset_packages",
+        "duplicate_case_input_policy",
     }
     _exact_keys(campaign, required=expected, optional=set(), label="generation campaign configuration")
     if campaign["schema_kind"] != "generation_campaign" or campaign["schema_version"] != 1:
@@ -978,6 +1128,13 @@ def _validate_campaign_header(
         message = "Campaign is non-executable because scientific counts, seeds, ranges, or mappings remain unresolved."
         raise GenerationConfigError(message)
     _campaign_references(campaign, source_path=source_path)
+    if campaign["duplicate_case_input_policy"] not in {
+        "prefer_transient_source",
+        "prefer_steady_source",
+        "reject_duplicates",
+    }:
+        message = "campaign.duplicate_case_input_policy is unsupported."
+        raise GenerationConfigError(message)
 
     selected = _name_list(campaign["materials"], label="campaign.materials")
     if any(material_family not in materials.MATERIAL_FAMILIES for material_family in selected):
@@ -1105,6 +1262,7 @@ def _build_batch(
         "storage": copy.deepcopy(dict(common_config["storage"])),
         "available_learning_views": list(profile.available_learning_views),
         "airflow_source": profile.airflow_source,
+        "steady_flow_conditioning": copy.deepcopy(common_config["_steady_flow_conditioning"]),
     }
     scientific_digest = common.serialization.canonical_json_sha256(scientific)
     case_input_digest = common.serialization.canonical_json_sha256(_input_identity_config(scientific))
@@ -1211,18 +1369,9 @@ def load_campaign_config(path: Path | str, *, require_executable: bool = True) -
         roles=campaign["roles"],
         allow_unresolved=not require_executable,
     )
-    expected_regimes = {"id", "parameter_ood"}
-    if campaign["roles"]["near_family_ood"]:
-        expected_regimes.add("near_family_ood")
-    if campaign["roles"]["far_family_ood"]:
-        expected_regimes.add("far_family_ood")
-    actual_regimes = {str(package["evaluation_regime"]) for package in dataset_packages}
-    if actual_regimes != expected_regimes:
-        message = f"Campaign dataset packages must cover exactly {sorted(expected_regimes)}."
-        raise GenerationConfigError(message)
-
     common_with_profile = copy.deepcopy(common_config)
     common_with_profile["_profile_exports"] = profile_config["exports"]
+    common_with_profile["_steady_flow_conditioning"] = profile_config["steady_flow_conditioning"]
     operations_digest = common.serialization.canonical_json_sha256(operations)
     batches: list[GenerationConfig] = []
     for sampling_regime in ("natural", "parameter_ood"):
@@ -1259,6 +1408,7 @@ def load_campaign_config(path: Path | str, *, require_executable: bool = True) -
         "campaign_seed": campaign_seed,
         "batch_ids": [batch.batch_id for batch in batches],
         "dataset_packages": list(dataset_packages),
+        "duplicate_case_input_policy": campaign["duplicate_case_input_policy"],
         "registry_config_digest": common.serialization.canonical_json_sha256(
             _load_yaml(campaign["registry_config"], label="generation parameter registry")
         ),
@@ -1277,6 +1427,7 @@ def load_campaign_config(path: Path | str, *, require_executable: bool = True) -
         roles=copy.deepcopy(campaign["roles"]),
         batches=tuple(batches),
         dataset_packages=dataset_packages,
+        duplicate_case_input_policy=str(campaign["duplicate_case_input_policy"]),
         execution_values=execution,
     )
 

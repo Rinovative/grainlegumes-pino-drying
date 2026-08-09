@@ -39,7 +39,7 @@ from . import generation_schedule as schedule_service
 from . import generation_source as source_service
 
 CASE_SCHEMA_KIND = "simulation_case"
-CASE_SCHEMA_VERSION = 3
+CASE_SCHEMA_VERSION = 4
 
 
 def compute_case_input_id(payload: dict[str, Any]) -> str:
@@ -73,6 +73,7 @@ def compute_simulation_case_id(payload: dict[str, Any]) -> str:
             "simulation_profile": payload["simulation_profile"],
             "template_sha256": payload["template"]["sha256"],
             "export_contract_sha256": payload["export_contract_sha256"],
+            "steady_flow_conditioning_digest": payload["steady_flow_conditioning_digest"],
         }
     except (KeyError, TypeError) as error:
         msg = "Simulation-case identity payload is incomplete or malformed."
@@ -237,6 +238,8 @@ def generate_case_input_bundle(
     input_paths = tuple(sorted((spatial_path, scalar_path, schedule_path), key=lambda item: item.name))
     input_files = {path.name: {"sha256": common.serialization.file_sha256(path), "size_bytes": path.stat().st_size} for path in input_paths}
     export_contract_sha256 = common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
+    steady_flow_conditioning = config.scientific_values["steady_flow_conditioning"]
+    steady_flow_conditioning_digest = common.serialization.canonical_json_sha256(steady_flow_conditioning)
     seed_evidence = {
         "batch_seed": config.seed_base,
         "case_seed": case_seed,
@@ -260,6 +263,8 @@ def generate_case_input_bundle(
         "ood": sample.ood_provenance,
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
+        "steady_flow_conditioning": steady_flow_conditioning,
+        "steady_flow_conditioning_digest": steady_flow_conditioning_digest,
         "seed_evidence": seed_evidence,
         "block_provenance": sample.block_provenance,
         "sampled_values": values,

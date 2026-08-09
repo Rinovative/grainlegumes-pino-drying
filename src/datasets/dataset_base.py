@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from src import domain
 
+from . import dataset_factory as runtime_factory
 from . import dataset_identity as identity
 
 if TYPE_CHECKING:
@@ -63,12 +64,28 @@ _REQUIRED_NORMALIZER_STATE_KEYS = (
 )
 _NORMALIZER_STATE_RANK = 4
 _NORMALIZER_DENOMINATOR_FLOOR = 1e-7
+_SHA256_HEX_LENGTH = 64
+_NORMALIZER_ARTIFACT_SCHEMA_KIND = "dataset_bound_normalizer"
+_NORMALIZER_ARTIFACT_SCHEMA_VERSION = 1
+_NORMALIZER_ARTIFACT_KEYS = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "task",
+        "data_contract_digest",
+        "dataset_id",
+        "dataset_fingerprint",
+        "train_membership_digest",
+        "train_sample_count",
+        "state",
+    }
+)
 
 
-class _IdentityDatasetView(Dataset[dict[str, Any]]):
+class _IdentityDatasetView(Dataset[Mapping[str, Any]]):
     """Expose one identity-bound ordered view without copying tensor payloads."""
 
-    def __init__(self, source: Dataset[dict[str, Any]], indices: list[int], *, label: str) -> None:
+    def __init__(self, source: Dataset[Mapping[str, Any]], indices: list[int], *, label: str) -> None:
         """Bind an ordered subset to a deterministic derived identity."""
         source_identity = getattr(source, "identity", None)
         if not isinstance(source_identity, identity.DatasetIdentity):
@@ -107,7 +124,7 @@ class _IdentityDatasetView(Dataset[dict[str, Any]]):
         """Return selected sample count."""
         return len(self.indices)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Return one source sample in view order."""
         return self.source[self.indices[index]]
 
@@ -131,10 +148,10 @@ def combined_dataset_id(dataset_ids: Sequence[str]) -> str:
     return f"combined_ood__{hashlib.sha256(payload).hexdigest()[:16]}"
 
 
-class _CombinedIdentityDataset(Dataset[dict[str, Any]]):
+class _CombinedIdentityDataset(Dataset[Mapping[str, Any]]):
     """Concatenate independent OOD packages under one derived loader identity."""
 
-    def __init__(self, sources: list[Dataset[dict[str, Any]]]) -> None:
+    def __init__(self, sources: list[Dataset[Mapping[str, Any]]]) -> None:
         """Validate compatible component identities and bind ordered membership."""
         if not sources:
             msg = "Combined OOD dataset requires at least one component."
@@ -201,7 +218,7 @@ class _CombinedIdentityDataset(Dataset[dict[str, Any]]):
         """Return combined OOD sample count."""
         return self.identity.sample_count
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Return one component sample in configured package order."""
         if index < 0:
             index += len(self)
@@ -211,7 +228,7 @@ class _CombinedIdentityDataset(Dataset[dict[str, Any]]):
         raise IndexError(index)
 
 
-def combine_identity_datasets(sources: Sequence[Dataset[dict[str, Any]]]) -> Dataset[dict[str, Any]]:
+def combine_identity_datasets(sources: Sequence[Dataset[Mapping[str, Any]]]) -> Dataset[Mapping[str, Any]]:
     """Return one verified dataset or an identity-bound ordered combination."""
     normalized = list(sources)
     if not normalized:
@@ -223,7 +240,7 @@ def combine_identity_datasets(sources: Sequence[Dataset[dict[str, Any]]]) -> Dat
     return normalized[0] if len(normalized) == 1 else _CombinedIdentityDataset(normalized)
 
 
-def _package_id_membership(dataset: Dataset[dict[str, Any]]) -> dict[str, list[int]] | None:
+def _package_id_membership(dataset: Dataset[Mapping[str, Any]]) -> dict[str, list[int]] | None:
     """Return exact package-owned ID membership when present."""
     dataset_identity = getattr(dataset, "identity", None)
     if not isinstance(dataset_identity, identity.DatasetIdentity) or dataset_identity.source_metadata is None:
@@ -703,6 +720,102 @@ def data_processor_from_state(
     return processor
 
 
+def _normalizer_split_identity(
+    split_info: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], str, int]:
+    """Return exact train-dataset, membership-digest, and sample-count evidence."""
+    metadata = split_info.get("metadata")
+    if not isinstance(metadata, Mapping):
+        message = "Split contract metadata is required for normalizer identity."
+        raise TypeError(message)
+    datasets_metadata = metadata.get("datasets")
+    membership_digests = metadata.get("membership_digests")
+    if not isinstance(datasets_metadata, Mapping) or not isinstance(membership_digests, Mapping):
+        message = "Split contract lacks dataset or membership identity for the normalizer."
+        raise TypeError(message)
+    train_dataset = datasets_metadata.get("train")
+    train_membership_digest = membership_digests.get("train")
+    train_indices = split_info.get("train_indices")
+    if (
+        not isinstance(train_dataset, Mapping)
+        or not isinstance(train_membership_digest, str)
+        or len(train_membership_digest) != _SHA256_HEX_LENGTH
+        or not isinstance(train_indices, Tensor)
+        or train_indices.ndim != 1
+        or train_indices.numel() < 1
+    ):
+        message = "Split contract train identity is malformed for normalizer binding."
+        raise ValueError(message)
+    return train_dataset, train_membership_digest, int(train_indices.numel())
+
+
+def build_normalizer_artifact(
+    data_processor: DefaultDataProcessor,
+    *,
+    task: TaskSpec,
+    split_info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one persisted normalizer bound to exact train data membership."""
+    train_dataset, membership_digest, train_sample_count = _normalizer_split_identity(split_info)
+    state = {key: value.detach().cpu().clone() for key, value in data_processor.state_dict().items()}
+    data_processor_from_state(state, device="cpu")
+    dataset_id = train_dataset.get("dataset_id")
+    dataset_fingerprint = train_dataset.get("fingerprint")
+    if (
+        not isinstance(dataset_id, str)
+        or not dataset_id
+        or not isinstance(dataset_fingerprint, str)
+        or len(dataset_fingerprint) != _SHA256_HEX_LENGTH
+        or train_dataset.get("data_contract_digest") != task.data_contract_digest
+    ):
+        message = "Split train dataset identity is incompatible with the task normalizer contract."
+        raise ValueError(message)
+    return {
+        "schema_kind": _NORMALIZER_ARTIFACT_SCHEMA_KIND,
+        "schema_version": _NORMALIZER_ARTIFACT_SCHEMA_VERSION,
+        "task": task.id,
+        "data_contract_digest": task.data_contract_digest,
+        "dataset_id": dataset_id,
+        "dataset_fingerprint": dataset_fingerprint,
+        "train_membership_digest": membership_digest,
+        "train_sample_count": train_sample_count,
+        "state": state,
+    }
+
+
+def validate_normalizer_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    task: TaskSpec,
+    split_info: Mapping[str, Any],
+) -> dict[str, Tensor]:
+    """Validate and return isolated tensors from one dataset-bound normalizer."""
+    if not isinstance(artifact, Mapping) or set(artifact) != _NORMALIZER_ARTIFACT_KEYS:
+        message = "Saved normalizer artifact keys do not match the dataset-bound schema."
+        raise ValueError(message)
+    train_dataset, membership_digest, train_sample_count = _normalizer_split_identity(split_info)
+    expected = {
+        "schema_kind": _NORMALIZER_ARTIFACT_SCHEMA_KIND,
+        "schema_version": _NORMALIZER_ARTIFACT_SCHEMA_VERSION,
+        "task": task.id,
+        "data_contract_digest": task.data_contract_digest,
+        "dataset_id": train_dataset.get("dataset_id"),
+        "dataset_fingerprint": train_dataset.get("fingerprint"),
+        "train_membership_digest": membership_digest,
+        "train_sample_count": train_sample_count,
+    }
+    observed = {key: artifact.get(key) for key in expected}
+    if observed != expected:
+        message = "Saved normalizer identity does not match the exact task, dataset, fingerprint, and train membership."
+        raise ValueError(message)
+    state = artifact.get("state")
+    if not isinstance(state, Mapping):
+        message = "Saved normalizer artifact state must be a mapping."
+        raise TypeError(message)
+    data_processor_from_state(state, device="cpu")
+    return {key: cast("Tensor", value).detach().cpu().clone() for key, value in state.items()}
+
+
 def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
     """
     Create a worker_init_fn for deterministic DataLoader worker seeding.
@@ -733,7 +846,6 @@ def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
 
 
 def create_dataloaders(
-    dataset_factory: Callable[..., Dataset[dict[str, Any]]],
     path_train: str,
     path_test_ood: str | Sequence[str],
     *,
@@ -757,8 +869,6 @@ def create_dataloaders(
 
     Parameters
     ----------
-    dataset_factory : Callable[..., Dataset]
-        Shared training/inference dataset factory.
     path_train : str
         Current resolved training dataset path.
     path_test_ood : str or Sequence[str]
@@ -830,7 +940,7 @@ def create_dataloaders(
     if num_workers == 0:
         persistent_workers = False
 
-    raw_train = dataset_factory(path_train, task=task)
+    raw_train = runtime_factory.create_steady_dataset(path_train, task=task)
     raw_train_identity = getattr(raw_train, "identity", None)
     if not isinstance(raw_train_identity, identity.DatasetIdentity):
         msg = "Task dataset factory must expose a verified DatasetIdentity."
@@ -844,7 +954,7 @@ def create_dataloaders(
     if not ood_paths or len(ood_paths) != len(ood_ids):
         msg = "OOD package paths and identifiers must be non-empty and aligned."
         raise ValueError(msg)
-    ood_sources = [dataset_factory(path, task=task) for path in ood_paths]
+    ood_sources = [runtime_factory.create_steady_dataset(path, task=task) for path in ood_paths]
     for expected_id, source_dataset in zip(ood_ids, ood_sources, strict=True):
         source_identity = getattr(source_dataset, "identity", None)
         if not isinstance(source_identity, identity.DatasetIdentity) or source_identity.dataset_id != expected_id:
@@ -857,9 +967,9 @@ def create_dataloaders(
         raise TypeError(msg)
 
     package_membership = _package_id_membership(raw_train)
-    id_test_set: Dataset[dict[str, Any]] | None = None
+    id_test_set: Dataset[Mapping[str, Any]] | None = None
     if package_membership is None:
-        full_train: Dataset[dict[str, Any]] = raw_train
+        full_train: Dataset[Mapping[str, Any]] = raw_train
         explicit_train_count = None
     else:
         train_positions = package_membership["train"]
@@ -971,7 +1081,11 @@ def create_dataloaders(
     if data_processor is None:
         xs_train: list[Tensor] = []
         ys_train: list[Tensor] = []
-        for batch in DataLoader(train_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False):
+        fitting_loader = runtime_factory.make_data_loader(
+            train_set,
+            runtime_factory.LoaderSettings(batch_size=batch_size),
+        )
+        for batch in fitting_loader:
             xs_train.append(batch["x"])
             ys_train.append(batch["y"])
         x_train = torch.cat(xs_train, dim=0)
@@ -985,27 +1099,25 @@ def create_dataloaders(
 
     generator = torch.Generator().manual_seed(loader_seed)
     worker_init = _make_worker_init_fn(worker_seed) if num_workers > 0 else None
-    train_loader = DataLoader(
+    train_loader = runtime_factory.make_data_loader(
         train_set,
-        batch_size=batch_size,
-        shuffle=True,
+        runtime_factory.LoaderSettings(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            shuffle=True,
+        ),
         generator=generator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
         worker_init_fn=worker_init,
-        drop_last=False,
     )
-    eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False)
-    ood_loader = DataLoader(ood_subset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False)
+    evaluation_settings = runtime_factory.LoaderSettings(batch_size=batch_size)
+    eval_loader = runtime_factory.make_data_loader(eval_set, evaluation_settings)
+    ood_loader = runtime_factory.make_data_loader(ood_subset, evaluation_settings)
     test_loaders = {"eval": eval_loader, "ood": ood_loader}
     if id_test_set is not None:
-        test_loaders["id_test"] = DataLoader(
+        test_loaders["id_test"] = runtime_factory.make_data_loader(
             id_test_set,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-            persistent_workers=False,
+            evaluation_settings,
         )
     return train_loader, test_loaders, cast("DefaultDataProcessor", data_processor), split_info

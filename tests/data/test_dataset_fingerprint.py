@@ -266,7 +266,7 @@ def test_default_dataset_load_rejects_modified_tensor_content(
     torch.save(payload, path)
 
     with pytest.raises(ValueError, match="fingerprint mismatch"):
-        datasets.simulation.create_task_dataset(path, task=steady_task)
+        datasets.factory.create_steady_dataset(path, task=steady_task)
 
 
 def test_duplicate_sample_id_is_rejected(
@@ -329,7 +329,6 @@ def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
     first_path = _save_dataset(tmp_path, training_dataset_payload_factory("parameter_ood"))
     second_path = _save_dataset(tmp_path, training_dataset_payload_factory("family_ood"))
     _train_loader, test_loaders, _processor, split_info = datasets.base.create_dataloaders(
-        dataset_factory=datasets.simulation.create_task_dataset,
         path_train=str(train_path),
         path_test_ood=(str(first_path), str(second_path)),
         task=steady_task,
@@ -367,7 +366,6 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     train_path = _save_dataset(tmp_path, train_payload)
     ood_path = _save_dataset(tmp_path, ood_payload)
     loader_args = {
-        "dataset_factory": datasets.simulation.create_task_dataset,
         "path_train": str(train_path),
         "path_test_ood": str(ood_path),
         "task": steady_task,
@@ -417,7 +415,6 @@ def test_saved_split_requires_integer_version_one(
     train_path = _save_dataset(tmp_path, training_dataset_payload_factory("split_train"))
     ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("split_ood"))
     loader_args = {
-        "dataset_factory": datasets.simulation.create_task_dataset,
         "path_train": str(train_path),
         "path_test_ood": str(ood_path),
         "task": steady_task,
@@ -508,6 +505,76 @@ def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
     assert torch.equal(normalized_outputs, torch.zeros_like(normalized_outputs))
 
 
+def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    training_dataset_payload_factory: Callable[..., dict[str, Any]],
+) -> None:
+    """Reject raw or stale normalizers whose training data identity changed."""
+    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_train"))
+    ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_ood"))
+    _train_loader, _test_loaders, processor, split_info = datasets.base.create_dataloaders(
+        path_train=str(train_path),
+        path_test_ood=str(ood_path),
+        task=steady_task,
+        train_dataset_id="normalizer_train",
+        ood_dataset_id="normalizer_ood",
+        batch_size=2,
+        train_ratio=0.5,
+        ood_fraction=0.5,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        split_seed=17,
+    )
+    artifact = datasets.base.build_normalizer_artifact(
+        processor,
+        task=steady_task,
+        split_info=split_info,
+    )
+    restored = datasets.base.validate_normalizer_artifact(
+        artifact,
+        task=steady_task,
+        split_info=split_info,
+    )
+
+    assert set(restored) == set(_valid_normalizer_state())
+    assert artifact["dataset_id"] == "normalizer_train"
+    assert artifact["train_sample_count"] == split_info["train_indices"].numel()
+    for key in restored:
+        assert torch.equal(restored[key], artifact["state"][key])
+        assert restored[key].data_ptr() != artifact["state"][key].data_ptr()
+
+    with pytest.raises(ValueError, match="artifact keys"):
+        datasets.base.validate_normalizer_artifact(
+            _valid_normalizer_state(),
+            task=steady_task,
+            split_info=split_info,
+        )
+
+    for key, replacement in (
+        ("dataset_id", "replacement_dataset"),
+        ("fingerprint", "f" * 64),
+    ):
+        stale_split = copy.deepcopy(split_info)
+        stale_split["metadata"]["datasets"]["train"][key] = replacement
+        with pytest.raises(ValueError, match="does not match"):
+            datasets.base.validate_normalizer_artifact(
+                artifact,
+                task=steady_task,
+                split_info=stale_split,
+            )
+
+    stale_membership = copy.deepcopy(split_info)
+    stale_membership["metadata"]["membership_digests"]["train"] = "e" * 64
+    with pytest.raises(ValueError, match="does not match"):
+        datasets.base.validate_normalizer_artifact(
+            artifact,
+            task=steady_task,
+            split_info=stale_membership,
+        )
+
+
 def test_training_loader_retains_a_partial_batch(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
@@ -523,7 +590,6 @@ def test_training_loader_retains_a_partial_batch(
     ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_ood"))
 
     train_loader, *_rest = datasets.base.create_dataloaders(
-        dataset_factory=datasets.simulation.create_task_dataset,
         path_train=str(train_path),
         path_test_ood=str(ood_path),
         task=steady_task,

@@ -570,7 +570,7 @@ def load_inference_context_with_resolution(
     processor = datasets.base.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
 
     task = experiments.config.loader.validate_resolved_task_contract(cfg)
-    source_packages = [datasets.simulation.create_task_dataset(path, task=task) for path in split_selection.dataset_paths]
+    source_packages = [datasets.factory.create_steady_dataset(path, task=task) for path in split_selection.dataset_paths]
     source_dataset = datasets.base.combine_identity_datasets(source_packages)
     _validate_split_indices_for_dataset(
         selection=split_selection,

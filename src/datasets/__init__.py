@@ -1,17 +1,16 @@
 """
-Dataset contracts, metadata, loaders, and simulation readers.
+Dataset contracts, package builders, and the unified dual-view runtime factory.
 
 Provides:
-- base: shared dataset interfaces
-- build: final dataset and metadata publication
+- base: steady experiment splitting and train-only preprocessing
+- factory: authoritative dataset, selector, and DataLoader construction
 - generated_batch: strict generated-simulation batch admission
-- identity: deterministic dataset identity and fingerprint contracts
-- metadata: dataset metadata admission and summary services
-- modules: model-ready task dataset modules
-- packages: campaign-owned multi-batch dataset assembly
-- simulation: persisted simulation-dataset access
-- transient: physical-unit one-hour transition builder and loader
-- transient_contract: unregistered transient step-data schema
+- identity: deterministic steady dataset and membership identities
+- metadata: dataset metadata admission and summaries
+- packages: campaign-owned dual-view package assembly and inspection
+- transient: lazy physical-unit transient transition indexes
+- transient_contract: canonical transient step-data channels
+- views: typed buildable dataset-view registry
 """
 
 from __future__ import annotations
@@ -21,29 +20,37 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import dataset_base as base
-    from . import dataset_build as build
+    from . import dataset_factory as factory
     from . import dataset_generated_batch as generated_batch
     from . import dataset_identity as identity
     from . import dataset_metadata as metadata
-    from . import dataset_modules as modules
     from . import dataset_packages as packages
-    from . import dataset_simulation as simulation
     from . import dataset_transient as transient
     from . import dataset_transient_contract as transient_contract
+    from . import dataset_views as views
 
 _MODULES = {
     "base": "dataset_base",
-    "build": "dataset_build",
+    "factory": "dataset_factory",
     "generated_batch": "dataset_generated_batch",
     "identity": "dataset_identity",
     "metadata": "dataset_metadata",
-    "modules": "dataset_modules",
     "packages": "dataset_packages",
-    "simulation": "dataset_simulation",
     "transient": "dataset_transient",
     "transient_contract": "dataset_transient_contract",
+    "views": "dataset_views",
 }
-__all__ = ["base", "build", "generated_batch", "identity", "metadata", "modules", "packages", "simulation", "transient", "transient_contract"]
+__all__ = [
+    "base",
+    "factory",
+    "generated_batch",
+    "identity",
+    "metadata",
+    "packages",
+    "transient",
+    "transient_contract",
+    "views",
+]
 
 
 def __getattr__(name: str) -> object:

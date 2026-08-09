@@ -701,8 +701,8 @@ def _load_mapping_artifact(path: Path, *, label: str) -> dict[str, Any]:
 def _validate_saved_data_contract(
     config: Mapping[str, Any],
     split_indices: Mapping[str, Any],
-    normalizer_state: Mapping[str, Any],
-) -> None:
+    normalizer_artifact: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
     """
     Admit saved split and normalizer artifacts against the resolved task config.
 
@@ -725,7 +725,11 @@ def _validate_saved_data_contract(
         expected_ood_fraction=data_config.get("ood_fraction"),
         expected_split_seed=derive_subseed(int(run_config["seed"]), "split"),
     )
-    datasets.base.data_processor_from_state(normalizer_state, device="cpu")
+    normalizer_state = datasets.base.validate_normalizer_artifact(
+        normalizer_artifact,
+        task=task,
+        split_info=split_indices,
+    )
     channel_axis = task.tensor_layout.index("channel")
     for prefix, expected_channels in (("in_normalizer", task.in_channels), ("out_normalizer", task.out_channels)):
         mean = normalizer_state[f"{prefix}.mean"]
@@ -733,6 +737,7 @@ def _validate_saved_data_contract(
             actual_shape = tuple(mean.shape) if isinstance(mean, torch.Tensor) else type(mean).__name__
             msg = f"Saved {prefix} channel shape does not match task fields: {actual_shape}."
             raise RunLifecycleError(msg)
+    return normalizer_state
 
 
 def _config_comparison_view(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -1160,8 +1165,13 @@ def _execute_prepared_run_locked(
         split_indices = dataloaders["split_indices"]
 
         if resume_from is None:
+            normalizer_artifact = datasets.base.build_normalizer_artifact(
+                data_processor,
+                task=config_loader.validate_resolved_task_contract(config),
+                split_info=split_indices,
+            )
             common.serialization.atomic_torch_save(
-                data_processor.state_dict(),
+                normalizer_artifact,
                 common.paths.resolve_normalizer_path(run_dir),
             )
             common.serialization.atomic_torch_save(
@@ -1528,8 +1538,8 @@ def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
     checkpoint_path = common.paths.resolve_best_checkpoint_file(path)
     config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
     split_indices = _load_mapping_artifact(split_path, label="split indices")
-    normalizer_state = _load_mapping_artifact(normalizer_path, label="normalizer")
-    _validate_saved_data_contract(config, split_indices, normalizer_state)
+    normalizer_artifact = _load_mapping_artifact(normalizer_path, label="normalizer")
+    normalizer_state = _validate_saved_data_contract(config, split_indices, normalizer_artifact)
     identity = learning.training.checkpoint.build_checkpoint_identity(
         config,
         split_indices,
@@ -1676,8 +1686,8 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     normalizer_path = common.paths.resolve_normalizer_path(path)
     config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
     split_indices = _load_mapping_artifact(split_path, label="split indices")
-    normalizer_state = _load_mapping_artifact(normalizer_path, label="normalizer")
-    _validate_saved_data_contract(config, split_indices, normalizer_state)
+    normalizer_artifact = _load_mapping_artifact(normalizer_path, label="normalizer")
+    normalizer_state = _validate_saved_data_contract(config, split_indices, normalizer_artifact)
     identity = learning.training.checkpoint.build_checkpoint_identity(
         config,
         split_indices,
@@ -1902,8 +1912,8 @@ def run_experiment(
         runtime_config["run"]["device"] = requested["run"]["device"]
 
         split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
-        normalizer_state = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
-        _validate_saved_data_contract(saved_config, split_indices, normalizer_state)
+        normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
+        normalizer_state = _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
         data_processor = datasets.base.data_processor_from_state(normalizer_state, device="cpu")
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,

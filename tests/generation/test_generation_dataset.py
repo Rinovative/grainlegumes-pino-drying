@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import pytest
 import torch
 
 from src import datasets, domain, generation
@@ -101,7 +102,7 @@ def test_steady_flow_publishes_unchanged_task_and_reusable_id_package(
     assert terminal["git_commit"] == "a" * 40
     assert [record["case_id"] for record in terminal["cases"]] == ["case_0001", "case_0002", "case_0003"]
 
-    result = datasets.packages.build_dataset_package(campaign, "id", storage_root=storage)
+    result = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert result["dataset_name"] == "steady_flow__lentil__id"
     assert result["sample_count"] == 3
     payload = torch.load(result["payload_path"], map_location="cpu", weights_only=False)
@@ -111,7 +112,18 @@ def test_steady_flow_publishes_unchanged_task_and_reusable_id_package(
     assert payload["inputs"].shape == (3, task.in_channels, 251, 401)
     assert payload["outputs"].shape == (3, task.out_channels, 251, 401)
     assert payload["fields"] == {"inputs": list(task.input_names), "outputs": list(task.output_names)}
-    loaded_dataset = datasets.simulation.create_task_dataset(result["payload_path"], task=task)
+    loaded_dataset = datasets.factory.create_steady_dataset(result["payload_path"], task=task)
+    assert {
+        "dataset_id",
+        "simulation_case_id",
+        "case_input_id",
+        "source_batch_id",
+        "source_simulation_profile",
+        "material_family",
+        "evaluation_regime",
+        "dataset_membership",
+        "source_hdf5_sha256",
+    }.issubset(loaded_dataset[0]["meta"])
     manifest = datasets.packages.load_dataset_package_manifest(
         result["dataset_id"],
         dataset_identity=loaded_dataset.identity,
@@ -124,6 +136,48 @@ def test_steady_flow_publishes_unchanged_task_and_reusable_id_package(
         "id_test": 1,
     }
     assert manifest["source_git_commits"] == ["a" * 40]
-    reused = datasets.packages.build_dataset_package(campaign, "id", storage_root=storage)
+    conditioning = manifest["steady_flow_conditioning"]
+    assert conditioning["hidden_conditioning"] is False
+    assert conditioning["T_flow_ref_owner"] == "not_used"
+    assert conditioning["package_fixed_physics"] == [{"name": "air_dynamic_viscosity", "unit": "Pa*s", "value": 1.8139e-5}]
+
+    inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
+    assert inspection["dataset_view"] == "steady_flow"
+    assert inspection["available_selectors"] == ["id/train", "id/validation", "id/id_test"]
+    assert inspection["tensors"]["input"]["shape"] == [task.in_channels, 251, 401]
+    assert inspection["tensors"]["target"]["shape"] == [task.out_channels, 251, 401]
+    assert inspection["sample_identity"]["source_hdf5_sha256"] == manifest["source_case_identities"][0]["case_hdf5_sha256"]
+    smoke = datasets.packages.smoke_dataset_package(
+        result["dataset_id"],
+        storage_root=storage,
+        membership="train",
+        num_workers=0,
+    )
+    assert smoke["status"] == "loaded"
+    assert smoke["batch_shapes"]["x"] == [1, task.in_channels, 251, 401]
+    multi_worker_smoke = datasets.packages.smoke_dataset_package(
+        result["dataset_id"],
+        storage_root=storage,
+        membership="validation",
+        num_workers=2,
+        persistent_workers=True,
+        prefetch_factor=1,
+    )
+    assert multi_worker_smoke["status"] == "loaded"
+    assert multi_worker_smoke["batch_shapes"]["y"] == [1, task.out_channels, 251, 401]
+
+    reused = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert reused["status"] == "reused"
     assert reused["dataset_id"] == result["dataset_id"]
+
+    manifest_path = Path(result["manifest_path"])
+    conflicting_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    conflicting_manifest["dataset_digest"] = "0" * 64
+    manifest_path.write_text(json.dumps(conflicting_manifest), encoding="utf-8")
+    with pytest.raises(FileExistsError, match="conflicts"):
+        datasets.packages.build_dataset_package(
+            campaign,
+            "steady_flow",
+            "id",
+            storage_root=storage,
+        )

@@ -77,12 +77,19 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
         f"transient_drying__{material_family}__parameter_ood" for material_family in generation.materials.MATERIAL_FAMILIES[:3]
     ]
     assert [batch.batch_name for batch in campaign.batches] == expected_batches
-    assert [package["dataset_name"] for package in campaign.dataset_packages] == [
-        "transient_drying__lentil+chickpea+kidney_bean__id",
-        "transient_drying__lentil+chickpea+kidney_bean__parameter_ood",
-        "transient_drying__field_pea__near_family_ood",
-        "transient_drying__almond__far_family_ood",
+    regimes = ("id", "parameter_ood", "near_family_ood", "far_family_ood")
+    package_materials = {
+        "id": "lentil+chickpea+kidney_bean",
+        "parameter_ood": "lentil+chickpea+kidney_bean",
+        "near_family_ood": "field_pea",
+        "far_family_ood": "almond",
+    }
+    expected_packages = [
+        f"{dataset_view}__{package_materials[regime]}__{regime}" for dataset_view in ("steady_flow", "transient_drying") for regime in regimes
     ]
+    assert [package["dataset_name"] for package in campaign.dataset_packages] == expected_packages
+    assert campaign.dataset_packages[0]["membership_seed"] == campaign.dataset_packages[4]["membership_seed"]
+    assert campaign.dataset_packages[0]["membership_counts_per_material"] == campaign.dataset_packages[4]["membership_counts_per_material"]
     reports = generation.inventory.audit_campaign(campaign)
     for report in reports.values():
         assert report.sampled_dimensions_by_block == {
@@ -387,7 +394,7 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
         {
             "material_family": "lentil",
             "package_case_id": f"lentil/case_{index}",
-            "record": {"simulation_case_id": character * 64},
+            "case_input_id": character * 64,
         }
         for index, character in enumerate("abcdef", start=1)
     ]
@@ -397,11 +404,13 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
         "membership_seed": 19,
         "membership_counts_per_material": {"train": 2, "validation": 1, "id_test": 1},
     }
-    selected_a, membership_a = datasets.packages._assign_membership(copy.deepcopy(plan), copy.deepcopy(candidates))
-    selected_b, membership_b = datasets.packages._assign_membership(copy.deepcopy(plan), list(reversed(copy.deepcopy(candidates))))
+    membership_a = datasets.packages._shared_id_membership(copy.deepcopy(plan), copy.deepcopy(candidates))
+    membership_b = datasets.packages._shared_id_membership(copy.deepcopy(plan), list(reversed(copy.deepcopy(candidates))))
     assert membership_a == membership_b
-    assert [item["package_case_id"] for item in selected_a] == [item["package_case_id"] for item in selected_b]
-    assert len({case_id for values in membership_a.values() for case_id in values}) == 4
+    assert len(membership_a) == 4
+    assert list(membership_a.values()).count("train") == 2
+    assert list(membership_a.values()).count("validation") == 1
+    assert list(membership_a.values()).count("id_test") == 1
 
     task = domain.tasks.registry.get_task("steady_flow")
     assert task.input_names == ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_bc")
@@ -410,6 +419,9 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
     assert task.default_datasets.train == "lhs_var80_seed3001"
     assert task.default_datasets.ood == ("lhs_var120_seed4001",)
     assert "transient_drying" not in domain.tasks.registry.available_tasks()
+    assert datasets.views.available_views() == ("steady_flow", "transient_drying")
+    assert datasets.views.get_view("steady_flow").trainable is True
+    assert datasets.views.get_view("transient_drying").trainable is False
     contract = datasets.transient_contract.TRANSIENT_STEP_CONTRACT
     assert tuple(field.name for field in contract.dynamic_state) == ("T", "phi", "w_surf", "w_int")
     assert tuple(field.name for field in contract.static_spatial_conditioning) == (
@@ -448,3 +460,159 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
     assert contract.time_step == 1.0
     assert contract.time_unit == "h"
     assert contract.canonical_storage_representation == "absolute_physical_states"
+
+
+def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
+    generation_config_factory: Any,
+) -> None:
+    """Require every varying stationary dependency to be a declared task input."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    campaign = generation.config.load_campaign_config(config_path)
+    batch = campaign.batch("steady_flow__lentil__natural")
+    contract = copy.deepcopy(batch.scientific_values["steady_flow_conditioning"])
+    record = {
+        "simulation_profile": "steady_flow",
+        "steady_flow_conditioning": contract,
+    }
+
+    accepted = datasets.packages.audit_steady_flow_conditioning([record])
+    assert accepted["hidden_conditioning"] is False
+    assert accepted["T_flow_ref_owner"] == "not_used"
+    coupled_record = copy.deepcopy(record)
+    coupled_record["simulation_profile"] = "transient_drying"
+    mixed = datasets.packages.audit_steady_flow_conditioning([record, coupled_record])
+    assert mixed["source_profiles"] == ["steady_flow", "transient_drying"]
+    assert mixed["conditioning_contract_digest"] == accepted["conditioning_contract_digest"]
+
+    hidden = copy.deepcopy(record)
+    dependency = next(item for item in hidden["steady_flow_conditioning"]["dependencies"] if item["name"] == "T_flow_ref")
+    dependency["affects_stationary_solution"] = True
+    dependency["owner"] = "model_input"
+    with pytest.raises(ValueError, match=r"Hidden steady-flow conditioning.*T_flow_ref"):
+        datasets.packages.audit_steady_flow_conditioning([hidden])
+
+
+def test_parameter_ood_eligibility_uses_registry_dependency_blocks(
+    generation_config_factory: Any,
+) -> None:
+    """Include airflow OOD in both views while excluding transient-only changes from steady."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    campaign = generation.config.load_campaign_config(config_path)
+    batch = campaign.batch("transient_drying__lentil__parameter_ood")
+    registry = batch.scientific_values["material"]["parameter_registry"]
+
+    def candidate(parameter: str) -> dict[str, Any]:
+        entry = registry[parameter]
+        return {
+            "package_case_id": f"case__{parameter}",
+            "batch": batch,
+            "case_payload": {
+                "ood": {
+                    "group": entry["ood_group"],
+                    "selected_units": [parameter],
+                    "units_per_case": 1,
+                },
+                "sampled_values": {parameter: 1.0},
+                "coupled_selections": {},
+                "block_provenance": {entry["block"]: {"design": "synthetic"}},
+            },
+        }
+
+    airflow = candidate("pressure_bc.mean")
+    steady_eligible, steady_parameters, steady_evidence, _reason = datasets.packages._ood_eligibility(
+        airflow,
+        view=datasets.views.get_view("steady_flow"),
+    )
+    transient_eligible, transient_parameters, _transient_evidence, _reason = datasets.packages._ood_eligibility(
+        airflow,
+        view=datasets.views.get_view("transient_drying"),
+    )
+    assert steady_eligible is transient_eligible is True
+    assert steady_parameters == transient_parameters == ("pressure_bc.mean",)
+    assert steady_evidence["parameters"][0]["block"] == "airflow"
+
+    moisture = candidate("initial_moisture.mean_db")
+    eligible, parameters, evidence, reason = datasets.packages._ood_eligibility(
+        moisture,
+        view=datasets.views.get_view("steady_flow"),
+    )
+    assert eligible is False
+    assert parameters == ()
+    assert evidence["group"] == "initial_moisture"
+    assert "steady_flow" in str(reason)
+    assert (
+        datasets.packages._ood_eligibility(
+            moisture,
+            view=datasets.views.get_view("transient_drying"),
+        )[0]
+        is True
+    )
+
+
+def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
+    """Resolve matched physical inputs deterministically and reject train/OOD leakage."""
+    physical_id = "c" * 64
+    candidates = [
+        {
+            "package_case_id": "steady_case",
+            "simulation_case_id": "1" * 64,
+            "case_input_id": physical_id,
+            "simulation_profile": "steady_flow",
+            "material_family": "lentil",
+        },
+        {
+            "package_case_id": "transient_case",
+            "simulation_case_id": "2" * 64,
+            "case_input_id": physical_id,
+            "simulation_profile": "transient_drying",
+            "material_family": "lentil",
+        },
+    ]
+    with pytest.raises(ValueError, match="requires an explicit source preference"):
+        datasets.packages.resolve_duplicate_case_inputs(
+            candidates,
+            dataset_view="steady_flow",
+            policy="reject_duplicates",
+        )
+
+    selected, decisions = datasets.packages.resolve_duplicate_case_inputs(
+        list(reversed(candidates)),
+        dataset_view="steady_flow",
+        policy="prefer_transient_source",
+    )
+    assert [candidate["package_case_id"] for candidate in selected] == ["transient_case"]
+    assert decisions[0]["selected_simulation_case_id"] == "2" * 64
+    assert decisions[0]["excluded_simulation_case_ids"] == ["1" * 64]
+
+    id_package = datasets.packages._PreparedPackage(
+        plan={"evaluation_regime": "id"},
+        batch_records=[],
+        candidates=[
+            {
+                "simulation_case_id": "3" * 64,
+                "case_input_id": physical_id,
+                "dataset_membership": "train",
+            }
+        ],
+        excluded=[],
+        membership={},
+        source_decisions=[],
+        steady_conditioning=None,
+    )
+    ood_package = datasets.packages._PreparedPackage(
+        plan={"evaluation_regime": "parameter_ood"},
+        batch_records=[],
+        candidates=[
+            {
+                "simulation_case_id": "4" * 64,
+                "case_input_id": physical_id,
+                "dataset_membership": "parameter_ood",
+            }
+        ],
+        excluded=[],
+        membership={},
+        source_decisions=[],
+        steady_conditioning=None,
+    )
+    with pytest.raises(ValueError, match="ID training and OOD package source overlap"):
+        datasets.packages._validate_no_id_ood_overlap((id_package, ood_package))

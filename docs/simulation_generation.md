@@ -58,14 +58,14 @@ The loader validates exact schemas and resolves one typed campaign; there is no 
 | --- | --- |
 | Material family | One role-neutral scientific/evidence definition; no seen/OOD role |
 | Batch | One simulation profile × one material family × one neutral sampling regime |
-| Campaign | Profiles, role assignments, counts/seeds, planned batches, and dataset declarations |
-| Dataset package | Exact terminal cases assembled for one learning task and evaluation regime |
+| Campaign | One simulation profile, role assignments, counts/seeds, planned batches, and dataset-view declarations |
+| Dataset package | Exact terminal cases assembled for one dataset view and evaluation regime |
 
 Visible names remain readable while immutable IDs bind full digests:
 
 ```text
 batch_name   = <simulation_profile>__<material_family>__<sampling_regime>
-dataset_name = <learning_task>__<ordered-material-list>__<evaluation-regime>
+dataset_name = <dataset_view>__<ordered-material-list>__<evaluation-regime>
 ```
 
 Names omit versions, timestamps, seeds, counts, source profiles, and digests. `batch_id`, `dataset_id`, `campaign_id`, and `campaign_run_id` append digest prefixes and manifests retain full identities. Material order follows the campaign declaration deterministically.
@@ -95,6 +95,49 @@ A template is verified by SHA-256, then copied to an isolated case work director
 Root attributes bind profile, material family, sampling regime, case input/simulation identities, config and template digests, export-contract digest, airflow source, Git commit, learning views, and raw-export hashes. JSON sidecars retain case, execution, timing, status, failure/resume, and batch/campaign evidence. Publication is atomic and validates finite Cartesian axes, exact names/units, shapes, dtypes, compression, chunks, schedule nodes, and source identities.
 
 The transient index admits only consecutive regular one-hour states, records `time`/`dt` with `time_unit: h`, excludes transitions across an irregular exact-stop state, and derives increment targets without changing canonical absolute states. It does not register a transient learning task.
+
+## Dual-view dataset packages and runtime loading
+
+`steady_flow` and `transient_drying` are source-owned dataset views, not two learning-task registries. `steady_flow` resolves the registered trainable task; `transient_drying` is buildable and loadable without a model, loss, trainer, normalizer, or evaluator. A standalone steady profile exposes only `steady_flow`. A coupled transient profile exposes both views from the same canonical case, so it never needs a second airflow simulation.
+
+Both views use the same top-level package regimes:
+
+| Regime | Membership and source rule |
+| --- | --- |
+| `id` | Natural lentil, chickpea, and kidney-bean cases, split into exactly `train`, `validation`, and `id_test` |
+| `parameter_ood` | Parameter-OOD cases admitted by the selected view's dependency contract |
+| `near_family_ood` | Natural field-pea cases; evaluation-only by default |
+| `far_family_ood` | Natural almond cases; evaluation-only by default |
+
+ID membership is ranked deterministically by material and `case_input_id` before any view-specific expansion. One transient case therefore contributes all of its one-hour transitions to exactly one membership. The steady and transient packages have separate immutable identities and sample counts, but matched transient-derived cases retain the same case-level membership in both manifests. A repeated `case_input_id` is never resolved by path order: a campaign must declare `prefer_transient_source`, `prefer_steady_source`, or `reject_duplicates`, and the manifest records every selection.
+
+One physical `parameter_ood` package owns one combined case/transition index plus compact group and parameter indexes. It is not copied four times. Transient drying admits valid `bed`, `operation`, `initial_moisture`, and `material_properties` changes. Steady eligibility is narrower and follows registry dependency blocks: only changed quantities represented through `Kxx`, `Kxy`, `Kyy`, `eps_bed`, or `p_bc` are eligible. Thus a pressure parameter can remain an `operation`-group selector while being steady-relevant through the `airflow` block; initial-moisture, drying-kinetic, and thermal-only changes are excluded from the steady package with their reason and evidence retained.
+
+Every source profile must provide an exhaustive `steady_flow_conditioning` contract before its steady view is admitted. The audit covers permeability, porosity, pressure boundary, viscosity, density where used, `T_flow_ref`, profile reference temperature, template/profile behavior, and any additional solver scalar. Each dependency is owned by a model input, a package-fixed value bound into identity, or an explicit `not_used` decision. A varying solution dependency absent from the registered inputs is hidden conditioning and fails preflight. When source-resolution logic compares profiles, their stationary-solution contract identity and complete conditioning digest must agree; each current campaign package remains owned by its declared source profile. Production profile files deliberately keep this contract unresolved until the COMSOL audit is complete.
+
+The physical runtime items are:
+
+| View | Item tensors |
+| --- | --- |
+| `steady_flow` | `x [7, ny, nx]` in task order; `y [3, ny, nx]`; source and membership metadata |
+| `transient_drying` | `state [4, ny, nx]`; `static [7, ny, nx]`; `boundary [5]`; `scalars [8]`; increment `target [4, ny, nx]`; scalar `dt = 1 h`; source/time metadata |
+
+Transient channel order comes only from `dataset_transient_contract.py`. Dynamic state is `T, phi, w_surf, w_int`; static conditioning is `x, y, u, v, p, eps_bed, rho_bu_dry`; boundary conditioning is the two endpoint values of `T_in` and `phi_in` plus `T_amb`; scalar conditioning is `r_surf_0, r_int_surf, f_surf, A_osw, B_osw, C_osw, k_gr, cp_gr_dry`. Targets are adjacent-state increments in the same dynamic order. Permeability, `p_bc`, and `X_0_db_field` remain archived ablation fields, and material family remains metadata rather than a model channel.
+
+Builders and runtime datasets expose physical units. New steady runs fit normalization only on the exact ID-training membership; the saved normalizer is bound to task, data contract, dataset ID, dataset fingerprint, train-membership digest, and count. Validation and every OOD loader reuse those statistics unchanged. Transient loading has one optional later transform hook but fits and applies no normalization here.
+
+Transient packages contain portable relative source locations, hashes, case membership, and a deterministic transition index; they do not duplicate trajectories or static fields per step. The runtime reads only selected HDF5 slices through lazy read-only process-local handles. An explicit bounded LRU closes evictions, serialization drops runtime handles, PID changes clear inherited handles, and `num_workers=0`, multiple workers, and persistent workers are supported. Loader settings reject worker-only options at zero workers and preserve sampler/shuffle ownership.
+
+Inspect one published package or load one selected batch inside the maintained container:
+
+```bash
+python -m src.datasets.dataset_packages inspect <dataset-id> --storage-root /workspace/storage
+python -m src.datasets.dataset_packages smoke <dataset-id> --storage-root /workspace/storage --membership train --num-workers 0
+python -m src.datasets.dataset_packages smoke <dataset-id> --storage-root /workspace/storage --membership train --num-workers 2 --persistent-workers --prefetch-factor 1
+python -m src.datasets.dataset_packages smoke <parameter-ood-dataset-id> --storage-root /workspace/storage --ood-group bed --num-workers 0
+```
+
+Inspection reports identity, view, regime, selectors, memberships, source/material/profile counts, transition count, channel names/order/units, tensor shapes/dtypes, and one source identity. An unavailable view or group selector fails explicitly rather than returning an unrelated or empty dataset.
 
 ## Native CPU and Docker responsibilities
 
@@ -165,7 +208,7 @@ Without `--wait`, `all` returns after launch and prints the resume command. A ca
 
 ## Manual COMSOL 6.4 adaptation checklist
 
-Adapt reviewed working copies manually. Keep both profile files at `template_ready: false`, with null export patterns and null logical headers, until every item below is confirmed. Never infer tags or formulas from binary strings, preserve aliases, or embed absolute developer/storage paths.
+Adapt reviewed working copies manually. Keep both profile files at `template_ready: false`, with null export patterns, null logical headers, and unresolved steady-flow conditioning, until every item below is confirmed. Never infer tags or formulas from binary strings, preserve aliases, or embed absolute developer/storage paths.
 
 ### Case-local inputs
 
@@ -250,4 +293,5 @@ Confirm source datasets, table orientation/sort order, delimiter, overwrite beha
 - Resolve every material taxonomy/product scope, parameter range/value, coupled record, evidence source, confidence, and validity range.
 - Resolve operation ranges, production campaign counts/seeds, wall time, and site-approved resource choices.
 - Complete the COMSOL checklist, smoke the converter against deliberate exports, and approve any template-byte change separately.
+- Resolve the exhaustive steady-flow conditioning contract for each profile, including fixed or unused viscosity, density, and temperature dependencies.
 - Keep common/material/operation templates non-executable and profile mappings fail-closed until all required owners validate together.

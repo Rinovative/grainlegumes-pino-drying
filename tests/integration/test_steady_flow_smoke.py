@@ -495,11 +495,17 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert split["metadata"]["split_seed"] == seed_plan["split"]
 
     train_indices = split["train_indices"]
-    normalizer = torch.load(
+    normalizer_artifact = torch.load(
         common.paths.resolve_normalizer_path(smoke.run_dir),
         map_location="cpu",
         weights_only=False,
     )
+    train_identity = split["metadata"]["datasets"]["train"]
+    assert normalizer_artifact["dataset_id"] == train_identity["dataset_id"]
+    assert normalizer_artifact["dataset_fingerprint"] == train_identity["fingerprint"]
+    assert normalizer_artifact["train_membership_digest"] == split["metadata"]["membership_digests"]["train"]
+    assert normalizer_artifact["train_sample_count"] == train_indices.numel()
+    normalizer = normalizer_artifact["state"]
     expected_input_mean = smoke.id_payload["inputs"][train_indices].mean(
         dim=(0, 2, 3),
         keepdim=True,

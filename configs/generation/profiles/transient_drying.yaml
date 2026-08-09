@@ -2,6 +2,7 @@ schema_kind: generation_profile
 schema_version: 1
 simulation_profile: transient_drying
 template_ready: false
+steady_flow_conditioning: null
 exports:
 - role: steady_flow_fields
   pattern: null

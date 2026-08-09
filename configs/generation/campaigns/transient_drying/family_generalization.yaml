@@ -45,10 +45,11 @@ sampling:
     units_per_case: 1
     balance_groups: true
     balance_parameters: true
+duplicate_case_input_policy: reject_duplicates
 dataset_packages:
-- learning_task: transient_drying
+- dataset_view: steady_flow
   evaluation_regime: id
-  materials:
+  materials: &id001
   - lentil
   - chickpea
   - kidney_bean
@@ -57,17 +58,34 @@ dataset_packages:
     train: null
     validation: null
     id_test: null
-- learning_task: transient_drying
+- dataset_view: steady_flow
   evaluation_regime: parameter_ood
-  materials:
+  materials: &id002
   - lentil
   - chickpea
   - kidney_bean
-- learning_task: transient_drying
+- dataset_view: steady_flow
   evaluation_regime: near_family_ood
-  materials:
+  materials: &id003
   - field_pea
-- learning_task: transient_drying
+- dataset_view: steady_flow
   evaluation_regime: far_family_ood
-  materials:
+  materials: &id004
   - almond
+- dataset_view: transient_drying
+  evaluation_regime: id
+  materials: *id001
+  membership_seed: null
+  membership_counts_per_material:
+    train: null
+    validation: null
+    id_test: null
+- dataset_view: transient_drying
+  evaluation_regime: parameter_ood
+  materials: *id002
+- dataset_view: transient_drying
+  evaluation_regime: near_family_ood
+  materials: *id003
+- dataset_view: transient_drying
+  evaluation_regime: far_family_ood
+  materials: *id004

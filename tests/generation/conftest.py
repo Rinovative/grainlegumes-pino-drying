@@ -100,6 +100,58 @@ def _parameter_values(definitions: dict[str, dict[str, Any]]) -> dict[str, dict[
     return result
 
 
+def _steady_flow_conditioning() -> dict[str, Any]:
+    """Return one explicit synthetic stationary-airflow dependency audit."""
+    model_inputs = {
+        "Kxx": "m^2",
+        "Kxy": "m^2",
+        "Kyy": "m^2",
+        "eps_bed": "1",
+        "p_bc": "Pa",
+    }
+    dependencies = [
+        {
+            "name": name,
+            "affects_stationary_solution": True,
+            "owner": "model_input",
+            "unit": unit,
+            "fixed_value": None,
+        }
+        for name, unit in model_inputs.items()
+    ]
+    dependencies.append(
+        {
+            "name": "air_dynamic_viscosity",
+            "affects_stationary_solution": True,
+            "owner": "package_fixed",
+            "unit": "Pa*s",
+            "fixed_value": 1.8139e-5,
+        }
+    )
+    dependencies.extend(
+        {
+            "name": name,
+            "affects_stationary_solution": False,
+            "owner": "not_used",
+            "unit": unit,
+            "fixed_value": None,
+        }
+        for name, unit in (
+            ("air_density", "kg/m^3"),
+            ("T_flow_ref", "K"),
+            ("profile_reference_temperature", "K"),
+        )
+    )
+    return {
+        "schema_kind": "steady_flow_conditioning",
+        "schema_version": 1,
+        "exhaustive": True,
+        "stationary_solution_contract_id": "synthetic_brinkman_airflow_v1",
+        "dependencies": dependencies,
+        "additional_case_varying_solver_scalars": [],
+    }
+
+
 def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: bool) -> dict[str, Any]:
     """Return complete test-owned mappings without inspecting template binaries."""
     profile = generation.profiles.get_profile(simulation_profile)
@@ -124,6 +176,7 @@ def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: b
         "schema_version": 1,
         "simulation_profile": simulation_profile,
         "template_ready": True,
+        "steady_flow_conditioning": _steady_flow_conditioning(),
         "exports": exports,
     }
 
@@ -269,24 +322,34 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         seen = tuple(material_family for material_family in selected if material_family in generation.materials.MATERIAL_FAMILIES[:3])
         near = tuple(material_family for material_family in selected if material_family == "field_pea")
         far = tuple(material_family for material_family in selected if material_family == "almond")
-        learning_task = "steady_flow" if simulation_profile == "steady_flow" else "transient_drying"
-        dataset_packages: list[dict[str, Any]] = [
-            {
-                "learning_task": learning_task,
-                "evaluation_regime": "id",
-                "materials": list(seen),
-                "membership_seed": 9101,
-                "membership_counts_per_material": {"train": 1, "validation": 1, "id_test": 1},
-            },
-            {
-                "learning_task": learning_task,
-                "evaluation_regime": "parameter_ood",
-                "materials": list(seen),
-            },
-        ]
-        for regime, role_materials in (("near_family_ood", near), ("far_family_ood", far)):
-            if role_materials:
-                dataset_packages.append({"learning_task": learning_task, "evaluation_regime": regime, "materials": list(role_materials)})
+        dataset_views = ("steady_flow",) if simulation_profile == "steady_flow" else ("steady_flow", "transient_drying")
+        dataset_packages: list[dict[str, Any]] = []
+        for dataset_view in dataset_views:
+            dataset_packages.extend(
+                [
+                    {
+                        "dataset_view": dataset_view,
+                        "evaluation_regime": "id",
+                        "materials": list(seen),
+                        "membership_seed": 9101,
+                        "membership_counts_per_material": {"train": 1, "validation": 1, "id_test": 1},
+                    },
+                    {
+                        "dataset_view": dataset_view,
+                        "evaluation_regime": "parameter_ood",
+                        "materials": list(seen),
+                    },
+                ]
+            )
+            for regime, role_materials in (("near_family_ood", near), ("far_family_ood", far)):
+                if role_materials:
+                    dataset_packages.append(
+                        {
+                            "dataset_view": dataset_view,
+                            "evaluation_regime": regime,
+                            "materials": list(role_materials),
+                        }
+                    )
         campaign = {
             "schema_kind": "generation_campaign",
             "schema_version": 1,
@@ -299,6 +362,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             "execution_config": "execution.yaml",
             "materials": list(selected),
             "roles": {"seen": list(seen), "near_family_ood": list(near), "far_family_ood": list(far)},
+            "duplicate_case_input_policy": "reject_duplicates",
             "sampling": {
                 "method": "lhs",
                 "seed_base": 3001,

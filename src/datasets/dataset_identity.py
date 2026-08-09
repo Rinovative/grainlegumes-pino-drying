@@ -15,7 +15,7 @@ Design principles:
   - Ordered membership remains distinct from dataset-level content identity
 
 This module does NOT:
-  - Load final datasets into model-ready samples. ``dataset_simulation`` owns that
+  - Load final datasets into model-ready samples. ``dataset_factory`` owns that
   - Choose training/evaluation ratios or random seeds. Experiment services own them
   - Publish dataset files. The generation-domain builder owns publication
 ===============================================================================

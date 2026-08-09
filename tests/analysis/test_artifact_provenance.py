@@ -694,10 +694,14 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         inputs=inputs,
         outputs=outputs,
     )
-    loaded = datasets.simulation.create_task_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
+    loaded = datasets.factory.create_steady_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
-    sample["meta"]["generator"]["parameters"]["scalar_parameter"] = -1.0
+    generator = sample["meta"].get("generator")
+    assert isinstance(generator, dict)
+    parameters = generator.get("parameters")
+    assert isinstance(parameters, dict)
+    parameters["scalar_parameter"] = -1.0
     assert loaded[0]["meta"] == expected_metadata
 
     batch = next(iter(DataLoader(loaded, batch_size=1, shuffle=False)))

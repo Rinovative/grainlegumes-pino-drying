@@ -554,10 +554,11 @@ def test_dataset_builder_runs_synchronously_without_gpu_queue(
     assert "--gpus" not in docker
     assert f"{harness.repository}:/workspace/repo:ro" in docker
     assert f"{harness.environment['STORAGE_ROOT']}:/workspace/storage:rw" in docker
-    assert docker[-6:] == [
+    assert docker[-7:] == [
         "python",
         "-m",
         "src.datasets.dataset_packages",
+        "build",
         f"/workspace/repo/{_CAMPAIGN_CONFIG_RELATIVE}",
         "--storage-root",
         "/workspace/storage",

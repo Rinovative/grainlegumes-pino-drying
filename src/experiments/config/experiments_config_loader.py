@@ -1534,7 +1534,6 @@ def create_dataloaders_from_config(
     seeds = dict(seed_plan or {})
     run_seed = int(config["run"]["seed"])
     train_loader, test_loaders, normalizer, split_indices = datasets.base.create_dataloaders(
-        dataset_factory=datasets.simulation.create_task_dataset,
         path_train=str(path_train),
         path_test_ood=tuple(str(path) for path in paths_test_ood),
         task=task,

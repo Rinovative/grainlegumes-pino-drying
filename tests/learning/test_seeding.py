@@ -175,6 +175,25 @@ def test_model_subseed_is_applied_immediately_before_construction(
             "split_indices": {"train_indices": torch.tensor([0]), "eval_indices": torch.tensor([1]), "ood_indices": torch.tensor([0])},
         },
     )
+    synthetic_task = object()
+    monkeypatch.setattr(
+        experiments.run.config_loader,
+        "validate_resolved_task_contract",
+        lambda _config: synthetic_task,
+    )
+
+    def build_normalizer_artifact(
+        processor: _Processor,
+        *,
+        task: object,
+        split_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep the construction-order test isolated from dataset identity."""
+        assert task is synthetic_task
+        assert split_info["train_indices"].tolist() == [0]
+        return {"state": processor.state_dict()}
+
+    monkeypatch.setattr(datasets.base, "build_normalizer_artifact", build_normalizer_artifact)
 
     class ConstructionReached(RuntimeError):
         """Stop the orchestration immediately after the ordering assertion."""

@@ -243,6 +243,30 @@ This table adds roles only; authoritative definitions remain in the catalogues a
 | Transient boundary conditioning | `T_in(t_n)`, `T_in(t_{n+1})`, `phi_in(t_n)`, `phi_in(t_{n+1})`, `T_amb` |
 | Transient scalar conditioning | `r_surf_0`, `r_int_surf`, `f_surf`, `A_osw`, `B_osw`, `C_osw`, `k_gr`, `cp_gr_dry` |
 | Archived transient ablation | `Kxx`, `Kxy`, `Kyy`, `p_bc`, `X_0_db_field` |
+| Transient increment target | `delta_T`, `delta_phi`, `delta_w_surf`, `delta_w_int`, derived as the next regular one-hour state minus the current state |
+
+### Package OOD relevance and stationary conditioning
+
+Dataset packages preserve the registry's physical OOD group and the numerical block that generated each selected unit. These are different ownership axes: for example, pressure-profile parameters belong to the `operation` OOD group but to the `airflow` numerical block because they generate the steady `p_bc` field.
+
+| Dataset view | Parameter-OOD eligibility |
+| --- | --- |
+| `transient_drying` | Valid selected units from `airflow`, `initial_moisture`, `operation`, and `material_properties`; all four physical group selectors are retained |
+| `steady_flow` | Selected units in the `airflow` block only, because their effects are represented by `Kxx`, `Kxy`, `Kyy`, `eps_bed`, or `p_bc` |
+
+One immutable parameter-OOD package stores the combined membership plus group and parameter indexes. Every included case records selected units, group, registry kind/block/transform/unit, natural support, OOD support, sampled or coupled value, and block row/design evidence. A steady-ineligible case remains in excluded-source provenance with its reason; it is not relabeled or silently returned by another group selector. Family OOD always uses the held-out family's natural support.
+
+The source profile's exhaustive `steady_flow_conditioning` record owns stationary-solution dependencies:
+
+| Owner | Meaning |
+| --- | --- |
+| `model_input` | Case-varying solution dependency represented by the registered steady input contract |
+| `package_fixed` | Solution dependency fixed across the package, with exact value and unit bound into package identity |
+| `not_used` | Quantity explicitly verified not to affect the stationary solve for that profile |
+
+The required audit inventory is `Kxx`, `Kxy`, `Kyy`, `eps_bed`, `p_bc`, air dynamic viscosity, air density, `T_flow_ref`, and profile reference temperature, plus an explicit list of any additional case-varying solver scalars. `T_flow_ref` is derived for case provenance but is not assumed to be a model input. If it or another solution dependency varies and is neither an existing model input nor package-fixed, package preflight reports hidden conditioning and stops. A stationary-solution contract ID and canonical digest make cross-profile compatibility explicit; template or profile similarity is never inferred.
+
+The four top-level package regimes are `id`, `parameter_ood`, `near_family_ood`, and `far_family_ood`. ID membership is assigned to physical cases before temporal expansion and persists as `train`, `validation`, or `id_test` in both matched views. OOD regimes are evaluation-only by default and never fit the steady normalizer.
 
 ## Semantic conflict decisions
 
@@ -287,6 +311,9 @@ Identity fields have no unit, sampling block, report symbol, or dimension.
 | --- | --- | --- |
 | `material_family` | role-neutral material identity | material filename, manifests, HDF5 |
 | `simulation_profile` | reference-simulation contract | campaign, case, HDF5 |
+| `dataset_view` | `steady_flow` or `transient_drying` package contract | campaign package, manifest, runtime request |
+| `evaluation_regime` | `id`, `parameter_ood`, `near_family_ood`, or `far_family_ood` | campaign package and dataset manifest |
+| `dataset_membership` | case-level `train`, `validation`, `id_test`, or owning OOD regime | dataset manifest and runtime metadata |
 | `sampling_regime` | `natural` or `parameter_ood` | batch, case, HDF5 |
 | `case_input_id` | digest of profile-pairable scientific inputs | case/HDF5/dataset source |
 | `simulation_case_id` | digest including simulation profile | case/HDF5/dataset source |
@@ -294,11 +321,12 @@ Identity fields have no unit, sampling block, report symbol, or dimension.
 | `dataset_name`, `dataset_id` | readable grammar, content identity | payload/manifest |
 | `campaign_id`, `campaign_run_id` | scientific campaign, then science+commit+resources | campaign manifests |
 | `scientific_config_digest` | resolved scientific contract digest | case/HDF5 |
+| `steady_flow_conditioning_digest` | exhaustive stationary-solution dependency contract | case and dataset provenance |
 | `git_commit` | exact source commit | campaign through dataset provenance |
 
 ```text
 batch_name   = <simulation_profile>__<material_family>__<sampling_regime>
-dataset_name = <learning_task>__<ordered-material-list>__<evaluation-regime>
+dataset_name = <dataset_view>__<ordered-material-list>__<evaluation-regime>
 ```
 
 Visible names omit versions, timestamps, seeds, counts, redundant profile words, and technical digests. Immutable IDs append digest prefixes and retain full provenance.

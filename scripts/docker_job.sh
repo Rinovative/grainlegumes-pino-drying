@@ -590,7 +590,7 @@ if [[ "${JOB_TYPE}" == build-datasets ]]; then
     -v "${PROJECT_DIR}:/workspace/repo:ro" \
     -v "${STORAGE_DIR}:/workspace/storage:rw" \
     "${IMAGE_NAME}" \
-    python -m src.datasets.dataset_packages \
+    python -m src.datasets.dataset_packages build \
     "${SEMANTIC_ARGS[0]}" --storage-root /workspace/storage
 fi
 

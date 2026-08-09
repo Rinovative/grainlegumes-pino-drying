@@ -93,7 +93,7 @@ import h5py
 import src
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
-from src.datasets import dataset_build, dataset_generated_batch
+from src.datasets import dataset_factory, dataset_generated_batch, dataset_packages
 
 expected = Path({str(expected_root)!r}).resolve()
 modules = (
@@ -105,20 +105,23 @@ modules = (
     experiments,
     generation,
     learning,
-    dataset_build,
+    dataset_factory,
     dataset_generated_batch,
+    dataset_packages,
     eda_dataframe,
 )
 for module in modules:
     path = Path(module.__file__).resolve()
     assert path.is_relative_to(expected), (module.__name__, path, expected)
-assert datasets.build is dataset_build
+assert datasets.factory is dataset_factory
+assert datasets.packages is dataset_packages
 assert datasets.generated_batch is dataset_generated_batch
 assert datasets.generated_batch.load_generated_batch is dataset_generated_batch.load_generated_batch
 assert h5py.version.version
 print(src.__file__)
 print(dataset_generated_batch.__file__)
-print(dataset_build.__file__)
+print(dataset_factory.__file__)
+print(dataset_packages.__file__)
 print(eda_dataframe.__file__)
 """
     )
@@ -128,11 +131,12 @@ print(eda_dataframe.__file__)
     if wheel_target is not None:
         help_probe += f"sys.path.insert(0, {str(wheel_target)!r}); "
     help_probe += (
-        "import runpy, sys; sys.argv=['src.datasets.dataset_build', '--help']; runpy.run_module('src.datasets.dataset_build', run_name='__main__')"
+        "import runpy, sys; sys.argv=['src.datasets.dataset_packages', '--help']; "
+        "runpy.run_module('src.datasets.dataset_packages', run_name='__main__')"
     )
     completed = _run([str(python), "-S", "-B", "-c", help_probe], cwd=cwd)
-    if "Completed source simulation batch identifier" not in completed.stdout:
-        message = "Builder help did not expose the maintained positional batch contract."
+    if "{build,inspect,smoke}" not in completed.stdout:
+        message = "Dataset package help did not expose the maintained build, inspect, and smoke commands."
         raise RuntimeError(message)
 
 

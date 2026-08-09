@@ -645,7 +645,7 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
         msg = f"Requested dataset {dataset_name!r} does not match configured source identity {expected_dataset_name!r}."
         raise RuntimeError(msg)
     source_datasets = [
-        datasets.simulation.create_task_dataset(
+        datasets.factory.create_steady_dataset(
             common.paths.resolve_dataset_path(source_name, dataset_root=dataset_root),
             task=task,
         )
