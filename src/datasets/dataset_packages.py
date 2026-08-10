@@ -494,19 +494,32 @@ def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
         entry = registry.get(name)
         if isinstance(entry, dict):
             block = entry.get("block")
+            detail = selection_details.get(name)
+            transform: Any
+            if entry.get("kind") == "conditional_interval":
+                if not isinstance(detail, dict) or detail.get("selection_kind") != "conditional_scalar_interval":
+                    message = f"Conditional OOD unit {name!r} lacks realized support evidence."
+                    raise ValueError(message)
+                id_support = copy.deepcopy(detail["id_interval"])
+                ood_support = copy.deepcopy(detail["ood_interval"])
+                transform = "conditional_log"
+            else:
+                id_support = {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry}
+                ood_support = copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets"))))
+                transform = entry.get("transform")
             parameters.append(
                 {
                     "name": name,
                     "group": entry.get("ood_group"),
                     "block": block,
                     "kind": entry.get("kind"),
-                    "transform": entry.get("transform"),
+                    "transform": transform,
                     "unit": entry.get("unit"),
-                    "id_support": {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry},
-                    "ood_support": copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets")))),
+                    "id_support": id_support,
+                    "ood_support": ood_support,
                     "sampled_value": copy.deepcopy(sampled_values.get(name)),
                     "coupled_selection": coupled.get(name),
-                    "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
+                    "transformed_coordinate_evidence": copy.deepcopy(detail),
                 }
             )
             continue

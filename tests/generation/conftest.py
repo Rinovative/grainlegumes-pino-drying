@@ -153,18 +153,6 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         directory.mkdir(parents=True)
         common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
         operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
-        synthetic_anchor = operations["parameter_values"]["porosity.anchor_rel"]
-        synthetic_anchor.update(
-            {
-                "lower": 12.0,
-                "upper": 18.0,
-                "nominal": 15.0,
-                "ood": [
-                    {"lower": 8.0, "upper": 10.0},
-                    {"lower": 20.0, "upper": 24.0},
-                ],
-            }
-        )
         profile = _profile_configuration(simulation_profile, repeated_airflow_times=repeated_airflow_times)
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
         execution["runtime"]["timeout_seconds"] = timeout

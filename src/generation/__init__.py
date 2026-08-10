@@ -12,6 +12,7 @@ Provides:
 - materials: role-neutral material and authoritative sampling-block contracts
 - pilot: technical pilot terminal evidence, storage accounting, and summaries
 - pilot_analysis: generic transient physical and runtime sanity diagnostics
+- porosity: material-calibrated conditional Kozeny-Carman coupling
 - preflight: non-solving native CPU environment and path validation
 - profiles: immutable simulation-profile and logical export contracts
 - readiness: fail-closed scientific, mapping, runtime, and launch reporting
@@ -37,6 +38,7 @@ from . import generation_mapping_probe as mapping_probe
 from . import generation_materials as materials
 from . import generation_pilot as pilot
 from . import generation_pilot_analysis as pilot_analysis
+from . import generation_porosity as porosity
 from . import generation_preflight as preflight
 from . import generation_profiles as profiles
 from . import generation_readiness as readiness
@@ -62,6 +64,7 @@ __all__ = [
     "materials",
     "pilot",
     "pilot_analysis",
+    "porosity",
     "preflight",
     "profiles",
     "readiness",

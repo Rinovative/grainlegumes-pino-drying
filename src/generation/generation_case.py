@@ -348,10 +348,28 @@ def generate_case_input_bundle(
         seeds={name: subseeds[name] for name in spatial_seed_names},
         family_bounds=initial_moisture_bounds,
         packing_porosity_mean_support=family_contract["packing_porosity_mean_support"],
-        porosity_support_departure_authorization=(
-            "active_porosity_parameter_ood" if sample.ood_provenance["active_unit_id"] in materials.POROSITY_GENERATOR_PARAMETERS else None
-        ),
+        material_kappa_nominal=float(family_contract["parameter_registry"]["kappa_mean"]["nominal"]),
+        active_ood_unit=sample.ood_provenance["active_unit_id"],
     )
+    complete_case_retry = fields.metadata["complete_case_support_retry"]
+    support_attempt = int(complete_case_retry["acceptance_attempt"])
+    if schedule is not None and support_attempt > 1:
+        schedule_seed_names = ("schedule_shared", "schedule_independent")
+        schedule = schedule_service.generate_schedule(
+            values,
+            config.scientific_values["time"],
+            fixed,
+            seeds={
+                name: config_contract.derive_seed(
+                    subseeds[name],
+                    "complete_case_support_retry",
+                    str(support_attempt),
+                    name,
+                )
+                for name in schedule_seed_names
+            },
+        )
+        values.update(schedule.derived_scalars)
     input_contract = config.scientific_values["input_contract"]
     spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
     input_paths_list = [spatial_path]
@@ -424,6 +442,7 @@ def generate_case_input_bundle(
         "stationary_fixed_values": stationary_fixed_entries,
         "seed_evidence": seed_evidence,
         "block_provenance": sample.block_provenance,
+        "conditional_supports": sample.conditional_supports,
         "sampled_values": values,
         "sampled_units": units,
         "coupled_selections": sample.coupled_selections,

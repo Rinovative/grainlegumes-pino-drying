@@ -83,7 +83,7 @@ coordinate.
 | `permeability.anisotropy.strength` | `1` | interval/linear | 1 |
 | `permeability.orientation.jitter` | `1` | interval/linear | 1 |
 | `permeability.orientation.smooth_len_rel` | `1` | interval/log | 1 |
-| `porosity.anchor_rel` | `1` | interval/log | 1 |
+| `porosity.kc_anchor_factor` | `1` | conditional interval/conditional log | 1 |
 | `porosity.smooth_len_rel` | `1` | interval/linear | 1 |
 | `porosity.texture_amp` | `1` | interval/linear | 1 |
 | `pressure_bc.mean` | `Pa` | interval/linear | 1 |
@@ -169,6 +169,80 @@ short scientific cross-check.
 
 `phi_eff=min(max(phi,1e-6),0.999)`. Moisture quantities carrying `_db` are dry
 basis; `_wb` are wet basis.
+
+### Material-calibrated porosity coupling
+
+There is one physical porosity field, `eps_bed(x,y)`. The scalar
+`eps_bed_cal_ref` is the calibration reference inherited from the active
+complete density-calibration record; it is not another field.
+`packing_porosity_mean_support=[eps_nat_lo,eps_nat_hi]` is the material-specific
+natural interval for the representative and realised mean packing, not a
+sampling coordinate or COMSOL scalar. The universal `eps_min_global=0.2` and
+`eps_max_global=0.8` remain pointwise guards rather than material-natural
+supports.
+
+Define
+
+```text
+g(eps) = eps^3/(1-eps)^2
+A_KC_ref = kappa_nom/g(eps_bed_cal_ref)
+A_KC_case = kc_anchor_factor*A_KC_ref
+kappa_mean = A_KC_case*g(eps_reference)
+```
+
+`A_KC_ref` is derived from the selected material nominal permeability and the
+active density-calibration reference; it is never authored or sampled. The
+last equation is inverted deterministically inside the global guards. Therefore
+`kappa_mean=kappa_nom` and `kc_anchor_factor=1` recover
+`eps_reference=eps_bed_cal_ref` to root-solver precision.
+
+For an already sampled `kappa_mean`, the material-natural conditional factor
+support is
+
+```text
+a_ID_lower(kappa_mean) = kappa_mean/(A_KC_ref*g(eps_nat_hi))
+a_ID_upper(kappa_mean) = kappa_mean/(A_KC_ref*g(eps_nat_lo))
+```
+
+The ordinary LHS unit coordinate is mapped logarithmically into this positive
+case- and material-specific interval. Thus `porosity.kc_anchor_factor` is one
+sampled airflow coordinate with report symbol `a_KC`, but its physical support
+is conditional; no six material-specific factor ranges are authored.
+
+For Seen-material parameter OOD, let
+`L=log(a_ID_lower)`, `U=log(a_ID_upper)`, and `W=U-L`. The exact synthetic tails
+are
+
+```text
+conditional ID: log(a_KC) in [L,U]
+lower tail:    log(a_KC) in [L-0.40*W, L-0.15*W]
+upper tail:    log(a_KC) in [U+0.15*W, U+0.40*W]
+transformed gap = 0.15*W
+tail width      = 0.25*W
+```
+
+A lower factor produces looser, higher-porosity global packing; an upper factor
+produces denser, lower-porosity packing. These tails have `synthetic_design`
+status and represent conditional extrapolation beyond material-natural packing
+support, not literature packing ranges. Field pea, Rapeseed, and Sunflower use
+natural supports only.
+
+Local morphology remains strictly background-field based:
+
+```text
+porosity_latent = smooth(z_background, porosity.smooth_len_rel)
+chi = zero-mean, unit-RMS normalization(porosity_latent)
+eps_unbounded = eps_reference + porosity.texture_amp*chi
+eps_bed = pointwise application of [eps_min_global,eps_max_global]
+```
+
+No realised local permeability scalar, tensor component, eigenvalue,
+determinant, or perturbation directly enters that texture. Permeability and
+porosity share `z_background`. Within porosity generation, `kappa_mean` enters
+only the global Kozeny-Carman anchor. The same realised `eps_bed` is consumed by steady
+airflow, transient moist-air volume, heat transfer, effective conductivity,
+dry bulk density, water inventory, COMSOL, HDF5, and the maintained learning
+views.
 
 The inlet schedule is heater-only: source air supplies humidity ratio,
 heating conserves `omega_in_bc`, and `phi_in_bc` is derived at the inlet

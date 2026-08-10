@@ -3,17 +3,14 @@
 cli_generation.py
 ===============================================================================
 Expose the profile-qualified generation services through one thin command line.
-
 Responsibilities:
   - Parse explicit configuration, case, campaign, pilot, and publication commands
   - Dispatch reusable generation services without duplicating their domain logic
   - Emit machine-readable command results and propagate terminal failures
-
 Design principles:
   - Scientific, execution, and storage choices remain explicit command inputs
   - Validation and lifecycle authority stay in the responsible source services
   - Destructive cleanup requires the service-owned identity and confirmation gates
-
 This module does NOT:
   - Define scientific values, sampling behavior, COMSOL mappings, or data schemas
   - Implement simulation, scheduling, persistence, or cleanup domain logic

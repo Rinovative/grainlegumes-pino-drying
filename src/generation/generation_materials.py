@@ -61,7 +61,7 @@ AIRFLOW_PARAMETERS: Final = (
     "permeability.anisotropy.strength",
     "permeability.orientation.jitter",
     "permeability.orientation.smooth_len_rel",
-    "porosity.anchor_rel",
+    "porosity.kc_anchor_factor",
     "porosity.smooth_len_rel",
     "porosity.texture_amp",
     "pressure_bc.mean",
@@ -136,7 +136,7 @@ DERIVED_PARAMETERS: Final = (
     "T_in_ref",
 )
 POROSITY_GENERATOR_PARAMETERS: Final = (
-    "porosity.anchor_rel",
+    "porosity.kc_anchor_factor",
     "porosity.smooth_len_rel",
     "porosity.texture_amp",
 )
@@ -405,6 +405,9 @@ def _validate_density_record(
     if rho <= 0 or not 0 < eps < 1 or not math.isclose(rho / (1.0 - eps), particle, rel_tol=2e-9, abs_tol=2e-6):
         message = f"{label}.reference is internally inconsistent."
         raise ValueError(message)
+    if not float(packing_support["lower"]) <= eps <= float(packing_support["upper"]):
+        message = f"{label}.reference.eps_bed_cal_ref must lie inside the material packing support."
+        raise ValueError(message)
     support = _mapping(density["rho_bu_dry_ref_support"], label=f"{label}.rho_bu_dry_ref_support")
     _exact_keys(support, {"lower", "upper", "transform"}, label=f"{label}.rho_bu_dry_ref_support")
     lower = _finite(support["lower"], label=f"{label}.rho_bu_dry_ref_support.lower")
@@ -643,7 +646,7 @@ def validate_profile_registry(
     blocks = active_sampling_blocks(profile_id)
     expected = {name for block in blocks for name in SAMPLING_BLOCKS[block]}
     if profile_id == "steady_flow":
-        expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global"})
+        expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
     else:
         expected.update(SUPPORT_PARAMETERS)
     if set(registry) != expected:
@@ -774,7 +777,7 @@ def project_material_for_profile(material: Mapping[str, Any], profile_id: str) -
     blocks = active_sampling_blocks(profile_id)
     active_names = {name for block in blocks for name in SAMPLING_BLOCKS[block]}
     if profile_id == "steady_flow":
-        active_names.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global"})
+        active_names.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
     else:
         active_names.update(SUPPORT_PARAMETERS)
     projected = {

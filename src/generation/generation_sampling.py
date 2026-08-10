@@ -55,6 +55,7 @@ class CaseSample:
     units: dict[str, str]
     coupled_selections: dict[str, str]
     block_provenance: dict[str, dict[str, Any]]
+    conditional_supports: dict[str, dict[str, Any]]
     ood_provenance: dict[str, Any]
 
 
@@ -447,6 +448,7 @@ def _ood_key(entry: Mapping[str, Any]) -> str | None:
     """Return the configured OOD inventory key for one typed entry."""
     return {
         "interval": "ood",
+        "conditional_interval": "parameter_ood",
         "integer": "ood",
         "categorical": "ood_choices",
         "simplex": "ood_values",
@@ -580,19 +582,22 @@ def _block_values(
     fixed: Mapping[str, Any],
     family_bounds: Mapping[str, float],
     initial_moisture_field_constraint: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, float]]:
     """Map one physical block row through typed and jointly constrained supports."""
     values: dict[str, Any] = {}
     coordinates_by_name: dict[str, float] = {}
     bounds_by_name: dict[str, Mapping[str, Any]] = {}
     ood_details: dict[str, dict[str, Any]] = {}
+    conditional_coordinates: dict[str, float] = {}
     column = 0
     for name in materials.SAMPLING_BLOCKS[block]:
         entry = registry[name]
         dimension = registry_service.effective_dimension(entry)
         coordinates = row[column : column + dimension]
         column += dimension
-        if entry["kind"] in {"interval", "integer"}:
+        if entry["kind"] == "conditional_interval":
+            conditional_coordinates[name] = float(coordinates[0])
+        elif entry["kind"] in {"interval", "integer"}:
             coordinate = float(coordinates[0])
             bounds, detail = _selected_interval(
                 name,
@@ -658,7 +663,157 @@ def _block_values(
         )
     for name, detail in ood_details.items():
         detail["realized_value"] = copy.deepcopy(values[name])
-    return values, ood_details
+    return values, ood_details, conditional_coordinates
+
+
+def _conditional_evidence(
+    name: str,
+    entry: Mapping[str, Any],
+    support: Mapping[str, Any],
+    *,
+    value: float,
+    coordinate: float | None,
+    selected_tail: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return complete realized support evidence for one conditional coordinate."""
+    transformed_value = registry_service.transformed_coordinate(value, entry)
+    natural = support["id_interval"]
+    lower_t = float(natural["transformed_lower"])
+    upper_t = float(natural["transformed_upper"])
+    width = float(natural["transformed_width"])
+    if selected_tail is None:
+        support_kind = "natural"
+        transformed_distance = 0.0
+        transformed_distance_fraction = 0.0
+        ood_interval = None
+        tail_id = None
+        physical_interpretation = "material_natural_global_packing"
+    else:
+        direction = str(selected_tail["direction"])
+        support_kind = str(selected_tail["support_kind"])
+        transformed_distance = lower_t - transformed_value if direction == "lower" else transformed_value - upper_t
+        transformed_distance_fraction = transformed_distance / width
+        ood_interval = [float(selected_tail["lower"]), float(selected_tail["upper"])]
+        tail_id = f"{name}__{support_kind}"
+        physical_interpretation = str(selected_tail["physical_interpretation"])
+    return {
+        "selection_kind": "conditional_scalar_interval",
+        "support_kind": support_kind,
+        "support_resolver": support["support_resolver"],
+        "conditioning_coordinate": support["conditioning_coordinate"],
+        "material_kappa_nominal": support["material_kappa_nominal"],
+        "sampled_kappa_mean": support["sampled_kappa_mean"],
+        "eps_bed_cal_ref": support["eps_bed_cal_ref"],
+        "packing_porosity_mean_support": copy.deepcopy(support["packing_porosity_mean_support"]),
+        "A_KC_reference": support["A_KC_reference"],
+        "id_interval": [float(natural["lower"]), float(natural["upper"])],
+        "id_transformed_interval": [lower_t, upper_t],
+        "id_transformed_width": width,
+        "ood_interval": ood_interval,
+        "tail_id": tail_id,
+        "transform": str(entry["transform"]),
+        "conditional_unit_coordinate": coordinate,
+        "transformed_support_coordinate": transformed_value,
+        "transformed_ood_distance": transformed_distance,
+        "transformed_ood_distance_fraction": transformed_distance_fraction,
+        "transform_space_distance": transformed_distance,
+        "transformed_gap": None if selected_tail is None else float(selected_tail["transformed_gap"]),
+        "transformed_width": None if selected_tail is None else float(selected_tail["transformed_width"]),
+        "transformed_gap_fraction": None if selected_tail is None else float(selected_tail["transformed_gap_fraction"]),
+        "transformed_width_fraction": None if selected_tail is None else float(selected_tail["transformed_width_fraction"]),
+        "physical_interpretation": physical_interpretation,
+        "ood_basis": support["ood_basis"],
+        "ood_status": support["ood_status"],
+        "available_ood_directions": [str(tail["direction"]) for tail in support["available_ood_tails"]],
+        "unavailable_ood_directions": copy.deepcopy(support["unavailable_ood_directions"]),
+        "realized_value": value,
+    }
+
+
+def _apply_conditional_values(
+    family_contract: Mapping[str, Any],
+    *,
+    coordinates: Mapping[str, float],
+    selected_ood: frozenset[str],
+    values: dict[str, Any],
+    seed_base: int,
+    case_index: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Resolve every conditional coordinate after all conditioning values and records."""
+    registry = family_contract["parameter_registry"]
+    expected = {name for name, entry in registry.items() if entry["kind"] == "conditional_interval"}
+    if set(coordinates) != expected:
+        message = f"Conditional coordinate coverage changed: expected={sorted(expected)}, actual={sorted(coordinates)}."
+        raise ValueError(message)
+    evidence: dict[str, dict[str, Any]] = {}
+    ood_details: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected):
+        entry = registry[name]
+        support = registry_service.resolve_conditional_support(
+            entry,
+            values=values,
+            material_contract=family_contract,
+        )
+        selected_tail = None
+        bounds: Mapping[str, Any] = support["id_interval"]
+        if name in selected_ood:
+            tails = support["available_ood_tails"]
+            if not tails:
+                message = f"Selected conditional OOD unit {name!r} has no physically feasible tail."
+                raise ValueError(message)
+            index = _seed(seed_base, "conditional_ood_tail", name, str(case_index)) % len(tails)
+            selected_tail = tails[index]
+            bounds = selected_tail
+        coordinate = float(coordinates[name])
+        realized = _interval_value(entry, coordinate, bounds=bounds)
+        values[name] = realized
+        detail = _conditional_evidence(
+            name,
+            entry,
+            support,
+            value=realized,
+            coordinate=coordinate,
+            selected_tail=selected_tail,
+        )
+        evidence[name] = detail
+        if selected_tail is not None:
+            ood_details[name] = copy.deepcopy(detail)
+    return evidence, ood_details
+
+
+def _nominal_conditional_supports(
+    family_contract: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Resolve conditional evidence for explicit configured nominal cases."""
+    result: dict[str, dict[str, Any]] = {}
+    for name, entry in family_contract["parameter_registry"].items():
+        if entry["kind"] != "conditional_interval":
+            continue
+        support = registry_service.resolve_conditional_support(
+            entry,
+            values=values,
+            material_contract=family_contract,
+        )
+        value = float(values[name])
+        lower = float(support["id_interval"]["lower"])
+        upper = float(support["id_interval"]["upper"])
+        if not lower <= value <= upper:
+            message = f"Explicit nominal conditional value {name!r} lies outside its resolved natural support."
+            raise ValueError(message)
+        transformed = registry_service.transformed_coordinate(value, entry)
+        lower_t = float(support["id_interval"]["transformed_lower"])
+        width = float(support["id_interval"]["transformed_width"])
+        coordinate = (transformed - lower_t) / width
+        result[name] = _conditional_evidence(
+            name,
+            entry,
+            support,
+            value=value,
+            coordinate=coordinate,
+            selected_tail=None,
+        )
+    return result
 
 
 def _coupled_transform_space_distance(
@@ -754,7 +909,7 @@ def _explicit_nominal_values(
         if kind == "fixed":
             values[name] = copy.deepcopy(entry["value"])
             continue
-        if kind in {"interval", "integer"}:
+        if kind in {"interval", "conditional_interval", "integer"}:
             if "nominal" not in entry:
                 message = f"Explicit pilot nominal is missing for resolved parameter owner/key {name!r}."
                 raise ValueError(message)
@@ -841,6 +996,10 @@ def _sample_nominal_case(config: GenerationConfig, case_index: int) -> CaseSampl
         values=values,
         units=_units(registry),
         coupled_selections=coupled_selections,
+        conditional_supports=_nominal_conditional_supports(
+            config.scientific_values["material"],
+            values,
+        ),
         block_provenance={
             block: {
                 "sampling_kind": "explicit_configured_nominal",
@@ -900,6 +1059,7 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
     position = config.case_indices.index(case_index)
     block_provenance: dict[str, dict[str, Any]] = {}
     ood_details: dict[str, dict[str, Any]] = {}
+    conditional_coordinates: dict[str, float] = {}
     family_bounds = family_contract.get("initial_moisture_bounds", {})
     initial_moisture_field_constraint = family_contract.get("initial_moisture_field_constraint", {})
     for block, plan in config.scientific_values["sampling"]["blocks"].items():
@@ -918,7 +1078,7 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         if overlap:
             message = f"Block {block!r} conflicts with coupled or fixed values {sorted(overlap)}."
             raise ValueError(message)
-        block_values, block_ood_details = _block_values(
+        block_values, block_ood_details, block_conditional_coordinates = _block_values(
             registry,
             block,
             design[row_index],
@@ -931,6 +1091,11 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         )
         values.update(block_values)
         ood_details.update(block_ood_details)
+        overlap = set(conditional_coordinates).intersection(block_conditional_coordinates)
+        if overlap:
+            message = f"Conditional coordinates were resolved by multiple blocks: {sorted(overlap)}."
+            raise ValueError(message)
+        conditional_coordinates.update(block_conditional_coordinates)
         block_provenance[block] = {
             "seed_origin": plan["seed_origin"],
             "design_seed": plan["design_seed"],
@@ -949,6 +1114,15 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         case_index=case_index,
     )
     ood_details.update(coupled_ood_details)
+    conditional_supports, conditional_ood_details = _apply_conditional_values(
+        family_contract,
+        coordinates=conditional_coordinates,
+        selected_ood=selected,
+        values=values,
+        seed_base=config.seed_base,
+        case_index=case_index,
+    )
+    ood_details.update(conditional_ood_details)
     if "schedule.component_weights" in values:
         simplex = values["schedule.component_weights"]
         if not isinstance(simplex, dict):
@@ -992,6 +1166,7 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         units=_units(registry),
         coupled_selections=coupled_selections,
         block_provenance=block_provenance,
+        conditional_supports=conditional_supports,
         ood_provenance={
             "group": assignment["ood_group"],
             "active_ood_group": assignment["ood_group"],

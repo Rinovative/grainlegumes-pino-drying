@@ -212,6 +212,7 @@ def _write_transient_case(
         "natural_support_state": "natural",
         "seed_evidence": {},
         "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
+        "conditional_supports": {},
         "sampled_values": scalar_values,
         "sampled_units": dict(zip(scalar_names, generation.profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
         "coupled_selections": {},

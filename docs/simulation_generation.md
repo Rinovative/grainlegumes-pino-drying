@@ -254,7 +254,10 @@ registry and actual tails or alternate atomic records. Each case activates one
 unit; the deterministic round-robin covers every eligible unit where possible
 and keeps allocation counts within one. Exact eligible units, case allocation,
 and counts persist in resolved scientific provenance. No top-level group quota
-is hard-coded, and steady planning cannot select transient-only units.
+is hard-coded, and steady planning cannot select transient-only units. The
+Seen-material `porosity.kc_anchor_factor` remains one eligible `bed` unit; its
+natural support and synthetic OOD tails are resolved conditionally in log space
+after `kappa_mean` and any active density-calibration record are known.
 
 ## CPU/GPU path and lifecycle
 
@@ -396,8 +399,9 @@ Launch is ready only when explicit production counts/seeds/memberships,
 the static scientific guards, reviewed mappings, both native profile reloads,
 scalar handoff, paired equivalence observations, HDF5/package/loader
 validation, and a current real-smoke receipt all pass. At present, the
-material packing-porosity sentinel failures and unconfirmed native mappings
-block launch; no real-smoke or pilot receipt can be claimed. A template hash
+corrected static porosity and parameter-effect sentinels pass, but unconfirmed
+native mappings and missing current real-smoke and pilot receipts still block
+launch. A template hash
 proves byte identity only; it does not prove model-tree behavior.
 
 ## Troubleshooting

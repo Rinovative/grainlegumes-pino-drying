@@ -11,7 +11,7 @@ constraints:
   source_relative_humidity: RH(T_amb,omega_in_bc(t),p_ref)
   inlet_relative_humidity: RH(T_in_bc(t),omega_in_bc(t),p_ref)
   infeasible_schedule_policy: reject_complete_schedule_and_deterministically_resample
-  porosity_natural_support_policy: realized_mean_must_match_material_support_except_active_porosity_ood
+  porosity_natural_support_policy: realized_mean_must_match_material_support_except_active_kc_anchor_factor_ood
 parameter_values:
   pressure_bc.mean:
     lower: 250.0
@@ -923,34 +923,27 @@ parameter_values:
         packing_or_flow_regime: packed-bed continuum; material validation applies
         product_form: material-specific whole-particle record
       notes: 'Redundancy assessment: Interacts with coarse/fine field scales.'
-  porosity.anchor_rel:
-    lower: 1.2
-    upper: 3.2
-    ood:
-    - lower: 0.5
-      upper: 0.8
-    - lower: 4.0
-      upper: 5.5
-    nominal: 2.0
-    distribution: uniform_in_log_transform_space
+  porosity.kc_anchor_factor:
+    nominal: 1.0
+    distribution: uniform_in_conditional_log_transform_space
     provenance:
       source_refs:
       - pino_airflow_project
-      status: project_baseline
+      status: synthetic_design
       derivation:
-        kind: selected_project_baseline
+        kind: selected_synthetic_generator_design
         origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Relative Kozeny-Carman global porosity anchor A_mat/kappa_mean. Expected visible effect: Sets mean porosity
-          jointly with kappa_mean.'
-      confidence: high_for_generator_semantics_medium_for_final_range
+        verification: mathematically_reproduced
+        description: The dimensionless factor scales A_KC_ref; its natural support is derived from sampled kappa_mean and material packing support.
+        formula_or_method: A_KC_case = kc_anchor_factor*A_KC_ref with conditional log-space ID support and relative OOD tails.
+        assumptions:
+        - Local porosity morphology is generated only from the shared background field.
+      confidence: high_for_generator_semantics
       validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
+        packing_or_flow_regime: material-calibrated packed-bed continuum with case-resolved natural packing support
         product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Physically coupled to material eps calibration; generated mean must pass material band
-        validation.'
+        equation_or_method: corrected non-cancelling Kozeny-Carman global anchor
+      notes: OOD tails are synthetic generator design and are not experimentally observed packing ranges.
   porosity.smooth_len_rel:
     lower: 0.03
     upper: 0.09

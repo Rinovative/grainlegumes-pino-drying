@@ -57,7 +57,15 @@ _BED_STRUCTURE_PARAMETERS: Final = frozenset(
 _PERMEABILITY_PARAMETERS: Final = frozenset(
     {"kappa_mean", "kappa_cv"} | {name for name in materials.EXPECTED_PARAMETERS if name.startswith("permeability.")}
 )
-_POROSITY_PARAMETERS: Final = frozenset((*materials.POROSITY_GENERATOR_PARAMETERS, "kappa_mean", "eps_min_global", "eps_max_global"))
+_POROSITY_PARAMETERS: Final = frozenset(
+    (
+        *materials.POROSITY_GENERATOR_PARAMETERS,
+        "kappa_mean",
+        "eps_bed_cal_ref",
+        "eps_min_global",
+        "eps_max_global",
+    )
+)
 _PRESSURE_PARAMETERS: Final = frozenset(name for name in materials.AIRFLOW_PARAMETERS if name.startswith("pressure_bc."))
 _INITIAL_MOISTURE_PARAMETERS: Final = frozenset(name for name in materials.EXPECTED_PARAMETERS if name.startswith("initial_moisture."))
 _SCHEDULE_PARAMETERS: Final = frozenset(materials.OPERATION_PARAMETERS)
@@ -90,6 +98,15 @@ _PARAMETER_CONSUMER_GROUPS: Final = MappingProxyType(
         "generation_fields derived dry-density fields": _DENSITY_FIELD_PARAMETERS,
         "generation_case transient scalar COMSOL adapter": _TRANSIENT_SCALAR_PARAMETERS,
         "common.physical_formulas COMSOL expression contract": _PHYSICAL_FORMULA_RECORDS,
+    }
+)
+_TRANSIENT_ONLY_CONSUMERS: Final = frozenset(
+    {
+        "generation_fields._initial_moisture",
+        "generation_schedule.generate_schedule",
+        "generation_fields derived dry-density fields",
+        "generation_case transient scalar COMSOL adapter",
+        "common.physical_formulas COMSOL expression contract",
     }
 )
 
@@ -180,7 +197,11 @@ def parameter_consumers(name: str, profile_id: str) -> tuple[str, ...]:
     if profile_id not in materials.PROFILE_SAMPLING_BLOCKS:
         message = f"Unknown generation profile {profile_id!r}."
         raise ValueError(message)
-    return tuple(label for label, names in _PARAMETER_CONSUMER_GROUPS.items() if name in names)
+    return tuple(
+        label
+        for label, names in _PARAMETER_CONSUMER_GROUPS.items()
+        if name in names and not (profile_id == profiles.STEADY_FLOW_PROFILE and label in _TRANSIENT_ONLY_CONSUMERS)
+    )
 
 
 def _infer_profile(registry: Mapping[str, Mapping[str, Any]]) -> str:
@@ -188,7 +209,7 @@ def _infer_profile(registry: Mapping[str, Mapping[str, Any]]) -> str:
     names = set(registry)
     transient_expected = set(materials.EXPECTED_PARAMETERS)
     steady_expected: set[str] = set(materials.AIRFLOW_PARAMETERS)
-    steady_expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global"})
+    steady_expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
     if names == transient_expected:
         return profiles.TRANSIENT_DRYING_PROFILE
     if names == steady_expected:
@@ -306,6 +327,20 @@ def _ood_inventory(material: Mapping[str, Any], name: str) -> list[Any]:
     entry = material["parameter_registry"].get(registry_name)
     if not isinstance(entry, Mapping):
         return []
+    if entry["kind"] == "conditional_interval":
+        registry = material["parameter_registry"]
+        values = {
+            "kappa_mean": registry["kappa_mean"]["nominal"],
+            "eps_bed_cal_ref": registry["eps_bed_cal_ref"]["value"],
+            "eps_min_global": registry["eps_min_global"]["value"],
+            "eps_max_global": registry["eps_max_global"]["value"],
+        }
+        support = registry_service.resolve_conditional_support(
+            entry,
+            values=values,
+            material_contract=material,
+        )
+        return copy.deepcopy(list(support["available_ood_tails"]))
     key = {
         "interval": "ood",
         "integer": "ood",
@@ -335,7 +370,14 @@ def _entry_inspection_contract(entry: Mapping[str, Any]) -> dict[str, Any]:
         "kind": entry["kind"],
         "classification": entry.get("classification"),
         "unit": entry.get("unit", entry.get("units")),
-        "transform": entry.get("transform"),
+        "transform": (
+            "conditional_log" if entry.get("kind") == "conditional_interval" and entry.get("transform") == "log" else entry.get("transform")
+        ),
+        "support_kind": entry.get("support_kind"),
+        "support_resolver": entry.get("support_resolver"),
+        "conditioning_coordinates": copy.deepcopy(entry.get("conditioning_coordinates")),
+        "material_inputs": copy.deepcopy(entry.get("material_inputs")),
+        "parameter_ood": entry.get("parameter_ood"),
         "block": entry.get("block"),
         "ood_group": entry.get("ood_group"),
         "profile_applicability": copy.deepcopy(entry.get("profile_applicability")),
@@ -727,4 +769,15 @@ def inspect_campaign_parameter(campaign: Any, canonical_name: str) -> dict[str, 
             if key in primary_entry:
                 output_key = "unit" if key == "units" else key
                 result[output_key] = copy.deepcopy(primary_entry[key])
+        if primary_entry["kind"] == "conditional_interval":
+            result.update(
+                {
+                    "transform": "conditional_log",
+                    "support_kind": primary_entry["support_kind"],
+                    "support_resolver": primary_entry["support_resolver"],
+                    "conditioning_coordinates": copy.deepcopy(primary_entry["conditioning_coordinates"]),
+                    "material_inputs": copy.deepcopy(primary_entry["material_inputs"]),
+                    "parameter_ood": primary_entry["parameter_ood"],
+                }
+            )
     return result

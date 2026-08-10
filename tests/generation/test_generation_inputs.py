@@ -267,7 +267,7 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
         "permeability.anisotropy.strength",
         "permeability.orientation.jitter",
         "permeability.orientation.smooth_len_rel",
-        "porosity.anchor_rel",
+        "porosity.kc_anchor_factor",
         "porosity.smooth_len_rel",
         "porosity.texture_amp",
         "pressure_bc.mean",
@@ -325,32 +325,6 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
     assert registry["kappa_cv"]["unit"] == "1"
     assert registry["bed.structure.fine_weight"]["sources"] == ["bed.structure.coarse_weight"]
     assert registry["initial_moisture.structure.fine_weight"]["sources"] == ["initial_moisture.structure.coarse_weight"]
-    old_generator_names = {
-        "a_max",
-        "a_gamma",
-        "tensor_strength",
-        "theta_jitter",
-        "theta_smooth_rel",
-        "A_rel",
-        "eps_smooth_rel",
-        "texture_amp",
-        "p_inlet_mean",
-        "a_sin",
-        "f_sin",
-        "phi_sin",
-        "k_gauss",
-        "a_gauss",
-        "sigma_gauss",
-        "gauss_jitter",
-        "a_lin",
-        "rho_schedule",
-        "sched_timescale_rel",
-        "schedule_component_weights",
-        "sched_event_count",
-        "sched_event_duration_rel",
-        "sched_event_width_rel",
-    }
-    assert old_generator_names.isdisjoint(registry)
     raw_registry = yaml.safe_load(Path("configs/generation/registry.yaml").read_text(encoding="utf-8"))
     _definitions, metadata = generation.materials.validate_semantic_registry(raw_registry)
     symbols = {name: entry["report_symbol"] for name, entry in metadata.items()}
@@ -367,39 +341,6 @@ def test_final_names_dimensions_inventory_and_profile_pairing(
         "initial_moisture.structure.cross_scale_corr": r"\rho_X",
         "schedule.corr": r"\rho_{T,\omega}",
     }
-    rejected_registry = copy.deepcopy(raw_registry)
-    for old_name, new_name in zip(
-        sorted(old_generator_names),
-        (
-            "porosity.anchor_rel",
-            "permeability.anisotropy.exponent",
-            "pressure_bc.linear_amp",
-            "permeability.anisotropy.max_ratio",
-            "pressure_bc.gauss_amp",
-            "pressure_bc.sin_amp",
-            "porosity.smooth_len_rel",
-            "pressure_bc.sin_freq",
-            "pressure_bc.gauss_jitter",
-            "pressure_bc.gauss_count",
-            "pressure_bc.mean",
-            "pressure_bc.sin_phase",
-            "schedule.corr",
-            "schedule.event_count",
-            "schedule.event_duration_rel",
-            "schedule.event_width_rel",
-            "schedule.timescale_rel",
-            "schedule.component_weights",
-            "pressure_bc.gauss_width",
-            "permeability.anisotropy.strength",
-            "porosity.texture_amp",
-            "permeability.orientation.jitter",
-            "permeability.orientation.smooth_len_rel",
-        ),
-        strict=True,
-    ):
-        rejected_registry["parameters"][old_name] = rejected_registry["parameters"].pop(new_name)
-    with pytest.raises(ValueError, match="Parameter semantics mismatch"):
-        generation.materials.validate_semantic_registry(rejected_registry)
 
     canonical_scientific_names = (
         set(registry)
@@ -577,11 +518,11 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         generation.inventory.inspect_campaign_parameter(steady, "time.stop")
 
 
-def test_scalar_handoff_rejects_an_obsolete_name(
+def test_scalar_handoff_rejects_an_unknown_name(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Protect exact scalar names even when modified bytes have a fresh hash record."""
+    """Protect the exact scalar schema after a modified file receives a fresh hash."""
     config_path, _template = generation_config_factory(simulation_profile="transient_drying")
     config = generation.config.load_generation_config(
         config_path,
@@ -592,13 +533,13 @@ def test_scalar_handoff_rejects_an_obsolete_name(
     content = scalar_path.read_text(encoding="utf-8")
     old = "T_flow_ref;"
     assert content.count(old) == 1
-    scalar_path.write_text(content.replace(old, "obsolete_flow_temperature;"), encoding="utf-8")
+    scalar_path.write_text(content.replace(old, "unexpected_flow_temperature;"), encoding="utf-8")
     payload = copy.deepcopy(bundle.case_payload)
     payload["input_files"]["scalars.csv"] = {
         "sha256": common.serialization.file_sha256(scalar_path),
         "size_bytes": scalar_path.stat().st_size,
     }
-    with pytest.raises(ValueError, match="missing, duplicate, unknown, obsolete"):
+    with pytest.raises(ValueError, match="missing, duplicate, unknown"):
         generation.storage._transient_scalar_values(
             payload,
             bundle.directory,
@@ -625,7 +566,8 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
         seeds=seeds,
         family_bounds=family_bounds,
         packing_porosity_mean_support=porosity_support,
-        porosity_support_departure_authorization=None,
+        material_kappa_nominal=float(registry["kappa_mean"]["nominal"]),
+        active_ood_unit=None,
     )
     bed_names = (
         "bed.structure.coarse_len_rel",
@@ -676,7 +618,8 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
             seeds=seeds,
             family_bounds=family_bounds,
             packing_porosity_mean_support=porosity_support,
-            porosity_support_departure_authorization=None,
+            material_kappa_nominal=float(registry["kappa_mean"]["nominal"]),
+            active_ood_unit=None,
         )
         fields = ("Kxx", "Kxy", "Kyy", "eps_bed") if name in bed_names else ("X_0_db_field",)
         difference = max(float(np.max(np.abs(generated.columns[field] - baseline.columns[field]))) for field in fields)

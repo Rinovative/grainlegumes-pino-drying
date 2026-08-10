@@ -198,14 +198,23 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-  porosity.anchor_rel:
-    kind: interval
+  porosity.kc_anchor_factor:
+    kind: conditional_interval
     unit: '1'
     transform: log
+    support_kind: conditional
+    support_resolver: kozeny_carman_anchor_factor
+    conditioning_coordinates:
+    - kappa_mean
+    material_inputs:
+    - permeability.nominal
+    - packing_porosity_mean_support
+    - density_calibration.reference.eps_bed_cal_ref
+    parameter_ood: conditional_relative_tails
     block: airflow
     ood_group: bed
-    report_symbol: A_K/\bar{\kappa}
-    description: Relative Kozeny-Carman anchoring factor for the porosity map.
+    report_symbol: a_KC
+    description: Dimensionless factor scaling the material-calibrated Kozeny-Carman reference coefficient.
     classification: sampled
     profile_applicability:
     - steady_flow
@@ -669,9 +678,10 @@ parameters:
     kind: fixed
     unit: '1'
     report_symbol: \varepsilon_{\mathrm{bed,cal,ref}}
-    description: Material calibration porosity for dry bulk density.
+    description: Material calibration porosity for Kozeny-Carman reference coupling and dry bulk density.
     classification: fixed
     profile_applicability:
+    - steady_flow
     - transient_drying
     atomic_record: density_calibration
   X_target_wb:

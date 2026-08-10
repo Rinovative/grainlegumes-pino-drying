@@ -19,6 +19,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
 from collections.abc import Mapping
@@ -29,10 +30,12 @@ import numpy as np
 from scipy import signal
 
 from . import generation_config as config_contract
+from . import generation_porosity as porosity_service
 from . import generation_profiles as profiles
 
 _MINIMUM_AXIS_POINTS = 2
 _EQUAL_PROBABILITY = 0.5
+_MAX_SPATIAL_SUPPORT_ATTEMPTS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,15 @@ class SpatialFields:
     shape: tuple[int, int]
     columns: dict[str, np.ndarray]
     metadata: dict[str, Any]
+
+
+class PorositySupportError(ValueError):
+    """Report a porosity-support failure and whether regeneration may resolve it."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        """Initialize the failure with its deterministic retry classification."""
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _finite(values: Mapping[str, Any], name: str) -> float:
@@ -289,10 +301,11 @@ def _porosity_field(
     resolution: float,
     length_x: float,
     values: Mapping[str, Any],
+    material_kappa_nominal: float,
     material_mean_support: Mapping[str, Any],
-    material_support_departure_authorization: str | None,
+    active_ood_unit: str | None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Generate porosity and enforce the supplied material mean support."""
+    """Generate background-based porosity under the conditional global coupling."""
     smooth_relative = _finite(values, "porosity.smooth_len_rel")
     if smooth_relative < 0:
         message = "porosity.smooth_len_rel must be non-negative."
@@ -319,44 +332,51 @@ def _porosity_field(
     if not 0 < minimum < maximum < 1:
         message = "Global porosity bounds must satisfy 0 < lower < upper < 1."
         raise ValueError(message)
-    support_lower = _finite(
-        material_mean_support,
-        "lower",
-    )
-    support_upper = _finite(
-        material_mean_support,
-        "upper",
-    )
-    if not 0 < support_lower < support_upper < 1:
-        message = "Material packing-porosity mean support must be ordered inside (0, 1)."
-        raise ValueError(message)
-    allowed_authorizations = {
-        "active_porosity_parameter_ood",
-        "static_sentinel_diagnostic_bypass",
-    }
-    if material_support_departure_authorization is not None and material_support_departure_authorization not in allowed_authorizations:
-        message = "Porosity material-support departure authorization is unknown."
+    support_lower = _finite(material_mean_support, "lower")
+    support_upper = _finite(material_mean_support, "upper")
+    if not minimum < support_lower < support_upper < maximum:
+        message = "Material packing-porosity mean support must lie inside the global guards."
         raise ValueError(message)
 
     permeability_mean = _finite(values, "kappa_mean")
-    material_factor = _finite(values, "porosity.anchor_rel") * permeability_mean
-    low = minimum + 1e-6
-    high = maximum - 1e-6
-    for _ in range(80):
-        middle = 0.5 * (low + high)
-        mapped = (
-            material_factor
-            * middle**3
-            / max(
-                (1.0 - middle) ** 2,
-                float(np.finfo(np.float64).eps),
-            )
+    calibration_porosity = _finite(values, "eps_bed_cal_ref")
+    anchor_factor = _finite(values, porosity_service.ANCHOR_PARAMETER_NAME)
+    support = porosity_service.resolve_anchor_factor_support(
+        sampled_kappa_mean=permeability_mean,
+        material_kappa_nominal=material_kappa_nominal,
+        eps_bed_cal_ref=calibration_porosity,
+        packing_porosity_mean_support=material_mean_support,
+        eps_min_global=minimum,
+        eps_max_global=maximum,
+    )
+    active_support_kind = porosity_service.classify_anchor_factor(anchor_factor, support)
+    anchor_ood_active = active_ood_unit == porosity_service.ANCHOR_PARAMETER_NAME
+    if anchor_ood_active != active_support_kind.startswith("ood_"):
+        message = (
+            "Conditional anchor support and one-active-OOD attribution disagree: "
+            f"active_unit={active_ood_unit!r}, support_kind={active_support_kind!r}."
         )
-        if mapped > permeability_mean:
-            high = middle
-        else:
-            low = middle
-    reference = 0.5 * (low + high)
+        raise PorositySupportError(message, retryable=False)
+    reference_coefficient = float(support["A_KC_reference"])
+    case_coefficient = anchor_factor * reference_coefficient
+    reference = porosity_service.solve_reference_porosity(
+        permeability_mean,
+        reference_coefficient,
+        anchor_factor,
+        eps_min_global=minimum,
+        eps_max_global=maximum,
+    )
+    reference_in_natural_support = support_lower <= reference <= support_upper
+    if active_support_kind == "natural" and not reference_in_natural_support:
+        message = "Natural conditional anchor produced a reference porosity outside material support."
+        raise PorositySupportError(message, retryable=False)
+    if active_support_kind == "ood_lower" and not reference > support_upper:
+        message = "Lower anchor-factor OOD did not produce looser higher-porosity packing."
+        raise PorositySupportError(message, retryable=False)
+    if active_support_kind == "ood_upper" and not reference < support_lower:
+        message = "Upper anchor-factor OOD did not produce denser lower-porosity packing."
+        raise PorositySupportError(message, retryable=False)
+
     unconstrained = reference + _finite(values, "porosity.texture_amp") * texture
     clipped = (unconstrained < minimum) | (unconstrained > maximum)
     porosity = np.clip(unconstrained, minimum, maximum)
@@ -368,19 +388,61 @@ def _porosity_field(
     realized_maximum = float(np.max(porosity))
     realized_mean = float(np.mean(porosity))
     realized_standard_deviation = float(np.std(porosity))
-    q05, q50, q95 = (
-        float(value)
-        for value in np.quantile(
-            porosity,
-            (0.05, 0.5, 0.95),
-        )
-    )
+    q05, q50, q95 = (float(value) for value in np.quantile(porosity, (0.05, 0.5, 0.95)))
     within_support = support_lower <= realized_mean <= support_upper
     lower_departure = max(support_lower - realized_mean, 0.0)
     upper_departure = max(realized_mean - support_upper, 0.0)
+    required_realized_state = (
+        within_support
+        if active_support_kind == "natural"
+        else realized_mean > support_upper
+        if active_support_kind == "ood_lower"
+        else realized_mean < support_lower
+    )
+    if not required_realized_state:
+        message = (
+            "Generated mean porosity does not retain its required material-support state: "
+            f"support_kind={active_support_kind}, mean={realized_mean}, "
+            f"support=[{support_lower}, {support_upper}]."
+        )
+        raise PorositySupportError(message, retryable=True)
+
+    natural = support["id_interval"]
+    transformed_factor = math.log(anchor_factor)
+    lower_t = float(natural["transformed_lower"])
+    upper_t = float(natural["transformed_upper"])
+    width_t = float(natural["transformed_width"])
+    transformed_ood_distance = (
+        0.0
+        if active_support_kind == "natural"
+        else lower_t - transformed_factor
+        if active_support_kind == "ood_lower"
+        else transformed_factor - upper_t
+    )
+    departure_cause = porosity_service.ANCHOR_PARAMETER_NAME if active_support_kind.startswith("ood_") else None
     diagnostics = {
+        "texture_source": "z_background",
+        "background_field_sha256": _array_sha256(background),
+        "material_kappa_nominal": float(support["material_kappa_nominal"]),
+        "sampled_kappa_mean": permeability_mean,
+        "eps_bed_cal_ref": calibration_porosity,
+        "packing_porosity_mean_support": {
+            "lower": support_lower,
+            "upper": support_upper,
+        },
+        "A_KC_reference": reference_coefficient,
+        "A_KC_case": case_coefficient,
+        "kc_anchor_factor": anchor_factor,
+        "kc_anchor_ID_lower": float(natural["lower"]),
+        "kc_anchor_ID_upper": float(natural["upper"]),
+        "active_anchor_support_kind": active_support_kind,
+        "transformed_support_coordinate": transformed_factor,
+        "transformed_ood_distance": transformed_ood_distance,
+        "transformed_ood_distance_fraction": transformed_ood_distance / width_t,
+        "available_anchor_ood_directions": [str(tail["direction"]) for tail in support["available_ood_tails"]],
+        "unavailable_anchor_ood_directions": copy.deepcopy(support["unavailable_ood_directions"]),
         "reference": reference,
-        "kozeny_carman_factor": material_factor,
+        "eps_reference": reference,
         "pointwise_guard_lower": minimum,
         "pointwise_guard_upper": maximum,
         "material_natural_support_lower": support_lower,
@@ -397,12 +459,24 @@ def _porosity_field(
         "material_support_departure": {
             "below_lower": lower_departure,
             "above_upper": upper_departure,
-            "authorized": material_support_departure_authorization is not None,
-            "authorization": material_support_departure_authorization,
         },
+        "material_support_departure_cause": departure_cause,
         "units": {
+            "material_kappa_nominal": "m^2",
+            "sampled_kappa_mean": "m^2",
+            "eps_bed_cal_ref": "1",
+            "packing_porosity_mean_support.lower": "1",
+            "packing_porosity_mean_support.upper": "1",
+            "A_KC_reference": "m^2",
+            "A_KC_case": "m^2",
+            "kc_anchor_factor": "1",
+            "kc_anchor_ID_lower": "1",
+            "kc_anchor_ID_upper": "1",
+            "transformed_support_coordinate": "1",
+            "transformed_ood_distance": "1",
+            "transformed_ood_distance_fraction": "1",
             "reference": "1",
-            "kozeny_carman_factor": "m^2",
+            "eps_reference": "1",
             "pointwise_guard_lower": "1",
             "pointwise_guard_upper": "1",
             "material_natural_support_lower": "1",
@@ -419,13 +493,6 @@ def _porosity_field(
             "material_support_departure.above_upper": "1",
         },
     }
-    if not within_support and material_support_departure_authorization is None:
-        message = (
-            "Generated mean porosity violates the material natural support: "
-            f"mean={realized_mean}, support=[{support_lower}, "
-            f"{support_upper}], diagnostics={diagnostics}."
-        )
-        raise ValueError(message)
     return porosity, diagnostics
 
 
@@ -561,7 +628,7 @@ def _initial_moisture(
     return field, metadata
 
 
-def generate_spatial_fields(
+def _generate_spatial_fields_once(
     simulation_profile: str,
     grid: Mapping[str, Any],
     values: Mapping[str, Any],
@@ -569,7 +636,8 @@ def generate_spatial_fields(
     seeds: Mapping[str, int],
     family_bounds: Mapping[str, Any] | None,
     packing_porosity_mean_support: Mapping[str, Any],
-    porosity_support_departure_authorization: str | None,
+    material_kappa_nominal: float,
+    active_ood_unit: str | None,
 ) -> SpatialFields:
     """Generate one deterministic profile-owned spatial input set."""
     if simulation_profile == profiles.STEADY_FLOW_PROFILE:
@@ -624,8 +692,9 @@ def generate_spatial_fields(
         resolution=resolution_x,
         length_x=length_x,
         values=values,
+        material_kappa_nominal=material_kappa_nominal,
         material_mean_support=packing_porosity_mean_support,
-        material_support_departure_authorization=porosity_support_departure_authorization,
+        active_ood_unit=active_ood_unit,
     )
     pressure, pressure_metadata = _pressure_boundary(
         x_grid,
@@ -725,3 +794,77 @@ def generate_spatial_fields(
         msg = "Generated spatial fields must share one finite Cartesian shape."
         raise ValueError(msg)
     return SpatialFields(shape=x_grid.shape, columns=columns, metadata=metadata)
+
+
+def _complete_case_retry_seeds(seeds: Mapping[str, int], attempt: int) -> dict[str, int]:
+    """Return exact initial seeds or one deterministic complete-case retry plan."""
+    if attempt == 1:
+        return dict(seeds)
+    return {
+        name: config_contract.derive_seed(
+            seed,
+            "complete_case_support_retry",
+            str(attempt),
+            name,
+        )
+        for name, seed in seeds.items()
+    }
+
+
+def generate_spatial_fields(
+    simulation_profile: str,
+    grid: Mapping[str, Any],
+    values: Mapping[str, Any],
+    *,
+    seeds: Mapping[str, int],
+    family_bounds: Mapping[str, Any] | None,
+    packing_porosity_mean_support: Mapping[str, Any],
+    material_kappa_nominal: float,
+    active_ood_unit: str | None,
+) -> SpatialFields:
+    """
+    Generate one deterministic spatial case with bounded support regeneration.
+
+    Only a realized mean-support failure caused by stochastic texture may retry.
+    Every retry regenerates the complete spatial input set from one derived seed
+    plan; its accepted attempt also controls remaining case-random inputs.
+    Structural coupling or attribution failures remain immediate errors.
+    """
+    rejection_reasons: list[str] = []
+    for attempt in range(1, _MAX_SPATIAL_SUPPORT_ATTEMPTS + 1):
+        try:
+            result = _generate_spatial_fields_once(
+                simulation_profile,
+                grid,
+                values,
+                seeds=_complete_case_retry_seeds(seeds, attempt),
+                family_bounds=family_bounds,
+                packing_porosity_mean_support=packing_porosity_mean_support,
+                material_kappa_nominal=material_kappa_nominal,
+                active_ood_unit=active_ood_unit,
+            )
+        except PorositySupportError as error:
+            if not error.retryable:
+                raise
+            rejection_reasons.append(str(error))
+            continue
+        metadata = copy.deepcopy(result.metadata)
+        accepted_seeds = _complete_case_retry_seeds(seeds, attempt)
+        metadata["complete_case_support_retry"] = {
+            "maximum_attempts": _MAX_SPATIAL_SUPPORT_ATTEMPTS,
+            "acceptance_attempt": attempt,
+            "rejection_count": len(rejection_reasons),
+            "rejection_reasons": rejection_reasons,
+            "accepted_attempt_seeds": accepted_seeds,
+            "policy": "reject_and_deterministically_regenerate_complete_case",
+        }
+        return SpatialFields(
+            shape=result.shape,
+            columns=result.columns,
+            metadata=metadata,
+        )
+    message = (
+        f"No complete spatial realization retained the required material porosity-support state after "
+        f"{_MAX_SPATIAL_SUPPORT_ATTEMPTS} deterministic attempts; last_reason={rejection_reasons[-1]!r}."
+    )
+    raise PorositySupportError(message, retryable=False)

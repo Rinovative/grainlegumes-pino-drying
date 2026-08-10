@@ -18,7 +18,7 @@ Heterogeneous permeability, porosity, pressure, and initial-moisture fields are 
 
 The repository now has one Python package, one research layout, and one external scientific storage root. Existing dataset identity, train-only normalization, deterministic training, exact resume, Optuna, W&B observation, run publication, artifact generation, and ID/OOD evaluation contracts remain the stationary-airflow baseline for subsequent drying work.
 
-The six-family generation/publication contract is implemented fail-closed as a 1,200-case steady campaign and a 660-trajectory transient campaign (1,860 profile-specific source cases combined). Production is currently blocked by the material packing-porosity sanity guard, unconfirmed native mappings, and missing real-smoke/pilot receipts. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
+The six-family generation/publication contract is implemented fail-closed as a 1,200-case steady campaign and a 660-trajectory transient campaign (1,860 profile-specific source cases combined). The corrected static porosity and parameter-effect sentinels pass; production remains blocked by unconfirmed native mappings and missing current real-smoke/pilot receipts. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
 
 > Configured scientific values are modelling and sampling decisions. Citations do
 > not imply that every final number is reported verbatim: values may be fitted,
