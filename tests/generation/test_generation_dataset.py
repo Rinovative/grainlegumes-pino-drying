@@ -25,6 +25,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect steady HDF5 publication and immutable technical-package reuse."""
     config_path, template = generation_config_factory(
@@ -34,7 +35,16 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         retain_raw_csv=True,
     )
     campaign = generation.config.load_campaign_config(config_path)
-    batch = campaign.batch("steady_flow__lentil__natural")
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+    )
+    profile_contract = generation.contracts.get_profile_contract(batch.profile.id)
+    grid = batch.scientific_values["grid"]
+    storage_contract = batch.scientific_values["storage"]
+    fixed_values = batch.scientific_values["scientific_fixed_values"]
+    nx = int(grid["nx"])
+    ny = int(grid["ny"])
     storage = tmp_path / "storage"
     template_bytes = template.read_bytes()
     outcomes = [
@@ -75,18 +85,18 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
             "stationary_fixed",
             "static",
         }
-        assert _dataset(handle, "coords/x").shape == (401,)
+        assert _dataset(handle, "coords/x").shape == (nx,)
         assert _dataset(handle, "coords/x").attrs["unit"] == "m"
-        assert _dataset(handle, "coords/y").shape == (251,)
+        assert _dataset(handle, "coords/y").shape == (ny,)
         assert _dataset(handle, "coords/y").attrs["unit"] == "m"
         static = _dataset(handle, "static/fields")
-        assert static.shape == (8, 251, 401)
+        assert static.shape == (len(profile_contract.static_fields), ny, nx)
         assert static.dtype.name == "float32"
-        assert static.compression == "gzip"
-        assert static.compression_opts == 4
-        assert static.shuffle
+        assert static.compression == storage_contract["compression"]
+        assert static.compression_opts == storage_contract["compression_level"]
+        assert static.shuffle is bool(storage_contract["shuffle"])
         fixed = _dataset(handle, "stationary_fixed/values")
-        assert fixed.shape == (3,)
+        assert fixed.shape == (len(profile_contract.stationary_fixed_fields),)
         assert fixed.attrs["runtime_source"] == "canonical_template"
     case = json.loads((completed / "case.json").read_text(encoding="utf-8"))
     assert identity["case_input_id"] == case["case_input_id"]
@@ -106,6 +116,17 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     terminal = generation.runtime.validate_terminal_batch(batch, storage_root=storage)
     assert terminal["git_commit"] == "a" * 40
     assert [record["case_id"] for record in terminal["cases"]] == ["case_0001", "case_0002"]
+    missing_project = tmp_path / "project without templates"
+    missing_project.mkdir()
+    monkeypatch.setenv("PROJECT_ROOT", str(missing_project))
+    assert not (missing_project / batch.profile.template_relative_path).exists()
+    admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
+    assert admitted.case("case_0001").hdf5_identity.git_commit == "a" * 40
+    unexpected = admitted.processed_directory / "unexpected_case"
+    unexpected.mkdir()
+    with pytest.raises(RuntimeError, match="membership mismatch"):
+        generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
+    unexpected.rmdir()
 
     result = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert result["dataset_name"] == "steady_flow__lentil__id"
@@ -114,30 +135,34 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     task = domain.tasks.registry.get_task("steady_flow")
     dataset_identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
     assert dataset_identity.sample_count == 2
-    assert payload["inputs"].shape == (2, task.in_channels, 251, 401)
-    assert payload["outputs"].shape == (2, task.out_channels, 251, 401)
+    assert payload["inputs"].shape == (2, task.in_channels, ny, nx)
+    assert payload["outputs"].shape == (2, task.out_channels, ny, nx)
     assert payload["fields"] == {"inputs": list(task.input_names), "outputs": list(task.output_names)}
     manifest = datasets.packages.load_package_manifest(
         result["dataset_id"],
         storage_root=storage,
     )
     assert manifest["training_eligible"] is False
+    assert manifest["builder_identity"] == "src.datasets.dataset_packages.build_campaign_packages"
     assert manifest["split_membership"] == {datasets.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
     assert manifest["source_git_commits"] == ["a" * 40]
     conditioning = manifest["steady_flow_conditioning"]
     assert conditioning["hidden_conditioning"] is False
     assert conditioning["T_flow_ref_owner"] == "package_fixed"
     assert conditioning["package_fixed_physics"] == [
-        {"name": "T_flow_ref", "unit": "K", "value": 300.65},
-        {"name": "p_ref", "unit": "Pa", "value": 101325.0},
-        {"name": "p_out", "unit": "Pa", "value": 0.0},
+        {
+            "name": field.name,
+            "unit": field.unit,
+            "value": fixed_values[field.name],
+        }
+        for field in profile_contract.stationary_fixed_fields
     ]
 
     inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
     assert inspection["dataset_view"] == "steady_flow"
     assert inspection["available_selectors"] == [datasets.views.TECHNICAL_SMOKE_MEMBERSHIP]
-    assert inspection["tensors"]["input"]["shape"] == [task.in_channels, 251, 401]
-    assert inspection["tensors"]["target"]["shape"] == [task.out_channels, 251, 401]
+    assert inspection["tensors"]["input"]["shape"] == [task.in_channels, ny, nx]
+    assert inspection["tensors"]["target"]["shape"] == [task.out_channels, ny, nx]
     assert inspection["sample_identity"]["source_hdf5_sha256"] == manifest["source_case_identities"][0]["case_hdf5_sha256"]
     smoke = datasets.packages.smoke_dataset_package(
         result["dataset_id"],
@@ -145,7 +170,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         num_workers=0,
     )
     assert smoke["status"] == "loaded"
-    assert smoke["batch_shapes"]["x"] == [1, task.in_channels, 251, 401]
+    assert smoke["batch_shapes"]["x"] == [1, task.in_channels, ny, nx]
 
     reused = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert reused["status"] == "reused"

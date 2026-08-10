@@ -33,6 +33,7 @@ from src.generation import generation_campaign_runtime as campaign_runtime
 from src.generation import generation_case as case_service
 from src.generation import generation_cluster as cluster_service
 from src.generation import generation_config as config_service
+from src.generation import generation_contracts as contracts_service
 from src.generation import generation_inventory as inventory_service
 from src.generation import generation_mapping_probe as mapping_probe_service
 from src.generation import generation_pilot as pilot_service
@@ -92,9 +93,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="include complete resolved evidence for one canonical parameter or atomic record",
     )
 
+    campaign_catalog = subparsers.add_parser(
+        "list-campaigns",
+        help="discover Generation campaigns by schema kind without relying on filenames",
+    )
+    campaign_catalog.add_argument(
+        "--workflow",
+        action="store_true",
+        help="require the unique primary and technical-smoke profile pairs used by the host workflow",
+    )
+
     static_sentinels = subparsers.add_parser(
         "static-sentinels",
-        help="run six-family and all-OOD-group generator checks without COMSOL",
+        help="run configured-family and all-OOD-group generator checks without COMSOL",
     )
     static_sentinels.add_argument("steady_campaign", type=Path)
     static_sentinels.add_argument("transient_campaign", type=Path)
@@ -375,6 +386,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="analyze pilot evidence and persist the immutable pre-cleanup receipt",
     )
     prepare_pilot.add_argument("campaign_run_id")
+    prepare_pilot.add_argument("--production-campaign", type=Path, required=True)
     prepare_pilot.add_argument("--keep-cpu-source", action="store_true")
     _add_storage_arguments(prepare_pilot)
 
@@ -397,6 +409,11 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     validate_pilot.add_argument("campaign_run_id")
     validate_pilot.add_argument("--require-cleanup-complete", action="store_true")
+    validate_pilot.add_argument(
+        "--if-present",
+        action="store_true",
+        help="return successfully without output when the canonical receipt is absent",
+    )
     validate_pilot.add_argument("--format", choices=("json", "summary"), default="json")
     _add_storage_arguments(validate_pilot)
 
@@ -546,25 +563,132 @@ def _summary(config: config_service.GenerationConfig) -> dict[str, Any]:
     }
 
 
+def _campaign_case_counts(campaign: config_service.CampaignConfig) -> dict[str, Any]:
+    """Return batch, regime, and material counts from resolved batches."""
+    by_batch: dict[str, int] = {}
+    by_sampling_regime: dict[str, dict[str, int]] = {}
+    by_material: dict[str, dict[str, int]] = {}
+    for batch in campaign.batches:
+        count = int(batch.scientific_values["case_count"])
+        by_batch[batch.batch_name] = count
+        by_sampling_regime.setdefault(batch.sampling_regime, {})[batch.material_family] = count
+        material_counts = by_material.setdefault(batch.material_family, {})
+        material_counts[batch.sampling_regime] = count
+        material_counts["total"] = int(material_counts.get("total", 0)) + count
+    return {
+        "by_batch": by_batch,
+        "by_sampling_regime": by_sampling_regime,
+        "by_material": by_material,
+        "derived_total": campaign.total_case_count,
+    }
+
+
+def _campaign_seed_plan(campaign: config_service.CampaignConfig) -> dict[str, Any]:
+    """Return every authored and derived campaign-level sampling seed."""
+    first_batch = campaign.batches[0]
+    batch_seeds: dict[str, Any] = {}
+    for batch in campaign.batches:
+        blocks = batch.scientific_values["sampling"]["blocks"]
+        batch_seeds[batch.batch_name] = {
+            "batch_seed": batch.seed_base,
+            "block_seeds": {
+                name: {
+                    "seed_origin": plan["seed_origin"],
+                    "design_seed": plan["design_seed"],
+                    "permutation_seed": plan["permutation_seed"],
+                }
+                for name, plan in blocks.items()
+            },
+        }
+    return {
+        "campaign_seed": first_batch.scientific_values["campaign_seed"],
+        "membership_seed": campaign.membership.get("seed"),
+        "paired_equivalence_seed": campaign.paired_equivalence_seed,
+        "batches": batch_seeds,
+        "case_seed_derivation": "batch_seed_and_case_identity",
+    }
+
+
+def _dataset_package_requests(campaign: config_service.CampaignConfig) -> list[dict[str, str]]:
+    """Return unique authored package intents represented by resolved packages."""
+    requests: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for package in campaign.dataset_packages:
+        key = (str(package["evaluation_regime"]), str(package["source_role"]))
+        if key not in seen:
+            seen.add(key)
+            requests.append(
+                {
+                    "evaluation_regime": key[0],
+                    "source_role": key[1],
+                }
+            )
+    return requests
+
+
+def _parameter_ood_summary(campaign: config_service.CampaignConfig) -> dict[str, Any]:
+    """Return resolved eligible units and deterministic case allocations."""
+    first_policy = campaign.batches[0].scientific_values["parameter_ood"]
+    policy_keys = (
+        "groups",
+        "units_per_case",
+        "allocation_strategy",
+        "eligibility_source",
+    )
+    batches: dict[str, Any] = {}
+    for batch in campaign.batches:
+        if batch.sampling_regime != "parameter_ood":
+            continue
+        resolved = batch.scientific_values["parameter_ood"]
+        batches[batch.batch_name] = {
+            "material_family": batch.material_family,
+            "case_count": len(batch.case_indices),
+            "eligible_units": resolved["eligible_units"],
+            "allocation_counts": resolved["allocation_counts"],
+            "case_allocation": resolved["case_allocation"],
+        }
+    return {
+        "policy": {name: first_policy[name] for name in policy_keys},
+        "batches": batches,
+    }
+
+
 def _campaign_summary(
     campaign: config_service.CampaignConfig,
     *,
     unresolved_gates: dict[str, list[str]],
 ) -> dict[str, Any]:
-    """Return one resolved campaign view without promoting unresolved values."""
-    summary = {
+    """Return the complete resolved campaign inspection view."""
+    case_counts = _campaign_case_counts(campaign)
+    package_inventory = list(campaign.dataset_packages)
+    material_inventory = [material_family for role in config_service.MATERIAL_ROLES for material_family in campaign.material_roles[role]]
+    summary: dict[str, Any] = {
         "campaign_name": campaign.campaign_name,
         "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
         "campaign_purpose": campaign.campaign_purpose,
         "simulation_profile": campaign.profile.id,
+        "source_path": str(campaign.source_path),
+        "material_inventory": material_inventory,
         "material_roles": {role: list(families) for role, families in campaign.material_roles.items()},
+        "material_memberships": {membership: list(families) for membership, families in campaign.material_memberships.items()},
+        "membership": campaign.membership,
         "evaluation_regimes": list(campaign.evaluation_regimes),
-        "counts": {batch.batch_name: batch.scientific_values["case_count"] for batch in campaign.batches},
+        "case_counts": case_counts,
+        "total_case_count": campaign.total_case_count,
+        "counts": case_counts["by_batch"],
+        "seed_plan": _campaign_seed_plan(campaign),
         "seeds": {batch.batch_name: batch.seed_base for batch in campaign.batches},
+        "sampling_method": campaign.batches[0].scientific_values["sampling"]["method"],
+        "parameter_ood": _parameter_ood_summary(campaign),
         "selected_batches": [_summary(batch) for batch in campaign.batches],
-        "dataset_packages": list(campaign.dataset_packages),
+        "dataset_package_requests": _dataset_package_requests(campaign),
+        "dataset_package_inventory": package_inventory,
+        "dataset_packages": package_inventory,
         "profile": {
             "id": campaign.profile.id,
+            "available_learning_views": list(campaign.profile.available_learning_views),
+            "airflow_source": campaign.profile.airflow_source,
             "template_path": str(campaign.profile.template_path),
             "template_sha256": campaign.profile.template_sha256,
         },
@@ -577,12 +701,21 @@ def _campaign_summary(
         },
         "unresolved_readiness_gates": unresolved_gates,
         "executable": not any(unresolved_gates.values()),
+        "cases_per_material": None,
+        "pilot_plan": None,
+        "technical_smoke_plan": None,
+        "static_sentinel_workload": None,
     }
-    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+    if campaign.campaign_purpose == "family_generalization":
+        summary["static_sentinel_workload"] = sentinel_service.inspect_sentinel_workload(campaign)
+    elif campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
         pilot = campaign.batches[0].scientific_values["pilot_check"]
+        summary["cases_per_material"] = pilot["cases_per_material"]
         summary["pilot_plan"] = {
+            "material_inventory": material_inventory,
             "cases_per_material": pilot["cases_per_material"],
             "total_case_count": campaign.total_case_count,
+            "campaign_seed": campaign.batches[0].scientific_values["campaign_seed"],
             "seed_namespace": campaign.batches[0].scientific_values["campaign_seed"],
             "case_semantics": pilot["case_semantics"],
             "case_kinds": pilot["case_kinds"],
@@ -590,11 +723,77 @@ def _campaign_summary(
             "dataset_package_count": len(campaign.dataset_packages),
             "evaluation_regime": config_service.NO_EVALUATION_REGIME,
         }
+    else:
+        summary["technical_smoke_plan"] = {
+            "material_inventory": material_inventory,
+            "case_counts": case_counts["by_material"],
+            "total_case_count": campaign.total_case_count,
+            "campaign_seed": campaign.batches[0].scientific_values["campaign_seed"],
+            "paired_equivalence_seed": campaign.paired_equivalence_seed,
+            "learning_membership": "none",
+            "dataset_package_count": len(campaign.dataset_packages),
+        }
     return summary
+
+
+def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
+    """Return discovered campaign metadata and an optional unique workflow view."""
+    repository = common.paths.get_project_root().resolve()
+    campaigns = config_service.discover_campaign_configs(
+        repository,
+        require_executable=False,
+    )
+    records: list[dict[str, Any]] = []
+    for campaign in campaigns:
+        profile_contract = contracts_service.get_profile_contract(campaign.profile.id)
+        profile_kind = "transient" if profile_contract.transient_fields else "stationary"
+        records.append(
+            {
+                "source_path": str(campaign.source_path),
+                "repository_path": campaign.source_path.relative_to(repository).as_posix(),
+                "campaign_name": campaign.campaign_name,
+                "campaign_purpose": campaign.campaign_purpose,
+                "simulation_profile": campaign.profile.id,
+                "profile_kind": profile_kind,
+                "execution_site": campaign.execution_values["site"],
+            }
+        )
+    result: dict[str, Any] = {
+        "schema_kind": "generation_campaign_catalog",
+        "schema_version": 1,
+        "campaigns": records,
+    }
+    if not require_workflow:
+        return result
+    workflow: dict[str, dict[str, dict[str, Any]]] = {}
+    for purpose in ("family_generalization", "technical_runtime_smoke"):
+        purpose_records = [record for record in records if record["campaign_purpose"] == purpose]
+        selected: dict[str, dict[str, Any]] = {}
+        for profile_kind in ("stationary", "transient"):
+            matches = [record for record in purpose_records if record["profile_kind"] == profile_kind]
+            if len(matches) != 1:
+                message = f"Host workflow requires exactly one {purpose!r} {profile_kind} campaign; discovered {len(matches)}."
+                raise ValueError(message)
+            selected[profile_kind] = matches[0]
+        workflow[purpose] = selected
+    selected_sites = {
+        common.serialization.canonical_json_sha256(record["execution_site"]): record["execution_site"]
+        for purpose_records in workflow.values()
+        for record in purpose_records.values()
+    }
+    if len(selected_sites) != 1:
+        message = "Host workflow campaign pairs must resolve one shared execution site."
+        raise ValueError(message)
+    result["workflow"] = workflow
+    result["shared_execution_site"] = next(iter(selected_sites.values()))
+    return result
 
 
 def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
+    if args.command == "list-campaigns":
+        print(json.dumps(_campaign_catalog(require_workflow=args.workflow), sort_keys=True))
+        return 0
     if args.command == "static-sentinels":
         report = sentinel_service.run_static_sentinels(
             args.steady_campaign,
@@ -899,13 +1098,14 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "prepare-pilot-check":
         receipt = pilot_service.prepare_pilot_receipt(
             args.campaign_run_id,
+            production_campaign=args.production_campaign,
             storage_root=args.storage_root,
             cleanup_requested=not args.keep_cpu_source,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "record-pilot-cleanup":
-        receipt = pilot_service.record_cleanup_result(
+        receipt = workflow_service.record_pilot_cleanup_result(
             args.campaign_run_id,
             storage_root=args.storage_root,
             cpu_source_removed=args.cpu_source_removed,
@@ -918,10 +1118,22 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "validate-pilot-check":
-        receipt = pilot_service.validate_pilot_receipt(
+        receipt_path = pilot_service.pilot_receipt_path(
             args.campaign_run_id,
             storage_root=args.storage_root,
-            require_cleanup_complete=args.require_cleanup_complete,
+        )
+        if args.if_present and not receipt_path.is_file():
+            return 0
+        receipt = (
+            workflow_service.validate_completed_pilot_receipt(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            if args.require_cleanup_complete
+            else pilot_service.validate_pilot_receipt(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
         )
         if args.format == "json":
             print(json.dumps(receipt, sort_keys=True))

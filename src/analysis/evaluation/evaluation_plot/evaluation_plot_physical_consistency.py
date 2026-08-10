@@ -500,15 +500,6 @@ def plot_physical_consistency_cdf_grid(
     return figure
 
 
-def plot_residual_distributions(
-    *,
-    datasets: Mapping[str, pd.DataFrame],
-    max_cases: int = _DEFAULT_CASE_LIMIT,
-) -> Figure:
-    """Retain the current public residual-grid alias."""
-    return plot_physical_consistency_cdf_grid(datasets=datasets, max_cases=max_cases)
-
-
 def plot_spatial_residuals(
     *,
     datasets: Mapping[str, pd.DataFrame],

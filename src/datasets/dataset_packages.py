@@ -4,16 +4,16 @@ dataset_packages.py
 ===============================================================================
 Assemble immutable dual-view dataset packages from terminal simulation cases.
 Responsibilities:
-  - Assign shared case-level ID membership before view-specific sample expansion
-  - Audit steady conditioning and task-specific parameter-OOD eligibility
-  - Publish provenance-bound steady tensors or compact transient indexes
+  - Build provenance-bound steady payloads or compact transient indexes
+  - Compute immutable package identities and publish exact manifests atomically
+  - Load, inspect, smoke-test, and expose the dataset-package CLI
 Design principles:
-  - Dataset views, regimes, memberships, and source decisions are explicit
+  - Package identity is independent of operational source locations
   - One combined parameter-OOD package owns compact group/parameter indexes
   - Existing valid identities are reused and conflicting publication fails closed
 This module does NOT:
+  - Select source cases, assign membership, or audit OOD eligibility
   - Fit normalization, train models, duplicate HDF5 cases, or register transient
-  - Infer scientific relevance from filenames, filesystem order, or group names
 ===============================================================================
 """
 
@@ -21,707 +21,38 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import shutil
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import torch
 
-from src import common, domain
-from src.generation import generation_config as config_service
-from src.generation import generation_profiles as profiles
+from src import common, domain, generation
 
+from . import dataset_factory as factory
 from . import dataset_generated_batch as generated
 from . import dataset_identity as identity
+from . import dataset_package_manifest as package_manifest
+from . import dataset_package_planning as planning
 from . import dataset_transient as transient
+from . import dataset_transient_contract as transient_contract
 from . import dataset_views as views
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Mapping
 
-DATASET_PACKAGE_SCHEMA_KIND: Final = "vp2_dataset_package_manifest"
-DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
-_ID_MEMBERSHIP_ROLES: Final = views.ID_MEMBERSHIPS
-_STEADY_SOLVER_INPUTS: Final = ("Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc")
-_PACKAGE_PROVENANCE_KEYS: Final = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "dataset_name",
-        "dataset_view",
-        "registered_task_id",
-        "evaluation_regime",
-        "materials",
-        "channel_contract",
-        "channel_contract_digest",
-        "source_simulation_profiles",
-        "source_batches",
-        "source_batch_ids",
-        "source_template_digests",
-        "source_git_commits",
-        "source_case_identities",
-        "included_source_cases",
-        "excluded_source_cases",
-        "source_selection_decisions",
-        "matched_case_input_ids",
-        "airflow_provenance",
-        "steady_flow_conditioning",
-        "material_file_identities",
-        "operation_config_digests",
-        "campaign_name",
-        "campaign_id",
-        "campaign_digest",
-        "campaign_purpose",
-        "material_roles",
-        "evaluation_regimes",
-        "material_memberships",
-        "source_role",
-        "training_eligible",
-        "duplicate_case_input_policy",
-        "case_membership",
-        "split_membership",
-        "membership_counts",
-        "available_ood_groups",
-        "ood_group_indexes",
-        "ood_parameter_indexes",
-        "task_relevant_ood_parameters",
-        "material_counts",
-        "source_profile_counts",
-        "candidate_source_case_count",
-        "builder_identity",
-        "schema_identity",
-    }
-)
-_PACKAGE_MANIFEST_KEYS: Final = _PACKAGE_PROVENANCE_KEYS | {
-    "dataset_id",
-    "dataset_digest",
-    "payload_filename",
-    "sample_count",
-    "source_case_count",
-    "transition_count",
-    "payload_sha256",
-}
-
-
-@dataclass(slots=True)
-class _PreparedPackage:
-    """Hold one completely admitted package before payload publication."""
-
-    plan: dict[str, Any]
-    batch_records: list[dict[str, Any]]
-    candidates: list[dict[str, Any]]
-    excluded: list[dict[str, Any]]
-    membership: dict[str, list[str]]
-    source_decisions: list[dict[str, Any]]
-    steady_conditioning: dict[str, Any] | None
-
-
-def _package_plan(
-    campaign: config_service.CampaignConfig,
-    dataset_view: str,
-    evaluation_regime: str,
-) -> dict[str, Any]:
-    """Return one exact declared view/regime package plan."""
-    matches = [
-        copy.deepcopy(package)
-        for package in campaign.dataset_packages
-        if package["dataset_view"] == dataset_view and package["evaluation_regime"] == evaluation_regime
-    ]
-    if len(matches) != 1:
-        message = f"Campaign {campaign.campaign_name!r} must declare exactly one {dataset_view!r}/{evaluation_regime!r} package."
-        raise ValueError(message)
-    return matches[0]
-
-
-def _source_batches(
-    campaign: config_service.CampaignConfig,
-    plan: Mapping[str, Any],
-) -> tuple[config_service.GenerationConfig, ...]:
-    """Resolve the exact source batches owned by one package regime."""
-    regime = str(plan["evaluation_regime"])
-    sampling_regime = "parameter_ood" if regime == "parameter_ood" else "natural"
-    return tuple(campaign.batch(f"{campaign.profile.id}__{material_family}__{sampling_regime}") for material_family in plan["materials"])
-
-
-def _global_case_id(batch_name: str, case_id: str) -> str:
-    """Return one readable package-unique source case identifier."""
-    return f"{batch_name}__{case_id}"
-
-
-def _json_object(path: Path, *, label: str) -> dict[str, Any]:
-    """Load one required JSON object from validated generated storage."""
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        message = f"{label} is unreadable: {path}."
-        raise ValueError(message) from error
-    if not isinstance(value, dict):
-        message = f"{label} must contain one JSON object: {path}."
-        raise TypeError(message)
-    return value
-
-
-def _load_candidates(
-    campaign: config_service.CampaignConfig,
-    plan: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Validate terminal batches and enumerate deterministic source candidates."""
-    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    batch_records: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
-    for batch in _source_batches(campaign, plan):
-        manifest, _manifest_path, manifest_sha256 = generated.load_batch_manifest(
-            batch.batch_id,
-            storage_root=storage,
-        )
-        if generated.validate_terminal_batch(batch.batch_id, storage_root=storage) != manifest:
-            message = f"Terminal batch changed during package admission: {batch.batch_name}."
-            raise RuntimeError(message)
-        if manifest["batch_identity"] != batch.batch_identity:
-            message = f"Terminal batch identity disagrees with campaign plan: {batch.batch_name}."
-            raise ValueError(message)
-        batch_records.append(
-            {
-                "batch_name": batch.batch_name,
-                "batch_id": batch.batch_id,
-                "batch_identity": batch.batch_identity,
-                "manifest_sha256": manifest_sha256,
-                "simulation_profile": manifest["simulation_profile"],
-                "template": manifest["template"],
-                "scientific_config_digest": manifest["scientific_config_digest"],
-                "git_commit": manifest["git_commit"],
-                "material_config_digest": batch.scientific_values["material_config_digest"],
-                "material_role": batch.material_role,
-                "evaluation_regime": batch.evaluation_regime,
-                "natural_support_state": batch.scientific_values["natural_support_state"],
-                "operation_config_digest": batch.scientific_values["operation_config_digest"],
-                "airflow_source": manifest["airflow_source"],
-                "available_learning_views": manifest["available_learning_views"],
-                "export_contract_sha256": manifest["export_contract_sha256"],
-                "steady_flow_conditioning": copy.deepcopy(batch.scientific_values["steady_flow_conditioning"]),
-            }
-        )
-        processed_root = common.paths.resolve_generated_batch_dir(
-            batch.batch_id,
-            stage="processed",
-            storage_root=storage,
-        )
-        for record in manifest["cases"]:
-            case_id = str(record["case_id"])
-            case_directory = processed_root / case_id
-            case_hdf5 = case_directory / "case.h5"
-            case_payload = _json_object(case_directory / "case.json", label="Canonical case provenance")
-            expected_source = {
-                "material_family": batch.material_family,
-                "material_role": batch.material_role,
-                "evaluation_regime": str(plan["evaluation_regime"]),
-                "sampling_regime": batch.sampling_regime,
-                "natural_support_state": "natural" if batch.sampling_regime == "natural" else "parameter_ood",
-            }
-            observed_source = {name: case_payload.get(name) for name in expected_source}
-            if (
-                observed_source != expected_source
-                or batch.evaluation_regime != plan["evaluation_regime"]
-                or batch.material_role != plan["source_role"]
-                or case_payload.get("ood", {}).get("natural_support_state") != expected_source["natural_support_state"]
-            ):
-                message = (
-                    f"Case {batch.batch_name}/{case_id} disagrees with package source-role/evaluation ownership: "
-                    f"expected={expected_source}, actual={observed_source}."
-                )
-                raise ValueError(message)
-            candidates.append(
-                {
-                    "batch": batch,
-                    "manifest": manifest,
-                    "record": record,
-                    "case_payload": case_payload,
-                    "batch_id": batch.batch_id,
-                    "batch_name": batch.batch_name,
-                    "case_id": case_id,
-                    "package_case_id": _global_case_id(batch.batch_name, case_id),
-                    "material_family": record["material_family"],
-                    "simulation_profile": manifest["simulation_profile"],
-                    "case_input_id": record["case_input_id"],
-                    "simulation_case_id": record["simulation_case_id"],
-                    "case_hdf5": case_hdf5,
-                    "case_hdf5_relative": case_hdf5.resolve().relative_to(storage).as_posix(),
-                    "case_hdf5_sha256": record["case_hdf5_sha256"],
-                }
-            )
-    return batch_records, candidates
-
-
-def resolve_duplicate_case_inputs(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    dataset_view: str,
-    policy: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Resolve repeated physical inputs with one explicit profile source policy."""
-    if policy not in {"prefer_transient_source", "prefer_steady_source", "reject_duplicates"}:
-        message = f"Unsupported duplicate case-input policy: {policy!r}."
-        raise ValueError(message)
-    normalized = [dict(candidate) for candidate in candidates]
-    simulation_ids = [str(candidate["simulation_case_id"]) for candidate in normalized]
-    if len(simulation_ids) != len(set(simulation_ids)):
-        message = f"Dataset view {dataset_view!r} contains duplicate simulation-case identities."
-        raise ValueError(message)
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for candidate in normalized:
-        grouped[str(candidate["case_input_id"])].append(candidate)
-    selected: list[dict[str, Any]] = []
-    decisions: list[dict[str, Any]] = []
-    preferred_profile = {
-        "prefer_transient_source": profiles.TRANSIENT_DRYING_PROFILE,
-        "prefer_steady_source": profiles.STEADY_FLOW_PROFILE,
-    }
-    for case_input_id in sorted(grouped):
-        group = grouped[case_input_id]
-        if len(group) == 1:
-            selected.append(group[0])
-            continue
-        sources = [
-            {
-                "package_case_id": candidate["package_case_id"],
-                "simulation_case_id": candidate["simulation_case_id"],
-                "simulation_profile": candidate["simulation_profile"],
-            }
-            for candidate in sorted(group, key=lambda item: str(item["simulation_case_id"]))
-        ]
-        if policy == "reject_duplicates":
-            message = f"Repeated case_input_id {case_input_id!r} requires an explicit source preference; candidates={sources}."
-            raise ValueError(message)
-        preferred = preferred_profile[policy]
-        matches = [candidate for candidate in group if candidate["simulation_profile"] == preferred]
-        if len(matches) != 1:
-            message = (
-                f"Duplicate policy {policy!r} requires exactly one {preferred!r} source for case_input_id {case_input_id!r}; candidates={sources}."
-            )
-            raise ValueError(message)
-        chosen = matches[0]
-        selected.append(chosen)
-        decisions.append(
-            {
-                "case_input_id": case_input_id,
-                "policy": policy,
-                "candidates": sources,
-                "selected_simulation_case_id": chosen["simulation_case_id"],
-                "excluded_simulation_case_ids": sorted(str(candidate["simulation_case_id"]) for candidate in group if candidate is not chosen),
-            }
-        )
-    selected.sort(key=lambda candidate: (str(candidate["material_family"]), str(candidate["case_input_id"])))
-    return selected, decisions
-
-
-def _membership_rank(seed: int, material_family: str, case_input_id: str) -> str:
-    """Return one stable family-local physical-input membership rank."""
-    payload = f"{seed}|{material_family}|{case_input_id}".encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _shared_id_membership(
-    plan: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
-) -> dict[str, str]:
-    """Assign deterministic material-stratified membership to physical case IDs."""
-    seed = plan["membership_seed"]
-    counts = plan["membership_counts_per_material"]
-    if not isinstance(seed, int) or any(not isinstance(counts.get(role), int) for role in _ID_MEMBERSHIP_ROLES):
-        message = "ID package membership seed and per-material counts must be resolved."
-        raise ValueError(message)
-    assignments: dict[str, str] = {}
-    for material_family in plan["materials"]:
-        family_by_input: dict[str, Mapping[str, Any]] = {}
-        for candidate in candidates:
-            if candidate["material_family"] != material_family:
-                continue
-            case_input_id = str(candidate["case_input_id"])
-            if case_input_id in family_by_input:
-                message = f"ID membership candidate pool duplicates physical input {case_input_id!r}."
-                raise ValueError(message)
-            family_by_input[case_input_id] = candidate
-        family = sorted(
-            family_by_input.values(),
-            key=lambda candidate: _membership_rank(
-                seed,
-                str(material_family),
-                str(candidate["case_input_id"]),
-            ),
-        )
-        required = sum(int(counts[role]) for role in _ID_MEMBERSHIP_ROLES)
-        if len(family) < required:
-            message = f"ID package requires {required} {material_family!r} cases but only {len(family)} are terminal."
-            raise ValueError(message)
-        offset = 0
-        for role in _ID_MEMBERSHIP_ROLES:
-            role_count = int(counts[role])
-            for candidate in family[offset : offset + role_count]:
-                assignments[str(candidate["case_input_id"])] = role
-            offset += role_count
-    if len(assignments) != len(set(assignments)):
-        message = "ID train, validation, and id_test membership must be disjoint."
-        raise RuntimeError(message)
-    return assignments
-
-
-def audit_steady_flow_conditioning(
-    batch_records: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Require complete task-compatible airflow dependencies for every source."""
-    task = domain.tasks.registry.get_task("steady_flow")
-    solver_inputs = set(_STEADY_SOLVER_INPUTS)
-    if not solver_inputs.issubset(task.input_names):
-        message = "The steady-flow TaskSpec no longer contains the audited solver inputs."
-        raise RuntimeError(message)
-    contracts: list[dict[str, Any]] = []
-    contract_digests: set[str] = set()
-    contract_ids: set[str] = set()
-    profiles_found: set[str] = set()
-    for record in batch_records:
-        raw_contract = record.get("steady_flow_conditioning")
-        if not isinstance(raw_contract, dict) or raw_contract.get("exhaustive") is not True:
-            message = f"Source profile {record.get('simulation_profile')!r} has no exhaustive steady-flow conditioning audit."
-            raise ValueError(message)
-        contract = copy.deepcopy(raw_contract)
-        dependencies = contract.get("dependencies")
-        if not isinstance(dependencies, list):
-            message = "Steady-flow conditioning dependencies are malformed."
-            raise TypeError(message)
-        dependency_by_name = {str(dependency.get("name")): dependency for dependency in dependencies if isinstance(dependency, dict)}
-        for name in solver_inputs:
-            dependency = dependency_by_name.get(name)
-            if dependency is None or dependency.get("owner") != "model_input" or dependency.get("affects_stationary_solution") is not True:
-                message = f"Steady-flow solver dependency {name!r} is not represented by the TaskSpec input contract."
-                raise ValueError(message)
-        for name, dependency in dependency_by_name.items():
-            if dependency.get("affects_stationary_solution") is not True:
-                continue
-            owner = dependency.get("owner")
-            if owner == "model_input" and name not in task.input_names:
-                message = (
-                    f"Hidden steady-flow conditioning detected: case-varying dependency {name!r} "
-                    "affects the reference solution but is absent from the TaskSpec inputs."
-                )
-                raise ValueError(message)
-            if owner not in {"model_input", "package_fixed"}:
-                message = f"Steady-flow dependency {name!r} has no admissible model-input or package-fixed owner."
-                raise ValueError(message)
-        additional = contract.get("additional_case_varying_solver_scalars")
-        if not isinstance(additional, list) or any(name not in task.input_names for name in additional):
-            message = f"Hidden steady-flow conditioning detected in additional_case_varying_solver_scalars={additional!r}."
-            raise ValueError(message)
-        contract_id = contract.get("stationary_solution_contract_id")
-        if not isinstance(contract_id, str) or not contract_id:
-            message = "Steady-flow conditioning lacks a stationary-solution compatibility identity."
-            raise ValueError(message)
-        digest = common.serialization.canonical_json_sha256(contract)
-        contract_ids.add(contract_id)
-        contract_digests.add(digest)
-        profiles_found.add(str(record["simulation_profile"]))
-        contracts.append(contract)
-    if len(contract_ids) != 1 or len(contract_digests) != 1:
-        message = (
-            "Steady-flow sources have incompatible stationary-solution conditioning contracts; "
-            f"contract_ids={sorted(contract_ids)}, digests={sorted(contract_digests)}."
-        )
-        raise ValueError(message)
-    contract = contracts[0]
-    dependencies = contract["dependencies"]
-    fixed = [
-        {
-            "name": dependency["name"],
-            "unit": dependency["unit"],
-            "value": dependency["fixed_value"],
-        }
-        for dependency in dependencies
-        if dependency["owner"] == "package_fixed"
-    ]
-    fixed_by_name = {item["name"]: item for item in fixed}
-    if set(fixed_by_name) != {"T_flow_ref", "p_ref", "p_out"}:
-        message = "Steady-flow package-fixed physics must be exactly T_flow_ref, p_ref, and p_out."
-        raise ValueError(message)
-    if (
-        fixed_by_name["T_flow_ref"] != {"name": "T_flow_ref", "unit": "K", "value": profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE}
-        or fixed_by_name["p_ref"]["unit"] != "Pa"
-        or fixed_by_name["p_out"]["unit"] != "Pa"
-    ):
-        message = "Steady-flow package-fixed values or units violate the frozen stationary contract."
-        raise ValueError(message)
-    unused = [dependency["name"] for dependency in dependencies if dependency["owner"] == "not_used"]
-    return {
-        "audit_schema_version": 1,
-        "stationary_solution_contract_id": next(iter(contract_ids)),
-        "conditioning_contract_digest": next(iter(contract_digests)),
-        "source_profiles": sorted(profiles_found),
-        "model_inputs": list(task.input_names),
-        "package_fixed_physics": fixed,
-        "unused_dependencies": unused,
-        "T_flow_ref_owner": next(dependency["owner"] for dependency in dependencies if dependency["name"] == "T_flow_ref"),
-        "hidden_conditioning": False,
-    }
-
-
-def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """Return scalar or complete-record OOD support and distance evidence."""
-    case_payload = candidate["case_payload"]
-    ood = case_payload.get("ood")
-    if not isinstance(ood, dict):
-        message = f"Case {candidate['package_case_id']!r} has malformed OOD provenance."
-        raise TypeError(message)
-    selected = ood.get("selected_units")
-    selection_details = ood.get("selections")
-    if not isinstance(selected, list) or not all(isinstance(name, str) for name in selected) or not isinstance(selection_details, dict):
-        message = f"Case {candidate['package_case_id']!r} has malformed OOD selections."
-        raise TypeError(message)
-    material = candidate["batch"].scientific_values["material"]
-    registry = material["parameter_registry"]
-    coupled_contracts = material["coupled_ood_records"]
-    sampled_values = case_payload.get("sampled_values")
-    coupled = case_payload.get("coupled_selections")
-    if not isinstance(sampled_values, dict) or not isinstance(coupled, dict):
-        message = f"Case {candidate['package_case_id']!r} lacks sampled OOD evidence."
-        raise TypeError(message)
-    parameters: list[dict[str, Any]] = []
-    for name in selected:
-        entry = registry.get(name)
-        if isinstance(entry, dict):
-            block = entry.get("block")
-            detail = selection_details.get(name)
-            transform: Any
-            if entry.get("kind") == "conditional_interval":
-                if not isinstance(detail, dict) or detail.get("selection_kind") != "conditional_scalar_interval":
-                    message = f"Conditional OOD unit {name!r} lacks realized support evidence."
-                    raise ValueError(message)
-                id_support = copy.deepcopy(detail["id_interval"])
-                ood_support = copy.deepcopy(detail["ood_interval"])
-                transform = "conditional_log"
-            else:
-                id_support = {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry}
-                ood_support = copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets"))))
-                transform = entry.get("transform")
-            parameters.append(
-                {
-                    "name": name,
-                    "group": entry.get("ood_group"),
-                    "block": block,
-                    "kind": entry.get("kind"),
-                    "transform": transform,
-                    "unit": entry.get("unit"),
-                    "id_support": id_support,
-                    "ood_support": ood_support,
-                    "sampled_value": copy.deepcopy(sampled_values.get(name)),
-                    "coupled_selection": coupled.get(name),
-                    "transformed_coordinate_evidence": copy.deepcopy(detail),
-                }
-            )
-            continue
-        contract = coupled_contracts.get(name)
-        if not isinstance(contract, dict):
-            message = f"OOD unit {name!r} is absent from scalar and coupled material contracts."
-            raise TypeError(message)
-        components = list(contract["components"])
-        parameters.append(
-            {
-                "name": name,
-                "group": contract["ood_group"],
-                "block": contract["block"],
-                "kind": "complete_coupled_record",
-                "transform": "component_owned",
-                "unit": copy.deepcopy(contract["units"]),
-                "id_support": {
-                    component: {key: copy.deepcopy(registry[component][key]) for key in ("lower", "upper", "value") if key in registry[component]}
-                    for component in components
-                },
-                "ood_support": copy.deepcopy(contract["records"]),
-                "sampled_value": {component: copy.deepcopy(sampled_values[component]) for component in components},
-                "coupled_selection": coupled.get(name),
-                "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
-            }
-        )
-    return {
-        "group": ood.get("group"),
-        "selected_units": list(selected),
-        "units_per_case": ood.get("units_per_case"),
-        "parameters": parameters,
-    }
-
-
-def _ood_eligibility(
-    candidate: dict[str, Any],
-    *,
-    view: views.DatasetViewSpec,
-) -> tuple[bool, tuple[str, ...], dict[str, Any], str | None]:
-    """Return view-specific eligibility from registry-owned dependency blocks."""
-    evidence = _parameter_evidence(candidate)
-    group = evidence["group"]
-    if group not in views.OOD_GROUPS:
-        message = f"Parameter-OOD case {candidate['package_case_id']!r} has invalid group {group!r}."
-        raise ValueError(message)
-    selected = evidence["parameters"]
-    if view.id == "transient_drying":
-        relevant = tuple(str(parameter["name"]) for parameter in selected)
-    else:
-        relevant = tuple(str(parameter["name"]) for parameter in selected if parameter["block"] in view.parameter_ood_blocks)
-    if not relevant:
-        reason = f"No selected parameter belongs to the {view.id!r} dependency blocks {list(view.parameter_ood_blocks)}."
-        return False, (), evidence, reason
-    return True, relevant, evidence, None
-
-
-def _excluded_case(candidate: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
-    """Return compact excluded-source evidence with one actionable reason."""
-    ood = candidate["case_payload"].get("ood", {})
-    return {
-        "package_case_id": candidate["package_case_id"],
-        "case_input_id": candidate["case_input_id"],
-        "simulation_case_id": candidate["simulation_case_id"],
-        "simulation_profile": candidate["simulation_profile"],
-        "material_family": candidate["material_family"],
-        "ood_group": ood.get("group") if isinstance(ood, dict) else None,
-        "ood_parameters": ood.get("selected_units", []) if isinstance(ood, dict) else [],
-        "reason": reason,
-    }
-
-
-def _prepare_campaign_packages(
-    campaign: config_service.CampaignConfig,
-    *,
-    storage_root: Path | str | None,
-    selected_plans: Sequence[Mapping[str, Any]] | None = None,
-) -> tuple[_PreparedPackage, ...]:
-    """Admit selected packages together so membership and leakage are global."""
-    plans = [copy.deepcopy(dict(plan)) for plan in (campaign.dataset_packages if selected_plans is None else selected_plans)]
-    source_by_regime: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
-    for plan in plans:
-        regime = str(plan["evaluation_regime"])
-        if regime not in source_by_regime:
-            source_by_regime[regime] = _load_candidates(campaign, plan, storage_root=storage_root)
-    id_plans = [plan for plan in plans if plan["evaluation_regime"] == "id"]
-    shared_membership: dict[str, str] = {}
-    technical_smoke = campaign.campaign_purpose == "technical_runtime_smoke"
-    if id_plans:
-        _id_records, id_candidates = source_by_regime["id"]
-        physical_id_candidates, _id_decisions = resolve_duplicate_case_inputs(
-            id_candidates,
-            dataset_view="shared_id_membership",
-            policy=campaign.duplicate_case_input_policy,
-        )
-        if technical_smoke:
-            shared_membership = {str(candidate["case_input_id"]): views.TECHNICAL_SMOKE_MEMBERSHIP for candidate in physical_id_candidates}
-        else:
-            shared_membership = _shared_id_membership(id_plans[0], physical_id_candidates)
-    elif campaign.campaign_purpose == "family_generalization":
-        message = "Family-generalization campaigns must declare an ID package."
-        raise ValueError(message)
-    prepared: list[_PreparedPackage] = []
-    for plan in plans:
-        dataset_view = str(plan["dataset_view"])
-        regime = str(plan["evaluation_regime"])
-        view = views.get_view(dataset_view)
-        batch_records, raw_candidates = source_by_regime[regime]
-        candidates, decisions = resolve_duplicate_case_inputs(
-            raw_candidates,
-            dataset_view=dataset_view,
-            policy=campaign.duplicate_case_input_policy,
-        )
-        for candidate in candidates:
-            views.validate_view_for_profile(dataset_view, str(candidate["simulation_profile"]))
-        steady_conditioning = audit_steady_flow_conditioning(batch_records) if dataset_view == "steady_flow" else None
-        included: list[dict[str, Any]] = []
-        excluded: list[dict[str, Any]] = []
-        membership: dict[str, list[str]] = (
-            {views.TECHNICAL_SMOKE_MEMBERSHIP: []}
-            if regime == "id" and technical_smoke
-            else {role: [] for role in _ID_MEMBERSHIP_ROLES}
-            if regime == "id"
-            else {regime: []}
-        )
-        for candidate in candidates:
-            if regime == "id":
-                assigned = shared_membership.get(str(candidate["case_input_id"]))
-                if assigned is None:
-                    excluded.append(
-                        _excluded_case(
-                            candidate,
-                            reason="Physical case was not selected by the declared material-stratified ID membership counts.",
-                        )
-                    )
-                    continue
-                candidate["dataset_membership"] = assigned
-                candidate["task_relevant_ood_parameters"] = []
-                candidate["ood_evidence"] = {}
-            else:
-                candidate["dataset_membership"] = regime
-                candidate["task_relevant_ood_parameters"] = []
-                candidate["ood_evidence"] = {}
-                if regime == "parameter_ood":
-                    eligible, relevant, evidence, reason = _ood_eligibility(candidate, view=view)
-                    if not eligible:
-                        excluded.append(_excluded_case(candidate, reason=str(reason)))
-                        continue
-                    candidate["task_relevant_ood_parameters"] = list(relevant)
-                    candidate["ood_evidence"] = evidence
-            included.append(candidate)
-            membership[str(candidate["dataset_membership"])].append(str(candidate["package_case_id"]))
-        if not included:
-            message = f"Declared package {dataset_view!r}/{regime!r} has no scientifically eligible source cases."
-            raise ValueError(message)
-        prepared.append(
-            _PreparedPackage(
-                plan=plan,
-                batch_records=copy.deepcopy(batch_records),
-                candidates=included,
-                excluded=excluded,
-                membership=membership,
-                source_decisions=decisions,
-                steady_conditioning=steady_conditioning,
-            )
-        )
-    _validate_no_id_ood_overlap(prepared)
-    return tuple(prepared)
-
-
-def _validate_no_id_ood_overlap(prepared: Sequence[_PreparedPackage]) -> None:
-    """Reject simulation or physical-input reuse from ID train into any OOD package."""
-    id_train_simulation_ids = {
-        str(candidate["simulation_case_id"])
-        for package in prepared
-        if package.plan["evaluation_regime"] == "id"
-        for candidate in package.candidates
-        if candidate["dataset_membership"] == "train"
-    }
-    id_train_input_ids = {
-        str(candidate["case_input_id"])
-        for package in prepared
-        if package.plan["evaluation_regime"] == "id"
-        for candidate in package.candidates
-        if candidate["dataset_membership"] == "train"
-    }
-    for package in prepared:
-        if package.plan["evaluation_regime"] == "id":
-            continue
-        simulation_overlap = id_train_simulation_ids.intersection(str(candidate["simulation_case_id"]) for candidate in package.candidates)
-        input_overlap = id_train_input_ids.intersection(str(candidate["case_input_id"]) for candidate in package.candidates)
-        if simulation_overlap or input_overlap:
-            message = (
-                "ID training and OOD package source overlap detected: "
-                f"simulation_case_ids={sorted(simulation_overlap)}, case_input_ids={sorted(input_overlap)}."
-            )
-            raise ValueError(message)
+DATASET_PACKAGE_SCHEMA_KIND: Final = package_manifest.DATASET_PACKAGE_SCHEMA_KIND
+DATASET_PACKAGE_SCHEMA_VERSION: Final = package_manifest.DATASET_PACKAGE_SCHEMA_VERSION
+_TRANSIENT_PROFILE_CONTRACT: Final = generation.contracts.get_profile_contract("transient_drying")
 
 
 def _channel_contract(dataset_view: str) -> dict[str, Any]:
     """Return one authoritative physical-unit tensor contract for the manifest."""
     if dataset_view == "transient_drying":
-        return transient.transient_contract_payload()
+        return transient_contract.transient_contract_payload()
     task = domain.tasks.registry.get_task("steady_flow")
     return {
         "input": [field.as_dict() for field in task.inputs],
@@ -731,7 +62,7 @@ def _channel_contract(dataset_view: str) -> dict[str, Any]:
 
 
 def _case_indexes(
-    prepared: _PreparedPackage,
+    prepared: planning.PreparedPackage,
 ) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]], list[str]]:
     """Build compact included, OOD-group, and OOD-parameter case indexes."""
     included = [str(candidate["package_case_id"]) for candidate in prepared.candidates]
@@ -758,8 +89,8 @@ def _case_indexes(
 
 
 def _package_provenance(
-    campaign: config_service.CampaignConfig,
-    prepared: _PreparedPackage,
+    campaign: generation.config.CampaignConfig,
+    prepared: planning.PreparedPackage,
 ) -> dict[str, Any]:
     """Return complete portable provenance before dataset identity binding."""
     plan = prepared.plan
@@ -771,6 +102,7 @@ def _package_provenance(
     operation_digests = sorted({str(record["operation_config_digest"]) for record in prepared.batch_records})
     git_commits = sorted({str(record["git_commit"]) for record in prepared.batch_records})
     case_membership = {str(candidate["package_case_id"]): str(candidate["dataset_membership"]) for candidate in prepared.candidates}
+    material_by_batch_name = {batch.batch_name: batch.material_family for batch in campaign.batches}
     material_counts: dict[str, int] = defaultdict(int)
     profile_counts: dict[str, int] = defaultdict(int)
     for candidate in prepared.candidates:
@@ -817,13 +149,13 @@ def _package_provenance(
         "excluded_source_cases": prepared.excluded,
         "source_selection_decisions": prepared.source_decisions,
         "matched_case_input_ids": sorted(
-            str(candidate["case_input_id"])
-            for candidate in prepared.candidates
-            if candidate["simulation_profile"] == profiles.TRANSIENT_DRYING_PROFILE
+            str(candidate["case_input_id"]) for candidate in prepared.candidates if candidate["simulation_profile"] == _TRANSIENT_PROFILE_CONTRACT.id
         ),
         "airflow_provenance": airflow if view.id == "steady_flow" else [],
         "steady_flow_conditioning": prepared.steady_conditioning,
-        "material_file_identities": {record["batch_name"].split("__")[1]: record["material_config_digest"] for record in prepared.batch_records},
+        "material_file_identities": {
+            material_by_batch_name[str(record["batch_name"])]: record["material_config_digest"] for record in prepared.batch_records
+        },
         "operation_config_digests": operation_digests,
         "campaign_name": campaign.campaign_name,
         "campaign_id": campaign.campaign_id,
@@ -856,27 +188,12 @@ def _package_provenance(
 
 def storage_schema_version() -> int:
     """Return the canonical source-case HDF5 schema identity."""
-    from src.generation import generation_storage  # noqa: PLC0415
-
-    return generation_storage.HDF5_SCHEMA_VERSION
-
-
-def _dataset_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str, str]:
-    """Return immutable dataset ID without operational relative source locators."""
-    identity_provenance = copy.deepcopy(dict(provenance))
-    source_cases = identity_provenance.get("source_case_identities")
-    if isinstance(source_cases, list):
-        for source_case in source_cases:
-            if isinstance(source_case, dict):
-                source_case.pop("source_relative_path", None)
-    digest = common.serialization.canonical_json_sha256(identity_provenance)
-    name = str(provenance["dataset_name"])
-    return f"{name}__{digest[:16]}", digest
+    return generation.storage.HDF5_SCHEMA_VERSION
 
 
 def _aggregate_generated_identity(
-    campaign: config_service.CampaignConfig,
-    prepared: _PreparedPackage,
+    campaign: generation.config.CampaignConfig,
+    prepared: planning.PreparedPackage,
 ) -> dict[str, Any]:
     """Build the steady payload's compatibility identity from exact source provenance."""
     profiles_found = {str(record["simulation_profile"]) for record in prepared.batch_records}
@@ -915,13 +232,12 @@ def _aggregate_generated_identity(
 
 
 def _build_steady_payload(
-    campaign: config_service.CampaignConfig,
-    prepared: _PreparedPackage,
+    campaign: generation.config.CampaignConfig,
+    prepared: planning.PreparedPackage,
     *,
     dataset_id: str,
     provenance: Mapping[str, Any],
     destination: Path,
-    storage_root: Path | str | None,
 ) -> None:
     """Build one eager steady tensor payload from admitted canonical HDF5 views."""
     task = domain.tasks.registry.get_task("steady_flow")
@@ -932,12 +248,9 @@ def _build_steady_payload(
     outputs: list[torch.Tensor] = []
     for candidate in prepared.candidates:
         _shape, case_inputs, case_outputs, metadata, source, _fingerprint = generated.interpret_generated_case(
-            candidate["batch_id"],
-            candidate["case_id"],
+            candidate["terminal_evidence"],
+            candidate["case_evidence"],
             task=task,
-            manifest=candidate["manifest"],
-            record=candidate["record"],
-            storage_root=storage_root,
         )
         metadata.update(
             {
@@ -986,25 +299,32 @@ def _build_steady_payload(
     common.serialization.atomic_torch_save(payload, destination)
 
 
-def _transient_sources(prepared: _PreparedPackage) -> tuple[transient.TransientSourceCase, ...]:
+def _transient_sources(prepared: planning.PreparedPackage) -> tuple[transient.TransientSourceCase, ...]:
     """Convert admitted candidates into typed transient index sources."""
-    return tuple(
-        transient.TransientSourceCase(
-            path=Path(candidate["case_hdf5"]),
-            package_case_id=str(candidate["package_case_id"]),
-            source_batch_id=str(candidate["batch_id"]),
-            membership=str(candidate["dataset_membership"]),
-            evaluation_regime=str(prepared.plan["evaluation_regime"]),
-            expected_sha256=str(candidate["case_hdf5_sha256"]),
-            expected_case_input_id=str(candidate["case_input_id"]),
-            expected_simulation_case_id=str(candidate["simulation_case_id"]),
-            material_family=str(candidate["material_family"]),
-            ood_group=(str(candidate["ood_evidence"]["group"]) if candidate.get("ood_evidence", {}).get("group") is not None else None),
-            ood_parameters=tuple(str(name) for name in candidate.get("task_relevant_ood_parameters", [])),
-            ood_evidence=copy.deepcopy(candidate.get("ood_evidence", {})),
+    sources: list[transient.TransientSourceCase] = []
+    for candidate in prepared.candidates:
+        case = candidate["case_evidence"]
+        artifact = case.artifact("processed", "case.h5")
+        if artifact.sha256 != case.case_hdf5_sha256:
+            message = f"Admitted transient HDF5 evidence disagrees for {case.case_id!r}."
+            raise RuntimeError(message)
+        sources.append(
+            transient.TransientSourceCase(
+                path=artifact.path,
+                package_case_id=str(candidate["package_case_id"]),
+                source_batch_id=str(candidate["batch_id"]),
+                membership=str(candidate["dataset_membership"]),
+                evaluation_regime=str(prepared.plan["evaluation_regime"]),
+                expected_sha256=artifact.sha256,
+                expected_case_input_id=case.case_input_id,
+                expected_simulation_case_id=case.simulation_case_id,
+                material_family=case.material_family,
+                ood_group=(str(candidate["ood_evidence"]["group"]) if candidate.get("ood_evidence", {}).get("group") is not None else None),
+                ood_parameters=tuple(str(name) for name in candidate.get("task_relevant_ood_parameters", [])),
+                ood_evidence=copy.deepcopy(candidate.get("ood_evidence", {})),
+            )
         )
-        for candidate in prepared.candidates
-    )
+    return tuple(sources)
 
 
 def _publish(
@@ -1070,14 +390,14 @@ def _publish(
 
 
 def _publish_prepared(
-    campaign: config_service.CampaignConfig,
-    prepared: _PreparedPackage,
+    campaign: generation.config.CampaignConfig,
+    prepared: planning.PreparedPackage,
     *,
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
     """Build or exactly reuse one fully prepared package payload."""
     provenance = _package_provenance(campaign, prepared)
-    dataset_id, dataset_digest = _dataset_identity_from_provenance(provenance)
+    dataset_id, dataset_digest = identity.package_identity_from_provenance(provenance)
     dataset_view = str(prepared.plan["dataset_view"])
     if dataset_view == "steady_flow":
         payload_filename = f"{dataset_id}.pt"
@@ -1091,7 +411,6 @@ def _publish_prepared(
                 dataset_id=dataset_id,
                 provenance=provenance,
                 destination=path,
-                storage_root=storage_root,
             )
 
     elif dataset_view == "transient_drying":
@@ -1104,7 +423,6 @@ def _publish_prepared(
             dataset_name=str(prepared.plan["dataset_name"]),
             dataset_id=dataset_id,
             evaluation_regime=str(prepared.plan["evaluation_regime"]),
-            contract_digest=views.get_view("transient_drying").contract_digest,
             source_root=source_root,
         )
         sample_count = int(preview["sample_count"])
@@ -1117,7 +435,6 @@ def _publish_prepared(
                 dataset_name=str(prepared.plan["dataset_name"]),
                 dataset_id=dataset_id,
                 evaluation_regime=str(prepared.plan["evaluation_regime"]),
-                contract_digest=views.get_view("transient_drying").contract_digest,
                 source_root=source_root,
             )
             if built["index_digest"] != preview["index_digest"]:
@@ -1158,18 +475,18 @@ def _publish_prepared(
 
 
 def build_dataset_package(
-    campaign: config_service.CampaignConfig,
+    campaign: generation.config.CampaignConfig,
     dataset_view: str,
     evaluation_regime: str,
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build one declared package with its required ID leakage companion."""
-    requested_plan = _package_plan(campaign, dataset_view, evaluation_regime)
+    requested_plan = planning.package_plan(campaign, dataset_view, evaluation_regime)
     selected_plans = [requested_plan]
     if evaluation_regime != "id":
-        selected_plans.insert(0, _package_plan(campaign, dataset_view, "id"))
-    prepared = _prepare_campaign_packages(
+        selected_plans.insert(0, planning.package_plan(campaign, dataset_view, "id"))
+    prepared = planning.prepare_campaign_packages(
         campaign,
         storage_root=storage_root,
         selected_plans=selected_plans,
@@ -1184,41 +501,13 @@ def build_dataset_package(
 
 
 def build_campaign_packages(
-    campaign: config_service.CampaignConfig,
+    campaign: generation.config.CampaignConfig,
     *,
     storage_root: Path | str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Build every declared package after one shared membership/leakage preflight."""
-    prepared = _prepare_campaign_packages(campaign, storage_root=storage_root)
+    prepared = planning.prepare_campaign_packages(campaign, storage_root=storage_root)
     return tuple(_publish_prepared(campaign, package, storage_root=storage_root) for package in prepared)
-
-
-def _validate_manifest_content(
-    manifest: Any,
-    *,
-    dataset_id: str,
-    payload_path: Path,
-) -> dict[str, Any]:
-    """Validate one current manifest against its portable identity and payload."""
-    if not isinstance(manifest, dict) or set(manifest) != _PACKAGE_MANIFEST_KEYS:
-        message = f"Dataset package manifest keys do not match the current schema for {dataset_id!r}."
-        raise ValueError(message)
-    provenance = {key: manifest[key] for key in _PACKAGE_PROVENANCE_KEYS}
-    expected_id, expected_digest = _dataset_identity_from_provenance(provenance)
-    if (
-        manifest["schema_kind"] != DATASET_PACKAGE_SCHEMA_KIND
-        or manifest["schema_version"] != DATASET_PACKAGE_SCHEMA_VERSION
-        or manifest["dataset_id"] != dataset_id
-        or manifest["dataset_id"] != expected_id
-        or manifest["dataset_digest"] != expected_digest
-        or manifest["payload_filename"] != payload_path.name
-        or manifest["payload_sha256"] != common.serialization.file_sha256(payload_path)
-        or manifest["sample_count"] < 1
-        or manifest["source_case_count"] < 1
-    ):
-        message = f"Dataset package manifest does not bind the exact payload identity for {dataset_id!r}."
-        raise ValueError(message)
-    return dict(manifest)
 
 
 def load_package_manifest(
@@ -1227,24 +516,10 @@ def load_package_manifest(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Load and validate one package manifest and its exact payload hash."""
-    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
-    metadata_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / logical_id / "dataset_manifest.json"
-    if not metadata_path.is_file() or metadata_path.is_symlink():
-        message = f"Dataset package manifest is missing or unsafe: {metadata_path}."
-        raise FileNotFoundError(message)
-    try:
-        manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        message = f"Dataset package manifest is unreadable: {metadata_path}."
-        raise ValueError(message) from error
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("payload_filename"), str):
-        message = f"Dataset package manifest is malformed: {metadata_path}."
-        raise TypeError(message)
-    payload_path = common.paths.get_dataset_payload_root(storage_root=storage_root) / logical_id / manifest["payload_filename"]
-    if not payload_path.is_file() or payload_path.is_symlink():
-        message = f"Dataset package payload is missing or unsafe: {payload_path}."
-        raise FileNotFoundError(message)
-    return _validate_manifest_content(manifest, dataset_id=logical_id, payload_path=payload_path)
+    return package_manifest.load_package_manifest(
+        dataset_id,
+        storage_root=storage_root,
+    )
 
 
 def load_dataset_package_manifest(
@@ -1255,32 +530,12 @@ def load_dataset_package_manifest(
     metadata_root: Path,
 ) -> dict[str, Any]:
     """Bind a steady package manifest to its validated tensor payload identity."""
-    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
-    payload_path = Path(dataset_path)
-    manifest_path = Path(metadata_root) / logical_id / "dataset_manifest.json"
-    if not payload_path.is_file() or payload_path.is_symlink():
-        message = f"Dataset package payload is missing or unsafe: {payload_path}."
-        raise FileNotFoundError(message)
-    if not manifest_path.is_file() or manifest_path.is_symlink():
-        message = f"Dataset package manifest is missing or unsafe: {manifest_path}."
-        raise FileNotFoundError(message)
-    try:
-        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        message = f"Dataset package manifest is unreadable: {manifest_path}."
-        raise ValueError(message) from error
-    manifest = _validate_manifest_content(raw_manifest, dataset_id=logical_id, payload_path=payload_path)
-    provenance = {key: manifest[key] for key in _PACKAGE_PROVENANCE_KEYS}
-    if (
-        manifest["dataset_view"] != "steady_flow"
-        or manifest["registered_task_id"] != dataset_identity.task
-        or manifest["sample_count"] != dataset_identity.sample_count
-        or dataset_identity.dataset_id != logical_id
-        or dataset_identity.source_provenance != provenance
-    ):
-        message = f"Steady package manifest does not bind its validated tensor identity: {manifest_path}."
-        raise ValueError(message)
-    return manifest
+    return package_manifest.load_steady_package_manifest(
+        dataset_id,
+        dataset_identity=dataset_identity,
+        dataset_path=dataset_path,
+        metadata_root=metadata_root,
+    )
 
 
 def _runtime_request(
@@ -1292,14 +547,12 @@ def _runtime_request(
     allow_technical_smoke: bool = False,
 ) -> Any:
     """Build one typed factory request from a validated package manifest."""
-    from . import dataset_factory as factory  # noqa: PLC0415
-
     return factory.DatasetRequest(
         dataset_id=str(manifest["dataset_id"]),
         dataset_view=cast("views.DatasetViewId", manifest["dataset_view"]),
         evaluation_regime=cast("views.PackageRegime", manifest["evaluation_regime"]),
         membership=cast("views.IdMembership | None", membership),
-        ood_group=cast("views.OodGroup | None", ood_group),
+        ood_group=ood_group,
         storage_root=storage_root,
         allow_technical_smoke=allow_technical_smoke,
     )
@@ -1320,8 +573,6 @@ def inspect_dataset_package(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Inspect one package through its validated manifest and runtime object."""
-    from . import dataset_factory as factory  # noqa: PLC0415
-
     manifest = load_package_manifest(dataset_id, storage_root=storage_root)
     request = _runtime_request(
         manifest,
@@ -1399,8 +650,6 @@ def smoke_dataset_package(
     hdf5_cache_size: int = 1,
 ) -> dict[str, Any]:
     """Load one batch through the unified factory with requested worker settings."""
-    from . import dataset_factory as factory  # noqa: PLC0415
-
     manifest = load_package_manifest(dataset_id, storage_root=storage_root)
     request = _runtime_request(
         manifest,
@@ -1450,7 +699,7 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("dataset_id")
     smoke.add_argument("--storage-root", type=Path)
     smoke.add_argument("--membership", choices=views.ID_MEMBERSHIPS)
-    smoke.add_argument("--ood-group", choices=views.OOD_GROUPS)
+    smoke.add_argument("--ood-group", help="parameter-OOD group declared by the selected package")
     smoke.add_argument("--num-workers", type=int, default=0)
     smoke.add_argument("--persistent-workers", action="store_true")
     smoke.add_argument("--prefetch-factor", type=int)
@@ -1462,7 +711,7 @@ def main() -> int:
     """Execute one explicit package build, inspection, or smoke command."""
     arguments = _build_parser().parse_args()
     if arguments.command == "build":
-        campaign = config_service.load_campaign_config(arguments.campaign_config)
+        campaign = generation.config.load_campaign_config(arguments.campaign_config)
         result: dict[str, Any] = {
             "campaign_id": campaign.campaign_id,
             "packages": build_campaign_packages(campaign, storage_root=arguments.storage_root),

@@ -14,6 +14,10 @@ from typing import Any
 import pytest
 
 from src import generation
+from src.generation import generation_campaign_evidence as campaign_evidence
+from src.generation import generation_cluster as cluster
+from src.generation import generation_profiles as profiles
+from src.generation import generation_workspace as workspace
 from src.generation.cli import cli_generation
 
 _SYNTHETIC_CASE_COUNT = 5
@@ -49,7 +53,7 @@ def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory:
     campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
     remaining = sum(len(batch.case_indices) for batch in campaign.batches)
     assert remaining == _SYNTHETIC_CASE_COUNT
-    plan = generation.cluster.build_resource_plan(
+    plan = cluster.build_resource_plan(
         max_nodes=2,
         cases_per_node=2,
         cores_per_case=8,
@@ -59,7 +63,7 @@ def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory:
     )
     assert plan.effective_parallel_cases == 3
     assert plan.effective_nodes == 2
-    command = generation.cluster.build_campaign_slurm_submission_command(campaign, plan=plan)
+    command = cluster.build_campaign_slurm_submission_command(campaign, plan=plan)
     assert command[0] == "sbatch"
     assert "--nodes=1" in command
     assert "--array=0-1%2" in command
@@ -68,11 +72,18 @@ def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory:
     wrapped = command[-1]
     assert "run-campaign-worker" not in wrapped
     assert "generation_campaign_node.sh" in wrapped
+    for variable, key in (
+        ("GENERATION_PYTHON_MODULE", "python_module"),
+        ("GENERATION_COMSOL_MODULE", "comsol_module"),
+        ("GENERATION_PYTHON_EXECUTABLE", "python_executable"),
+        ("GENERATION_COMSOL_EXECUTABLE", "comsol_executable"),
+    ):
+        assert f"{variable}={campaign.execution_values['site'][key]}" in wrapped
     assert "--only-batch" not in wrapped
-    assert len(generation.cluster.campaign_tasks(campaign)) == remaining
+    assert len(cluster.campaign_tasks(campaign)) == remaining
 
     with pytest.raises(ValueError, match="cores_per_node"):
-        generation.cluster.build_resource_plan(
+        cluster.build_resource_plan(
             max_nodes=2,
             cases_per_node=5,
             cores_per_case=8,
@@ -81,7 +92,7 @@ def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory:
             remaining_cases=10,
         )
     with pytest.raises(ValueError, match=r"max_nodes \* cases_per_node"):
-        generation.cluster.build_resource_plan(
+        cluster.build_resource_plan(
             max_nodes=2,
             cases_per_node=2,
             cores_per_case=8,
@@ -99,7 +110,7 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
     """Protect the campaign-global slot pool when many subbatches share a worker."""
     config_path, _template = generation_config_factory()
     campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
-    plan = generation.cluster.build_resource_plan(
+    plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=4,
         cores_per_case=1,
@@ -123,9 +134,9 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
             tracker["active"] -= 1
         return object()
 
-    monkeypatch.setattr(generation.cluster.runtime_service, "completed_case_is_valid", never_completed)
-    monkeypatch.setattr(generation.cluster.runtime_service, "run_case", fake_run_case)
-    result = generation.cluster.run_campaign_worker(
+    monkeypatch.setattr(cluster.runtime_service, "completed_case_is_valid", never_completed)
+    monkeypatch.setattr(cluster.runtime_service, "run_case", fake_run_case)
+    result = cluster.run_campaign_worker(
         campaign,
         plan=plan,
         worker_index=0,
@@ -140,10 +151,7 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
         "calls": _SYNTHETIC_CASE_COUNT,
     }
     assert len(result.completed_tasks) == _SYNTHETIC_CASE_COUNT
-    assert {task.batch_name for task in result.completed_tasks} == {
-        "transient_drying__lentil__natural_first",
-        "transient_drying__lentil__natural_second",
-    }
+    assert {task.batch_name for task in result.completed_tasks} == {batch.batch_name for batch in campaign.batches}
 
 
 def test_submit_manifest_and_fake_scheduler_status(
@@ -154,7 +162,7 @@ def test_submit_manifest_and_fake_scheduler_status(
     """Protect exact-commit submission evidence and resumable scheduler queries."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.config.load_campaign_config(config_path)
-    plan = generation.cluster.build_resource_plan(
+    plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=2,
         cores_per_case=4,
@@ -168,7 +176,7 @@ def test_submit_manifest_and_fake_scheduler_status(
         git_commit=commit,
         resource_plan=plan,
     )
-    intent_path = generation.campaign_runtime._run_manifest_path(
+    intent_path = campaign_evidence.campaign_run_manifest_path(
         run_id,
         storage_root=tmp_path / "storage",
     )
@@ -216,7 +224,7 @@ def test_submit_manifest_and_fake_scheduler_status(
         storage_root=tmp_path / "storage",
     )
     assert reused == manifest
-    loaded = generation.campaign_runtime.load_campaign_run(
+    loaded = campaign_evidence.load_campaign_run(
         manifest["campaign_run_id"],
         storage_root=tmp_path / "storage",
     )
@@ -255,7 +263,7 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
     """Protect durable intent and scheduler-name recovery after a lost response."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.config.load_campaign_config(config_path)
-    plan = generation.cluster.build_resource_plan(
+    plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=1,
         cores_per_case=4,
@@ -284,7 +292,7 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
             git_commit=commit,
             storage_root=storage,
         )
-    intent = generation.campaign_runtime.load_campaign_run(run_id, storage_root=storage)
+    intent = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
     assert intent["state"] == "submitting"
     assert intent["slurm_job_ids"] == []
 
@@ -300,9 +308,97 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
     status = generation.campaign_runtime.campaign_status(run_id, storage_root=storage)
     assert status["campaign_state"] == "running"
     assert status["slurm_job_ids"] == ["98765"]
-    recovered = generation.campaign_runtime.load_campaign_run(run_id, storage_root=storage)
+    recovered = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
     assert recovered["state"] == "submitted"
     assert recovered["slurm_job_ids"] == ["98765"]
+
+
+def test_campaign_discovery_uses_schema_kind_and_deterministic_paths(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Protect filename-independent discovery while ignoring unrelated YAML."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    (tmp_path / "unrelated.yaml").write_text("schema_kind: unrelated\n", encoding="utf-8")
+
+    discovered = generation.config.discover_campaign_configs(tmp_path)
+
+    assert tuple(campaign.source_path for campaign in discovered) == (config_path.resolve(),)
+    status = cli_generation.main(["list-campaigns"])
+    assert status == 0
+    output = json.loads(capsys.readouterr().out)
+    assert [record["source_path"] for record in output["campaigns"]] == [str(config_path.resolve())]
+    assert output["campaigns"][0]["campaign_purpose"] == discovered[0].campaign_purpose
+    assert "workflow" not in output
+
+
+def test_workflow_catalog_rejects_duplicate_profile_purpose_matches(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require unambiguous semantic campaign selection for the no-argument workflow."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = generation.config.load_campaign_config(config_path, require_executable=False)
+    stationary = profiles.resolve_profile(profiles.STEADY_FLOW_PROFILE)
+    transient = profiles.resolve_profile(profiles.TRANSIENT_DRYING_PROFILE)
+
+    def variant(name: str, purpose: str, profile: Any) -> Any:
+        return replace(
+            campaign,
+            source_path=config_path.with_name(f"{name}.yaml"),
+            campaign_purpose=purpose,
+            profile=profile,
+        )
+
+    discovered = (
+        variant("family-stationary", "family_generalization", stationary),
+        variant("family-transient", "family_generalization", transient),
+        variant("smoke-stationary", "technical_runtime_smoke", stationary),
+        variant("smoke-transient-a", "technical_runtime_smoke", transient),
+        variant("smoke-transient-b", "technical_runtime_smoke", transient),
+    )
+    monkeypatch.setattr(
+        cli_generation.config_service,
+        "discover_campaign_configs",
+        lambda *_args, **_kwargs: discovered,
+    )
+
+    with pytest.raises(ValueError, match=r"exactly one 'technical_runtime_smoke' transient campaign; discovered 2"):
+        cli_generation._campaign_catalog(require_workflow=True)
+
+
+def test_validate_config_exposes_resolved_campaign_ownership(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Expose resolved counts, seeds, packages, and purpose scope without mutation."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = generation.config.load_campaign_config(config_path, require_executable=False)
+    monkeypatch.setattr(
+        cli_generation.readiness_service,
+        "campaign_unresolved_gates",
+        lambda _path: {},
+    )
+
+    status = cli_generation.main(["validate-config", str(config_path), "--allow-incomplete"])
+
+    assert status == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["campaign_purpose"] == campaign.campaign_purpose
+    assert output["material_inventory"] == ["lentil"]
+    assert output["case_counts"]["derived_total"] == campaign.total_case_count
+    assert sum(output["counts"].values()) == campaign.total_case_count
+    assert output["seed_plan"]["campaign_seed"] == campaign.batches[0].scientific_values["campaign_seed"]
+    assert output["seed_plan"]["paired_equivalence_seed"] == campaign.paired_equivalence_seed
+    assert output["seed_plan"]["membership_seed"] is None
+    assert output["dataset_package_requests"] == [{"evaluation_regime": "id", "source_role": "seen"}]
+    assert len(output["dataset_package_inventory"]) == len(campaign.dataset_packages)
+    assert output["parameter_ood"]["batches"] == {}
+    assert output["technical_smoke_plan"]["learning_membership"] == "none"
+    assert output["pilot_plan"] is None
+    assert output["static_sentinel_workload"] is None
 
 
 def test_cli_allows_only_execution_overrides(
@@ -318,6 +414,11 @@ def test_cli_allows_only_execution_overrides(
     assert modified.campaign_digest == campaign.campaign_digest
     assert [batch.scientific_config_digest for batch in modified.batches] == [batch.scientific_config_digest for batch in campaign.batches]
     commit = "a" * 40
+    batch_name = generation.config.build_batch_name(
+        campaign.profile.id,
+        "lentil",
+        "natural",
+    )
     storage = tmp_path / "storage"
     storage.mkdir()
     monkeypatch.setattr(generation.campaign_runtime, "_repository_commit", lambda: commit)
@@ -326,7 +427,7 @@ def test_cli_allows_only_execution_overrides(
             "plan-campaign",
             str(config_path),
             "--only-batch",
-            "transient_drying__lentil__natural",
+            batch_name,
             "--wall-time",
             "01:30:00",
             "--git-commit",
@@ -349,7 +450,7 @@ def test_cli_allows_only_execution_overrides(
     output = json.loads(capsys.readouterr().out)
     assert output["state"] == "planned"
     assert output["filesystem_mutated"] is False
-    assert "--only-batch transient_drying__lentil__natural" in output["submission_command"][-1]
+    assert f"--only-batch {batch_name}" in output["submission_command"][-1]
     assert "--time=01:30:00" in output["submission_command"]
     assert not Path(output["paths"]["run_root"]).exists()
     with pytest.raises(SystemExit) as error:
@@ -366,7 +467,7 @@ def test_cancel_then_resume_submits_only_incomplete_validated_membership(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.config.load_campaign_config(config_path)
     total_cases = sum(len(batch.case_indices) for batch in campaign.batches)
-    plan = generation.cluster.build_resource_plan(
+    plan = cluster.build_resource_plan(
         max_nodes=2,
         cases_per_node=2,
         cores_per_case=4,
@@ -411,7 +512,7 @@ def test_cancel_then_resume_submits_only_incomplete_validated_membership(
         storage_root=storage,
     )
     assert receipt["attempts"][-1]["command"] == ["scancel", "11111"]
-    cancelled = generation.campaign_runtime.load_campaign_run(
+    cancelled = campaign_evidence.load_campaign_run(
         manifest["campaign_run_id"],
         storage_root=storage,
     )
@@ -452,7 +553,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     run_id = "synthetic_transfer__0123456789abcdef"
     source_storage = tmp_path / "source storage"
     destination = tmp_path / "destination storage"
-    staging = generation.workspace.create_transfer_staging(
+    staging = workspace.create_transfer_staging(
         storage_root=source_storage,
         run_id=run_id,
     )

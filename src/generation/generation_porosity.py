@@ -25,10 +25,6 @@ from typing import TYPE_CHECKING, Any, Final
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-_LOWER_TAIL_OUTER_OFFSET: Final = 0.40
-_LOWER_TAIL_INNER_OFFSET: Final = 0.15
-_UPPER_TAIL_INNER_OFFSET: Final = 0.15
-_UPPER_TAIL_OUTER_OFFSET: Final = 0.40
 _BISECTION_ITERATIONS: Final = 96
 ANCHOR_PARAMETER_NAME: Final = "porosity.kc_anchor_factor"
 
@@ -171,6 +167,8 @@ def resolve_anchor_factor_support(
     packing_porosity_mean_support: Mapping[str, Any],
     eps_min_global: float,
     eps_max_global: float,
+    ood_gap_fraction: float,
+    ood_width_fraction: float,
 ) -> dict[str, Any]:
     """
     Resolve the conditional natural factor interval and feasible OOD tails.
@@ -178,6 +176,31 @@ def resolve_anchor_factor_support(
     The interval is conditioned on the sampled mean permeability and the active
     density-calibration reference. OOD tails are exact relative log-space
     extensions of that interval and are never independently authored values.
+
+    Parameters
+    ----------
+    sampled_kappa_mean : float
+        Case-level mean permeability.
+    material_kappa_nominal : float
+        Material-calibration nominal permeability.
+    eps_bed_cal_ref : float
+        Material density-calibration porosity.
+    packing_porosity_mean_support : Mapping[str, Any]
+        Material-natural lower and upper mean-porosity bounds.
+    eps_min_global : float
+        Open global lower porosity guard.
+    eps_max_global : float
+        Open global upper porosity guard.
+    ood_gap_fraction : float
+        Required transformed gap as a fraction of natural-support width.
+    ood_width_fraction : float
+        Required transformed tail width as a fraction of natural-support width.
+
+    Returns
+    -------
+    dict[str, Any]
+        Resolved natural support, feasible OOD tails, and physical evidence.
+
     """
     permeability = _finite(sampled_kappa_mean, label="Sampled mean permeability")
     if permeability <= 0.0:
@@ -199,16 +222,22 @@ def resolve_anchor_factor_support(
     lower_log = math.log(id_lower)
     upper_log = math.log(id_upper)
     width = upper_log - lower_log
+    gap_fraction = _finite(ood_gap_fraction, label="OOD transformed gap fraction")
+    width_fraction = _finite(ood_width_fraction, label="OOD transformed width fraction")
+    if gap_fraction <= 0.0 or width_fraction <= 0.0:
+        message = "OOD transformed gap and width fractions must be strictly positive."
+        raise ValueError(message)
+    outer_fraction = gap_fraction + width_fraction
     candidate_logs = (
         (
             "lower",
-            lower_log - _LOWER_TAIL_OUTER_OFFSET * width,
-            lower_log - _LOWER_TAIL_INNER_OFFSET * width,
+            lower_log - outer_fraction * width,
+            lower_log - gap_fraction * width,
         ),
         (
             "upper",
-            upper_log + _UPPER_TAIL_INNER_OFFSET * width,
-            upper_log + _UPPER_TAIL_OUTER_OFFSET * width,
+            upper_log + gap_fraction * width,
+            upper_log + outer_fraction * width,
         ),
     )
     available: list[dict[str, Any]] = []

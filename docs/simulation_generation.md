@@ -3,8 +3,9 @@
 ## Quick start
 
 Run local commands from `/workspace/repo` in the development container. The
-workflow connects to the native CPU/COMSOL host `sricehpc01`; it publishes
-validated results into the local `STORAGE_ROOT`.
+workflow connects to the native CPU/COMSOL host declared by the resolved
+execution configuration; it publishes validated results into the local
+`STORAGE_ROOT`.
 
 > Configured scientific values are modelling and sampling decisions. A citation
 > does not imply that every final number appears verbatim in its source. The
@@ -20,13 +21,18 @@ export STORAGE_ROOT=/workspace/storage
 STEADY_CAMPAIGN=configs/generation/campaigns/steady_flow/family_generalization.yaml
 TRANSIENT_CAMPAIGN=configs/generation/campaigns/transient_drying/family_generalization.yaml
 PILOT_CAMPAIGN=configs/generation/campaigns/transient_drying/pilot_check.yaml
+CPU_HOST="$(
+  python -m src.generation.cli.cli_generation validate-config \
+    "$STEADY_CAMPAIGN" --allow-incomplete | \
+    python -c 'import json,sys; print(json.load(sys.stdin)["execution_resources"]["site"]["cpu_host"])'
+)"
 ```
 
 1. Preview CPU setup, then perform it explicitly:
 
 ```bash
-./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01
-./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01 --execute
+./scripts/generation_workflow.sh setup-cpu --cpu-host "$CPU_HOST"
+./scripts/generation_workflow.sh setup-cpu --cpu-host "$CPU_HOST" --execute
 ```
 
 The first command is read-only. The second creates the remote checkout,
@@ -41,26 +47,26 @@ python -m src.generation.cli.cli_generation validate-config \
   "$TRANSIENT_CAMPAIGN" --allow-incomplete
 ```
 
-The resolved output includes campaign purpose, roles, regimes, counts, seeds,
-batches, packages, template, execution resources, and exact readiness gates.
+The resolved output includes purpose and profile, material inventory and roles,
+counts and their derived total, memberships, authored and derived seed plans,
+package requests and resolved package inventory, eligible parameter-OOD units and
+allocations, purpose-specific pilot or smoke scope, bounded static-sentinel work,
+execution resources, and exact readiness gates.
 
 3. Preview the resolved Slurm plan after every primary gate is filled:
 
 ```bash
-./scripts/generation_workflow.sh plan "$STEADY_CAMPAIGN" \
-  --max-nodes 1 --cases-per-node 2 --cores-per-case 16 \
-  --max-parallel-cases 2
+./scripts/generation_workflow.sh plan "$STEADY_CAMPAIGN"
 ```
 
 `plan` is read-only but intentionally fails while production values or mappings
-remain unresolved.
+remain unresolved. Re-run `validate-config` after any configuration edit; its
+resolved JSON is the review surface for the exact work that `plan` will use.
 
 4. Run the canonical paired technical runtime smoke:
 
 ```bash
-./scripts/generation_workflow.sh smoke \
-  --max-nodes 1 --cases-per-node 2 --cores-per-case 16 \
-  --max-parallel-cases 2 --keep-cpu-source
+./scripts/generation_workflow.sh smoke --keep-cpu-source
 ```
 
 If mappings are unconfirmed, this command first runs retained mapping probes
@@ -93,26 +99,22 @@ GENERATION_RUN_ID='<campaign_run_id>'
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
 ```
 
-8. After readiness is complete, run one whole six-family production campaign:
+8. After readiness is complete, run one complete resolved production campaign:
 
 ```bash
-./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN" \
-  --max-nodes 1 --cases-per-node 2 --cores-per-case 16 \
-  --max-parallel-cases 2
+./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN"
 
-./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN" \
-  --max-nodes 1 --cases-per-node 2 --cores-per-case 16 \
-  --max-parallel-cases 2
+./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"
 ```
 
-Resource values shown here are explicit examples, not hidden production
-defaults. Review them and the resolved plan for the intended run. The generic
-`--only-batch <profile>__<family>__<natural|parameter_ood>` selector can run a
-predeclared subset; there is no material-specific Sunflower path. The standard
-`all` command includes the extreme-family group. An explicit
-`--skip-extreme-family-ood` flag may omit only that group for one execution;
-it does not modify the canonical six-family campaign or material inventory and
-cannot be combined with `--only-batch`.
+Execution config owns the default resources. Optional resource flags are explicit
+one-run overrides; review any override in the resolved plan. The generic
+`--only-batch <resolved-batch-name>` selector can run a predeclared subset.
+`all` otherwise uses exactly the batches displayed by
+`validate-config`. When the resolved campaign declares an extreme-family group,
+`--skip-extreme-family-ood` can omit that group for one execution without
+changing the campaign configuration; it cannot be combined with
+`--only-batch`.
 
 9. Inspect local and remote status:
 
@@ -135,135 +137,76 @@ cannot be combined with `--only-batch`.
 All setup, plan, launch, smoke, resume, and cleanup operations bind an exact
 Git commit. Launching operations require a clean worktree.
 
-## Configuration map
+## Configuration ownership and inspection
 
-```text
-configs/
-|-- generation/
-|   |-- common.yaml
-|   |-- sources.yaml
-|   |-- registry.yaml
-|   |-- operations/fixed_bed.yaml
-|   |-- materials/
-|   |   |-- lentil.yaml
-|   |   |-- chickpea.yaml
-|   |   |-- kidney_bean.yaml
-|   |   |-- field_pea.yaml
-|   |   |-- rapeseed.yaml
-|   |   `-- sunflower_seed.yaml
-|   |-- profiles/{steady_flow,transient_drying}.yaml
-|   |-- campaigns/steady_flow/
-|   |   |-- family_generalization.yaml
-|   |   `-- technical_smoke.yaml
-|   |-- campaigns/transient_drying/
-|   |   |-- family_generalization.yaml
-|   |   |-- technical_smoke.yaml
-|   |   `-- pilot_check.yaml
-|   `-- execution/cluster_cpu.yaml
-`-- learning/steady_flow/
-```
+Configuration files author decisions; Python resolution validates and combines
+them. Do not copy resolved values into scripts, notebooks, or documentation.
+The owners are:
 
-| Config | Controls | User normally edits | Must not contain |
-| --- | --- | --- | --- |
-| `generation/sources.yaml` | Central supplied bibliographic records keyed once | Only when supplied source records change | Parameter values, inferred source assignments, roles, execution |
-| `generation/registry.yaml` | Canonical names, units, kinds, transforms, blocks, OOD groups, components, derivations | Only when the parameter contract changes | Material ranges, campaign counts, mappings, cluster resources |
-| `generation/common.yaml` | Grid, time, shared fixed physics, formulas, adapter/storage contracts | Shared scientific design changes | Material values, roles, counts, learning choices |
-| `generation/operations/fixed_bed.yaml` | Pressure-field and inlet/ambient schedule ranges, operation OOD supports and constraints | Reviewed apparatus/operation evidence | Material values, template mappings, Slurm resources |
-| `generation/materials/<family>.yaml` | Role-neutral material scope, natural values/supports, coupled records, targets, evidence | Reviewed family evidence | Campaign role, membership, count, profile, execution |
-| `generation/profiles/<profile>.yaml` | Template identity, adapters, exports, explicit COMSOL mappings, profile conditioning | Reviewed COMSOL mapping/audit results | Material values, counts, roles, cluster plans |
-| `generation/campaigns/<profile>/<campaign>.yaml` | Purpose, profile references, material roles, sampling method/counts/seeds, package declarations | Campaign counts, seeds, memberships | Parameter ranges, package material lists, execution defaults |
-| `generation/execution/cluster_cpu.yaml` | Site, module/executable names, runtime limits, Slurm allocation values, purpose-specific retention | Explicit execution resources | Scientific ranges, material roles, learning parameters |
-| `learning/<task>/<kind>/<config>.yaml` | Dataset IDs, model, optimization, training, evaluation and artifacts | Learning experiments | Generation paths, material ranges, campaign membership |
-
-Every semantic decision has one authored owner. Campaign material lists,
-evaluation-regime lists, package materials, eligibility, names, IDs, module
-commands, and purpose-specific retention are derived and persisted in resolved
-provenance. Validation errors identify the exact file, key, rule, actual value,
-and owner to edit.
-
-## Campaign and package semantics
-
-The primary `steady_flow` and `transient_drying` campaigns both declare:
-
-| Material role | Families | Sampling |
+| Owner | Controls | Excludes |
 | --- | --- | --- |
-| `seen` | `lentil`, `chickpea`, `kidney_bean` | Natural plus parameter OOD |
-| `near_family_ood` | `field_pea` | Natural only |
-| `far_family_ood` | `rapeseed` | Natural only |
-| `extreme_family_ood` | `sunflower_seed` | Natural only |
+| `configs/generation/sources.yaml` | Supplied bibliographic records keyed once | Parameter values, inferred assignments, roles, execution |
+| `configs/generation/registry.yaml` | Canonical decision identity, parameter names, units, kinds, transforms, sampling order, OOD groups, components, derivations | Material supports, campaign counts, mappings, cluster resources |
+| `configs/generation/common.yaml` | Grid, time, shared fixed physics, formulas, adapter and storage contracts | Material values, roles, counts, learning choices |
+| `configs/generation/operations/<operation>.yaml` | Operation supports and constraints | Material values, template mappings, execution resources |
+| `configs/generation/materials/<family>.yaml` | Role-neutral material scope, natural supports, coupled records, targets, evidence | Campaign role, membership, count, profile, execution |
+| `configs/generation/profiles/<profile>.yaml` | Template identity, adapters, exports, explicit native mappings, profile conditioning | Material values, counts, roles, cluster plans |
+| `configs/generation/campaigns/<profile>/<campaign>.yaml` | Purpose, layer references, material roles, sampling counts and seeds, memberships, package requests | Parameter ranges, derived package materials, execution defaults |
+| `configs/generation/execution/<site>.yaml` | Site, modules, executables, runtime limits, scheduler resources, purpose-specific retention | Scientific ranges, material roles, learning parameters |
+| `configs/learning/<task>/<kind>/<config>.yaml` | Dataset IDs, model, optimization, training, evaluation, artifacts | Generation paths, material ranges, campaign membership |
 
-Their canonical evaluation regimes are exactly:
+Inspect the effective campaign rather than maintaining a parallel summary:
 
-```text
-id
-parameter_ood
-near_family_ood
-far_family_ood
-extreme_family_ood
+```bash
+python -m src.generation.cli.cli_generation validate-config \
+  "$TRANSIENT_CAMPAIGN" --allow-incomplete
 ```
 
-`extreme_family_ood` is only an evaluation category. It creates no model,
-training regime, operator channel, equation, sampling coordinate, or COMSOL
-profile. Sunflower has no training, validation, ID-test, or parameter-OOD
-membership.
+The JSON has four useful layers:
 
-A concise campaign declaration maps package regimes to source roles:
+- `material_inventory`, `material_roles`, `case_counts`, `membership`, and
+  `material_memberships` show source-case scope and split eligibility.
+- `seed_plan` shows the campaign, membership, paired-equivalence, batch, and
+  sampling-block seeds; case seeds remain deterministically derived from batch
+  seed and case identity.
+- `dataset_package_requests` preserves the campaign intent, while
+  `dataset_package_inventory` shows every profile-expanded immutable package.
+- `parameter_ood`, `pilot_plan`, `technical_smoke_plan`,
+  `static_sentinel_workload`, and `execution_resources` show the applicable
+  derived workload and runtime plan.
 
-```yaml
-campaign_purpose: family_generalization
-material_roles:
-  seen: [lentil, chickpea, kidney_bean]
-  near_family_ood: [field_pea]
-  far_family_ood: [rapeseed]
-  extreme_family_ood: [sunflower_seed]
-dataset_packages:
-  - {evaluation_regime: id, source_role: seen}
-  - {evaluation_regime: parameter_ood, source_role: seen}
-  - {evaluation_regime: near_family_ood, source_role: near_family_ood}
-  - {evaluation_regime: far_family_ood, source_role: far_family_ood}
-  - {evaluation_regime: extreme_family_ood, source_role: extreme_family_ood}
-```
+Validation errors identify the exact file, key, rule, actual value, and owner to
+edit. Resolved identities, allocation evidence, and the effective scientific
+configuration persist with generated artifacts.
 
-The steady primary campaign resolves five immutable packages. The transient
-primary campaign resolves ten: five `steady_flow` views and five
-`transient_drying` views. Each near, far, and extreme package is separate. ID
-membership is assigned once per physical case before transient temporal
-expansion.
+## Resolved campaign and package semantics
 
-The technical campaigns use `campaign_purpose: technical_runtime_smoke`,
-profile seeds `9910` (steady) and `9920` (transient), paired-equivalence seed
-`9930`, two Lentil natural cases, and ID packages marked non-training.
-Technical membership is operational metadata, not an evaluation regime, and
-the dataset factory rejects it unless a caller explicitly enables technical
-smoke inspection.
+Campaign YAML owns role assignment, sampling counts and seed namespaces,
+learning membership, and package requests. Resolution derives material and
+evaluation inventories, batch names and identities, source-case totals, package
+materials, split eligibility, and profile-expanded package names. A pilot
+campaign resolves no normal dataset packages; a technical runtime smoke keeps
+its operational membership distinct from learning membership.
 
-The final primary plans are:
+Parameter-OOD planning derives profile-applicable units from the projected
+registry and the material's actual tails or alternate atomic records. Each case
+activates one unit. The deterministic allocation covers every eligible unit
+when capacity permits and distributes remaining cases evenly. The exact unit
+inventory, group, per-unit counts, and per-case allocation appear under
+`parameter_ood` and persist in resolved scientific provenance. A profile cannot
+select a unit that its registry projection excludes.
 
-| Profile | Seen natural | Parameter OOD | Near | Far | Extreme | Total | Campaign seed | Membership seed |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `steady_flow` | 720 (240/family) | 240 (80/family) | 80 | 80 | 80 | 1,200 | 9100 | 9150 |
-| `transient_drying` | 360 (120/family) | 180 (60/family) | 40 | 40 | 40 | 660 | 9200 | 9250 |
-
-Steady Seen membership is 192 train, 24 validation, and 24 ID-test cases per
-family (576/72/72 total). Transient Seen membership is 96/12/12 per family
-(288/36/36 total). Together the campaigns contain 1,860 profile-specific
-source cases.
-
-Parameter-OOD planning derives profile-applicable units from the resolved
-registry and actual tails or alternate atomic records. Each case activates one
-unit; the deterministic round-robin covers every eligible unit where possible
-and keeps allocation counts within one. Exact eligible units, case allocation,
-and counts persist in resolved scientific provenance. No top-level group quota
-is hard-coded, and steady planning cannot select transient-only units. The
-Seen-material `porosity.kc_anchor_factor` remains one eligible `bed` unit; its
-natural support and synthetic OOD tails are resolved conditionally in log space
-after `kappa_mean` and any active density-calibration record are known.
+Static sentinels are deliberately independent of production counts. The
+`static_sentinel_workload` view reports their bounded natural-material and
+eligible-OOD coverage before the sentinels run. This keeps scientific checks
+complete when campaign counts or material inventories change without turning
+production configuration into a golden fixture.
 
 ## CPU/GPU path and lifecycle
 
 ```text
-native CPU / sricehpc01
-  exact commit + COMSOL 6.4 + Slurm
+configured native CPU / COMSOL host
+  exact commit + configured COMSOL module + scheduler
   -> isolated case workspaces
   -> validated terminal campaign
   -> retained source evidence
@@ -295,16 +238,19 @@ manual review.
 ## Smoke versus production
 
 Static sentinels start no COMSOL process and mutate no production state. They
-exercise all six families, all four sampling blocks, all four parameter-OOD
-groups, coupled records, fields, schedules, and deterministic replay.
+exercise every material, active sampling block, and eligible parameter-OOD unit
+reported by `static_sentinel_workload`, plus coupled records, fields, schedules,
+and deterministic replay.
 
 The fake runtime uses a test-owned executable. It proves Python case isolation,
 HDF5 conversion/publication, package construction, factory guards, and
 DataLoader behavior; it is not COMSOL evidence.
 
-The real technical smoke is the native COMSOL gate. It requires:
+The real technical smoke is the native COMSOL gate. Inspect each technical
+campaign with `validate-config` to review its exact cases, paired seed, package
+inventory, and retained-evidence policy. The gate requires:
 
-- two distinct steady cases and two distinct transient cases;
+- every distinct case declared by both resolved technical campaigns;
 - case-local file reload and scalar handoff;
 - validated raw exports and canonical HDF5;
 - paired shared inputs across the two profiles;
@@ -320,27 +266,38 @@ Python runtime setter; their configured record is bound to the canonical
 hashed template and model-report evidence, while case-adapter reload still
 requires native runtime evidence.
 
-## Canonical transient pilot check
+## Configured transient pilot check
 
-Run the normal all-in-one diagnostic pilot from the GPU/development host:
+Inspect the pilot owner before launch:
+
+```bash
+python -m src.generation.cli.cli_generation validate-config \
+  configs/generation/campaigns/transient_drying/pilot_check.yaml \
+  --allow-incomplete
+```
+
+`pilot_plan` reports the resolved material inventory, cases per material, total,
+campaign seed, case semantics, and the absence of learning membership and normal
+package publication. Those values come from the pilot campaign, so changing a
+valid pilot configuration changes inspection, planning, and execution together.
+
+Run the all-in-one diagnostic from the GPU/development host:
 
 ```bash
 ./scripts/generation_workflow.sh pilot-check \
   configs/generation/campaigns/transient_drying/pilot_check.yaml
 ```
 
-The dedicated config is the single human-authored pilot owner. It uses
-`campaign_purpose: pilot_check`, seed namespace `9940`, and plans 18 transient
-cases: one `nominal_reference` followed by two deterministic
-`natural_pilot` cases for each of the six families.
-It uses no parameter OOD, family-OOD sampling, corner construction, training
-membership, or automatic calibration. The same generic analysis checks runtime
-and conversion contracts, nominal drying duration, natural-support robustness,
-physical bounds, water balances without an invented tolerance, run-wide
-extrema, heterogeneity, schedules, supplied validity metadata, and measured
-storage for every family.
+The configured first-case and remaining-case semantics are resolved into every
+batch assignment. The pilot uses natural support only and performs no parameter
+OOD, family-OOD sampling, training membership, or automatic calibration. Its
+generic analysis checks runtime and conversion contracts, drying duration,
+natural-support robustness, physical bounds, water balances without an invented
+tolerance, run-wide extrema, heterogeneity, schedules, supplied validity
+metadata, and measured storage for every resolved material.
 
-Fast nominal-only form:
+A smaller diagnostic can override the resolved cases-per-material value for that
+execution without editing campaign YAML:
 
 ```bash
 ./scripts/generation_workflow.sh pilot-check \
@@ -356,22 +313,24 @@ Retained-source debugging form:
   --keep-cpu-source
 ```
 
-The normal lifecycle performs host preflight, exact commit/config/template
-binding, CPU readiness, a mapping probe when required, deterministic planning,
-Slurm execution and monitoring, terminal collection, hash validation, HDF5
-conversion, runtime/physical/mass-balance/extrema/trend analysis, pre-cleanup
-CPU and staging measurement, permanent GPU measurement, and a 660-case
-projection labelled `observed_real_pilot_based_estimate`. One canonical
+The lifecycle performs host preflight, exact commit/config/template binding, CPU
+readiness, a mapping probe when required, deterministic planning, scheduler
+execution and monitoring, terminal collection, hash validation, HDF5 conversion,
+runtime/physical/mass-balance/extrema/trend analysis, pre-cleanup CPU and staging
+measurement, permanent GPU measurement, and a storage projection against the
+separately resolved production campaign. It labels that projection
+`observed_real_pilot_based_estimate`; no production case total is embedded in
+the analysis. One canonical
 `01_generation/meta/pilot_checks/<pilot_check_id>/pilot_check.json` owns the
 results; `summary.csv` and `summary.md` are derived from it.
 
-After retained evidence validates, the normal command performs authorised
+After retained evidence validates, the normal command performs authorized
 CPU-source and transfer-staging cleanup and verifies deletion. It never deletes
 active, incomplete, hash-invalid, or insufficiently retained evidence.
 `--keep-cpu-source` is the explicit CPU-source opt-out; staging is still cleaned
-after validation. There is no storage-budget pass/fail guard. Until the current
-static scientific guard and native mappings pass, the command stops before
-launching COMSOL.
+after validation. There is no storage-budget pass/fail guard. The command stops
+before native execution whenever the current readiness report has an unresolved
+gate.
 
 ## Readiness gates
 
@@ -383,26 +342,15 @@ python -m src.generation.cli.cli_generation readiness-report \
   --run-static-sentinels
 ```
 
-The exact status vocabulary is:
-
-```text
-STATIC_SCIENTIFIC_INTEGRATION_COMPLETE
-CONFIG_OWNERSHIP_CONSOLIDATION_COMPLETE
-DOCUMENTATION_CONSOLIDATION_COMPLETE
-STATIC_GENERATOR_SENTINELS_COMPLETE | STATIC_GENERATOR_SENTINELS_PENDING | STATIC_GENERATOR_SENTINELS_BLOCKED
-REAL_RUNTIME_VALIDATION_COMPLETE | REAL_RUNTIME_VALIDATION_PENDING
-PRIMARY_PRODUCTION_CONFIG_COMPLETE | PRIMARY_PRODUCTION_CONFIG_INCOMPLETE
-PRODUCTION_READY_FOR_USER_LAUNCH | PRODUCTION_READY_FOR_USER_LAUNCH_BLOCKED
-```
-
-Launch is ready only when explicit production counts/seeds/memberships,
-the static scientific guards, reviewed mappings, both native profile reloads,
-scalar handoff, paired equivalence observations, HDF5/package/loader
-validation, and a current real-smoke receipt all pass. At present, the
-corrected static porosity and parameter-effect sentinels pass, but unconfirmed
-native mappings and missing current real-smoke and pilot receipts still block
-launch. A template hash
-proves byte identity only; it does not prove model-tree behavior.
+The report owns its status vocabulary and includes one structured record for
+each configuration, static-science, mapping, native-runtime, and launch gate.
+Treat its current JSON as authoritative; do not infer readiness from a template
+hash, a historical receipt, or documentation text. Launch is ready only when
+the resolved production configuration, static scientific checks, reviewed
+mappings, native profile reloads, scalar handoff, paired-equivalence
+observations, HDF5/package/loader validation, and a source-current real-smoke
+receipt all pass. A template hash proves byte identity only; it does not prove
+model-tree behavior.
 
 ## Troubleshooting
 

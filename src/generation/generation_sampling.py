@@ -24,7 +24,7 @@ import hashlib
 import math
 import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue] -- SciPy typing omits the public export
@@ -35,16 +35,47 @@ from src import common
 
 from . import generation_materials as materials
 from . import generation_registry as registry_service
+from . import generation_seeding as seeding
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from .generation_config import GenerationConfig
 
 LHS_MAXIMIN_CANDIDATES = 50
 SOBOL_SKIP = 1000
 SOBOL_LEAP = 200
 _NEAREST_NEIGHBOR_COUNT = 2
+
+
+class _SamplingConfig(Protocol):
+    """Describe the resolved batch surface consumed by case sampling."""
+
+    @property
+    def scientific_values(self) -> dict[str, Any]:
+        """Return the resolved scientific configuration."""
+        ...
+
+    @property
+    def case_indices(self) -> tuple[int, ...]:
+        """Return batch case indices in canonical order."""
+        ...
+
+    @property
+    def seed_base(self) -> int | None:
+        """Return the resolved batch seed when sampling is executable."""
+        ...
+
+    @property
+    def batch_name(self) -> str:
+        """Return the human-readable batch name."""
+        ...
+
+    def case_id(self, case_index: int) -> str:
+        """Return the canonical case identifier for one batch member."""
+        ...
+
+    def case_assignment(self, case_index: int) -> dict[str, Any]:
+        """Return one isolated resolved case assignment."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,13 +88,6 @@ class CaseSample:
     block_provenance: dict[str, dict[str, Any]]
     conditional_supports: dict[str, dict[str, Any]]
     ood_provenance: dict[str, Any]
-
-
-def _seed(seed_base: int, *labels: str) -> int:
-    """Delegate semantic seed derivation to the scientific configuration owner."""
-    from .generation_config import derive_seed  # noqa: PLC0415 -- breaks the config/sampling import cycle
-
-    return derive_seed(seed_base, *labels)
 
 
 def _lhs_design(*, count: int, dimensions: int, seed: int) -> np.ndarray:
@@ -138,10 +162,15 @@ def build_sampling_plan(
     seed_base: int,
     method: str,
     blocks: tuple[str, ...],
+    block_parameters: Mapping[str, tuple[str, ...]],
     block_seed_bases: Mapping[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build serializable designs for only the profile-active blocks."""
-    dimensions = materials.sampling_block_dimensions(registry, blocks=blocks)
+    dimensions = materials.sampling_block_dimensions(
+        registry,
+        blocks=blocks,
+        block_parameters=block_parameters,
+    )
     overrides = {} if block_seed_bases is None else dict(block_seed_bases)
     unknown_overrides = sorted(set(overrides).difference(blocks))
     if unknown_overrides:
@@ -149,13 +178,13 @@ def build_sampling_plan(
         raise ValueError(message)
     plan: dict[str, dict[str, Any]] = {}
     for block in blocks:
-        parameters = materials.SAMPLING_BLOCKS[block]
+        parameters = block_parameters[block]
         dimension = dimensions[block]
         paired = block in overrides
         block_seed_base = overrides.get(block, seed_base)
         namespace = "paired_equivalence_block" if paired else "sampling_block"
-        design_seed = _seed(block_seed_base, namespace, block, "design")
-        permutation_seed = _seed(
+        design_seed = seeding.derive_seed(block_seed_base, namespace, block, "design")
+        permutation_seed = seeding.derive_seed(
             block_seed_base,
             namespace,
             block,
@@ -225,7 +254,7 @@ def _selected_interval(
     if not intervals:
         msg = f"Selected scalar OOD unit {name!r} has no configured tails."
         raise ValueError(msg)
-    index = _seed(seed_base, "scalar_ood_tail", name, str(case_index)) % len(intervals)
+    index = seeding.derive_seed(seed_base, "scalar_ood_tail", name, str(case_index)) % len(intervals)
     bounds = intervals[index]
     transform = str(entry.get("transform", "linear"))
     id_lower = registry_service.transformed_coordinate(float(entry["lower"]), entry)
@@ -440,7 +469,7 @@ def _select_coupled(
     if not candidates:
         msg = f"Selected coupled unit {name!r} has no {'OOD' if use_ood else 'ID'} records."
         raise ValueError(msg)
-    rng = np.random.default_rng(_seed(seed_base, "coupled_selection", name, str(case_index), "ood" if use_ood else "id"))
+    rng = np.random.default_rng(seeding.derive_seed(seed_base, "coupled_selection", name, str(case_index), "ood" if use_ood else "id"))
     return copy.deepcopy(candidates[int(rng.integers(0, len(candidates)))])
 
 
@@ -558,7 +587,7 @@ def _non_numerical_values(
             if not choices:
                 msg = f"Categorical parameter {name!r} has no selectable values."
                 raise ValueError(msg)
-            rng = np.random.default_rng(_seed(seed_base, "categorical_selection", name, str(case_index)))
+            rng = np.random.default_rng(seeding.derive_seed(seed_base, "categorical_selection", name, str(case_index)))
             values[name] = copy.deepcopy(choices[int(rng.integers(0, len(choices)))])
         elif kind == "parameter_set":
             record = _select_coupled(name, entry, seed_base=seed_base, case_index=case_index, use_ood=name in selected_ood)
@@ -576,6 +605,7 @@ def _block_values(
     block: str,
     row: np.ndarray,
     *,
+    parameters: tuple[str, ...],
     selected_ood: frozenset[str],
     seed_base: int,
     case_index: int,
@@ -590,7 +620,7 @@ def _block_values(
     ood_details: dict[str, dict[str, Any]] = {}
     conditional_coordinates: dict[str, float] = {}
     column = 0
-    for name in materials.SAMPLING_BLOCKS[block]:
+    for name in parameters:
         entry = registry[name]
         dimension = registry_service.effective_dimension(entry)
         coordinates = row[column : column + dimension]
@@ -618,12 +648,12 @@ def _block_values(
             ood_index = None
             if name in selected_ood:
                 count = len(entry.get("ood_values", []))
-                ood_index = 0 if count == 0 else _seed(seed_base, "simplex_ood", name, str(case_index)) % count
+                ood_index = 0 if count == 0 else seeding.derive_seed(seed_base, "simplex_ood", name, str(case_index)) % count
             simplex_values, transform_space_distance = _simplex_value(
                 entry,
                 coordinates,
                 ood_index=ood_index,
-                seed=_seed(seed_base, "truncated_dirichlet", name, str(case_index)),
+                seed=seeding.derive_seed(seed_base, "truncated_dirichlet", name, str(case_index)),
             )
             values[name] = simplex_values
             if ood_index is not None:
@@ -639,6 +669,7 @@ def _block_values(
     expected = materials.sampling_block_dimensions(
         registry,
         blocks=(block,),
+        block_parameters={block: parameters},
     )[block]
     if column != expected:
         msg = f"Sampling block {block!r} consumed {column} coordinates; expected {expected}."
@@ -761,7 +792,7 @@ def _apply_conditional_values(
             if not tails:
                 message = f"Selected conditional OOD unit {name!r} has no physically feasible tail."
                 raise ValueError(message)
-            index = _seed(seed_base, "conditional_ood_tail", name, str(case_index)) % len(tails)
+            index = seeding.derive_seed(seed_base, "conditional_ood_tail", name, str(case_index)) % len(tails)
             selected_tail = tails[index]
             bounds = selected_tail
         coordinate = float(coordinates[name])
@@ -860,7 +891,7 @@ def _apply_coupled_ood_records(
         if not records:
             msg = f"Selected coupled OOD unit {name!r} has no records."
             raise ValueError(msg)
-        index = _seed(seed_base, "coupled_ood_record", name, str(case_index)) % len(records)
+        index = seeding.derive_seed(seed_base, "coupled_ood_record", name, str(case_index)) % len(records)
         record = records[index]
         components = tuple(contract["components"])
         before = {component: copy.deepcopy(values[component]) for component in components}
@@ -983,7 +1014,7 @@ def _explicit_nominal_values(
     return values, coupled_selections
 
 
-def _sample_nominal_case(config: GenerationConfig, case_index: int) -> CaseSample:
+def _sample_nominal_case(config: _SamplingConfig, case_index: int) -> CaseSample:
     """Return one fail-closed explicit configured nominal with no seed search."""
     registry = config.scientific_values["material"]["parameter_registry"]
     values, coupled_selections = _explicit_nominal_values(registry)
@@ -1025,7 +1056,7 @@ def _sample_nominal_case(config: GenerationConfig, case_index: int) -> CaseSampl
     )
 
 
-def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
+def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
     """Resolve one deterministic case from profile-active block designs."""
     config.case_id(case_index)
     assignment = config.case_assignment(case_index)
@@ -1073,7 +1104,8 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         if _array_sha256(design) != plan["design_sha256"]:
             message = f"Sampling design digest changed for block {block!r}."
             raise RuntimeError(message)
-        numerical_block_parameters = {name for name in materials.SAMPLING_BLOCKS[block] if registry_service.effective_dimension(registry[name]) > 0}
+        parameters = tuple(str(name) for name in plan["parameters"])
+        numerical_block_parameters = {name for name in parameters if registry_service.effective_dimension(registry[name]) > 0}
         overlap = set(values).intersection(numerical_block_parameters)
         if overlap:
             message = f"Block {block!r} conflicts with coupled or fixed values {sorted(overlap)}."
@@ -1082,6 +1114,7 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
             registry,
             block,
             design[row_index],
+            parameters=parameters,
             selected_ood=selected,
             seed_base=config.seed_base,
             case_index=case_index,
@@ -1181,11 +1214,11 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
     )
 
 
-def sample_all_cases(config: GenerationConfig) -> dict[int, CaseSample]:
+def sample_all_cases(config: _SamplingConfig) -> dict[int, CaseSample]:
     """Return all configured samples in canonical case-index order."""
     return {case_index: sample_case(config, case_index) for case_index in config.case_indices}
 
 
-def sampling_plan_sha256(config: GenerationConfig) -> str:
+def sampling_plan_sha256(config: _SamplingConfig) -> str:
     """Return the deterministic identity of all persisted block plans."""
     return common.serialization.canonical_json_sha256(config.scientific_values["sampling"]["blocks"])

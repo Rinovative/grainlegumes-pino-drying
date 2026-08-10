@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from src import common
+from src import common, generation
 
 RUNTIME_COMPARISON_FILENAME = "runtime_comparison.json"
 SIMULATION_TIMING_SCHEMA_KIND = "simulation_batch_timing"
@@ -270,7 +270,7 @@ def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
     ):
         msg = "Simulation batch timing has an invalid schema."
         raise ValueError(msg)
-    if payload.get("simulation_profile") not in {"steady_flow", "transient_drying"}:
+    if payload.get("simulation_profile") not in generation.contracts.available_profile_ids():
         msg = "Simulation batch timing has an unsupported simulation_profile."
         raise ValueError(msg)
     _require_text(payload.get("batch_id"), label="simulation batch_id")
@@ -548,7 +548,7 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         if set(comparison) != {"status", "simulation_profile", "batch_id", "batch_manifest_sha256"}:
             msg = "Available comparison descriptor has invalid fields."
             raise ValueError(msg)
-        if comparison.get("simulation_profile") not in {"steady_flow", "transient_drying"}:
+        if comparison.get("simulation_profile") not in generation.contracts.available_profile_ids():
             msg = "Available comparison simulation_profile is unsupported."
             raise ValueError(msg)
         _require_text(comparison.get("batch_id"), label="comparison.batch_id")

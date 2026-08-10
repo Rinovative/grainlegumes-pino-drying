@@ -10,6 +10,16 @@ from typing import Any
 import pytest
 
 from src import common, generation
+from src.generation import generation_workspace as workspace
+
+
+def _steady_natural_batch_name() -> str:
+    """Return the canonical synthetic steady natural-batch selector."""
+    return generation.config.build_batch_name(
+        "steady_flow",
+        "lentil",
+        "natural",
+    )
 
 
 def test_default_storage_is_the_canonical_repository_sibling(
@@ -22,7 +32,7 @@ def test_default_storage_is_the_canonical_repository_sibling(
     monkeypatch.setenv("PROJECT_ROOT", str(repository))
     monkeypatch.delenv("STORAGE_ROOT", raising=False)
 
-    resolved = generation.workspace.resolve_storage_root(None, create=True)
+    resolved = workspace.resolve_storage_root(None, create=True)
 
     assert resolved == (tmp_path / "storage").resolve()
     assert resolved.is_dir()
@@ -40,7 +50,7 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_steady_natural_batch_name(),
     )
     storage = tmp_path / "storage root"
     work = tmp_path / "scratch root with spaces"
@@ -68,7 +78,7 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
         assert (prepared.work_directory / "model.mph").is_file()
         assert not (prepared.work_directory / "scalars.csv").exists()
         assert not (prepared.work_directory / "schedule.csv").exists()
-        generation.workspace.cleanup_case_workspace(
+        workspace.cleanup_case_workspace(
             prepared.work_directory,
             allowed_root=prepared.work_root,
             storage_root=storage.resolve(),
@@ -89,7 +99,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_steady_natural_batch_name(),
     )
     storage = (tmp_path / "storage").resolve()
     work = (tmp_path / "work").resolve()
@@ -112,7 +122,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     )
     for target in protected:
         with pytest.raises((ValueError, FileNotFoundError)):
-            generation.workspace.cleanup_case_workspace(
+            workspace.cleanup_case_workspace(
                 target,
                 allowed_root=work,
                 storage_root=storage,
@@ -123,7 +133,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     missing_marker = work / "missing-marker"
     missing_marker.mkdir()
     with pytest.raises(ValueError, match="marker"):
-        generation.workspace.cleanup_case_workspace(
+        workspace.cleanup_case_workspace(
             missing_marker,
             allowed_root=work,
             storage_root=storage,
@@ -138,7 +148,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="marker identity"):
-        generation.workspace.cleanup_case_workspace(
+        workspace.cleanup_case_workspace(
             prepared.work_directory,
             allowed_root=work,
             storage_root=storage,
@@ -152,19 +162,19 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        generation.workspace,
+        workspace,
         "_slurm_job_is_active",
         lambda _job_id: True,
     )
     with pytest.raises(RuntimeError, match="remains active"):
-        generation.workspace.cleanup_case_workspace(
+        workspace.cleanup_case_workspace(
             prepared.work_directory,
             allowed_root=work,
             storage_root=storage,
             expected_run_id=prepared.workspace_run_id,
             expected_case_id=prepared.bundle.case_id,
         )
-    generation.workspace.cleanup_case_workspace(
+    workspace.cleanup_case_workspace(
         prepared.work_directory,
         allowed_root=work,
         storage_root=storage,
@@ -185,7 +195,7 @@ def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_steady_natural_batch_name(),
     )
     storage = tmp_path / "storage"
     observed: dict[str, Path] = {}

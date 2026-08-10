@@ -1,10 +1,6 @@
 schema_kind: generation_material
 schema_version: 1
 material_family: sunflower_seed
-decision_source:
-  artifact: VP2_Parameter_Decisions.yaml
-  schema_version: 1.1.0
-  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 material_scope:
   common_name: Sunflower seed
   species: Helianthus annuus L.
@@ -62,7 +58,6 @@ density_calibration:
   reference:
     rho_bu_dry_ref: 377.4
     eps_bed_cal_ref: 0.5306
-    inferred_rho_particle_dry: 804.005113
   rho_bu_dry_ref_support:
     lower: 330.0
     upper: 410.0
@@ -208,10 +203,9 @@ initial_moisture:
         material_scope_ref: material_scope
         product_form: Cleaned whole mature high-oleic sunflower achene
         moisture_basis: kg water/kg dry solids
-  field_constraint: min(X_0_db_field) >= 0.07382979 kg/kg
+  margin_above_target_db: 0.01
 target_moisture:
   selected_simulation_target_wb: 0.06
-  selected_target_db: 0.06382978723404255
   market_acceptance_moisture_wb: 0.06
   safe_storage_moisture_wb: 0.06
   provenance:

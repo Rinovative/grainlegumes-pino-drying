@@ -405,35 +405,26 @@ def _aggregate_diagonal_permeability(case: cases.EvaluationCase) -> np.ndarray:
     return np.mean(np.stack(diagonals), axis=0)
 
 
-def _normalize_error_mode(error_mode: str) -> str:
-    """Normalize the two historical labels and direct-call semantic aliases."""
-    aliases = {"MAE": "MAE", "absolute": "MAE", "Relative [%]": "Relative [%]", "local_relative": "Relative [%]"}
-    try:
-        return aliases[error_mode]
-    except KeyError as error:
+def _require_error_mode(error_mode: str) -> str:
+    """Require one current error-presentation mode."""
+    if error_mode not in {"MAE", "Relative [%]"}:
         msg = "error_mode must be 'MAE' or 'Relative [%]'."
-        raise ValueError(msg) from error
+        raise ValueError(msg)
+    return error_mode
 
 
-def _normalize_scale_mode(scale_mode: str) -> str:
-    """Normalize the two historical prediction/reference scale labels."""
-    aliases = {
-        "Independent": "Independent",
-        "independent": "Independent",
-        "Shared (GT)": "Shared (GT)",
-        "shared": "Shared (GT)",
-    }
-    try:
-        return aliases[scale_mode]
-    except KeyError as error:
+def _require_scale_mode(scale_mode: str) -> str:
+    """Require one current prediction/reference scale mode."""
+    if scale_mode not in {"Independent", "Shared (GT)"}:
         msg = "scale_mode must be 'Independent' or 'Shared (GT)'."
-        raise ValueError(msg) from error
+        raise ValueError(msg)
+    return scale_mode
 
 
 def _error_values(reference: np.ndarray, prediction: np.ndarray, *, error_mode: str) -> tuple[np.ndarray, str]:
     """Return MAE or current field-RMS-relative percentage evidence."""
     absolute = np.abs(prediction - reference)
-    if _normalize_error_mode(error_mode) == "MAE":
+    if _require_error_mode(error_mode) == "MAE":
         return absolute, "MAE"
     denominator = float(np.sqrt(np.mean(reference**2))) + _RELATIVE_DENOMINATOR_FLOOR
     return absolute / denominator * 100.0, "relative error [% of reference RMS]"
@@ -469,8 +460,8 @@ def _plot_prediction_overview(
     if len(fields) != _REQUIRED_DISPLAY_FIELDS:
         msg = "The restored overview requires four supported display fields."
         raise dataframe.ComparisonCompatibilityError(msg)
-    scale = _normalize_scale_mode(scale_mode)
-    error = _normalize_error_mode(error_mode)
+    scale = _require_scale_mode(scale_mode)
+    error = _require_error_mode(error_mode)
     _x, _y, x_grid, y_grid = presentation.display_grid(case)
     figure, axes = layout.map_subplots(rows=4, columns=4)
     permeability = _aggregate_diagonal_permeability(case)
@@ -720,7 +711,7 @@ def plot_pressure_velocity_comparison(
     )
     row_labels = ("GT", first_label, second_label)
     row_cases = (first_case, first_case, second_case)
-    scale = _normalize_scale_mode(scale_mode)
+    scale = _require_scale_mode(scale_mode)
     _x, _y, x_grid, y_grid = presentation.display_grid(first_case)
     figure, axes = layout.map_subplots(rows=3, columns=2)
     for row, row_label in enumerate(row_labels):

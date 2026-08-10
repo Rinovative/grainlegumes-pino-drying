@@ -9,9 +9,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from src import generation
+
 _COMMIT = "a" * 40
 _RUN_ID = "steady_flow_family_generalization__0123456789abcdef"
-_BATCH_NAME = "steady_flow__lentil__natural"
+_BATCH_NAME = generation.config.build_batch_name(
+    "steady_flow",
+    "synthetic_material",
+    "natural",
+)
 _AUTHORIZATION_SHA = "1" * 64
 _TRANSFER_SHA = "2" * 64
 _DATASET_SHA = "3" * 64
@@ -137,12 +143,24 @@ cp -a -- "${source}" "${destination}/${relative}"
 set -euo pipefail
 printf 'local-python-start\n' >> "${FAKE_COMMAND_LOG}"
 for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
+if [[ " $* " == *' list-campaigns '* ]]; then
+  printf '%s\n' '{}'
+  exit 0
+fi
 if [[ " $* " == *' -c '* ]]; then
   cat >/dev/null
-  if [[ " $* " == *'counts = tuple'* ]]; then
-    printf 'pilot\tpilot_check\t3\t18\n'
+  if [[ " $* " == *'workflow = value'* ]]; then
+    printf 'workflow\t%s\t%s\t%s\t%s\tfixture.cluster\tslurm\tfixture\t48\t'\
+'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' \
+      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/steady_flow/technical_smoke.yaml" \
+      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/transient_drying/technical_smoke.yaml" \
+      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/steady_flow/family_generalization.yaml" \
+      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/transient_drying/family_generalization.yaml"
+  elif [[ " $* " == *'counts = tuple'* ]]; then
+    printf 'pilot\tpilot_check\t4\t20\n'
   elif [[ " $* " == *'execution_resources'* ]]; then
-    printf 'resources\t1\t2\t16\t2\t-\t32\n'
+    printf 'execution\tfamily_generalization\t3\t4\t6\t7\t-\t48\tfixture.cluster\tslurm\tfixture\t'\
+'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n'
   elif [[ " $* " == *'campaign_purpose'* ]]; then
     printf 'campaign\tfamily_generalization\t\n'
   fi
@@ -217,6 +235,7 @@ fi
             "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             "FAKE_COMMAND_LOG": str(log),
             "FAKE_GIT_COMMIT": _COMMIT,
+            "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
             "FAKE_RUN_ID": _RUN_ID,
             "FAKE_TRANSFER_PLAN": "",
@@ -301,7 +320,10 @@ def _pilot_campaign(workflow: Path) -> Path:
 def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
     """Create one complete fake terminal transfer tree and TSV plan."""
     campaign_directory = f"01_generation/meta/campaigns/{_RUN_ID}"
-    batch_id = f"{_BATCH_NAME}__fedcba9876543210"
+    batch_id = generation.config.build_batch_id(
+        _BATCH_NAME,
+        "fedcba9876543210" + "0" * 48,
+    )
     meta_directory = f"01_generation/meta/batches/{batch_id}"
     raw_directory = f"01_generation/raw/{batch_id}"
     processed_directory = f"01_generation/processed/{batch_id}"
@@ -334,8 +356,8 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert dry_run.returncode == 0, dry_run.stderr
     assert "Mode: dry-run" in dry_run.stdout
     assert "Dry run: no remote files or jobs were created." in dry_run.stdout
-    assert "Python/3.10" in dry_run.stdout
-    assert "Comsol/v6.4" in dry_run.stdout
+    assert "Python/fixture-3.12" in dry_run.stdout
+    assert "Comsol/fixture-9.9" in dry_run.stdout
     assert not storage.exists()
 
     execute = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
@@ -343,8 +365,9 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     log_text = log.read_text(encoding="utf-8")
     assert "<BatchMode=yes>" in log_text
     assert "checkout --detach" in log_text
-    assert "module load Python/3.10" in log_text
-    assert "module load Comsol/v6.4" in log_text
+    assert " Python/fixture-3.12 Comsol/fixture-9.9 " in log_text
+    assert 'module load "${python_module}"' in log_text
+    assert 'module load "${comsol_module}"' in log_text
 
     unsafe = _run(workflow, ["setup-cpu", "--cpu-host", "bad;host"], environment)
     assert unsafe.returncode == 2
@@ -357,6 +380,21 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     plan = _run(workflow, ["plan", str(_campaign(workflow)), *_remote_options(), *_resource_options()], environment)
     assert plan.returncode == 0, plan.stderr
     assert '"filesystem_mutated":false' in plan.stdout
+
+    configured = _run(
+        workflow,
+        [
+            "plan",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            "--only-batch",
+            "future.profile::batch",
+        ],
+        environment,
+    )
+    assert configured.returncode == 0, configured.stderr
+    configured_log = log.read_text(encoding="utf-8")
+    assert " 3 4 6 7 future.profile::batch " in configured_log
 
     whole_campaign_resources = _resource_options()
     del whole_campaign_resources[-4:-2]
@@ -372,7 +410,7 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
         environment,
     )
     assert skipped.returncode == 0, skipped.stderr
-    assert " true>\n" in log.read_text(encoding="utf-8")
+    assert " plan-campaign '' true Python/fixture-3.12" in log.read_text(encoding="utf-8")
     incompatible = _run(
         workflow,
         [
@@ -412,7 +450,7 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
             "--max-nodes",
             "1",
             "--cases-per-node",
-            "5",
+            "7",
             "--cores-per-case",
             "8",
             "--max-parallel-cases",
@@ -421,7 +459,7 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
         environment,
     )
     assert rejected.returncode == 2
-    assert "exceeds 32" in rejected.stderr
+    assert "exceeds 48" in rejected.stderr
 
 
 def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: Path) -> None:
@@ -433,7 +471,7 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
         environment,
     )
     assert normal.returncode != 2
-    assert "Pilot cases: 6 materials x 3 = 18 total." in normal.stdout
+    assert "Pilot cases: 5 materials x 4 = 20 total." in normal.stdout
 
     fast_root = tmp_path / "fast"
     fast_root.mkdir()
@@ -450,7 +488,7 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
         fast_environment,
     )
     assert fast.returncode != 2
-    assert "Pilot cases: 6 materials x 1 = 6 total." in fast.stdout
+    assert "Pilot cases: 5 materials x 1 = 5 total." in fast.stdout
     help_result = _run(workflow, ["--help"], environment)
     assert "pilot-check CAMPAIGN [--cases-per-material N]" in help_result.stderr
     assert "duration-check" not in help_result.stderr

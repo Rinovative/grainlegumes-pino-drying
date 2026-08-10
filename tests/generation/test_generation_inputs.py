@@ -4,144 +4,93 @@
 from __future__ import annotations
 
 import copy
-import csv
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import yaml
 
 from src import common, datasets, domain, generation
-from src.datasets import dataset_transient_contract as transient_contract
+from src.datasets import dataset_package_planning as package_planning
+from src.generation import generation_fields as fields
+from src.generation import generation_inventory as inventory
+from src.generation import generation_materials as materials
+from src.generation import generation_sampling as sampling
+from src.generation import generation_schedule as schedule_service
+from src.generation import generation_seeding as seeding
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
-def test_production_templates_are_role_neutral_fail_closed_campaigns() -> None:
-    """Protect six role-neutral materials and fail-closed campaign launch gates."""
-    primary_paths = (
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+def test_semantic_seed_derivation_is_version_bound() -> None:
+    """Protect persisted random-substream identity across internal ownership changes."""
+    assert (
+        seeding.derive_seed(
+            12345,
+            "generation_batch",
+            "profile_a",
+            "material_a",
+            "regime_a",
+            "evaluation_a",
+        )
+        == 2107745129
     )
-    technical_paths = (
-        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"),
-        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"),
-    )
-    expected_roles = {
-        "seen": ("lentil", "chickpea", "kidney_bean"),
-        "near_family_ood": ("field_pea",),
-        "far_family_ood": ("rapeseed",),
-        "extreme_family_ood": ("sunflower_seed",),
-    }
-    campaign_keys = {
-        "schema_kind",
-        "schema_version",
-        "campaign_purpose",
-        "sources_config",
-        "registry_config",
-        "common_config",
-        "operations_config",
-        "profile_config",
-        "execution_config",
-        "material_roles",
-        "sampling",
-        "membership",
-        "dataset_packages",
-    }
-    expected_case_counts = {"steady_flow": 1200, "transient_drying": 660}
-    for path in primary_paths:
-        authored = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert set(authored) == campaign_keys
-        assert all(
-            set(package)
-            <= {
-                "evaluation_regime",
-                "source_role",
-                "membership_seed",
-                "membership_counts_per_material",
-            }
-            for package in authored["dataset_packages"]
-        )
-        campaign = generation.config.load_campaign_config(path, require_executable=False)
-        assert campaign.profile.id == path.parent.name
-        assert campaign.material_roles == expected_roles
-        assert len(campaign.batches) == 9
-        assert sum(len(batch.case_indices) for batch in campaign.batches) == expected_case_counts[path.parent.name]
-        extreme_case_count = sum(len(batch.case_indices) for batch in campaign.batches if batch.evaluation_regime == "extreme_family_ood")
-        reduced = campaign.without_extreme_family_ood()
-        assert reduced.material_roles == campaign.material_roles
-        assert reduced.total_case_count == campaign.total_case_count - extreme_case_count
-        assert all(batch.evaluation_regime != "extreme_family_ood" for batch in reduced.batches)
-        assert all(package["evaluation_regime"] != "extreme_family_ood" for package in reduced.dataset_packages)
-        assert [
-            package["evaluation_regime"]
-            for package in campaign.dataset_packages
-            if package["dataset_view"] == campaign.profile.available_learning_views[-1]
-        ] == ["id", "parameter_ood", "near_family_ood", "far_family_ood", "extreme_family_ood"]
-        assert all(
-            export["mapping_state"] in {"declared_unverified", "mapping_probe_required"}
-            for export in campaign.batches[0].scientific_values["output_contract"]["exports"]
-        )
-        with pytest.raises(generation.config.GenerationConfigError, match="unconfirmed required export mappings"):
-            generation.config.load_campaign_config(path)
-    for path in technical_paths:
-        campaign = generation.config.load_campaign_config(path, require_executable=False)
-        assert campaign.campaign_purpose == "technical_runtime_smoke"
-        assert len(campaign.batches) == 1
-        assert len(campaign.batches[0].case_indices) == 2
-        assert all(package["evaluation_regime"] == "id" for package in campaign.dataset_packages)
-        assert all("membership" not in package for package in campaign.dataset_packages)
-        assert all(
-            package["split_eligibility"] == {"train": False, "validation": False, "id_test": False, "parameter_ood": False}
-            for package in campaign.dataset_packages
-        )
-        with pytest.raises(generation.config.GenerationConfigError, match="unconfirmed required export mappings"):
-            generation.config.load_campaign_config(path)
 
-    expected_keys = {
-        "schema_kind",
-        "schema_version",
-        "material_family",
-        "decision_source",
-        "material_scope",
-        "permeability",
-        "packing_porosity_mean_support",
-        "density_calibration",
-        "thermal_properties",
-        "initial_moisture",
-        "target_moisture",
-        "oswin",
-        "two_compartment_kinetics",
+
+def test_generation_public_facade_is_explicit_and_narrow() -> None:
+    """Protect stable services without exposing implementation module layout."""
+    expected = {
+        "campaign_runtime",
+        "case",
+        "config",
+        "contracts",
+        "pilot",
+        "readiness",
+        "runtime",
+        "sentinels",
+        "smoke",
+        "storage",
+        "workflow",
     }
-    material_paths = tuple(sorted(Path("configs/generation/materials").glob("*.yaml")))
-    assert tuple(path.stem for path in material_paths) == tuple(sorted(generation.materials.MATERIAL_FAMILIES))
-    for path in material_paths:
-        material = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert set(material) == expected_keys
-        assert material["material_family"] == path.stem
-        assert material["decision_source"]["sha256"] == generation.materials.VP2_DECISION_SHA256
-        assert not ({"role", "count", "sampling_regime", "dataset_membership"} & set(material))
-        assert set(material["material_scope"]) == {
-            "common_name",
-            "species",
-            "market_class",
-            "product_form",
-            "coat_or_hull_state",
-            "description",
-        }
-        assert all(
-            "provenance" in material[record]
-            for record in (
-                "permeability",
-                "packing_porosity_mean_support",
-                "density_calibration",
-                "target_moisture",
-                "oswin",
-                "two_compartment_kinetics",
-            )
-        )
-    sunflower = yaml.safe_load(Path("configs/generation/materials/sunflower_seed.yaml").read_text(encoding="utf-8"))
-    assert sunflower["material_scope"]["product_form"] == "whole_achene"
-    assert sunflower["material_scope"]["coat_or_hull_state"] == "hull_intact"
+    assert set(generation.__all__) == expected
+    assert all(getattr(generation, name) is not None for name in expected)
+    assert not hasattr(generation, "materials")
+    assert not hasattr(generation, "profiles")
+    assert not hasattr(generation, "workspace")
+
+
+def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
+    """Record current config-derived outputs without making them validator rules."""
+    expected = {
+        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"): (1200, 28),
+        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"): (660, 54),
+        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"): (2, 28),
+        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"): (2, 54),
+        Path("configs/generation/campaigns/transient_drying/pilot_check.yaml"): (18, 54),
+    }
+    for path, (case_count, dimension) in expected.items():
+        campaign = generation.config.load_campaign_config(path, require_executable=False)
+        assert campaign.total_case_count == case_count
+        assert sum(campaign.batches[0].scientific_values["sampling"]["block_dimensions"].values()) == dimension
+        inventory_names = tuple(family for role in generation.contracts.material_roles() for family in campaign.material_roles[role])
+        assert len(inventory_names) == len(set(inventory_names))
+        assert set(inventory_names) <= set(generation.contracts.available_material_families())
+    pilot_path = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
+    fast = generation.config.load_campaign_config(
+        pilot_path,
+        require_executable=False,
+        pilot_cases_per_material=1,
+    )
+    assert fast.total_case_count == 6
+
+    for path in tuple(expected)[:4]:
+        with pytest.raises(
+            generation.config.GenerationConfigError,
+            match="unconfirmed required export mappings",
+        ):
+            generation.config.load_campaign_config(path)
 
 
 def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None:
@@ -161,10 +110,11 @@ def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None
             assert set(counts) == {unit["unit_id"] for unit in eligible}
             assert min(counts.values()) >= 1
             assert max(counts.values()) - min(counts.values()) <= 1
-            assert {unit["ood_group"] for unit in eligible} == set(generation.materials.active_ood_groups(campaign.profile.id))
+            registry = batch.scientific_values["material"]["parameter_registry"]
+            assert {unit["ood_group"] for unit in eligible} == set(materials.active_ood_groups(registry, campaign.profile.id))
             for case_index in (batch.case_indices[0], batch.case_indices[-1]):
                 assignment = batch.case_assignment(case_index)
-                sample = generation.sampling.sample_case(batch, case_index)
+                sample = sampling.sample_case(batch, case_index)
                 assert sample.ood_provenance["active_unit_id"] == assignment["ood_unit_id"]
                 assert sample.ood_provenance["active_ood_group"] == assignment["ood_group"]
                 assert sample.ood_provenance["units_per_case"] == 1
@@ -198,220 +148,254 @@ def test_generation_and_hdf5_versions_are_integer_one(
         generation.config.load_campaign_config(config_path)
 
 
-def test_final_names_dimensions_inventory_and_profile_pairing(
-    generation_config_factory: Any,
+def _temporary_family_campaign(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any], Path, dict[str, Any]]:
+    """Copy one layered campaign while retaining repository scientific owners."""
+    directory = tmp_path / name
+    directory.mkdir()
+    source = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
+    campaign = yaml.safe_load(source.read_text(encoding="utf-8"))
+    reference_keys = (
+        "sources_config",
+        "registry_config",
+        "operations_config",
+        "profile_config",
+    )
+    for key in reference_keys:
+        campaign[key] = str(Path(campaign[key]).resolve())
+
+    common_path = directory / "common.yaml"
+    common = yaml.safe_load(Path(campaign["common_config"]).read_text(encoding="utf-8"))
+    campaign["common_config"] = str(common_path)
+
+    execution_path = directory / "execution.yaml"
+    execution = yaml.safe_load(Path(campaign["execution_config"]).read_text(encoding="utf-8"))
+    campaign["execution_config"] = str(execution_path)
+
+    campaign_path = directory / "campaign.yaml"
+    return campaign_path, campaign, common_path, common, execution_path, execution
+
+
+def _write_yaml(path: Path, value: dict[str, Any]) -> None:
+    """Write one deterministic temporary YAML fixture."""
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+
+def test_valid_config_edits_are_resolved_without_source_synchronization(
+    tmp_path: Path,
 ) -> None:
-    """Protect canonical names, complete ownership, dimensions, and paired inputs."""
-    config_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-    with monkeypatch.context() as production_environment:
-        production_environment.setenv("PROJECT_ROOT", str(Path.cwd()))
-        campaign = generation.config.load_campaign_config(config_path, require_executable=False)
-    expected_batches = [f"transient_drying__{material_family}__natural" for material_family in generation.materials.MATERIAL_FAMILIES] + [
-        f"transient_drying__{material_family}__parameter_ood" for material_family in generation.materials.MATERIAL_FAMILIES[:3]
-    ]
-    assert [batch.batch_name for batch in campaign.batches] == expected_batches
-    regimes = ("id", "parameter_ood", "near_family_ood", "far_family_ood", "extreme_family_ood")
-    package_materials = {
-        "id": "lentil+chickpea+kidney_bean",
-        "parameter_ood": "lentil+chickpea+kidney_bean",
-        "near_family_ood": "field_pea",
-        "far_family_ood": "rapeseed",
-        "extreme_family_ood": "sunflower_seed",
+    """Prove counts, seeds, roles, packages, science, and resources are config-owned."""
+    campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(tmp_path, "editable")
+    campaign["sampling"]["seed_base"] = 12345
+    campaign["membership"] = {
+        "seed": 12346,
+        "per_seen_material": {
+            "train": 190,
+            "validation": 25,
+            "id_test": 25,
+        },
     }
-    expected_packages = [
-        f"{dataset_view}__{package_materials[regime]}__{regime}" for dataset_view in ("steady_flow", "transient_drying") for regime in regimes
-    ]
-    assert [package["dataset_name"] for package in campaign.dataset_packages] == expected_packages
-    assert regimes == datasets.views.PACKAGE_REGIMES
-    assert campaign.material_memberships["extreme_family_ood"] == ("sunflower_seed",)
-    assert all(
-        "sunflower_seed" not in campaign.material_memberships[membership] for membership in ("train", "validation", "id_test", "parameter_ood")
-    )
-    steady_membership = campaign.dataset_packages[0]["membership"]
-    transient_membership = campaign.dataset_packages[5]["membership"]
-    assert steady_membership == transient_membership
-    assert {
-        "seed": steady_membership["seed"],
-        "per_seen_material": steady_membership["per_seen_material"],
-    } == campaign.membership
-    assert steady_membership["totals"] == {"train": 288, "validation": 36, "id_test": 36}
-    reports = generation.inventory.audit_campaign(campaign)
-    for report in reports.values():
-        assert report.sampled_dimensions_by_block == {
-            "airflow": 28,
-            "initial_moisture": 8,
-            "operation": 12,
-            "material_properties": 6,
-        }
-        assert report.total_effective_dimension == 54
-        assert report.configured_but_unused == ()
-        assert report.consumed_but_undeclared == ()
+    for material_family in campaign["sampling"]["counts"]["natural"]:
+        campaign["sampling"]["counts"]["natural"][material_family] = 241 if material_family in campaign["material_roles"]["seen"] else 81
+    for material_family in campaign["sampling"]["counts"]["parameter_ood"]:
+        campaign["sampling"]["counts"]["parameter_ood"][material_family] = 81
 
-    registry = campaign.batches[0].scientific_values["material"]["parameter_registry"]
-    expected_airflow_parameters = (
-        "kappa_mean",
-        "kappa_cv",
-        "bed.structure.coarse_len_rel",
-        "bed.structure.fine_len_rel",
-        "bed.structure.coarse_weight",
-        "bed.structure.cross_scale_corr",
-        "bed.structure.fine_ani_x",
-        "bed.structure.fine_ani_y",
-        "bed.perturbations.amplitude",
-        "bed.perturbations.granularity",
-        "bed.perturbations.sign_bias",
-        "permeability.anisotropy.max_ratio",
-        "permeability.anisotropy.exponent",
-        "permeability.anisotropy.strength",
-        "permeability.orientation.jitter",
-        "permeability.orientation.smooth_len_rel",
-        "porosity.kc_anchor_factor",
-        "porosity.smooth_len_rel",
-        "porosity.texture_amp",
-        "pressure_bc.mean",
-        "pressure_bc.sin_amp",
-        "pressure_bc.sin_freq",
-        "pressure_bc.sin_phase",
-        "pressure_bc.gauss_count",
-        "pressure_bc.gauss_amp",
-        "pressure_bc.gauss_width",
-        "pressure_bc.gauss_jitter",
-        "pressure_bc.linear_amp",
-    )
-    expected_schedule_controls = (
-        "schedule.corr",
-        "schedule.timescale_rel",
-        "schedule.component_weights",
-        "schedule.event_count",
-        "schedule.event_duration_rel",
-        "schedule.event_width_rel",
-    )
-    assert expected_airflow_parameters == generation.materials.AIRFLOW_PARAMETERS
-    assert tuple(name for name in generation.materials.OPERATION_PARAMETERS if name.startswith("schedule.")) == expected_schedule_controls
-    assert set(generation.materials.SAMPLING_BLOCKS) == {
-        "airflow",
-        "initial_moisture",
-        "operation",
-        "material_properties",
-    }
+    original_seen = campaign["material_roles"]["seen"][1]
+    replacement_seen = campaign["material_roles"]["near_family_ood"][0]
+    campaign["material_roles"]["seen"][1] = replacement_seen
+    campaign["material_roles"]["near_family_ood"][0] = original_seen
+    parameter_counts = campaign["sampling"]["counts"]["parameter_ood"]
+    parameter_counts[replacement_seen] = parameter_counts.pop(original_seen)
+    natural_counts = campaign["sampling"]["counts"]["natural"]
+    natural_counts[replacement_seen] = 241
+    natural_counts[original_seen] = 81
+    campaign["dataset_packages"] = [package for package in campaign["dataset_packages"] if package["evaluation_regime"] != "extreme_family_ood"]
 
-    final_names = {
-        "kappa_mean",
-        "kappa_cv",
-        "bed.structure.coarse_len_rel",
-        "bed.structure.fine_len_rel",
-        "bed.structure.coarse_weight",
-        "bed.structure.fine_weight",
-        "bed.structure.cross_scale_corr",
-        "bed.structure.fine_ani_x",
-        "bed.structure.fine_ani_y",
-        "bed.perturbations.amplitude",
-        "bed.perturbations.granularity",
-        "bed.perturbations.sign_bias",
-        "initial_moisture.mean_db",
-        "initial_moisture.amplitude_db",
-        "initial_moisture.structure.coarse_len_rel",
-        "initial_moisture.structure.fine_len_rel",
-        "initial_moisture.structure.coarse_weight",
-        "initial_moisture.structure.fine_weight",
-        "initial_moisture.structure.cross_scale_corr",
-        "initial_moisture.structure.fine_ani_x",
-        "initial_moisture.structure.fine_ani_y",
-    }
-    assert final_names.issubset(registry)
-    assert registry["kappa_mean"]["unit"] == "m^2"
-    assert registry["kappa_cv"]["unit"] == "1"
-    assert registry["bed.structure.fine_weight"]["sources"] == ["bed.structure.coarse_weight"]
-    assert registry["initial_moisture.structure.fine_weight"]["sources"] == ["initial_moisture.structure.coarse_weight"]
-    raw_registry = yaml.safe_load(Path("configs/generation/registry.yaml").read_text(encoding="utf-8"))
-    _definitions, metadata = generation.materials.validate_semantic_registry(raw_registry)
-    symbols = {name: entry["report_symbol"] for name, entry in metadata.items()}
-    assert len(set(symbols.values())) == len(symbols)
-    assert {
-        name: symbols[name]
-        for name in (
-            "bed.structure.cross_scale_corr",
-            "initial_moisture.structure.cross_scale_corr",
-            "schedule.corr",
-        )
-    } == {
-        "bed.structure.cross_scale_corr": r"\rho_b",
-        "initial_moisture.structure.cross_scale_corr": r"\rho_X",
-        "schedule.corr": r"\rho_{T,\omega}",
-    }
-
-    canonical_scientific_names = (
-        set(registry)
-        | set(generation.profiles.STEADY_SPATIAL_INPUT_FIELDS)
-        | set(generation.profiles.TRANSIENT_SPATIAL_INPUT_FIELDS)
-        | set(generation.profiles.STATIONARY_FIXED_FIELDS)
-        | set(generation.profiles.TRANSIENT_SCALAR_INPUT_FIELDS)
-        | set(generation.profiles.SCHEDULE_FIELDS)
-        | set(generation.profiles.STEADY_STATIC_FIELD_NAMES)
-        | set(generation.profiles.TRANSIENT_STATIC_FIELD_NAMES)
-        | set(generation.profiles.TRANSIENT_FIELD_NAMES)
-        | set(generation.profiles.GLOBAL_FIELD_NAMES)
-        | set(generation.profiles.FINAL_STATUS_FIELDS)
-    )
-    assert not {name for name in canonical_scientific_names if name.endswith(("_K", "_Pa", "_m", "_h"))}
-    common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
-    assert common["physical_formulas"]["w_gr"] == "f_surf*w_surf + (1-f_surf)*w_int"
-    assert common["physical_formulas"]["f_wet_dm"] == ("integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)")
-    assert common["scientific_fixed_values"]["T_flow_ref"]["value"] == 300.65
-    assert common["scientific_fixed_values"]["f_wet_dm_max"]["value"] == 0.05
-    assert {"f_wet_dm", "m_w_gr", "m_v_gas", "m_dot_evap", "m_dot_v_in", "m_dot_v_out"}.issubset(generation.profiles.GLOBAL_FIELD_NAMES)
-    assert "f_wet_dm_final" in generation.profiles.FINAL_STATUS_FIELDS
-
-    steady_path, _ = generation_config_factory(simulation_profile="steady_flow")
-    transient_path, _ = generation_config_factory(simulation_profile="transient_drying")
-    steady = generation.config.load_generation_config(steady_path, only_batch="steady_flow__lentil__natural")
-    transient = generation.config.load_generation_config(
-        transient_path,
-        only_batch="transient_drying__lentil__natural",
-    )
-    assert steady.case_input_config_digest != transient.case_input_config_digest
-    assert steady.scientific_config_digest != transient.scientific_config_digest
-    steady_bundle = generation.case.generate_case_input_bundle(steady, 1, tmp_path / "steady")
-    transient_bundle = generation.case.generate_case_input_bundle(transient, 1, tmp_path / "transient")
-    assert steady_bundle.case_input_id != transient_bundle.case_input_id
-    assert steady_bundle.simulation_case_id != transient_bundle.simulation_case_id
-    assert {path.name for path in steady_bundle.input_paths} == {"fields.csv"}
-    assert {path.name for path in transient_bundle.input_paths} == {"fields.csv", "scalars.csv", "schedule.csv"}
-    assert transient_bundle.case_payload["schedule_diagnostics"]["generator_kind"] == "compositional_mixed"
-    assert transient_bundle.case_payload["schedule_diagnostics"]["generator_version"] == 1
-    assert not (steady_bundle.directory / "scalars.csv").exists()
-    assert not (steady_bundle.directory / "schedule.csv").exists()
-    assert "scalar_handoff" not in steady_bundle.case_payload
-    assert "scalars" not in steady_bundle.case_payload
-    assert steady_bundle.case_payload["stationary_fixed_values"] == [
+    common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0, "Lz": 0.4})
+    common["time"].update({"start": 0.0, "stop": 4.0, "interval": 0.5})
+    common["scientific_fixed_values"]["T_flow_ref"]["value"] = 301.15
+    common["scientific_fixed_values"]["p_ref"]["value"] = 100000.0
+    common["storage"].update(
         {
-            "name": name,
-            "value": generation.profiles.STATIONARY_FIXED_VALUES[name],
-            "unit": unit,
-            "owner": "package_fixed",
-            "runtime_source": "canonical_template",
+            "compression_level": 6,
+            "chunk_time": 3,
+            "chunk_y": 5,
+            "chunk_x": 7,
         }
-        for name, unit in zip(
-            generation.profiles.STATIONARY_FIXED_FIELDS,
-            generation.profiles.STATIONARY_FIXED_UNITS,
-            strict=True,
+    )
+
+    execution["runtime"].update(
+        {
+            "timeout_seconds": 4200,
+            "maximum_failures": 3,
+        }
+    )
+    execution["cluster"].update(
+        {
+            "max_nodes": 2,
+            "cases_per_node": 1,
+            "cores_per_case": 8,
+            "max_parallel_cases": 2,
+        }
+    )
+    execution["site"].update(
+        {
+            "cpu_host": "synthetic-host",
+            "cores_per_node": 16,
+            "python_module": "Python/test",
+            "comsol_module": "Comsol/test",
+        }
+    )
+    _write_yaml(common_path, common)
+    _write_yaml(execution_path, execution)
+    _write_yaml(campaign_path, campaign)
+
+    resolved = generation.config.load_campaign_config(
+        campaign_path,
+        require_executable=False,
+    )
+    expected_total = sum(count for regime_counts in campaign["sampling"]["counts"].values() for count in regime_counts.values())
+    assert resolved.total_case_count == expected_total
+    assert resolved.membership == campaign["membership"]
+    assert resolved.batches[0].scientific_values["campaign_seed"] == 12345
+    assert resolved.material_roles["seen"][1] == replacement_seen
+    expected_evaluation_regimes = tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in campaign["dataset_packages"]))
+    assert resolved.evaluation_regimes == expected_evaluation_regimes
+    assert (
+        resolved.require_batch(
+            material_family=replacement_seen,
+            sampling_regime="parameter_ood",
+        ).material_family
+        == replacement_seen
+    )
+    assert (
+        resolved.find_batch(
+            material_family=original_seen,
+            sampling_regime="parameter_ood",
         )
-    ]
-    with (steady_bundle.directory / "fields.csv").open(encoding="utf-8", newline="") as stream:
-        steady_fields = list(csv.reader(stream, delimiter=";"))
-    with (transient_bundle.directory / "fields.csv").open(encoding="utf-8", newline="") as stream:
-        transient_fields = list(csv.reader(stream, delimiter=";"))
-    assert tuple(steady_fields[0]) == generation.profiles.STEADY_SPATIAL_INPUT_FIELDS
-    assert tuple(transient_fields[0]) == generation.profiles.TRANSIENT_SPATIAL_INPUT_FIELDS
-    assert [row[:7] for row in transient_fields[1:]] == steady_fields[1:]
-    with (transient_bundle.directory / "scalars.csv").open(
-        encoding="utf-8",
-        newline="",
-    ) as stream:
-        transient_scalars = list(csv.DictReader(stream, delimiter=";"))
-    assert tuple(row["name"] for row in transient_scalars) == generation.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+        is None
+    )
+    scientific = resolved.batches[0].scientific_values
+    assert scientific["grid"]["dx"] == pytest.approx(0.1)
+    assert scientific["grid"]["dy"] == pytest.approx(0.1)
+    assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(9)]
+    assert scientific["scientific_fixed_values"]["T_flow_ref"] == 301.15
+    assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
+    assert scientific["storage"]["compression_level"] == 6
+    assert resolved.execution_values["runtime"]["timeout_seconds"] == 4200.0
+    assert resolved.execution_values["runtime"]["maximum_failures"] == 3
+    assert resolved.execution_values["cluster"]["max_parallel_cases"] == 2
+    assert resolved.execution_values["site"]["cpu_host"] == "synthetic-host"
+
+
+def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
+    tmp_path: Path,
+) -> None:
+    """Bind explicit registry coordinate order through each scientific batch identity."""
+    campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(
+        tmp_path,
+        "coordinate-order",
+    )
+    registry_path = campaign_path.parent / "registry.yaml"
+    registry = yaml.safe_load(Path(campaign["registry_config"]).read_text(encoding="utf-8"))
+    campaign["registry_config"] = str(registry_path)
+    _write_yaml(common_path, common)
+    _write_yaml(execution_path, execution)
+    _write_yaml(registry_path, registry)
+    _write_yaml(campaign_path, campaign)
+
+    original = generation.config.load_campaign_config(campaign_path, require_executable=False)
+    original_family = original.material_inventory[0]
+    original_batch = original.require_batch(
+        material_family=original_family,
+        sampling_regime="natural",
+    )
+    original_parameters = original_batch.scientific_values["sampling"]["blocks"]["airflow"]["parameters"]
+
+    left = "bed.structure.cross_scale_corr"
+    right = "bed.structure.fine_ani_x"
+    left_order = registry["parameters"][left]["sampling_order"]
+    right_order = registry["parameters"][right]["sampling_order"]
+    registry["parameters"][left]["sampling_order"] = right_order
+    registry["parameters"][right]["sampling_order"] = left_order
+    _write_yaml(registry_path, registry)
+
+    reordered = generation.config.load_campaign_config(campaign_path, require_executable=False)
+    reordered_batch = reordered.require_batch(
+        material_family=original_family,
+        sampling_regime="natural",
+    )
+    reordered_parameters = reordered_batch.scientific_values["sampling"]["blocks"]["airflow"]["parameters"]
+
+    assert original_parameters.index(left) == reordered_parameters.index(right)
+    assert original_parameters.index(right) == reordered_parameters.index(left)
+    assert reordered_batch.scientific_config_digest != original_batch.scientific_config_digest
+    assert reordered_batch.batch_id != original_batch.batch_id
+    assert reordered.campaign_digest != original.campaign_digest
+
+
+def test_invalid_config_combinations_report_authoritative_owner(
+    tmp_path: Path,
+) -> None:
+    """Reject invalid counts, membership, role overlap, and package sources precisely."""
+
+    def expect_failure(
+        name: str,
+        mutate: Callable[[dict[str, Any]], None],
+        expected_key: str | Callable[[dict[str, Any]], str],
+    ) -> None:
+        campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(tmp_path, name)
+        mutate(campaign)
+        _write_yaml(common_path, common)
+        _write_yaml(execution_path, execution)
+        _write_yaml(campaign_path, campaign)
+        with pytest.raises(generation.config.GenerationConfigError) as caught:
+            generation.config.load_campaign_config(
+                campaign_path,
+                require_executable=False,
+            )
+        details = generation.config.validation_error_details(campaign_path, caught.value)
+        assert details["file"] == str(campaign_path)
+        assert details["owner_to_edit"] == str(campaign_path)
+        resolved_expected_key = expected_key(campaign) if callable(expected_key) else expected_key
+        assert details["key"] == resolved_expected_key
+        assert details["actual_value"] != "<missing>"
+        assert details["expected_type_or_rule"]
+
+    expect_failure(
+        "bad-count",
+        lambda campaign: campaign["sampling"]["counts"]["natural"].__setitem__(
+            next(iter(campaign["sampling"]["counts"]["natural"])),
+            0,
+        ),
+        lambda campaign: f"sampling.counts.natural.{next(iter(campaign['sampling']['counts']['natural']))}",
+    )
+    expect_failure(
+        "membership-overflow",
+        lambda campaign: campaign["membership"]["per_seen_material"].__setitem__("train", 999),
+        "membership.per_seen_material",
+    )
+    expect_failure(
+        "role-overlap",
+        lambda campaign: campaign["material_roles"]["near_family_ood"].append(campaign["material_roles"]["seen"][0]),
+        "material_roles",
+    )
+
+    def mismatch_near_family_source(campaign: dict[str, Any]) -> None:
+        declaration = next(item for item in campaign["dataset_packages"] if item["evaluation_regime"] == "near_family_ood")
+        declaration["source_role"] = "far_family_ood"
+
+    def near_family_package_key(campaign: dict[str, Any]) -> str:
+        index = next(index for index, item in enumerate(campaign["dataset_packages"]) if item["evaluation_regime"] == "near_family_ood")
+        return f"dataset_packages[{index}]"
+
+    expect_failure(
+        "missing-package-source",
+        mismatch_near_family_source,
+        near_family_package_key,
+    )
 
 
 def test_readiness_distinguishes_failed_static_sentinels_from_pending(
@@ -438,29 +422,30 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
         require_executable=False,
     )
-    report = next(iter(generation.inventory.audit_campaign(transient).values()))
-    assert len(report.sampled_coordinate_names) == report.total_effective_dimension == 54
+    report = next(iter(inventory.audit_campaign(transient).values()))
+    assert len(report.sampled_coordinate_names) == report.total_effective_dimension
+    assert report.total_effective_dimension > 0
     assert "schedule.component_weights[1]" in report.sampled_coordinate_names
     assert "schedule.component_weights[2]" in report.sampled_coordinate_names
 
-    oswin = generation.inventory.inspect_campaign_parameter(transient, "oswin")
-    oswin_component = generation.inventory.inspect_campaign_parameter(transient, "A_osw")
-    density = generation.inventory.inspect_campaign_parameter(transient, "density_calibration")
-    density_component = generation.inventory.inspect_campaign_parameter(transient, "eps_bed_cal_ref")
-    kinetics = generation.inventory.inspect_campaign_parameter(transient, "two_compartment_kinetics")
-    simplex = generation.inventory.inspect_campaign_parameter(transient, "schedule_simplex")
-    schedule_bound = generation.inventory.inspect_campaign_parameter(transient, "T_in_min")
-    clip_bound = generation.inventory.inspect_campaign_parameter(transient, "phi_clip_min")
-    permeability_mean = generation.inventory.inspect_campaign_parameter(transient, "kappa_mean")
-    template_fixed = generation.inventory.inspect_campaign_parameter(transient, "cp_w")
-    grid_spacing = generation.inventory.inspect_campaign_parameter(transient, "grid.dx")
-    wall_coefficient = generation.inventory.inspect_campaign_parameter(transient, "U_wall")
-    time_stop = generation.inventory.inspect_campaign_parameter(transient, "time.stop")
-    density_formula = generation.inventory.inspect_campaign_parameter(
+    oswin = inventory.inspect_campaign_parameter(transient, "oswin")
+    oswin_component = inventory.inspect_campaign_parameter(transient, "A_osw")
+    density = inventory.inspect_campaign_parameter(transient, "density_calibration")
+    density_component = inventory.inspect_campaign_parameter(transient, "eps_bed_cal_ref")
+    kinetics = inventory.inspect_campaign_parameter(transient, "two_compartment_kinetics")
+    simplex = inventory.inspect_campaign_parameter(transient, "schedule_simplex")
+    schedule_bound = inventory.inspect_campaign_parameter(transient, "T_in_min")
+    clip_bound = inventory.inspect_campaign_parameter(transient, "phi_clip_min")
+    permeability_mean = inventory.inspect_campaign_parameter(transient, "kappa_mean")
+    template_fixed = inventory.inspect_campaign_parameter(transient, "cp_w")
+    grid_spacing = inventory.inspect_campaign_parameter(transient, "grid.dx")
+    wall_coefficient = inventory.inspect_campaign_parameter(transient, "U_wall")
+    time_stop = inventory.inspect_campaign_parameter(transient, "time.stop")
+    density_formula = inventory.inspect_campaign_parameter(
         transient,
         "physical_formulas.rho_bu_dry",
     )
-    porosity_support = generation.inventory.inspect_campaign_parameter(
+    porosity_support = inventory.inspect_campaign_parameter(
         transient,
         "packing_porosity_mean_support",
     )
@@ -485,21 +470,24 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
     ]
     assert template_fixed["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
     assert template_fixed["provenance"]["derivation"]["origin"] == "supplied_by_handoff"
-    assert grid_spacing["configured"] == {"dx": 0.003}
+    authored_common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
+    expected_dx = authored_common["grid"]["Lx"] / (authored_common["grid"]["nx"] - 1)
+    assert grid_spacing["configured"] == {"dx": expected_dx}
     assert grid_spacing["provenance"]["status"] == "derived"
     assert grid_spacing["provenance"]["derivation"]["verification"] == "mathematically_reproduced"
-    assert wall_coefficient["configured"]["value"] == 3.687943262411348
+    fixed = authored_common["scientific_fixed_values"]
+    expected_u_wall = 1.0 / (1.0 / fixed["h_ext"]["value"] + fixed["d_wall"]["value"] / fixed["k_wall"]["value"])
+    assert wall_coefficient["configured"]["value"] == pytest.approx(expected_u_wall)
     assert wall_coefficient["provenance"]["derivation"]["verification"] == "mathematically_reproduced"
-    authored_common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
     assert "dx" not in authored_common["grid"]
     assert "dy" not in authored_common["grid"]
     assert "value" not in authored_common["scientific_fixed_values"]["U_wall"]
-    assert time_stop["configured"] == {"stop": 168.0}
+    assert time_stop["configured"] == {"stop": authored_common["time"]["stop"]}
     assert density_formula["configured"] == {"rho_bu_dry": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)"}
     assert density_formula["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_formula_requires_native_model_verification")
-    assert set(porosity_support["materials"]) == set(generation.materials.MATERIAL_FAMILIES)
+    assert set(porosity_support["materials"]) == set(transient.material_inventory)
     assert all(not material["applicability"]["parameter_ood"] for material in porosity_support["materials"].values())
-    for family in generation.materials.MATERIAL_FAMILIES:
+    for family in transient.material_inventory:
         assert oswin_component["materials"][family]["provenance"] == oswin["materials"][family]["provenance"]
         assert density_component["materials"][family]["provenance"] == density["materials"][family]["provenance"]
 
@@ -507,15 +495,15 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
         require_executable=False,
     )
-    steady_reference_pressure = generation.inventory.inspect_campaign_parameter(steady, "p_ref")
+    steady_reference_pressure = inventory.inspect_campaign_parameter(steady, "p_ref")
     assert steady_reference_pressure["producer_to_consumer_path"]["effective_downstream_consumers"] == [
         "canonical steady COMSOL template fixed conditioning"
     ]
     assert steady_reference_pressure["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
     with pytest.raises(ValueError, match="not applicable to profile 'steady_flow'"):
-        generation.inventory.inspect_campaign_parameter(steady, "density_calibration")
+        inventory.inspect_campaign_parameter(steady, "density_calibration")
     with pytest.raises(ValueError, match="not applicable to profile 'steady_flow'"):
-        generation.inventory.inspect_campaign_parameter(steady, "time.stop")
+        inventory.inspect_campaign_parameter(steady, "time.stop")
 
 
 def test_scalar_handoff_rejects_an_unknown_name(
@@ -526,7 +514,11 @@ def test_scalar_handoff_rejects_an_unknown_name(
     config_path, _template = generation_config_factory(simulation_profile="transient_drying")
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch=generation.config.build_batch_name(
+            "transient_drying",
+            "lentil",
+            "natural",
+        ),
     )
     bundle = generation.case.generate_case_input_bundle(config, 1, tmp_path / "case")
     scalar_path = bundle.directory / "scalars.csv"
@@ -550,8 +542,11 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     """Protect material consumption of all 17 independent morphology controls."""
     config_path, _template = generation_config_factory()
     campaign = generation.config.load_campaign_config(config_path)
-    batch = campaign.batch("transient_drying__lentil__natural")
-    sample = generation.sampling.sample_case(batch, 1)
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+    )
+    sample = sampling.sample_case(batch, 1)
     values = sample.values
     registry = batch.scientific_values["material"]["parameter_registry"]
     grid = {"Lx": 1.2, "Ly": 0.75, "Lz": 0.8, "dx": 0.015, "dy": 0.015, "nx": 81, "ny": 51}
@@ -559,7 +554,7 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     family_contract = batch.scientific_values["material"]
     family_bounds = family_contract["initial_moisture_bounds"]
     porosity_support = family_contract["packing_porosity_mean_support"]
-    baseline = generation.fields.generate_spatial_fields(
+    baseline = fields.generate_spatial_fields(
         "transient_drying",
         grid,
         values,
@@ -611,7 +606,7 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
             variant["bed.structure.fine_weight"] = 1.0 - variant[name]
         elif name == "initial_moisture.structure.coarse_weight":
             variant["initial_moisture.structure.fine_weight"] = 1.0 - variant[name]
-        generated = generation.fields.generate_spatial_fields(
+        generated = fields.generate_spatial_fields(
             "transient_drying",
             grid,
             variant,
@@ -621,16 +616,16 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
             material_kappa_nominal=float(registry["kappa_mean"]["nominal"]),
             active_ood_unit=None,
         )
-        fields = ("Kxx", "Kxy", "Kyy", "eps_bed") if name in bed_names else ("X_0_db_field",)
-        difference = max(float(np.max(np.abs(generated.columns[field] - baseline.columns[field]))) for field in fields)
-        scale = max(float(np.max(np.abs(baseline.columns[field]))) for field in fields)
+        affected_fields = ("Kxx", "Kxy", "Kyy", "eps_bed") if name in bed_names else ("X_0_db_field",)
+        difference = max(float(np.max(np.abs(generated.columns[field] - baseline.columns[field]))) for field in affected_fields)
+        scale = max(float(np.max(np.abs(baseline.columns[field]))) for field in affected_fields)
         observed[name] = difference / max(scale, np.finfo(np.float64).tiny)
     assert set(observed) == set(bed_names) | set(moisture_names)
     assert all(effect > 1e-10 for effect in observed.values()), observed
 
 
-def test_domain_moisture_dataset_membership_and_task_scope() -> None:
-    """Protect one moisture implementation, deterministic ID splits, and task scope."""
+def test_domain_moisture_and_dataset_membership() -> None:
+    """Protect one moisture implementation and deterministic ID membership."""
     dry_basis = np.asarray([0.0, 0.25, 1.0])
     wet_basis = domain.moisture.dry_basis_to_wet_basis(dry_basis)
     np.testing.assert_allclose(wet_basis, [0.0, 0.2, 0.5])
@@ -654,62 +649,16 @@ def test_domain_moisture_dataset_membership_and_task_scope() -> None:
         "membership_seed": 19,
         "membership_counts_per_material": {"train": 2, "validation": 1, "id_test": 1},
     }
-    membership_a = datasets.packages._shared_id_membership(copy.deepcopy(plan), copy.deepcopy(candidates))
-    membership_b = datasets.packages._shared_id_membership(copy.deepcopy(plan), list(reversed(copy.deepcopy(candidates))))
+    membership_a = package_planning._shared_id_membership(copy.deepcopy(plan), copy.deepcopy(candidates))
+    membership_b = package_planning._shared_id_membership(
+        copy.deepcopy(plan),
+        list(reversed(copy.deepcopy(candidates))),
+    )
     assert membership_a == membership_b
     assert len(membership_a) == 4
     assert list(membership_a.values()).count("train") == 2
     assert list(membership_a.values()).count("validation") == 1
     assert list(membership_a.values()).count("id_test") == 1
-
-    task = domain.tasks.registry.get_task("steady_flow")
-    assert task.input_names == ("x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc")
-    assert task.output_names == ("p", "u", "v")
-    assert task.tensor_layout == ("batch", "channel", "y", "x")
-    assert task.default_datasets.train == "lhs_var80_seed3001"
-    assert task.default_datasets.ood == ("lhs_var120_seed4001",)
-    assert "transient_drying" not in domain.tasks.registry.available_tasks()
-    assert datasets.views.available_views() == ("steady_flow", "transient_drying")
-    assert datasets.views.get_view("steady_flow").trainable is True
-    assert datasets.views.get_view("transient_drying").trainable is False
-    contract = datasets.transient_contract.TRANSIENT_STEP_CONTRACT
-    assert tuple(field.name for field in contract.dynamic_state) == ("T", "phi", "w_surf", "w_int")
-    assert tuple(field.name for field in contract.static_spatial_conditioning) == (
-        "x",
-        "y",
-        "u",
-        "v",
-        "p",
-        "eps_bed",
-        "rho_bu_dry",
-    )
-    assert tuple(field.name for field in contract.step_boundary_conditioning) == (
-        "T_in_bc_t_n",
-        "T_in_bc_t_np1",
-        "phi_in_bc_t_n",
-        "phi_in_bc_t_np1",
-        "T_amb",
-    )
-    assert tuple(field.name for field in contract.scalar_conditioning) == (
-        "r_surf_0",
-        "r_int_surf",
-        "f_surf",
-        "A_osw",
-        "B_osw",
-        "C_osw",
-        "k_gr",
-        "cp_gr_dry",
-    )
-    assert tuple(field.name for field in contract.archived_ablation_fields) == (
-        "Kxx",
-        "Kxy",
-        "Kyy",
-        "p_in_bc",
-        "X_0_db_field",
-    )
-    assert contract.time_step == 1.0
-    assert contract.time_unit == "h"
-    assert contract.canonical_storage_representation == "absolute_physical_states"
 
 
 def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
@@ -718,19 +667,22 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
     """Require every varying stationary dependency to be a declared task input."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow")
     campaign = generation.config.load_campaign_config(config_path)
-    batch = campaign.batch("steady_flow__lentil__natural")
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+    )
     contract = copy.deepcopy(batch.scientific_values["steady_flow_conditioning"])
     record = {
         "simulation_profile": "steady_flow",
         "steady_flow_conditioning": contract,
     }
 
-    accepted = datasets.packages.audit_steady_flow_conditioning([record])
+    accepted = package_planning.audit_steady_flow_conditioning([record])
     assert accepted["hidden_conditioning"] is False
     assert accepted["T_flow_ref_owner"] == "package_fixed"
     coupled_record = copy.deepcopy(record)
     coupled_record["simulation_profile"] = "transient_drying"
-    mixed = datasets.packages.audit_steady_flow_conditioning([record, coupled_record])
+    mixed = package_planning.audit_steady_flow_conditioning([record, coupled_record])
     assert mixed["source_profiles"] == ["steady_flow", "transient_drying"]
     assert mixed["conditioning_contract_digest"] == accepted["conditioning_contract_digest"]
 
@@ -739,14 +691,17 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
     dependency["affects_stationary_solution"] = True
     dependency["owner"] = "model_input"
     with pytest.raises(ValueError, match=r"Hidden steady-flow conditioning.*T_flow_ref"):
-        datasets.packages.audit_steady_flow_conditioning([hidden])
+        package_planning.audit_steady_flow_conditioning([hidden])
 
 
 def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     """Include airflow OOD in both views while excluding transient-only changes from steady."""
     config_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
     campaign = generation.config.load_campaign_config(config_path, require_executable=False)
-    batch = campaign.batch("transient_drying__lentil__parameter_ood")
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="parameter_ood",
+    )
     registry = batch.scientific_values["material"]["parameter_registry"]
 
     def candidate(parameter: str) -> dict[str, Any]:
@@ -773,11 +728,11 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
         }
 
     airflow = candidate("pressure_bc.mean")
-    steady_eligible, steady_parameters, steady_evidence, _reason = datasets.packages._ood_eligibility(
+    steady_eligible, steady_parameters, steady_evidence, _reason = package_planning._ood_eligibility(
         airflow,
         view=datasets.views.get_view("steady_flow"),
     )
-    transient_eligible, transient_parameters, _transient_evidence, _reason = datasets.packages._ood_eligibility(
+    transient_eligible, transient_parameters, _transient_evidence, _reason = package_planning._ood_eligibility(
         airflow,
         view=datasets.views.get_view("transient_drying"),
     )
@@ -786,7 +741,7 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     assert steady_evidence["parameters"][0]["block"] == "airflow"
 
     moisture = candidate("initial_moisture.mean_db")
-    eligible, parameters, evidence, reason = datasets.packages._ood_eligibility(
+    eligible, parameters, evidence, reason = package_planning._ood_eligibility(
         moisture,
         view=datasets.views.get_view("steady_flow"),
     )
@@ -795,7 +750,7 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     assert evidence["group"] == "initial_moisture"
     assert "steady_flow" in str(reason)
     assert (
-        datasets.packages._ood_eligibility(
+        package_planning._ood_eligibility(
             moisture,
             view=datasets.views.get_view("transient_drying"),
         )[0]
@@ -823,13 +778,13 @@ def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
         },
     ]
     with pytest.raises(ValueError, match="requires an explicit source preference"):
-        datasets.packages.resolve_duplicate_case_inputs(
+        package_planning.resolve_duplicate_case_inputs(
             candidates,
             dataset_view="steady_flow",
             policy="reject_duplicates",
         )
 
-    selected, decisions = datasets.packages.resolve_duplicate_case_inputs(
+    selected, decisions = package_planning.resolve_duplicate_case_inputs(
         list(reversed(candidates)),
         dataset_view="steady_flow",
         policy="prefer_transient_source",
@@ -838,7 +793,7 @@ def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
     assert decisions[0]["selected_simulation_case_id"] == "2" * 64
     assert decisions[0]["excluded_simulation_case_ids"] == ["1" * 64]
 
-    id_package = datasets.packages._PreparedPackage(
+    id_package = package_planning.PreparedPackage(
         plan={"evaluation_regime": "id"},
         batch_records=[],
         candidates=[
@@ -853,7 +808,7 @@ def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
         source_decisions=[],
         steady_conditioning=None,
     )
-    ood_package = datasets.packages._PreparedPackage(
+    ood_package = package_planning.PreparedPackage(
         plan={"evaluation_regime": "parameter_ood"},
         batch_records=[],
         candidates=[
@@ -869,7 +824,7 @@ def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
         steady_conditioning=None,
     )
     with pytest.raises(ValueError, match="ID training and OOD package source overlap"):
-        datasets.packages._validate_no_id_ood_overlap((id_package, ood_package))
+        package_planning._validate_no_id_ood_overlap((id_package, ood_package))
 
 
 def test_heater_schedule_retries_complete_realization_deterministically(
@@ -880,12 +835,16 @@ def test_heater_schedule_retries_complete_realization_deterministically(
     config_path, _template = generation_config_factory(simulation_profile="transient_drying")
     batch = generation.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch=generation.config.build_batch_name(
+            "transient_drying",
+            "lentil",
+            "natural",
+        ),
     )
-    sample = generation.sampling.sample_case(batch, 1)
+    sample = sampling.sample_case(batch, 1)
     assert batch.seed_base is not None
-    seeds = {name: generation.config.derive_seed(batch.seed_base, "case", "1", name) for name in ("schedule_shared", "schedule_independent")}
-    original = generation.schedule._candidate_schedule
+    seeds = {name: seeding.derive_seed(batch.seed_base, "case", "1", name) for name in ("schedule_shared", "schedule_independent")}
+    original = schedule_service._candidate_schedule
 
     def force_first_rejection(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
         result = original(*args, **kwargs)
@@ -895,14 +854,14 @@ def test_heater_schedule_retries_complete_realization_deterministically(
         rejected = np.full_like(temperature, float(sample.values["T_amb"]) - 1.0)
         return (rejected, *remaining)
 
-    monkeypatch.setattr(generation.schedule, "_candidate_schedule", force_first_rejection)
-    first = generation.schedule.generate_schedule(
+    monkeypatch.setattr(schedule_service, "_candidate_schedule", force_first_rejection)
+    first = schedule_service.generate_schedule(
         sample.values,
         batch.scientific_values["time"],
         batch.scientific_values["scientific_fixed_values"],
         seeds=seeds,
     )
-    second = generation.schedule.generate_schedule(
+    second = schedule_service.generate_schedule(
         sample.values,
         batch.scientific_values["time"],
         batch.scientific_values["scientific_fixed_values"],
@@ -914,91 +873,38 @@ def test_heater_schedule_retries_complete_realization_deterministically(
     assert first.metadata["schedule_acceptance_attempt"] == 2
     assert first.metadata["min_heater_temperature_rise"] >= 0.0
     assert 0.0 < first.metadata["min_phi_source_air"] <= first.metadata["max_phi_source_air"] <= 1.0
-    assert first.metadata["column_order"] == ["t", "T_in_bc", "omega_in_bc", "phi_in_bc"]
+    assert first.metadata["column_order"] == [field.name for field in generation.contracts.get_profile_contract("transient_drying").schedule_fields]
     assert first.metadata["phi_source_air_usage"] == "validation_and_provenance_only"
 
 
-def _markdown_row(section: str, label: str) -> list[str]:
-    """Return cells from one uniquely labelled Markdown table row."""
-    rows = [line for line in section.splitlines() if line.startswith(f"| {label} |")]
-    assert len(rows) == 1
-    return [cell.strip() for cell in rows[0].strip("|").split("|")]
-
-
-def _code_tokens(cell: str) -> tuple[str, ...]:
-    """Return the inline-code tokens in one Markdown cell."""
-    parts = cell.split("`")
-    return tuple(parts[index] for index in range(1, len(parts), 2))
-
-
-def test_documented_learning_views_match_programmatic_contracts() -> None:
-    """Protect exact steady and transient channels, dtype, shape, and step semantics."""
-    text = Path("docs/generation_parameter_reference.md").read_text(encoding="utf-8")
-    steady_section = text.split("### Steady learning view", 1)[1].split(
-        "### Transient Neural-Operator learning view",
-        1,
-    )[0]
-    transient_section = text.split("### Transient Neural-Operator learning view", 1)[1].split(
-        "## Inspect the resolved contract",
-        1,
-    )[0]
-    task = domain.tasks.registry.get_task("steady_flow")
-    assert _code_tokens(_markdown_row(steady_section, "Inputs")[1]) == task.input_names
-    assert _code_tokens(_markdown_row(steady_section, "Targets")[1]) == task.output_names
-
-    contract = transient_contract.TRANSIENT_STEP_CONTRACT
-    rows = {
-        "State at `t_n`": (contract.dynamic_state, (len(contract.dynamic_state), *contract.spatial_shape)),
-        "Static fields": (
-            contract.static_spatial_conditioning,
-            (len(contract.static_spatial_conditioning), *contract.spatial_shape),
-        ),
-        "Material/scientific scalars": (contract.scalar_conditioning, (len(contract.scalar_conditioning),)),
-        "Target": (contract.target_increments, (len(contract.target_increments), *contract.spatial_shape)),
+def test_schedule_feasibility_diagnostic_uses_resolved_operating_bounds() -> None:
+    """Report the effective humidity envelope without freezing production values."""
+    fixed = {
+        "T_in_min": 290.0,
+        "T_in_max": 310.0,
+        "omega_min": 0.001,
+        "omega_max": 0.02,
+        "phi_operational_min": 0.2,
+        "phi_operational_max": 0.7,
     }
-    for label, (fields, shape) in rows.items():
-        cells = _markdown_row(transient_section, label)
-        assert _code_tokens(cells[1]) == (contract.tensor_dtype,)
-        assert _code_tokens(cells[2]) == ("[" + ",".join(str(value) for value in shape) + "]",)
-        assert _code_tokens(cells[3])[: len(fields)] == tuple(field.name for field in fields)
-    boundary = _markdown_row(transient_section, "Boundary conditioning")
-    boundary_names = tuple(field.name.replace("_t_np1", "(t_n+1)").replace("_t_n", "(t_n)") for field in contract.step_boundary_conditioning)
-    assert _code_tokens(boundary[1]) == (contract.tensor_dtype,)
-    assert _code_tokens(boundary[2]) == (f"[{len(boundary_names)}]",)
-    assert _code_tokens(boundary[3]) == boundary_names
-    target = _markdown_row(transient_section, "Target")
-    assert _code_tokens(target[3])[-1] == "q(t_n+1) - q(t_n)"
-    assert _code_tokens(_markdown_row(transient_section, "Time step")[3]) == ("dt = 1 h",)
-    assert contract.time_step == 1.0
-    assert contract.time_unit == "h"
-    assert "`omega_in_bc` remains schedule/provenance" in transient_section
-    assert "Material family is metadata, not a one-hot channel" in transient_section
-    assert all(f"`{field.name}`" in transient_section for field in contract.archived_ablation_fields)
-    assert "Exact irregular stop states are" in transient_section
+    reason = schedule_service._feasibility_reason(
+        np.asarray([300.0]),
+        np.asarray([0.01]),
+        np.asarray([0.8]),
+        np.asarray([0.5]),
+        ambient_temperature=295.0,
+        fixed=fixed,
+    )
+
+    assert reason == "phi_in_bc violates the configured operating envelope [0.2, 0.7]"
 
 
-def test_source_catalogue_and_executable_refs_match_canonical_registry() -> None:
-    """Protect one exact human-readable row per source and complete ref resolution."""
+def test_all_generation_source_references_resolve() -> None:
+    """Require every authored source reference to resolve through the source registry."""
     registry = yaml.safe_load(Path("configs/generation/sources.yaml").read_text(encoding="utf-8"))
     sources = registry["sources"]
-    source_by_key = {record["source_key"]: record for record in sources}
-    assert len(source_by_key) == len(sources)
-    text = Path("docs/generation_parameter_reference.md").read_text(encoding="utf-8")
-    catalogue = text.split("<!-- source-catalogue:start -->", 1)[1].split(
-        "<!-- source-catalogue:end -->",
-        1,
-    )[0]
-    rows = [line for line in catalogue.splitlines() if line.startswith("| `")]
-    assert len(rows) == len(sources)
-    documented = {}
-    for line in rows:
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        assert len(cells) == 5
-        key = cells[0].strip("`")
-        assert key not in documented
-        documented[key] = cells
-    assert set(documented) == set(source_by_key)
-
+    source_keys = {record["source_key"] for record in sources}
+    assert len(source_keys) == len(sources)
     used_refs: set[str] = set()
 
     def collect(value: Any) -> None:
@@ -1017,12 +923,4 @@ def test_source_catalogue_and_executable_refs_match_canonical_registry() -> None
     for path in Path("configs/generation").rglob("*.yaml"):
         if path.name != "sources.yaml":
             collect(yaml.safe_load(path.read_text(encoding="utf-8")))
-    assert used_refs <= set(source_by_key)
-    for key, source in source_by_key.items():
-        cells = documented[key]
-        assert cells[1] == " ".join(source["citation"].split())
-        assert cells[2] == " ".join(source["identifier"].split())
-        assert cells[3].strip("`") == " ".join(source["canonical_locator"].split())
-        expected_prefix = "Executable source_refs" if key in used_refs else "Supplied supporting source"
-        assert cells[4].startswith(expected_prefix)
-        assert catalogue.count(f"| `{key}` |") == 1
+    assert used_refs <= source_keys

@@ -55,7 +55,6 @@ __all__ = [
     "LoadedEvaluationArtifact",
     "LoadedRunArtifacts",
     "MissingEvaluationArtifactsError",
-    "load_completed_run_artifacts",
     "load_run_artifacts",
 ]
 
@@ -297,44 +296,6 @@ def _nonempty_string(value: Any, *, label: str) -> str:
     return value
 
 
-def _indices(value: Any, *, label: str) -> tuple[int, ...]:
-    """
-    Return exact non-negative ordered source indices from saved split state.
-
-    Parameters
-    ----------
-    value : Any
-        Tensor-like or sequence-like saved membership.
-    label : str
-        Semantic path used in validation failures.
-
-    Returns
-    -------
-    tuple[int, ...]
-        Exact ordered source indices.
-
-    Raises
-    ------
-    TypeError
-        If the membership is empty or contains non-integral values.
-    ValueError
-        If the membership contains duplicate source indices.
-
-    """
-    raw = value.tolist() if hasattr(value, "tolist") else value
-    if not isinstance(raw, (list, tuple)) or not raw:
-        msg = f"{label} must contain a non-empty ordered index sequence."
-        raise TypeError(msg)
-    if any(isinstance(item, bool) or not isinstance(item, Integral) or int(item) < 0 for item in raw):
-        msg = f"{label} must contain only non-negative integers."
-        raise TypeError(msg)
-    result = tuple(int(item) for item in raw)
-    if len(result) != len(set(result)):
-        msg = f"{label} contains duplicate source indices."
-        raise ValueError(msg)
-    return result
-
-
 def _artifact_command(*, run_dir: Path, rebuild: bool) -> str:
     """Return the host wrapper command for one exact current run directory."""
     suffix = " --rebuild" if rebuild else ""
@@ -411,59 +372,6 @@ def _incompatible(
     )
 
 
-def _saved_dataset_identity(
-    metadata: Mapping[str, Any],
-    *,
-    identity_key: Literal["train", "ood"],
-    task: str,
-    data_contract_digest: str,
-) -> Mapping[str, Any]:
-    """
-    Admit one compact dataset identity from validated saved split evidence.
-
-    Parameters
-    ----------
-    metadata : collections.abc.Mapping
-        Saved split metadata containing dataset identities.
-    identity_key : {"train", "ood"}
-        Dataset identity supplying the requested role.
-    task : str
-        Canonical completed-run task.
-    data_contract_digest : str
-        Exact validated dataset data-contract digest.
-
-    Returns
-    -------
-    collections.abc.Mapping
-        Admitted saved dataset identity.
-
-    Raises
-    ------
-    TypeError, ValueError
-        If names, counts, fingerprints, or task identity are malformed or
-        contradictory.
-
-    """
-    datasets = _mapping(metadata.get("datasets"), label="split_indices.pt metadata.datasets")
-    identity = _mapping(
-        datasets.get(identity_key),
-        label=f"split_indices.pt metadata.datasets.{identity_key}",
-    )
-    dataset_name = common.paths.validate_logical_name(
-        identity.get("dataset_id"),
-        label=f"split_indices.pt metadata.datasets.{identity_key}.dataset_id",
-    )
-    if identity.get("task") != task or identity.get("data_contract_digest") != data_contract_digest:
-        msg = f"Saved {identity_key} dataset identity contradicts the evaluable run data contract."
-        raise ValueError(msg)
-    _nonempty_string(identity.get("fingerprint"), label=f"saved {identity_key} dataset fingerprint")
-    _positive_int(identity.get("sample_count"), label=f"saved {identity_key} dataset sample_count")
-    if identity.get("dataset_id") != dataset_name:
-        msg = f"Saved {identity_key} dataset name is not canonical."
-        raise ValueError(msg)
-    return identity
-
-
 def _saved_roles(
     *,
     completed: Mapping[str, Any],
@@ -471,52 +379,29 @@ def _saved_roles(
     task: str,
     task_spec: TaskSpec,
 ) -> tuple[_SavedRole, _SavedRole]:
-    """
-    Resolve exact ID and OOD roots and ordered memberships from one run.
-
-    Parameters
-    ----------
-    completed : collections.abc.Mapping
-        Result of strict completed-run validation.
-    run_dir : pathlib.Path
-        Exact canonical completed-run directory.
-    task : str
-        Canonical registered task identifier.
-    task_spec : TaskSpec
-        Validated persisted task contract.
-
-    Returns
-    -------
-    tuple[_SavedRole, _SavedRole]
-        ID evaluation role followed by the configured OOD package combination.
-
-    Raises
-    ------
-    TypeError, ValueError
-        If config dataset names, compact identities, counts, or membership
-        digests disagree.
-
-    """
+    """Resolve admitted ID and OOD artifact roles from typed split evidence."""
     config = _mapping(completed.get("config"), label="completed config")
-    split = _mapping(completed.get("split_indices"), label="completed split_indices")
-    metadata = _mapping(split.get("metadata"), label="split_indices.pt metadata")
+    split_contract = datasets.splits.admit_split_contract(_mapping(completed.get("split_indices"), label="completed split_indices"))
+    if split_contract.task != task or split_contract.task_contract_digest != task_spec.contract_digest:
+        msg = "Saved split task identity contradicts the evaluable run task contract."
+        raise ValueError(msg)
     data_config = _mapping(config.get("data"), label="config.yaml data")
-    membership = _mapping(metadata.get("membership_digests"), label="split_indices.pt metadata.membership_digests")
-
-    id_identity = _saved_dataset_identity(
-        metadata,
-        identity_key="train",
-        task=task,
-        data_contract_digest=task_spec.data_contract_digest,
+    id_evidence = split_contract.role("eval")
+    ood_evidence = split_contract.role("ood")
+    id_name = common.paths.validate_logical_name(
+        id_evidence.source.dataset_id,
+        label="saved eval dataset identity",
     )
-    ood_identity = _saved_dataset_identity(
-        metadata,
-        identity_key="ood",
-        task=task,
-        data_contract_digest=task_spec.data_contract_digest,
+    ood_name = common.paths.validate_logical_name(
+        ood_evidence.source.dataset_id,
+        label="saved OOD dataset identity",
     )
-    id_name = str(id_identity["dataset_id"])
-    ood_name = str(ood_identity["dataset_id"])
+    if id_evidence.source.data_contract_digest != task_spec.data_contract_digest:
+        msg = "Saved ID dataset identity contradicts the evaluable run data contract."
+        raise ValueError(msg)
+    if ood_evidence.source.data_contract_digest != task_spec.data_contract_digest:
+        msg = "Saved OOD dataset identity contradicts the evaluable run data contract."
+        raise ValueError(msg)
     if data_config.get("train_dataset") != id_name:
         msg = "config.yaml data.train_dataset contradicts saved ID dataset identity."
         raise ValueError(msg)
@@ -528,57 +413,26 @@ def _saved_roles(
         common.paths.validate_logical_name(dataset_id, label=f"config.yaml data.ood_datasets[{index}]")
         for index, dataset_id in enumerate(raw_configured_ood)
     )
-    if len(configured_ood) != len(set(configured_ood)) or datasets.base.combined_dataset_id(configured_ood) != ood_name:
+    if len(configured_ood) != len(set(configured_ood)) or datasets.identity.combined_dataset_id(configured_ood) != ood_name:
         msg = "config.yaml data.ood_datasets do not match the saved OOD package-combination identity."
         raise ValueError(msg)
 
-    role_specs: tuple[tuple[ArtifactRole, str, Mapping[str, Any], str, str, str, str, Path], ...] = (
-        (
-            "eval",
-            id_name,
-            id_identity,
-            "eval_indices",
-            "eval",
-            "n_eval",
-            "n_train_full",
-            common.paths.resolve_id_analysis_dir(run_dir),
-        ),
-        (
-            "ood",
-            ood_name,
-            ood_identity,
-            "ood_indices",
-            "ood",
-            "n_ood",
-            "n_ood_full",
-            common.paths.resolve_ood_analysis_dir(run_dir, ood_name),
-        ),
+    id_role = _SavedRole(
+        split_role="eval",
+        dataset_name=id_evidence.source.dataset_id,
+        dataset_identity=id_evidence.source.as_dict(),
+        source_indices=id_evidence.index_values,
+        saved_membership_digest=id_evidence.membership_digest,
+        root=common.paths.resolve_id_analysis_dir(run_dir).absolute(),
     )
-    roles: list[_SavedRole] = []
-    for split_role, dataset_name, identity, index_key, membership_key, count_key, full_count_key, root in role_specs:
-        source_indices = _indices(split.get(index_key), label=f"split_indices.pt {index_key}")
-        if _positive_int(metadata.get(count_key), label=f"split_indices.pt metadata.{count_key}") != len(source_indices):
-            msg = f"Saved {split_role} membership count contradicts its ordered indices."
-            raise ValueError(msg)
-        full_count = _positive_int(metadata.get(full_count_key), label=f"split_indices.pt metadata.{full_count_key}")
-        if full_count != _positive_int(identity.get("sample_count"), label=f"saved {split_role} sample_count"):
-            msg = f"Saved {split_role} full count contradicts its dataset identity."
-            raise ValueError(msg)
-        saved_digest = _nonempty_string(
-            membership.get(membership_key),
-            label=f"split_indices.pt metadata.membership_digests.{membership_key}",
-        )
-        roles.append(
-            _SavedRole(
-                split_role=split_role,
-                dataset_name=dataset_name,
-                dataset_identity=identity,
-                source_indices=source_indices,
-                saved_membership_digest=saved_digest,
-                root=Path(root).absolute(),
-            )
-        )
-    id_role, ood_role = roles
+    ood_role = _SavedRole(
+        split_role="ood",
+        dataset_name=ood_evidence.source.dataset_id,
+        dataset_identity=ood_evidence.source.as_dict(),
+        source_indices=ood_evidence.index_values,
+        saved_membership_digest=ood_evidence.membership_digest,
+        root=common.paths.resolve_ood_analysis_dir(run_dir, ood_name).absolute(),
+    )
     return id_role, ood_role
 
 
@@ -587,28 +441,22 @@ def _expected_run_provenance(
     summary: Mapping[str, Any],
     task_spec: TaskSpec,
     run_name: str,
-    evaluation: Mapping[str, Any] | None = None,
+    evaluation: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project immutable scientific and optional lifecycle evaluation evidence."""
-    result = {
+    """Project immutable scientific and lifecycle evaluation evidence."""
+    return {
         "name": run_name,
         "task": task_spec.id,
         "task_contract_digest": task_spec.contract_digest,
-        "effective_config_digest": summary.get("effective_config_digest"),
-        "best_checkpoint_sha256": summary.get("best_checkpoint_sha256"),
-        "normalizer_sha256": summary.get("normalizer_sha256"),
+        "effective_config_digest": summary["effective_config_digest"],
+        "best_checkpoint_sha256": summary["best_checkpoint_sha256"],
+        "normalizer_sha256": summary["normalizer_sha256"],
+        "best_checkpoint_epoch": evaluation["selected_checkpoint_epoch"],
+        "lifecycle_status": evaluation["lifecycle_status"],
+        "is_completed": evaluation["is_completed"],
+        "is_provisional": evaluation["is_provisional"],
+        "selected_checkpoint_role": evaluation["selected_checkpoint_role"],
     }
-    if evaluation is not None:
-        result.update(
-            {
-                "best_checkpoint_epoch": evaluation.get("selected_checkpoint_epoch"),
-                "lifecycle_status": evaluation.get("lifecycle_status"),
-                "is_completed": evaluation.get("is_completed"),
-                "is_provisional": evaluation.get("is_provisional"),
-                "selected_checkpoint_role": evaluation.get("selected_checkpoint_role"),
-            }
-        )
-    return result
 
 
 def _expected_model_provenance(
@@ -1073,20 +921,14 @@ def _bind_artifact_to_run(
         msg = f"Artifact provenance schema mismatch: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
 
-    expected_legacy_run = _expected_run_provenance(
-        summary=summary,
-        task_spec=task_spec,
-        run_name=run_name,
-    )
-    expected_current_run = _expected_run_provenance(
+    expected_run = _expected_run_provenance(
         summary=summary,
         task_spec=task_spec,
         run_name=run_name,
         evaluation=evaluation,
     )
     actual_run = dict(_mapping(provenance.get("run"), label="artifact provenance run"))
-    allowed_runs = (expected_current_run,) if evaluation.get("is_provisional") is True else (expected_legacy_run, expected_current_run)
-    if actual_run not in allowed_runs:
+    if actual_run != expected_run:
         msg = "Artifact run provenance does not match the authoritative evaluable run and selected checkpoint."
         raise ValueError(msg)
     expected_model = _expected_model_provenance(config=config, summary=summary)
@@ -1312,25 +1154,16 @@ def _load_admitted_run_artifacts(
         raise ValueError(msg)
 
     evidence_summary = dict(summary)
-    evidence_summary["effective_config_digest"] = admitted.get(
-        "effective_config_digest",
-        evidence_summary.get("effective_config_digest"),
-    )
-    evidence_summary["best_checkpoint_sha256"] = admitted.get(
-        "selected_checkpoint_sha256",
-        evidence_summary.get("best_checkpoint_sha256"),
-    )
-    evidence_summary["normalizer_sha256"] = admitted.get(
-        "normalizer_sha256",
-        evidence_summary.get("normalizer_sha256"),
-    )
+    evidence_summary["effective_config_digest"] = admitted["effective_config_digest"]
+    evidence_summary["best_checkpoint_sha256"] = admitted["selected_checkpoint_sha256"]
+    evidence_summary["normalizer_sha256"] = admitted["normalizer_sha256"]
     evaluation = {
-        "lifecycle_status": admitted.get("lifecycle_status", "completed"),
-        "is_completed": admitted.get("is_completed", True),
-        "is_provisional": admitted.get("is_provisional", False),
-        "selected_checkpoint_role": admitted.get("selected_checkpoint_role", "best"),
-        "selected_checkpoint_epoch": admitted.get("selected_checkpoint_epoch"),
-        "selected_checkpoint_sha256": evidence_summary.get("best_checkpoint_sha256"),
+        "lifecycle_status": admitted["lifecycle_status"],
+        "is_completed": admitted["is_completed"],
+        "is_provisional": admitted["is_provisional"],
+        "selected_checkpoint_role": admitted["selected_checkpoint_role"],
+        "selected_checkpoint_epoch": admitted["selected_checkpoint_epoch"],
+        "selected_checkpoint_sha256": admitted["selected_checkpoint_sha256"],
     }
     try:
         id_role, ood_role = _saved_roles(
@@ -1396,36 +1229,3 @@ def load_run_artifacts(
     path = Path(run_dir).expanduser().resolve()
     with experiments.run.evaluable_run_lease(path) as admitted:
         return _load_admitted_run_artifacts(path, admitted, artifact_roles=artifact_roles)
-
-
-def load_completed_run_artifacts(
-    task: str,
-    run_name: str,
-    *,
-    output_root: Path | str | None = None,
-) -> LoadedRunArtifacts:
-    """
-    Load one strictly completed run through the canonical-name convenience path.
-
-    This compatibility resolver remains strict and delegates artifact loading to
-    the same path-based implementation used for relocated evaluable bundles.
-    """
-    canonical_task = common.paths.validate_logical_name(task, label="task")
-    canonical_run_name = common.paths.validate_logical_name(run_name, label="run_name")
-    run_dir = common.paths.resolve_run_output_dir(
-        canonical_task,
-        canonical_run_name,
-        output_root=output_root,
-    ).resolve()
-    with experiments.run.run_reader_lease(run_dir):
-        completed = experiments.run.validate_completed_run(run_dir)
-        config = _mapping(completed.get("config"), label="completed config")
-        summary = _mapping(completed.get("summary"), label="completed summary")
-        run_config = _mapping(config.get("run"), label="config.yaml run")
-        if config.get("task") != canonical_task or summary.get("task") != canonical_task:
-            msg = "Requested task contradicts the authoritative completed run."
-            raise ValueError(msg)
-        if run_config.get("name") != canonical_run_name or summary.get("run_name") != canonical_run_name:
-            msg = "Requested run name contradicts the authoritative completed run."
-            raise ValueError(msg)
-        return _load_admitted_run_artifacts(run_dir, completed)

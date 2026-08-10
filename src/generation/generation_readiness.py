@@ -4,9 +4,9 @@ generation_readiness.py
 ===============================================================================
 Report fail-closed VP2 scientific, mapping, runtime, and launch readiness.
 Responsibilities:
-  - Resolve every canonical campaign without requiring production launch values
-  - Enumerate exact missing primary counts, seeds, memberships, and mappings
-  - Emit the binding seven-line production-readiness status vocabulary
+  - Resolve both configured primary campaigns without requiring launch values
+  - Enumerate missing configured counts, seeds, memberships, and mappings
+  - Emit seven evidence-derived production-readiness status lines
 Design principles:
   - Static validity never substitutes for native COMSOL runtime evidence
   - Missing values are reported by repository-relative file and dotted key
@@ -28,6 +28,7 @@ from src import common
 
 from . import generation_config as config_service
 from . import generation_materials as materials
+from . import generation_profiles as profiles
 from . import generation_sentinels as sentinel_service
 from . import generation_smoke as smoke_service
 
@@ -49,6 +50,24 @@ def _yaml(path: Path) -> dict[str, Any]:
 def _relative(path: Path) -> str:
     """Return one stable repository-relative configuration path."""
     return path.resolve().relative_to(common.paths.get_project_root().resolve()).as_posix()
+
+
+def _resolved_decision_source(
+    campaigns: tuple[config_service.CampaignConfig, ...],
+) -> dict[str, str]:
+    """Return the one registry-owned decision identity shared by all batches."""
+    decision_source: dict[str, str] | None = None
+    for campaign in campaigns:
+        for batch in campaign.batches:
+            decision_source = materials.validate_decision_source(
+                batch.scientific_values["material"]["decision_source"],
+                label=f"resolved batch {batch.batch_name!r} decision_source",
+                expected=decision_source,
+            )
+    if decision_source is None:
+        message = "Production readiness campaigns contain no resolved batch decision evidence."
+        raise ValueError(message)
+    return decision_source
 
 
 def _primary_missing(path: Path) -> list[str]:
@@ -132,6 +151,35 @@ def campaign_unresolved_gates(path: Path | str) -> dict[str, list[str]]:
     }
 
 
+def _campaign_contract(
+    campaign: config_service.CampaignConfig,
+) -> dict[str, Any]:
+    """Return configured profile, inventory, role, regime, and package evidence."""
+    inventory = campaign.material_inventory
+    return {
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "campaign_purpose": campaign.campaign_purpose,
+        "source_path": _relative(campaign.source_path),
+        "simulation_profile": campaign.profile.id,
+        "total_case_count": campaign.total_case_count,
+        "material_inventory": list(inventory),
+        "material_roles": {role: list(material_families) for role, material_families in campaign.material_roles.items()},
+        "evaluation_regimes": list(campaign.evaluation_regimes),
+        "dataset_packages": [
+            {
+                "dataset_name": package["dataset_name"],
+                "dataset_view": package["dataset_view"],
+                "evaluation_regime": package["evaluation_regime"],
+                "source_role": package["source_role"],
+                "materials": list(package["materials"]),
+                "source_case_count": package["source_case_count"],
+            }
+            for package in campaign.dataset_packages
+        ],
+    }
+
+
 def build_readiness_report(
     steady_primary_path: Path | str,
     transient_primary_path: Path | str,
@@ -142,17 +190,24 @@ def build_readiness_report(
     """Build one read-only, exact-key production-readiness report."""
     steady_path = Path(steady_primary_path).expanduser().resolve()
     transient_path = Path(transient_primary_path).expanduser().resolve()
-    campaigns = [config_service.load_campaign_config(path, require_executable=False) for path in (steady_path, transient_path)]
-    expected_roles = {
-        "seen": ("lentil", "chickpea", "kidney_bean"),
-        "near_family_ood": ("field_pea",),
-        "far_family_ood": ("rapeseed",),
-        "extreme_family_ood": ("sunflower_seed",),
-    }
-    inventory = tuple(family for role in expected_roles for family in campaigns[0].material_roles[role])
-    if inventory != materials.MATERIAL_FAMILIES or any(campaign.material_roles != expected_roles for campaign in campaigns):
-        message = "Readiness family inventory or roles do not match the six-family VP2 contract."
-        raise ValueError(message)
+    campaigns = tuple(config_service.load_campaign_config(path, require_executable=False) for path in (steady_path, transient_path))
+    expected_profiles = (
+        profiles.STEADY_FLOW_PROFILE,
+        profiles.TRANSIENT_DRYING_PROFILE,
+    )
+    for campaign, expected_profile in zip(campaigns, expected_profiles, strict=True):
+        if campaign.campaign_purpose != "family_generalization" or campaign.profile.id != expected_profile:
+            message = (
+                "Readiness inputs must be family-generalization campaigns for "
+                f"{expected_profile!r}; received {campaign.profile.id!r} "
+                f"with purpose {campaign.campaign_purpose!r}."
+            )
+            raise ValueError(message)
+    campaign_contracts = {campaign.profile.id: _campaign_contract(campaign) for campaign in campaigns}
+    decision_source = _resolved_decision_source(campaigns)
+    campaign_resolution_complete = len(campaign_contracts) == len(campaigns)
+    resolved_ownership_complete = campaign_resolution_complete
+
     steady_gates = campaign_unresolved_gates(steady_path)
     transient_gates = campaign_unresolved_gates(transient_path)
     primary_missing = sorted(set(steady_gates["missing_production_keys"] + transient_gates["missing_production_keys"]))
@@ -161,26 +216,27 @@ def build_readiness_report(
         set(steady_gates["declared_unverified_profile_mapping_keys"] + transient_gates["declared_unverified_profile_mapping_keys"])
     )
     optional_mapping_missing = sorted(set(steady_gates["optional_profile_mapping_keys"] + transient_gates["optional_profile_mapping_keys"]))
+
     static_report = None
     if run_static_sentinels:
-        static_report = sentinel_service.run_static_sentinels(steady_path, transient_path)
+        static_report = sentinel_service.run_static_sentinels(
+            steady_path,
+            transient_path,
+        )
     receipt_path = None if real_runtime_receipt is None else Path(real_runtime_receipt).expanduser().resolve()
     real_complete = False
     if receipt_path is not None:
         smoke_service.validate_real_smoke_receipt(receipt_path)
         real_complete = True
-    scientific_complete = True
-    ownership_complete = True
-    documentation_complete = True
+
     primary_complete = not primary_missing
     mapping_complete = not mapping_missing and (not mapping_declared_unverified or real_complete)
     static_complete = static_report is not None and static_report["status"] == "pass"
     static_status = _STATUS_COMPLETE if static_complete else _STATUS_BLOCKED if static_report is not None else _STATUS_PENDING
     production_ready = all(
         (
-            scientific_complete,
-            ownership_complete,
-            documentation_complete,
+            campaign_resolution_complete,
+            resolved_ownership_complete,
             primary_complete,
             mapping_complete,
             static_complete,
@@ -189,14 +245,12 @@ def build_readiness_report(
     )
     return {
         "schema_kind": "vp2_production_readiness",
-        "schema_version": 1,
-        "decision_sha256": materials.VP2_DECISION_SHA256,
-        "canonical_family_inventory": list(materials.MATERIAL_FAMILIES),
-        "canonical_family_roles": {name: list(values) for name, values in expected_roles.items()},
+        "schema_version": 2,
+        "decision_sha256": decision_source["sha256"],
+        "campaign_contracts": campaign_contracts,
         "campaign_ids": [campaign.campaign_id for campaign in campaigns],
-        "static_scientific_integration_complete": scientific_complete,
-        "config_ownership_consolidation_complete": ownership_complete,
-        "documentation_consolidation_complete": documentation_complete,
+        "campaign_config_resolution_complete": campaign_resolution_complete,
+        "resolved_config_ownership_validation_complete": resolved_ownership_complete,
         "static_generator_sentinels_complete": static_complete,
         "real_runtime_validation_complete": real_complete,
         "primary_production_config_complete": primary_complete,
@@ -206,16 +260,16 @@ def build_readiness_report(
         "missing_profile_mapping_keys": mapping_missing,
         "declared_unverified_profile_mapping_keys": mapping_declared_unverified,
         "optional_profile_mapping_keys": optional_mapping_missing,
-        "real_runtime_receipt": None if receipt_path is None else str(receipt_path),
+        "real_runtime_receipt": (None if receipt_path is None else str(receipt_path)),
         "static_sentinel_report": static_report,
         "status_lines": [
-            "STATIC_SCIENTIFIC_INTEGRATION_COMPLETE",
-            "CONFIG_OWNERSHIP_CONSOLIDATION_COMPLETE",
-            "DOCUMENTATION_CONSOLIDATION_COMPLETE",
+            ("CAMPAIGN_CONFIG_RESOLUTION_COMPLETE" if campaign_resolution_complete else "CAMPAIGN_CONFIG_RESOLUTION_INCOMPLETE"),
+            ("RESOLVED_CONFIG_OWNERSHIP_VALIDATION_COMPLETE" if resolved_ownership_complete else "RESOLVED_CONFIG_OWNERSHIP_VALIDATION_INCOMPLETE"),
             f"STATIC_GENERATOR_SENTINELS_{static_status}",
-            f"PRIMARY_PRODUCTION_CONFIG_{_STATUS_COMPLETE if primary_complete else _STATUS_INCOMPLETE}",
-            f"REAL_RUNTIME_VALIDATION_{_STATUS_COMPLETE if real_complete else _STATUS_PENDING}",
-            f"PRODUCTION_READY_FOR_USER_LAUNCH_{_STATUS_COMPLETE if production_ready else _STATUS_BLOCKED}",
+            (f"PRIMARY_PRODUCTION_CONFIG_{_STATUS_COMPLETE if primary_complete else _STATUS_INCOMPLETE}"),
+            (f"PROFILE_MAPPING_{_STATUS_COMPLETE if mapping_complete else _STATUS_INCOMPLETE}"),
+            (f"REAL_RUNTIME_VALIDATION_{_STATUS_COMPLETE if real_complete else _STATUS_PENDING}"),
+            (f"PRODUCTION_READY_FOR_USER_LAUNCH_{_STATUS_COMPLETE if production_ready else _STATUS_BLOCKED}"),
         ],
         "production_solve_started": False,
     }

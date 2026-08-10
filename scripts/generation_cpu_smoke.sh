@@ -1,8 +1,8 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 10 )); then
-  printf 'Usage: %s VENV CAMPAIGN STORAGE ONLY_BATCH MAX_NODES CASES_PER_NODE CORES_PER_CASE MAX_PARALLEL CORES_PER_NODE MODE\n' "$0" >&2
+if (( $# != 15 )); then
+  printf 'Usage: %s VENV CAMPAIGN STORAGE ONLY_BATCH MAX_NODES CASES_PER_NODE CORES_PER_CASE MAX_PARALLEL CORES_PER_NODE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER\n' "$0" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -22,6 +22,11 @@ CORES_PER_CASE="$7"
 MAX_PARALLEL_CASES="$8"
 CORES_PER_NODE="$9"
 PREFLIGHT_MODE="${10}"
+PYTHON_MODULE="${11}"
+COMSOL_MODULE="${12}"
+PYTHON_EXECUTABLE="${13}"
+COMSOL_EXECUTABLE="${14}"
+SCHEDULER_KIND="${15}"
 
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_CONFIG}" != /* ]]; then
   printf 'Venv, campaign, and storage paths must be absolute.\n' >&2
@@ -36,14 +41,24 @@ if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != producti
   exit 2
 fi
 
-module load Python/3.10
-module load Comsol/v6.4
-command -v python3
-python3 --version
-command -v comsol
-COMSOL_VERSION_OUTPUT="$(comsol -version 2>&1)"
+for value in "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
+  "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}"; do
+  [[ -n "${value}" && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || {
+    printf 'Resolved execution bootstrap values must be safe non-empty text.\n' >&2
+    exit 2
+  }
+done
+[[ "${SCHEDULER_KIND}" == slurm ]] || {
+  printf 'CPU preflight requires configured scheduler=slurm.\n' >&2
+  exit 2
+}
+module load "${PYTHON_MODULE}"
+module load "${COMSOL_MODULE}"
+command -v "${PYTHON_EXECUTABLE}"
+"${PYTHON_EXECUTABLE}" --version
+command -v "${COMSOL_EXECUTABLE}"
+COMSOL_VERSION_OUTPUT="$("${COMSOL_EXECUTABLE}" -version 2>&1)"
 printf '%s\n' "${COMSOL_VERSION_OUTPUT}"
-[[ "${COMSOL_VERSION_OUTPUT}" == *"6.4"* ]] || { printf 'COMSOL 6.4 required.\n' >&2; exit 1; }
 command -v sbatch
 sbatch --version
 command -v squeue
@@ -52,8 +67,7 @@ command -v scancel
 command -v rsync
 rsync --version
 source "${GENERATION_CPU_VENV}/bin/activate"
-python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else f"Python 3.10 required, got {sys.version}")'
-python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+"${GENERATION_CPU_VENV}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
 
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
 if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then

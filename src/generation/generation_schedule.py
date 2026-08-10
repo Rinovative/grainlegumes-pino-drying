@@ -10,7 +10,7 @@ Responsibilities:
 Design principles:
   - Schedule class is metadata and never selects a production implementation path
   - All event details and activation decisions are label-derived provenance
-  - The planned complete 0..168-hour schedule owns the reference temperature
+  - The configured complete schedule owns the reference temperature
 This module does NOT:
   - Define material ranges, COMSOL interpolation tags, or alternate class generators
   - Infer values from an early solver stop
@@ -22,14 +22,32 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Final
 
 import numpy as np
 
-from . import generation_config as config_contract
+from . import generation_profiles as profiles
+from . import generation_seeding as seeding
 
 _EVENT_SELECTION_THRESHOLD = 0.5
 _MAX_SCHEDULE_ATTEMPTS = 32
+_MINIMUM_SCHEDULE_NODES = 2
+SCHEDULE_DIAGNOSTIC_UNITS: Final = MappingProxyType(
+    {
+        "min_T_in_bc": "K",
+        "max_T_in_bc": "K",
+        "min_omega_in_bc": "kg/kg",
+        "max_omega_in_bc": "kg/kg",
+        "min_phi_in_bc": "1",
+        "max_phi_in_bc": "1",
+        "min_phi_source_air": "1",
+        "max_phi_source_air": "1",
+        "min_heater_temperature_rise": "K",
+        "schedule_rejection_count": "1",
+        "schedule_acceptance_attempt": "1",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +57,11 @@ class Schedule:
     values: np.ndarray
     metadata: dict[str, Any]
     derived_scalars: dict[str, float]
+
+    @property
+    def diagnostics(self) -> dict[str, float | int]:
+        """Return the canonical generated-schedule diagnostic values."""
+        return {name: self.metadata[name] for name in SCHEDULE_DIAGNOSTIC_UNITS}
 
 
 def saturation_vapor_pressure(temperature: np.ndarray) -> np.ndarray:
@@ -214,7 +237,7 @@ def _attempt_seed(seed: int, *, attempt: int) -> int:
     """Return the original seed first, then label-derived retry streams."""
     if attempt == 1:
         return seed
-    return config_contract.derive_seed(seed, "schedule_retry", str(attempt))
+    return seeding.derive_seed(seed, "schedule_retry", str(attempt))
 
 
 def _candidate_schedule(
@@ -269,8 +292,10 @@ def _feasibility_reason(
         return "omega_in_bc is not strictly positive"
     if np.any((phi_source <= 0.0) | (phi_source > 1.0)):
         return "phi_source_air lies outside (0, 1]"
-    if np.any((phi_in < float(fixed["phi_operational_min"])) | (phi_in > float(fixed["phi_operational_max"]))):
-        return "phi_in_bc violates the 0.05-0.85 operating envelope"
+    phi_minimum = float(fixed["phi_operational_min"])
+    phi_maximum = float(fixed["phi_operational_max"])
+    if np.any((phi_in < phi_minimum) | (phi_in > phi_maximum)):
+        return f"phi_in_bc violates the configured operating envelope [{phi_minimum}, {phi_maximum}]"
     return None
 
 
@@ -281,13 +306,20 @@ def generate_schedule(
     *,
     seeds: Mapping[str, int],
 ) -> Schedule:
-    """Generate the single finalized mixed schedule on regular hourly nodes."""
+    """Generate the single finalized mixed schedule on configured regular nodes."""
     if set(seeds) != {"schedule_shared", "schedule_independent"}:
         msg = "Schedule generation requires exact shared and independent seeds."
         raise ValueError(msg)
     time = np.asarray(time_contract["regular_times"], dtype=np.float64)
-    if time.shape != (169,) or not np.array_equal(time, np.arange(169, dtype=np.float64)):
-        msg = "Schedule time contract must contain regular hourly nodes 0..168 h."
+    interval = float(time_contract["interval"])
+    tolerance = np.finfo(np.float64).eps * max(1.0, abs(interval)) * 16
+    if (
+        time.ndim != 1
+        or time.size < _MINIMUM_SCHEDULE_NODES
+        or not np.isfinite(time).all()
+        or not np.allclose(np.diff(time), interval, rtol=0.0, atol=tolerance)
+    ):
+        msg = "Schedule time contract must contain at least two finite, regularly spaced configured nodes."
         raise ValueError(msg)
     weights_raw = values["schedule.component_weights"]
     if not isinstance(weights_raw, Mapping) or tuple(weights_raw) != ("smooth", "event", "trend"):
@@ -376,7 +408,7 @@ def generate_schedule(
         values=values_array,
         metadata={
             "generator_kind": "compositional_mixed",
-            "generator_version": config_contract.GENERATOR_VERSION,
+            "generator_version": seeding.GENERATOR_VERSION,
             "interpolation": "linear",
             "schedule_class": _schedule_class(
                 active,
@@ -393,7 +425,7 @@ def generate_schedule(
             **diagnostics,
             "shared_realization": shared_details,
             "independent_realization": independent_details,
-            "column_order": ["t", "T_in_bc", "omega_in_bc", "phi_in_bc"],
+            "column_order": list(profiles.SCHEDULE_FIELDS),
             "heater_physics": "humidity_ratio_conserved_across_ambient_air_heater",
             "source_air_humidity_ratio": "omega_source_air(t)=omega_in_bc(t)",
             "humidity_formula": "phi_in_bc=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_in_bc)",
@@ -426,17 +458,7 @@ def generate_schedule(
                     "events.width": "h",
                     "events.local_jitter": "h",
                     "planned_interval": "h",
-                    "min_T_in_bc": "K",
-                    "max_T_in_bc": "K",
-                    "min_omega_in_bc": "kg/kg",
-                    "max_omega_in_bc": "kg/kg",
-                    "min_phi_in_bc": "1",
-                    "max_phi_in_bc": "1",
-                    "min_phi_source_air": "1",
-                    "max_phi_source_air": "1",
-                    "min_heater_temperature_rise": "K",
-                    "schedule_rejection_count": "1",
-                    "schedule_acceptance_attempt": "1",
+                    **SCHEDULE_DIAGNOSTIC_UNITS,
                 },
             },
         },

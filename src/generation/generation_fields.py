@@ -29,9 +29,10 @@ from typing import Any
 import numpy as np
 from scipy import signal
 
-from . import generation_config as config_contract
 from . import generation_porosity as porosity_service
 from . import generation_profiles as profiles
+from . import generation_registry as registry_service
+from . import generation_seeding as seeding
 
 _MINIMUM_AXIS_POINTS = 2
 _EQUAL_PROBABILITY = 0.5
@@ -341,6 +342,7 @@ def _porosity_field(
     permeability_mean = _finite(values, "kappa_mean")
     calibration_porosity = _finite(values, "eps_bed_cal_ref")
     anchor_factor = _finite(values, porosity_service.ANCHOR_PARAMETER_NAME)
+    ood_gap_fraction, ood_width_fraction = registry_service.ood_separation_fractions()
     support = porosity_service.resolve_anchor_factor_support(
         sampled_kappa_mean=permeability_mean,
         material_kappa_nominal=material_kappa_nominal,
@@ -348,6 +350,8 @@ def _porosity_field(
         packing_porosity_mean_support=material_mean_support,
         eps_min_global=minimum,
         eps_max_global=maximum,
+        ood_gap_fraction=ood_gap_fraction,
+        ood_width_fraction=ood_width_fraction,
     )
     active_support_kind = porosity_service.classify_anchor_factor(anchor_factor, support)
     anchor_ood_active = active_ood_unit == porosity_service.ANCHOR_PARAMETER_NAME
@@ -711,7 +715,7 @@ def _generate_spatial_fields_once(
         "p_in_bc": pressure,
     }
     metadata: dict[str, Any] = {
-        "generator_version": config_contract.GENERATOR_VERSION,
+        "generator_version": seeding.GENERATOR_VERSION,
         "simulation_profile": simulation_profile,
         "random_stream": "numpy.default_rng",
         "seeds": dict(seeds),
@@ -801,7 +805,7 @@ def _complete_case_retry_seeds(seeds: Mapping[str, int], attempt: int) -> dict[s
     if attempt == 1:
         return dict(seeds)
     return {
-        name: config_contract.derive_seed(
+        name: seeding.derive_seed(
             seed,
             "complete_case_support_retry",
             str(attempt),

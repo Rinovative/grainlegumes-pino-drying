@@ -35,16 +35,19 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src import common
-from src.generation import generation_profiles as profiles
-from src.generation import generation_storage as storage
+from src import common, generation
 
-from .dataset_transient_contract import TRANSIENT_STEP_CONTRACT
-from .dataset_views import ID_MEMBERSHIPS, PACKAGE_REGIMES, TECHNICAL_SMOKE_MEMBERSHIP
+from . import dataset_transient_contract as transient_contract
+from . import dataset_views as views
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
 TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
-_TIME_TOLERANCE: Final = storage.TIME_CLASSIFICATION_ATOL
+_SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(
+    transient_contract.TRANSIENT_PROFILE_ID,
+)
+_SOURCE_TRANSIENT_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.transient_fields)
+_SOURCE_SCHEDULE_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.schedule_fields)
+_SOURCE_SCALAR_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.scalar_inputs)
 
 
 class TransientDataContractError(ValueError):
@@ -136,35 +139,51 @@ def _hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     return value
 
 
-def transient_contract_payload() -> dict[str, Any]:
-    """Return the exact persisted transient tensor names, units, and step."""
-    contract = TRANSIENT_STEP_CONTRACT
-    return {
-        "state": [{"name": field.name, "unit": field.unit} for field in contract.dynamic_state],
-        "static": [{"name": field.name, "unit": field.unit} for field in contract.static_spatial_conditioning],
-        "boundary": [{"name": field.name, "unit": field.unit} for field in contract.step_boundary_conditioning],
-        "scalars": [{"name": field.name, "unit": field.unit} for field in contract.scalar_conditioning],
-        "target": [{"name": field.name, "unit": field.unit} for field in contract.target_increments],
-        "dt": {"value": contract.time_step, "unit": contract.time_unit},
-        "storage": contract.canonical_storage_representation,
-        "target_derivation": contract.target_derivation_stage,
-        "material_family_usage": contract.material_family_usage,
-    }
-
-
-def _regular_time_contract(time: np.ndarray, *, path: Path) -> int:
-    """Require the canonical HDF5 time dataset to contain regular states only."""
+def _regular_time_contract(
+    time: np.ndarray,
+    *,
+    path: Path,
+    tolerance: float,
+) -> tuple[int, int]:
+    """Return state count and source stride for the learned transition step."""
     if time.ndim != 1 or time.size < 1 or not np.isfinite(time).all():
         message = f"Transient regular time must be one non-empty finite sequence: {path}."
         raise TransientDataContractError(message)
-    expected = np.arange(time.size, dtype=np.float64) * TRANSIENT_STEP_CONTRACT.time_step
-    if not np.allclose(time, expected, rtol=0.0, atol=_TIME_TOLERANCE):
-        message = f"Transient regular states must be the contiguous one-hour prefix 0..N: {path}."
+    if not math.isclose(float(time[0]), 0.0, rel_tol=0.0, abs_tol=tolerance):
+        message = f"Transient regular time must start at zero: {path}."
         raise TransientDataContractError(message)
-    return int(time.size)
+    if time.size == 1:
+        return 1, 1
+    deltas = np.diff(time)
+    source_step = float(deltas[0])
+    expected = np.arange(time.size, dtype=np.float64) * source_step
+    if (
+        source_step <= 0.0
+        or not np.allclose(deltas, source_step, rtol=0.0, atol=tolerance)
+        or not np.allclose(
+            time,
+            expected,
+            rtol=0.0,
+            atol=tolerance,
+        )
+    ):
+        message = f"Transient HDF5 time states must form one positive regular prefix: {path}."
+        raise TransientDataContractError(message)
+    learned_step = float(transient_contract.TRANSIENT_STEP_CONTRACT.time_step)
+    stride = round(learned_step / source_step)
+    if stride < 1 or not math.isclose(stride * source_step, learned_step, rel_tol=0.0, abs_tol=tolerance):
+        message = f"Transient source step {source_step} h must evenly divide the learned {learned_step} h transition step: {path}."
+        raise TransientDataContractError(message)
+    return int(time.size), stride
 
 
-def _status_evidence(path: Path, time: np.ndarray, exact_stop: float | None) -> dict[str, Any]:
+def _status_evidence(
+    path: Path,
+    time: np.ndarray,
+    exact_stop: float | None,
+    *,
+    tolerance: float,
+) -> dict[str, Any]:
     """Validate an adjacent canonical status sidecar when it is available."""
     status_path = path.with_name("status.json")
     last_regular = float(time[-1])
@@ -183,7 +202,7 @@ def _status_evidence(path: Path, time: np.ndarray, exact_stop: float | None) -> 
     if (
         not isinstance(status, dict)
         or status.get("schema_kind") != "simulation_case_status"
-        or status.get("schema_version") != storage.STATUS_SCHEMA_VERSION
+        or status.get("schema_version") != generation.storage.STATUS_SCHEMA_VERSION
     ):
         message = f"Transient status sidecar schema is invalid: {status_path}."
         raise TransientDataContractError(message)
@@ -194,8 +213,8 @@ def _status_evidence(path: Path, time: np.ndarray, exact_stop: float | None) -> 
         or status.get("schedule_valid") is not True
         or status.get("n_regular_states") != time.size
         or status.get("has_exact_stop_state") is not (exact_stop is not None)
-        or not math.isclose(float(status.get("t_last_regular", math.nan)), last_regular, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
-        or not math.isclose(float(status.get("t_stop_exact", math.nan)), expected_stop, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
+        or not math.isclose(float(status.get("t_last_regular", math.nan)), last_regular, rel_tol=0.0, abs_tol=tolerance)
+        or not math.isclose(float(status.get("t_stop_exact", math.nan)), expected_stop, rel_tol=0.0, abs_tol=tolerance)
     ):
         message = f"Transient status sidecar disagrees with its regular/exact-stop HDF5 sequence: {status_path}."
         raise TransientDataContractError(message)
@@ -207,7 +226,7 @@ def _status_evidence(path: Path, time: np.ndarray, exact_stop: float | None) -> 
     elif (
         isinstance(observed_exact, bool)
         or not isinstance(observed_exact, (int, float))
-        or not math.isclose(float(observed_exact), exact_stop, rel_tol=0.0, abs_tol=_TIME_TOLERANCE)
+        or not math.isclose(float(observed_exact), exact_stop, rel_tol=0.0, abs_tol=tolerance)
     ):
         message = f"Transient exact-stop status disagrees with HDF5: {status_path}."
         raise TransientDataContractError(message)
@@ -246,7 +265,7 @@ def _validate_source_metadata(source: TransientSourceCase, handle: h5py.File) ->
         "simulation_case_id": source.expected_simulation_case_id,
         "material_family": source.material_family,
     }
-    if profile != profiles.TRANSIENT_DRYING_PROFILE or observed != expected:
+    if profile != transient_contract.TRANSIENT_PROFILE_ID or observed != expected:
         message = f"Transient source identity disagrees with package admission: {source.path}."
         raise TransientDataContractError(message)
     return profile
@@ -259,10 +278,10 @@ def _case_record(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Validate one source and return compact case and transition records."""
     path = source.path.expanduser().resolve()
-    if source.evaluation_regime not in PACKAGE_REGIMES:
+    if source.evaluation_regime not in views.PACKAGE_REGIMES:
         message = f"Unsupported transient evaluation regime: {source.evaluation_regime!r}."
         raise TransientDataContractError(message)
-    valid_memberships = (*ID_MEMBERSHIPS, TECHNICAL_SMOKE_MEMBERSHIP) if source.evaluation_regime == "id" else (source.evaluation_regime,)
+    valid_memberships = (*views.ID_MEMBERSHIPS, views.TECHNICAL_SMOKE_MEMBERSHIP) if source.evaluation_regime == "id" else (source.evaluation_regime,)
     if source.membership not in valid_memberships:
         message = f"Membership {source.membership!r} is invalid for {source.evaluation_regime!r}."
         raise TransientDataContractError(message)
@@ -270,11 +289,19 @@ def _case_record(
     if observed_sha256 != source.expected_sha256:
         message = f"Transient source content differs from package admission: {path}."
         raise TransientDataContractError(message)
-    storage.validate_case_hdf5(path, expected_profile=profiles.TRANSIENT_DRYING_PROFILE)
     with h5py.File(path, "r") as handle:
         profile = _validate_source_metadata(source, handle)
-        time = np.asarray(_hdf5_dataset(handle, "time"), dtype=np.float64)
-        regular_count = _regular_time_contract(time, path=path)
+        time_dataset = _hdf5_dataset(handle, "time")
+        time = np.asarray(time_dataset, dtype=np.float64)
+        tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            message = f"Transient time classification tolerance is invalid: {path}."
+            raise TransientDataContractError(message)
+        regular_count, transition_stride = _regular_time_contract(
+            time,
+            path=path,
+            tolerance=tolerance,
+        )
         exact_stop_dataset = handle.get("exact_stop/time")
         exact_stop = None
         if exact_stop_dataset is not None:
@@ -294,23 +321,23 @@ def _case_record(
         static_names = _json_string_list(static_dataset.attrs["field_names"], label="static.field_names")
         schedule_names = _json_string_list(schedule_dataset.attrs["field_names"], label="schedule.field_names")
         scalar_names = _json_string_list(scalar_dataset.attrs["field_names"], label="scalar.field_names")
-        if transient_names != list(profiles.TRANSIENT_FIELD_NAMES):
+        if transient_names != list(_SOURCE_TRANSIENT_FIELDS):
             message = f"Transient fields are not canonical: {path}."
             raise TransientDataContractError(message)
-        required_static = {field.name for field in TRANSIENT_STEP_CONTRACT.static_spatial_conditioning}.difference({"x", "y"})
+        required_static = {field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning}.difference({"x", "y"})
         if not required_static.issubset(static_names):
             message = f"Transient static conditioning is incomplete: {path}."
             raise TransientDataContractError(message)
-        if schedule_names != list(profiles.SCHEDULE_FIELDS) or scalar_names != list(profiles.TRANSIENT_SCALAR_INPUT_FIELDS):
+        if schedule_names != list(_SOURCE_SCHEDULE_FIELDS) or scalar_names != list(_SOURCE_SCALAR_FIELDS):
             message = f"Transient boundary or scalar conditioning is not canonical: {path}."
             raise TransientDataContractError(message)
         schedule_time = np.asarray(schedule_dataset[:, schedule_names.index("t")], dtype=np.float64)
         samples: list[dict[str, Any]] = []
-        for time_index in range(max(regular_count - 1, 0)):
+        for time_index in range(0, max(regular_count - transition_stride, 0), transition_stride):
             t_n = float(time[time_index])
-            t_np1 = float(time[time_index + 1])
-            current = np.flatnonzero(np.isclose(schedule_time, t_n, rtol=0.0, atol=_TIME_TOLERANCE))
-            following = np.flatnonzero(np.isclose(schedule_time, t_np1, rtol=0.0, atol=_TIME_TOLERANCE))
+            t_np1 = float(time[time_index + transition_stride])
+            current = np.flatnonzero(np.isclose(schedule_time, t_n, rtol=0.0, atol=tolerance))
+            following = np.flatnonzero(np.isclose(schedule_time, t_np1, rtol=0.0, atol=tolerance))
             if current.size != 1 or following.size != 1:
                 message = f"Schedule lacks exact endpoints for transition {t_n} -> {t_np1} h: {path}."
                 raise TransientDataContractError(message)
@@ -327,7 +354,7 @@ def _case_record(
     if not samples:
         message = f"Transient source has no complete one-hour transition: {path}."
         raise TransientDataContractError(message)
-    status = _status_evidence(path, time, exact_stop)
+    status = _status_evidence(path, time, exact_stop, tolerance=tolerance)
     record = {
         "package_case_id": source.package_case_id,
         "source_relative_path": _safe_relative_source(path, source_root),
@@ -370,14 +397,13 @@ def build_transient_index(
     dataset_name: str,
     dataset_id: str,
     evaluation_regime: str,
-    contract_digest: str,
     source_root: Path | str,
 ) -> dict[str, Any]:
     """Build one deterministic compact transition index from canonical cases."""
     if not sources:
         message = "Transient index construction requires at least one source case."
         raise TransientDataContractError(message)
-    if evaluation_regime not in PACKAGE_REGIMES or not dataset_name or not dataset_id:
+    if evaluation_regime not in views.PACKAGE_REGIMES or not dataset_name or not dataset_id:
         message = "Transient dataset name, ID, or evaluation regime is invalid."
         raise TransientDataContractError(message)
     root = Path(source_root)
@@ -407,8 +433,8 @@ def build_transient_index(
         "dataset_id": dataset_id,
         "dataset_view": "transient_drying",
         "evaluation_regime": evaluation_regime,
-        "contract_digest": contract_digest,
-        "contract": transient_contract_payload(),
+        "contract_digest": transient_contract.transient_contract_digest(),
+        "contract": transient_contract.transient_contract_payload(),
         "source_locator_root": "storage_root",
         "cases": cases,
         "samples": samples,
@@ -461,8 +487,9 @@ def _load_index(path: Path) -> dict[str, Any]:
         payload["schema_kind"] != TRANSIENT_INDEX_SCHEMA_KIND
         or payload["schema_version"] != TRANSIENT_INDEX_SCHEMA_VERSION
         or payload["dataset_view"] != "transient_drying"
-        or payload["evaluation_regime"] not in PACKAGE_REGIMES
-        or payload["contract"] != transient_contract_payload()
+        or payload["evaluation_regime"] not in views.PACKAGE_REGIMES
+        or payload["contract_digest"] != transient_contract.transient_contract_digest()
+        or payload["contract"] != transient_contract.transient_contract_payload()
         or payload["source_locator_root"] != "storage_root"
         or not isinstance(payload["cases"], list)
         or not isinstance(payload["samples"], list)
@@ -629,24 +656,33 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             schedule_names = _json_string_list(schedule_dataset.attrs["field_names"], label="schedule.field_names")
             scalar_names = _json_string_list(scalar_dataset.attrs["field_names"], label="scalar.field_names")
             time_index = int(sample["time_index"])
-            dynamic_indices = [transient_names.index(field.name) for field in TRANSIENT_STEP_CONTRACT.dynamic_state]
+            time_dataset = _hdf5_dataset(handle, "time")
+            time = np.asarray(time_dataset, dtype=np.float64)
+            tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
+            next_matches = np.flatnonzero(np.isclose(time, float(sample["t_np1"]), rtol=0.0, atol=tolerance))
+            if next_matches.size != 1:
+                message = f"Transient source lacks indexed next state {sample['t_np1']!r}: {path}."
+                raise TransientDataContractError(message)
+            next_time_index = int(next_matches[0])
+            dynamic_indices = [transient_names.index(field.name) for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state]
             state_array = np.asarray(transient_dataset[time_index, dynamic_indices, :, :], dtype=np.float32)
-            next_array = np.asarray(transient_dataset[time_index + 1, dynamic_indices, :, :], dtype=np.float32)
+            next_array = np.asarray(transient_dataset[next_time_index, dynamic_indices, :, :], dtype=np.float32)
             x_axis = np.asarray(_hdf5_dataset(handle, "coords/x")[:], dtype=np.float32)
             y_axis = np.asarray(_hdf5_dataset(handle, "coords/y")[:], dtype=np.float32)
             x_grid, y_grid = np.meshgrid(x_axis, y_axis)
             static_values: dict[str, np.ndarray] = {"x": x_grid, "y": y_grid}
-            for field in TRANSIENT_STEP_CONTRACT.static_spatial_conditioning:
+            for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning:
                 if field.name not in static_values:
                     static_values[field.name] = np.asarray(static_dataset[static_names.index(field.name), :, :], dtype=np.float32)
             static_array = np.stack(
-                [static_values[field.name] for field in TRANSIENT_STEP_CONTRACT.static_spatial_conditioning],
+                [static_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning],
                 axis=0,
             )
             schedule_n = int(sample["schedule_index_n"])
             schedule_np1 = int(sample["schedule_index_np1"])
             scalar_lookup = {
-                field.name: float(scalar_dataset[scalar_names.index(field.name)]) for field in TRANSIENT_STEP_CONTRACT.scalar_conditioning
+                field.name: float(scalar_dataset[scalar_names.index(field.name)])
+                for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
             }
             scalar_lookup["T_amb"] = float(scalar_dataset[scalar_names.index("T_amb")])
             boundary_values = {
@@ -657,11 +693,11 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "T_amb": scalar_lookup["T_amb"],
             }
             boundary_array = np.asarray(
-                [boundary_values[field.name] for field in TRANSIENT_STEP_CONTRACT.step_boundary_conditioning],
+                [boundary_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning],
                 dtype=np.float32,
             )
             scalar_array = np.asarray(
-                [scalar_lookup[field.name] for field in TRANSIENT_STEP_CONTRACT.scalar_conditioning],
+                [scalar_lookup[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning],
                 dtype=np.float32,
             )
         finally:
@@ -675,7 +711,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             "boundary": self._finite_tensor(boundary_array, label="boundary conditioning", path=path),
             "scalars": self._finite_tensor(scalar_array, label="scalar conditioning", path=path),
             "target": next_state - state,
-            "dt": torch.tensor(TRANSIENT_STEP_CONTRACT.time_step, dtype=torch.float32),
+            "dt": torch.tensor(transient_contract.TRANSIENT_STEP_CONTRACT.time_step, dtype=torch.float32),
             "metadata": {
                 "dataset_id": str(self.payload["dataset_id"]),
                 "dataset_name": str(self.payload["dataset_name"]),

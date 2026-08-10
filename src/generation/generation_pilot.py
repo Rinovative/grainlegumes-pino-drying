@@ -26,15 +26,18 @@ import json
 import math
 import shutil
 import statistics
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 
+from . import generation_campaign_evidence as campaign_evidence
 from . import generation_config as config_service
-from . import generation_materials as material_service
 from . import generation_pilot_analysis as analysis_service
+from . import generation_profiles as profiles
 from . import generation_runtime as runtime_service
 from . import generation_storage as storage_service
 from . import generation_workspace as workspace_service
@@ -51,7 +54,8 @@ PILOT_PRE_CLEANUP_FILENAME: Final = "pilot_check_pre_cleanup.json"
 PILOT_STAGING_CLEANUP_FILENAME: Final = "pilot_staging_cleanup.json"
 PILOT_SUMMARY_CSV: Final = "summary.csv"
 PILOT_SUMMARY_MARKDOWN: Final = "summary.md"
-PILOT_SCHEMA_VERSION: Final = 2
+PILOT_SCHEMA_VERSION: Final = 3
+_MIN_REGULAR_STATE_COUNT: Final = 2
 PILOT_RESULT_CLASSES: Final = (
     "PASS",
     "PASS_WITH_WARNINGS",
@@ -96,15 +100,44 @@ _MAX_FIXED_POINT_ITERATIONS: Final = 20
 _SHA256_LENGTH: Final = 64
 
 
+@dataclass(frozen=True, slots=True)
+class CleanupWorkflowEvidence:
+    """Validated terminal workflow evidence required by pilot cleanup."""
+
+    campaign_run_id: str
+    status: str
+    receipt_sha256: str | None
+    reclaimed_bytes: int
+
+    def __post_init__(self) -> None:
+        """Validate one terminal cleanup or retention binding."""
+        if not self.campaign_run_id:
+            message = "Cleanup workflow evidence requires a campaign-run identity."
+            raise ValueError(message)
+        if self.status == "complete":
+            digest = self.receipt_sha256
+            if (
+                not isinstance(digest, str)
+                or len(digest) != _SHA256_LENGTH
+                or any(character not in "0123456789abcdef" for character in digest)
+                or isinstance(self.reclaimed_bytes, bool)
+                or not isinstance(self.reclaimed_bytes, int)
+                or self.reclaimed_bytes < 0
+            ):
+                message = "Completed cleanup workflow evidence is malformed."
+                raise ValueError(message)
+        elif self.status == "skipped_by_request":
+            if self.receipt_sha256 is not None or self.reclaimed_bytes != 0:
+                message = "Retained-source workflow evidence cannot report cleanup results."
+                raise ValueError(message)
+        else:
+            message = f"Cleanup workflow evidence has nonterminal status {self.status!r}."
+            raise ValueError(message)
+
+
 def _utc_now() -> str:
     """Return one timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _run_directory(run_id: str, *, storage_root: Path) -> Path:
-    """Return one existing campaign-run metadata directory."""
-    safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    return common.paths.get_generation_meta_root(storage_root=storage_root) / "campaigns" / safe_id
 
 
 def pilot_check_directory(run_id: str, *, storage_root: Path | str | None) -> Path:
@@ -141,7 +174,8 @@ def _validate_case_result(record: Any) -> None:
         message = "Pilot case result is missing required canonical fields."
         raise ValueError(message)
     if (
-        record["material"] not in material_service.MATERIAL_FAMILIES
+        not isinstance(record["material"], str)
+        or not record["material"]
         or record["material_role"] not in config_service.MATERIAL_ROLES
         or record["case_kind"] not in config_service.PILOT_CASE_KINDS
         or record["result_class"] not in PILOT_RESULT_CLASSES
@@ -194,13 +228,68 @@ def _validate_case_result(record: Any) -> None:
         raise ValueError(message)
 
 
-def _validate_case_results(records: Any) -> None:
-    """Validate exact case-result count and each canonical record."""
+def _validate_case_results(
+    records: Any,
+    *,
+    expected_materials: tuple[str, ...] | None = None,
+) -> None:
+    """Validate each canonical result and optional campaign material coverage."""
     if not isinstance(records, list) or not records:
         message = "Pilot receipt must contain case results."
         raise ValueError(message)
     for record in records:
         _validate_case_result(record)
+    if expected_materials is not None and (
+        not expected_materials
+        or len(expected_materials) != len(set(expected_materials))
+        or {record["material"] for record in records} != set(expected_materials)
+    ):
+        message = "Pilot case results do not cover the resolved campaign material inventory."
+        raise ValueError(message)
+
+
+def _validate_storage_projection(value: Any) -> None:
+    """Validate a projection bound to one resolved production campaign."""
+    required = {
+        "target_campaign_id",
+        "target_campaign_digest",
+        "simulation_profile",
+        "target_case_count",
+        "regular_state_count",
+        "regular_time_start_h",
+        "time_horizon_h",
+        "status",
+        "mean_based_bytes",
+        "median_based_bytes",
+    }
+    if not isinstance(value, dict) or not required.issubset(value):
+        message = "Pilot storage projection lacks its resolved production contract."
+        raise ValueError(message)
+    positive_counts = (value["target_case_count"], value["regular_state_count"])
+    numeric_times = (value["regular_time_start_h"], value["time_horizon_h"])
+    digest = value["target_campaign_digest"]
+    if (
+        not isinstance(value["target_campaign_id"], str)
+        or not value["target_campaign_id"]
+        or not isinstance(digest, str)
+        or len(digest) != _SHA256_LENGTH
+        or any(character not in "0123456789abcdef" for character in digest)
+        or value["simulation_profile"] != profiles.TRANSIENT_DRYING_PROFILE
+        or any(isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in positive_counts)
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in numeric_times)
+        or float(value["time_horizon_h"]) <= float(value["regular_time_start_h"])
+        or value["status"] not in {"available", "unavailable"}
+    ):
+        message = "Pilot storage projection has an invalid resolved production contract."
+        raise ValueError(message)
+    estimates = (value["mean_based_bytes"], value["median_based_bytes"])
+    if value["status"] == "available":
+        if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in estimates):
+            message = "Available pilot storage projections require non-negative byte estimates."
+            raise ValueError(message)
+    elif any(item is not None for item in estimates):
+        message = "Unavailable pilot storage projections cannot report byte estimates."
+        raise ValueError(message)
 
 
 def _regular_files(roots: Iterable[Path], *, excluded: set[Path] | None = None) -> list[Path]:
@@ -366,18 +455,16 @@ def finalize_pilot_campaign(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Publish terminal pilot evidence after every case succeeds or fails durably."""
-    from . import generation_campaign_runtime as campaign_runtime  # noqa: PLC0415
-
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    manifest = campaign_runtime.load_campaign_run(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     if campaign.campaign_purpose != config_service.PILOT_CAMPAIGN_PURPOSE:
         message = f"Campaign {run_id!r} is not a pilot-check campaign."
         raise ValueError(message)
     if not manifest["slurm_job_ids"]:
         message = f"Pilot campaign scheduler identity has not been recovered: {run_id}"
         raise RuntimeError(message)
-    run_directory = _run_directory(run_id, storage_root=storage)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     terminal_path = run_directory / "campaign_terminal.json"
     if terminal_path.exists():
         return terminal_path
@@ -532,7 +619,7 @@ def finalize_pilot_campaign(
         "scheduler_job_name": manifest["scheduler_job_name"],
         "scheduler_log_directory": manifest["scheduler_log_directory"],
         "cases_per_material": len(campaign.batches[0].case_indices),
-        "materials": list(material_service.MATERIAL_FAMILIES),
+        "materials": list(campaign.material_inventory),
         "batches": batch_records,
         "cases": case_records,
         "dataset_packages": [],
@@ -554,22 +641,27 @@ def validate_pilot_terminal(
 ) -> dict[str, Any]:
     """Revalidate one terminal pilot and every success/failure evidence path."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    path = _run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
+    path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
     if not path.exists():
         path = finalize_pilot_campaign(run_id, storage_root=storage)
     terminal = _load_json(path, label="pilot terminal campaign")
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
+    materials = terminal.get("materials")
     if (
         terminal.get("schema_kind") != PILOT_TERMINAL_SCHEMA_KIND
         or terminal.get("schema_version") != PILOT_SCHEMA_VERSION
         or terminal.get("campaign_run_id") != run_id
+        or terminal.get("campaign_id") != campaign.campaign_id
+        or terminal.get("campaign_digest") != campaign.campaign_digest
         or terminal.get("campaign_purpose") != config_service.PILOT_CAMPAIGN_PURPOSE
+        or materials != list(campaign.material_inventory)
         or terminal.get("dataset_packages") != []
     ):
         message = f"Pilot terminal campaign is malformed: {path}"
         raise ValueError(message)
     for record in terminal["cases"]:
         if (
-            record.get("material") not in material_service.MATERIAL_FAMILIES
+            record.get("material") not in terminal["materials"]
             or record.get("material_role") not in config_service.MATERIAL_ROLES
             or record.get("case_kind") not in config_service.PILOT_CASE_KINDS
             or not isinstance(record.get("case_index"), int)
@@ -614,12 +706,10 @@ def pilot_transfer_plan(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return public directories for successful cases and published failure evidence."""
-    from . import generation_campaign_runtime as campaign_runtime  # noqa: PLC0415
-
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     terminal = validate_pilot_terminal(run_id, storage_root=storage)
-    manifest = campaign_runtime.load_campaign_run(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
 
     def relative(directory: Path) -> str:
         resolved = directory.resolve()
@@ -633,7 +723,7 @@ def pilot_transfer_plan(
         "campaign_name": campaign.campaign_name,
         "git_commit": manifest["git_commit"],
         "campaign_config": manifest["campaign_config"],
-        "campaign_directory": relative(_run_directory(run_id, storage_root=storage)),
+        "campaign_directory": relative(campaign_evidence.campaign_run_directory(run_id, storage_root=storage)),
         "batches": [
             {
                 "batch_name": batch.batch_name,
@@ -739,7 +829,7 @@ def record_cpu_source_inventory(
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     terminal = validate_pilot_terminal(run_id, storage_root=storage)
     plan = pilot_transfer_plan(run_id, storage_root=storage)
-    path = _run_directory(run_id, storage_root=storage) / PILOT_SOURCE_INVENTORY_FILENAME
+    path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / PILOT_SOURCE_INVENTORY_FILENAME
     roots = _plan_roots(plan, storage=storage)
     files = _regular_files(roots, excluded={path})
     records = _file_records(files, storage_root=storage)
@@ -798,7 +888,7 @@ def record_transfer_staging_inventory(
 ) -> dict[str, Any]:
     """Record exact transfer-staging bytes before publication and later cleanup."""
     staging = workspace_service.validate_transfer_staging(staging_root, run_id=run_id)
-    run_directory = _run_directory(run_id, storage_root=staging)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=staging)
     path = run_directory / PILOT_STAGING_INVENTORY_FILENAME
     files = _regular_files([staging], excluded={path})
     base_bytes = sum(item.stat().st_size for item in files)
@@ -840,7 +930,7 @@ def validate_cpu_source_inventory(
 ) -> dict[str, Any]:
     """Validate the transferred exact pre-cleanup CPU source inventory."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    path = _run_directory(run_id, storage_root=storage) / PILOT_SOURCE_INVENTORY_FILENAME
+    path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / PILOT_SOURCE_INVENTORY_FILENAME
     payload = _load_json(path, label="transferred pilot CPU source inventory")
     required = {
         "schema_kind",
@@ -910,7 +1000,7 @@ def validate_transfer_staging_inventory(
 ) -> dict[str, Any]:
     """Validate recorded staging size and, while retained, its exact live tree."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    path = _run_directory(run_id, storage_root=storage) / PILOT_STAGING_INVENTORY_FILENAME
+    path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / PILOT_STAGING_INVENTORY_FILENAME
     payload = _load_json(path, label="pilot transfer staging inventory")
     required = {
         "schema_kind",
@@ -1067,10 +1157,13 @@ def _invalid_success_case_result(
     }
 
 
-def _per_material(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate one directly comparable row per pilot material."""
+def _per_material(
+    cases: list[dict[str, Any]],
+    materials: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Aggregate one directly comparable row per configured pilot material."""
     rows: list[dict[str, Any]] = []
-    for material in config_service.materials.MATERIAL_FAMILIES:
+    for material in materials:
         selected = [record for record in cases if record["material"] == material]
         nominal = next(record for record in selected if record["case_kind"] == "nominal_reference")
         successful = [
@@ -1157,7 +1250,7 @@ def _problems(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "problem_category": "duration",
                     "explanation": duration["result"],
                     "actual_value": duration["drying_time_h"],
-                    "reference_value": "nominal target window 24 h through 168 h",
+                    "reference_value": duration["adequacy_window_h"],
                 }
             )
         if not duration["stop_consistent"]:
@@ -1359,12 +1452,15 @@ def _summary_markdown(receipt: Mapping[str, Any]) -> str:
                 f"({receipt['cleanup']['transfer_staging']['bytes_reclaimed']} bytes reclaimed)"
             ),
             "",
-            "## Projection for 660 transient cases",
+            f"## Projection for {receipt['production_storage_projection']['target_case_count']} transient cases",
             "",
+            f"- Target campaign: {receipt['production_storage_projection']['target_campaign_id']}",
+            f"- Configured regular states per full-horizon case: {receipt['production_storage_projection']['regular_state_count']}",
+            f"- Configured time horizon: {receipt['production_storage_projection']['time_horizon_h']} h",
             f"- Basis: {receipt['production_storage_projection'].get('basis')}",
-            f"- Observed mean-based: {receipt['production_storage_projection'].get('mean_based_660_bytes')}",
-            f"- Observed median-based: {receipt['production_storage_projection'].get('median_based_660_bytes')}",
-            f"- Full-horizon projection: {receipt['production_storage_projection'].get('full_horizon_projection')}",
+            f"- Observed mean-based: {receipt['production_storage_projection'].get('mean_based_bytes')}",
+            f"- Observed median-based: {receipt['production_storage_projection'].get('median_based_bytes')}",
+            f"- Configured-horizon projection: {receipt['production_storage_projection'].get('full_horizon_projection')}",
             "",
             "All conservation residuals are reported without an invented acceptance tolerance.",
             "",
@@ -1379,9 +1475,7 @@ def _gpu_inventory(
     storage: Path,
 ) -> dict[str, Any]:
     """Measure permanent GPU generation and pilot metadata separately."""
-    from . import generation_campaign_runtime as campaign_runtime  # noqa: PLC0415
-
-    plan = campaign_runtime.campaign_transfer_plan(run_id, storage_root=storage)
+    plan = pilot_transfer_plan(run_id, storage_root=storage)
     generation_files = _regular_files(_plan_roots(plan, storage=storage))
     pilot_directory = pilot_check_directory(run_id, storage_root=storage)
     pilot_files = _regular_files([pilot_directory]) if pilot_directory.is_dir() else []
@@ -1452,28 +1546,78 @@ def _write_receipt_and_views(
     return receipt
 
 
+def _production_projection_contract(production_campaign: Path | str) -> dict[str, Any]:
+    """Resolve the production count and time basis for pilot projections."""
+    campaign = config_service.load_campaign_config(
+        production_campaign,
+        require_executable=False,
+    )
+    if (
+        campaign.campaign_purpose != "family_generalization"
+        or campaign.profile.id != profiles.TRANSIENT_DRYING_PROFILE
+        or not campaign.batches
+        or campaign.total_case_count < 1
+    ):
+        message = "Pilot projections require a transient family-generalization campaign."
+        raise ValueError(message)
+    time_contracts: list[tuple[float, ...]] = []
+    for batch in campaign.batches:
+        time = batch.scientific_values.get("time")
+        raw_times = time.get("regular_times") if isinstance(time, dict) else None
+        if not isinstance(raw_times, list) or len(raw_times) < _MIN_REGULAR_STATE_COUNT:
+            message = f"Production batch {batch.batch_name!r} lacks resolved regular times."
+            raise ValueError(message)
+        regular_times = tuple(float(value) for value in raw_times)
+        if not all(math.isfinite(value) for value in regular_times) or any(current <= previous for previous, current in pairwise(regular_times)):
+            message = f"Production batch {batch.batch_name!r} has invalid resolved regular times."
+            raise ValueError(message)
+        time_contracts.append(regular_times)
+    regular_times = time_contracts[0]
+    if any(candidate != regular_times for candidate in time_contracts[1:]):
+        message = "Production batches disagree on the resolved regular-time contract."
+        raise ValueError(message)
+    return {
+        "target_campaign_id": campaign.campaign_id,
+        "target_campaign_digest": campaign.campaign_digest,
+        "simulation_profile": campaign.profile.id,
+        "target_case_count": campaign.total_case_count,
+        "regular_state_count": len(regular_times),
+        "regular_time_start_h": regular_times[0],
+        "time_horizon_h": regular_times[-1],
+    }
+
+
 def prepare_pilot_receipt(
     run_id: str,
     *,
+    production_campaign: Path | str,
     storage_root: Path | str | None = None,
     cleanup_requested: bool = True,
 ) -> dict[str, Any]:
-    """Analyze transferred evidence and durably gate cleanup with a canonical receipt."""
-    from . import generation_campaign_runtime as campaign_runtime  # noqa: PLC0415
-
+    """Analyze evidence using an explicit resolved production projection target."""
     if not isinstance(cleanup_requested, bool):
         message = "cleanup_requested must be boolean."
         raise TypeError(message)
+    projection_contract = _production_projection_contract(production_campaign)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
     terminal = validate_pilot_terminal(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
-    run_directory = _run_directory(run_id, storage_root=storage)
+    campaign_evidence.validate_transfer_receipt(
+        run_id,
+        terminal=terminal,
+        plan=pilot_transfer_plan(run_id, storage_root=storage),
+        storage_root=storage,
+    )
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     snapshot_path = pilot_check_directory(run_id, storage_root=storage) / PILOT_PRE_CLEANUP_FILENAME
     if snapshot_path.exists():
         snapshot = validate_pilot_pre_cleanup(run_id, storage_root=storage)
         if snapshot.get("cleanup", {}).get("cleanup_requested") is not cleanup_requested:
             message = "Existing pilot cleanup choice conflicts with the current --keep-cpu-source selection."
+            raise ValueError(message)
+        projection = snapshot.get("production_storage_projection")
+        if not isinstance(projection, dict) or any(projection.get(key) != value for key, value in projection_contract.items()):
+            message = "Existing pilot projection conflicts with the resolved production campaign."
             raise ValueError(message)
         return snapshot
     source_inventory = validate_cpu_source_inventory(run_id, storage_root=storage)
@@ -1495,9 +1639,9 @@ def prepare_pilot_receipt(
             cases.append(result)
         else:
             cases.append(_failure_case_result(record, storage=storage))
-    _validate_case_results(cases)
+    _validate_case_results(cases, expected_materials=campaign.material_inventory)
     successful = [record for record in cases if record["solver_status"] == "success" and record["storage"].get("canonical_hdf5_bytes") is not None]
-    per_material = _per_material(cases)
+    per_material = _per_material(cases, campaign.material_inventory)
     duration_ready = all(
         row["nominal_duration_result"] == "PASS"
         and row["nominal_result_class"] in {"PASS", "PASS_WITH_WARNINGS"}
@@ -1523,7 +1667,7 @@ def prepare_pilot_receipt(
         },
         "template_digest": campaign.profile.template_sha256,
         "execution_resources": copy.deepcopy(campaign.execution_values),
-        "materials": list(material_service.MATERIAL_FAMILIES),
+        "materials": list(campaign.material_inventory),
         "cases_per_material": terminal["cases_per_material"],
         "case_counts": terminal["terminal_counts"],
         "cases": cases,
@@ -1532,7 +1676,14 @@ def prepare_pilot_receipt(
         "pre_cleanup_cpu_inventory": source_inventory,
         "transfer_staging_inventory": staging_inventory,
         "post_transfer_gpu_inventory": {},
-        "production_storage_projection": analysis_service.production_storage_projection(successful),
+        "production_storage_projection": {
+            **analysis_service.production_storage_projection(
+                successful,
+                target_case_count=projection_contract["target_case_count"],
+                regular_state_count=projection_contract["regular_state_count"],
+            ),
+            **projection_contract,
+        },
         "retained_evidence_paths": retained_paths,
         "cleanup": {
             "authorized": True,
@@ -1590,8 +1741,6 @@ def validate_pilot_pre_cleanup(
     require_live_evidence: bool = False,
 ) -> dict[str, Any]:
     """Validate the immutable pilot evidence snapshot required for cleanup."""
-    from . import generation_campaign_runtime as campaign_runtime  # noqa: PLC0415
-
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     directory = pilot_check_directory(run_id, storage_root=storage)
     snapshot = _load_json(
@@ -1599,6 +1748,7 @@ def validate_pilot_pre_cleanup(
         label="pilot pre-cleanup snapshot",
     )
     _validate_case_results(snapshot.get("cases"))
+    _validate_storage_projection(snapshot.get("production_storage_projection"))
     retained = snapshot.get("retained_evidence_paths", [])
     retained_paths = [Path(value).resolve() for value in retained if isinstance(value, str)]
     if (
@@ -1612,6 +1762,18 @@ def validate_pilot_pre_cleanup(
     ):
         message = f"Pilot pre-cleanup evidence is invalid: {directory}"
         raise ValueError(message)
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
+    _validate_case_results(
+        snapshot.get("cases"),
+        expected_materials=campaign.material_inventory,
+    )
+    if (
+        snapshot.get("campaign_id") != campaign.campaign_id
+        or snapshot.get("campaign_digest") != campaign.campaign_digest
+        or snapshot.get("materials") != list(campaign.material_inventory)
+    ):
+        message = f"Pilot pre-cleanup campaign evidence is invalid: {directory}"
+        raise ValueError(message)
     validate_cpu_source_inventory(run_id, storage_root=storage)
     validate_transfer_staging_inventory(
         run_id,
@@ -1619,8 +1781,13 @@ def validate_pilot_pre_cleanup(
         require_staging_present=require_live_evidence,
     )
     if require_live_evidence:
-        campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
-        validate_pilot_terminal(run_id, storage_root=storage)
+        terminal = validate_pilot_terminal(run_id, storage_root=storage)
+        campaign_evidence.validate_transfer_receipt(
+            run_id,
+            terminal=terminal,
+            plan=pilot_transfer_plan(run_id, storage_root=storage),
+            storage_root=storage,
+        )
         canonical = _load_json(directory / PILOT_RECEIPT_FILENAME, label="canonical pilot receipt")
         if (
             canonical != snapshot
@@ -1723,10 +1890,11 @@ def cleanup_recorded_transfer_staging(
     return receipt
 
 
-def record_cleanup_result(
+def finalize_cleanup_receipt(
     run_id: str,
     *,
     storage_root: Path | str | None,
+    workflow_evidence: CleanupWorkflowEvidence,
     cpu_source_removed: bool,
     cpu_bytes_reclaimed: int,
     cpu_cleanup_receipt_sha256: str | None,
@@ -1768,29 +1936,21 @@ def record_cleanup_result(
     if not cleanup_requested and cpu_source_removed:
         message = "--keep-cpu-source pilot unexpectedly removed CPU source."
         raise RuntimeError(message)
-    from . import generation_workflow as workflow_service  # noqa: PLC0415
-
-    workflow = workflow_service.validate_all_workflow_receipt(
-        run_id,
-        storage_root=storage,
-    )
-    workflow_cleanup = workflow["cpu_cleanup_complete"]
-    workflow_evidence = workflow["cpu_cleanup_receipt"]
+    if not isinstance(workflow_evidence, CleanupWorkflowEvidence):
+        message = "Pilot cleanup requires validated workflow evidence."
+        raise TypeError(message)
+    if workflow_evidence.campaign_run_id != run_id:
+        message = "Pilot cleanup workflow evidence belongs to a different campaign run."
+        raise ValueError(message)
     if cleanup_requested:
         if (
-            workflow_cleanup.get("status") != "complete"
-            or not isinstance(workflow_evidence, dict)
-            or workflow_evidence.get("receipt_sha256") != cpu_cleanup_receipt_sha256
-            or workflow_evidence.get("reclaimed_bytes") != cpu_bytes_reclaimed
+            workflow_evidence.status != "complete"
+            or workflow_evidence.receipt_sha256 != cpu_cleanup_receipt_sha256
+            or workflow_evidence.reclaimed_bytes != cpu_bytes_reclaimed
         ):
             message = "Pilot CPU cleanup result differs from the validated all-workflow receipt."
             raise ValueError(message)
-    elif (
-        workflow_cleanup.get("status") != "skipped_by_request"
-        or workflow_evidence is not None
-        or cpu_cleanup_receipt_sha256 is not None
-        or cpu_bytes_reclaimed != 0
-    ):
+    elif workflow_evidence.status != "skipped_by_request" or cpu_cleanup_receipt_sha256 is not None or cpu_bytes_reclaimed != 0:
         message = "Retained pilot CPU source differs from the validated all-workflow receipt."
         raise ValueError(message)
     receipt["cleanup"]["cpu_source"] = {
@@ -1825,14 +1985,19 @@ def validate_pilot_receipt(
     validate_pilot_pre_cleanup(run_id, storage_root=storage)
     path = pilot_receipt_path(run_id, storage_root=storage)
     receipt = _load_json(path, label="canonical pilot receipt")
-    _validate_case_results(receipt.get("cases"))
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
+    _validate_case_results(
+        receipt.get("cases"),
+        expected_materials=campaign.material_inventory,
+    )
+    _validate_storage_projection(receipt.get("production_storage_projection"))
     directory = path.parent
     if (
         receipt.get("schema_kind") != PILOT_RECEIPT_SCHEMA_KIND
         or receipt.get("schema_version") != PILOT_SCHEMA_VERSION
         or receipt.get("pilot_check_id") != run_id
         or receipt.get("campaign_purpose") != config_service.PILOT_CAMPAIGN_PURPOSE
-        or receipt.get("materials") != list(material_service.MATERIAL_FAMILIES)
+        or receipt.get("materials") != list(campaign.material_inventory)
         or receipt.get("scientific_interpretation", {}).get("mass_balance_acceptance_tolerance") is not None
         or receipt.get("scientific_interpretation", {}).get("storage_budget_guard") is not None
         or not all(Path(item).exists() for item in receipt.get("retained_evidence_paths", []))
@@ -1848,26 +2013,6 @@ def validate_pilot_receipt(
         message = f"Pilot cleanup is not terminally complete: {run_id}"
         raise RuntimeError(message)
     if require_cleanup_complete:
-        from . import generation_workflow as workflow_service  # noqa: PLC0415
-
-        workflow = workflow_service.validate_all_workflow_receipt(
-            run_id,
-            storage_root=storage,
-        )
-        cleanup_requested = bool(receipt["cleanup"]["cleanup_requested"])
-        if cleanup_requested:
-            workflow_evidence = workflow["cpu_cleanup_receipt"]
-            if (
-                workflow["cpu_cleanup_complete"].get("status") != "complete"
-                or not isinstance(workflow_evidence, dict)
-                or workflow_evidence.get("receipt_sha256") != receipt["cleanup"]["cpu_source"]["receipt_sha256"]
-                or workflow_evidence.get("reclaimed_bytes") != receipt["cleanup"]["cpu_source"]["bytes_reclaimed"]
-            ):
-                message = f"Pilot CPU cleanup is not bound to the all-workflow receipt: {run_id}"
-                raise ValueError(message)
-        elif workflow["cpu_cleanup_complete"].get("status") != "skipped_by_request":
-            message = f"Pilot CPU-source retention is not bound to the all-workflow receipt: {run_id}"
-            raise ValueError(message)
         staging_cleanup_path = directory / PILOT_STAGING_CLEANUP_FILENAME
         staging_sha256 = receipt["cleanup"]["transfer_staging"].get("receipt_sha256")
         if (
@@ -1952,10 +2097,13 @@ def terminal_summary(receipt: Mapping[str, Any]) -> str:
             f"CPU bytes reclaimed: {cleanup['cpu_source']['bytes_reclaimed']}",
             f"Staging bytes reclaimed: {cleanup['transfer_staging']['bytes_reclaimed']}",
             "",
-            "Projection for 660 transient cases",
-            f"Observed mean-based: {projection.get('mean_based_660_bytes')}",
-            f"Observed median-based: {projection.get('median_based_660_bytes')}",
-            f"Full-horizon projection: {projection.get('full_horizon_projection')}",
+            f"Projection for {projection['target_case_count']} transient cases",
+            f"Target campaign: {projection['target_campaign_id']}",
+            f"Configured regular states per full-horizon case: {projection['regular_state_count']}",
+            f"Configured time horizon: {projection['time_horizon_h']} h",
+            f"Observed mean-based: {projection.get('mean_based_bytes')}",
+            f"Observed median-based: {projection.get('median_based_bytes')}",
+            f"Configured-horizon projection: {projection.get('full_horizon_projection')}",
         ]
     )
     return "\n".join(lines)

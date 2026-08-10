@@ -351,7 +351,7 @@ def plot_mean_error_maps(
     error_mode: str = "MAE",
 ) -> Figure:
     """Plot current MAE or field-RMS-relative mean maps in historical layout."""
-    if error_mode in {"MAE", "absolute"}:
+    if error_mode == "MAE":
         return _map_figure(
             datasets=datasets,
             max_cases=max_cases,
@@ -359,7 +359,7 @@ def plot_mean_error_maps(
             metric_label="MAE",
             title="Mean absolute error maps",
         )
-    if error_mode in {"Relative [%]", "local_relative"}:
+    if error_mode == "Relative [%]":
         return _map_figure(
             datasets=datasets,
             max_cases=max_cases,

@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from src import common, generation
+from src.generation import generation_campaign_evidence as campaign_evidence
+from src.generation import generation_workspace as workspace
 
 _RUN_ID = "synthetic_workflow__0123456789abcdef"
 _COMMIT = "a" * 40
@@ -405,7 +407,7 @@ def test_cpu_cleanup_rejects_sources_shared_with_another_campaign_run(
     other_directory.mkdir()
     shared_batch = {key: str((storage / plan["batches"][0][key]).resolve()) for key in ("meta_directory", "raw_directory", "processed_directory")}
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        campaign_evidence,
         "load_campaign_run",
         lambda *_args, **_kwargs: {"state": "submitted", "batches": [shared_batch]},
     )
@@ -548,7 +550,7 @@ def test_storage_status_reports_separate_protected_layers_and_staging(
     datasets_root.mkdir(parents=True)
     (generation_root / "source.bin").write_bytes(b"source")
     (datasets_root / "package.bin").write_bytes(b"package")
-    staging = generation.workspace.create_transfer_staging(
+    staging = workspace.create_transfer_staging(
         storage_root=storage,
         run_id=_RUN_ID,
     )

@@ -24,10 +24,10 @@ CAMPAIGN_CONFIG="$1"
 shift
 WORKER_ARGUMENTS=("$@")
 
-GENERATION_CPU_VENV="${GENERATION_CPU_VENV:-${HOME}/.venvs/grainlegumes-generation-cpu}"
-STORAGE_ROOT="${STORAGE_ROOT:-${HOME}/grainlegumes-generation/storage}"
+GENERATION_CPU_VENV="${GENERATION_CPU_VENV:-}"
+STORAGE_ROOT="${STORAGE_ROOT:-}"
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
-  printf 'GENERATION_CPU_VENV and STORAGE_ROOT must be absolute paths.\n' >&2
+  printf 'GENERATION_CPU_VENV and STORAGE_ROOT must be explicit absolute paths.\n' >&2
   exit 2
 fi
 if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
@@ -68,20 +68,26 @@ if [[ ! "${SLURM_CPUS_PER_TASK:-}" =~ ^[1-9][0-9]*$ || "${SLURM_CPUS_PER_TASK}" 
   exit 2
 fi
 
-module load Python/3.10
-module load Comsol/v6.4
-command -v python3
-python3 --version
-command -v comsol
-COMSOL_VERSION_OUTPUT="$(comsol -version 2>&1)"
+for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
+  GENERATION_PYTHON_EXECUTABLE GENERATION_COMSOL_EXECUTABLE; do
+  value="${!variable_name:-}"
+  if [[ -z "${value}" || "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    printf '%s must be supplied by the resolved campaign execution plan.\n' "${variable_name}" >&2
+    exit 2
+  fi
+done
+module load "${GENERATION_PYTHON_MODULE}"
+module load "${GENERATION_COMSOL_MODULE}"
+command -v "${GENERATION_PYTHON_EXECUTABLE}"
+"${GENERATION_PYTHON_EXECUTABLE}" --version
+command -v "${GENERATION_COMSOL_EXECUTABLE}"
+COMSOL_VERSION_OUTPUT="$("${GENERATION_COMSOL_EXECUTABLE}" -version 2>&1)"
 printf '%s\n' "${COMSOL_VERSION_OUTPUT}"
-[[ "${COMSOL_VERSION_OUTPUT}" == *"6.4"* ]] || { printf 'COMSOL 6.4 required.\n' >&2; exit 1; }
 command -v rsync
 rsync --version
 command -v srun
 source "${GENERATION_CPU_VENV}/bin/activate"
-python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else f"Python 3.10 required, got {sys.version}")'
-python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+"${GENERATION_CPU_VENV}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
 
 export STORAGE_ROOT
 SCRATCH_PARENT="${TMPDIR:-/tmp}"

@@ -6,15 +6,26 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 
 from src import common, generation
+from src.generation import generation_workspace as workspace
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def _natural_batch_name(simulation_profile: str) -> str:
+    """Return one canonical synthetic natural-batch selector."""
+    return generation.config.build_batch_name(
+        simulation_profile,
+        "lentil",
+        "natural",
+    )
 
 
 def test_float32_conversion_requires_explicit_tolerance() -> None:
@@ -34,7 +45,7 @@ def test_resolved_science_and_execution_are_persisted_separately(
     config_path, _template = generation_config_factory()
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch=_natural_batch_name("transient_drying"),
     )
     scientific_path = generation.runtime.initialize_batch_metadata(config, storage_root=tmp_path / "storage")
     assert scientific_path.name == "resolved_generation_config.json"
@@ -48,6 +59,148 @@ def test_resolved_science_and_execution_are_persisted_separately(
     assert common.serialization.canonical_json_sha256(scientific) == config.scientific_config_digest
 
 
+def test_terminal_case_identity_binds_persisted_input_configuration(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reject case identities recomputed around an arbitrary input-config digest."""
+    config_path, _template = generation_config_factory()
+    config = generation.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    bundle = generation.case.generate_case_input_bundle(config, 1, tmp_path / "case identity")
+    payload = bundle.case_payload
+    manifest = {
+        "simulation_profile": config.profile.id,
+        "batch_id": config.batch_id,
+        "batch_identity": config.batch_identity,
+        "scientific_config_digest": config.scientific_config_digest,
+        "git_commit": "a" * 40,
+        "material_family": config.material_family,
+        "sampling_regime": config.sampling_regime,
+        "available_learning_views": list(config.profile.available_learning_views),
+        "airflow_source": config.profile.airflow_source,
+        "template": {
+            "relative_path": config.profile.template_relative_path,
+            "sha256": config.template_sha256,
+        },
+        "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
+    }
+    record = {
+        "case_id": bundle.case_id,
+        "case_index": 1,
+        "case_input_id": bundle.case_input_id,
+        "simulation_case_id": bundle.simulation_case_id,
+        "material_family": config.material_family,
+    }
+    generation.runtime._require_case_matches_terminal(  # noqa: SLF001
+        payload,
+        manifest=manifest,
+        scientific=config.scientific_values,
+        record=record,
+        directory=bundle.directory,
+    )
+
+    tampered = json.loads(json.dumps(payload))
+    tampered["case_input_config_digest"] = "0" * 64
+    assert tampered["case_input_config_digest"] != config.case_input_config_digest
+    tampered["case_input_id"] = generation.case.compute_case_input_id(tampered)
+    tampered["simulation_case_id"] = generation.case.compute_simulation_case_id(tampered)
+    tampered_record = {
+        **record,
+        "case_input_id": tampered["case_input_id"],
+        "simulation_case_id": tampered["simulation_case_id"],
+    }
+    with pytest.raises(RuntimeError, match="metadata disagrees"):
+        generation.runtime._require_case_matches_terminal(  # noqa: SLF001
+            tampered,
+            manifest=manifest,
+            scientific=config.scientific_values,
+            record=tampered_record,
+            directory=bundle.directory,
+        )
+
+
+def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """Protect pilot terminal identity when sampling_regime remains natural."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+    )
+    original = generation.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    scientific = json.loads(json.dumps(original.scientific_values))
+    assignment = {
+        "case_index": 1,
+        "regime_index": 0,
+        "material_family": "lentil",
+        "material_role": "seen",
+        "evaluation_regime": generation.config.NO_EVALUATION_REGIME,
+        "sampling_regime": "natural",
+        "assignment_role": "nominal_reference",
+        "ood_group": None,
+        "ood_unit_id": None,
+        "ood_units_per_case": 0,
+        "pilot_case_kind": "nominal_reference",
+    }
+    scientific.update(
+        {
+            "campaign_purpose": generation.config.PILOT_CAMPAIGN_PURPOSE,
+            "evaluation_regime": generation.config.NO_EVALUATION_REGIME,
+            "case_count": 1,
+            "assignments": [assignment],
+            "pilot_check": {
+                "cases_per_material": 1,
+                "case_kinds": list(generation.config.PILOT_CASE_KINDS),
+                "case_semantics": {"first": "nominal_reference", "remaining": "natural_pilot"},
+                "nominal_case_index": 1,
+                "dataset_membership": "none",
+                "sampling_semantics": "one_explicit_nominal_then_ordinary_natural_support",
+            },
+        }
+    )
+    scientific.pop("paired_equivalence_seed", None)
+    scientific_digest = common.serialization.canonical_json_sha256(scientific)
+    case_input_digest = generation.config.compute_case_input_config_digest(scientific)
+    batch_name = generation.config.build_batch_name(
+        original.profile.id,
+        original.material_family,
+        generation.config.PILOT_CAMPAIGN_PURPOSE,
+    )
+    batch = replace(
+        original,
+        evaluation_regime=generation.config.NO_EVALUATION_REGIME,
+        batch_name=batch_name,
+        scientific_values=scientific,
+        case_indices=(1,),
+        assignments={1: assignment},
+        scientific_config_digest=scientific_digest,
+        case_input_config_digest=case_input_digest,
+        batch_identity=scientific_digest,
+        batch_id=generation.config.build_batch_id(batch_name, scientific_digest),
+    )
+    storage = tmp_path / "pilot terminal storage"
+    generation.runtime.run_case(
+        batch,
+        1,
+        cores_per_case=1,
+        storage_root=storage,
+        work_root=tmp_path / "pilot terminal work",
+    )
+    generation.runtime.finalize_batch(batch, storage_root=storage)
+    admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
+    assert admitted.batch_name == batch_name
+    assert admitted.sampling_regime == "natural"
+    assert admitted.scientific_config_payload()["campaign_purpose"] == "pilot_check"
+
+
 def test_preparation_failure_is_recorded_without_a_work_directory(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -57,7 +210,7 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
     config_path, _template = generation_config_factory()
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch=_natural_batch_name("transient_drying"),
     )
     storage = tmp_path / "storage"
 
@@ -91,7 +244,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     config_path, _template = generation_config_factory(executable=fake_comsol, timeout=0.1)
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch=_natural_batch_name("transient_drying"),
     )
     storage = tmp_path / "storage"
     work = tmp_path / "work"
@@ -130,7 +283,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     prepared = generation.case.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work)
     with pytest.raises(FileNotFoundError, match=r"airflow\.csv"):
         generation.runtime.collect_exports(config, prepared)
-    generation.workspace.cleanup_case_workspace(
+    workspace.cleanup_case_workspace(
         prepared.work_directory,
         allowed_root=prepared.work_root,
         storage_root=storage.resolve(),
@@ -166,11 +319,11 @@ def test_solver_receives_exact_isolated_cwd_and_relative_files(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "storage with spaces"
     cleanup_observations: list[bool] = []
-    original_cleanup = generation.workspace.cleanup_case_workspace
+    original_cleanup = workspace.cleanup_case_workspace
 
     def cleanup_after_publication(*args: Any, **kwargs: Any) -> int:
         cleanup_observations.append(
@@ -183,7 +336,7 @@ def test_solver_receives_exact_isolated_cwd_and_relative_files(
         return original_cleanup(*args, **kwargs)
 
     monkeypatch.setattr(
-        generation.workspace,
+        workspace,
         "cleanup_case_workspace",
         cleanup_after_publication,
     )
@@ -228,7 +381,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "concurrent storage"
     work = tmp_path / "concurrent work"
@@ -288,10 +441,10 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "publication failure storage"
-    original_cleanup = generation.workspace.cleanup_case_workspace
+    original_cleanup = workspace.cleanup_case_workspace
     observed = {"publication_called": False, "failure_before_cleanup": False}
 
     def fail_publication(*_args: Any, **_kwargs: Any) -> None:
@@ -315,7 +468,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         fail_publication,
     )
     monkeypatch.setattr(
-        generation.workspace,
+        workspace,
         "cleanup_case_workspace",
         evidence_first_cleanup,
     )
@@ -360,7 +513,7 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
     )
     config = generation.config.load_generation_config(
         config_path,
-        only_batch="steady_flow__lentil__natural",
+        only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "cancelled storage"
     tracker = tmp_path / "cancelled tracker.json"

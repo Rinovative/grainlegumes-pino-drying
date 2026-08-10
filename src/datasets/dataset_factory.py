@@ -2,66 +2,42 @@
 ===============================================================================
 dataset_factory.py
 ===============================================================================
-Resolve typed dataset packages, selectors, runtime objects, and DataLoaders.
+Resolve package requests and orchestrate generic Dataset runtime loading.
 Responsibilities:
-  - Load the sole steady tensor contract and transient lazy HDF5 contract
-  - Apply explicit ID-membership and parameter-OOD group selectors
-  - Validate worker, sampler, shuffle, prefetch, and HDF5-cache settings
+  - Validate package-view, selector, and DataLoader requests
+  - Dispatch steady and transient packages to their responsible runtimes
+  - Construct DataLoaders with safe worker and collation settings
 Design principles:
+  - View runtimes own their data contracts and selection behavior
   - Package identity and ordering remain independent of DataLoader behavior
   - Worker-only options are passed only when worker processes exist
-  - Transient values remain physical and expose one optional transform hook
 This module does NOT:
-  - Fit normalization, choose experiment splits, register tasks, or train models
-  - Add transient normalization, distributed training, or storage backends
+  - Implement steady or transient Dataset storage access
+  - Fit normalization, choose experiment splits, or train models
 ===============================================================================
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import torch
 from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 
-from src import common, domain
+from src import common
 
 from . import dataset_identity as identity
-from . import dataset_packages as packages
+from . import dataset_package_manifest as package_manifest
+from . import dataset_steady as steady
 from . import dataset_transient as transient
 from . import dataset_views as views
 
 if TYPE_CHECKING:
-    from src.domain.tasks.domain_task_spec import TaskSpec
+    from pathlib import Path
 
-
-class SteadyFlowMetadata(TypedDict, total=False):
-    """Describe the source identity required on new steady package items."""
-
-    dataset_id: str
-    simulation_case_id: str
-    case_input_id: str
-    source_batch_id: str
-    source_simulation_profile: str
-    material_family: str
-    evaluation_regime: str
-    dataset_membership: str
-    source_hdf5_sha256: str
-    generator: dict[str, Any]
-
-
-class SteadyFlowItem(TypedDict):
-    """Expose one steady input/target pair and isolated source metadata."""
-
-    x: torch.Tensor
-    y: torch.Tensor
-    meta: SteadyFlowMetadata
+    import torch
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +48,7 @@ class DatasetRequest:
     dataset_view: views.DatasetViewId
     evaluation_regime: views.PackageRegime
     membership: views.IdMembership | None = None
-    ood_group: views.OodGroup | None = None
+    ood_group: str | None = None
     storage_root: Path | str | None = None
     allow_technical_smoke: bool = False
 
@@ -83,8 +59,8 @@ class DatasetRequest:
         if self.membership is not None and self.membership not in views.ID_MEMBERSHIPS:
             message = f"Unsupported ID membership selector: {self.membership!r}."
             raise ValueError(message)
-        if self.ood_group is not None and self.ood_group not in views.OOD_GROUPS:
-            message = f"Unsupported parameter-OOD group selector: {self.ood_group!r}."
+        if self.ood_group is not None and (not isinstance(self.ood_group, str) or not self.ood_group):
+            message = "Parameter-OOD group selectors must be non-empty strings."
             raise ValueError(message)
         if self.evaluation_regime not in views.PACKAGE_REGIMES:
             message = f"Unsupported package regime: {self.evaluation_regime!r}."
@@ -140,167 +116,9 @@ class LoaderSettings:
             raise ValueError(message)
 
 
-class SteadyFlowDataset(Dataset[SteadyFlowItem]):
-    """Load and verify one steady tensor payload in authoritative task order."""
-
-    def __init__(self, data_path: Path | str, *, task: TaskSpec) -> None:
-        """Load one exact payload and verify its complete content fingerprint."""
-        path = Path(data_path)
-        if not path.is_file() or path.is_symlink():
-            message = f"Steady training dataset is missing or unsafe: {path}."
-            raise FileNotFoundError(message)
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict):
-            message = f"Steady training dataset must contain one dictionary payload: {path}."
-            raise TypeError(message)
-        self.path = path
-        self.task = task
-        self.input_fields = list(task.input_names)
-        self.output_fields = list(task.output_names)
-        self.data = payload
-        self.identity = identity.validate_training_dataset_payload(
-            payload,
-            task=task,
-            verify_content=True,
-        )
-        self.inputs = payload["inputs"]
-        self.outputs = payload["outputs"]
-
-    def __len__(self) -> int:
-        """Return the verified ordered steady sample count."""
-        return self.identity.sample_count
-
-    def __getitem__(self, index: int) -> SteadyFlowItem:
-        """Return one task-ordered pair and a defensive metadata copy."""
-        raw_meta = self.data["source_metadata"][index]
-        if not isinstance(raw_meta, Mapping):
-            message = f"Steady source_metadata[{index}] must be a mapping: {self.path}."
-            raise TypeError(message)
-        return {
-            "x": self.inputs[index],
-            "y": self.outputs[index],
-            "meta": cast("SteadyFlowMetadata", deepcopy(dict(raw_meta))),
-        }
-
-
-class SteadyDatasetSelection(Dataset[SteadyFlowItem]):
-    """Expose one identity-bound steady case selection without tensor copies."""
-
-    def __init__(
-        self,
-        source: SteadyFlowDataset,
-        indices: Sequence[int],
-        *,
-        selector: str,
-    ) -> None:
-        """Validate an ordered unique selection and derive its exact identity."""
-        selected = tuple(indices)
-        if not selected or len(selected) != len(set(selected)) or min(selected) < 0 or max(selected) >= len(source):
-            message = f"Steady selector {selector!r} must resolve non-empty unique in-range positions."
-            raise ValueError(message)
-        self.source = source
-        self.indices = selected
-        self.input_fields = source.input_fields
-        self.output_fields = source.output_fields
-        sample_ids = tuple(source.identity.sample_ids[index] for index in selected)
-        fingerprint_payload = json.dumps(
-            {
-                "source_fingerprint": source.identity.fingerprint,
-                "selector": selector,
-                "sample_ids": sample_ids,
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        source_metadata = source.identity.source_metadata
-        self.identity = identity.DatasetIdentity(
-            dataset_id=source.identity.dataset_id,
-            task=source.identity.task,
-            data_contract_digest=source.identity.data_contract_digest,
-            fingerprint=hashlib.sha256(fingerprint_payload).hexdigest(),
-            sample_ids=sample_ids,
-            sample_count=len(sample_ids),
-            spatial_shape=source.identity.spatial_shape,
-            source_metadata=(None if source_metadata is None else tuple(source_metadata[index] for index in selected)),
-            source_provenance=source.identity.source_provenance,
-        )
-
-    def __len__(self) -> int:
-        """Return selected case count."""
-        return len(self.indices)
-
-    def __getitem__(self, index: int) -> SteadyFlowItem:
-        """Return one selected source sample."""
-        return self.source[self.indices[index]]
-
-
-def create_steady_dataset(
-    data_path: Path | str,
-    *,
-    task: TaskSpec | None = None,
-) -> SteadyFlowDataset:
-    """Construct the sole verified steady runtime dataset implementation."""
-    resolved_task = domain.tasks.registry.get_task("steady_flow") if task is None else task
-    return SteadyFlowDataset(data_path, task=resolved_task)
-
-
 def _payload_path(manifest: Mapping[str, Any], *, storage_root: Path | str | None) -> Path:
     """Resolve a manifest-bound payload under the dataset lifecycle root."""
     return common.paths.get_dataset_payload_root(storage_root=storage_root) / str(manifest["dataset_id"]) / str(manifest["payload_filename"])
-
-
-def _case_positions(
-    dataset: SteadyFlowDataset,
-    package_case_ids: Sequence[str],
-    *,
-    selector: str,
-) -> tuple[int, ...]:
-    """Resolve package case IDs to ordered steady payload positions."""
-    position_by_id = {sample_id: index for index, sample_id in enumerate(dataset.identity.sample_ids)}
-    if len(position_by_id) != len(dataset.identity.sample_ids):
-        message = "Steady dataset sample identities are duplicated."
-        raise ValueError(message)
-    try:
-        positions = tuple(position_by_id[case_id] for case_id in package_case_ids)
-    except KeyError as error:
-        message = f"Manifest selector {selector!r} references a missing steady sample {error.args[0]!r}."
-        raise ValueError(message) from error
-    if not positions:
-        message = f"Manifest selector {selector!r} is unavailable in this steady package."
-        raise ValueError(message)
-    return positions
-
-
-def _select_steady(
-    dataset: SteadyFlowDataset,
-    manifest: Mapping[str, Any],
-    request: DatasetRequest,
-) -> Dataset[SteadyFlowItem]:
-    """Apply an explicit manifest-owned steady membership or group selector."""
-    package_case_ids: Sequence[str] | None = None
-    selector = "all"
-    if request.evaluation_regime == "id" and request.membership is not None:
-        split_membership = manifest["split_membership"]
-        package_case_ids = split_membership.get(request.membership)
-        selector = f"id/{request.membership}"
-    elif request.evaluation_regime == "parameter_ood" and request.ood_group is not None:
-        available = manifest["available_ood_groups"]
-        if request.ood_group not in available:
-            message = f"Steady-flow parameter-OOD group {request.ood_group!r} is unavailable; available selectors are {available}."
-            raise ValueError(message)
-        package_case_ids = manifest["ood_group_indexes"].get(request.ood_group)
-        selector = f"parameter_ood/{request.ood_group}"
-    if package_case_ids is None:
-        return dataset
-    if not isinstance(package_case_ids, list) or not all(isinstance(value, str) for value in package_case_ids):
-        message = f"Manifest selector {selector!r} is malformed."
-        raise TypeError(message)
-    return SteadyDatasetSelection(
-        dataset,
-        _case_positions(dataset, package_case_ids, selector=selector),
-        selector=selector,
-    )
 
 
 def _select_transient(
@@ -332,9 +150,9 @@ def create_dataset(
     *,
     hdf5_cache_size: int = 0,
     transient_transform: transient.TransientTransform | None = None,
-) -> Dataset[SteadyFlowItem] | transient.TransientPhysicalDataset:
+) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
     """Resolve, validate, and select one package-backed runtime dataset."""
-    manifest = packages.load_package_manifest(
+    manifest = package_manifest.load_package_manifest(
         request.dataset_id,
         storage_root=request.storage_root,
     )
@@ -352,8 +170,14 @@ def create_dataset(
         if transient_transform is not None:
             message = "Transient transforms cannot be applied to steady-flow datasets."
             raise ValueError(message)
-        steady_dataset = create_steady_dataset(payload_path)
-        return _select_steady(steady_dataset, manifest, request)
+        steady_dataset = steady.create_dataset(payload_path)
+        return steady.select_dataset(
+            steady_dataset,
+            manifest,
+            evaluation_regime=request.evaluation_regime,
+            membership=request.membership,
+            ood_group=request.ood_group,
+        )
     if request.ood_group is not None and request.ood_group not in manifest["available_ood_groups"]:
         message = f"Transient parameter-OOD group {request.ood_group!r} is unavailable; available selectors are {manifest['available_ood_groups']}."
         raise ValueError(message)

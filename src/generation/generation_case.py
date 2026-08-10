@@ -35,11 +35,13 @@ from . import generation_materials as materials
 from . import generation_profiles as profiles
 from . import generation_sampling as sampling_service
 from . import generation_schedule as schedule_service
+from . import generation_seeding as seeding
 from . import generation_source as source_service
 from . import generation_workspace as workspace_service
 
 CASE_SCHEMA_KIND = "simulation_case"
 CASE_SCHEMA_VERSION = 1
+_TABLE_RANK = 2
 
 
 def compute_case_input_id(payload: dict[str, Any]) -> str:
@@ -166,7 +168,7 @@ def _write_scalar_file(
     """Write and validate the sole profile-owned long-form scalar handoff."""
     field_names = profiles.scalar_input_fields(profile_id)
     expected_units = profiles.scalar_input_units(profile_id)
-    package_fixed = {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
+    package_fixed = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
     entries: list[dict[str, Any]] = []
     for name, expected_unit in zip(field_names, expected_units, strict=True):
         if name not in values:
@@ -198,8 +200,8 @@ def _write_scalar_file(
 def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: schedule_service.Schedule) -> Path:
     """Write the exact four-column regular schedule adapter."""
     columns = list(spec["columns"])
-    if tuple(columns) != profiles.SCHEDULE_FIELDS or schedule.values.shape != (169, len(columns)):
-        msg = "Generated schedule does not satisfy the exact adapter shape and field contract."
+    if tuple(columns) != profiles.SCHEDULE_FIELDS or schedule.values.ndim != _TABLE_RANK or schedule.values.shape[1] != len(columns):
+        msg = "Generated schedule does not satisfy the configured adapter field contract."
         raise ValueError(msg)
     rows = [columns]
     rows.extend([_format_number(float(value)) for value in row] for row in schedule.values)
@@ -241,7 +243,7 @@ def _subseeds(
             )
         )
     result = {
-        label: config_contract.derive_seed(
+        label: seeding.derive_seed(
             case_seed,
             "case_substream",
             label,
@@ -251,7 +253,7 @@ def _subseeds(
     paired_seed = config.scientific_values.get("paired_equivalence_seed")
     if paired_seed is not None:
         assignment = config.case_assignment(case_index)
-        paired_case_seed = config_contract.derive_seed(
+        paired_case_seed = seeding.derive_seed(
             int(paired_seed),
             "paired_equivalence_case",
             config.material_family,
@@ -260,7 +262,7 @@ def _subseeds(
             str(case_index),
         )
         for label in ("bed", "pressure_bc"):
-            result[label] = config_contract.derive_seed(
+            result[label] = seeding.derive_seed(
                 paired_case_seed,
                 "paired_airflow_substream",
                 label,
@@ -299,10 +301,6 @@ def generate_case_input_bundle(
             msg = f"Package-fixed stationary scalar {name!r} is unresolved."
             raise ValueError(msg)
         number = float(value)
-        expected = profiles.STATIONARY_FIXED_VALUES[name]
-        if number != expected:
-            msg = f"Package-fixed stationary value {name!r} does not match the canonical template contract."
-            raise ValueError(msg)
         values[name] = number
         units[name] = unit
         stationary_fixed_entries.append(
@@ -360,7 +358,7 @@ def generate_case_input_bundle(
             config.scientific_values["time"],
             fixed,
             seeds={
-                name: config_contract.derive_seed(
+                name: seeding.derive_seed(
                     subseeds[name],
                     "complete_case_support_retry",
                     str(support_attempt),
@@ -426,7 +424,7 @@ def generate_case_input_bundle(
         "case_input_config_digest": config.case_input_config_digest,
         "case_id": case_id,
         "case_index": case_index,
-        "generator_version": config_contract.GENERATOR_VERSION,
+        "generator_version": seeding.GENERATOR_VERSION,
         "git_commit": source_service.required_git_commit(),
         "material_family": assignment["material_family"],
         "material_role": config.material_role,

@@ -93,7 +93,20 @@ import h5py
 import src
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
-from src.datasets import dataset_factory, dataset_generated_batch, dataset_packages
+from src.datasets import (
+    dataset_factory,
+    dataset_generated_batch,
+    dataset_identity,
+    dataset_metadata,
+    dataset_normalization,
+    dataset_packages,
+    dataset_splits,
+    dataset_steady,
+    dataset_training,
+    dataset_transient,
+    dataset_transient_contract,
+    dataset_views,
+)
 
 expected = Path({str(expected_root)!r}).resolve()
 modules = (
@@ -107,16 +120,37 @@ modules = (
     learning,
     dataset_factory,
     dataset_generated_batch,
+    dataset_identity,
+    dataset_metadata,
+    dataset_normalization,
     dataset_packages,
+    dataset_splits,
+    dataset_steady,
+    dataset_training,
+    dataset_transient,
+    dataset_transient_contract,
+    dataset_views,
     eda_dataframe,
 )
 for module in modules:
     path = Path(module.__file__).resolve()
     assert path.is_relative_to(expected), (module.__name__, path, expected)
 assert datasets.factory is dataset_factory
-assert datasets.packages is dataset_packages
 assert datasets.generated_batch is dataset_generated_batch
+assert datasets.identity is dataset_identity
+assert datasets.metadata is dataset_metadata
+assert datasets.normalization is dataset_normalization
+assert datasets.packages is dataset_packages
+assert datasets.splits is dataset_splits
+assert datasets.steady is dataset_steady
+assert datasets.training is dataset_training
+assert datasets.transient is dataset_transient
+assert datasets.transient_contract is dataset_transient_contract
+assert datasets.views is dataset_views
+assert not hasattr(datasets, "base")
 assert datasets.generated_batch.load_generated_batch is dataset_generated_batch.load_generated_batch
+assert datasets.views.inspect_contract("steady_flow").contract_digest
+assert generation.contracts.get_profile_contract("transient_drying").id == "transient_drying"
 assert h5py.version.version
 print(src.__file__)
 print(dataset_generated_batch.__file__)

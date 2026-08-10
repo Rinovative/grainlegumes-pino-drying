@@ -3,16 +3,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import copy
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src import generation
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
+from src.generation import generation_mapping_probe as mapping_probe
+from src.generation import generation_profiles as profiles
 
 
 def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance() -> None:
@@ -40,10 +40,10 @@ def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance
     }
 
     global_values = np.zeros(
-        (3, len(generation.profiles.GLOBAL_FIELD_NAMES)),
+        (3, len(profiles.GLOBAL_FIELD_NAMES)),
         dtype=np.float64,
     )
-    columns = {name: index for index, name in enumerate(generation.profiles.GLOBAL_FIELD_NAMES)}
+    columns = {name: index for index, name in enumerate(profiles.GLOBAL_FIELD_NAMES)}
     global_values[:, columns["t"]] = [0.0, 1.0, 2.0]
     global_values[:, columns["m_w_gr"]] = 10.0
     global_values[:, columns["m_v_gas"]] = 1.0
@@ -76,7 +76,7 @@ def test_mapping_probe_reports_exact_unconfirmed_keys_and_actual_table(
 ) -> None:
     """Keep mapping observation explicit and prohibit silent mapping inference."""
     monkeypatch.setattr(
-        generation.mapping_probe.common.paths,
+        mapping_probe.common.paths,
         "get_project_root",
         lambda: tmp_path,
     )
@@ -100,11 +100,11 @@ exports:
 """,
         encoding="utf-8",
     )
-    raw = generation.mapping_probe._profile_mapping(profile)
+    raw = mapping_probe._profile_mapping(profile)
 
     table = tmp_path / "observed.csv"
     table.write_text("x,y,p\n0,1,2\n3,4,5\n", encoding="utf-8")
-    observation = generation.mapping_probe._table_observation(table)
+    observation = mapping_probe._table_observation(table)
     assert observation == {
         "delimiter": ",",
         "header": ["x", "y", "p"],
@@ -112,7 +112,7 @@ exports:
         "rectangular": True,
         "time_header_candidates": [],
     }
-    comparison = generation.mapping_probe._mapping_comparison(
+    comparison = mapping_probe._mapping_comparison(
         raw,
         [{"relative_path": "observed.csv", "table": observation}],
         profile_path=profile,
@@ -120,3 +120,26 @@ exports:
     assert comparison["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
     assert comparison["optional_corrections"] == []
     assert comparison["aliases_used"] is False
+
+
+def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None:
+    """Bind receipt version evidence to configured paired execution contracts."""
+    root = Path("configs/generation/campaigns")
+    steady = generation.config.load_campaign_config(
+        root / "steady_flow/technical_smoke.yaml",
+        require_executable=False,
+    )
+    transient = generation.config.load_campaign_config(
+        root / "transient_drying/technical_smoke.yaml",
+        require_executable=False,
+    )
+    contract = generation.smoke._paired_comsol_contract((steady, transient))
+    assert contract["module"] == steady.execution_values["site"]["comsol_module"]
+    assert contract["executable"] == steady.execution_values["site"]["comsol_executable"]
+    assert contract["required_version"] in contract["module"]
+
+    changed_execution = copy.deepcopy(transient.execution_values)
+    changed_execution["site"]["comsol_module"] = f"{contract['module']}.different"
+    changed = replace(transient, execution_values=changed_execution)
+    with pytest.raises(RuntimeError, match="must agree"):
+        generation.smoke._paired_comsol_contract((steady, changed))

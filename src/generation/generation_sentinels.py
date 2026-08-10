@@ -4,7 +4,7 @@ generation_sentinels.py
 ===============================================================================
 Run deterministic no-COMSOL sentinels over both maintained VP2 profiles.
 Responsibilities:
-  - Exercise all six families under the exact 28-D steady and 54-D transient plans
+  - Exercise every configured material under each resolved profile sampling plan
   - Cover every configured profile-active OOD unit and complete atomic record
   - Validate fields, schedules, moisture, density, and psychrometric invariants
 Design principles:
@@ -27,54 +27,26 @@ from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
 
-from src import common
+from src import common, domain
 
 from . import generation_config as config_service
 from . import generation_fields as field_service
 from . import generation_inventory as inventory_service
 from . import generation_materials as materials
+from . import generation_porosity as porosity_service
 from . import generation_profiles as profiles
 from . import generation_registry as registry_service
 from . import generation_sampling as sampling_service
 from . import generation_schedule as schedule_service
+from . import generation_seeding as seeding
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-_STATIC_SENTINEL_SCHEMA_VERSION: Final = 3
+_STATIC_SENTINEL_SCHEMA_VERSION: Final = 4
 _PRIMARY_SENTINEL_SEED: Final = 202608090
 _ID_SENTINEL_CASE_COUNT: Final = 8
-_CANONICAL_CASE_COUNTS: Final = {
-    profiles.STEADY_FLOW_PROFILE: 1200,
-    profiles.TRANSIENT_DRYING_PROFILE: 660,
-}
-_SCHEDULE_DIAGNOSTIC_NAMES: Final = (
-    "min_T_in_bc",
-    "max_T_in_bc",
-    "min_omega_in_bc",
-    "max_omega_in_bc",
-    "min_phi_in_bc",
-    "max_phi_in_bc",
-    "min_phi_source_air",
-    "max_phi_source_air",
-    "min_heater_temperature_rise",
-    "schedule_rejection_count",
-    "schedule_acceptance_attempt",
-)
-_EXPECTED_ROLES: Final = {
-    "seen": ("lentil", "chickpea", "kidney_bean"),
-    "near_family_ood": ("field_pea",),
-    "far_family_ood": ("rapeseed",),
-    "extreme_family_ood": ("sunflower_seed",),
-}
-_EXPECTED_EVALUATION_REGIMES: Final = (
-    "id",
-    "parameter_ood",
-    "near_family_ood",
-    "far_family_ood",
-    "extreme_family_ood",
-)
 
 
 def _array_sha256(value: np.ndarray) -> str:
@@ -95,7 +67,7 @@ def _sentinel_ood_allocation(
     """Return the same generic eligible-unit allocation used by campaigns."""
     if batch.sampling_regime != "parameter_ood":
         return ()
-    groups = materials.active_ood_groups(batch.profile.id)
+    groups = materials.active_ood_groups(batch.scientific_values["material"]["parameter_registry"], batch.profile.id)
     eligible = sampling_service.eligible_ood_units(
         batch.scientific_values["material"],
         groups=groups,
@@ -137,11 +109,11 @@ def _sentinel_view(
     assignments = _assignments(batch, case_count=case_count)
     scientific = copy.deepcopy(batch.scientific_values)
     registry = scientific["material"]["parameter_registry"]
-    blocks = materials.active_sampling_blocks(batch.profile.id)
+    blocks = materials.active_sampling_blocks(batch.scientific_values["material"]["parameter_registry"], batch.profile.id)
     scientific["case_count"] = case_count
     scientific["assignments"] = [assignments[index] for index in assignments]
     if batch.sampling_regime == "parameter_ood":
-        groups = materials.active_ood_groups(batch.profile.id)
+        groups = materials.active_ood_groups(batch.scientific_values["material"]["parameter_registry"], batch.profile.id)
         eligible = sampling_service.eligible_ood_units(
             scientific["material"],
             groups=groups,
@@ -153,6 +125,7 @@ def _sentinel_view(
         for unit in allocation:
             counts[unit["unit_id"]] += 1
         scientific["parameter_ood"]["allocation_counts"] = counts
+    block_parameters = {block: tuple(str(name) for name in scientific["sampling"]["blocks"][block]["parameters"]) for block in blocks}
     scientific["sampling"]["seed_base"] = seed_base
     scientific["sampling"]["blocks"] = sampling_service.build_sampling_plan(
         registry=registry,
@@ -160,6 +133,7 @@ def _sentinel_view(
         seed_base=seed_base,
         method=str(scientific["sampling"]["method"]),
         blocks=blocks,
+        block_parameters=block_parameters,
     )
     digest = common.serialization.canonical_json_sha256(scientific)
     return replace(
@@ -171,7 +145,7 @@ def _sentinel_view(
         scientific_config_digest=digest,
         case_input_config_digest=digest,
         batch_identity=digest,
-        batch_id=f"static_sentinel__{batch.batch_name}__{digest[:16]}",
+        batch_id=config_service.build_batch_id(f"static_sentinel__{batch.batch_name}", digest),
     )
 
 
@@ -181,7 +155,7 @@ def _subseeds(batch: config_service.GenerationConfig, case_index: int) -> dict[s
         message = "Static sentinel view unexpectedly lacks a seed."
         raise RuntimeError(message)
     return {
-        name: config_service.derive_seed(batch.seed_base, "static_sentinel_case", str(case_index), name)
+        name: seeding.derive_seed(batch.seed_base, "static_sentinel_case", str(case_index), name)
         for name in ("bed", "pressure_bc", "initial_moisture", "schedule_shared", "schedule_independent")
     }
 
@@ -190,9 +164,15 @@ def _design_change_evidence(batch: config_service.GenerationConfig) -> dict[str,
     """Require every unit-design coordinate and sampled parameter to vary."""
     registry = batch.scientific_values["material"]["parameter_registry"]
     coordinate_changes: dict[str, bool] = {}
-    labels = materials.sampling_coordinate_labels(registry, batch.profile.id)
+    plans = batch.scientific_values["sampling"]["blocks"]
+    block_parameters = {block: tuple(str(name) for name in plan["parameters"]) for block, plan in plans.items()}
+    labels = materials.sampling_coordinate_labels(
+        registry,
+        batch.profile.id,
+        block_parameters=block_parameters,
+    )
     label_offset = 0
-    for plan in batch.scientific_values["sampling"]["blocks"].values():
+    for plan in plans.values():
         design = sampling_service.unit_design(
             batch.scientific_values["sampling"]["method"],
             count=len(batch.case_indices),
@@ -212,8 +192,8 @@ def _design_change_evidence(batch: config_service.GenerationConfig) -> dict[str,
         raise RuntimeError(message)
     samples = [sampling_service.sample_case(batch, case_index) for case_index in batch.case_indices]
     parameter_changes: dict[str, bool] = {}
-    for block in materials.active_sampling_blocks(batch.profile.id):
-        for name in materials.SAMPLING_BLOCKS[block]:
+    for plan in plans.values():
+        for name in plan["parameters"]:
             serialized = {common.serialization.canonical_json_sha256(sample.values[name]) for sample in samples}
             changed = len(serialized) > 1
             if not changed:
@@ -308,9 +288,9 @@ def _realization_evidence(
     ):
         message = "Static schedule sentinel escaped its temperature, humidity-ratio, or RH envelope."
         raise ValueError(message)
-    schedule_diagnostics = {name: schedule.metadata[name] for name in _SCHEDULE_DIAGNOSTIC_NAMES}
+    schedule_diagnostics = schedule.diagnostics
     if (
-        schedule.metadata["column_order"] != ["t", "T_in_bc", "omega_in_bc", "phi_in_bc"]
+        schedule.metadata["column_order"] != list(profiles.SCHEDULE_FIELDS)
         or schedule_diagnostics["min_phi_source_air"] <= 0.0
         or schedule_diagnostics["max_phi_source_air"] > 1.0
         or schedule_diagnostics["min_heater_temperature_rise"] < 0.0
@@ -367,12 +347,10 @@ def _field_coupling_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
     """Prove scalar coupling effects and the shared-background local contract."""
-    from . import generation_porosity as porosity_service  # noqa: PLC0415 -- keeps sentinel dependencies explicit
-
     sentinel = _sentinel_view(
         batch,
         case_count=2,
-        seed_base=config_service.derive_seed(
+        seed_base=seeding.derive_seed(
             _PRIMARY_SENTINEL_SEED,
             batch.profile.id,
             "field_coupling",
@@ -419,7 +397,7 @@ def _field_coupling_evidence(
         alternate = _alternate_interval_value(registry[name], float(sample.values[name]))
         fields = generated({name: alternate})
         porosity_identical = np.array_equal(fields.columns["eps_bed"], baseline.columns["eps_bed"])
-        permeability_difference = _maximum_field_difference(baseline, fields, ("Kxx", "Kxy", "Kyy"))
+        permeability_difference = _maximum_field_difference(baseline, fields, domain.fields.PERMEABILITY_FIELDS)
         if not porosity_identical or permeability_difference <= 0.0:
             message = f"Local porosity incorrectly depends on permeability-only control {name!r}."
             raise ValueError(message)
@@ -437,8 +415,8 @@ def _field_coupling_evidence(
             )
         }
     )
-    shared_porosity_difference = _maximum_field_difference(baseline, shared_fields, ("eps_bed",))
-    shared_permeability_difference = _maximum_field_difference(baseline, shared_fields, ("Kxx", "Kxy", "Kyy"))
+    shared_porosity_difference = _maximum_field_difference(baseline, shared_fields, domain.fields.POROSITY_FIELDS)
+    shared_permeability_difference = _maximum_field_difference(baseline, shared_fields, domain.fields.PERMEABILITY_FIELDS)
     smooth_name = "porosity.smooth_len_rel"
     smooth_fields = generated(
         {
@@ -457,10 +435,10 @@ def _field_coupling_evidence(
             )
         }
     )
-    factor_difference = _maximum_field_difference(baseline, factor_fields, ("eps_bed",))
-    kappa_difference = _maximum_field_difference(baseline, kappa_fields, ("eps_bed",))
-    smooth_difference = _maximum_field_difference(baseline, smooth_fields, ("eps_bed",))
-    amplitude_difference = _maximum_field_difference(baseline, amplitude_fields, ("eps_bed",))
+    factor_difference = _maximum_field_difference(baseline, factor_fields, domain.fields.POROSITY_FIELDS)
+    kappa_difference = _maximum_field_difference(baseline, kappa_fields, domain.fields.POROSITY_FIELDS)
+    smooth_difference = _maximum_field_difference(baseline, smooth_fields, domain.fields.POROSITY_FIELDS)
+    amplitude_difference = _maximum_field_difference(baseline, amplitude_fields, domain.fields.POROSITY_FIELDS)
     if (
         min(
             shared_porosity_difference,
@@ -511,8 +489,6 @@ def _nominal_anchor_evidence(
         material_contract=material,
     )
     coefficient = float(support["A_KC_reference"])
-    from . import generation_porosity as porosity_service  # noqa: PLC0415 -- keeps sentinel dependencies explicit
-
     reference = porosity_service.solve_reference_porosity(
         values["kappa_mean"],
         coefficient,
@@ -547,12 +523,10 @@ def _anchor_ood_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
     """Realize every feasible conditional anchor tail with one active OOD unit."""
-    from . import generation_porosity as porosity_service  # noqa: PLC0415 -- keeps sentinel dependencies explicit
-
     sentinel = _sentinel_view(
         batch,
         case_count=2,
-        seed_base=config_service.derive_seed(
+        seed_base=seeding.derive_seed(
             _PRIMARY_SENTINEL_SEED,
             batch.profile.id,
             batch.material_family,
@@ -567,9 +541,14 @@ def _anchor_ood_evidence(
         values=sample.values,
         material_contract=material,
     )
+    group = entry.get("ood_group")
+    if not isinstance(group, str) or not group:
+        message = f"Conditional anchor {porosity_service.ANCHOR_PARAMETER_NAME!r} has no registry OOD group."
+        raise RuntimeError(message)
     packing = material["packing_porosity_mean_support"]
     lower = float(packing["lower"])
     upper = float(packing["upper"])
+    minimum_gap_fraction, minimum_width_fraction = registry_service.ood_separation_fractions()
     directions: dict[str, Any] = {}
     for tail in support["available_ood_tails"]:
         direction = str(tail["direction"])
@@ -579,8 +558,8 @@ def _anchor_ood_evidence(
         ood = copy.deepcopy(sample.ood_provenance)
         ood.update(
             {
-                "group": "bed",
-                "active_ood_group": "bed",
+                "group": group,
+                "active_ood_group": group,
                 "selected_units": [porosity_service.ANCHOR_PARAMETER_NAME],
                 "active_unit_id": porosity_service.ANCHOR_PARAMETER_NAME,
                 "active_record_id": f"{porosity_service.ANCHOR_PARAMETER_NAME}__ood_{direction}",
@@ -598,8 +577,8 @@ def _anchor_ood_evidence(
             not correct_direction
             or diagnostics["active_anchor_support_kind"] != f"ood_{direction}"
             or diagnostics["material_support_departure_cause"] != porosity_service.ANCHOR_PARAMETER_NAME
-            or float(tail["transformed_gap_fraction"]) < 0.15 - 1e-12
-            or float(tail["transformed_width_fraction"]) < 0.25 - 1e-12
+            or float(tail["transformed_gap_fraction"]) < minimum_gap_fraction - 1e-12
+            or float(tail["transformed_width_fraction"]) < minimum_width_fraction - 1e-12
             or float(diagnostics["eps_bed_min"]) < float(sample.values["eps_min_global"])
             or float(diagnostics["eps_bed_max"]) > float(sample.values["eps_max_global"])
         ):
@@ -634,6 +613,21 @@ def _downstream_ood_attribution_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
     """Prove non-anchor OOD responses do not create a second OOD unit."""
+    candidates = _ood_candidates(batch)
+    case_count = sum(len(names) for names in candidates.values())
+    if case_count <= 0:
+        message = f"Seen material {batch.material_family!r} has no eligible parameter-OOD units."
+        raise ValueError(message)
+    sentinel = _sentinel_view(
+        batch,
+        case_count=case_count,
+        seed_base=seeding.derive_seed(
+            _PRIMARY_SENTINEL_SEED,
+            batch.profile.id,
+            batch.material_family,
+            "downstream_ood_attribution",
+        ),
+    )
     requested = [
         "kappa_mean",
         "porosity.smooth_len_rel",
@@ -643,16 +637,16 @@ def _downstream_ood_attribution_evidence(
         requested.append("density_calibration")
     results: dict[str, Any] = {}
     for unit in requested:
-        matches = [case_index for case_index in batch.case_indices if batch.case_assignment(case_index)["ood_unit_id"] == unit]
+        matches = [case_index for case_index in sentinel.case_indices if sentinel.case_assignment(case_index)["ood_unit_id"] == unit]
         if not matches:
-            message = f"Static attribution sentinel could not find allocated OOD unit {unit!r}."
+            message = f"Static attribution sentinel could not find eligible OOD unit {unit!r}."
             raise ValueError(message)
         case_index = matches[0]
-        sample = sampling_service.sample_case(batch, case_index)
+        sample = sampling_service.sample_case(sentinel, case_index)
         if sample.ood_provenance["selected_units"] != [unit]:
             message = f"Static attribution sentinel {unit!r} is not the sole active OOD unit."
             raise ValueError(message)
-        fields = _diagnostic_fields(batch, case_index, sample)
+        fields = _diagnostic_fields(sentinel, case_index, sample)
         porosity = fields.metadata["porosity"]
         conditional = sample.conditional_supports["porosity.kc_anchor_factor"]
         if (
@@ -678,24 +672,27 @@ def _downstream_ood_attribution_evidence(
 
 def _ood_candidates(batch: config_service.GenerationConfig) -> dict[str, tuple[str, ...]]:
     """Return every configured profile-active OOD unit by physical group."""
-    groups = materials.active_ood_groups(batch.profile.id)
+    groups = materials.active_ood_groups(batch.scientific_values["material"]["parameter_registry"], batch.profile.id)
     candidates: dict[str, list[str]] = {group: [] for group in groups}
     for unit in sampling_service.eligible_ood_units(
         batch.scientific_values["material"],
         groups=groups,
     ):
         candidates[unit["ood_group"]].append(unit["unit_id"])
-    return {group: tuple(names) for group, names in candidates.items()}
+    return {group: tuple(names) for group, names in candidates.items() if names}
 
 
 def _ood_evidence(batch: config_service.GenerationConfig) -> dict[str, Any]:
     """Cover every OOD unit with one-group/one-unit selection evidence."""
     candidates = _ood_candidates(batch)
     case_count = sum(len(names) for names in candidates.values())
+    if case_count <= 0:
+        message = f"Seen material {batch.material_family!r} has no eligible parameter-OOD units."
+        raise ValueError(message)
     sentinel = _sentinel_view(
         batch,
         case_count=case_count,
-        seed_base=config_service.derive_seed(_PRIMARY_SENTINEL_SEED, batch.profile.id, "parameter_ood"),
+        seed_base=seeding.derive_seed(_PRIMARY_SENTINEL_SEED, batch.profile.id, "parameter_ood"),
     )
     group_cases: dict[str, list[int]] = {group: [] for group in candidates}
     selected_units: set[str] = set()
@@ -733,19 +730,110 @@ def _ood_evidence(batch: config_service.GenerationConfig) -> dict[str, Any]:
     }
 
 
-def _validate_campaign(campaign: config_service.CampaignConfig, profile_id: str) -> None:
-    """Require one canonical six-family, five-regime maintained campaign."""
-    inventory = tuple(family for role in _EXPECTED_ROLES for family in campaign.material_roles[role])
-    if (
-        campaign.campaign_purpose != "family_generalization"
-        or campaign.profile.id != profile_id
-        or campaign.material_roles != _EXPECTED_ROLES
-        or campaign.evaluation_regimes != _EXPECTED_EVALUATION_REGIMES
-        or inventory != materials.MATERIAL_FAMILIES
-        or campaign.total_case_count != _CANONICAL_CASE_COUNTS[profile_id]
-    ):
-        message = f"Static sentinel input is not the canonical {profile_id!r} six-family campaign."
+def _campaign_inventory(campaign: config_service.CampaignConfig) -> tuple[str, ...]:
+    """Return the configured material inventory in role-declaration order."""
+    inventory = campaign.material_inventory
+    if not inventory or len(inventory) != len(set(inventory)):
+        message = f"Campaign {campaign.campaign_id!r} has an empty or duplicate material inventory."
         raise ValueError(message)
+    return inventory
+
+
+def _resolved_decision_source(
+    campaigns: Mapping[str, config_service.CampaignConfig],
+) -> dict[str, str]:
+    """Return the one registry-owned decision identity shared by all batches."""
+    decision_source: dict[str, str] | None = None
+    for campaign in campaigns.values():
+        for batch in campaign.batches:
+            decision_source = materials.validate_decision_source(
+                batch.scientific_values["material"]["decision_source"],
+                label=f"resolved batch {batch.batch_name!r} decision_source",
+                expected=decision_source,
+            )
+    if decision_source is None:
+        message = "Static-sentinel campaigns contain no resolved batch decision evidence."
+        raise ValueError(message)
+    return decision_source
+
+
+def _parameter_ood_source(
+    natural_batch: config_service.GenerationConfig,
+) -> config_service.GenerationConfig:
+    """Return a sentinel-only parameter-OOD source independent of production counts."""
+    if natural_batch.material_role != "seen" or natural_batch.sampling_regime != "natural":
+        message = "Parameter-OOD sentinels require one Seen natural source batch."
+        raise ValueError(message)
+    scientific = copy.deepcopy(natural_batch.scientific_values)
+    scientific["sampling_regime"] = "parameter_ood"
+    scientific["evaluation_regime"] = "parameter_ood"
+    scientific["natural_support_state"] = "parameter_ood"
+    return replace(
+        natural_batch,
+        evaluation_regime="parameter_ood",
+        sampling_regime="parameter_ood",
+        scientific_values=scientific,
+    )
+
+
+def _validate_campaign(
+    campaign: config_service.CampaignConfig,
+    profile_id: str,
+) -> tuple[str, ...]:
+    """Require a family campaign with natural support for its full inventory."""
+    if campaign.campaign_purpose != "family_generalization" or campaign.profile.id != profile_id:
+        message = f"Static sentinel input is not a family-generalization campaign for {profile_id!r}."
+        raise ValueError(message)
+    inventory = _campaign_inventory(campaign)
+    missing_natural = [
+        material_family
+        for material_family in inventory
+        if campaign.find_batch(
+            material_family=material_family,
+            sampling_regime="natural",
+        )
+        is None
+    ]
+    if missing_natural:
+        message = f"Static sentinel campaign lacks natural batches for configured materials {missing_natural}."
+        raise ValueError(message)
+    return inventory
+
+
+def _sampling_dimension(batch: config_service.GenerationConfig) -> int:
+    """Return one resolved batch sampling dimension."""
+    dimensions = batch.scientific_values["sampling"]["block_dimensions"]
+    return sum(int(value) for value in dimensions.values())
+
+
+def inspect_sentinel_workload(
+    campaign: config_service.CampaignConfig,
+) -> dict[str, Any]:
+    """Return the bounded config-derived static-sentinel workload plan."""
+    inventory = _validate_campaign(campaign, campaign.profile.id)
+    parameter_ood: dict[str, Any] = {}
+    for material_family in campaign.material_roles["seen"]:
+        natural = campaign.require_batch(
+            material_family=material_family,
+            sampling_regime="natural",
+        )
+        source = campaign.find_batch(
+            material_family=material_family,
+            sampling_regime="parameter_ood",
+        )
+        candidates = _ood_candidates(_parameter_ood_source(natural) if source is None else source)
+        parameter_ood[material_family] = {
+            "case_count": sum(len(names) for names in candidates.values()),
+            "eligible_units_by_group": {group: list(names) for group, names in candidates.items()},
+        }
+    return {
+        "natural_materials": list(inventory),
+        "natural_cases_per_material": _ID_SENTINEL_CASE_COUNT,
+        "natural_case_count": len(inventory) * _ID_SENTINEL_CASE_COUNT,
+        "parameter_ood": parameter_ood,
+        "parameter_ood_case_count": sum(int(evidence["case_count"]) for evidence in parameter_ood.values()),
+        "production_case_count_independent": True,
+    }
 
 
 def run_static_sentinels(
@@ -763,21 +851,37 @@ def run_static_sentinels(
             require_executable=False,
         ),
     }
+    decision_source = _resolved_decision_source(campaigns)
+    campaign_contracts: dict[str, Any] = {}
     profile_evidence: dict[str, Any] = {}
     support_failures: list[dict[str, Any]] = []
     for profile_id, campaign in campaigns.items():
-        _validate_campaign(campaign, profile_id)
+        inventory = _validate_campaign(campaign, profile_id)
+        natural_sources = {
+            material_family: campaign.require_batch(
+                material_family=material_family,
+                sampling_regime="natural",
+            )
+            for material_family in inventory
+        }
         family_evidence: dict[str, Any] = {}
-        for family in materials.MATERIAL_FAMILIES:
-            source = campaign.batch(f"{profile_id}__{family}__natural")
+        for material_family, source in natural_sources.items():
             sentinel = _sentinel_view(
                 source,
                 case_count=_ID_SENTINEL_CASE_COUNT,
-                seed_base=config_service.derive_seed(_PRIMARY_SENTINEL_SEED, profile_id, "material", family),
+                seed_base=seeding.derive_seed(
+                    _PRIMARY_SENTINEL_SEED,
+                    profile_id,
+                    "material",
+                    material_family,
+                ),
             )
             report = inventory_service.audit_parameter_registry(
                 sentinel.scientific_values["material"]["parameter_registry"],
                 profile_id=profile_id,
+                block_parameters={
+                    block: tuple(str(name) for name in plan["parameters"]) for block, plan in sentinel.scientific_values["sampling"]["blocks"].items()
+                },
             )
             change_evidence = _design_change_evidence(sentinel)
             realization = _realization_evidence(sentinel, 1)
@@ -785,42 +889,63 @@ def run_static_sentinels(
                 support_failures.append(
                     {
                         "simulation_profile": profile_id,
-                        "material_family": family,
+                        "material_family": material_family,
                         "message": realization["porosity_guard_failure"],
                         "porosity": realization["porosity"],
                     }
                 )
-            family_evidence[family] = {
+            family_evidence[material_family] = {
                 "inventory": asdict(report),
                 "design_change_evidence": change_evidence,
                 "nominal_anchor": _nominal_anchor_evidence(source),
                 "realization": realization,
             }
-        parameter_source = campaign.batch(f"{profile_id}__lentil__parameter_ood")
-        anchor_ood = {family: _anchor_ood_evidence(campaign.batch(f"{profile_id}__{family}__natural")) for family in materials.MATERIAL_FAMILIES[:3]}
-        parameter_ood = _ood_evidence(parameter_source)
-        parameter_ood["eligible_unit_count"] = len(parameter_ood["selected_units"])
-        parameter_ood["downstream_porosity_attribution"] = _downstream_ood_attribution_evidence(parameter_source)
+
+        seen_materials = campaign.material_roles["seen"]
+        anchor_ood = {material_family: _anchor_ood_evidence(natural_sources[material_family]) for material_family in seen_materials}
+        parameter_ood: dict[str, Any] = {}
+        for material_family in seen_materials:
+            configured_source = campaign.find_batch(
+                material_family=material_family,
+                sampling_regime="parameter_ood",
+            )
+            source = _parameter_ood_source(natural_sources[material_family]) if configured_source is None else configured_source
+            evidence = _ood_evidence(source)
+            evidence["eligible_unit_count"] = len(evidence["selected_units"])
+            evidence["downstream_porosity_attribution"] = _downstream_ood_attribution_evidence(source)
+            evidence["configured_production_batch"] = configured_source is not None
+            parameter_ood[material_family] = evidence
+
+        dimensions = {_sampling_dimension(source) for source in natural_sources.values()}
+        if len(dimensions) != 1:
+            message = f"Configured {profile_id!r} materials resolve inconsistent sampling dimensions {sorted(dimensions)}."
+            raise ValueError(message)
+        sampling_dimension = next(iter(dimensions))
+        campaign_contracts[profile_id] = {
+            "campaign_id": campaign.campaign_id,
+            "campaign_digest": campaign.campaign_digest,
+            "material_inventory": list(inventory),
+            "material_roles": {role: list(material_families) for role, material_families in campaign.material_roles.items()},
+            "evaluation_regimes": list(campaign.evaluation_regimes),
+            "production_case_count": campaign.total_case_count,
+            "sampling_dimension": sampling_dimension,
+        }
         profile_evidence[profile_id] = {
             "family_evidence": family_evidence,
-            "field_coupling": _field_coupling_evidence(campaign.batch(f"{profile_id}__lentil__natural")),
+            "field_coupling_by_material": {material_family: _field_coupling_evidence(source) for material_family, source in natural_sources.items()},
             "anchor_ood_by_seen_material": anchor_ood,
-            "parameter_ood": parameter_ood,
+            "parameter_ood_by_seen_material": parameter_ood,
         }
+
     status = "pass" if not support_failures else "blocked_by_scientific_sanity_guard"
     return {
         "schema_kind": "vp2_static_generator_sentinels",
         "schema_version": _STATIC_SENTINEL_SCHEMA_VERSION,
         "status": status,
         "implementation_checks_complete": True,
-        "decision_sha256": materials.VP2_DECISION_SHA256,
-        "material_families": list(materials.MATERIAL_FAMILIES),
-        "material_roles": {name: list(values) for name, values in _EXPECTED_ROLES.items()},
-        "evaluation_regimes": list(_EXPECTED_EVALUATION_REGIMES),
-        "profile_dimensions": {
-            profiles.STEADY_FLOW_PROFILE: materials.STEADY_DIMENSION,
-            profiles.TRANSIENT_DRYING_PROFILE: materials.TRANSIENT_DIMENSION,
-        },
+        "decision_sha256": decision_source["sha256"],
+        "campaign_contracts": campaign_contracts,
+        "profile_dimensions": {profile_id: contract["sampling_dimension"] for profile_id, contract in campaign_contracts.items()},
         "profile_evidence": profile_evidence,
         "scientific_support_guard_failures": support_failures,
         "comsol_started": False,

@@ -694,7 +694,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         inputs=inputs,
         outputs=outputs,
     )
-    loaded = datasets.factory.create_steady_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
+    loaded = datasets.steady.create_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
     generator = sample["meta"].get("generator")

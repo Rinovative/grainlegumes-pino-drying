@@ -6,7 +6,7 @@ Define and verify persisted final-dataset and split identity contracts.
 
 Responsibilities:
   - Validate the single current task-aware training-dataset schema
-  - Compute stable case, dataset, and split-membership fingerprints
+  - Compute stable package, case, dataset, and split-membership fingerprints
   - Bind persisted tensors and ordered sample identities to task contracts
 
 Design principles:
@@ -23,14 +23,15 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
-from src import domain
+from src import domain, generation
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -41,7 +42,7 @@ TRAINING_DATASET_SCHEMA_VERSION = 1
 TRAINING_DATASET_SCHEMA_KIND = "training_dataset"
 GENERATED_BATCH_IDENTITY_SCHEMA_VERSION = 1
 CASE_FINGERPRINT_VERSION = 1
-SPLIT_SCHEMA_VERSION = 1
+TRAINING_TENSOR_DTYPE: Final = "float32"
 _SHA256_HEX_LENGTH = 64
 _TENSOR_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
@@ -73,11 +74,6 @@ _GENERATED_CASE_KEYS = frozenset(
         "provenance_sha256",
     }
 )
-_PROFILE_METADATA = {
-    "steady_flow": (("steady_flow",), "comsol_steady_reference"),
-    "transient_drying": (("steady_flow", "transient_drying"), "comsol_coupled_reference"),
-}
-
 _REQUIRED_KEYS = frozenset(
     {
         "schema_version",
@@ -137,6 +133,25 @@ class DatasetIdentity:
         }
 
 
+def combined_dataset_id(dataset_ids: Sequence[str]) -> str:
+    """Return the stable logical identity for one ordered OOD package selection."""
+    identifiers = tuple(dataset_ids)
+    if not identifiers or any(not isinstance(item, str) or not item for item in identifiers):
+        msg = "Combined OOD package identifiers must be non-empty strings."
+        raise ValueError(msg)
+    if len(identifiers) != len(set(identifiers)):
+        msg = "Combined OOD package identifiers must be unique."
+        raise ValueError(msg)
+    if len(identifiers) == 1:
+        return identifiers[0]
+    payload = json.dumps(
+        list(identifiers),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"combined_ood__{hashlib.sha256(payload).hexdigest()[:16]}"
+
+
 def _canonical_json(value: Any, *, label: str) -> bytes:
     try:
         return json.dumps(
@@ -149,6 +164,21 @@ def _canonical_json(value: Any, *, label: str) -> bytes:
     except (TypeError, ValueError) as error:
         msg = f"{label} must be JSON-serializable without non-finite values."
         raise TypeError(msg) from error
+
+
+def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str, str]:
+    """Return one immutable package ID without operational source locators."""
+    identity_provenance = copy.deepcopy(dict(provenance))
+    source_cases = identity_provenance.get("source_case_identities")
+    if isinstance(source_cases, list):
+        for source_case in source_cases:
+            if isinstance(source_case, dict):
+                source_case.pop("source_relative_path", None)
+    digest = hashlib.sha256(
+        _canonical_json(identity_provenance, label="Dataset package provenance"),
+    ).hexdigest()
+    name = str(provenance["dataset_name"])
+    return f"{name}__{digest[:16]}", digest
 
 
 def _update_hash(hasher: Any, value: bytes) -> None:
@@ -269,9 +299,11 @@ def _validate_generated_batch_identity(
         batch_identity["simulation_profile"],
         label=f"{label}.simulation_profile",
     )
-    if profile not in _PROFILE_METADATA:
+    try:
+        profile_contract = generation.contracts.get_profile_contract(profile)
+    except ValueError as error:
         msg = f"{label}.simulation_profile is unsupported: {profile!r}."
-        raise ValueError(msg)
+        raise ValueError(msg) from error
     _require_sha256(batch_identity["batch_identity"], label=f"{label}.batch_identity")
     _require_sha256(batch_identity["scientific_config_digest"], label=f"{label}.scientific_config_digest")
     _require_sha256(
@@ -291,13 +323,12 @@ def _validate_generated_batch_identity(
         msg = f"{label}.template.relative_path must be one safe relative .mph path."
         raise ValueError(msg)
     _require_sha256(template["sha256"], label=f"{label}.template.sha256")
-    expected_views, expected_source = _PROFILE_METADATA[profile]
     views = _require_string_sequence(
         batch_identity["available_learning_views"],
         label=f"{label}.available_learning_views",
         unique=True,
     )
-    if views != expected_views or batch_identity["airflow_source"] != expected_source:
+    if views != profile_contract.available_learning_views or batch_identity["airflow_source"] != profile_contract.airflow_source:
         msg = f"{label} has learning-view or airflow provenance inconsistent with {profile!r}."
         raise ValueError(msg)
     intended = _require_string_sequence(
@@ -445,8 +476,8 @@ def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
     if tensor.ndim != rank:
         msg = f"{label} must have rank {rank}, got shape {tuple(tensor.shape)}."
         raise ValueError(msg)
-    if tensor.dtype != torch.float32:
-        msg = f"{label} must use torch.float32, got {tensor.dtype}."
+    if _tensor_dtype(tensor) != TRAINING_TENSOR_DTYPE:
+        msg = f"{label} must use torch.{TRAINING_TENSOR_DTYPE}, got {tensor.dtype}."
         raise TypeError(msg)
     cpu_tensor = tensor.detach().cpu()
     flat = cpu_tensor.reshape(-1)

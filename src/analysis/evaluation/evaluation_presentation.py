@@ -312,11 +312,9 @@ def metadata_parameter_selection(
 def metadata_parameters(
     frames: Sequence[pd.DataFrame],
     *,
-    sorted_labels: bool = False,
     max_cases: int | None = None,
 ) -> tuple[str, ...]:
     """Return shared variable inputs in canonical source-application order."""
-    del sorted_labels  # retained for source compatibility; canonical order always wins.
     return metadata_parameter_selection(frames, max_cases=max_cases).included
 
 

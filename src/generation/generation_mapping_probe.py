@@ -370,7 +370,7 @@ def run_mapping_probe(
             "timed_out": timed_out,
             "start_error": start_error,
             "runtime_s": runtime_s,
-            "raw_artifacts_relative_path": f"01_generation/meta/mapping_probes/{probe_id}",
+            "raw_artifacts_relative_path": destination.relative_to(storage).as_posix(),
             "mapping_auto_detection_used": False,
             "production_solve_started": False,
             "technical_case_started": exit_code is not None or timed_out,

@@ -29,15 +29,14 @@ from typing import Any, Final, cast
 import h5py
 import numpy as np
 
+from src import domain
+
 from . import generation_config as config_service
 from . import generation_profiles as profiles
 from . import generation_storage as storage_service
 
 _SECONDS_PER_HOUR: Final = 3600.0
-_PILOT_HORIZON_H: Final = 168.0
-_NOMINAL_MIN_DURATION_H: Final = 24.0
-_NOMINAL_MAX_DURATION_H: Final = 168.0
-_PRODUCTION_TRANSIENT_CASES: Final = 660
+_PILOT_ADEQUACY_MIN_DURATION_H: Final = 24.0
 _TABLE_RANK: Final = 2
 _MINIMUM_BALANCE_STATES: Final = 2
 
@@ -213,26 +212,28 @@ def duration_diagnostic(
     final_x_wb_bulk: float,
     final_f_wet_dm: float,
     configured_threshold: float,
+    configured_horizon_h: float,
     previous_regular_f_wet_dm: float | None,
 ) -> dict[str, Any]:
-    """Classify objective target and nominal duration semantics without censoring fabrication."""
+    """Classify duration using a protocol lower bound and configured horizon."""
     numeric = (
         final_time_h,
         last_regular_time_h,
         final_x_wb_bulk,
         final_f_wet_dm,
         configured_threshold,
+        configured_horizon_h,
     )
-    if case_kind not in config_service.PILOT_CASE_KINDS or not all(math.isfinite(value) for value in numeric):
+    if case_kind not in config_service.PILOT_CASE_KINDS or not all(math.isfinite(value) for value in numeric) or configured_horizon_h <= 0.0:
         message = "Duration diagnostics received malformed pilot state."
         raise ValueError(message)
     if target_reached:
         drying_time_h: float | None = final_time_h
         stop_reason = "target_stop"
         if case_kind == "nominal_reference":
-            if final_time_h < _NOMINAL_MIN_DURATION_H:
+            if final_time_h < _PILOT_ADEQUACY_MIN_DURATION_H:
                 result = "TOO_FAST"
-            elif final_time_h <= _NOMINAL_MAX_DURATION_H:
+            elif final_time_h <= configured_horizon_h:
                 result = "PASS"
             else:
                 result = "INVALID_RESULT"
@@ -254,6 +255,12 @@ def duration_diagnostic(
         "final_X_wb_bulk": final_x_wb_bulk,
         "final_f_wet_dm": final_f_wet_dm,
         "configured_threshold": configured_threshold,
+        "adequacy_window_h": {
+            "minimum": _PILOT_ADEQUACY_MIN_DURATION_H,
+            "maximum": configured_horizon_h,
+            "minimum_basis": "pilot_protocol_lower_diagnostic",
+            "maximum_basis": "resolved_case_time_horizon",
+        },
         "previous_regular_f_wet_dm": previous_regular_f_wet_dm,
         "stop_consistent": stop_consistent,
         "root_crossing_interpolation": None,
@@ -326,7 +333,12 @@ def field_and_physical_diagnostics(
     scalars: Mapping[str, float],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Inspect all canonical spatial states through one material-generic path."""
-    required_static = ("Kxx", "Kxy", "Kyy", "eps_bed", "rho_bu_dry", "p", "u", "v")
+    required_static = (
+        *domain.fields.PERMEABILITY_FIELDS,
+        *domain.fields.POROSITY_FIELDS,
+        "rho_bu_dry",
+        *domain.fields.STATE_FIELDS,
+    )
     static_arrays = {name: np.asarray(static[name], dtype=np.float64) for name in required_static}
     shape = static_arrays["eps_bed"].shape
     if any(array.shape != shape for array in static_arrays.values()):
@@ -395,7 +407,7 @@ def field_and_physical_diagnostics(
     local_evaporation_nonfinite_count = 0
     local_evaporation_negative_count = 0
     for state in transient_states:
-        arrays = {name: np.asarray(state[name], dtype=np.float64) for name in ("T", "phi", "w_surf", "w_int")}
+        arrays = {name: np.asarray(state[name], dtype=np.float64) for name in profiles.TRANSIENT_FIELD_NAMES}
         if any(array.shape != shape for array in arrays.values()):
             message = "Pilot transient fields do not match the static Cartesian shape."
             raise ValueError(message)
@@ -757,6 +769,15 @@ def analyze_successful_case(
         if isinstance(scientific_raw, bytes):
             scientific_raw = scientific_raw.decode("utf-8")
         scientific = json.loads(str(scientific_raw))
+        configured_regular_times = _finite_vector(
+            scientific["time"]["regular_times"],
+            label="configured regular times",
+            minimum_length=2,
+        )
+        if np.any(np.diff(configured_regular_times) <= 0.0):
+            message = "Configured regular times must be strictly increasing."
+            raise ValueError(message)
+        configured_horizon_h = float(scientific["time"]["stop"])
         fixed = scientific["scientific_fixed_values"]
         scalars.update(
             {
@@ -794,6 +815,7 @@ def analyze_successful_case(
         final_x_wb_bulk=float(global_columns["X_wb_bulk"][-1]),
         final_f_wet_dm=final_f_wet,
         configured_threshold=threshold,
+        configured_horizon_h=configured_horizon_h,
         previous_regular_f_wet_dm=previous_regular,
     )
     balances = water_balance_diagnostics(global_time, global_columns)
@@ -828,8 +850,10 @@ def analyze_successful_case(
         "time_classification": True,
         "required_shapes": True,
         "finite_required_arrays": status.get("contains_nan_or_inf") is False,
-        "ordered_regular_times": bool(np.array_equal(regular_time, np.arange(regular_time.size, dtype=np.float64))),
-        "regular_one_hour_contract": bool(np.array_equal(np.diff(regular_time), np.ones(max(regular_time.size - 1, 0)))),
+        "ordered_regular_times": bool(regular_time.size >= 1 and np.all(np.diff(regular_time) > 0.0)),
+        "regular_times_match_configured_contract": bool(
+            regular_time.size <= configured_regular_times.size and np.array_equal(regular_time, configured_regular_times[: regular_time.size])
+        ),
         "exact_stop_excluded_from_regular_transitions": exact_time is None or exact_time > regular_time[-1],
         "source_config_template_identity": (
             identity["case_input_id"] == case_payload["case_input_id"]
@@ -863,7 +887,8 @@ def analyze_successful_case(
         "INVALID_RESULT",
     }:
         warnings.append(f"duration:{duration['result']}")
-    if case_kind == "natural_pilot" and target_reached and not (_NOMINAL_MIN_DURATION_H <= final_time_h <= _NOMINAL_MAX_DURATION_H):
+    adequacy_window = duration["adequacy_window_h"]
+    if case_kind == "natural_pilot" and target_reached and not (adequacy_window["minimum"] <= final_time_h <= adequacy_window["maximum"]):
         warnings.append("natural_duration_outside_nominal_window")
     if not duration["stop_consistent"]:
         warnings.append("target_stop_inconsistent")
@@ -935,14 +960,33 @@ def analyze_successful_case(
     }
 
 
-def production_storage_projection(successful_cases: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Project 660-case storage only from measured successful pilot HDF5 files."""
+def production_storage_projection(
+    successful_cases: Iterable[Mapping[str, Any]],
+    *,
+    target_case_count: int,
+    regular_state_count: int,
+) -> dict[str, Any]:
+    """Project configured production storage from measured successful HDF5 files."""
+    for value, label in (
+        (target_case_count, "target_case_count"),
+        (regular_state_count, "regular_state_count"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            message = f"{label} must be a positive integer."
+            raise ValueError(message)
     records = list(successful_cases)
     sizes = [int(record["storage"]["canonical_hdf5_bytes"]) for record in records]
+    common = {
+        "target_case_count": target_case_count,
+        "regular_state_count": regular_state_count,
+    }
     if not sizes:
         return {
-            "production_storage_projection": "unavailable",
+            **common,
+            "status": "unavailable",
             "basis": None,
+            "mean_based_bytes": None,
+            "median_based_bytes": None,
             "reason": "no successful real pilot HDF5 artifacts",
         }
     mean_size = float(statistics.fmean(sizes))
@@ -950,23 +994,23 @@ def production_storage_projection(successful_cases: Iterable[Mapping[str, Any]])
     full_horizon_cases: list[float] = []
     for record in records:
         storage = record["storage"]
-        states = int(storage["regular_state_count"])
+        observed_states = int(storage["regular_state_count"])
         transient_bytes = int(storage["transient_dataset_storage_bytes"])
         global_bytes = int(storage["global_dataset_storage_bytes"])
         size = int(storage["canonical_hdf5_bytes"])
-        if states < 1:
+        if observed_states < 1:
             continue
         base_bytes = size - transient_bytes - global_bytes
         if base_bytes < 0:
             continue
-        per_state = (transient_bytes + global_bytes) / states
-        full_horizon_cases.append(base_bytes + per_state * 169)
+        per_state = (transient_bytes + global_bytes) / observed_states
+        full_horizon_cases.append(base_bytes + per_state * regular_state_count)
     full_horizon = (
         {
             "status": "available",
-            "projected_bytes": round(statistics.fmean(full_horizon_cases) * _PRODUCTION_TRANSIENT_CASES),
-            "method": "measured_nontrajectory_bytes_plus_measured_regular_state_storage_times_169",
-            "label": "full_horizon_projection",
+            "projected_bytes": round(statistics.fmean(full_horizon_cases) * target_case_count),
+            "method": "measured_nontrajectory_bytes_plus_measured_regular_state_storage_scaled_to_configured_state_count",
+            "label": "configured_horizon_projection",
             "exact": False,
         }
         if full_horizon_cases
@@ -976,15 +1020,16 @@ def production_storage_projection(successful_cases: Iterable[Mapping[str, Any]])
         }
     )
     return {
-        "production_storage_projection": "available",
+        **common,
+        "status": "available",
         "basis": "observed_real_pilot_based_estimate",
         "successful_hdf5_case_count": len(sizes),
         "mean_hdf5_bytes_per_case": mean_size,
         "median_hdf5_bytes_per_case": median_size,
         "min_hdf5_bytes_per_case": min(sizes),
         "max_hdf5_bytes_per_case": max(sizes),
-        "mean_based_660_bytes": round(mean_size * _PRODUCTION_TRANSIENT_CASES),
-        "median_based_660_bytes": round(median_size * _PRODUCTION_TRANSIENT_CASES),
+        "mean_based_bytes": round(mean_size * target_case_count),
+        "median_based_bytes": round(median_size * target_case_count),
         "full_horizon_projection": full_horizon,
         "storage_budget_guard": None,
     }

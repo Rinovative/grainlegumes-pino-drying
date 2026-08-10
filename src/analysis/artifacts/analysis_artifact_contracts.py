@@ -60,13 +60,11 @@ def resolve_case_payload_path(
     expected_filename: str,
 ) -> Path:
     """
-    Resolve one relative or safely relocatable legacy NPZ reference.
+    Resolve one exact bundle-relative NPZ reference.
 
-    New rows must store exactly ``npz/<expected_filename>``. Legacy absolute
-    paths are accepted only when they end in the same unambiguous bundle-local
-    suffix below an ``analysis`` path. The historical absolute prefix is never
-    followed. Existing symbolic-link substitutions below the current artifact
-    root are rejected.
+    Rows must store exactly ``npz/<expected_filename>``. Absolute paths, parent
+    traversal, and symbolic-link substitutions below the artifact root are
+    rejected.
     """
     if not isinstance(stored_path, str) or not stored_path:
         msg = "Artifact Parquet npz_path must be a non-empty string."
@@ -76,11 +74,7 @@ def resolve_case_payload_path(
         raise ValueError(msg)
     raw = Path(stored_path)
     expected_relative = Path("npz") / expected_filename
-    if raw.is_absolute():
-        if raw.name != expected_filename or raw.parent.name != "npz" or "analysis" not in raw.parts[:-2]:
-            msg = f"Legacy absolute NPZ path has no safe bundle-local interpretation: {stored_path!r}."
-            raise ValueError(msg)
-    elif raw != expected_relative or ".." in raw.parts:
+    if raw != expected_relative or raw.is_absolute() or ".." in raw.parts:
         msg = f"Artifact relative NPZ path must be exactly {expected_relative.as_posix()!r}, got {stored_path!r}."
         raise ValueError(msg)
 

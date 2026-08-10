@@ -11,6 +11,7 @@ production tensors are deliberately not loaded.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -266,7 +267,7 @@ def test_default_dataset_load_rejects_modified_tensor_content(
     torch.save(payload, path)
 
     with pytest.raises(ValueError, match="fingerprint mismatch"):
-        datasets.factory.create_steady_dataset(path, task=steady_task)
+        datasets.steady.create_dataset(path, task=steady_task)
 
 
 def test_duplicate_sample_id_is_rejected(
@@ -328,7 +329,7 @@ def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
     train_path = _save_dataset(tmp_path, training_dataset_payload_factory("combined_train"))
     first_path = _save_dataset(tmp_path, training_dataset_payload_factory("parameter_ood"))
     second_path = _save_dataset(tmp_path, training_dataset_payload_factory("family_ood"))
-    _train_loader, test_loaders, _processor, split_info = datasets.base.create_dataloaders(
+    _train_loader, _test_loaders, _processor, split_info = datasets.training.create_dataloaders(
         path_train=str(train_path),
         path_test_ood=(str(first_path), str(second_path)),
         task=steady_task,
@@ -343,9 +344,23 @@ def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
         split_seed=9,
     )
 
-    expected_id = datasets.base.combined_dataset_id(("parameter_ood", "family_ood"))
+    split_contract = datasets.splits.admit_split_contract(split_info)
+    assert split_contract.role("eval").source is split_contract.role("train").source
+    assert split_contract.role("train").source.dataset_id == "combined_train"
+    assert split_contract.role("ood").count == _COMBINED_OOD_SAMPLE_COUNT
+    isolated_indices = split_contract.role("ood").indices
+    isolated_indices.fill_(-1)
+    assert min(split_contract.role("ood").index_values) >= 0
+    rebuilt = split_contract.as_payload()
+    assert list(rebuilt) == list(split_info)
+    assert rebuilt["metadata"] == split_info["metadata"]
+    for key in ("train_indices", "eval_indices", "ood_indices"):
+        assert torch.equal(rebuilt[key], split_info[key])
+        assert rebuilt[key].data_ptr() != split_info[key].data_ptr()
+
+    expected_id = datasets.identity.combined_dataset_id(("parameter_ood", "family_ood"))
     assert split_info["metadata"]["datasets"]["ood"]["dataset_id"] == expected_id
-    assert expected_id != datasets.base.combined_dataset_id(("family_ood", "parameter_ood"))
+    assert expected_id != datasets.identity.combined_dataset_id(("family_ood", "parameter_ood"))
     assert split_info["ood_indices"].numel() == _COMBINED_OOD_SAMPLE_COUNT
     assert len(set(split_info["metadata"]["datasets"]["ood"]["sample_ids"])) == _COMBINED_OOD_SAMPLE_COUNT
 
@@ -379,14 +394,14 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
         "persistent_workers": False,
         "split_seed": 9,
     }
-    *_, split_info = datasets.base.create_dataloaders(**loader_args)
+    *_, split_info = datasets.training.create_dataloaders(**loader_args)
     assert split_info["task_contract_digest"] == steady_task.contract_digest
     assert split_info["metadata"]["datasets"]["train"]["data_contract_digest"] == steady_task.data_contract_digest
     assert split_info["metadata"]["datasets"]["ood"]["data_contract_digest"] == steady_task.data_contract_digest
     stale_header = copy.deepcopy(split_info)
     stale_header["task_contract_digest"] = "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a"
     with pytest.raises(ValueError, match="current registered task"):
-        datasets.base.validate_split_info(stale_header)
+        datasets.splits.admit_split_contract(stale_header)
 
     replaced = training_dataset_payload_factory(
         "train",
@@ -394,7 +409,7 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     )
     torch.save(replaced, train_path)
     with pytest.raises(ValueError, match="identity does not match"):
-        datasets.base.create_dataloaders(
+        datasets.training.create_dataloaders(
             **loader_args,
             split_indices=split_info,
         )
@@ -428,12 +443,12 @@ def test_saved_split_requires_integer_version_one(
         "persistent_workers": False,
         "split_seed": 9,
     }
-    *_, split_info = datasets.base.create_dataloaders(**loader_args)
+    *_, split_info = datasets.training.create_dataloaders(**loader_args)
     invalid = copy.deepcopy(split_info)
     invalid["schema_version"] = schema_version
 
     with pytest.raises(ValueError, match="schema_version"):
-        datasets.base.validate_split_info(invalid)
+        datasets.splits.admit_split_contract(invalid)
 
 
 def _valid_normalizer_state() -> dict[str, torch.Tensor]:
@@ -472,7 +487,7 @@ def test_saved_normalizer_state_fails_closed(
     state[key] = replacement
 
     with pytest.raises(error_type, match=match):
-        datasets.base.data_processor_from_state(state)
+        datasets.normalization.data_processor_from_state(state)
 
 
 def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
@@ -486,7 +501,7 @@ def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
     state["in_normalizer.std"][0, 0] = 0.0
     state["out_normalizer.std"].zero_()
 
-    processor = datasets.base.data_processor_from_state(state)
+    processor = datasets.normalization.data_processor_from_state(state)
     in_normalizer = processor.in_normalizer
     out_normalizer = processor.out_normalizer
     assert in_normalizer is not None
@@ -513,7 +528,7 @@ def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
     """Reject raw or stale normalizers whose training data identity changed."""
     train_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_train"))
     ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_ood"))
-    _train_loader, _test_loaders, processor, split_info = datasets.base.create_dataloaders(
+    _train_loader, _test_loaders, processor, split_info = datasets.training.create_dataloaders(
         path_train=str(train_path),
         path_test_ood=str(ood_path),
         task=steady_task,
@@ -527,15 +542,16 @@ def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
         persistent_workers=False,
         split_seed=17,
     )
-    artifact = datasets.base.build_normalizer_artifact(
+    split_contract = datasets.splits.admit_split_contract(split_info)
+    artifact = datasets.normalization.build_normalizer_artifact(
         processor,
         task=steady_task,
-        split_info=split_info,
+        split_contract=split_contract,
     )
-    restored = datasets.base.validate_normalizer_artifact(
+    restored = datasets.normalization.validate_normalizer_artifact(
         artifact,
         task=steady_task,
-        split_info=split_info,
+        split_contract=split_contract,
     )
 
     assert set(restored) == set(_valid_normalizer_state())
@@ -546,32 +562,33 @@ def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
         assert restored[key].data_ptr() != artifact["state"][key].data_ptr()
 
     with pytest.raises(ValueError, match="artifact keys"):
-        datasets.base.validate_normalizer_artifact(
+        datasets.normalization.validate_normalizer_artifact(
             _valid_normalizer_state(),
             task=steady_task,
-            split_info=split_info,
+            split_contract=split_contract,
         )
 
     for key, replacement in (
         ("dataset_id", "replacement_dataset"),
         ("fingerprint", "f" * 64),
     ):
-        stale_split = copy.deepcopy(split_info)
-        stale_split["metadata"]["datasets"]["train"][key] = replacement
+        stale_identity = replace(split_contract.role("train").source, **{key: replacement})
+        stale_evidence = replace(split_contract.role("train"), source=stale_identity)
+        stale_contract = replace(split_contract, train=stale_evidence)
         with pytest.raises(ValueError, match="does not match"):
-            datasets.base.validate_normalizer_artifact(
+            datasets.normalization.validate_normalizer_artifact(
                 artifact,
                 task=steady_task,
-                split_info=stale_split,
+                split_contract=stale_contract,
             )
 
-    stale_membership = copy.deepcopy(split_info)
-    stale_membership["metadata"]["membership_digests"]["train"] = "e" * 64
+    stale_evidence = replace(split_contract.role("train"), membership_digest="e" * 64)
+    stale_contract = replace(split_contract, train=stale_evidence)
     with pytest.raises(ValueError, match="does not match"):
-        datasets.base.validate_normalizer_artifact(
+        datasets.normalization.validate_normalizer_artifact(
             artifact,
             task=steady_task,
-            split_info=stale_membership,
+            split_contract=stale_contract,
         )
 
 
@@ -589,7 +606,7 @@ def test_training_loader_retains_a_partial_batch(
     train_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_train"))
     ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_ood"))
 
-    train_loader, *_rest = datasets.base.create_dataloaders(
+    train_loader, *_rest = datasets.training.create_dataloaders(
         path_train=str(train_path),
         path_test_ood=str(ood_path),
         task=steady_task,
@@ -630,3 +647,26 @@ def test_operational_provenance_is_excluded_from_scientific_fingerprint(
 
     assert first["dataset_fingerprint"] == second["dataset_fingerprint"]
     datasets.identity.validate_training_dataset_payload(second, task=domain.tasks.registry.get_task("steady_flow"), verify_content=True)
+
+
+def test_package_identity_excludes_only_operational_source_location() -> None:
+    """Keep relocation out of package identity while binding scientific case evidence."""
+    provenance = {
+        "dataset_name": "synthetic_package",
+        "source_case_identities": [
+            {
+                "source_relative_path": "first/location/case.h5",
+                "case_input_id": "a" * 64,
+            }
+        ],
+        "scientific_marker": {"value": 3},
+    }
+    original = datasets.identity.package_identity_from_provenance(provenance)
+
+    relocated = copy.deepcopy(provenance)
+    relocated["source_case_identities"][0]["source_relative_path"] = "second/location/case.h5"
+    assert datasets.identity.package_identity_from_provenance(relocated) == original
+
+    changed = copy.deepcopy(provenance)
+    changed["source_case_identities"][0]["case_input_id"] = "b" * 64
+    assert datasets.identity.package_identity_from_provenance(changed) != original

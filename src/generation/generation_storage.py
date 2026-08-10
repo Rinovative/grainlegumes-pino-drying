@@ -51,15 +51,11 @@ _MINIMUM_AXIS_POINTS = 2
 _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
 _STATIONARITY_RTOL = profiles.STATIONARITY_TOLERANCE
-_TIME_HORIZON = 168.0
-_TIME_INTERVAL = 1.0
-TIME_CLASSIFICATION_ATOL = 16.0 * np.finfo(np.float64).eps * _TIME_HORIZON
+_TIME_CLASSIFICATION_FACTOR = 16.0
 _THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
-_HDF5_COMPRESSION_LEVEL = 4
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 _SCALAR_COLUMN_COUNT = 3
-_TIME_CLASSIFICATION_BASIS = "16*float64_epsilon*168h; numerical classification only"
 STATUS_SCHEMA_VERSION = 1
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION = 1
@@ -73,6 +69,32 @@ class CanonicalCase:
     status_path: Path
     status: dict[str, Any]
     source_export_hashes: dict[str, dict[str, Any]]
+
+
+def time_classification_tolerance(time_contract: Mapping[str, Any]) -> float:
+    """Return the numerical state-time classification tolerance."""
+    scale = max(
+        1.0,
+        abs(float(time_contract["start"])),
+        abs(float(time_contract["stop"])),
+        abs(float(time_contract["interval"])),
+    )
+    return _TIME_CLASSIFICATION_FACTOR * np.finfo(np.float64).eps * scale
+
+
+def _time_classification_basis(time_contract: Mapping[str, Any]) -> str:
+    """Describe the numerical state-time classification tolerance."""
+    stop = float(time_contract["stop"])
+    return f"{_TIME_CLASSIFICATION_FACTOR:g}*float64_epsilon*{stop:g}h; numerical classification only"
+
+
+def _compression_matches(dataset: h5py.Dataset, storage: Mapping[str, Any]) -> bool:
+    """Return whether one HDF5 dataset uses the configured filter contract."""
+    return (
+        dataset.compression == storage["compression"]
+        and dataset.compression_opts == int(storage["compression_level"])
+        and dataset.shuffle is bool(storage["shuffle"])
+    )
 
 
 def _read_table(path: Path, *, delimiter: str) -> tuple[list[str], np.ndarray]:
@@ -171,7 +193,7 @@ def _static_fields(
         or not np.allclose(actual_x, x_axis, rtol=0.0, atol=_COORDINATE_ATOL)
         or not np.allclose(actual_y, y_axis, rtol=0.0, atol=_COORDINATE_ATOL)
     ):
-        msg = "Static export coordinates do not match the authoritative 401x251 grid."
+        msg = "Static export coordinates do not match the configured boundary-inclusive grid."
         raise ValueError(msg)
     coordinate_rows: dict[tuple[float, float], list[int]] = {}
     for row, coordinate in enumerate(zip(x_values, y_values, strict=True)):
@@ -207,25 +229,33 @@ def _static_fields(
     return x_axis, y_axis, arrays
 
 
-def _classify_transient_times(times: np.ndarray) -> tuple[np.ndarray, np.ndarray, int | None]:
-    """Classify float64 solver times as regular hours plus one optional exact stop."""
+def _classify_transient_times(
+    times: np.ndarray,
+    time_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, int | None]:
+    """Classify solver times as configured regular nodes plus one exact stop."""
     values = np.asarray(times, dtype=np.float64)
+    start = float(time_contract["start"])
+    stop = float(time_contract["stop"])
+    interval = float(time_contract["interval"])
+    tolerance = time_classification_tolerance(time_contract)
+    maximum_index = len(time_contract["regular_times"]) - 1
     if (
         values.ndim != 1
         or values.size < 1
         or not np.isfinite(values).all()
         or np.any(np.diff(values) <= 0.0)
-        or abs(float(values[0])) > TIME_CLASSIFICATION_ATOL
-        or float(values[-1]) > _TIME_HORIZON + TIME_CLASSIFICATION_ATOL
+        or abs(float(values[0]) - start) > tolerance
+        or float(values[-1]) > stop + tolerance
     ):
-        msg = "Transient state times must be finite, increasing, begin at zero, and not exceed 168 h."
+        msg = "Transient state times must be finite, increasing, begin at the configured start, and not exceed the configured stop."
         raise ValueError(msg)
     regular_by_index: dict[int, int] = {}
     irregular_positions: list[int] = []
     for position, value in enumerate(values):
-        regular_index = round(float(value) / _TIME_INTERVAL)
-        regular_value = regular_index * _TIME_INTERVAL
-        if 0 <= regular_index <= int(_TIME_HORIZON / _TIME_INTERVAL) and abs(float(value) - regular_value) <= TIME_CLASSIFICATION_ATOL:
+        regular_index = round((float(value) - start) / interval)
+        regular_value = start + regular_index * interval
+        if 0 <= regular_index <= maximum_index and abs(float(value) - regular_value) <= tolerance:
             if regular_index in regular_by_index:
                 msg = f"Transient export contains duplicate regular state index {regular_index}."
                 raise ValueError(msg)
@@ -235,20 +265,20 @@ def _classify_transient_times(times: np.ndarray) -> tuple[np.ndarray, np.ndarray
     if len(irregular_positions) > 1:
         msg = "Transient export may contain at most one exact irregular stop state."
         raise ValueError(msg)
-    if not regular_by_index:
-        msg = "Transient export must contain at least the regular t=0 state."
+    if not regular_by_index or 0 not in regular_by_index:
+        msg = "Transient export must contain at least the configured initial state."
         raise ValueError(msg)
     regular_indices = sorted(regular_by_index)
     if regular_indices != list(range(regular_indices[-1] + 1)):
-        msg = "Regular transient states must form a contiguous hourly prefix beginning at t=0."
+        msg = "Regular transient states must form a contiguous configured prefix."
         raise ValueError(msg)
     regular_positions = np.asarray([regular_by_index[index] for index in regular_indices], dtype=np.int64)
-    regular_times = np.asarray(regular_indices, dtype=np.float64) * _TIME_INTERVAL
+    regular_times = start + np.asarray(regular_indices, dtype=np.float64) * interval
     irregular_position = irregular_positions[0] if irregular_positions else None
     if irregular_position is not None:
         irregular_time = float(values[irregular_position])
-        if irregular_position != values.size - 1 or irregular_time <= float(regular_times[-1]) + TIME_CLASSIFICATION_ATOL:
-            msg = "The optional irregular state must be the final state after the last regular hour."
+        if irregular_position != values.size - 1 or irregular_time <= float(regular_times[-1]) + tolerance:
+            msg = "The optional irregular state must be final and follow the last regular state."
             raise ValueError(msg)
     return regular_times, regular_positions, irregular_position
 
@@ -264,7 +294,10 @@ def _transient_fields(
     contract = _contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)
     mapped = _mapped_table(_role_paths(exports, profiles.TRANSIENT_RAW_EXPORT_ROLE), contract)
     raw_times = np.unique(mapped["t"])
-    regular_times, regular_positions, irregular_position = _classify_transient_times(raw_times)
+    regular_times, regular_positions, irregular_position = _classify_transient_times(
+        raw_times,
+        config.scientific_values["time"],
+    )
     actual_x = np.unique(mapped["x"])
     actual_y = np.unique(mapped["y"])
     expected_rows = raw_times.size * x_axis.size * y_axis.size
@@ -347,6 +380,7 @@ def _validate_global_bulk_moisture(
     global_values: np.ndarray,
     *,
     f_surf: float,
+    time_tolerance: float,
 ) -> None:
     """Validate exported bulk moisture against the weighted two-state contract."""
     rho_bu_dry = static_fields[profiles.TRANSIENT_STATIC_FIELD_NAMES.index("rho_bu_dry")]
@@ -367,7 +401,7 @@ def _validate_global_bulk_moisture(
         global_time,
         state_time,
         rtol=0.0,
-        atol=TIME_CLASSIFICATION_ATOL,
+        atol=time_tolerance,
     ):
         message = "Global diagnostics must contain exactly one row for every regular and optional exact-stop state."
         raise ValueError(message)
@@ -378,14 +412,17 @@ def _validate_global_bulk_moisture(
         raise ValueError(message)
 
 
-def _stationary_fixed_values(case_payload: Mapping[str, Any]) -> np.ndarray:
-    """Validate package-fixed template conditioning without claiming file input."""
+def _stationary_fixed_values(
+    case_payload: Mapping[str, Any],
+    fixed_values: Mapping[str, Any],
+) -> np.ndarray:
+    """Validate configured package-fixed conditioning without claiming file input."""
     entries = case_payload.get("stationary_fixed_values")
     ownership = case_payload.get("stationary_fixed_ownership")
     expected_entries = [
         {
             "name": name,
-            "value": profiles.STATIONARY_FIXED_VALUES[name],
+            "value": fixed_values[name],
             "unit": unit,
             "owner": "package_fixed",
             "runtime_source": "canonical_template",
@@ -400,7 +437,7 @@ def _stationary_fixed_values(case_payload: Mapping[str, Any]) -> np.ndarray:
         name: {
             "owner": "package_fixed",
             "unit": unit,
-            "fixed_value": profiles.STATIONARY_FIXED_VALUES[name],
+            "fixed_value": fixed_values[name],
         }
         for name, unit in zip(
             profiles.STATIONARY_FIXED_FIELDS,
@@ -409,16 +446,14 @@ def _stationary_fixed_values(case_payload: Mapping[str, Any]) -> np.ndarray:
         )
     }
     if entries != expected_entries or ownership != expected_ownership:
-        msg = "Stationary package-fixed provenance disagrees with the canonical template contract."
+        msg = "Stationary package-fixed provenance disagrees with the configured template contract."
         raise ValueError(msg)
     sampled = case_payload.get("sampled_values")
-    if not isinstance(sampled, Mapping) or any(
-        sampled.get(name) != profiles.STATIONARY_FIXED_VALUES[name] for name in profiles.STATIONARY_FIXED_FIELDS
-    ):
+    if not isinstance(sampled, Mapping) or any(sampled.get(name) != fixed_values[name] for name in profiles.STATIONARY_FIXED_FIELDS):
         msg = "Stationary package-fixed values are missing from case identity provenance."
         raise ValueError(msg)
     return np.asarray(
-        [profiles.STATIONARY_FIXED_VALUES[name] for name in profiles.STATIONARY_FIXED_FIELDS],
+        [fixed_values[name] for name in profiles.STATIONARY_FIXED_FIELDS],
         dtype=np.float64,
     )
 
@@ -463,7 +498,7 @@ def _transient_scalar_values(
         or [entry.get("name") for entry in entries if isinstance(entry, dict)] != list(names)
         or [entry.get("unit") for entry in entries if isinstance(entry, dict)] != list(units)
         or [entry.get("owner") for entry in entries if isinstance(entry, dict)]
-        != ["package_fixed" if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"} else "case_dependent" for name in names]
+        != ["package_fixed" if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS else "case_dependent" for name in names]
     ):
         msg = "Case scalar provenance does not match the exact names, units, and ownership classes."
         raise ValueError(msg)
@@ -474,8 +509,14 @@ def _transient_scalar_values(
     return values
 
 
-def _schedule_values(case_payload: Mapping[str, Any], work_directory: Path, *, p_ref: float) -> np.ndarray:
-    """Read and thermodynamically revalidate the schedule bound by case.json."""
+def _schedule_values(
+    case_payload: Mapping[str, Any],
+    work_directory: Path,
+    *,
+    p_ref: float,
+    time_contract: Mapping[str, Any],
+) -> np.ndarray:
+    """Read and revalidate the configured schedule bound by case.json."""
     spec = case_payload["input_contract"]["schedule"]
     path = work_directory / spec["filename"]
     identity = case_payload["input_files"][path.name]
@@ -483,11 +524,15 @@ def _schedule_values(case_payload: Mapping[str, Any], work_directory: Path, *, p
         msg = "Schedule adapter bytes changed after case-input identity was computed."
         raise RuntimeError(msg)
     header, values = _read_table(path, delimiter=spec["delimiter"])
-    if header != list(profiles.SCHEDULE_FIELDS) or values.shape != (169, len(profiles.SCHEDULE_FIELDS)):
-        msg = "Schedule adapter does not match the exact regular 0..168-hour contract."
+    expected_time = np.asarray(time_contract["regular_times"], dtype=np.float64)
+    if header != list(profiles.SCHEDULE_FIELDS) or values.shape != (
+        expected_time.size,
+        len(profiles.SCHEDULE_FIELDS),
+    ):
+        msg = "Schedule adapter does not match the configured regular-time contract."
         raise ValueError(msg)
-    if not np.array_equal(values[:, 0], np.arange(169, dtype=np.float64)):
-        msg = "Schedule adapter time must be the exact hourly 0..168 sequence."
+    if not np.array_equal(values[:, 0], expected_time):
+        msg = "Schedule adapter time must match the configured regular nodes."
         raise ValueError(msg)
     if np.any((values[:, 3] < 0.0) | (values[:, 3] > 1.0)):
         msg = "Schedule relative humidity must lie in [0, 1]."
@@ -520,11 +565,12 @@ def _validate_transient_outputs(
     f_surf: float,
 ) -> None:
     """Validate final weighted moisture, diagnostic signs, and exact-stop alignment."""
+    time_tolerance = time_classification_tolerance(config.scientific_values["time"])
     if global_values.shape != (state_time.size, len(profiles.GLOBAL_FIELD_NAMES)):
         msg = "Global diagnostics must contain one complete row per exported solution state."
         raise ValueError(msg)
     global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
-    if not np.allclose(global_time, state_time, rtol=0.0, atol=TIME_CLASSIFICATION_ATOL):
+    if not np.allclose(global_time, state_time, rtol=0.0, atol=time_tolerance):
         msg = "Global diagnostic times do not align with the complete exported state axis."
         raise ValueError(msg)
     f_wet = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]
@@ -541,7 +587,7 @@ def _validate_transient_outputs(
         msg = "Final status export must contain exactly one complete row."
         raise ValueError(msg)
     final = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
-    if abs(float(final["t_final"]) - float(state_time[-1])) > TIME_CLASSIFICATION_ATOL:
+    if abs(float(final["t_final"]) - float(state_time[-1])) > time_tolerance:
         msg = "Final Status t_final must identify the actual last exported solution state."
         raise ValueError(msg)
     if not np.isclose(float(final["f_wet_dm_final"]), float(f_wet[-1]), rtol=1e-6, atol=1e-9):
@@ -591,7 +637,14 @@ def _validate_transient_outputs(
     ):
         msg = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
         raise ValueError(msg)
-    _validate_global_bulk_moisture(static_fields, state_time, state_fields, global_values, f_surf=f_surf)
+    _validate_global_bulk_moisture(
+        static_fields,
+        state_time,
+        state_fields,
+        global_values,
+        f_surf=f_surf,
+        time_tolerance=time_tolerance,
+    )
 
 
 def validate_float32_conversion(values: np.ndarray, *, rtol: float, atol: float, label: str) -> np.ndarray:
@@ -879,8 +932,9 @@ def _write_hdf5(
                 raise ValueError(msg)
             time_dataset = handle.create_dataset("time", data=np.asarray(transient_time, dtype=np.float64))
             time_dataset.attrs["unit"] = "h"
-            time_dataset.attrs["classification_atol"] = TIME_CLASSIFICATION_ATOL
-            time_dataset.attrs["classification_basis"] = _TIME_CLASSIFICATION_BASIS
+            time_contract = config.scientific_values["time"]
+            time_dataset.attrs["classification_atol"] = time_classification_tolerance(time_contract)
+            time_dataset.attrs["classification_basis"] = _time_classification_basis(time_contract)
             transient = handle.create_group("transient")
             transient_dataset = transient.create_dataset(
                 "fields",
@@ -1095,7 +1149,7 @@ def _validate_hdf5_provenance(
         name: {
             "owner": "package_fixed",
             "unit": unit,
-            "fixed_value": profiles.STATIONARY_FIXED_VALUES[name],
+            "fixed_value": scientific["scientific_fixed_values"][name],
         }
         for name, unit in zip(
             profiles.STATIONARY_FIXED_FIELDS,
@@ -1240,17 +1294,13 @@ def _validate_hdf5_provenance(
     )
     expected_template = {
         "relative_path": profile_contract.template_relative_path,
-        "filename": profile_contract.template_path.name,
-        "sha256": profile_contract.template_sha256,
+        "filename": Path(profile_contract.template_relative_path).name,
+        "sha256": template_sha256,
         "sha256_validation": "pass",
         "comsol_internal_contract": "runtime_validation_required",
     }
-    if (
-        relative_path != profile_contract.template_relative_path
-        or template_sha256 != profile_contract.template_sha256
-        or template != expected_template
-    ):
-        msg = "Canonical HDF5 template path, sidecar digest, or runtime-validation provenance is invalid."
+    if relative_path != profile_contract.template_relative_path or not _is_sha256(template_sha256) or template != expected_template:
+        msg = "Canonical HDF5 persisted template identity or runtime-validation provenance is invalid."
         raise ValueError(msg)
     return scientific, relative_path, scalar_handoff, fixed_ownership
 
@@ -1259,8 +1309,9 @@ def _validate_hdf5_static_and_parameters(
     handle: h5py.File,
     profile: str,
     scalar_handoff: Mapping[str, Any] | None,
+    scientific: Mapping[str, Any],
 ) -> tuple[h5py.Dataset, tuple[str, ...]]:
-    """Validate the frozen grid, static fields, and profile parameter provenance."""
+    """Validate configured grid, static fields, and parameter provenance."""
     _require_group_members(handle, "coords", {"x", "y"})
     _require_group_members(handle, "static", {"fields"})
     x_axis = _hdf5_dataset(handle, "coords/x")
@@ -1274,24 +1325,36 @@ def _validate_hdf5_static_and_parameters(
     if x_unit != "m" or y_unit != "m":
         msg = "Canonical coordinate units must be explicit metres."
         raise ValueError(msg)
+    grid = scientific["grid"]
+    storage = scientific["storage"]
+    fixed_values = scientific["scientific_fixed_values"]
+    nx = int(grid["nx"])
+    ny = int(grid["ny"])
+    expected_x = np.linspace(0.0, float(grid["Lx"]), nx, dtype=np.float64)
+    expected_y = np.linspace(0.0, float(grid["Ly"]), ny, dtype=np.float64)
     x_values = np.asarray(x_axis, dtype=np.float64)
     y_values = np.asarray(y_axis, dtype=np.float64)
     if (
-        x_values.shape != (401,)
-        or y_values.shape != (251,)
+        x_values.shape != expected_x.shape
+        or y_values.shape != expected_y.shape
         or not np.isfinite(x_values).all()
         or not np.isfinite(y_values).all()
-        or not np.allclose(x_values, np.linspace(0.0, 1.2, 401), rtol=0.0, atol=_COORDINATE_ATOL)
-        or not np.allclose(y_values, np.linspace(0.0, 0.75, 251), rtol=0.0, atol=_COORDINATE_ATOL)
+        or not np.allclose(x_values, expected_x, rtol=0.0, atol=_COORDINATE_ATOL)
+        or not np.allclose(y_values, expected_y, rtol=0.0, atol=_COORDINATE_ATOL)
     ):
-        msg = "Canonical coordinate axes must satisfy the frozen 401x251 boundary-inclusive grid."
+        msg = "Canonical coordinate axes disagree with the embedded configured grid."
         raise ValueError(msg)
     static_names = profiles.static_field_names(profile)
     static_units = profiles.static_field_units(profile)
-    if static.shape != (len(static_names), 251, 401) or not _dataset_is_finite(static):
+    if static.shape != (len(static_names), ny, nx) or not _dataset_is_finite(static):
         msg = "Canonical static field shape or finiteness is invalid."
         raise ValueError(msg)
-    if static.compression != "gzip" or static.compression_opts != _HDF5_COMPRESSION_LEVEL or not static.shuffle or static.chunks != (1, 64, 64):
+    expected_static_chunks = (
+        1,
+        min(int(storage["chunk_y"]), ny),
+        min(int(storage["chunk_x"]), nx),
+    )
+    if not _compression_matches(static, storage) or static.chunks != expected_static_chunks:
         msg = "Canonical static compression or chunking contract is invalid."
         raise ValueError(msg)
     _dataset_contract(static, names=static_names, units=static_units, label="static")
@@ -1314,7 +1377,7 @@ def _validate_hdf5_static_and_parameters(
             label="stationary_fixed.runtime_source",
         )
         expected_values = np.asarray(
-            [profiles.STATIONARY_FIXED_VALUES[name] for name in scalar_names],
+            [fixed_values[name] for name in scalar_names],
             dtype=np.float64,
         )
         if (
@@ -1325,7 +1388,7 @@ def _validate_hdf5_static_and_parameters(
             or runtime_source != "canonical_template"
             or not np.array_equal(scalar_values, expected_values)
         ):
-            msg = "Canonical stationary template-fixed values or provenance are invalid."
+            msg = "Canonical configured stationary values or provenance are invalid."
             raise ValueError(msg)
         _dataset_contract(
             scalar,
@@ -1346,7 +1409,8 @@ def _validate_hdf5_static_and_parameters(
             label="scalar.ownership",
         )
     )
-    expected_ownership = ["package_fixed" if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"} else "case_dependent" for name in scalar_names]
+    package_fixed_names = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
+    expected_ownership = ["package_fixed" if name in package_fixed_names else "case_dependent" for name in scalar_names]
     entries = None if scalar_handoff is None else scalar_handoff.get("entries")
     expected_entries = [
         {"name": name, "value": float(value), "unit": unit, "owner": owner}
@@ -1358,15 +1422,14 @@ def _validate_hdf5_static_and_parameters(
             strict=True,
         )
     ]
+    fixed_values_match = all(scalar_values[scalar_names.index(name)] == float(fixed_values[name]) for name in package_fixed_names)
     if (
         scalar.dtype != np.float64
         or scalar.shape != (len(scalar_names),)
         or ownership != expected_ownership
         or not np.isfinite(scalar_values).all()
         or entries != expected_entries
-        or scalar_values[scalar_names.index("T_flow_ref")] != profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE
-        or scalar_values[scalar_names.index("p_ref")] != profiles.STATIONARY_FLOW_REFERENCE_PRESSURE
-        or scalar_values[scalar_names.index("p_out")] != profiles.STATIONARY_FLOW_OUTLET_PRESSURE
+        or not fixed_values_match
     ):
         msg = "Canonical transient scalar values or handoff provenance are invalid."
         raise ValueError(msg)
@@ -1379,27 +1442,46 @@ def _validate_hdf5_static_and_parameters(
     return scalar, scalar_names
 
 
-def _validate_hdf5_regular_trajectory(handle: h5py.File) -> np.ndarray:
-    """Validate the regular-only time axis and absolute physical trajectory."""
+def _validate_hdf5_regular_trajectory(
+    handle: h5py.File,
+    scientific: Mapping[str, Any],
+) -> np.ndarray:
+    """Validate the configured regular-only axis and absolute trajectory."""
     _require_group_members(handle, "transient", {"fields"})
     time = _hdf5_dataset(handle, "time")
     transient = _hdf5_dataset(handle, "transient/fields")
     time_values = np.asarray(time, dtype=np.float64)
+    time_contract = scientific["time"]
+    grid = scientific["grid"]
+    storage = scientific["storage"]
+    configured_times = np.asarray(time_contract["regular_times"], dtype=np.float64)
+    tolerance = time_classification_tolerance(time_contract)
     if (
         time.dtype != np.float64
         or transient.dtype != np.float32
         or time_values.ndim != 1
         or time_values.size < 1
-        or not np.array_equal(time_values, np.arange(time_values.size, dtype=np.float64))
-        or time_values[-1] > _TIME_HORIZON
+        or time_values.size > configured_times.size
+        or not np.array_equal(time_values, configured_times[: time_values.size])
         or _hdf5_text_attribute(time.attrs.get("unit", ""), label="time.unit") != "h"
-        or float(time.attrs.get("classification_atol", -1.0)) != TIME_CLASSIFICATION_ATOL
-        or _hdf5_text_attribute(time.attrs.get("classification_basis", ""), label="time.classification_basis") != _TIME_CLASSIFICATION_BASIS
+        or float(time.attrs.get("classification_atol", -1.0)) != tolerance
+        or _hdf5_text_attribute(time.attrs.get("classification_basis", ""), label="time.classification_basis")
+        != _time_classification_basis(time_contract)
         or not _dataset_is_finite(transient)
     ):
         msg = "Canonical regular time axis, dtypes, or classification provenance is invalid."
         raise ValueError(msg)
-    if transient.shape != (time.size, len(profiles.TRANSIENT_FIELD_NAMES), 251, 401):
+    time_size = time.size
+    if time_size is None:
+        msg = "Canonical regular time dataset must have a finite element count."
+        raise ValueError(msg)
+    expected_shape = (
+        time_size,
+        len(profiles.TRANSIENT_FIELD_NAMES),
+        int(grid["ny"]),
+        int(grid["nx"]),
+    )
+    if transient.shape != expected_shape:
         msg = "Canonical regular transient field shape is invalid."
         raise ValueError(msg)
     _dataset_contract(
@@ -1408,46 +1490,75 @@ def _validate_hdf5_regular_trajectory(handle: h5py.File) -> np.ndarray:
         units=profiles.TRANSIENT_FIELD_UNITS,
         label="transient",
     )
-    if (
-        transient.compression != "gzip"
-        or transient.compression_opts != _HDF5_COMPRESSION_LEVEL
-        or not transient.shuffle
-        or transient.chunks != (1, 1, 64, 64)
-    ):
+    expected_chunks = (
+        min(int(storage["chunk_time"]), time_size),
+        1,
+        min(int(storage["chunk_y"]), int(grid["ny"])),
+        min(int(storage["chunk_x"]), int(grid["nx"])),
+    )
+    if not _compression_matches(transient, storage) or transient.chunks != expected_chunks:
         msg = "Canonical transient compression or chunking contract is invalid."
         raise ValueError(msg)
     return time_values
 
 
-def _validate_hdf5_schedule(handle: h5py.File, scalar: h5py.Dataset, scalar_names: tuple[str, ...]) -> None:
-    """Validate exact schedule fields and the sole thermodynamic conversion owner."""
+def _validate_hdf5_schedule(
+    handle: h5py.File,
+    scalar: h5py.Dataset,
+    scalar_names: tuple[str, ...],
+    scientific: Mapping[str, Any],
+) -> None:
+    """Validate configured schedule fields and thermodynamic conversion."""
     _require_group_members(handle, "schedule", {"values"})
     schedule = _hdf5_dataset(handle, "schedule/values")
     values = np.asarray(schedule, dtype=np.float64)
+    expected_time = np.asarray(scientific["time"]["regular_times"], dtype=np.float64)
+    storage = scientific["storage"]
     if (
         schedule.dtype != np.float64
-        or schedule.shape != (169, len(profiles.SCHEDULE_FIELDS))
+        or schedule.shape != (expected_time.size, len(profiles.SCHEDULE_FIELDS))
         or not np.isfinite(values).all()
-        or schedule.compression != "gzip"
-        or schedule.compression_opts != _HDF5_COMPRESSION_LEVEL
-        or not schedule.shuffle
+        or not _compression_matches(schedule, storage)
     ):
         msg = "Canonical schedule dtype, shape, finiteness, or compression is invalid."
         raise ValueError(msg)
-    if not np.array_equal(values[:, 0], np.arange(169, dtype=np.float64)):
+    if not np.array_equal(values[:, 0], expected_time):
         msg = "Canonical schedule time coverage is invalid."
         raise ValueError(msg)
-    _dataset_contract(schedule, names=profiles.SCHEDULE_FIELDS, units=profiles.SCHEDULE_UNITS, label="schedule")
+    _dataset_contract(
+        schedule,
+        names=profiles.SCHEDULE_FIELDS,
+        units=profiles.SCHEDULE_UNITS,
+        label="schedule",
+    )
     p_ref = float(np.asarray(scalar, dtype=np.float64)[scalar_names.index("p_ref")])
-    conversion = json.loads(_hdf5_text_attribute(schedule.attrs.get("conversion_pressure", ""), label="schedule.conversion_pressure"))
+    conversion = json.loads(
+        _hdf5_text_attribute(
+            schedule.attrs.get("conversion_pressure", ""),
+            label="schedule.conversion_pressure",
+        )
+    )
     conversion_owner = _hdf5_text_attribute(
         schedule.attrs.get("humidity_conversion_owner", ""),
         label="schedule.humidity_conversion_owner",
     )
-    if conversion != {"name": "p_ref", "value": p_ref, "unit": "Pa", "owner": "package_fixed"} or conversion_owner != "generation_schedule":
+    if (
+        conversion
+        != {
+            "name": "p_ref",
+            "value": p_ref,
+            "unit": "Pa",
+            "owner": "package_fixed",
+        }
+        or conversion_owner != "generation_schedule"
+    ):
         msg = "Canonical schedule conversion-pressure provenance is invalid."
         raise ValueError(msg)
-    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(values[:, 2], values[:, 1], pressure=p_ref)
+    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        values[:, 2],
+        values[:, 1],
+        pressure=p_ref,
+    )
     if not np.allclose(
         values[:, 3],
         expected_phi,
@@ -1458,8 +1569,12 @@ def _validate_hdf5_schedule(handle: h5py.File, scalar: h5py.Dataset, scalar_name
         raise ValueError(msg)
 
 
-def _complete_hdf5_time(handle: h5py.File, regular_time: np.ndarray) -> np.ndarray:
-    """Validate and append one optional diagnostic exact-stop time."""
+def _complete_hdf5_time(
+    handle: h5py.File,
+    regular_time: np.ndarray,
+    scientific: Mapping[str, Any],
+) -> np.ndarray:
+    """Validate and append one optional configured diagnostic exact-stop time."""
     if "exact_stop" not in handle:
         return regular_time
     exact_group = _require_group_members(handle, "exact_stop", {"time", "fields"})
@@ -1467,18 +1582,32 @@ def _complete_hdf5_time(handle: h5py.File, regular_time: np.ndarray) -> np.ndarr
     exact_fields = _hdf5_dataset(handle, "exact_stop/fields")
     values = np.asarray(exact_time, dtype=np.float64)
     unit = _hdf5_text_attribute(exact_time.attrs.get("unit", ""), label="exact_stop.time.unit")
+    time_contract = scientific["time"]
+    grid = scientific["grid"]
+    storage = scientific["storage"]
+    tolerance = time_classification_tolerance(time_contract)
+    configured_times = np.asarray(time_contract["regular_times"], dtype=np.float64)
+    separated_from_regular = values.shape == (1,) and np.min(np.abs(configured_times - values[0])) > tolerance
+    expected_shape = (
+        len(profiles.TRANSIENT_FIELD_NAMES),
+        int(grid["ny"]),
+        int(grid["nx"]),
+    )
+    expected_chunks = (
+        1,
+        min(int(storage["chunk_y"]), int(grid["ny"])),
+        min(int(storage["chunk_x"]), int(grid["nx"])),
+    )
     if (
         exact_time.dtype != np.float64
         or values.shape != (1,)
-        or values[0] <= regular_time[-1] + TIME_CLASSIFICATION_ATOL
-        or values[0] > _TIME_HORIZON + TIME_CLASSIFICATION_ATOL
-        or abs(values[0] - round(float(values[0]))) <= TIME_CLASSIFICATION_ATOL
+        or values[0] <= regular_time[-1] + tolerance
+        or values[0] > float(time_contract["stop"]) + tolerance
+        or not separated_from_regular
         or exact_fields.dtype != np.float32
-        or exact_fields.shape != (len(profiles.TRANSIENT_FIELD_NAMES), 251, 401)
-        or exact_fields.compression != "gzip"
-        or exact_fields.compression_opts != _HDF5_COMPRESSION_LEVEL
-        or not exact_fields.shuffle
-        or exact_fields.chunks != (1, 64, 64)
+        or exact_fields.shape != expected_shape
+        or not _compression_matches(exact_fields, storage)
+        or exact_fields.chunks != expected_chunks
         or not _dataset_is_finite(exact_fields)
         or unit != "h"
         or exact_group.attrs.get("usage") != "diagnostic_only_no_training_transition"
@@ -1494,7 +1623,11 @@ def _complete_hdf5_time(handle: h5py.File, regular_time: np.ndarray) -> np.ndarr
     return np.concatenate((regular_time, values))
 
 
-def _validate_hdf5_diagnostics(handle: h5py.File, complete_time: np.ndarray) -> None:
+def _validate_hdf5_diagnostics(
+    handle: h5py.File,
+    complete_time: np.ndarray,
+    scientific: Mapping[str, Any],
+) -> None:
     """Validate complete global diagnostics and actual Final Status."""
     _require_group_members(handle, "global", {"values"})
     _require_group_members(handle, "final_status", {"values"})
@@ -1502,23 +1635,28 @@ def _validate_hdf5_diagnostics(handle: h5py.File, complete_time: np.ndarray) -> 
     final_status = _hdf5_dataset(handle, "final_status/values")
     global_array = np.asarray(global_values, dtype=np.float64)
     final_array = np.asarray(final_status, dtype=np.float64)
+    storage = scientific["storage"]
+    tolerance = time_classification_tolerance(scientific["time"])
     if (
         global_values.dtype != np.float64
         or global_array.shape != (complete_time.size, len(profiles.GLOBAL_FIELD_NAMES))
         or not np.isfinite(global_array).all()
-        or global_values.compression != "gzip"
-        or global_values.compression_opts != _HDF5_COMPRESSION_LEVEL
-        or not global_values.shuffle
-        or not np.allclose(global_array[:, 0], complete_time, rtol=0.0, atol=TIME_CLASSIFICATION_ATOL)
+        or not _compression_matches(global_values, storage)
+        or not np.allclose(global_array[:, 0], complete_time, rtol=0.0, atol=tolerance)
     ):
         msg = "Canonical complete global diagnostic values or time semantics are invalid."
         raise ValueError(msg)
-    _dataset_contract(global_values, names=profiles.GLOBAL_FIELD_NAMES, units=profiles.GLOBAL_FIELD_UNITS, label="global")
+    _dataset_contract(
+        global_values,
+        names=profiles.GLOBAL_FIELD_NAMES,
+        units=profiles.GLOBAL_FIELD_UNITS,
+        label="global",
+    )
     if (
         final_status.dtype != np.float64
         or final_array.shape != (len(profiles.FINAL_STATUS_FIELDS),)
         or not np.isfinite(final_array).all()
-        or abs(final_array[0] - complete_time[-1]) > TIME_CLASSIFICATION_ATOL
+        or abs(final_array[0] - complete_time[-1]) > tolerance
     ):
         msg = "Canonical final-status values or actual final time are invalid."
         raise ValueError(msg)
@@ -1530,11 +1668,17 @@ def _validate_hdf5_diagnostics(handle: h5py.File, complete_time: np.ndarray) -> 
     )
 
 
-def _validate_hdf5_transient(handle: h5py.File, scalar: h5py.Dataset, scalar_names: tuple[str, ...]) -> None:
+def _validate_hdf5_transient(
+    handle: h5py.File,
+    scalar: h5py.Dataset,
+    scalar_names: tuple[str, ...],
+    scientific: Mapping[str, Any],
+) -> None:
     """Validate all transient-only schema-v1 members."""
-    regular_time = _validate_hdf5_regular_trajectory(handle)
-    _validate_hdf5_schedule(handle, scalar, scalar_names)
-    _validate_hdf5_diagnostics(handle, _complete_hdf5_time(handle, regular_time))
+    regular_time = _validate_hdf5_regular_trajectory(handle, scientific)
+    _validate_hdf5_schedule(handle, scalar, scalar_names, scientific)
+    complete_time = _complete_hdf5_time(handle, regular_time, scientific)
+    _validate_hdf5_diagnostics(handle, complete_time, scientific)
 
 
 def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> dict[str, Any]:
@@ -1554,7 +1698,7 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         if expected_profile is not None and profile != expected_profile:
             msg = f"Canonical case profile mismatch: expected {expected_profile!r}, got {profile!r}."
             raise ValueError(msg)
-        profile_contract = profiles.get_profile(profile)
+        profile_contract = profiles.resolve_profile(profile)
         _validate_hdf5_members(handle, profile)
         (
             scientific,
@@ -1570,9 +1714,10 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
             handle,
             profile,
             scalar_handoff,
+            scientific,
         )
         if profile == profiles.TRANSIENT_DRYING_PROFILE:
-            _validate_hdf5_transient(handle, scalar, scalar_names)
+            _validate_hdf5_transient(handle, scalar, scalar_names, scientific)
         identities = {
             name: _hdf5_text_attribute(handle.attrs[name], label=name)
             for name in ("case_input_id", "simulation_case_id", "scientific_config_digest", "template_sha256")
@@ -1601,6 +1746,9 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
             "simulation_profile": profile,
             "git_commit": git_commit,
             "template_relative_path": template_relative_path,
+            "export_contract_sha256": export_contract_sha256,
+            "available_learning_views": tuple(available_views),
+            "airflow_source": airflow_source,
             **identities,
         }
 
@@ -1616,7 +1764,10 @@ def convert_exports_to_hdf5(
 ) -> CanonicalCase:
     """Validate all adapters and atomically create the sole canonical payload."""
     x_axis, y_axis, static_fields = _static_fields(config, exports)
-    stationary_values = _stationary_fixed_values(case_payload)
+    stationary_values = _stationary_fixed_values(
+        case_payload,
+        config.scientific_values["scientific_fixed_values"],
+    )
     scalar_values = stationary_values if config.profile.id == profiles.STEADY_FLOW_PROFILE else _transient_scalar_values(case_payload, work_directory)
     transient_time: np.ndarray | None = None
     transient_fields: np.ndarray | None = None
@@ -1635,7 +1786,12 @@ def convert_exports_to_hdf5(
         scalar_names = profiles.scalar_input_fields(config.profile.id)
         p_ref = float(scalar_values[scalar_names.index("p_ref")])
         f_surf = float(scalar_values[scalar_names.index("f_surf")])
-        schedule_values = _schedule_values(case_payload, work_directory, p_ref=p_ref)
+        schedule_values = _schedule_values(
+            case_payload,
+            work_directory,
+            p_ref=p_ref,
+            time_contract=config.scientific_values["time"],
+        )
         global_values = _ordered_values(config, exports, profiles.GLOBAL_EXPORT_ROLE, profiles.GLOBAL_FIELD_NAMES)
         if np.any(np.diff(global_values[:, 0]) <= 0):
             msg = "Global diagnostic time must be strictly increasing."

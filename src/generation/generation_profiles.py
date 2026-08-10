@@ -41,9 +41,6 @@ EXACT_STOP_EXPORT_ROLE = "exact_stop_diagnostics"
 STEADY_FLOW_LEARNING_VIEW = "steady_flow"
 TRANSIENT_DRYING_LEARNING_VIEW = "transient_drying"
 STATIONARITY_TOLERANCE = 1e-10
-STATIONARY_FLOW_REFERENCE_TEMPERATURE = 300.65
-STATIONARY_FLOW_REFERENCE_PRESSURE = 101325.0
-STATIONARY_FLOW_OUTLET_PRESSURE = 0.0
 _SIDECAR_PART_COUNT = 2
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -61,13 +58,7 @@ SCHEDULE_FIELDS: Final = ("t", "T_in_bc", "omega_in_bc", "phi_in_bc")
 SCHEDULE_UNITS: Final = ("h", "K", "kg/kg", "1")
 STATIONARY_FIXED_FIELDS: Final = ("T_flow_ref", "p_ref", "p_out")
 STATIONARY_FIXED_UNITS: Final = ("K", "Pa", "Pa")
-STATIONARY_FIXED_VALUES: Final = MappingProxyType(
-    {
-        "T_flow_ref": STATIONARY_FLOW_REFERENCE_TEMPERATURE,
-        "p_ref": STATIONARY_FLOW_REFERENCE_PRESSURE,
-        "p_out": STATIONARY_FLOW_OUTLET_PRESSURE,
-    }
-)
+TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS: Final = (*STATIONARY_FIXED_FIELDS, "f_wet_dm_max")
 TRANSIENT_SCALAR_INPUT_FIELDS: Final = (
     *STATIONARY_FIXED_FIELDS,
     "T_init",
@@ -361,14 +352,19 @@ def available_profiles() -> tuple[str, ...]:
     return tuple(sorted(_PROFILES))
 
 
-def get_profile(profile_id: str) -> SimulationProfile:
-    """Resolve one exact profile and validate its immutable template bytes."""
+def resolve_profile(profile_id: str) -> SimulationProfile:
+    """Resolve one immutable profile schema without touching template bytes."""
     try:
-        profile = _PROFILES[profile_id]
+        return _PROFILES[profile_id]
     except KeyError as error:
         available = ", ".join(available_profiles())
         message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
         raise ValueError(message) from error
+
+
+def get_profile(profile_id: str) -> SimulationProfile:
+    """Resolve one profile and validate its immutable template bytes."""
+    profile = resolve_profile(profile_id)
     path = profile.template_path
     if not path.is_file() or path.suffix.lower() != ".mph":
         message = f"Required COMSOL template is missing for profile {profile.id!r}: {path}"

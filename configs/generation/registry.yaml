@@ -17,6 +17,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 1
   kappa_cv:
     kind: interval
     unit: '1'
@@ -30,6 +31,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 2
   bed.structure.coarse_len_rel:
     kind: interval
     unit: '1'
@@ -42,6 +44,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 3
   bed.structure.fine_len_rel:
     kind: interval
     unit: '1'
@@ -54,6 +57,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 4
   bed.structure.coarse_weight:
     kind: interval
     unit: '1'
@@ -66,6 +70,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 5
   bed.structure.fine_ani_x:
     kind: interval
     unit: '1'
@@ -78,6 +83,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 7
   bed.structure.fine_ani_y:
     kind: interval
     unit: '1'
@@ -90,6 +96,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 8
   bed.structure.cross_scale_corr:
     kind: interval
     unit: '1'
@@ -102,6 +109,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 6
   bed.perturbations.amplitude:
     kind: interval
     unit: '1'
@@ -114,6 +122,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 9
   bed.perturbations.granularity:
     kind: interval
     unit: '1'
@@ -126,6 +135,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 10
   bed.perturbations.sign_bias:
     kind: interval
     unit: '1'
@@ -138,6 +148,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 11
   permeability.anisotropy.max_ratio:
     kind: interval
     unit: '1'
@@ -150,6 +161,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 12
   permeability.anisotropy.exponent:
     kind: interval
     unit: '1'
@@ -162,6 +174,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 13
   permeability.anisotropy.strength:
     kind: interval
     unit: '1'
@@ -174,6 +187,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 14
   permeability.orientation.jitter:
     kind: interval
     unit: '1'
@@ -186,6 +200,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 15
   permeability.orientation.smooth_len_rel:
     kind: interval
     unit: '1'
@@ -198,6 +213,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 16
   porosity.kc_anchor_factor:
     kind: conditional_interval
     unit: '1'
@@ -214,11 +230,13 @@ parameters:
     block: airflow
     ood_group: bed
     report_symbol: a_KC
-    description: Dimensionless factor scaling the material-calibrated Kozeny-Carman reference coefficient.
+    description: Dimensionless factor scaling the material-calibrated Kozeny-Carman
+      reference coefficient.
     classification: sampled
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 17
   porosity.smooth_len_rel:
     kind: interval
     unit: '1'
@@ -231,6 +249,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 18
   porosity.texture_amp:
     kind: interval
     unit: '1'
@@ -243,6 +262,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 19
   pressure_bc.mean:
     kind: interval
     unit: Pa
@@ -255,6 +275,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 20
   pressure_bc.sin_amp:
     kind: interval
     unit: '1'
@@ -267,6 +288,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 21
   pressure_bc.sin_freq:
     kind: interval
     unit: '1'
@@ -279,6 +301,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 22
   pressure_bc.sin_phase:
     kind: interval
     unit: rad
@@ -291,6 +314,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 23
   pressure_bc.gauss_count:
     kind: integer
     unit: '1'
@@ -302,6 +326,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 24
   pressure_bc.gauss_amp:
     kind: interval
     unit: '1'
@@ -314,6 +339,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 25
   pressure_bc.gauss_width:
     kind: interval
     unit: '1'
@@ -326,6 +352,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 26
   pressure_bc.gauss_jitter:
     kind: interval
     unit: '1'
@@ -338,6 +365,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 27
   pressure_bc.linear_amp:
     kind: interval
     unit: '1'
@@ -350,6 +378,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
+    sampling_order: 28
   initial_moisture.mean_db:
     kind: interval
     unit: kg/kg
@@ -361,6 +390,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 1
   initial_moisture.amplitude_db:
     kind: interval
     unit: kg/kg
@@ -372,6 +402,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 2
   initial_moisture.structure.coarse_len_rel:
     kind: interval
     unit: '1'
@@ -383,6 +414,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 3
   initial_moisture.structure.fine_len_rel:
     kind: interval
     unit: '1'
@@ -394,6 +426,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 4
   initial_moisture.structure.coarse_weight:
     kind: interval
     unit: '1'
@@ -406,6 +439,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 5
   initial_moisture.structure.fine_ani_x:
     kind: interval
     unit: '1'
@@ -417,6 +451,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 7
   initial_moisture.structure.fine_ani_y:
     kind: interval
     unit: '1'
@@ -428,6 +463,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 8
   initial_moisture.structure.cross_scale_corr:
     kind: interval
     unit: '1'
@@ -439,6 +475,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 6
   T_in_base:
     kind: interval
     unit: K
@@ -450,6 +487,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 1
   T_in_amp:
     kind: interval
     unit: K
@@ -461,6 +499,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 2
   omega_in_base:
     kind: interval
     unit: kg/kg
@@ -472,6 +511,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 3
   omega_in_amp:
     kind: interval
     unit: kg/kg
@@ -483,6 +523,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 4
   schedule.corr:
     kind: interval
     unit: '1'
@@ -494,6 +535,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 5
   schedule.timescale_rel:
     kind: interval
     unit: '1'
@@ -505,6 +547,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 6
   schedule.component_weights:
     kind: simplex
     unit: '1'
@@ -520,6 +563,7 @@ parameters:
     profile_applicability:
     - transient_drying
     atomic_record: schedule_simplex
+    sampling_order: 7
   schedule.event_count:
     kind: integer
     unit: '1'
@@ -530,6 +574,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 8
   schedule.event_duration_rel:
     kind: interval
     unit: '1'
@@ -541,6 +586,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 9
   schedule.event_width_rel:
     kind: interval
     unit: '1'
@@ -552,6 +598,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 10
   rho_bu_dry_ref:
     kind: interval
     unit: kg/m^3
@@ -564,6 +611,7 @@ parameters:
     profile_applicability:
     - transient_drying
     atomic_record: density_calibration
+    sampling_order: 1
   k_gr:
     kind: interval
     unit: W/(m*K)
@@ -575,6 +623,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 2
   cp_gr_dry:
     kind: interval
     unit: J/(kg*K)
@@ -586,6 +635,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 3
   r_surf_0:
     kind: interval
     unit: 1/s
@@ -598,6 +648,7 @@ parameters:
     profile_applicability:
     - transient_drying
     atomic_record: two_compartment_kinetics
+    sampling_order: 4
   r_int_surf:
     kind: interval
     unit: '1'
@@ -610,6 +661,7 @@ parameters:
     profile_applicability:
     - transient_drying
     atomic_record: two_compartment_kinetics
+    sampling_order: 5
   f_surf:
     kind: interval
     unit: '1'
@@ -622,6 +674,7 @@ parameters:
     profile_applicability:
     - transient_drying
     atomic_record: two_compartment_kinetics
+    sampling_order: 6
   T_amb:
     kind: interval
     unit: K
@@ -633,6 +686,7 @@ parameters:
     classification: sampled
     profile_applicability:
     - transient_drying
+    sampling_order: 11
   bed.structure.fine_weight:
     kind: derived
     unit: '1'
@@ -678,7 +732,8 @@ parameters:
     kind: fixed
     unit: '1'
     report_symbol: \varepsilon_{\mathrm{bed,cal,ref}}
-    description: Material calibration porosity for Kozeny-Carman reference coupling and dry bulk density.
+    description: Material calibration porosity for Kozeny-Carman reference coupling
+      and dry bulk density.
     classification: fixed
     profile_applicability:
     - steady_flow

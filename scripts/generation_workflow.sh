@@ -4,16 +4,20 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 LOCAL_PYTHON="${GENERATION_LOCAL_PYTHON:-python3}"
-REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
-DEFAULT_CPU_HOST="sricehpc01"
-STEADY_SMOKE_CAMPAIGN="configs/generation/campaigns/steady_flow/technical_smoke.yaml"
-TRANSIENT_SMOKE_CAMPAIGN="configs/generation/campaigns/transient_drying/technical_smoke.yaml"
-STEADY_PRIMARY_CAMPAIGN="configs/generation/campaigns/steady_flow/family_generalization.yaml"
-TRANSIENT_PRIMARY_CAMPAIGN="configs/generation/campaigns/transient_drying/family_generalization.yaml"
+REPOSITORY_URL="${GENERATION_REPOSITORY_URL:-}"
 GENERATION_MODULE="src.generation.cli.cli_generation"
-PYTHON_MODULE="Python/3.10"
-COMSOL_MODULE="Comsol/v6.4"
-CORES_PER_NODE=32
+STATIONARY_SMOKE_CAMPAIGN_PATH=""
+TRANSIENT_SMOKE_CAMPAIGN_PATH=""
+STATIONARY_PRIMARY_CAMPAIGN_PATH=""
+TRANSIENT_PRIMARY_CAMPAIGN_PATH=""
+CAMPAIGN_PURPOSE=""
+SCHEDULER_KIND=""
+PARTITION=""
+CORES_PER_NODE=""
+PYTHON_MODULE=""
+COMSOL_MODULE=""
+PYTHON_EXECUTABLE=""
+COMSOL_EXECUTABLE=""
 STATUS_POLL_SECONDS="${GENERATION_STATUS_POLL_SECONDS:-30}"
 ALL_WORKFLOW_ACTIVE=false
 ALL_STAGE="not_started"
@@ -22,6 +26,8 @@ CPU_BYTES_RETAINED=0
 CPU_BYTES_RECLAIMED=0
 CPU_CLEANUP_RECEIPT_SHA=""
 PILOT_CASES_PER_MATERIAL=""
+PILOT_MATERIAL_COUNT=""
+PILOT_TOTAL_CASES=""
 SKIP_EXTREME_FAMILY_OOD=false
 PILOT_STAGING=""
 PILOT_STAGING_BYTES=0
@@ -31,11 +37,11 @@ usage() {
   cat >&2 <<EOF
 Usage:
   $0 setup-cpu [--cpu-host HOST] [--remote-root PATH] [--git-commit COMMIT] [--execute]
-  $0 preflight CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
-  $0 plan CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
-  $0 launch CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
-  $0 all CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [--detach] [--keep-cpu-source] [options]
-  $0 smoke --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
+  $0 preflight CAMPAIGN [resource overrides] [options]
+  $0 plan CAMPAIGN [resource overrides] [options]
+  $0 launch CAMPAIGN [resource overrides] [options]
+  $0 all CAMPAIGN [resource overrides] [--detach] [--keep-cpu-source] [options]
+  $0 smoke [resource overrides] [options]
   $0 pilot-check CAMPAIGN [--cases-per-material N] [--keep-cpu-source] [options]
   $0 status [CAMPAIGN_RUN_ID] [remote options]
   $0 collect|build-datasets|resume CAMPAIGN_RUN_ID [options]
@@ -43,20 +49,21 @@ Usage:
   $0 accounting|cancel|validate CAMPAIGN_RUN_ID [remote options]
 
 Remote options:
-  --cpu-host HOST       default: ${DEFAULT_CPU_HOST}
-  --remote-root PATH    default: remote HOME/grainlegumes-generation
+  --cpu-host HOST       explicit override for the configured CPU site
+  --remote-root PATH    bootstrap layout default: remote HOME/grainlegumes-generation
   --git-commit COMMIT   exact lowercase 40-character commit
   --only-batch NAME     one predeclared batch
   --skip-extreme-family-ood
                          skip only the extreme-family batch for this execution
   --wall-time TIME      Slurm [days-]hours:minutes:seconds
 
-setup-cpu and cleanup are dry runs unless --execute or --confirm is supplied.
+Resource options override values resolved from the selected campaign. setup-cpu
+and cleanup are dry runs unless --execute or --confirm is supplied.
 collect validates and publishes GPU generation data without deleting CPU sources.
 all waits synchronously, builds every package, smokes every loader, and cleans the
 verified CPU source by default. Use only --keep-cpu-source to retain it.
 smoke owns the canonical paired two-profile technical run and always retains CPU source.
-pilot-check runs six-material transient diagnostics and safely cleans CPU/staging by default.
+pilot-check runs configured-material transient diagnostics and safely cleans CPU/staging by default.
 EOF
 }
 fail() {
@@ -106,14 +113,6 @@ validate_digest() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail 2 "Malformed SHA-256 digest."
 }
 
-validate_batch() {
-  [[ "$1" =~ ^[a-z0-9_]+__[a-z0-9_]+__(natural|parameter_ood)$ ]]     || fail 2 "Invalid --only-batch value."
-}
-
-validate_wall_time() {
-  [[ "$1" =~ ^([0-9]+-)?[0-9]{1,2}:[0-9]{2}:[0-9]{2}$ ]]     || fail 2 "Invalid Slurm wall time."
-}
-
 print_command() {
   printf '  '
   printf '%q ' "$@"
@@ -140,6 +139,7 @@ REMOTE
 }
 
 resolve_remote_layout() {
+  ensure_execution_bootstrap
   validate_host "${CPU_HOST}"
   REMOTE_HOME="$(read_remote_home "${CPU_HOST}")" || fail 1 "Could not resolve remote HOME."
   validate_path "remote HOME" "${REMOTE_HOME}"
@@ -162,41 +162,127 @@ resolve_local_commit() {
   validate_commit "${head}"
   [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]]     || fail 1 "Requested commit differs from local HEAD."
   REQUESTED_COMMIT="${head}"
+  if [[ -z "${REPOSITORY_URL}" ]]; then
+    REPOSITORY_URL="$(git -C "${PROJECT_DIR}" remote get-url origin)" ||
+      fail 1 "Could not resolve the repository origin URL."
+  fi
+  [[ -n "${REPOSITORY_URL}" && "${REPOSITORY_URL}" != *$'\n'* \
+    && "${REPOSITORY_URL}" != *$'\r'* && "${REPOSITORY_URL}" != *$'\t'* ]] ||
+    fail 2 "Repository URL must be safe non-empty bootstrap text."
   if [[ "${clean}" == true ]]; then
     status="$(git -C "${PROJECT_DIR}" status --porcelain)"
     [[ -z "${status}" ]] || fail 1 "This operation requires a clean local worktree."
   fi
 }
 
+resolve_workflow_campaigns() {
+  resolve_local_python
+  local record kind extra configured_cpu_host configured_scheduler configured_partition
+  local configured_cores_per_node configured_python_module configured_comsol_module
+  local configured_python_executable configured_comsol_executable
+  record="$(local_cli list-campaigns --workflow |
+    "${LOCAL_PYTHON}" -c 'import json, sys
+value = json.load(sys.stdin)
+workflow = value["workflow"]
+site = value["shared_execution_site"]
+fields = (
+    workflow["technical_runtime_smoke"]["stationary"]["source_path"],
+    workflow["technical_runtime_smoke"]["transient"]["source_path"],
+    workflow["family_generalization"]["stationary"]["source_path"],
+    workflow["family_generalization"]["transient"]["source_path"],
+    site["cpu_host"], site["scheduler"], site["partition"], str(site["cores_per_node"]),
+    site["python_module"], site["comsol_module"],
+    site["python_executable"], site["comsol_executable"],
+)
+if any("\t" in str(item) or "\n" in str(item) or "\r" in str(item) for item in fields):
+    raise SystemExit("workflow catalog contains unsafe shell transport text")
+print("\t".join(("workflow", *(str(item) for item in fields))))')" ||
+    fail 1 "Could not resolve the unique configured workflow campaigns."
+  IFS=$'\t' read -r kind STATIONARY_SMOKE_CAMPAIGN_PATH \
+    TRANSIENT_SMOKE_CAMPAIGN_PATH STATIONARY_PRIMARY_CAMPAIGN_PATH \
+    TRANSIENT_PRIMARY_CAMPAIGN_PATH configured_cpu_host configured_scheduler \
+    configured_partition configured_cores_per_node configured_python_module \
+    configured_comsol_module configured_python_executable \
+    configured_comsol_executable extra <<< "${record}"
+  [[ "${kind}" == workflow && -z "${extra:-}" ]] ||
+    fail 1 "Malformed workflow campaign catalog record."
+  [[ -n "${CPU_HOST}" ]] || CPU_HOST="${configured_cpu_host}"
+  [[ -n "${SCHEDULER_KIND}" ]] || SCHEDULER_KIND="${configured_scheduler}"
+  [[ -n "${PARTITION}" ]] || PARTITION="${configured_partition}"
+  [[ -n "${CORES_PER_NODE}" ]] || CORES_PER_NODE="${configured_cores_per_node}"
+  [[ -n "${PYTHON_MODULE}" ]] || PYTHON_MODULE="${configured_python_module}"
+  [[ -n "${COMSOL_MODULE}" ]] || COMSOL_MODULE="${configured_comsol_module}"
+  [[ -n "${PYTHON_EXECUTABLE}" ]] || PYTHON_EXECUTABLE="${configured_python_executable}"
+  [[ -n "${COMSOL_EXECUTABLE}" ]] || COMSOL_EXECUTABLE="${configured_comsol_executable}"
+}
+
 resolve_configured_resources() {
   resolve_local_python
-  local defaults kind configured_max_nodes configured_cases_per_node
+  local record kind configured_max_nodes configured_cases_per_node
   local configured_cores_per_case configured_max_parallel configured_wall_time
-  local configured_cores_per_node extra
-  defaults="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
+  local configured_cores_per_node configured_cpu_host configured_scheduler
+  local configured_partition configured_python_module configured_comsol_module
+  local configured_python_executable configured_comsol_executable extra
+  record="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
     "${LOCAL_PYTHON}" -c 'import json, sys
-value = json.load(sys.stdin)["execution_resources"]["cluster"]
-wall = value.get("wall_time")
-print("\t".join(("resources", str(value["max_nodes"]), str(value["cases_per_node"]), str(value["cores_per_case"]), str(value["max_parallel_cases"]), "-" if wall is None else str(wall), str(value["cores_per_node"]))))')" ||
-    fail 1 "Could not resolve configured campaign resources."
-  IFS=$'\t' read -r kind configured_max_nodes configured_cases_per_node \
-    configured_cores_per_case configured_max_parallel configured_wall_time \
-    configured_cores_per_node extra <<< "${defaults}"
-  [[ "${kind}" == resources && -z "${extra:-}" ]] || fail 1 "Malformed configured resource record."
+value = json.load(sys.stdin)
+resources = value["execution_resources"]
+cluster = resources["cluster"]
+site = resources["site"]
+runtime = resources["runtime"]
+wall = cluster.get("wall_time")
+fields = (
+    value["campaign_purpose"], cluster["max_nodes"], cluster["cases_per_node"],
+    cluster["cores_per_case"], cluster["max_parallel_cases"],
+    "-" if wall is None else wall, cluster["cores_per_node"],
+    site["cpu_host"], site["scheduler"], site["partition"],
+    site["python_module"], site["comsol_module"],
+    site["python_executable"], site["comsol_executable"],
+)
+if any("\t" in str(item) or "\n" in str(item) or "\r" in str(item) for item in fields):
+    raise SystemExit("execution configuration contains unsafe shell transport text")
+print("\t".join(("execution", *(str(item) for item in fields))))')" ||
+    fail 1 "Could not resolve configured campaign execution."
+  IFS=$'\t' read -r kind CAMPAIGN_PURPOSE configured_max_nodes \
+    configured_cases_per_node configured_cores_per_case configured_max_parallel \
+    configured_wall_time configured_cores_per_node configured_cpu_host \
+    configured_scheduler configured_partition configured_python_module \
+    configured_comsol_module configured_python_executable \
+    configured_comsol_executable extra <<< "${record}"
+  [[ "${kind}" == execution && -z "${extra:-}" ]] ||
+    fail 1 "Malformed configured execution record."
   validate_positive "configured max_nodes" "${configured_max_nodes}"
   validate_positive "configured cases_per_node" "${configured_cases_per_node}"
   validate_positive "configured cores_per_case" "${configured_cores_per_case}"
   validate_positive "configured max_parallel_cases" "${configured_max_parallel}"
   validate_positive "configured cores_per_node" "${configured_cores_per_node}"
-  [[ "${configured_cores_per_node}" == "${CORES_PER_NODE}" ]] ||
-    fail 1 "Configured cores_per_node differs from the maintained host contract."
   [[ "${configured_wall_time}" != - ]] || configured_wall_time=""
+  [[ -n "${CPU_HOST}" ]] || CPU_HOST="${configured_cpu_host}"
+  SCHEDULER_KIND="${configured_scheduler}"
+  PARTITION="${configured_partition}"
+  CORES_PER_NODE="${configured_cores_per_node}"
+  PYTHON_MODULE="${configured_python_module}"
+  COMSOL_MODULE="${configured_comsol_module}"
+  PYTHON_EXECUTABLE="${configured_python_executable}"
+  COMSOL_EXECUTABLE="${configured_comsol_executable}"
   [[ -n "${MAX_NODES}" ]] || MAX_NODES="${configured_max_nodes}"
   [[ -n "${CASES_PER_NODE}" ]] || CASES_PER_NODE="${configured_cases_per_node}"
   [[ -n "${CORES_PER_CASE}" ]] || CORES_PER_CASE="${configured_cores_per_case}"
   [[ -n "${MAX_PARALLEL_CASES}" ]] || MAX_PARALLEL_CASES="${configured_max_parallel}"
   [[ -n "${WALL_TIME}" ]] || WALL_TIME="${configured_wall_time}"
 }
+
+ensure_execution_bootstrap() {
+  if [[ -z "${PYTHON_MODULE}" || -z "${COMSOL_MODULE}" || -z "${PYTHON_EXECUTABLE}" \
+    || -z "${COMSOL_EXECUTABLE}" || -z "${CPU_HOST}" || -z "${SCHEDULER_KIND}" \
+    || -z "${PARTITION}" || -z "${CORES_PER_NODE}" ]]; then
+    resolve_workflow_campaigns
+  fi
+  [[ "${SCHEDULER_KIND}" == slurm ]] ||
+    fail 2 "The maintained remote workflow requires configured scheduler=slurm."
+  validate_positive "configured cores_per_node" "${CORES_PER_NODE}"
+}
+
 
 resolve_campaign() {
   require_command realpath
@@ -229,13 +315,15 @@ print("\t".join(("pilot", str(value["campaign_purpose"]), str(counts[0]), str(su
     fail 2 "pilot-check requires a dedicated campaign with campaign_purpose: pilot_check."
   validate_positive "configured pilot cases per material" "${configured_count}"
   validate_positive "configured pilot total" "${configured_total}"
-  (( configured_total == 6 * configured_count )) ||
-    fail 2 "The dedicated pilot campaign must contain all six materials."
+  (( configured_total % configured_count == 0 )) ||
+    fail 2 "Pilot total must be divisible by its uniform cases-per-material count."
+  PILOT_MATERIAL_COUNT="$((configured_total / configured_count))"
   if [[ -z "${PILOT_CASES_PER_MATERIAL}" ]]; then
     PILOT_CASES_PER_MATERIAL="${configured_count}"
   else
     validate_positive --cases-per-material "${PILOT_CASES_PER_MATERIAL}"
   fi
+  PILOT_TOTAL_CASES="$((PILOT_MATERIAL_COUNT * PILOT_CASES_PER_MATERIAL))"
 }
 
 validate_resources() {
@@ -245,8 +333,6 @@ validate_resources() {
   validate_positive --max-parallel-cases "${MAX_PARALLEL_CASES}"
   (( CASES_PER_NODE * CORES_PER_CASE <= CORES_PER_NODE ))     || fail 2 "cases_per_node * cores_per_case exceeds ${CORES_PER_NODE}."
   (( MAX_PARALLEL_CASES <= MAX_NODES * CASES_PER_NODE ))     || fail 2 "max_parallel_cases exceeds max_nodes * cases_per_node."
-  [[ -z "${ONLY_BATCH}" ]] || validate_batch "${ONLY_BATCH}"
-  [[ -z "${WALL_TIME}" ]] || validate_wall_time "${WALL_TIME}"
 }
 
 print_layout() {
@@ -259,9 +345,11 @@ verify_remote_setup() {
   resolve_remote_layout
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" <<'REMOTE'
+    "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" "${PYTHON_MODULE}" \
+    "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; repository_url="$5"
+python_module="$6"; comsol_module="$7"; python_executable="$8"; comsol_executable="$9"
 [[ -d "${repository}/.git" && -d "${storage}" && -x "${venv}/bin/python" ]]
 [[ ! -L "${repository}" && ! -L "${storage}" && ! -L "${venv}" ]]
 [[ "$(stat -c %u "${repository}")" -eq "${UID}" ]]
@@ -270,18 +358,19 @@ repository="$1"; storage="$2"; venv="$3"; commit="$4"; repository_url="$5"
 [[ -z "$(git -C "${repository}" status --porcelain)" ]]
 [[ "$(git -C "${repository}" rev-parse HEAD)" == "${commit}" ]]
 [[ "$(git -C "${repository}" remote get-url origin)" == "${repository_url}" ]]
-module load Python/3.10
-module load Comsol/v6.4
-COMSOL_VERSION_OUTPUT="$(comsol -version 2>&1)"
-printf '%s\n' "${COMSOL_VERSION_OUTPUT}"
-[[ "${COMSOL_VERSION_OUTPUT}" == *"6.4"* ]] || { printf 'COMSOL 6.4 required.\n' >&2; exit 1; }
-for name in python3 comsol sbatch squeue sacct scancel rsync; do command -v "${name}" >/dev/null; done
+module load "${python_module}"
+module load "${comsol_module}"
+command -v "${python_executable}" >/dev/null
+command -v "${comsol_executable}" >/dev/null
+"${python_executable}" --version
+"${comsol_executable}" -version 2>&1
+for name in sbatch squeue sacct scancel rsync; do command -v "${name}" >/dev/null; done
 source "${venv}/bin/activate"
 cd "${repository}"
-python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else f"Python 3.10 required, got {sys.version}")'
-python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+"${venv}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
 REMOTE
 }
+
 
 setup_cpu() {
   resolve_local_commit false
@@ -293,7 +382,7 @@ setup_cpu() {
   print_command git -C "${REMOTE_REPOSITORY}" fetch origin "${REQUESTED_COMMIT}"
   print_command git -C "${REMOTE_REPOSITORY}" checkout --detach "${REQUESTED_COMMIT}"
   print_command module load "${PYTHON_MODULE}"
-  print_command python3 -m venv "${REMOTE_VENV}"
+  print_command "${PYTHON_EXECUTABLE}" -m venv "${REMOTE_VENV}"
   print_command "${REMOTE_VENV}/bin/python" -m pip install -e "${REMOTE_REPOSITORY}[generation-cpu]"
   print_command module load "${COMSOL_MODULE}"
   if [[ "${EXECUTE_SETUP}" != true ]]; then
@@ -302,9 +391,12 @@ setup_cpu() {
   fi
   remote_bash "${CPU_HOST}" \
     "${REMOTE_ROOT}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" <<'REMOTE'
+    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" \
+    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
+    "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 root="$1"; repository="$2"; storage="$3"; venv="$4"; commit="$5"; repository_url="$6"
+python_module="$7"; comsol_module="$8"; python_executable="$9"; comsol_executable="${10}"
 [[ "${root}" != / && "${root}" != "${HOME}" ]]
 parent="${root}"
 while [[ ! -e "${parent}" ]]; do parent="$(dirname "${parent}")"; done
@@ -321,21 +413,18 @@ fi
 git -C "${repository}" fetch origin "${commit}"
 git -C "${repository}" cat-file -e "${commit}^{commit}"
 git -C "${repository}" checkout --detach "${commit}"
-module load Python/3.10
-[[ -x "${venv}/bin/python" ]] || python3 -m venv "${venv}"
+module load "${python_module}"
+[[ -x "${venv}/bin/python" ]] || "${python_executable}" -m venv "${venv}"
 source "${venv}/bin/activate"
-python -m pip install -e "${repository}[generation-cpu]"
-module load Comsol/v6.4
-python3 --version
-COMSOL_VERSION_OUTPUT="$(comsol -version 2>&1)"
-printf '%s\n' "${COMSOL_VERSION_OUTPUT}"
-[[ "${COMSOL_VERSION_OUTPUT}" == *"6.4"* ]] || { printf 'COMSOL 6.4 required.\n' >&2; exit 1; }
+"${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
+module load "${comsol_module}"
+"${python_executable}" --version
+"${comsol_executable}" -version 2>&1
 sbatch --version
 rsync --version
 for name in squeue sacct scancel; do command -v "${name}" >/dev/null; done
 cd "${repository}"
-python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 10) else f"Python 3.10 required, got {sys.version}")'
-python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+"${venv}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
 printf 'CPU setup complete: %s\n' "${root}"
 REMOTE
 }
@@ -348,22 +437,23 @@ remote_plan_submit() {
     "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" \
     "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" \
     "${MAX_PARALLEL_CASES}" "${ONLY_BATCH}" "${WALL_TIME}" "${operation}" \
-    "${PILOT_CASES_PER_MATERIAL}" "${SKIP_EXTREME_FAMILY_OOD}" <<'REMOTE'
+    "${PILOT_CASES_PER_MATERIAL}" "${SKIP_EXTREME_FAMILY_OOD}" \
+    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${CORES_PER_NODE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
 max_nodes="$6"; cases_per_node="$7"; cores_per_case="$8"; max_parallel="$9"
 only_batch="${10}"; wall_time="${11}"; operation="${12}"; pilot_cases="${13}"
-skip_extreme="${14}"
-module load Python/3.10
-module load Comsol/v6.4
+skip_extreme="${14}"; python_module="${15}"; comsol_module="${16}"; cores_per_node="${17}"
+module load "${python_module}"
+module load "${comsol_module}"
 source "${venv}/bin/activate"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
 cd "${repository}"
-command=(python -m src.generation.cli.cli_generation "${operation}" "${repository}/${campaign}"
+command=("${venv}/bin/python" -m src.generation.cli.cli_generation "${operation}" "${repository}/${campaign}"
   --git-commit "${commit}" --max-nodes "${max_nodes}"
   --cases-per-node "${cases_per_node}" --cores-per-case "${cores_per_case}"
-  --max-parallel-cases "${max_parallel}" --cores-per-node 32
+  --max-parallel-cases "${max_parallel}" --cores-per-node "${cores_per_node}"
   --storage-root "${storage}")
 [[ -z "${only_batch}" ]] || command+=(--only-batch "${only_batch}")
 [[ -z "${wall_time}" ]] || command+=(--wall-time "${wall_time}")
@@ -373,58 +463,82 @@ command=(python -m src.generation.cli.cli_generation "${operation}" "${repositor
 REMOTE
 }
 
+
 preflight_cpu() {
   resolve_local_commit true
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_configured_resources
   validate_resources
   verify_remote_setup
   print_layout
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${CAMPAIGN_RELATIVE_PATH}" "${ONLY_BATCH}" \
-    "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" "${MAX_PARALLEL_CASES}" <<'REMOTE'
+    "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" "${MAX_PARALLEL_CASES}" \
+    "${CORES_PER_NODE}" "${PARTITION}" "${WALL_TIME}" "${PYTHON_MODULE}" \
+    "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" \
+    "${SCHEDULER_KIND}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; campaign="$4"; only_batch="$5"
 max_nodes="$6"; cases_per_node="$7"; cores_per_case="$8"; max_parallel="$9"
+cores_per_node="${10}"; partition="${11}"; wall_time="${12}"; python_module="${13}"
+comsol_module="${14}"; python_executable="${15}"; comsol_executable="${16}"; scheduler="${17}"
 preflight_id="$(date -u +%Y%m%dT%H%M%SZ)"
-logs="${storage}/01_generation/meta/preflight/${preflight_id}"
+cd "${repository}"
+meta_root="$("${venv}/bin/python" -c 'import sys; from src import common; print(common.paths.get_generation_meta_root(storage_root=sys.argv[1]))' "${storage}")"
+logs="${meta_root}/preflight/${preflight_id}"
 mkdir -p "${logs}"
 [[ -n "${only_batch}" ]] || only_batch=-
 printf 'Preflight log root: %s\n' "${logs}"
-sbatch --wait --parsable --partition=standard --nodes=1 --ntasks=1 \
-  --cpus-per-task=1 --time=00:05:00 --job-name=vp2-generation-preflight \
-  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err" \
-  --chdir="${repository}" "${repository}/scripts/generation_cpu_smoke.sh" \
+submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntasks=1
+  --cpus-per-task=1 --job-name=vp2-generation-preflight
+  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err"
+  --chdir="${repository}")
+[[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
+"${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
   "${venv}" "${repository}/${campaign}" "${storage}" "${only_batch}" \
-  "${max_nodes}" "${cases_per_node}" "${cores_per_case}" "${max_parallel}" 32 environment-only
+  "${max_nodes}" "${cases_per_node}" "${cores_per_case}" "${max_parallel}" \
+  "${cores_per_node}" environment-only "${python_module}" "${comsol_module}" \
+  "${python_executable}" "${comsol_executable}" "${scheduler}"
 REMOTE
 }
+
 
 mapping_probe_cpu() {
   local campaign_argument="$1"
   resolve_campaign "${campaign_argument}"
+  resolve_configured_resources
+  validate_resources
   resolve_remote_layout
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" \
     "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" \
-    "${MAX_PARALLEL_CASES}" "${WALL_TIME}" <<'REMOTE'
+    "${MAX_PARALLEL_CASES}" "${WALL_TIME}" "${CORES_PER_NODE}" \
+    "${PARTITION}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
+    "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
 max_nodes="$6"; cases_per_node="$7"; cores_per_case="$8"; max_parallel="$9"
-wall_time="${10}"
-[[ -n "${wall_time}" ]] || wall_time=01:00:00
+wall_time="${10}"; cores_per_node="${11}"; partition="${12}"; python_module="${13}"
+comsol_module="${14}"; python_executable="${15}"; comsol_executable="${16}"; scheduler="${17}"
 probe_id="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
-logs="${storage}/01_generation/meta/mapping_probe_jobs/${probe_id}"
+cd "${repository}"
+meta_root="$("${venv}/bin/python" -c 'import sys; from src import common; print(common.paths.get_generation_meta_root(storage_root=sys.argv[1]))' "${storage}")"
+logs="${meta_root}/mapping_probe_jobs/${probe_id}"
 mkdir -p "${logs}"
+submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntasks=1
+  --cpus-per-task="${cores_per_case}" --job-name=vp2-mapping-probe
+  --export="ALL,GENERATION_GIT_COMMIT=${commit}"
+  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err"
+  --chdir="${repository}")
+[[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
 set +e
-job_id="$(sbatch --wait --parsable --partition=standard --nodes=1 --ntasks=1 \
-  --cpus-per-task="${cores_per_case}" --time="${wall_time}" \
-  --job-name=vp2-mapping-probe --export="ALL,GENERATION_GIT_COMMIT=${commit}" \
-  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err" \
-  --chdir="${repository}" "${repository}/scripts/generation_cpu_smoke.sh" \
+job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
   "${venv}" "${repository}/${campaign}" "${storage}" - \
-  "${max_nodes}" "${cases_per_node}" "${cores_per_case}" "${max_parallel}" 32 mapping-probe)"
+  "${max_nodes}" "${cases_per_node}" "${cores_per_case}" "${max_parallel}" \
+  "${cores_per_node}" mapping-probe "${python_module}" "${comsol_module}" \
+  "${python_executable}" "${comsol_executable}" "${scheduler}")"
 status="$?"
 set -e
 job_id="${job_id%%;*}"
@@ -436,14 +550,13 @@ exit "${status}"
 REMOTE
 }
 
-campaign_is_technical_smoke() {
-  [[ "${CAMPAIGN_RELATIVE_PATH}" == "${STEADY_SMOKE_CAMPAIGN}"     || "${CAMPAIGN_RELATIVE_PATH}" == "${TRANSIENT_SMOKE_CAMPAIGN}" ]]
-}
 
 validate_local_launch_gates() {
   local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null
-  campaign_is_technical_smoke && return
-  local_cli static-sentinels "${PROJECT_DIR}/${STEADY_PRIMARY_CAMPAIGN}"     "${PROJECT_DIR}/${TRANSIENT_PRIMARY_CAMPAIGN}" >/dev/null ||
+  [[ "${CAMPAIGN_PURPOSE}" == technical_runtime_smoke ]] && return
+  resolve_workflow_campaigns
+  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_PATH}" \
+    "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}" >/dev/null ||
     fail 2 "Static scientific sentinels block production planning or launch."
   local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
@@ -451,55 +564,59 @@ validate_local_launch_gates() {
 
 technical_profiles_ready() {
   resolve_local_python
-  local_cli validate-config "${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}" >/dev/null 2>&1 &&
-    local_cli validate-config "${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}" >/dev/null 2>&1
+  resolve_workflow_campaigns
+  local_cli validate-config "${STATIONARY_SMOKE_CAMPAIGN_PATH}" >/dev/null 2>&1 &&
+    local_cli validate-config "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" >/dev/null 2>&1
 }
 
 remote_comsol_version() {
-  remote_bash "${CPU_HOST}" <<'REMOTE'
+  remote_bash "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
-module load Comsol/v6.4
-comsol -version 2>&1
+comsol_module="$1"; comsol_executable="$2"
+module load "${comsol_module}"
+"${comsol_executable}" -version 2>&1
 REMOTE
 }
+
 
 run_smoke() {
   [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
     fail 2 "smoke does not support --detach, --confirm, or --only-batch."
   resolve_local_commit true
-  validate_resources
-  resolve_remote_layout
+  resolve_workflow_campaigns
   KEEP_CPU_SOURCE=true
-  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}"
+  CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
   preflight_cpu
   if ! technical_profiles_ready; then
     printf 'Profile mappings remain unconfirmed; running isolated retained probes.\n' >&2
     local probe_failed=false
-    mapping_probe_cpu "${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}" || probe_failed=true
-    mapping_probe_cpu "${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}" || probe_failed=true
+    mapping_probe_cpu "${STATIONARY_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
+    mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
     if [[ "${probe_failed}" == true ]]; then
       printf 'One or more mapping probes reported an execution or mapping failure.\n' >&2
     fi
     fail 2 "Mapping confirmation is required. Review mapping_probe.json artifacts, update only explicit profile mappings, commit, and rerun this smoke command."
   fi
-  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}"
+  CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
   run_all
-  local steady_run_id="${RUN_ID}"
-  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}"
+  local stationary_run_id="${RUN_ID}"
+  CAMPAIGN_ARGUMENT="${TRANSIENT_SMOKE_CAMPAIGN_PATH}"
   run_all
   local transient_run_id="${RUN_ID}"
   local comsol_version receipt
   comsol_version="$(remote_comsol_version)"
-  receipt="$(local_cli finalize-real-smoke "${steady_run_id}" "${transient_run_id}" \
+  receipt="$(local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
     --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
   printf 'Real technical runtime-smoke receipt: %s\n' "${receipt}"
   printf 'CPU sources retained for review for runs %s and %s.\n' \
-    "${steady_run_id}" "${transient_run_id}"
+    "${stationary_run_id}" "${transient_run_id}"
 }
+
 
 plan_campaign() {
   resolve_local_commit true
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_configured_resources
   validate_resources
   resolve_remote_layout
   resolve_local_storage
@@ -512,6 +629,7 @@ plan_campaign() {
 launch_campaign() {
   resolve_local_commit true
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_configured_resources
   validate_resources
   resolve_remote_layout
   print_layout
@@ -529,14 +647,14 @@ launch_campaign() {
 remote_cli() {
   verify_remote_setup
   remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "$@" <<'REMOTE'
+    "${REMOTE_VENV}" "${PYTHON_MODULE}" "$@" <<'REMOTE'
 set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"
-shift 3
-module load Python/3.10
+repository="$1"; storage="$2"; venv="$3"; python_module="$4"
+shift 4
+module load "${python_module}"
 source "${venv}/bin/activate"
 cd "${repository}"
-python -m src.generation.cli.cli_generation "$@"
+"${venv}/bin/python" -m src.generation.cli.cli_generation "$@"
 REMOTE
 }
 
@@ -805,9 +923,8 @@ storage_status_report() {
   local_cli "${local_arguments[@]}"
   printf 'CPU storage status:\n'
   remote_cli "${remote_arguments[@]}"
-  if [[ -n "${RUN_ID}" && -f "${LOCAL_STORAGE_ROOT}/01_generation/meta/pilot_checks/${RUN_ID}/pilot_check.json" ]]; then
-    printf 'Pilot check summary:\n'
-    local_cli validate-pilot-check "${RUN_ID}" --format summary \
+  if [[ -n "${RUN_ID}" ]]; then
+    local_cli validate-pilot-check "${RUN_ID}" --if-present --format summary \
       --storage-root "${LOCAL_STORAGE_ROOT}"
   fi
 }
@@ -918,7 +1035,12 @@ print("\t".join(("campaign", str(value["campaign_purpose"]), "" if value["cases_
 }
 
 prepare_pilot_check_receipt() {
-  local -a arguments=(prepare-pilot-check "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
+  resolve_workflow_campaigns
+  local -a arguments=(
+    prepare-pilot-check "${RUN_ID}"
+    --production-campaign "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}"
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+  )
   [[ "${KEEP_CPU_SOURCE}" != true ]] || arguments+=(--keep-cpu-source)
   local_cli "${arguments[@]}" >/dev/null
 }
@@ -1033,13 +1155,14 @@ run_pilot_check() {
     mapping_probe_cpu "${CAMPAIGN_CONFIG_PATH}" || true
     fail 2 "Mapping confirmation is required. Review mapping_probe.json, update only explicit profile mappings, commit, and rerun pilot-check."
   fi
-  ALL_STAGE="six-family static scientific sentinels"
-  local_cli static-sentinels "${PROJECT_DIR}/${STEADY_PRIMARY_CAMPAIGN}" \
-    "${PROJECT_DIR}/${TRANSIENT_PRIMARY_CAMPAIGN}" ||
+  ALL_STAGE="configured-material static scientific sentinels"
+  resolve_workflow_campaigns
+  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_PATH}" \
+    "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}" ||
     fail 2 "Static scientific sentinels block pilot launch; inspect the sentinel report before rerunning."
   print_layout
-  printf 'Pilot cases: 6 materials x %s = %s total.\n' \
-    "${PILOT_CASES_PER_MATERIAL}" "$((6 * PILOT_CASES_PER_MATERIAL))"
+  printf 'Pilot cases: %s materials x %s = %s total.\n' \
+    "${PILOT_MATERIAL_COUNT}" "${PILOT_CASES_PER_MATERIAL}" "${PILOT_TOTAL_CASES}"
   ALL_STAGE="resolved pilot campaign plan"
   remote_plan_submit plan-campaign
   ALL_STAGE="pilot campaign launch"
@@ -1093,6 +1216,7 @@ run_all() {
   ALL_STAGE="local repository, campaign, and resource validation"
   resolve_local_commit true
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_configured_resources
   validate_resources
   resolve_remote_layout
   resolve_local_storage
@@ -1137,7 +1261,7 @@ resume_all() {
 [[ "$1" != -h && "$1" != --help ]] || { usage; exit 0; }
 SUBCOMMAND="$1"
 shift
-CPU_HOST="${DEFAULT_CPU_HOST}"
+CPU_HOST="${GENERATION_CPU_HOST:-}"
 REMOTE_ROOT=""
 REQUESTED_COMMIT=""
 EXECUTE_SETUP=false
@@ -1152,6 +1276,8 @@ CASES_PER_NODE=""
 CORES_PER_CASE=""
 MAX_PARALLEL_CASES=""
 PILOT_CASES_PER_MATERIAL=""
+PILOT_MATERIAL_COUNT=""
+PILOT_TOTAL_CASES=""
 POSITIONAL=()
 
 while (( $# > 0 )); do

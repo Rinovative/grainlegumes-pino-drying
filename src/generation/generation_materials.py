@@ -4,7 +4,7 @@ generation_materials.py
 ===============================================================================
 Resolve compact role-neutral material records into typed scientific registries.
 Responsibilities:
-  - Define exact material identifiers and profile-specific coordinate contracts
+  - Discover material identifiers and resolve profile-specific coordinate contracts
   - Merge disjoint common, operation, and family-specific scientific owners
   - Resolve atomic density, Oswin, and kinetics records with effective provenance
 Design principles:
@@ -21,120 +21,20 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final
 
+import yaml
+
+from src import common
+
 from . import generation_provenance as provenance_service
 from . import generation_registry as registry_service
 
-MATERIAL_FAMILIES: Final = (
-    "lentil",
-    "chickpea",
-    "kidney_bean",
-    "field_pea",
-    "rapeseed",
-    "sunflower_seed",
-)
-VP2_DECISION_ARTIFACT: Final = "VP2_Parameter_Decisions.yaml"
-VP2_DECISION_SCHEMA_VERSION: Final = "1.1.0"
-VP2_DECISION_SHA256: Final = "774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5"
-_SIMPLEX_MINIMUM_EACH: Final = 0.05
-_SIMPLEX_MAXIMUM_EACH: Final = 0.8
-STEADY_DIMENSION: Final = 28
-TRANSIENT_DIMENSION: Final = 54
-
-AIRFLOW_PARAMETERS: Final = (
-    "kappa_mean",
-    "kappa_cv",
-    "bed.structure.coarse_len_rel",
-    "bed.structure.fine_len_rel",
-    "bed.structure.coarse_weight",
-    "bed.structure.cross_scale_corr",
-    "bed.structure.fine_ani_x",
-    "bed.structure.fine_ani_y",
-    "bed.perturbations.amplitude",
-    "bed.perturbations.granularity",
-    "bed.perturbations.sign_bias",
-    "permeability.anisotropy.max_ratio",
-    "permeability.anisotropy.exponent",
-    "permeability.anisotropy.strength",
-    "permeability.orientation.jitter",
-    "permeability.orientation.smooth_len_rel",
-    "porosity.kc_anchor_factor",
-    "porosity.smooth_len_rel",
-    "porosity.texture_amp",
-    "pressure_bc.mean",
-    "pressure_bc.sin_amp",
-    "pressure_bc.sin_freq",
-    "pressure_bc.sin_phase",
-    "pressure_bc.gauss_count",
-    "pressure_bc.gauss_amp",
-    "pressure_bc.gauss_width",
-    "pressure_bc.gauss_jitter",
-    "pressure_bc.linear_amp",
-)
-INITIAL_MOISTURE_PARAMETERS: Final = (
-    "initial_moisture.mean_db",
-    "initial_moisture.amplitude_db",
-    "initial_moisture.structure.coarse_len_rel",
-    "initial_moisture.structure.fine_len_rel",
-    "initial_moisture.structure.coarse_weight",
-    "initial_moisture.structure.cross_scale_corr",
-    "initial_moisture.structure.fine_ani_x",
-    "initial_moisture.structure.fine_ani_y",
-)
-OPERATION_PARAMETERS: Final = (
-    "T_in_base",
-    "T_in_amp",
-    "omega_in_base",
-    "omega_in_amp",
-    "schedule.corr",
-    "schedule.timescale_rel",
-    "schedule.component_weights",
-    "schedule.event_count",
-    "schedule.event_duration_rel",
-    "schedule.event_width_rel",
-    "T_amb",
-)
-MATERIAL_PROPERTY_PARAMETERS: Final = (
-    "rho_bu_dry_ref",
-    "k_gr",
-    "cp_gr_dry",
-    "r_surf_0",
-    "r_int_surf",
-    "f_surf",
-)
-SAMPLING_BLOCKS: Final = MappingProxyType(
-    {
-        "airflow": AIRFLOW_PARAMETERS,
-        "initial_moisture": INITIAL_MOISTURE_PARAMETERS,
-        "operation": OPERATION_PARAMETERS,
-        "material_properties": MATERIAL_PROPERTY_PARAMETERS,
-    }
-)
-SAMPLING_BLOCK_DIMENSIONS: Final = MappingProxyType({"airflow": 28, "initial_moisture": 8, "operation": 12, "material_properties": 6})
-PROFILE_SAMPLING_BLOCKS: Final = MappingProxyType(
-    {
-        "steady_flow": ("airflow",),
-        "transient_drying": tuple(SAMPLING_BLOCKS),
-    }
-)
-PROFILE_OOD_GROUPS: Final = MappingProxyType(
-    {
-        "steady_flow": ("bed", "operation"),
-        "transient_drying": ("bed", "operation", "initial_moisture", "material_properties"),
-    }
-)
-OOD_GROUPS: Final = PROFILE_OOD_GROUPS["transient_drying"]
-DERIVED_PARAMETERS: Final = (
-    "bed.structure.fine_weight",
-    "initial_moisture.structure.fine_weight",
-    "T_init",
-    "r_surf",
-    "r_int",
-    "T_in_ref",
-)
+_MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
+_SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.kc_anchor_factor",
     "porosity.smooth_len_rel",
@@ -144,15 +44,8 @@ INITIAL_MOISTURE_LEVEL_PARAMETERS: Final = (
     "initial_moisture.mean_db",
     "initial_moisture.amplitude_db",
 )
-SUPPORT_PARAMETERS: Final = (
-    "eps_min_global",
-    "eps_max_global",
-    "eps_bed_cal_ref",
-    "X_target_wb",
-    "oswin",
-    *DERIVED_PARAMETERS,
-)
-EXPECTED_PARAMETERS: Final = frozenset(name for names in SAMPLING_BLOCKS.values() for name in names) | frozenset(SUPPORT_PARAMETERS)
+
+
 _REGISTRY_METADATA_KEYS: Final = frozenset({"report_symbol", "description"})
 _SCOPE_KEYS: Final = {
     "common_name",
@@ -164,56 +57,122 @@ _SCOPE_KEYS: Final = {
 }
 _ALLOWED_SCOPE_VALUES: Final = MappingProxyType(
     {
-        "market_class": frozenset(
-            {
-                "red_or_brown_dry_lentil",
-                "kabuli",
-                "red_kidney",
-                "yellow_or_green_field_pea",
-                "canola_quality_rapeseed",
-                "high_oleic_oil_type",
-            }
-        ),
         "product_form": frozenset({"whole_seed", "whole_achene"}),
         "coat_or_hull_state": frozenset({"intact", "hull_intact"}),
     }
 )
-_COUPLED_COMPONENTS: Final = MappingProxyType(
-    {
-        "density_calibration": ("rho_bu_dry_ref", "eps_bed_cal_ref"),
-        "two_compartment_kinetics": ("r_surf_0", "r_int_surf", "f_surf"),
-    }
-)
-_CORRELATION_REPORT_SYMBOLS: Final = MappingProxyType(
-    {
-        "bed.structure.cross_scale_corr": r"\rho_b",
-        "initial_moisture.structure.cross_scale_corr": r"\rho_X",
-        "schedule.corr": r"\rho_{T,\omega}",
-    }
-)
+
+
+def validate_material_family(value: object) -> str:
+    """Return one safe role-neutral material-family identifier."""
+    if not isinstance(value, str) or _MATERIAL_FAMILY_PATTERN.fullmatch(value) is None:
+        message = f"Material family must match {_MATERIAL_FAMILY_PATTERN.pattern!r}; received {value!r}."
+        raise ValueError(message)
+    return value
 
 
 def available_material_families() -> tuple[str, ...]:
-    """Return exact role-neutral material identifiers in canonical order."""
-    return MATERIAL_FAMILIES
+    """Discover validated role-neutral material identifiers from configuration files."""
+    root = common.paths.get_project_root() / "configs" / "generation" / "materials"
+    paths = tuple(sorted(root.glob("*.yaml")))
+    if not paths:
+        message = f"Generation material configuration directory contains no YAML files: {root}."
+        raise FileNotFoundError(message)
+    families: list[str] = []
+    for path in paths:
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as error:
+            message = f"Generation material configuration is not valid YAML: {path}."
+            raise ValueError(message) from error
+        if not isinstance(payload, Mapping):
+            message = f"Generation material configuration must be a mapping: {path}."
+            raise TypeError(message)
+        family = validate_material_family(payload.get("material_family"))
+        if payload.get("schema_kind") != "generation_material" or payload.get("schema_version") != 1:
+            message = f"Unsupported generation material schema: {path}."
+            raise ValueError(message)
+        if family != path.stem:
+            message = f"Generation material filename and material_family disagree: {path}."
+            raise ValueError(message)
+        families.append(family)
+    if len(families) != len(set(families)):
+        message = f"Generation material configurations contain duplicate identifiers: {families}."
+        raise ValueError(message)
+    return tuple(families)
 
 
-def active_sampling_blocks(profile_id: str) -> tuple[str, ...]:
-    """Return exact numerical blocks consumed by one simulation profile."""
-    try:
-        return PROFILE_SAMPLING_BLOCKS[profile_id]
-    except KeyError as error:
-        message = f"Unknown simulation profile {profile_id!r}."
-        raise ValueError(message) from error
+def _profile_applicability(entry: Mapping[str, Any], *, name: str) -> tuple[str, ...]:
+    """Return one registry entry's ordered profile applicability."""
+    value = entry.get("profile_applicability")
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item for item in value):
+        message = f"Registry parameter {name!r} must declare non-empty profile_applicability."
+        raise ValueError(message)
+    return tuple(value)
 
 
-def active_ood_groups(profile_id: str) -> tuple[str, ...]:
-    """Return exact parameter-OOD groups consumed by one simulation profile."""
-    try:
-        return PROFILE_OOD_GROUPS[profile_id]
-    except KeyError as error:
-        message = f"Unknown simulation profile {profile_id!r}."
-        raise ValueError(message) from error
+def profile_parameter_names(
+    registry: Mapping[str, Mapping[str, Any]],
+    profile_id: str,
+) -> tuple[str, ...]:
+    """Return registry parameters applicable to one profile in authored order."""
+    names = tuple(name for name, entry in registry.items() if profile_id in _profile_applicability(entry, name=name))
+    if not names:
+        message = f"Registry declares no parameters for simulation profile {profile_id!r}."
+        raise ValueError(message)
+    return names
+
+
+def sampling_blocks(registry: Mapping[str, Mapping[str, Any]]) -> Mapping[str, tuple[str, ...]]:
+    """Derive ordered sampling-block membership from registry declarations."""
+    grouped: dict[str, list[str]] = {}
+    for name, entry in registry.items():
+        block = entry.get("block")
+        if block is None:
+            continue
+        if not isinstance(block, str) or not block:
+            message = f"Registry parameter {name!r} block must be non-empty text."
+            raise ValueError(message)
+        grouped.setdefault(block, []).append(name)
+    if not grouped:
+        message = "Registry must declare at least one sampling block."
+        raise ValueError(message)
+    return MappingProxyType({block: tuple(names) for block, names in grouped.items()})
+
+
+def active_sampling_blocks(
+    registry: Mapping[str, Mapping[str, Any]],
+    profile_id: str,
+) -> tuple[str, ...]:
+    """Derive numerical blocks consumed by one profile from the registry."""
+    applicable = set(profile_parameter_names(registry, profile_id))
+    return tuple(block for block, names in sampling_blocks(registry).items() if applicable.intersection(names))
+
+
+def active_ood_groups(
+    registry: Mapping[str, Mapping[str, Any]],
+    profile_id: str,
+) -> tuple[str, ...]:
+    """Derive profile-active parameter-OOD groups in authored registry order."""
+    applicable = set(profile_parameter_names(registry, profile_id))
+    groups: list[str] = []
+    for name, entry in registry.items():
+        if name not in applicable:
+            continue
+        group = entry.get("ood_group")
+        if group is None:
+            continue
+        if not isinstance(group, str) or not group:
+            message = f"Registry parameter {name!r} ood_group must be non-empty text."
+            raise ValueError(message)
+        if group not in groups:
+            groups.append(group)
+    return tuple(groups)
+
+
+def derived_parameter_names(registry: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
+    """Return parameters whose values are derived by the typed registry."""
+    return tuple(name for name, entry in registry.items() if entry.get("kind") == "derived")
 
 
 def _mapping(value: Any, *, label: str) -> dict[str, Any]:
@@ -242,24 +201,40 @@ def _finite(value: Any, *, label: str) -> float:
     return float(value)
 
 
-def validate_decision_source(value: Any, *, label: str) -> dict[str, str]:
-    """Validate the immutable handoff decision identity copied into production YAML."""
+def validate_decision_source(
+    value: Any,
+    *,
+    label: str,
+    expected: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Validate one decision identity and optionally bind it to the registry owner."""
     decision = _mapping(value, label=label)
     _exact_keys(decision, {"artifact", "schema_version", "sha256"}, label=label)
-    expected = {
-        "artifact": VP2_DECISION_ARTIFACT,
-        "schema_version": VP2_DECISION_SCHEMA_VERSION,
-        "sha256": VP2_DECISION_SHA256,
-    }
-    if decision != expected:
-        message = f"{label} must bind the validated VP2 decision artifact identity {expected}."
+    normalized = {key: str(item) for key, item in decision.items()}
+    if any(not item for item in normalized.values()) or _SHA256_PATTERN.fullmatch(normalized["sha256"]) is None:
+        message = f"{label} must contain non-empty artifact/schema identifiers and one lowercase SHA-256 digest."
         raise ValueError(message)
-    return {key: str(item) for key, item in decision.items()}
+    if expected is not None and normalized != dict(expected):
+        message = f"{label} must equal the registry-owned decision identity {dict(expected)}."
+        raise ValueError(message)
+    return normalized
 
 
-def _semantic_entry(value: Any, *, label: str) -> tuple[dict[str, Any], dict[str, str]]:
-    """Separate executable semantics from catalogue-only labels."""
+def _semantic_entry(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, str], int | None]:
+    """Separate executable semantics, coordinate order, and catalogue labels."""
     entry = _mapping(value, label=label)
+    sampling_order_value = entry.pop("sampling_order", None)
+    if sampling_order_value is None:
+        sampling_order = None
+    elif isinstance(sampling_order_value, bool) or not isinstance(sampling_order_value, int) or sampling_order_value <= 0:
+        message = f"{label}.sampling_order must be a positive integer."
+        raise ValueError(message)
+    else:
+        sampling_order = sampling_order_value
     metadata: dict[str, str] = {}
     for key in _REGISTRY_METADATA_KEYS:
         item = entry.pop(key, None)
@@ -267,38 +242,93 @@ def _semantic_entry(value: Any, *, label: str) -> tuple[dict[str, Any], dict[str
             message = f"{label}.{key} must be non-empty text."
             raise ValueError(message)
         metadata[key] = item
-    return entry, metadata
+    return entry, metadata, sampling_order
 
 
-def validate_semantic_registry(value: Any) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, str]]]:
-    """Validate the source-owned parameter-semantic inventory."""
+def _validate_sampling_block_contract(
+    definitions: Mapping[str, Mapping[str, Any]],
+    sampling_orders: Mapping[str, int],
+) -> dict[str, tuple[str, ...]]:
+    """Derive registry block membership from entry-owned block and coordinate order."""
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    expected: set[str] = set()
+    for name, entry in definitions.items():
+        block = entry.get("block")
+        if block is None:
+            if name in sampling_orders:
+                message = f"Non-sampled registry parameter {name!r} cannot declare sampling_order."
+                raise ValueError(message)
+            continue
+        if not isinstance(block, str) or not block:
+            message = f"Registry parameter {name!r} block must be non-empty text."
+            raise ValueError(message)
+        expected.add(name)
+        order = sampling_orders.get(name)
+        if order is None:
+            message = f"Sampled registry parameter {name!r} must declare sampling_order."
+            raise ValueError(message)
+        grouped.setdefault(block, []).append((order, name))
+    unknown = sorted(set(sampling_orders).difference(expected))
+    if unknown:
+        message = f"Only sampled registry parameters may declare sampling_order: {unknown}."
+        raise ValueError(message)
+    if not grouped:
+        message = "Generation parameter registry must declare at least one sampling block."
+        raise ValueError(message)
+    normalized: dict[str, tuple[str, ...]] = {}
+    for block, ordered_names in grouped.items():
+        ranks = [order for order, _name in ordered_names]
+        expected_ranks = list(range(1, len(ordered_names) + 1))
+        if sorted(ranks) != expected_ranks:
+            message = f"Sampling block {block!r} orders must be exactly {expected_ranks}; received {sorted(ranks)}."
+            raise ValueError(message)
+        normalized[block] = tuple(name for _order, name in sorted(ordered_names))
+    return normalized
+
+
+def validate_semantic_registry(
+    value: Any,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, str]],
+    dict[str, str],
+    dict[str, tuple[str, ...]],
+]:
+    """Validate registry-owned parameter semantics and decision provenance."""
     config = _mapping(value, label="generation parameter registry")
-    _exact_keys(config, {"schema_kind", "schema_version", "decision_source", "parameters"}, label="generation parameter registry")
+    _exact_keys(
+        config,
+        {"schema_kind", "schema_version", "decision_source", "parameters"},
+        label="generation parameter registry",
+    )
     if config["schema_kind"] != "generation_parameter_registry" or config["schema_version"] != 1:
         message = "Unsupported generation parameter-registry schema."
         raise ValueError(message)
-    validate_decision_source(config["decision_source"], label="generation parameter registry.decision_source")
+    decision_source = validate_decision_source(
+        config["decision_source"],
+        label="generation parameter registry.decision_source",
+    )
     raw = _mapping(config["parameters"], label="generation parameter registry.parameters")
-    if set(raw) != EXPECTED_PARAMETERS:
-        missing = sorted(EXPECTED_PARAMETERS.difference(raw))
-        unknown = sorted(set(raw).difference(EXPECTED_PARAMETERS))
-        message = f"Parameter semantics mismatch: missing={missing}, unknown={unknown}."
+    if not raw:
+        message = "generation parameter registry.parameters must be non-empty."
         raise ValueError(message)
     definitions: dict[str, dict[str, Any]] = {}
     metadata: dict[str, dict[str, str]] = {}
+    sampling_orders: dict[str, int] = {}
     symbols: dict[str, str] = {}
     for name, item in raw.items():
-        definitions[name], metadata[name] = _semantic_entry(item, label=f"parameters.{name}")
-        symbol = metadata[name]["report_symbol"]
+        definition, entry_metadata, sampling_order = _semantic_entry(item, label=f"parameters.{name}")
+        definitions[name] = definition
+        metadata[name] = entry_metadata
+        if sampling_order is not None:
+            sampling_orders[name] = sampling_order
+        symbol = entry_metadata["report_symbol"]
         if symbol in symbols:
             message = f"Report symbol {symbol!r} is assigned to both {symbols[symbol]!r} and {name!r}."
             raise ValueError(message)
         symbols[symbol] = name
-    for name, expected in _CORRELATION_REPORT_SYMBOLS.items():
-        if metadata[name]["report_symbol"] != expected:
-            message = f"Correlation parameter {name!r} must use report symbol {expected!r}."
-            raise ValueError(message)
-    return definitions, metadata
+    block_contract = _validate_sampling_block_contract(definitions, sampling_orders)
+    return definitions, metadata, decision_source, block_contract
 
 
 def resolve_value_record(
@@ -377,10 +407,35 @@ def _validate_packing_support(
     return support
 
 
+def _atomic_ood_location(
+    definitions: Mapping[str, Mapping[str, Any]],
+    components: tuple[str, ...],
+    *,
+    label: str,
+) -> tuple[str, str]:
+    """Return the one registry-owned OOD group and block for atomic components."""
+    locations: set[tuple[str, str]] = set()
+    for name in components:
+        entry = definitions[name]
+        group = entry.get("ood_group")
+        block = entry.get("block")
+        if group is None and block is None:
+            continue
+        if not isinstance(group, str) or not group or not isinstance(block, str) or not block:
+            message = f"{label} component {name!r} must declare both ood_group and block."
+            raise ValueError(message)
+        locations.add((group, block))
+    if len(locations) != 1:
+        message = f"{label} sampled components must share one OOD group and block; received {sorted(locations)}."
+        raise ValueError(message)
+    return next(iter(locations))
+
+
 def _validate_density_record(
     value: Any,
     *,
     packing_support: Mapping[str, Any],
+    definitions: Mapping[str, Mapping[str, Any]],
     sources: Mapping[str, Mapping[str, Any]],
     label: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -398,13 +453,13 @@ def _validate_density_record(
         message = f"{label}.selection_rule must be complete_record_atomic."
         raise ValueError(message)
     reference = _mapping(density["reference"], label=f"{label}.reference")
-    _exact_keys(reference, {"rho_bu_dry_ref", "eps_bed_cal_ref", "inferred_rho_particle_dry"}, label=f"{label}.reference")
+    _exact_keys(reference, {"rho_bu_dry_ref", "eps_bed_cal_ref"}, label=f"{label}.reference")
     rho = _finite(reference["rho_bu_dry_ref"], label=f"{label}.reference.rho_bu_dry_ref")
     eps = _finite(reference["eps_bed_cal_ref"], label=f"{label}.reference.eps_bed_cal_ref")
-    particle = _finite(reference["inferred_rho_particle_dry"], label=f"{label}.reference.inferred_rho_particle_dry")
-    if rho <= 0 or not 0 < eps < 1 or not math.isclose(rho / (1.0 - eps), particle, rel_tol=2e-9, abs_tol=2e-6):
+    if rho <= 0 or not 0 < eps < 1:
         message = f"{label}.reference is internally inconsistent."
         raise ValueError(message)
+    particle = round(rho / (1.0 - eps), 6)
     if not float(packing_support["lower"]) <= eps <= float(packing_support["upper"]):
         message = f"{label}.reference.eps_bed_cal_ref must lie inside the material packing support."
         raise ValueError(message)
@@ -458,10 +513,16 @@ def _validate_density_record(
         "provenance": copy.deepcopy(density["provenance"]),
     }
     eps_owner = {"value": eps, "nominal": eps, "provenance": copy.deepcopy(density["provenance"])}
+    components = ("rho_bu_dry_ref", "eps_bed_cal_ref")
+    ood_group, block = _atomic_ood_location(
+        definitions,
+        components,
+        label=f"{label}.ood_records",
+    )
     contract = {
-        "ood_group": "material_properties",
-        "block": "material_properties",
-        "components": ["rho_bu_dry_ref", "eps_bed_cal_ref"],
+        "ood_group": ood_group,
+        "block": block,
+        "components": list(components),
         "units": {"rho_bu_dry_ref": "kg/m^3", "eps_bed_cal_ref": "1"},
         "records": ood_records,
         "selection_rule": "complete_record_atomic",
@@ -507,6 +568,7 @@ def _validate_oswin_record(
 def _validate_kinetics_record(
     value: Any,
     *,
+    definitions: Mapping[str, Mapping[str, Any]],
     sources: Mapping[str, Mapping[str, Any]],
     label: str,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
@@ -564,9 +626,14 @@ def _validate_kinetics_record(
         records.append({"id": identity, "values": values, "metadata": {}})
     kinetics["components"] = normalized_components
     kinetics["ood_records"] = records
+    ood_group, block = _atomic_ood_location(
+        definitions,
+        expected,
+        label=f"{label}.ood_records",
+    )
     contract = {
-        "ood_group": "material_properties",
-        "block": "material_properties",
+        "ood_group": ood_group,
+        "block": block,
         "components": list(expected),
         "units": {"r_surf_0": "1/s", "r_int_surf": "1", "f_surf": "1"},
         "records": records,
@@ -595,7 +662,7 @@ def _merge_registry(
             message = f"Parameter {name!r} has duplicate semantic/value keys {sorted(overlap)}."
             raise ValueError(message)
         entry.update(additions)
-        if name not in DERIVED_PARAMETERS and name not in owners:
+        if entry.get("kind") != "derived" and name not in owners:
             missing.append(name)
         merged[name] = entry
     if missing:
@@ -642,54 +709,40 @@ def validate_profile_registry(
     registry: Mapping[str, Mapping[str, Any]],
     profile_id: str,
 ) -> dict[str, int]:
-    """Validate one exact profile projection of the canonical registry."""
-    blocks = active_sampling_blocks(profile_id)
-    expected = {name for block in blocks for name in SAMPLING_BLOCKS[block]}
-    if profile_id == "steady_flow":
-        expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
-    else:
-        expected.update(SUPPORT_PARAMETERS)
-    if set(registry) != expected:
-        missing = sorted(expected.difference(registry))
-        unknown = sorted(set(registry).difference(expected))
-        message = f"Profile {profile_id!r} registry projection mismatch: missing={missing}, unknown={unknown}."
+    """Validate one registry projection against authored profile applicability."""
+    applicable = set(profile_parameter_names(registry, profile_id))
+    inapplicable = sorted(set(registry).difference(applicable))
+    if inapplicable:
+        message = f"Profile {profile_id!r} registry contains inapplicable parameters {inapplicable}."
         raise ValueError(message)
-    for name, entry in registry.items():
-        applicability = entry.get("profile_applicability")
-        if not isinstance(applicability, list) or profile_id not in applicability:
-            message = f"Registry parameter {name!r} is inapplicable to profile {profile_id!r}."
-            raise ValueError(message)
-    dimensions = sampling_block_dimensions(registry, blocks=blocks)
-    expected_dimensions = {block: SAMPLING_BLOCK_DIMENSIONS[block] for block in blocks}
-    if dimensions != expected_dimensions:
-        message = f"Profile {profile_id!r} block dimensions must be {expected_dimensions}, got {dimensions}."
+    blocks = active_sampling_blocks(registry, profile_id)
+    if not blocks:
+        message = f"Profile {profile_id!r} registry has no active sampling block."
         raise ValueError(message)
-    expected_total = STEADY_DIMENSION if profile_id == "steady_flow" else TRANSIENT_DIMENSION
-    if sum(dimensions.values()) != expected_total:
-        message = f"Profile {profile_id!r} effective dimension changed."
-        raise ValueError(message)
-    return dimensions
+    return sampling_block_dimensions(registry, blocks=blocks)
 
 
 def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
-    """Validate the unique 28D/54D profile contract and atomic memberships."""
-    if set(registry) != EXPECTED_PARAMETERS:
-        missing = sorted(EXPECTED_PARAMETERS.difference(registry))
-        unknown = sorted(set(registry).difference(EXPECTED_PARAMETERS))
-        message = f"VP2 parameter registry mismatch: missing={missing}, unknown={unknown}."
+    """Validate the algorithm-bound coupled and derived parameter contracts."""
+    expected_derived = {
+        "bed.structure.fine_weight": ("complement_of_one", ("bed.structure.coarse_weight",)),
+        "initial_moisture.structure.fine_weight": ("complement_of_one", ("initial_moisture.structure.coarse_weight",)),
+        "T_init": ("copy", ("T_amb",)),
+        "r_surf": ("copy", ("r_surf_0",)),
+        "r_int": ("product", ("r_int_surf", "r_surf")),
+        "T_in_ref": ("schedule_time_average", ("schedule",)),
+    }
+    required = {
+        "rho_bu_dry_ref",
+        "eps_bed_cal_ref",
+        "schedule.component_weights",
+        "oswin",
+        *expected_derived,
+    }
+    missing = sorted(required.difference(registry))
+    if missing:
+        message = f"Registry is missing algorithm-bound parameters {missing}."
         raise ValueError(message)
-    for block, parameters in SAMPLING_BLOCKS.items():
-        actual = {name for name, entry in registry.items() if entry.get("block") == block}
-        if actual != set(parameters):
-            message = f"Sampling block {block!r} must contain exactly {sorted(parameters)}, got {sorted(actual)}."
-            raise ValueError(message)
-        dimension = sum(registry_service.effective_dimension(registry[name]) for name in parameters)
-        if dimension != SAMPLING_BLOCK_DIMENSIONS[block]:
-            message = f"Sampling block {block!r} has dimension {dimension}; expected {SAMPLING_BLOCK_DIMENSIONS[block]}."
-            raise ValueError(message)
-    if sum(SAMPLING_BLOCK_DIMENSIONS.values()) != TRANSIENT_DIMENSION or SAMPLING_BLOCK_DIMENSIONS["airflow"] != STEADY_DIMENSION:
-        message = "Canonical profile dimensions must remain steady=28 and transient=54."
-        raise RuntimeError(message)
     if registry["rho_bu_dry_ref"]["kind"] != "interval" or registry["eps_bed_cal_ref"]["kind"] != "fixed":
         message = "Natural density must sample rho_bu_dry_ref while eps_bed_cal_ref remains fixed."
         raise ValueError(message)
@@ -704,28 +757,17 @@ def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
         simplex["kind"] != "simplex"
         or tuple(simplex["components"]) != ("smooth", "event", "trend")
         or simplex.get("selection") != "truncated_dirichlet"
-        or simplex.get("alpha") != [5.5, 3.0, 1.5]
-        or simplex.get("minimum_each") != _SIMPLEX_MINIMUM_EACH
-        or simplex.get("maximum_each") != _SIMPLEX_MAXIMUM_EACH
     ):
-        message = "schedule.component_weights must be the binding complete truncated Dirichlet simplex."
+        message = "schedule.component_weights must use the supported ordered smooth/event/trend truncated-Dirichlet protocol."
         raise ValueError(message)
     oswin = registry["oswin"]
     if oswin["kind"] != "parameter_set" or tuple(oswin["components"]) != ("A_osw", "B_osw", "C_osw"):
         message = "oswin must be one complete A_osw/B_osw/C_osw parameter set."
         raise ValueError(message)
-    expected_derived = {
-        "bed.structure.fine_weight": ("complement_of_one", ("bed.structure.coarse_weight",)),
-        "initial_moisture.structure.fine_weight": ("complement_of_one", ("initial_moisture.structure.coarse_weight",)),
-        "T_init": ("copy", ("T_amb",)),
-        "r_surf": ("copy", ("r_surf_0",)),
-        "r_int": ("product", ("r_int_surf", "r_surf")),
-        "T_in_ref": ("schedule_time_average", ("schedule",)),
-    }
     for name, (derivation, source_names) in expected_derived.items():
         entry = registry[name]
         if entry["kind"] != "derived" or entry["derivation"] != derivation or tuple(entry["sources"]) != source_names:
-            message = f"Derived parameter {name!r} violates its supplied rule."
+            message = f"Derived parameter {name!r} violates its supported rule."
             raise ValueError(message)
     return "sampled_rho_fixed_reference_epsilon"
 
@@ -734,36 +776,28 @@ def sampling_block_dimensions(
     registry: Mapping[str, Mapping[str, Any]],
     *,
     blocks: tuple[str, ...] | None = None,
+    block_parameters: Mapping[str, tuple[str, ...]] | None = None,
 ) -> dict[str, int]:
-    """Return exact numerical dimensions for selected active blocks."""
-    selected = tuple(SAMPLING_BLOCKS) if blocks is None else blocks
-    if not selected or any(block not in SAMPLING_BLOCKS for block in selected):
+    """Return numerical dimensions for selected registry-owned blocks."""
+    membership = sampling_blocks(registry) if block_parameters is None else block_parameters
+    selected = tuple(membership) if blocks is None else blocks
+    if not selected or any(block not in membership for block in selected):
         message = f"Unknown or empty active sampling blocks {selected}."
         raise ValueError(message)
-    result: dict[str, int] = {}
-    for block in selected:
-        missing = [name for name in SAMPLING_BLOCKS[block] if name not in registry]
-        if missing:
-            message = f"Active block {block!r} is missing registry parameters {missing}."
-            raise ValueError(message)
-        result[block] = sum(registry_service.effective_dimension(registry[name]) for name in SAMPLING_BLOCKS[block])
-        if result[block] != SAMPLING_BLOCK_DIMENSIONS[block]:
-            message = f"Active block {block!r} has dimension {result[block]}, expected {SAMPLING_BLOCK_DIMENSIONS[block]}."
-            raise ValueError(message)
-    return result
+    return {block: sum(registry_service.effective_dimension(registry[name]) for name in membership[block]) for block in selected}
 
 
 def sampling_coordinate_labels(
     registry: Mapping[str, Mapping[str, Any]],
     profile_id: str,
+    *,
+    block_parameters: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[str, ...]:
-    """Return exact profile-qualified numerical coordinate labels."""
+    """Return profile-qualified numerical coordinate labels in configured order."""
+    membership = sampling_blocks(registry) if block_parameters is None else block_parameters
     labels: list[str] = []
-    for block in active_sampling_blocks(profile_id):
-        for name in SAMPLING_BLOCKS[block]:
-            if name not in registry:
-                message = f"Active sampling coordinate {name!r} is missing from the registry."
-                raise ValueError(message)
+    for block in active_sampling_blocks(registry, profile_id):
+        for name in membership[block]:
             dimension = registry_service.effective_dimension(registry[name])
             if dimension == 1:
                 labels.append(name)
@@ -772,27 +806,33 @@ def sampling_coordinate_labels(
     return tuple(labels)
 
 
-def project_material_for_profile(material: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
-    """Return only material science consumed by one simulation profile."""
-    blocks = active_sampling_blocks(profile_id)
-    active_names = {name for block in blocks for name in SAMPLING_BLOCKS[block]}
-    if profile_id == "steady_flow":
-        active_names.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
-    else:
-        active_names.update(SUPPORT_PARAMETERS)
+def project_material_for_profile(
+    material: Mapping[str, Any],
+    profile_id: str,
+    *,
+    sampling_block_contract: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Return only registry-declared material science applicable to one profile."""
+    full_registry = material["parameter_registry"]
+    active_names = profile_parameter_names(full_registry, profile_id)
+    active_name_set = set(active_names)
+    projected_registry = {name: copy.deepcopy(entry) for name, entry in full_registry.items() if name in active_name_set}
+    blocks = tuple(block for block, names in sampling_block_contract.items() if active_name_set.intersection(names))
+    active_block_parameters = {block: tuple(name for name in sampling_block_contract[block] if name in active_name_set) for block in blocks}
+    extra_provenance = {"A_osw", "B_osw", "C_osw"} if "oswin" in active_name_set else set()
     projected = {
         "material_family": material["material_family"],
         "decision_source": copy.deepcopy(material["decision_source"]),
         "material_scope": copy.deepcopy(material["material_scope"]),
         "packing_porosity_mean_support": copy.deepcopy(material["packing_porosity_mean_support"]),
-        "parameter_registry": {name: copy.deepcopy(entry) for name, entry in material["parameter_registry"].items() if name in active_names},
+        "parameter_registry": projected_registry,
         "effective_parameter_provenance": {
             name: copy.deepcopy(value)
             for name, value in material["effective_parameter_provenance"].items()
-            if name in active_names or (profile_id == "transient_drying" and name in {"A_osw", "B_osw", "C_osw"})
+            if name in active_name_set or name in extra_provenance
         },
         "active_sampling_blocks": list(blocks),
-        "active_coordinate_names": [name for block in blocks for name in SAMPLING_BLOCKS[block]],
+        "active_coordinate_names": [name for block in blocks for name in active_block_parameters[block]],
     }
     if profile_id == "transient_drying":
         projected.update(
@@ -856,6 +896,7 @@ def resolve_material_definition(
     material_config: Any,
     *,
     sources: Mapping[str, Mapping[str, Any]],
+    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Resolve one compact role-neutral material file with complete provenance."""
     material = _mapping(material_config, label="material configuration")
@@ -863,7 +904,6 @@ def resolve_material_definition(
         "schema_kind",
         "schema_version",
         "material_family",
-        "decision_source",
         "material_scope",
         "permeability",
         "packing_porosity_mean_support",
@@ -875,11 +915,11 @@ def resolve_material_definition(
         "two_compartment_kinetics",
     }
     _exact_keys(material, expected, label="material configuration")
-    family = material["material_family"]
-    if material["schema_kind"] != "generation_material" or material["schema_version"] != 1 or family not in MATERIAL_FAMILIES:
-        message = "Unsupported or unknown role-neutral material configuration."
+    family = validate_material_family(material["material_family"])
+    if material["schema_kind"] != "generation_material" or material["schema_version"] != 1:
+        message = "Unsupported role-neutral material configuration schema."
         raise ValueError(message)
-    decision = validate_decision_source(material["decision_source"], label=f"material {family} decision_source")
+    decision = copy.deepcopy(dict(decision_source))
     scope = _validate_material_scope(material["material_scope"], label=f"material {family}.material_scope")
     packing = _validate_packing_support(
         material["packing_porosity_mean_support"],
@@ -918,7 +958,11 @@ def resolve_material_definition(
     owners["k_gr"] = _support_record(thermal["k_gr"], sources=sources, label=f"material {family}.thermal_properties.k_gr")
     owners["cp_gr_dry"] = _support_record(thermal["cp_gr_dry"], sources=sources, label=f"material {family}.thermal_properties.cp_gr_dry")
     initial = _mapping(material["initial_moisture"], label=f"material {family}.initial_moisture")
-    _exact_keys(initial, {"mean_db", "amplitude_db", "field_support", "field_constraint"}, label=f"material {family}.initial_moisture")
+    _exact_keys(
+        initial,
+        {"mean_db", "amplitude_db", "field_support", "margin_above_target_db"},
+        label=f"material {family}.initial_moisture",
+    )
     owners["initial_moisture.mean_db"] = _support_record(initial["mean_db"], sources=sources, label=f"material {family}.initial_moisture.mean_db")
     owners["initial_moisture.amplitude_db"] = _support_record(
         initial["amplitude_db"],
@@ -937,6 +981,7 @@ def resolve_material_definition(
     density, rho_owner, density_parts = _validate_density_record(
         material["density_calibration"],
         packing_support=packing,
+        definitions=definitions,
         sources=sources,
         label=f"material {family}.density_calibration",
     )
@@ -946,6 +991,7 @@ def resolve_material_definition(
     owners["oswin"] = oswin_owner
     kinetics, kinetics_owners, kinetics_contract = _validate_kinetics_record(
         material["two_compartment_kinetics"],
+        definitions=definitions,
         sources=sources,
         label=f"material {family}.two_compartment_kinetics",
     )
@@ -955,34 +1001,47 @@ def resolve_material_definition(
         target,
         {
             "selected_simulation_target_wb",
-            "selected_target_db",
             "market_acceptance_moisture_wb",
             "safe_storage_moisture_wb",
             "provenance",
         },
         label=f"material {family}.target_moisture",
     )
-    target_wb = _finite(target["selected_simulation_target_wb"], label=f"material {family}.target_moisture.selected_simulation_target_wb")
-    target_db = _finite(target["selected_target_db"], label=f"material {family}.target_moisture.selected_target_db")
-    if not 0 < target_wb < 1 or not math.isclose(target_wb / (1.0 - target_wb), target_db, rel_tol=1e-14, abs_tol=1e-14):
-        message = f"Material {family!r} target moisture basis conversion is inconsistent."
+    target_wb = _finite(
+        target["selected_simulation_target_wb"],
+        label=f"material {family}.target_moisture.selected_simulation_target_wb",
+    )
+    if not 0 < target_wb < 1:
+        message = f"Material {family!r} simulation target moisture must lie inside (0, 1)."
         raise ValueError(message)
-    field_minimum_db = target_db + 0.01
+    target_db = target_wb / (1.0 - target_wb)
+    target = {
+        "selected_simulation_target_wb": target_wb,
+        "selected_target_db": target_db,
+        "market_acceptance_moisture_wb": target["market_acceptance_moisture_wb"],
+        "safe_storage_moisture_wb": target["safe_storage_moisture_wb"],
+        "provenance": copy.deepcopy(target["provenance"]),
+    }
+    margin_above_target_db = _finite(
+        initial["margin_above_target_db"],
+        label=f"material {family}.initial_moisture.margin_above_target_db",
+    )
+    field_minimum_db = target_db + margin_above_target_db
+    if margin_above_target_db <= 0 or field_minimum_db <= 0:
+        message = f"Material {family!r} initial-moisture target margin must be positive."
+        raise ValueError(message)
     expected_field_constraint = f"min(X_0_db_field) >= {field_minimum_db:.8f} kg/kg"
-    if initial["field_constraint"] != expected_field_constraint or field_minimum_db <= 0:
-        message = f"Material {family!r} initial-moisture field constraint must be exactly {expected_field_constraint!r}."
-        raise ValueError(message)
     field_constraint = {
         "authored_expression": expected_field_constraint,
         "minimum_db": field_minimum_db,
-        "margin_above_target_db": 0.01,
+        "margin_above_target_db": margin_above_target_db,
         "unit": "kg/kg",
         "derivation": {
             "kind": "derived_from_configured_target",
             "origin": "supplied_by_handoff",
             "verification": "mathematically_reproduced",
-            "inputs": ["X_target_db", "0.01 kg/kg"],
-            "formula_or_method": "minimum_db = X_target_db + 0.01 kg/kg",
+            "inputs": ["X_target_db", f"{margin_above_target_db:g} kg/kg"],
+            "formula_or_method": f"minimum_db = X_target_db + {margin_above_target_db:g} kg/kg",
         },
         "decision_source": copy.deepcopy(decision),
     }
@@ -993,7 +1052,7 @@ def resolve_material_definition(
         entry_provenance = entry.get("provenance")
         if isinstance(entry_provenance, Mapping):
             effective[name] = copy.deepcopy(dict(entry_provenance))
-        elif name in DERIVED_PARAMETERS:
+        elif entry.get("kind") == "derived":
             derived = _derived_provenance(name, registry, registry_metadata, sources)
             registry[name]["provenance"] = copy.deepcopy(derived)
             effective[name] = derived

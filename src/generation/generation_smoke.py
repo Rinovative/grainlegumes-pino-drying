@@ -4,7 +4,7 @@ generation_smoke.py
 ===============================================================================
 Validate and bind one two-profile native technical runtime smoke.
 Responsibilities:
-  - Require two terminal steady and two terminal transient Slurm cases
+  - Require contrasting terminal steady and transient Slurm cases
   - Bind retained inputs, exports, HDF5, packages, loaders, and source identities
   - Report paired airflow differences and transient mass-balance observations
   - Write and revalidate one immutable runtime-validation receipt
@@ -35,9 +35,11 @@ import numpy as np
 
 from src import common, domain
 
+from . import generation_campaign_evidence as campaign_evidence
 from . import generation_campaign_runtime as campaign_runtime
 from . import generation_config as config_service
 from . import generation_materials as materials
+from . import generation_preflight as preflight_service
 from . import generation_profiles as profiles
 from . import generation_runtime as runtime_service
 from . import generation_storage as storage_service
@@ -49,28 +51,17 @@ if TYPE_CHECKING:
 
 REAL_SMOKE_SCHEMA_KIND: Final = "vp2_real_runtime_smoke"
 REAL_SMOKE_SCHEMA_VERSION: Final = 1
-STEADY_SMOKE_CAMPAIGN_ID: Final = "steady_flow_technical_runtime_smoke_v1"
-TRANSIENT_SMOKE_CAMPAIGN_ID: Final = "transient_drying_technical_runtime_smoke_v1"
 TECHNICAL_SMOKE_PURPOSE: Final = "technical_runtime_smoke"
-_SHARED_FIELD_NAMES: Final = ("Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc")
-_AIRFLOW_FIELD_NAMES: Final = ("p", "u", "v")
-_EXPECTED_CASE_COUNT: Final = 2
+_SHARED_FIELD_NAMES: Final = (
+    *domain.fields.PERMEABILITY_FIELDS,
+    *domain.fields.POROSITY_FIELDS,
+    *domain.fields.BOUNDARY_FIELDS,
+)
+_AIRFLOW_FIELD_NAMES: Final = domain.fields.STATE_FIELDS
+_MINIMUM_CONTRASTING_CASES: Final = 2
 _EXPECTED_PROFILE_COUNT: Final = 2
 _GIT_SHA_LENGTH: Final = 40
 _SHA256_LENGTH: Final = 64
-_SOURCE_RELATIVE_PATHS: Final = (
-    "configs/generation/sources.yaml",
-    "configs/generation/registry.yaml",
-    "configs/generation/common.yaml",
-    "configs/generation/operations/fixed_bed.yaml",
-    *(f"configs/generation/materials/{family}.yaml" for family in materials.MATERIAL_FAMILIES),
-    "configs/generation/profiles/steady_flow.yaml",
-    "configs/generation/profiles/transient_drying.yaml",
-    "configs/generation/campaigns/steady_flow/family_generalization.yaml",
-    "configs/generation/campaigns/transient_drying/family_generalization.yaml",
-    "configs/generation/campaigns/steady_flow/technical_smoke.yaml",
-    "configs/generation/campaigns/transient_drying/technical_smoke.yaml",
-)
 _RECEIPT_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -469,32 +460,47 @@ def _case_evidence(
 def _validate_campaign(
     run_id: str,
     *,
-    expected_campaign_id: str,
     expected_profile: str,
     storage: Path,
-) -> tuple[config_service.CampaignConfig, dict[str, Any], dict[str, Any], tuple[_CaseEvidence, ...]]:
-    """Validate one retained two-case technical smoke workflow."""
-    workflow = workflow_service.validate_completed_workflow(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
-    terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
+) -> tuple[
+    config_service.CampaignConfig,
+    dict[str, Any],
+    dict[str, Any],
+    tuple[_CaseEvidence, ...],
+]:
+    """Validate one retained technical-smoke workflow."""
+    workflow = workflow_service.validate_completed_workflow(
+        run_id,
+        storage_root=storage,
+    )
+    campaign = campaign_evidence.campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    terminal = campaign_runtime.validate_terminal_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    valid_batch_count = len(campaign.batches) == 1
+    batch = campaign.batches[0] if valid_batch_count else None
     if (
-        campaign.campaign_id != expected_campaign_id
-        or campaign.campaign_purpose != TECHNICAL_SMOKE_PURPOSE
+        campaign.campaign_purpose != TECHNICAL_SMOKE_PURPOSE
         or campaign.profile.id != expected_profile
-        or len(campaign.batches) != 1
-        or len(campaign.batches[0].case_indices) != _EXPECTED_CASE_COUNT
-        or campaign.batches[0].sampling_regime != "natural"
-        or campaign.batches[0].material_family != "lentil"
+        or not valid_batch_count
+        or batch is None
+        or len(batch.case_indices) < _MINIMUM_CONTRASTING_CASES
+        or batch.sampling_regime != "natural"
         or workflow["cleanup_requested"] is not False
         or workflow["cpu_cleanup_complete"] != {"status": "skipped_by_request", "evidence": None}
     ):
-        message = f"Campaign run {run_id!r} is not the canonical retained two-case {expected_profile} smoke."
+        message = f"Campaign run {run_id!r} is not a retained {expected_profile!r} technical smoke with at least two natural cases."
         raise ValueError(message)
-    cases = tuple(_case_evidence(campaign.batches[0], case_index, storage=storage) for case_index in campaign.batches[0].case_indices)
-    if len({case.record["case_input_id"] for case in cases}) != _EXPECTED_CASE_COUNT:
+    cases = tuple(_case_evidence(batch, case_index, storage=storage) for case_index in batch.case_indices)
+    case_count = len(cases)
+    if len({case.record["case_input_id"] for case in cases}) != case_count:
         message = f"Technical smoke {expected_profile!r} reused a case-input identity."
         raise RuntimeError(message)
-    if len({case.record["simulation_case_id"] for case in cases}) != _EXPECTED_CASE_COUNT:
+    if len({case.record["simulation_case_id"] for case in cases}) != case_count:
         message = f"Technical smoke {expected_profile!r} reused a simulation identity."
         raise RuntimeError(message)
     return campaign, terminal, workflow, cases
@@ -519,7 +525,7 @@ def _difference_metrics(
 ) -> dict[str, Any]:
     """Return observed same-grid differences without applying a pass tolerance."""
     if left.shape != right.shape or left.shape != (y_axis.size, x_axis.size):
-        message = "Template-equivalence fields do not share the canonical grid."
+        message = "Template-equivalence fields do not share the configured grid."
         raise ValueError(message)
     difference = np.asarray(left, dtype=np.float64) - np.asarray(right, dtype=np.float64)
     absolute = np.abs(difference)
@@ -542,35 +548,50 @@ def _difference_metrics(
     }
 
 
-def _variation_report(cases: Sequence[_CaseEvidence], *, profile_id: str) -> dict[str, Any]:
-    """Require the two technical cases to exercise distinct authoritative inputs."""
-    first, second = cases
-    spatial_differences = {name: float(np.max(np.abs(first.static[name] - second.static[name]))) for name in _SHARED_FIELD_NAMES}
+def _variation_report(
+    cases: Sequence[_CaseEvidence],
+    *,
+    profile_id: str,
+) -> dict[str, Any]:
+    """Require configured technical cases to include contrasting inputs."""
+    if len(cases) < _MINIMUM_CONTRASTING_CASES:
+        message = f"Technical smoke for {profile_id!r} has fewer than {_MINIMUM_CONTRASTING_CASES} contrasting cases."
+        raise ValueError(message)
+    reference = cases[0]
+    contrasts = cases[1:]
+    spatial_differences = {
+        name: max(float(np.max(np.abs(reference.static[name] - case.static[name]))) for case in contrasts) for name in _SHARED_FIELD_NAMES
+    }
     required_spatial = ("p_in_bc", "Kxx", "eps_bed")
     if any(spatial_differences[name] == 0.0 for name in required_spatial):
-        message = f"Two-case {profile_id} smoke did not vary required airflow inputs {required_spatial}."
+        message = f"Configured {profile_id} smoke did not vary required airflow inputs {required_spatial}."
         raise RuntimeError(message)
+    input_identities = {common.serialization.canonical_json_sha256(case.record["input_files"]) for case in cases}
     report: dict[str, Any] = {
+        "case_count": len(cases),
         "spatial_maximum_absolute_differences": spatial_differences,
-        "input_hash_sets_distinct": first.record["input_files"] != second.record["input_files"],
+        "input_hash_sets_distinct": len(input_identities) > 1,
     }
     if profile_id == profiles.TRANSIENT_DRYING_PROFILE:
-        if first.schedule is None or second.schedule is None:
+        if reference.schedule is None or any(case.schedule is None for case in contrasts):
             message = "Transient smoke cases have no canonical schedules."
             raise RuntimeError(message)
-        schedule_difference = float(np.max(np.abs(first.schedule - second.schedule)))
-        moisture_difference = float(np.max(np.abs(first.static["X_0_db_field"] - second.static["X_0_db_field"])))
-        fixed = set(profiles.STATIONARY_FIXED_FIELDS) | {"f_wet_dm_max"}
+        schedule_difference = max(float(np.max(np.abs(reference.schedule - case.schedule))) for case in contrasts if case.schedule is not None)
+        moisture_difference = max(float(np.max(np.abs(reference.static["X_0_db_field"] - case.static["X_0_db_field"]))) for case in contrasts)
+        fixed = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
+        common_scalar_names = set(reference.scalars)
+        for case in contrasts:
+            common_scalar_names.intersection_update(case.scalars)
         changed_scalars = sorted(
-            name for name in first.scalars.keys() & second.scalars.keys() if name not in fixed and first.scalars[name] != second.scalars[name]
+            name for name in common_scalar_names if name not in fixed and any(reference.scalars[name] != case.scalars[name] for case in contrasts)
         )
         if schedule_difference == 0.0 or moisture_difference == 0.0 or not changed_scalars:
-            message = "Two-case transient smoke did not vary schedule, initial moisture, and a case-dependent scalar."
+            message = "Configured transient smoke did not vary schedule, initial moisture, and a case-dependent scalar."
             raise RuntimeError(message)
         report.update(
             {
                 "schedule_maximum_absolute_difference": schedule_difference,
-                "initial_moisture_maximum_absolute_difference": moisture_difference,
+                "initial_moisture_maximum_absolute_difference": (moisture_difference),
                 "changed_case_dependent_scalars": changed_scalars,
                 "scalar_handoff_consumed": True,
             }
@@ -578,15 +599,61 @@ def _variation_report(cases: Sequence[_CaseEvidence], *, profile_id: str) -> dic
     return report
 
 
+def _paired_smoke_batches(
+    steady_campaign: config_service.CampaignConfig,
+    transient_campaign: config_service.CampaignConfig,
+) -> tuple[
+    config_service.GenerationConfig,
+    config_service.GenerationConfig,
+]:
+    """Return two structurally paired technical-smoke batches."""
+    steady_batch = steady_campaign.batches[0]
+    transient_batch = transient_campaign.batches[0]
+    if (
+        steady_campaign.paired_equivalence_seed is None
+        or steady_campaign.paired_equivalence_seed != transient_campaign.paired_equivalence_seed
+        or steady_batch.material_family != transient_batch.material_family
+        or steady_batch.material_role != transient_batch.material_role
+        or steady_batch.case_indices != transient_batch.case_indices
+    ):
+        message = "Technical-smoke campaigns must pair one material, role, case inventory, and configured equivalence seed across both profiles."
+        raise ValueError(message)
+    return steady_batch, transient_batch
+
+
 def _equivalence_report(
     steady_cases: Sequence[_CaseEvidence],
     transient_cases: Sequence[_CaseEvidence],
+    *,
+    steady_config: config_service.GenerationConfig,
+    transient_config: config_service.GenerationConfig,
 ) -> dict[str, Any]:
-    """Compare paired template airflow outputs while requiring exact shared inputs."""
-    x_axis = np.linspace(0.0, 1.2, 401, dtype=np.float64)
-    y_axis = np.linspace(0.0, 0.75, 251, dtype=np.float64)
+    """Compare paired template airflow outputs on their configured grid."""
+    steady_grid = steady_config.scientific_values["grid"]
+    transient_grid = transient_config.scientific_values["grid"]
+    if steady_grid != transient_grid:
+        message = "Paired technical-smoke campaigns resolve different grids."
+        raise ValueError(message)
+    nx = int(steady_grid["nx"])
+    ny = int(steady_grid["ny"])
+    x_axis = np.linspace(
+        0.0,
+        float(steady_grid["Lx"]),
+        nx,
+        dtype=np.float64,
+    )
+    y_axis = np.linspace(
+        0.0,
+        float(steady_grid["Ly"]),
+        ny,
+        dtype=np.float64,
+    )
     pairs: list[dict[str, Any]] = []
-    for steady, transient in zip(steady_cases, transient_cases, strict=True):
+    for steady, transient in zip(
+        steady_cases,
+        transient_cases,
+        strict=True,
+    ):
         shared = {}
         for name in _SHARED_FIELD_NAMES:
             if not np.array_equal(steady.static[name], transient.static[name]):
@@ -596,12 +663,17 @@ def _equivalence_report(
         if steady.stationary_fixed != transient.stationary_fixed:
             message = "Paired templates did not bind identical stationary fixed values."
             raise RuntimeError(message)
-        pair_identity = common.serialization.canonical_json_sha256({"shared_fields": shared, "stationary_fixed": steady.stationary_fixed})
+        pair_identity = common.serialization.canonical_json_sha256(
+            {
+                "shared_fields": shared,
+                "stationary_fixed": steady.stationary_fixed,
+            }
+        )
         pairs.append(
             {
                 "case_index": steady.record["case_index"],
-                "steady_simulation_case_id": steady.record["simulation_case_id"],
-                "transient_simulation_case_id": transient.record["simulation_case_id"],
+                "steady_simulation_case_id": (steady.record["simulation_case_id"]),
+                "transient_simulation_case_id": (transient.record["simulation_case_id"]),
                 "paired_input_identity": pair_identity,
                 "shared_input_identities": shared,
                 "stationary_fixed": steady.stationary_fixed,
@@ -616,10 +688,21 @@ def _equivalence_report(
                 },
             }
         )
+    dx = float(steady_grid["dx"])
+    dy = float(steady_grid["dy"])
     return {
         "status": "observed_no_acceptance_threshold",
-        "grid_shape": [251, 401],
-        "grid_spacing_m": 0.003,
+        "grid_shape": [ny, nx],
+        "grid_spacing_m": dx if dx == dy else None,
+        "grid_spacing_by_axis_m": {
+            "x": dx,
+            "y": dy,
+        },
+        "grid_extent_m": {
+            "x": float(steady_grid["Lx"]),
+            "y": float(steady_grid["Ly"]),
+            "z": float(steady_grid["Lz"]),
+        },
         "pair_count": len(pairs),
         "pairs": pairs,
         "acceptance_tolerance": None,
@@ -692,38 +775,60 @@ def _mass_balance_case(case: _CaseEvidence) -> dict[str, Any]:
     }
 
 
-def _source_binding() -> dict[str, Any]:
-    """Return exact repository scientific-source identities for readiness binding."""
+def _source_binding(
+    campaigns: Sequence[config_service.CampaignConfig],
+) -> dict[str, Any]:
+    """Return exact source-file and resolved-campaign identities."""
     repository = common.paths.get_project_root().resolve()
+    source_paths = {source_path.resolve() for campaign in campaigns for source_path in campaign.source_files}
     records = []
-    for relative in _SOURCE_RELATIVE_PATHS:
-        path = (repository / relative).resolve()
+    for path in sorted(source_paths):
         if not path.is_file() or path.is_symlink():
             message = f"Required smoke source is missing or unsafe: {path}"
             raise FileNotFoundError(message)
+        try:
+            relative_path = path.relative_to(repository).as_posix()
+        except ValueError as error:
+            message = f"Smoke source escapes the configured project root: {path}"
+            raise ValueError(message) from error
         records.append(
             {
-                "relative_path": relative,
+                "relative_path": relative_path,
                 "sha256": common.serialization.file_sha256(path),
                 "size_bytes": path.stat().st_size,
             }
         )
+    campaign_records = [
+        {
+            "campaign_id": campaign.campaign_id,
+            "campaign_digest": campaign.campaign_digest,
+            "simulation_profile": campaign.profile.id,
+        }
+        for campaign in campaigns
+    ]
     return {
         "files": records,
-        "bundle_digest": common.serialization.canonical_json_sha256(records),
+        "resolved_campaigns": campaign_records,
+        "bundle_digest": common.serialization.canonical_json_sha256(
+            {
+                "files": records,
+                "resolved_campaigns": campaign_records,
+            }
+        ),
     }
 
 
-def _template_binding() -> dict[str, Any]:
-    """Return exact current template identities."""
+def _template_binding(
+    campaigns: Sequence[config_service.CampaignConfig],
+) -> dict[str, Any]:
+    """Return exact configured template identities."""
     return {
-        profile_id: {
-            "relative_path": profile.template_relative_path,
-            "sha256": profile.template_sha256,
-            "size_bytes": profile.template_path.stat().st_size,
+        campaign.profile.id: {
+            "relative_path": campaign.profile.template_relative_path,
+            "sha256": campaign.profile.template_sha256,
+            "size_bytes": campaign.profile.template_path.stat().st_size,
         }
-        for profile_id in profiles.available_profiles()
-        for profile in (profiles.get_profile(profile_id),)
+        for campaign in campaigns
     }
 
 
@@ -814,6 +919,28 @@ def _dataset_records(workflows: Sequence[Mapping[str, Any]]) -> list[dict[str, A
     return records
 
 
+def _paired_comsol_contract(
+    campaigns: Sequence[config_service.CampaignConfig],
+) -> dict[str, str]:
+    """Return one agreed configured COMSOL module, executable, and version."""
+    modules = {str(campaign.execution_values["site"]["comsol_module"]) for campaign in campaigns}
+    executables = {str(campaign.execution_values["site"]["comsol_executable"]) for campaign in campaigns}
+    if len(modules) != 1 or len(executables) != 1:
+        message = "Paired technical smoke campaigns must agree on one COMSOL module and executable."
+        raise RuntimeError(message)
+    module = next(iter(modules))
+    executable = next(iter(executables))
+    version = preflight_service.configured_module_version(module)
+    if version is None:
+        message = f"Configured COMSOL module must expose a version suffix: {module!r}."
+        raise ValueError(message)
+    return {
+        "module": module,
+        "executable": executable,
+        "required_version": version,
+    }
+
+
 def _build_payload(
     steady_run_id: str,
     transient_run_id: str,
@@ -825,23 +952,29 @@ def _build_payload(
     """Recompute the complete receipt payload except its self-digest."""
     steady_campaign, steady_terminal, steady_workflow, steady_cases = _validate_campaign(
         steady_run_id,
-        expected_campaign_id=STEADY_SMOKE_CAMPAIGN_ID,
         expected_profile=profiles.STEADY_FLOW_PROFILE,
         storage=storage,
     )
     transient_campaign, transient_terminal, transient_workflow, transient_cases = _validate_campaign(
         transient_run_id,
-        expected_campaign_id=TRANSIENT_SMOKE_CAMPAIGN_ID,
         expected_profile=profiles.TRANSIENT_DRYING_PROFILE,
         storage=storage,
+    )
+    steady_batch, transient_batch = _paired_smoke_batches(
+        steady_campaign,
+        transient_campaign,
     )
     commits = {steady_terminal["git_commit"], transient_terminal["git_commit"]}
     current_commit = _repository_commit()
     if commits != {current_commit}:
         message = "Technical smoke runs and current repository do not share one exact Git commit."
         raise RuntimeError(message)
-    if not isinstance(comsol_version_output, str) or "6.4" not in comsol_version_output:
-        message = "Real-smoke receipt requires observed COMSOL 6.4 version output."
+    comsol_contract = _paired_comsol_contract((steady_campaign, transient_campaign))
+    if not isinstance(comsol_version_output, str) or not preflight_service.reported_version_matches(
+        comsol_version_output,
+        comsol_contract["required_version"],
+    ):
+        message = f"Real-smoke receipt version output does not report configured COMSOL version {comsol_contract['required_version']!r}."
         raise ValueError(message)
     source_hosts = {steady_workflow["cpu_source_host"], transient_workflow["cpu_source_host"]}
     if len(source_hosts) != 1:
@@ -851,20 +984,25 @@ def _build_payload(
     transient_variation = _variation_report(transient_cases, profile_id=profiles.TRANSIENT_DRYING_PROFILE)
     all_cases = (*steady_cases, *transient_cases)
     profile_mappings = _profile_mapping_binding((steady_campaign, transient_campaign))
+    decision_source = materials.validate_decision_source(
+        steady_batch.scientific_values["material"]["decision_source"],
+        label=f"resolved batch {steady_batch.batch_name!r} decision_source",
+    )
+    materials.validate_decision_source(
+        transient_batch.scientific_values["material"]["decision_source"],
+        label=f"resolved batch {transient_batch.batch_name!r} decision_source",
+        expected=decision_source,
+    )
     payload: dict[str, Any] = {
         "schema_kind": REAL_SMOKE_SCHEMA_KIND,
         "schema_version": REAL_SMOKE_SCHEMA_VERSION,
         "status": "observations_complete_no_scientific_acceptance_threshold",
         "recorded_at": recorded_at,
         "git_commit": current_commit,
-        "decision_source": {
-            "artifact": materials.VP2_DECISION_ARTIFACT,
-            "schema_version": materials.VP2_DECISION_SCHEMA_VERSION,
-            "sha256": materials.VP2_DECISION_SHA256,
-        },
-        "material_family_inventory": list(materials.MATERIAL_FAMILIES),
-        "source_binding": _source_binding(),
-        "templates": _template_binding(),
+        "decision_source": decision_source,
+        "material_family_inventory": [steady_batch.material_family],
+        "source_binding": _source_binding((steady_campaign, transient_campaign)),
+        "templates": _template_binding((steady_campaign, transient_campaign)),
         "profile_mappings": profile_mappings,
         "campaigns": [
             _campaign_record(steady_run_id, steady_campaign, steady_terminal, steady_workflow),
@@ -872,8 +1010,8 @@ def _build_payload(
         ],
         "cases": [case.record for case in all_cases],
         "comsol": {
-            "required_version": "6.4",
-            "version_command": ["comsol", "-version"],
+            "required_version": comsol_contract["required_version"],
+            "version_command": [comsol_contract["executable"], "-version"],
             "version_output": comsol_version_output[:4096],
             "source_host": next(iter(source_hosts)),
         },
@@ -888,7 +1026,12 @@ def _build_payload(
             "transient": transient_workflow["cpu_cleanup_complete"],
             "review_required_before_cleanup": True,
         },
-        "template_equivalence": _equivalence_report(steady_cases, transient_cases),
+        "template_equivalence": _equivalence_report(
+            steady_cases,
+            transient_cases,
+            steady_config=steady_batch,
+            transient_config=transient_batch,
+        ),
         "mass_balance": {
             "status": "observed_no_acceptance_threshold",
             "cases": [_mass_balance_case(case) for case in transient_cases],

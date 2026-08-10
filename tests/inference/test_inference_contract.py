@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from src import analysis, experiments, learning
+from src import analysis, datasets, experiments, learning
 
 _REQUIRED_PAYLOAD_FILES = (
     "config.yaml",
@@ -152,10 +152,29 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         "best_checkpoint": {"model_state_dict": model.state_dict()},
         "normalizer_state": normalizer_state,
     }
+    source_identity = datasets.identity.DatasetIdentity(
+        dataset_id="synthetic",
+        task="synthetic",
+        data_contract_digest="d" * 64,
+        fingerprint="f" * 64,
+        sample_ids=("sample-0",),
+        sample_count=1,
+        spatial_shape=(1, 1),
+    )
+    evidence = datasets.splits.SplitRoleEvidence(
+        name="eval",
+        source=source_identity,
+        index_values=(0,),
+        count=1,
+        full_count=1,
+        membership_digest="e" * 64,
+        ratio=0.5,
+        seed=9,
+    )
     selection = context.SplitSelection(
         role="eval",
         dataset_paths=(tmp_path / "unused.pt",),
-        indices=torch.tensor([0]),
+        evidence=evidence,
     )
     dataset = _SyntheticDataset()
 
@@ -183,8 +202,8 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
 
     monkeypatch.setattr(context, "_build_model_from_config", build_model)
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
-    monkeypatch.setattr(context.datasets.factory, "create_steady_dataset", create_dataset)
-    monkeypatch.setattr(context.datasets.base, "combine_identity_datasets", lambda _sources: dataset)
+    monkeypatch.setattr(context.datasets.steady, "create_dataset", create_dataset)
+    monkeypatch.setattr(context.datasets.splits, "combine_identity_datasets", lambda _sources: dataset)
     monkeypatch.setattr(context, "_validate_split_indices_for_dataset", lambda **_kwargs: None)
 
     def unexpected_torch_load(*_args: Any, **_kwargs: Any) -> Any:

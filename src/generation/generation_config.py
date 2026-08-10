@@ -20,13 +20,12 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
-import hashlib
 import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import yaml
 
@@ -35,25 +34,24 @@ from src import common
 from . import generation_materials as materials
 from . import generation_profiles as profiles
 from . import generation_provenance as provenance_service
+from . import generation_sampling as sampling_service
+from . import generation_seeding as seeding
+
+IdMembership: TypeAlias = Literal["train", "validation", "id_test"]
+EvaluationRegime: TypeAlias = Literal[
+    "id",
+    "parameter_ood",
+    "near_family_ood",
+    "far_family_ood",
+    "extreme_family_ood",
+]
 
 CONFIG_SCHEMA_VERSION = 1
-GENERATOR_VERSION = 1
 CANONICAL_HDF5_SCHEMA_VERSION = 1
 CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
-UINT32_MAX = 2**32 - 1
-_EXPECTED_T_IN_MIN = 298.15
-_EXPECTED_T_IN_MAX = 313.15
-_EXPECTED_F_WET_DM_MAX = 0.05
-_EXPECTED_HDF5_COMPRESSION_LEVEL = 4
-_MAXIMUM_TIME_CHUNK = 2
-PRODUCTION_CASE_COUNTS = {
-    profiles.STEADY_FLOW_PROFILE: 1200,
-    profiles.TRANSIENT_DRYING_PROFILE: 660,
-}
-PAIRED_EQUIVALENCE_SEED = 9930
+_MAXIMUM_GZIP_COMPRESSION_LEVEL = 9
 PILOT_CAMPAIGN_PURPOSE = "pilot_check"
-PILOT_CAMPAIGN_SEED = 9940
 PILOT_CASE_KINDS = ("nominal_reference", "natural_pilot")
 NO_EVALUATION_REGIME = "not_applicable"
 _FINAL_PHYSICAL_FORMULAS = {
@@ -84,27 +82,16 @@ _FINAL_PHYSICAL_FORMULAS = {
     "f_wet_dm": "integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)",
     "total_water_balance": "d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out",
 }
-_STEADY_FLOW_AUDIT_DEPENDENCIES = (
-    "Kxx",
-    "Kxy",
-    "Kyy",
-    "eps_bed",
-    "p_in_bc",
-    "T_flow_ref",
-    "p_ref",
-    "p_out",
-)
+ID_MEMBERSHIPS: tuple[IdMembership, ...] = ("train", "validation", "id_test")
 SPLIT_NAMES = (
-    "train",
-    "validation",
-    "id_test",
+    *ID_MEMBERSHIPS,
     "parameter_ood",
     "near_family_ood",
     "far_family_ood",
     "extreme_family_ood",
     "technical_smoke",
 )
-EVALUATION_REGIMES = (
+EVALUATION_REGIMES: tuple[EvaluationRegime, ...] = (
     "id",
     "parameter_ood",
     "near_family_ood",
@@ -118,7 +105,8 @@ MATERIAL_ROLES = (
     "extreme_family_ood",
 )
 CAMPAIGN_PURPOSES = ("family_generalization", "technical_runtime_smoke", PILOT_CAMPAIGN_PURPOSE)
-_SEEN_SPLITS = frozenset({"train", "validation", "id_test", "parameter_ood"})
+_SEEN_SPLITS = frozenset((*ID_MEMBERSHIPS, "parameter_ood"))
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _COMSOL_OWNED_ARGUMENTS = ("-inputfile", "-outputfile", "-np", "-nn", "-nnhost", "-mpihosts")
 _SCHEDULER_OWNED_OPTIONS = (
     "--parsable",
@@ -136,6 +124,39 @@ _SCHEDULER_OWNED_OPTIONS = (
     "--export",
     "--wrap",
 )
+
+
+def build_batch_name(
+    simulation_profile: str,
+    material_family: str,
+    batch_kind: str,
+) -> str:
+    """Build the canonical profile, material, and semantic-kind batch name."""
+    components = {
+        "simulation_profile": simulation_profile,
+        "material_family": material_family,
+        "batch_kind": batch_kind,
+    }
+    for label, value in components.items():
+        common.paths.validate_logical_name(value, label=label)
+        if "__" in value:
+            message = f"{label} cannot contain the canonical batch separator '__'."
+            raise ValueError(message)
+    return "__".join(components.values())
+
+
+def build_batch_id(batch_name: str, scientific_config_digest: str) -> str:
+    """Build the canonical immutable batch identifier from scientific identity."""
+    name = common.paths.validate_logical_name(batch_name, label="batch_name")
+    if _SHA256_PATTERN.fullmatch(scientific_config_digest) is None:
+        message = "scientific_config_digest must be one lowercase SHA-256 digest."
+        raise ValueError(message)
+    return f"{name}__{scientific_config_digest[:16]}"
+
+
+def compute_case_input_config_digest(scientific: Mapping[str, Any]) -> str:
+    """Compute the canonical adapter-input configuration identity."""
+    return common.serialization.canonical_json_sha256(_input_identity_config(scientific))
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +196,7 @@ class GenerationConfig:
             message = f"Batch {self.batch_name!r} has no resolved seed."
             raise ValueError(message)
         assignment = self.assignments[case_index]
-        return derive_seed(
+        return seeding.derive_seed(
             self.seed_base,
             "case",
             self.profile.id,
@@ -206,12 +227,18 @@ class CampaignConfig:
     material_memberships: dict[str, tuple[str, ...]]
     membership: dict[str, Any]
     source_registry: dict[str, dict[str, Any]]
+    source_files: tuple[Path, ...]
     total_case_count: int
     paired_equivalence_seed: int | None
     batches: tuple[GenerationConfig, ...]
     dataset_packages: tuple[dict[str, Any], ...]
     duplicate_case_input_policy: str
     execution_values: dict[str, Any]
+
+    @property
+    def material_inventory(self) -> tuple[str, ...]:
+        """Return configured materials in canonical role and authored item order."""
+        return tuple(material_family for role in MATERIAL_ROLES for material_family in self.material_roles[role])
 
     def batch(self, batch_name: str) -> GenerationConfig:
         """Select one predeclared generation batch by its human-readable name."""
@@ -220,6 +247,53 @@ class CampaignConfig:
                 return batch
         available = ", ".join(item.batch_name for item in self.batches)
         message = f"Batch {batch_name!r} is not declared by campaign {self.campaign_name!r}. Available: {available}."
+        raise ValueError(message)
+
+    def find_batch(
+        self,
+        *,
+        material_family: str,
+        sampling_regime: str,
+        simulation_profile: str | None = None,
+    ) -> GenerationConfig | None:
+        """Return one structurally selected batch, or ``None`` when absent."""
+        profile_id = self.profile.id if simulation_profile is None else simulation_profile
+        matches = tuple(
+            batch
+            for batch in self.batches
+            if batch.profile.id == profile_id and batch.material_family == material_family and batch.sampling_regime == sampling_regime
+        )
+        if len(matches) > 1:
+            message = (
+                "Campaign batch identities are ambiguous for "
+                f"profile={profile_id!r}, material_family={material_family!r}, "
+                f"sampling_regime={sampling_regime!r}."
+            )
+            raise RuntimeError(message)
+        return None if not matches else matches[0]
+
+    def require_batch(
+        self,
+        *,
+        material_family: str,
+        sampling_regime: str,
+        simulation_profile: str | None = None,
+    ) -> GenerationConfig:
+        """Return one structurally selected batch and fail clearly when absent."""
+        batch = self.find_batch(
+            material_family=material_family,
+            sampling_regime=sampling_regime,
+            simulation_profile=simulation_profile,
+        )
+        if batch is not None:
+            return batch
+        profile_id = self.profile.id if simulation_profile is None else simulation_profile
+        available = ", ".join(f"({item.profile.id}, {item.material_family}, {item.sampling_regime})" for item in self.batches)
+        message = (
+            "No campaign batch is declared for "
+            f"profile={profile_id!r}, material_family={material_family!r}, "
+            f"sampling_regime={sampling_regime!r}. Available: {available}."
+        )
         raise ValueError(message)
 
     def select_batches(self, batch_names: tuple[str, ...] | None) -> CampaignConfig:
@@ -273,18 +347,6 @@ class CampaignConfig:
 
 class GenerationConfigError(ValueError):
     """Report one invalid layered generation configuration."""
-
-
-def derive_seed(seed_base: int, *labels: str) -> int:
-    """Derive one stable uint32 seed from an integer base and semantic labels."""
-    if isinstance(seed_base, bool) or not isinstance(seed_base, int) or not 0 <= seed_base <= UINT32_MAX:
-        message = f"seed_base must be an integer in the uint32 range, got {seed_base!r}."
-        raise ValueError(message)
-    if not labels or any(not isinstance(label, str) or not label for label in labels):
-        message = "Seed derivation requires one or more non-empty labels."
-        raise ValueError(message)
-    payload = f"{GENERATOR_VERSION}|{seed_base}|" + "|".join(labels)
-    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], byteorder="big", signed=False)
 
 
 def _mapping(value: Any, *, label: str) -> dict[str, Any]:
@@ -425,7 +487,9 @@ def validation_error_details(path: Path | str, error: Exception) -> dict[str, An
         "profile": "profile_config",
         "execution": "execution_config",
     }
-    if isinstance(campaign_raw, Mapping) and layer in references:
+    if layer == "campaign":
+        local_key = key.removeprefix("campaign.")
+    elif isinstance(campaign_raw, Mapping) and layer in references:
         reference = campaign_raw.get(references[layer])
         if isinstance(reference, str):
             owner_path = _reference_path(
@@ -475,7 +539,7 @@ def _reference_path(value: Any, *, source_path: Path, label: str) -> Path:
 
 
 def _validate_grid(value: Any) -> dict[str, Any]:
-    """Validate the authoritative grid and derive its two exact spacings."""
+    """Validate a boundary-inclusive Cartesian grid and derive its spacings."""
     grid = _mapping(value, label="common.grid")
     authored = {"nx", "ny", "Lx", "Ly", "Lz", "boundaries_included"}
     _exact_keys(grid, required=authored, optional=set(), label="common.grid")
@@ -487,26 +551,19 @@ def _validate_grid(value: Any) -> dict[str, Any]:
         "Lz": _finite(grid["Lz"], label="common.grid.Lz"),
         "boundaries_included": grid["boundaries_included"],
     }
+    if any(normalized[name] <= 0.0 for name in ("Lx", "Ly", "Lz")):
+        message = "common.grid lengths must be finite and strictly positive."
+        raise GenerationConfigError(message)
+    if normalized["boundaries_included"] is not True:
+        message = "common.grid.boundaries_included must be true for the maintained Cartesian adapter."
+        raise GenerationConfigError(message)
     normalized["dx"] = normalized["Lx"] / (normalized["nx"] - 1)
     normalized["dy"] = normalized["Ly"] / (normalized["ny"] - 1)
-    required = {
-        "nx": 401,
-        "ny": 251,
-        "Lx": 1.2,
-        "Ly": 0.75,
-        "Lz": 0.8,
-        "boundaries_included": True,
-        "dx": 0.003,
-        "dy": 0.003,
-    }
-    if normalized != required:
-        message = f"Grid must resolve to the authoritative boundary-inclusive 401x251 contract: {required}."
-        raise GenerationConfigError(message)
     return normalized
 
 
 def _validate_time(value: Any) -> dict[str, Any]:
-    """Validate the authoritative hourly 0-through-168-hour contract."""
+    """Validate a regular output-time contract and derive its exact nodes."""
     time = _mapping(value, label="common.time")
     expected = {"start", "stop", "interval", "internal_steps", "irregular_stop_state"}
     _exact_keys(time, required=expected, optional=set(), label="common.time")
@@ -517,17 +574,30 @@ def _validate_time(value: Any) -> dict[str, Any]:
         "internal_steps": time["internal_steps"],
         "irregular_stop_state": time["irregular_stop_state"],
     }
-    expected_values = {
-        "start": 0.0,
-        "stop": 168.0,
-        "interval": 1.0,
-        "internal_steps": "adaptive",
-        "irregular_stop_state": "diagnostic_only",
-    }
-    if normalized != expected_values:
-        message = f"Time contract must be hourly 0..168 h with adaptive internal steps: {expected_values}."
+    if normalized["start"] < 0.0 or normalized["stop"] <= normalized["start"]:
+        message = "common.time must have 0 <= start < stop."
         raise GenerationConfigError(message)
-    normalized["regular_times"] = [float(value) for value in range(169)]
+    if normalized["interval"] <= 0.0:
+        message = "common.time.interval must be strictly positive."
+        raise GenerationConfigError(message)
+    if normalized["internal_steps"] != "adaptive":
+        message = "common.time.internal_steps must use the supported adaptive solver policy."
+        raise GenerationConfigError(message)
+    if normalized["irregular_stop_state"] != "diagnostic_only":
+        message = "common.time.irregular_stop_state must remain diagnostic_only."
+        raise GenerationConfigError(message)
+    step_count = (normalized["stop"] - normalized["start"]) / normalized["interval"]
+    regular_intervals = round(step_count)
+    tolerance = 64.0 * math.ulp(max(abs(step_count), 1.0))
+    if regular_intervals < 1 or not math.isclose(
+        step_count,
+        float(regular_intervals),
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        message = "common.time interval must divide the configured start-to-stop span exactly."
+        raise GenerationConfigError(message)
+    normalized["regular_times"] = [float(normalized["start"] + index * normalized["interval"]) for index in range(regular_intervals + 1)]
     return normalized
 
 
@@ -609,40 +679,34 @@ def _validate_scientific_fixed(
                 raise GenerationConfigError(message)
         elif name == "schedule_interpolation":
             if record["value"] != "linear":
-                message = "The maintained schedule interpolation must be linear between hourly nodes."
+                message = "The maintained schedule adapter supports linear interpolation between regular nodes."
                 raise GenerationConfigError(message)
             resolved_values[name] = "linear"
         else:
             resolved_values[name] = _finite(record["value"], label=f"common.scientific_fixed_values.{name}.value")
         records[name] = record
 
+    positive_names = (
+        "T_flow_ref",
+        "p_ref",
+        "T_in_min",
+        "T_in_max",
+        "cp_w",
+        "h_fg",
+        "D_v_air",
+        "M_v",
+        "d_wall",
+        "k_wall",
+        "h_ext",
+    )
+    if any(resolved_values[name] <= 0.0 for name in positive_names):
+        message = f"Scientific fixed values must be strictly positive for {list(positive_names)}."
+        raise GenerationConfigError(message)
+    if resolved_values["T_in_min"] >= resolved_values["T_in_max"]:
+        message = "common.scientific_fixed_values must satisfy T_in_min < T_in_max."
+        raise GenerationConfigError(message)
     resolved_values["U_wall"] = 1.0 / (resolved_values["d_wall"] / resolved_values["k_wall"] + 1.0 / resolved_values["h_ext"])
     records["U_wall"]["value"] = resolved_values["U_wall"]
-    if resolved_values["T_flow_ref"] != profiles.STATIONARY_FLOW_REFERENCE_TEMPERATURE:
-        message = "common.scientific_fixed_values.T_flow_ref must be the package-fixed 300.65 K."
-        raise GenerationConfigError(message)
-    if resolved_values["p_ref"] != profiles.STATIONARY_FLOW_REFERENCE_PRESSURE:
-        message = "common.scientific_fixed_values.p_ref must match the package-fixed 101325 Pa template contract."
-        raise GenerationConfigError(message)
-    if resolved_values["p_out"] != profiles.STATIONARY_FLOW_OUTLET_PRESSURE:
-        message = "common.scientific_fixed_values.p_out must match the package-fixed 0 Pa template contract."
-        raise GenerationConfigError(message)
-    expected_constants = {
-        "T_in_min": _EXPECTED_T_IN_MIN,
-        "T_in_max": _EXPECTED_T_IN_MAX,
-        "cp_w": 4180.0,
-        "h_fg": 2418200.0,
-        "D_v_air": 2.811e-05,
-        "M_v": 0.01801528,
-        "d_wall": 0.019,
-        "k_wall": 0.13,
-        "h_ext": 8.0,
-        "U_wall": 3.687943262411348,
-        "f_wet_dm_max": _EXPECTED_F_WET_DM_MAX,
-    }
-    if any(resolved_values[name] != expected for name, expected in expected_constants.items()):
-        message = f"Scientific fixed values must match the binding VP2 constants {expected_constants}."
-        raise GenerationConfigError(message)
     humidity = tuple(
         resolved_values[name]
         for name in (
@@ -654,12 +718,11 @@ def _validate_scientific_fixed(
             "phi_clip_max",
         )
     )
-    if not (
-        0 <= humidity[0] < humidity[1]
-        and (humidity[2], humidity[3]) == (0.05, 0.85)
-        and 0 <= humidity[4] < humidity[2] < humidity[3] < humidity[5] <= 1
-    ):
+    if not (0.0 <= humidity[0] < humidity[1] and 0.0 < humidity[4] < humidity[2] < humidity[3] < humidity[5] < 1.0):
         message = "Operational humidity bounds and numerical Oswin clipping limits are invalid or conflated."
+        raise GenerationConfigError(message)
+    if not 0.0 < resolved_values["f_wet_dm_max"] < 1.0:
+        message = "common.scientific_fixed_values.f_wet_dm_max must lie strictly inside (0, 1)."
         raise GenerationConfigError(message)
     return resolved_values, records
 
@@ -708,7 +771,7 @@ def _validate_input_contract(value: Any) -> dict[str, Any]:
 
 
 def _validate_storage(value: Any) -> dict[str, Any]:
-    """Validate the canonical HDF5 conversion and layout settings."""
+    """Validate the versioned HDF5 conversion and configured layout settings."""
     storage = _mapping(value, label="common.storage")
     expected = {
         "schema_version",
@@ -732,9 +795,19 @@ def _validate_storage(value: Any) -> dict[str, Any]:
     if storage["schema_version"] != CANONICAL_HDF5_SCHEMA_VERSION or storage["converter_version"] != CANONICAL_HDF5_CONVERTER_VERSION:
         msg = f"Canonical storage must use schema {CANONICAL_HDF5_SCHEMA_VERSION} and converter {CANONICAL_HDF5_CONVERTER_VERSION!r}."
         raise GenerationConfigError(msg)
-    if storage["compression"] != "gzip" or storage["compression_level"] != _EXPECTED_HDF5_COMPRESSION_LEVEL or storage["shuffle"] is not True:
-        msg = "Canonical case fields require gzip level 4 with shuffle enabled."
-        raise GenerationConfigError(msg)
+    if storage["compression"] != "gzip":
+        message = "Canonical HDF5 schema v1 supports gzip compression."
+        raise GenerationConfigError(message)
+    storage["compression_level"] = _integer(
+        storage["compression_level"],
+        label="common.storage.compression_level",
+    )
+    if storage["compression_level"] > _MAXIMUM_GZIP_COMPRESSION_LEVEL:
+        message = "common.storage.compression_level must be a gzip level from 0 through 9."
+        raise GenerationConfigError(message)
+    if not isinstance(storage["shuffle"], bool):
+        message = "common.storage.shuffle must be boolean."
+        raise TypeError(message)
     for key in ("float32_rtol", "float32_atol"):
         storage[key] = _finite(storage[key], label=f"common.storage.{key}")
         if storage[key] < 0:
@@ -742,9 +815,6 @@ def _validate_storage(value: Any) -> dict[str, Any]:
             raise GenerationConfigError(msg)
     for key in ("chunk_time", "chunk_y", "chunk_x"):
         storage[key] = _integer(storage[key], label=f"common.storage.{key}", minimum=1)
-    if storage["chunk_time"] > _MAXIMUM_TIME_CHUNK:
-        msg = "common.storage.chunk_time must optimize one or two time-step reads."
-        raise GenerationConfigError(msg)
     return storage
 
 
@@ -772,6 +842,7 @@ def _validate_common(
     value: Any,
     *,
     sources: Mapping[str, Mapping[str, Any]],
+    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Validate the global material-independent scientific owner."""
     common_config = _mapping(value, label="generation common configuration")
@@ -779,7 +850,6 @@ def _validate_common(
         "schema_kind",
         "schema_version",
         "generator_version",
-        "decision_source",
         "parameter_values",
         "scientific_fixed_values",
         "physical_formulas",
@@ -800,13 +870,10 @@ def _validate_common(
         label="generation common generator_version",
         minimum=1,
     )
-    if common_config["generator_version"] != GENERATOR_VERSION:
-        message = f"generator_version must be {GENERATOR_VERSION!r}."
+    if common_config["generator_version"] != seeding.GENERATOR_VERSION:
+        message = f"generator_version must be {seeding.GENERATOR_VERSION!r}."
         raise GenerationConfigError(message)
-    common_config["decision_source"] = materials.validate_decision_source(
-        common_config["decision_source"],
-        label="generation common decision_source",
-    )
+    common_config["decision_source"] = copy.deepcopy(dict(decision_source))
     common_config["parameter_values"] = _mapping(common_config["parameter_values"], label="common.parameter_values")
     if set(common_config["parameter_values"]) != {"eps_min_global", "eps_max_global"}:
         message = "common.parameter_values must own exactly the two global porosity guards."
@@ -915,18 +982,17 @@ def _validate_steady_flow_conditioning(
             if "fixed_value" in dependency:
                 message = f"{label} model inputs cannot author fixed_value."
                 raise GenerationConfigError(message)
-        elif "fixed_value" not in dependency:
-            message = f"{label} package-fixed dependencies require fixed_value."
-            raise GenerationConfigError(message)
-        else:
-            dependency["fixed_value"] = _finite(
+        elif "fixed_value" in dependency:
+            _finite(
                 dependency["fixed_value"],
                 label=f"{label}.fixed_value",
             )
         validated.append(dependency)
+    model_input_names = tuple(name for name in profiles.STEADY_SPATIAL_INPUT_FIELDS if name not in {"x", "y"})
+    expected_dependencies = (*model_input_names, *profiles.STATIONARY_FIXED_FIELDS)
     names = tuple(str(dependency["name"]) for dependency in validated)
-    if names != _STEADY_FLOW_AUDIT_DEPENDENCIES:
-        message = f"steady_flow_conditioning.dependencies must be exactly {list(_STEADY_FLOW_AUDIT_DEPENDENCIES)} in order."
+    if names != expected_dependencies:
+        message = f"steady_flow_conditioning.dependencies must be exactly {list(expected_dependencies)} in order."
         raise GenerationConfigError(message)
     additional = _name_list(
         conditioning["additional_case_varying_solver_scalars"],
@@ -937,13 +1003,14 @@ def _validate_steady_flow_conditioning(
         message = "The canonical steady template permits no additional case-varying solver scalars."
         raise GenerationConfigError(message)
     declared = {str(dependency["name"]): dependency for dependency in validated}
-    expected_model_inputs = {
-        "Kxx": "m^2",
-        "Kxy": "m^2",
-        "Kyy": "m^2",
-        "eps_bed": "1",
-        "p_in_bc": "Pa",
-    }
+    static_units: dict[str, str] = dict(
+        zip(
+            profiles.STEADY_STATIC_FIELD_NAMES,
+            profiles.STEADY_STATIC_FIELD_UNITS,
+            strict=True,
+        )
+    )
+    expected_model_inputs = {name: static_units[name] for name in model_input_names}
     for name, unit in expected_model_inputs.items():
         if declared[name] != {
             "name": name,
@@ -958,15 +1025,16 @@ def _validate_steady_flow_conditioning(
         profiles.STATIONARY_FIXED_UNITS,
         strict=True,
     ):
-        expected_value = profiles.STATIONARY_FIXED_VALUES[name]
-        if float(fixed_values[name]) != expected_value or declared[name] != {
+        expected_value = float(fixed_values[name])
+        declared[name]["fixed_value"] = expected_value
+        if declared[name] != {
             "name": name,
             "affects_stationary_solution": True,
             "owner": "package_fixed",
             "unit": unit,
             "fixed_value": expected_value,
         }:
-            message = f"Steady-flow conditioning for {name!r} disagrees with the canonical template contract."
+            message = f"Steady-flow conditioning for {name!r} disagrees with the resolved common-value contract."
             raise GenerationConfigError(message)
     conditioning["dependencies"] = validated
     conditioning["additional_case_varying_solver_scalars"] = []
@@ -1173,6 +1241,8 @@ def _validate_operations(
     value: Any,
     *,
     sources: Mapping[str, Mapping[str, Any]],
+    definitions: Mapping[str, Mapping[str, Any]],
+    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Validate material-independent operating-distribution ownership."""
     operations = _mapping(value, label="generation operations configuration")
@@ -1180,7 +1250,6 @@ def _validate_operations(
         "schema_kind",
         "schema_version",
         "operation_id",
-        "decision_source",
         "constraints",
         "parameter_values",
     }
@@ -1191,10 +1260,7 @@ def _validate_operations(
     if operations["operation_id"] != "fixed_bed":
         message = "The maintained operation configuration must use operation_id fixed_bed."
         raise GenerationConfigError(message)
-    operations["decision_source"] = materials.validate_decision_source(
-        operations["decision_source"],
-        label="generation operations decision_source",
-    )
+    operations["decision_source"] = copy.deepcopy(dict(decision_source))
     constraints = _mapping(operations["constraints"], label="operations.constraints")
     expected_constraints = {
         "heater_only": True,
@@ -1230,12 +1296,8 @@ def _validate_operations(
         "r_int_surf",
         "f_surf",
     }
-    expected_parameters = (
-        set(materials.EXPECTED_PARAMETERS)
-        .difference(materials.DERIVED_PARAMETERS)
-        .difference(material_owned)
-        .difference({"eps_min_global", "eps_max_global"})
-    )
+    derived_parameters = {name for name, definition in definitions.items() if definition.get("kind") == "derived"}
+    expected_parameters = set(definitions).difference(derived_parameters).difference(material_owned).difference({"eps_min_global", "eps_max_global"})
     if set(parameter_values) != expected_parameters:
         missing = sorted(expected_parameters.difference(parameter_values))
         unknown = sorted(set(parameter_values).difference(expected_parameters))
@@ -1266,7 +1328,7 @@ def _name_list(value: Any, *, label: str, allow_empty: bool = False) -> tuple[st
 def _uint32(value: Any, *, label: str) -> int:
     """Return one explicit uint32 seed."""
     number = _integer(value, label=label)
-    if number > UINT32_MAX:
+    if number > seeding.UINT32_MAX:
         message = f"{label} exceeds the uint32 range."
         raise GenerationConfigError(message)
     return number
@@ -1279,97 +1341,34 @@ def _validate_batch_counts(
     seen: tuple[str, ...],
     regimes: tuple[str, ...],
 ) -> dict[str, dict[str, int]]:
-    """Validate one explicit positive count for every planned batch."""
+    """Validate positive batch counts and normalize material ordering."""
     counts = _mapping(value, label="campaign.sampling.counts")
     _exact_keys(counts, required=set(regimes), optional=set(), label="campaign.sampling.counts")
-    expected = {regime: materials_in_order if regime == "natural" else seen for regime in regimes}
     normalized: dict[str, dict[str, int]] = {}
-    for regime, expected_materials in expected.items():
+    for regime in regimes:
         raw = _mapping(counts[regime], label=f"campaign.sampling.counts.{regime}")
-        if tuple(raw) != expected_materials:
-            message = f"campaign.sampling.counts.{regime} must follow exact material order {list(expected_materials)}."
+        if not raw:
+            message = f"campaign.sampling.counts.{regime} must declare at least one material."
             raise GenerationConfigError(message)
+        allowed = materials_in_order if regime == "natural" else seen
+        unknown = set(raw).difference(allowed)
+        if unknown:
+            message = f"campaign.sampling.counts.{regime} references materials outside its eligible role: {sorted(unknown)}."
+            raise GenerationConfigError(message)
+        if regime == "natural" and set(raw) != set(materials_in_order):
+            missing = set(materials_in_order).difference(raw)
+            message = f"campaign.sampling.counts.natural is missing configured materials {sorted(missing)}."
+            raise GenerationConfigError(message)
+        ordered_materials = tuple(material_family for material_family in allowed if material_family in raw)
         normalized[regime] = {
             material_family: _integer(
-                count,
+                raw[material_family],
                 label=f"campaign.sampling.counts.{regime}.{material_family}",
                 minimum=1,
             )
-            for material_family, count in raw.items()
+            for material_family in ordered_materials
         }
     return normalized
-
-
-def _validate_binding_sampling_contract(
-    *,
-    campaign_purpose: str,
-    profile_id: str,
-    campaign_seed: int,
-    counts: Mapping[str, Mapping[str, int]],
-) -> None:
-    """Require the supplied production, smoke, or pilot allocation exactly."""
-    if campaign_purpose == "technical_runtime_smoke":
-        expected_seed = 9910 if profile_id == profiles.STEADY_FLOW_PROFILE else 9920
-        expected_counts = {"natural": {"lentil": 2}}
-        if campaign_seed != expected_seed or counts != expected_counts:
-            message = f"The {profile_id} technical smoke must use seed {expected_seed} and exactly two natural lentil cases."
-            raise GenerationConfigError(message)
-        return
-    if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
-        case_counts = tuple(counts.get("natural", {}).values())
-        expected_materials = set(materials.MATERIAL_FAMILIES)
-        if (
-            profile_id != profiles.TRANSIENT_DRYING_PROFILE
-            or campaign_seed != PILOT_CAMPAIGN_SEED
-            or set(counts) != {"natural"}
-            or set(counts["natural"]) != expected_materials
-            or not case_counts
-            or len(set(case_counts)) != 1
-        ):
-            message = "The pilot-check campaign must use transient_drying, seed 9940, and one uniform positive count for all six materials."
-            raise GenerationConfigError(message)
-        return
-    expected_seed = 9100 if profile_id == profiles.STEADY_FLOW_PROFILE else 9200
-    expected_counts = (
-        {
-            "natural": {
-                "lentil": 240,
-                "chickpea": 240,
-                "kidney_bean": 240,
-                "field_pea": 80,
-                "rapeseed": 80,
-                "sunflower_seed": 80,
-            },
-            "parameter_ood": {
-                "lentil": 80,
-                "chickpea": 80,
-                "kidney_bean": 80,
-            },
-        }
-        if profile_id == profiles.STEADY_FLOW_PROFILE
-        else {
-            "natural": {
-                "lentil": 120,
-                "chickpea": 120,
-                "kidney_bean": 120,
-                "field_pea": 40,
-                "rapeseed": 40,
-                "sunflower_seed": 40,
-            },
-            "parameter_ood": {
-                "lentil": 60,
-                "chickpea": 60,
-                "kidney_bean": 60,
-            },
-        }
-    )
-    if campaign_seed != expected_seed or counts != expected_counts:
-        message = f"The {profile_id} family-generalization campaign does not match the binding final allocation and seed {expected_seed}."
-        raise GenerationConfigError(message)
-    expected_total = PRODUCTION_CASE_COUNTS[profile_id]
-    if sum(count for regime in counts.values() for count in regime.values()) != expected_total:
-        message = f"The {profile_id} family-generalization campaign must contain exactly {expected_total} COMSOL source cases."
-        raise GenerationConfigError(message)
 
 
 def _validate_parameter_ood_policy(
@@ -1410,28 +1409,14 @@ def dataset_package_name(dataset_view: str, material_families: tuple[str, ...], 
     return f"{dataset_view}__{joined_materials}__{evaluation_regime}"
 
 
-def _expected_package_roles(
-    material_roles: Mapping[str, tuple[str, ...]],
-    *,
-    campaign_purpose: str,
-) -> tuple[tuple[str, str], ...]:
-    """Return ordered evaluation-regime to material-role ownership."""
-    if campaign_purpose == "technical_runtime_smoke":
-        return (("id", "seen"),)
-    if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
-        return ()
-    expected = [("id", "seen"), ("parameter_ood", "seen")]
-    expected.extend((role, role) for role in MATERIAL_ROLES[1:] if material_roles[role])
-    return tuple(expected)
-
-
 def _validate_membership(
     value: Any,
     *,
     campaign_purpose: str,
-    profile_id: str,
+    seen: tuple[str, ...],
+    counts: Mapping[str, Mapping[str, int]],
 ) -> dict[str, Any]:
-    """Validate one campaign-level immutable Seen-family membership contract."""
+    """Validate immutable Seen-family membership within natural-case capacity."""
     if campaign_purpose in {"technical_runtime_smoke", PILOT_CAMPAIGN_PURPOSE}:
         if value is not None:
             message = f"{campaign_purpose} campaigns do not declare learning membership."
@@ -1444,36 +1429,38 @@ def _validate_membership(
         optional=set(),
         label="campaign.membership",
     )
-    expected_seed = 9150 if profile_id == profiles.STEADY_FLOW_PROFILE else 9250
     membership["seed"] = _uint32(membership["seed"], label="campaign.membership.seed")
-    if membership["seed"] != expected_seed:
-        message = f"The {profile_id} family-generalization membership seed must be {expected_seed}."
-        raise GenerationConfigError(message)
     per_material = _mapping(
         membership["per_seen_material"],
         label="campaign.membership.per_seen_material",
     )
-    expected_counts = (
-        {"train": 192, "validation": 24, "id_test": 24}
-        if profile_id == profiles.STEADY_FLOW_PROFILE
-        else {"train": 96, "validation": 12, "id_test": 12}
-    )
+    membership_names = ID_MEMBERSHIPS
     _exact_keys(
         per_material,
-        required=set(expected_counts),
+        required=set(membership_names),
         optional=set(),
         label="campaign.membership.per_seen_material",
     )
     normalized = {
         name: _integer(
-            count,
+            per_material[name],
             label=f"campaign.membership.per_seen_material.{name}",
             minimum=1,
         )
-        for name, count in per_material.items()
+        for name in membership_names
     }
-    if normalized != expected_counts:
-        message = f"Seen-family membership must be exactly {expected_counts} per material."
+    required_natural_cases = sum(normalized.values())
+    natural_counts = counts.get("natural", {})
+    insufficient = {
+        material_family: natural_counts.get(material_family, 0)
+        for material_family in seen
+        if natural_counts.get(material_family, 0) < required_natural_cases
+    }
+    if insufficient:
+        message = (
+            "campaign.membership.per_seen_material exceeds available Seen-natural cases: "
+            f"requires {required_natural_cases} per material, available {insufficient}."
+        )
         raise GenerationConfigError(message)
     membership["per_seen_material"] = normalized
     return membership
@@ -1486,10 +1473,22 @@ def _package_source_count(
     material_roles: Mapping[str, tuple[str, ...]],
     counts: Mapping[str, Mapping[str, int]],
 ) -> int:
-    """Derive one package source-case count without counting learning views."""
+    """Derive one package source-case count and require every source batch."""
     materials_in_package = material_roles[source_role]
     sampling_regime = "parameter_ood" if regime == "parameter_ood" else "natural"
-    return sum(counts[sampling_regime][family] for family in materials_in_package)
+    regime_counts = counts.get(sampling_regime)
+    if regime_counts is None:
+        message = f"Dataset package regime {regime!r} has no {sampling_regime!r} source batches."
+        raise GenerationConfigError(message)
+    missing = tuple(material_family for material_family in materials_in_package if material_family not in regime_counts)
+    if missing:
+        message = f"Dataset package regime {regime!r} and source role {source_role!r} have no source batches for {list(missing)}."
+        raise GenerationConfigError(message)
+    source_count = sum(regime_counts[family] for family in materials_in_package)
+    if source_count <= 0:
+        message = f"Dataset package regime {regime!r} resolved no source cases."
+        raise GenerationConfigError(message)
+    return source_count
 
 
 def _validate_dataset_packages(
@@ -1501,7 +1500,7 @@ def _validate_dataset_packages(
     counts: Mapping[str, Mapping[str, int]],
     membership: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
-    """Validate concise declarations and derive immutable package semantics."""
+    """Validate declared package sources and derive immutable package semantics."""
     if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
         if value != []:
             message = "Pilot-check campaigns prohibit normal dataset-package publication."
@@ -1510,8 +1509,8 @@ def _validate_dataset_packages(
     if not isinstance(value, list) or not value:
         message = "campaign.dataset_packages must be a non-empty list."
         raise GenerationConfigError(message)
-    expected = _expected_package_roles(material_roles, campaign_purpose=campaign_purpose)
     declarations: list[dict[str, Any]] = []
+    declared_pairs: set[tuple[str, str]] = set()
     for index, raw in enumerate(value):
         label = f"campaign.dataset_packages[{index}]"
         package = _mapping(raw, label=label)
@@ -1521,18 +1520,33 @@ def _validate_dataset_packages(
             optional=set(),
             label=label,
         )
-        pair = (package["evaluation_regime"], package["source_role"])
-        if index >= len(expected) or pair != expected[index]:
-            message = f"campaign.dataset_packages must declare regime/source-role pairs in order {list(expected)}."
+        regime = package["evaluation_regime"]
+        source_role = package["source_role"]
+        if not isinstance(regime, str) or regime not in EVALUATION_REGIMES:
+            message = f"{label}.evaluation_regime must be one of {list(EVALUATION_REGIMES)}."
             raise GenerationConfigError(message)
-        source_role = str(package["source_role"])
+        if not isinstance(source_role, str) or source_role not in MATERIAL_ROLES:
+            message = f"{label}.source_role must be one of {list(MATERIAL_ROLES)}."
+            raise GenerationConfigError(message)
+        expected_role = "seen" if regime in {"id", "parameter_ood"} else regime
+        if source_role != expected_role:
+            message = f"{label} regime {regime!r} must use source_role {expected_role!r}."
+            raise GenerationConfigError(message)
         if not material_roles[source_role]:
             message = f"{label}.source_role {source_role!r} has no materials."
             raise GenerationConfigError(message)
+        pair = (regime, source_role)
+        if pair in declared_pairs:
+            message = f"campaign.dataset_packages repeats regime/source-role pair {pair}."
+            raise GenerationConfigError(message)
+        declared_pairs.add(pair)
+        _package_source_count(
+            regime,
+            source_role,
+            material_roles=material_roles,
+            counts=counts,
+        )
         declarations.append(package)
-    if len(declarations) != len(expected):
-        message = f"campaign.dataset_packages must declare exactly {list(expected)}."
-        raise GenerationConfigError(message)
 
     packages: list[dict[str, Any]] = []
     for dataset_view in profile.available_learning_views:
@@ -1569,6 +1583,10 @@ def _validate_dataset_packages(
                     "totals": {name: count * len(package_materials) for name, count in per_material.items()},
                 }
             packages.append(package)
+    dataset_names = tuple(str(package["dataset_name"]) for package in packages)
+    if len(dataset_names) != len(set(dataset_names)):
+        message = "campaign.dataset_packages resolves duplicate dataset names."
+        raise GenerationConfigError(message)
     return tuple(packages)
 
 
@@ -1700,9 +1718,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         label="execution.runtime.maximum_failures",
         minimum=1,
     )
-    if runtime["maximum_failures"] != 1:
-        msg = "The maintained generation runtime supports only fail-on-one maximum_failures=1."
-        raise GenerationConfigError(msg)
+
     arguments = runtime["extra_arguments"]
     if not isinstance(arguments, list) or not all(
         isinstance(item, str) and item and not any(char in item for char in ("\x00", "\n", "\r")) for item in arguments
@@ -1868,23 +1884,14 @@ def _validate_campaign_header(
         )
         for role in MATERIAL_ROLES
     }
-    if purpose in {"family_generalization", PILOT_CAMPAIGN_PURPOSE}:
-        expected_roles = {
-            "seen": ("lentil", "chickpea", "kidney_bean"),
-            "near_family_ood": ("field_pea",),
-            "far_family_ood": ("rapeseed",),
-            "extreme_family_ood": ("sunflower_seed",),
-        }
-    else:
-        expected_roles = {
-            "seen": ("lentil",),
-            "near_family_ood": (),
-            "far_family_ood": (),
-            "extreme_family_ood": (),
-        }
-    if material_roles != expected_roles:
-        message = f"campaign.material_roles must match the canonical {purpose} family-role contract {expected_roles}."
-        raise GenerationConfigError(message)
+    role_by_material: dict[str, str] = {}
+    for role in MATERIAL_ROLES:
+        for material_family in material_roles[role]:
+            previous_role = role_by_material.get(material_family)
+            if previous_role is not None:
+                message = f"campaign.material_roles assigns {material_family!r} to both {previous_role!r} and {role!r}."
+                raise GenerationConfigError(message)
+            role_by_material[material_family] = role
     campaign["materials"] = tuple(material_family for role in MATERIAL_ROLES for material_family in material_roles[role])
     campaign["material_roles"] = material_roles
     return campaign
@@ -1903,6 +1910,7 @@ def _build_batch(
     parameter_ood: Mapping[str, Any],
     common_config: Mapping[str, Any],
     registry_metadata: Mapping[str, Mapping[str, str]],
+    sampling_block_contract: Mapping[str, tuple[str, ...]],
     operations_digest: str,
     material_digest: str,
     execution: Mapping[str, Any],
@@ -1915,8 +1923,8 @@ def _build_batch(
     """Build one immutable profile-projected generation batch."""
     material_family = str(material["material_family"])
     batch_kind = PILOT_CAMPAIGN_PURPOSE if campaign_purpose == PILOT_CAMPAIGN_PURPOSE else sampling_regime
-    batch_name = f"{profile.id}__{material_family}__{batch_kind}"
-    batch_seed = derive_seed(
+    batch_name = build_batch_name(profile.id, material_family, batch_kind)
+    batch_seed = seeding.derive_seed(
         campaign_seed,
         "generation_batch",
         profile.id,
@@ -1924,9 +1932,8 @@ def _build_batch(
         sampling_regime,
         evaluation_regime,
     )
-    groups = materials.active_ood_groups(profile.id)
-    from . import generation_sampling as sampling_service  # noqa: PLC0415 -- typed config/sampling cycle
-
+    registry = material["parameter_registry"]
+    groups = materials.active_ood_groups(registry, profile.id)
     eligible_units = sampling_service.eligible_ood_units(material, groups=groups) if sampling_regime == "parameter_ood" else ()
     ood_allocation = sampling_service.allocate_ood_units(eligible_units, case_count=case_count) if sampling_regime == "parameter_ood" else ()
     resolved_parameter_ood = copy.deepcopy(dict(parameter_ood))
@@ -1949,8 +1956,8 @@ def _build_batch(
         pilot_case_semantics=pilot_case_semantics,
     )
     case_indices = tuple(assignments)
-    registry = material["parameter_registry"]
-    active_blocks = materials.active_sampling_blocks(profile.id)
+    active_blocks = tuple(material["active_sampling_blocks"])
+    active_block_parameters = {block: tuple(name for name in sampling_block_contract[block] if name in registry) for block in active_blocks}
 
     block_seed_bases = {"airflow": paired_equivalence_seed} if paired_equivalence_seed is not None else None
     sampling_plan = sampling_service.build_sampling_plan(
@@ -1960,10 +1967,12 @@ def _build_batch(
         method=sampling_method,
         blocks=active_blocks,
         block_seed_bases=block_seed_bases,
+        block_parameters=active_block_parameters,
     )
     block_dimensions = materials.sampling_block_dimensions(
         registry,
         blocks=active_blocks,
+        block_parameters=active_block_parameters,
     )
     input_contract = copy.deepcopy(dict(common_config["input_contract"]))
     spatial_contract = input_contract["spatial"]
@@ -1988,7 +1997,7 @@ def _build_batch(
     scientific: dict[str, Any] = {
         "schema_kind": "resolved_generation_batch",
         "schema_version": CONFIG_SCHEMA_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "generator_version": seeding.GENERATOR_VERSION,
         "simulation_profile": profile.id,
         "campaign_id": campaign_id,
         "campaign_purpose": campaign_purpose,
@@ -2065,8 +2074,8 @@ def _build_batch(
         scientific["steady_flow_conditioning"] = copy.deepcopy(conditioning)
 
     scientific_digest = common.serialization.canonical_json_sha256(scientific)
-    case_input_digest = common.serialization.canonical_json_sha256(_input_identity_config(scientific))
-    batch_id = f"{batch_name}__{scientific_digest[:16]}"
+    case_input_digest = compute_case_input_config_digest(scientific)
+    batch_id = build_batch_id(batch_name, scientific_digest)
     return GenerationConfig(
         source_path=source_path,
         profile=profile,
@@ -2089,6 +2098,21 @@ def _build_batch(
     )
 
 
+def _registry_catalog_digest(config: Mapping[str, Any]) -> str:
+    """Hash registry catalogue semantics; batch plans bind coordinate order."""
+    payload = copy.deepcopy(dict(config))
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, Mapping):
+        message = "Generation parameter registry must contain a parameters mapping."
+        raise TypeError(message)
+    for entry in parameters.values():
+        if not isinstance(entry, dict):
+            message = "Generation parameter registry entries must be mappings."
+            raise TypeError(message)
+        entry.pop("sampling_order", None)
+    return common.serialization.canonical_json_sha256(payload)
+
+
 def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign resolver
     path: Path | str,
     *,
@@ -2101,28 +2125,33 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         _load_yaml(source_path, label="generation campaign configuration"),
         source_path=source_path,
     )
-    source_config = _load_yaml(
-        campaign["sources_config"],
-        label="generation scientific source registry",
+    registry_config = _load_yaml(
+        campaign["registry_config"],
+        label="generation parameter registry",
+    )
+    definitions, registry_metadata, decision_source, sampling_block_contract = materials.validate_semantic_registry(registry_config)
+    source_config = provenance_service.bind_decision_source(
+        _load_yaml(
+            campaign["sources_config"],
+            label="generation scientific source registry",
+        ),
+        decision_source,
     )
     sources = provenance_service.validate_source_registry(
         source_config,
         decision_validator=lambda value: materials.validate_decision_source(
             value,
             label="generation source registry decision_source",
+            expected=decision_source,
         ),
     )
-    registry_config = _load_yaml(
-        campaign["registry_config"],
-        label="generation parameter registry",
-    )
-    definitions, registry_metadata = materials.validate_semantic_registry(registry_config)
     common_config = _validate_common(
         _load_yaml(
             campaign["common_config"],
             label="generation common configuration",
         ),
         sources=sources,
+        decision_source=decision_source,
     )
     operations = _validate_operations(
         _load_yaml(
@@ -2130,6 +2159,8 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             label="generation operations configuration",
         ),
         sources=sources,
+        definitions=definitions,
+        decision_source=decision_source,
     )
     profile_raw = _load_yaml(
         campaign["profile_config"],
@@ -2169,9 +2200,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             campaign["paired_equivalence_seed"],
             label="campaign.paired_equivalence_seed",
         )
-        if paired_equivalence_seed != PAIRED_EQUIVALENCE_SEED:
-            message = "Both technical-smoke campaigns must use paired_equivalence_seed 9930."
-            raise GenerationConfigError(message)
 
     resolved_materials: dict[str, dict[str, Any]] = {}
     material_digests: dict[str, str] = {}
@@ -2192,10 +2220,12 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             operations["parameter_values"],
             material_raw,
             sources=sources,
+            decision_source=decision_source,
         )
         projected = materials.project_material_for_profile(
             full_material,
             profile.id,
+            sampling_block_contract=sampling_block_contract,
         )
         resolved_materials[material_family] = projected
         material_digests[material_family] = common.serialization.canonical_json_sha256(projected)
@@ -2257,11 +2287,18 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     if sampling["method"] not in {"lhs", "sobol"}:
         message = "campaign.sampling.method must be lhs or sobol."
         raise GenerationConfigError(message)
-    sampling_regimes = tuple(raw_counts)
-    expected_sampling_regimes = ("natural", "parameter_ood") if campaign_purpose == "family_generalization" else ("natural",)
-    if sampling_regimes != expected_sampling_regimes:
-        message = f"campaign.sampling must resolve regimes in order {list(expected_sampling_regimes)}."
+    supported_sampling_regimes = ("natural", "parameter_ood")
+    unknown_sampling_regimes = set(raw_counts).difference(supported_sampling_regimes)
+    if unknown_sampling_regimes:
+        message = f"campaign.sampling.counts has unsupported regimes {sorted(unknown_sampling_regimes)}."
         raise GenerationConfigError(message)
+    if "natural" not in raw_counts:
+        message = "campaign.sampling.counts must declare natural source cases."
+        raise GenerationConfigError(message)
+    if campaign_purpose != "family_generalization" and set(raw_counts) != {"natural"}:
+        message = f"{campaign_purpose} campaigns support only natural sampling."
+        raise GenerationConfigError(message)
+    sampling_regimes = tuple(regime for regime in supported_sampling_regimes if regime in raw_counts)
     campaign_seed = _uint32(
         sampling["seed_base"],
         label="campaign.sampling.seed_base",
@@ -2273,12 +2310,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         seen=material_roles["seen"],
         regimes=sampling_regimes,
     )
-    _validate_binding_sampling_contract(
-        campaign_purpose=campaign_purpose,
-        profile_id=profile.id,
-        campaign_seed=campaign_seed,
-        counts=counts,
-    )
     if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
         cases_per_material = next(iter(counts["natural"].values()))
         campaign_id = _campaign_name(f"{campaign_name}_n{cases_per_material}_v{campaign_schema_version}")
@@ -2289,10 +2320,11 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     membership = _validate_membership(
         campaign.get("membership"),
         campaign_purpose=campaign_purpose,
-        profile_id=profile.id,
+        seen=material_roles["seen"],
+        counts=counts,
     )
     if campaign_purpose == "family_generalization":
-        ood_groups = materials.active_ood_groups(profile.id)
+        ood_groups = materials.active_ood_groups(definitions, profile.id)
         parameter_ood = _validate_parameter_ood_policy(
             {
                 "groups": list(ood_groups),
@@ -2318,12 +2350,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         membership=membership,
     )
     evaluation_regimes = tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in dataset_packages))
-    expected_evaluation_regimes = (
-        EVALUATION_REGIMES if campaign_purpose == "family_generalization" else ("id",) if campaign_purpose == "technical_runtime_smoke" else ()
-    )
-    if evaluation_regimes != expected_evaluation_regimes:
-        message = f"Resolved evaluation regimes must be exactly {list(expected_evaluation_regimes)}."
-        raise GenerationConfigError(message)
     material_memberships = _material_memberships(
         material_roles,
         campaign_purpose=campaign_purpose,
@@ -2334,7 +2360,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     common_with_profile["_profile_exports"] = profile_config["exports"]
     common_with_profile["_steady_flow_conditioning"] = profile_config["steady_flow_conditioning"]
     common_with_profile["_operation_constraints"] = operations["constraints"]
-    active_names = {name for block in materials.active_sampling_blocks(profile.id) for name in materials.SAMPLING_BLOCKS[block]}
+    active_names = set(materials.profile_parameter_names(definitions, profile.id))
     active_operation = {name: operations["parameter_values"][name] for name in operations["parameter_values"] if name in active_names}
     active_constraints = (
         operations["constraints"]
@@ -2375,6 +2401,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
                     parameter_ood=parameter_ood,
                     common_config=common_with_profile,
                     registry_metadata=registry_metadata,
+                    sampling_block_contract=sampling_block_contract,
                     operations_digest=operations_digest,
                     material_digest=material_digests[material_family],
                     execution=execution,
@@ -2389,17 +2416,11 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     if len(batch_names) != len(set(batch_names)):
         message = "Campaign planned duplicate batch names."
         raise GenerationConfigError(message)
-    total_case_count = sum(len(batch.case_indices) for batch in batches)
-    expected_total = (
-        2
-        if campaign_purpose == "technical_runtime_smoke"
-        else len(materials.MATERIAL_FAMILIES) * int(cases_per_material)
-        if campaign_purpose == PILOT_CAMPAIGN_PURPOSE and cases_per_material is not None
-        else PRODUCTION_CASE_COUNTS[profile.id]
-    )
-    if total_case_count != expected_total:
-        message = f"Resolved campaign has {total_case_count} cases; expected {expected_total}."
+    batch_ids = [batch.batch_id for batch in batches]
+    if len(batch_ids) != len(set(batch_ids)):
+        message = "Campaign planned duplicate scientific batch identities."
         raise GenerationConfigError(message)
+    total_case_count = sum(len(batch.case_indices) for batch in batches)
 
     duplicate_case_input_policy = "reject_duplicates"
     campaign_scientific = {
@@ -2427,7 +2448,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         "dataset_packages": list(dataset_packages),
         "duplicate_case_input_policy": duplicate_case_input_policy,
         "sources_config_digest": common.serialization.canonical_json_sha256(source_config),
-        "registry_config_digest": common.serialization.canonical_json_sha256(registry_config),
+        "registry_config_digest": _registry_catalog_digest(registry_config),
         "common_config_digest": common.serialization.canonical_json_sha256(common_config),
         "operation_config_digest": operations_digest,
         "material_config_digests": material_digests,
@@ -2454,12 +2475,85 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         material_memberships=material_memberships,
         membership=copy.deepcopy(membership),
         source_registry=copy.deepcopy(sources),
+        source_files=(
+            source_path,
+            *(
+                campaign[key]
+                for key in (
+                    "sources_config",
+                    "registry_config",
+                    "common_config",
+                    "operations_config",
+                    "profile_config",
+                    "execution_config",
+                )
+            ),
+            *(project_root / "configs" / "generation" / "materials" / f"{material_family}.yaml" for material_family in campaign["materials"]),
+        ),
         total_case_count=total_case_count,
         paired_equivalence_seed=paired_equivalence_seed,
         batches=tuple(batches),
         dataset_packages=dataset_packages,
         duplicate_case_input_policy=duplicate_case_input_policy,
         execution_values=execution,
+    )
+
+
+def discover_campaign_configs(
+    repository_root: Path | str | None = None,
+    *,
+    require_executable: bool = False,
+) -> tuple[CampaignConfig, ...]:
+    """
+    Discover Generation campaigns by schema kind in deterministic path order.
+
+    Parameters
+    ----------
+    repository_root : Path | str | None, optional
+        Repository tree to inspect. The configured project root is used by
+        default.
+    require_executable : bool, optional
+        Require every discovered campaign to pass executable mapping gates.
+
+    Returns
+    -------
+    tuple[CampaignConfig, ...]
+        Resolved campaigns ordered by repository-relative source path.
+
+    Notes
+    -----
+    Discovery is presentation-only. Source paths and discovery order do not
+    enter campaign scientific identity. Non-campaign YAML is ignored.
+
+    """
+    root = common.paths.get_project_root().resolve() if repository_root is None else Path(repository_root).expanduser().resolve()
+    if not root.is_dir():
+        message = f"Campaign discovery root is not a directory: {root}"
+        raise NotADirectoryError(message)
+    campaign_paths: list[Path] = []
+    for candidate in root.rglob("*.yaml"):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        try:
+            source = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        try:
+            raw = yaml.safe_load(source)
+        except yaml.YAMLError as error:
+            if "schema_kind: generation_campaign" in source:
+                message = f"Could not inspect declared Generation campaign {candidate}."
+                raise GenerationConfigError(message) from error
+            continue
+        if isinstance(raw, Mapping) and raw.get("schema_kind") == "generation_campaign":
+            campaign_paths.append(candidate.resolve())
+    campaign_paths.sort(key=lambda candidate: candidate.relative_to(root).as_posix())
+    return tuple(
+        load_campaign_config(
+            campaign_path,
+            require_executable=require_executable,
+        )
+        for campaign_path in campaign_paths
     )
 
 

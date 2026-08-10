@@ -1,10 +1,6 @@
 schema_kind: generation_material
 schema_version: 1
 material_family: chickpea
-decision_source:
-  artifact: VP2_Parameter_Decisions.yaml
-  schema_version: 1.1.0
-  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 material_scope:
   common_name: Chickpea
   species: Cicer arietinum L.
@@ -65,7 +61,6 @@ density_calibration:
   reference:
     rho_bu_dry_ref: 676.0
     eps_bed_cal_ref: 0.403
-    inferred_rho_particle_dry: 1132.328308
   rho_bu_dry_ref_support:
     lower: 620.0
     upper: 730.0
@@ -230,10 +225,9 @@ initial_moisture:
         material_scope_ref: material_scope
         product_form: Whole mature dry Kabuli chickpea
         moisture_basis: kg water/kg dry solids
-  field_constraint: min(X_0_db_field) >= 0.14636364 kg/kg
+  margin_above_target_db: 0.01
 target_moisture:
   selected_simulation_target_wb: 0.12
-  selected_target_db: 0.13636363636363635
   market_acceptance_moisture_wb: 0.135
   safe_storage_moisture_wb: 0.11923
   provenance:

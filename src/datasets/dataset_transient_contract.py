@@ -2,30 +2,38 @@
 ===============================================================================
 dataset_transient_contract.py
 ===============================================================================
-Define the unregistered transient drying step-data schema.
+Define and serialize the unregistered transient drying step-data contract.
 Responsibilities:
-  - Declare ordered dynamic, spatial, boundary, scalar, and target fields
-  - Record fixed-step, absolute-state, and metadata semantics
-  - Separate baseline conditioning from archived ablation fields
+  - Select Dataset-owned conditioning fields from Generation storage descriptors
+  - Declare ordered dynamic, boundary, scalar, target, and ablation channels
+  - Serialize and digest the exact persisted transient step contract
 Design principles:
-  - Canonical simulation storage retains absolute physical states
-  - Step increments belong to later dataset construction
-  - Material family remains metadata rather than a model input channel
+  - Generation owns canonical HDF5 source names and physical units
+  - Dataset owns model-facing channel selection and step-target derivation
+  - Spatial shape is resolved from admitted runtime data rather than declared here
 This module does NOT:
   - Register a transient learning task or build transient tensors
-  - Define normalization, models, losses, or rollout behavior
+  - Validate HDF5 payloads, normalize data, or define rollout behavior
 ===============================================================================
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
+
+from src import generation
+
+TRANSIENT_PROFILE_ID: Final = "transient_drying"
+TRANSIENT_VIEW_ID: Final = "transient_drying"
+TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION: Final = 1
 
 
 @dataclass(frozen=True, slots=True)
 class DataField:
-    """Describe one ordered logical field and its physical unit."""
+    """Describe one ordered logical Dataset field and its physical unit."""
 
     name: str
     unit: str
@@ -33,7 +41,7 @@ class DataField:
 
 @dataclass(frozen=True, slots=True)
 class TransientStepContract:
-    """Describe the planned one-hour transient operator data contract."""
+    """Describe the one-hour transient operator data contract."""
 
     dynamic_state: tuple[DataField, ...]
     static_spatial_conditioning: tuple[DataField, ...]
@@ -42,7 +50,6 @@ class TransientStepContract:
     target_increments: tuple[DataField, ...]
     archived_ablation_fields: tuple[DataField, ...]
     tensor_dtype: str
-    spatial_shape: tuple[int, int]
     time_step: float
     time_unit: str
     canonical_storage_representation: str
@@ -50,57 +57,112 @@ class TransientStepContract:
     material_family_usage: str
 
 
+_SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(TRANSIENT_PROFILE_ID)
+
+
+def _source_field(name: str) -> DataField:
+    """Return one Dataset descriptor derived from the Generation source schema."""
+    source = _SOURCE_PROFILE.field(name)
+    return DataField(source.name, source.unit)
+
+
+def _scheduled_field(source_name: str, endpoint: str) -> DataField:
+    """Return one step-endpoint field derived from a Generation schedule field."""
+    source = _SOURCE_PROFILE.field(source_name)
+    return DataField(f"{source.name}_{endpoint}", source.unit)
+
+
 TRANSIENT_STEP_CONTRACT: Final = TransientStepContract(
-    dynamic_state=(
-        DataField("T", "K"),
-        DataField("phi", "1"),
-        DataField("w_surf", "kg/m^3"),
-        DataField("w_int", "kg/m^3"),
-    ),
-    static_spatial_conditioning=(
-        DataField("x", "m"),
-        DataField("y", "m"),
-        DataField("u", "m/s"),
-        DataField("v", "m/s"),
-        DataField("p", "Pa"),
-        DataField("eps_bed", "1"),
-        DataField("rho_bu_dry", "kg/m^3"),
+    dynamic_state=tuple(DataField(field.name, field.unit) for field in _SOURCE_PROFILE.transient_fields),
+    static_spatial_conditioning=tuple(
+        _source_field(name)
+        for name in (
+            "x",
+            "y",
+            "u",
+            "v",
+            "p",
+            "eps_bed",
+            "rho_bu_dry",
+        )
     ),
     step_boundary_conditioning=(
-        DataField("T_in_bc_t_n", "K"),
-        DataField("T_in_bc_t_np1", "K"),
-        DataField("phi_in_bc_t_n", "1"),
-        DataField("phi_in_bc_t_np1", "1"),
-        DataField("T_amb", "K"),
+        _scheduled_field("T_in_bc", "t_n"),
+        _scheduled_field("T_in_bc", "t_np1"),
+        _scheduled_field("phi_in_bc", "t_n"),
+        _scheduled_field("phi_in_bc", "t_np1"),
+        _source_field("T_amb"),
     ),
-    scalar_conditioning=(
-        DataField("r_surf_0", "1/s"),
-        DataField("r_int_surf", "1"),
-        DataField("f_surf", "1"),
-        DataField("A_osw", "1"),
-        DataField("B_osw", "1/K"),
-        DataField("C_osw", "1"),
-        DataField("k_gr", "W/(m*K)"),
-        DataField("cp_gr_dry", "J/(kg*K)"),
+    scalar_conditioning=tuple(
+        _source_field(name)
+        for name in (
+            "r_surf_0",
+            "r_int_surf",
+            "f_surf",
+            "A_osw",
+            "B_osw",
+            "C_osw",
+            "k_gr",
+            "cp_gr_dry",
+        )
     ),
-    target_increments=(
-        DataField("delta_T", "K"),
-        DataField("delta_phi", "1"),
-        DataField("delta_w_surf", "kg/m^3"),
-        DataField("delta_w_int", "kg/m^3"),
-    ),
-    archived_ablation_fields=(
-        DataField("Kxx", "m^2"),
-        DataField("Kxy", "m^2"),
-        DataField("Kyy", "m^2"),
-        DataField("p_in_bc", "Pa"),
-        DataField("X_0_db_field", "kg/kg"),
+    target_increments=tuple(DataField(f"delta_{field.name}", field.unit) for field in _SOURCE_PROFILE.transient_fields),
+    archived_ablation_fields=tuple(
+        _source_field(name)
+        for name in (
+            "Kxx",
+            "Kxy",
+            "Kyy",
+            "p_in_bc",
+            "X_0_db_field",
+        )
     ),
     tensor_dtype="float32",
-    spatial_shape=(251, 401),
     time_step=1.0,
-    time_unit="h",
+    time_unit=_SOURCE_PROFILE.field("t").unit,
     canonical_storage_representation="absolute_physical_states",
     target_derivation_stage="transient_dataset_builder",
     material_family_usage="metadata_only",
 )
+
+
+def transient_contract_payload() -> dict[str, Any]:
+    """Return the exact persisted transient tensor names, units, and step."""
+    contract = TRANSIENT_STEP_CONTRACT
+    return {
+        "state": [{"name": field.name, "unit": field.unit} for field in contract.dynamic_state],
+        "static": [{"name": field.name, "unit": field.unit} for field in contract.static_spatial_conditioning],
+        "boundary": [{"name": field.name, "unit": field.unit} for field in contract.step_boundary_conditioning],
+        "scalars": [{"name": field.name, "unit": field.unit} for field in contract.scalar_conditioning],
+        "target": [{"name": field.name, "unit": field.unit} for field in contract.target_increments],
+        "dt": {"value": contract.time_step, "unit": contract.time_unit},
+        "storage": contract.canonical_storage_representation,
+        "target_derivation": contract.target_derivation_stage,
+        "material_family_usage": contract.material_family_usage,
+    }
+
+
+def transient_contract_digest() -> str:
+    """Return the exact path-independent transient Dataset contract digest."""
+    contract = TRANSIENT_STEP_CONTRACT
+    payload = {
+        "schema_version": TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION,
+        "view": TRANSIENT_VIEW_ID,
+        "state": [(field.name, field.unit) for field in contract.dynamic_state],
+        "static": [(field.name, field.unit) for field in contract.static_spatial_conditioning],
+        "boundary": [(field.name, field.unit) for field in contract.step_boundary_conditioning],
+        "scalars": [(field.name, field.unit) for field in contract.scalar_conditioning],
+        "target": [(field.name, field.unit) for field in contract.target_increments],
+        "dt": {"value": contract.time_step, "unit": contract.time_unit},
+        "storage": contract.canonical_storage_representation,
+        "target_derivation": contract.target_derivation_stage,
+        "material_family_usage": contract.material_family_usage,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

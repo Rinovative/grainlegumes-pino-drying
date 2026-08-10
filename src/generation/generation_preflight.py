@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -36,29 +37,22 @@ from . import generation_profiles as profiles
 from . import generation_workspace as workspace_service
 
 _REQUIRED_IMPORTS = ("numpy", "scipy", "yaml", "h5py")
-_REQUIRED_COMMANDS = (
-    "python3",
-    "comsol",
-    "sbatch",
-    "squeue",
-    "sacct",
-    "scancel",
-    "rsync",
-)
-_EXPECTED_MODULE_INITIALIZATION = (
-    "module load Python/3.10",
-    "module load Comsol/v6.4",
-)
+_SLURM_COMMANDS = ("sbatch", "squeue", "sacct", "scancel")
+_MODULE_VERSION_PATTERN = re.compile(r"/v?([0-9]+(?:\.[0-9]+)*)$", re.IGNORECASE)
 
 
-def _version_output(command: list[str]) -> dict[str, Any]:
+def _version_output(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     """Return bounded version output for one required executable."""
     result = subprocess.run(  # noqa: S603 -- required executable paths resolved by shutil.which
         command,
         check=False,
         capture_output=True,
         text=True,
-        timeout=30.0,
+        timeout=timeout_seconds,
     )
     output = (result.stdout + result.stderr).strip()
     return {
@@ -87,22 +81,45 @@ def _owned_writable_directory(path: Path, *, label: str) -> dict[str, Any]:
     }
 
 
-def _command_versions(commands: dict[str, str]) -> dict[str, Any]:
-    """Collect non-solving version evidence from native tools."""
+def configured_module_version(module_name: str) -> str | None:
+    """Return an optional version suffix authored by one module identifier."""
+    match = _MODULE_VERSION_PATTERN.search(module_name)
+    return None if match is None else match.group(1)
+
+
+def reported_version_matches(output: object, expected: str) -> bool:
+    """Return whether tool output reports the configured version or one patch release."""
+    pattern = rf"(?<![0-9.]){re.escape(expected)}(?:\.[0-9]+)*(?![0-9.])"
+    return re.search(pattern, str(output)) is not None
+
+
+def _command_versions(
+    commands: dict[str, str],
+    *,
+    python_module: str,
+    comsol_module: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Collect and validate non-solving version evidence from native tools."""
     arguments = {
-        "python3": [commands["python3"], "--version"],
+        "python": [commands["python"], "--version"],
         "comsol": [commands["comsol"], "-version"],
-        "sbatch": [commands["sbatch"], "--version"],
+        "scheduler": [commands["sbatch"], "--version"],
         "rsync": [commands["rsync"], "--version"],
     }
-    results = {name: _version_output(command) for name, command in arguments.items()}
+    results = {name: _version_output(command, timeout_seconds=timeout_seconds) for name, command in arguments.items()}
     failures = [name for name, result in results.items() if result["exit_code"] != 0]
     if failures:
         message = f"Required version commands failed: {failures}."
         raise RuntimeError(message)
-    if "6.4" not in str(results["comsol"]["output"]):
-        message = "Native COMSOL must report version 6.4."
-        raise RuntimeError(message)
+    expected_versions = {
+        "python": configured_module_version(python_module),
+        "comsol": configured_module_version(comsol_module),
+    }
+    for name, expected in expected_versions.items():
+        if expected is not None and not reported_version_matches(results[name]["output"], expected):
+            message = f"Configured {name} module expects version {expected}, but the active executable reported {results[name]['output']!r}."
+            raise RuntimeError(message)
     return results
 
 
@@ -173,7 +190,11 @@ def _path_guard_probe(
     }
 
 
-def _quota_evidence(home: Path) -> dict[str, Any]:
+def _quota_evidence(
+    home: Path,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     """Return optional quota output without making quota support mandatory."""
     executable = shutil.which("quota")
     if executable is None:
@@ -183,7 +204,7 @@ def _quota_evidence(home: Path) -> dict[str, Any]:
         check=False,
         capture_output=True,
         text=True,
-        timeout=30.0,
+        timeout=timeout_seconds,
         cwd=home,
     )
     return {
@@ -232,51 +253,55 @@ def run_cpu_preflight(
         "work": _owned_writable_directory(work, label="work_root"),
         "venv": _owned_writable_directory(venv, label="venv"),
     }
-    try:
-        Path(sys.executable).resolve().relative_to(venv)
-    except ValueError as error:
-        message = f"Active Python executable {sys.executable} is not inside venv {venv}."
-        raise RuntimeError(message) from error
-    if sys.version_info[:2] != (3, 10):
-        message = f"Native generation requires Python 3.10 exactly, got {sys.version}."
-        raise RuntimeError(message)
-    pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
-    if 'requires-python = ">=3.10"' not in pyproject:
-        message = "Package metadata no longer declares the audited Python >=3.10 contract."
-        raise RuntimeError(message)
-    missing_imports = [name for name in _REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
-    if missing_imports:
-        message = f"Generation CPU venv is missing imports: {missing_imports}."
-        raise ModuleNotFoundError(message)
-    commands: dict[str, str] = {}
-    for name in _REQUIRED_COMMANDS:
-        executable = shutil.which(name)
-        if executable is None:
-            message = f"Required native CPU command is unavailable: {name}"
-            raise FileNotFoundError(message)
-        commands[name] = executable
-    versions = _command_versions(commands)
-
     campaign = config_service.load_campaign_config(
         config_path,
         require_executable=False,
     )
     if only_batch is not None:
         campaign = campaign.select_batches((only_batch,))
-    modules = tuple(campaign.execution_values["runtime"]["module_initialization"])
-    if modules != _EXPECTED_MODULE_INITIALIZATION:
-        message = "Execution configuration must load exactly Python/3.10 and Comsol/v6.4 in that order."
-        raise ValueError(message)
     site = campaign.execution_values["site"]
-    if (
-        site["python_module"] != "Python/3.10"
-        or site["comsol_module"] != "Comsol/v6.4"
-        or site["python_executable"] != "python3"
-        or site["comsol_executable"] != "comsol"
-        or site["scheduler"] != "slurm"
-    ):
-        message = "Execution site configuration disagrees with the native ICE contract."
+    if site["scheduler"] != "slurm":
+        message = "Native CPU cluster preflight requires configured scheduler='slurm'."
         raise ValueError(message)
+    modules = tuple(campaign.execution_values["runtime"]["module_initialization"])
+    timeout_seconds = float(campaign.execution_values["runtime"]["timeout_seconds"])
+
+    try:
+        Path(sys.executable).resolve().relative_to(venv)
+    except ValueError as error:
+        message = f"Active Python executable {sys.executable} is not inside venv {venv}."
+        raise RuntimeError(message) from error
+    configured_python_version = configured_module_version(str(site["python_module"]))
+    if configured_python_version is not None:
+        expected_python = tuple(int(component) for component in configured_python_version.split("."))
+        active_python = tuple(sys.version_info[: len(expected_python)])
+        if active_python != expected_python:
+            message = f"Configured Python module expects version {configured_python_version}, but the active interpreter is {sys.version}."
+            raise RuntimeError(message)
+    missing_imports = [name for name in _REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
+    if missing_imports:
+        message = f"Generation CPU venv is missing imports: {missing_imports}."
+        raise ModuleNotFoundError(message)
+    command_names = {
+        "python": str(site["python_executable"]),
+        "comsol": str(site["comsol_executable"]),
+        "rsync": "rsync",
+        **{name: name for name in _SLURM_COMMANDS},
+    }
+    commands: dict[str, str] = {}
+    for label, command_name in command_names.items():
+        executable = shutil.which(command_name)
+        if executable is None:
+            message = f"Required native CPU command is unavailable: {command_name}"
+            raise FileNotFoundError(message)
+        commands[label] = executable
+    versions = _command_versions(
+        commands,
+        python_module=str(site["python_module"]),
+        comsol_module=str(site["comsol_module"]),
+        timeout_seconds=timeout_seconds,
+    )
+
     remaining = max(
         sum(len(batch.case_indices) for batch in campaign.batches),
         1,
@@ -318,7 +343,7 @@ def run_cpu_preflight(
             "used_bytes": disk.used,
             "free_bytes": disk.free,
         },
-        "quota": _quota_evidence(home),
+        "quota": _quota_evidence(home, timeout_seconds=timeout_seconds),
         "commands": commands,
         "versions": versions,
         "configured_modules": list(modules),

@@ -31,17 +31,14 @@ steady_flow_conditioning:
     affects_stationary_solution: true
     owner: package_fixed
     unit: K
-    fixed_value: 300.65
   - name: p_ref
     affects_stationary_solution: true
     owner: package_fixed
     unit: Pa
-    fixed_value: 101325.0
   - name: p_out
     affects_stationary_solution: true
     owner: package_fixed
     unit: Pa
-    fixed_value: 0.0
   additional_case_varying_solver_scalars: []
 exports:
 - role: steady_flow_fields

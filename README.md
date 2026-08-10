@@ -18,7 +18,7 @@ Heterogeneous permeability, porosity, pressure, and initial-moisture fields are 
 
 The repository now has one Python package, one research layout, and one external scientific storage root. Existing dataset identity, train-only normalization, deterministic training, exact resume, Optuna, W&B observation, run publication, artifact generation, and ID/OOD evaluation contracts remain the stationary-airflow baseline for subsequent drying work.
 
-The six-family generation/publication contract is implemented fail-closed as a 1,200-case steady campaign and a 660-trajectory transient campaign (1,860 profile-specific source cases combined). The corrected static porosity and parameter-effect sentinels pass; production remains blocked by unconfirmed native mappings and missing current real-smoke/pilot receipts. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
+Generation and publication are fail-closed. Campaign inventories, roles, counts, memberships, seeds, package requests, OOD allocations, and execution resources are resolved from their authoritative YAML owners instead of being repeated in documentation. `validate-config` displays the complete effective plan and current launch gates before any runtime work. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
 
 > Configured scientific values are modelling and sampling decisions. Citations do
 > not imply that every final number is reported verbatim: values may be fitted,
@@ -98,7 +98,7 @@ python -m src.generation.cli.cli_generation readiness-report \
   --run-static-sentinels
 ```
 
-The normal six-family transient diagnostic, once those gates pass, is:
+The configured transient diagnostic, once those gates pass, is:
 
 ```bash
 ./scripts/generation_workflow.sh pilot-check \

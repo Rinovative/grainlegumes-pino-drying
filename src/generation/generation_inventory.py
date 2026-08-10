@@ -4,7 +4,7 @@ generation_inventory.py
 ===============================================================================
 Audit profile-qualified parameter ownership, dimensions, and effective consumers.
 Responsibilities:
-  - Report exact 28-D steady and 54-D transient coordinate inventories
+  - Report exact profile-specific sampled-coordinate inventories
   - Trace each resolved parameter to one authored owner and downstream consumer
   - Keep scientific, generated, COMSOL-adapter, output, and execution state separate
 Design principles:
@@ -29,47 +29,23 @@ from . import generation_materials as materials
 from . import generation_profiles as profiles
 from . import generation_registry as registry_service
 
-COMMON_VALUE_PARAMETERS: Final = frozenset({"eps_min_global", "eps_max_global"})
-OPERATION_VALUE_PARAMETERS: Final = frozenset(
-    set(materials.AIRFLOW_PARAMETERS).difference({"kappa_mean"})
-    | set(materials.INITIAL_MOISTURE_PARAMETERS).difference(materials.INITIAL_MOISTURE_LEVEL_PARAMETERS)
-    | set(materials.OPERATION_PARAMETERS)
-)
-
-PARAMETER_OWNERS: Final = MappingProxyType(
+_COMMON_VALUE_PARAMETERS: Final = frozenset({"eps_min_global", "eps_max_global"})
+_MATERIAL_VALUE_PARAMETERS: Final = frozenset(
     {
-        name: (
-            "configs/generation/common.yaml"
-            if name in COMMON_VALUE_PARAMETERS
-            else "configs/generation/operations/fixed_bed.yaml"
-            if name in OPERATION_VALUE_PARAMETERS
-            else "configs/generation/registry.yaml"
-            if name in materials.DERIVED_PARAMETERS
-            else "configs/generation/materials/<material>.yaml"
-        )
-        for name in materials.EXPECTED_PARAMETERS
+        "kappa_mean",
+        "initial_moisture.mean_db",
+        "initial_moisture.amplitude_db",
+        "rho_bu_dry_ref",
+        "eps_bed_cal_ref",
+        "k_gr",
+        "cp_gr_dry",
+        "X_target_wb",
+        "oswin",
+        "r_surf_0",
+        "r_int_surf",
+        "f_surf",
     }
 )
-
-_BED_STRUCTURE_PARAMETERS: Final = frozenset(
-    name for name in materials.EXPECTED_PARAMETERS if name.startswith(("bed.structure.", "bed.perturbations."))
-)
-_PERMEABILITY_PARAMETERS: Final = frozenset(
-    {"kappa_mean", "kappa_cv"} | {name for name in materials.EXPECTED_PARAMETERS if name.startswith("permeability.")}
-)
-_POROSITY_PARAMETERS: Final = frozenset(
-    (
-        *materials.POROSITY_GENERATOR_PARAMETERS,
-        "kappa_mean",
-        "eps_bed_cal_ref",
-        "eps_min_global",
-        "eps_max_global",
-    )
-)
-_PRESSURE_PARAMETERS: Final = frozenset(name for name in materials.AIRFLOW_PARAMETERS if name.startswith("pressure_bc."))
-_INITIAL_MOISTURE_PARAMETERS: Final = frozenset(name for name in materials.EXPECTED_PARAMETERS if name.startswith("initial_moisture."))
-_SCHEDULE_PARAMETERS: Final = frozenset(materials.OPERATION_PARAMETERS)
-_DENSITY_FIELD_PARAMETERS: Final = frozenset({"rho_bu_dry_ref", "eps_bed_cal_ref"})
 _TRANSIENT_SCALAR_PARAMETERS: Final = frozenset(
     {
         "T_init",
@@ -84,20 +60,6 @@ _TRANSIENT_SCALAR_PARAMETERS: Final = frozenset(
         "r_int_surf",
         "f_surf",
         "oswin",
-    }
-)
-_PHYSICAL_FORMULA_RECORDS: Final = frozenset({"r_surf", "r_int"})
-_PARAMETER_CONSUMER_GROUPS: Final = MappingProxyType(
-    {
-        "generation_fields._bed_structure": _BED_STRUCTURE_PARAMETERS,
-        "generation_fields._permeability_fields": _PERMEABILITY_PARAMETERS,
-        "generation_fields._porosity_field": _POROSITY_PARAMETERS,
-        "generation_fields._pressure_boundary": _PRESSURE_PARAMETERS,
-        "generation_fields._initial_moisture": _INITIAL_MOISTURE_PARAMETERS,
-        "generation_schedule.generate_schedule": _SCHEDULE_PARAMETERS,
-        "generation_fields derived dry-density fields": _DENSITY_FIELD_PARAMETERS,
-        "generation_case transient scalar COMSOL adapter": _TRANSIENT_SCALAR_PARAMETERS,
-        "common.physical_formulas COMSOL expression contract": _PHYSICAL_FORMULA_RECORDS,
     }
 )
 _TRANSIENT_ONLY_CONSUMERS: Final = frozenset(
@@ -123,7 +85,7 @@ COMSOL_INPUT_SOURCES: Final = MappingProxyType(
         **{
             name: (
                 "common.scientific_fixed_values"
-                if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
+                if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS
                 else "typed parameter registry or deterministic derivation"
             )
             for name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS
@@ -183,57 +145,75 @@ class InventoryReport:
     total_effective_dimension: int
 
 
-def parameter_owner(name: str) -> str:
-    """Return the one authoritative configuration owner for a parameter."""
-    try:
-        return PARAMETER_OWNERS[name]
-    except KeyError as error:
-        message = f"Parameter {name!r} has no declared scientific owner."
-        raise ValueError(message) from error
+def parameter_owner(name: str, entry: Mapping[str, Any]) -> str:
+    """Return the authoritative configuration owner from one resolved entry."""
+    if name in _COMMON_VALUE_PARAMETERS:
+        return "configs/generation/common.yaml"
+    if entry.get("kind") == "derived":
+        return "configs/generation/registry.yaml"
+    if name in _MATERIAL_VALUE_PARAMETERS:
+        return "configs/generation/materials/<material>.yaml"
+    return "configs/generation/operations/fixed_bed.yaml"
 
 
-def parameter_consumers(name: str, profile_id: str) -> tuple[str, ...]:
-    """Return effective downstream consumers for one profile-applicable parameter."""
-    if profile_id not in materials.PROFILE_SAMPLING_BLOCKS:
-        message = f"Unknown generation profile {profile_id!r}."
-        raise ValueError(message)
-    return tuple(
-        label
-        for label, names in _PARAMETER_CONSUMER_GROUPS.items()
-        if name in names and not (profile_id == profiles.STEADY_FLOW_PROFILE and label in _TRANSIENT_ONLY_CONSUMERS)
-    )
+def parameter_consumers(
+    name: str,
+    profile_id: str,
+    entry: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return effective implementation consumers for one resolved parameter."""
+    profiles.resolve_profile(profile_id)
+    consumers: list[str] = []
+    if name.startswith(("bed.structure.", "bed.perturbations.")):
+        consumers.append("generation_fields._bed_structure")
+    if name in {"kappa_mean", "kappa_cv"} or name.startswith("permeability."):
+        consumers.append("generation_fields._permeability_fields")
+    if name in {*materials.POROSITY_GENERATOR_PARAMETERS, "kappa_mean", "eps_bed_cal_ref", "eps_min_global", "eps_max_global"}:
+        consumers.append("generation_fields._porosity_field")
+    if name.startswith("pressure_bc."):
+        consumers.append("generation_fields._pressure_boundary")
+    if name.startswith("initial_moisture."):
+        consumers.append("generation_fields._initial_moisture")
+    if entry.get("block") == "operation":
+        consumers.append("generation_schedule.generate_schedule")
+    if name in {"rho_bu_dry_ref", "eps_bed_cal_ref"}:
+        consumers.append("generation_fields derived dry-density fields")
+    if name in _TRANSIENT_SCALAR_PARAMETERS:
+        consumers.append("generation_case transient scalar COMSOL adapter")
+    if name in {"r_surf", "r_int"}:
+        consumers.append("common.physical_formulas COMSOL expression contract")
+    return tuple(consumer for consumer in consumers if not (profile_id == profiles.STEADY_FLOW_PROFILE and consumer in _TRANSIENT_ONLY_CONSUMERS))
 
 
 def _infer_profile(registry: Mapping[str, Mapping[str, Any]]) -> str:
-    """Infer only the two exact maintained registry projections."""
-    names = set(registry)
-    transient_expected = set(materials.EXPECTED_PARAMETERS)
-    steady_expected: set[str] = set(materials.AIRFLOW_PARAMETERS)
-    steady_expected.update({"bed.structure.fine_weight", "eps_min_global", "eps_max_global", "eps_bed_cal_ref"})
-    if names == transient_expected:
-        return profiles.TRANSIENT_DRYING_PROFILE
-    if names == steady_expected:
-        return profiles.STEADY_FLOW_PROFILE
-    message = "Registry is neither the exact steady-flow nor transient-drying projection."
-    raise ValueError(message)
+    """Infer the profile represented by one already projected registry."""
+    applicability = {name: tuple(entry.get("profile_applicability", ())) for name, entry in registry.items()}
+    if not applicability or any(not values for values in applicability.values()):
+        message = "Projected registry entries must declare profile_applicability."
+        raise ValueError(message)
+    if any(profiles.STEADY_FLOW_PROFILE not in values for values in applicability.values()):
+        if all(profiles.TRANSIENT_DRYING_PROFILE in values for values in applicability.values()):
+            return profiles.TRANSIENT_DRYING_PROFILE
+        message = "Projected registry mixes incompatible profile applicability."
+        raise ValueError(message)
+    return profiles.STEADY_FLOW_PROFILE
 
 
 def audit_parameter_registry(
     registry: Mapping[str, Mapping[str, Any]],
     *,
     profile_id: str | None = None,
+    block_parameters: Mapping[str, tuple[str, ...]] | None = None,
 ) -> InventoryReport:
     """Audit one fully resolved profile registry and return its exact inventory."""
     selected_profile = _infer_profile(registry) if profile_id is None else profile_id
-    dimensions = materials.validate_profile_registry(registry, selected_profile)
+    materials.validate_profile_registry(registry, selected_profile)
     declared = set(registry)
-    consumers = {name: parameter_consumers(name, selected_profile) for name in registry}
+    consumers = {name: parameter_consumers(name, selected_profile, entry) for name, entry in registry.items()}
     configured_but_unused = tuple(sorted(name for name, values in consumers.items() if not values))
     consumed_but_undeclared: tuple[str, ...] = ()
-    if not declared.issubset(PARAMETER_OWNERS):
-        message = "Parameter-owner inventory must cover the exact active registry."
-        raise ValueError(message)
-    if any(owner.startswith("execution") for owner in PARAMETER_OWNERS.values()):
+    owners = {name: parameter_owner(name, entry) for name, entry in registry.items()}
+    if any(owner.startswith("execution") for owner in owners.values()):
         message = "Execution settings cannot own scientific parameters."
         raise ValueError(message)
     for name, entry in registry.items():
@@ -251,16 +231,25 @@ def audit_parameter_registry(
     if not adapter_names.issubset(COMSOL_INPUT_SOURCES):
         message = "Every profile-active COMSOL input adapter value must have one explicit source."
         raise ValueError(message)
-    blocks = materials.active_sampling_blocks(selected_profile)
+    blocks = materials.active_sampling_blocks(registry, selected_profile)
+    block_membership = materials.sampling_blocks(registry) if block_parameters is None else block_parameters
+    dimensions = materials.sampling_block_dimensions(
+        registry,
+        blocks=blocks,
+        block_parameters=block_membership,
+    )
     sampled_by_block = {
-        block: tuple(name for name in materials.SAMPLING_BLOCKS[block] if registry_service.effective_dimension(registry[name]) > 0)
-        for block in blocks
+        block: tuple(name for name in block_membership[block] if registry_service.effective_dimension(registry[name]) > 0) for block in blocks
     }
-    coordinate_names = materials.sampling_coordinate_labels(registry, selected_profile)
+    coordinate_names = materials.sampling_coordinate_labels(
+        registry,
+        selected_profile,
+        block_parameters=block_membership,
+    )
     material_fixed = tuple(
         name
         for name, entry in registry.items()
-        if parameter_owner(name) == "configs/generation/materials/<material>.yaml" and entry["kind"] == "fixed"
+        if parameter_owner(name, entry) == "configs/generation/materials/<material>.yaml" and entry["kind"] == "fixed"
     )
     return InventoryReport(
         profile_id=selected_profile,
@@ -289,7 +278,14 @@ def audit_campaign(campaign: Any) -> dict[str, InventoryReport]:
             message = f"Batch {batch.batch_name!r} leaks execution settings into scientific identity."
             raise ValueError(message)
         registry = batch.scientific_values["material"]["parameter_registry"]
-        reports[batch.batch_name] = audit_parameter_registry(registry, profile_id=batch.profile.id)
+        block_parameters = {
+            block: tuple(str(name) for name in plan["parameters"]) for block, plan in batch.scientific_values["sampling"]["blocks"].items()
+        }
+        reports[batch.batch_name] = audit_parameter_registry(
+            registry,
+            profile_id=batch.profile.id,
+            block_parameters=block_parameters,
+        )
     return reports
 
 
@@ -401,9 +397,7 @@ _SCHEDULE_FIXED_CONSUMERS: Final = frozenset(
 )
 _TEMPLATE_FIXED_NAMES: Final = frozenset(
     {
-        "T_flow_ref",
-        "p_ref",
-        "p_out",
+        *profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS,
         "phi_clip_min",
         "phi_clip_max",
         "cp_w",
@@ -414,7 +408,6 @@ _TEMPLATE_FIXED_NAMES: Final = frozenset(
         "k_wall",
         "h_ext",
         "U_wall",
-        "f_wet_dm_max",
         "schedule_interpolation",
     }
 )
@@ -590,9 +583,7 @@ def _inspect_porosity_support(
         return None
     role_by_material = {family: role for role, families in campaign.material_roles.items() for family in families}
     material_views: dict[str, Any] = {}
-    for family in materials.MATERIAL_FAMILIES:
-        if family not in natural_batches:
-            continue
+    for family in natural_batches:
         material = natural_batches[family].scientific_values["material"]
         record = material["packing_porosity_mean_support"]
         material_views[family] = {
@@ -674,13 +665,14 @@ def inspect_campaign_parameter(campaign: Any, canonical_name: str) -> dict[str, 
         owner = "configs/generation/materials/<material>.yaml"
     elif canonical_name == "schedule_simplex":
         owner = "configs/generation/operations/fixed_bed.yaml"
+    elif isinstance(first_entry, Mapping):
+        owner = parameter_owner(registry_name, first_entry)
     else:
-        owner = parameter_owner(registry_name)
+        message = f"Parameter {registry_name!r} does not resolve to one registry mapping."
+        raise TypeError(message)
     role_by_material = {family: role for role, families in campaign.material_roles.items() for family in families}
     materials_view: dict[str, Any] = {}
-    for family in materials.MATERIAL_FAMILIES:
-        if family not in natural_batches:
-            continue
+    for family in natural_batches:
         material = natural_batches[family].scientific_values["material"]
         registry = material["parameter_registry"]
         if is_atomic_record:
@@ -733,7 +725,7 @@ def inspect_campaign_parameter(campaign: Any, canonical_name: str) -> dict[str, 
     applicability = {profile_id for _name, entry in route_entries for profile_id in entry.get("profile_applicability", ())}
     profiles_applicable = [profile_id for profile_id in _PROFILE_ORDER if profile_id in applicability]
     coordinate_labels = tuple(label for name, entry in route_entries for label in _entry_coordinate_labels(name, entry))
-    consumers = tuple(dict.fromkeys(consumer for name, _entry in route_entries for consumer in parameter_consumers(name, campaign.profile.id)))
+    consumers = tuple(dict.fromkeys(consumer for name, entry in route_entries for consumer in parameter_consumers(name, campaign.profile.id, entry)))
     component_contracts = {name: _entry_inspection_contract(entry) for name, entry in route_entries}
     result: dict[str, Any] = {
         "schema_kind": "vp2_resolved_parameter_inspection",

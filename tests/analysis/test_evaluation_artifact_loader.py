@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,7 @@ import pandas as pd
 import pytest
 import torch
 
-from src import common, domain
+from src import common, datasets, domain
 from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_artifact_loader as loader
 from src.analysis.evaluation import evaluation_dataframe
@@ -34,7 +35,6 @@ _OOD_DATASET = "fixture_ood"
 class _Fixture:
     """Compact completed-run evidence and its two persisted artifact roots."""
 
-    output_root: Path
     run_dir: Path
     completed: dict[str, Any]
     validate_calls: list[Path]
@@ -105,6 +105,18 @@ def _summary() -> dict[str, Any]:
     }
 
 
+def _evaluation() -> dict[str, Any]:
+    """Return exact current completed-run evaluation evidence."""
+    return {
+        "lifecycle_status": "completed",
+        "is_completed": True,
+        "is_provisional": False,
+        "selected_checkpoint_role": "best",
+        "selected_checkpoint_epoch": 4,
+        "selected_checkpoint_sha256": "b" * 64,
+    }
+
+
 def _dataset_identity(
     task_spec: TaskSpec,
     *,
@@ -125,18 +137,39 @@ def _dataset_identity(
 
 def _split(task_spec: TaskSpec) -> dict[str, Any]:
     """Build distinct ordered ID and OOD memberships with saved digests."""
+    train_identity = _dataset_identity(
+        task_spec,
+        dataset_name=_ID_DATASET,
+        fingerprint="1" * 64,
+    )
+    ood_identity = _dataset_identity(
+        task_spec,
+        dataset_name=_OOD_DATASET,
+        fingerprint="2" * 64,
+    )
+    indices = {
+        "train": torch.tensor([1, 3], dtype=torch.long),
+        "eval": torch.tensor([2, 0], dtype=torch.long),
+        "ood": torch.tensor([3, 1], dtype=torch.long),
+    }
+    memberships = {
+        role: datasets.identity.membership_digest(
+            role=role,
+            dataset_fingerprint=(ood_identity if role == "ood" else train_identity)["fingerprint"],
+            sample_ids=(ood_identity if role == "ood" else train_identity)["sample_ids"],
+            indices=[int(value) for value in role_indices.tolist()],
+        )
+        for role, role_indices in indices.items()
+    }
     return {
-        "schema_version": 1,
+        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
         "task": task_spec.id,
         "task_contract_digest": task_spec.contract_digest,
-        "train_indices": torch.tensor([1, 3], dtype=torch.long),
-        "eval_indices": torch.tensor([2, 0], dtype=torch.long),
-        "ood_indices": torch.tensor([3, 1], dtype=torch.long),
+        "train_indices": indices["train"],
+        "eval_indices": indices["eval"],
+        "ood_indices": indices["ood"],
         "metadata": {
-            "datasets": {
-                "train": _dataset_identity(task_spec, dataset_name=_ID_DATASET, fingerprint="i" * 64),
-                "ood": _dataset_identity(task_spec, dataset_name=_OOD_DATASET, fingerprint="o" * 64),
-            },
+            "datasets": {"train": train_identity, "ood": ood_identity},
             "n_train_full": 4,
             "n_train": 2,
             "n_eval": 2,
@@ -145,11 +178,7 @@ def _split(task_spec: TaskSpec) -> dict[str, Any]:
             "train_ratio": 0.5,
             "ood_fraction": 0.5,
             "split_seed": 7,
-            "membership_digests": {
-                "train": "t" * 64,
-                "eval": "e" * 64,
-                "ood": "d" * 64,
-            },
+            "membership_digests": memberships,
         },
     }
 
@@ -194,7 +223,7 @@ def _artifact_row(
         "case_index": case_index,
         "source_index": source_index,
         "split_local_index": split_local_index,
-        "npz_path": str(npz_path.resolve()),
+        "npz_path": (Path("npz") / npz_path.name).as_posix(),
         "meta": json.dumps({"fixture_parameter": float(source_index + 1)}),
         "inference_time_ms": 1.0,
         "rel_l2": 0.1,
@@ -279,6 +308,7 @@ def _write_artifact(
             summary=summary,
             task_spec=task_spec,
             run_name=_RUN_NAME,
+            evaluation=_evaluation(),
         ),
         "model": loader._expected_model_provenance(config=config, summary=summary),
         "split_role": split_role,
@@ -353,6 +383,10 @@ def _build_fixture(
         "summary": summary,
         "split_indices": split,
         "normalizer_state": _normalizer_state(task_spec),
+        "scientific_run_name": _RUN_NAME,
+        "effective_config_digest": summary["effective_config_digest"],
+        "normalizer_sha256": summary["normalizer_sha256"],
+        **_evaluation(),
     }
     id_root = common.paths.resolve_id_analysis_dir(run_dir).resolve()
     ood_root = common.paths.resolve_ood_analysis_dir(run_dir, _OOD_DATASET).resolve()
@@ -385,13 +419,12 @@ def _build_fixture(
         )
     validate_calls: list[Path] = []
 
-    def validate_completed_run(candidate: Path) -> dict[str, Any]:
+    def evaluable_run_lease(candidate: Path) -> nullcontext[dict[str, Any]]:
         validate_calls.append(Path(candidate).resolve())
-        return completed
+        return nullcontext(completed)
 
-    monkeypatch.setattr(loader.experiments.run, "validate_completed_run", validate_completed_run)
+    monkeypatch.setattr(loader.experiments.run, "evaluable_run_lease", evaluable_run_lease)
     return _Fixture(
-        output_root=output_root,
         run_dir=run_dir,
         completed=completed,
         validate_calls=validate_calls,
@@ -436,11 +469,7 @@ def test_completed_run_admission_is_read_only_and_generation_free(
         raise AssertionError(message)
 
     monkeypatch.setattr(np, "load", unexpected_npz_open)
-    loaded = loader.load_completed_run_artifacts(
-        _TASK,
-        _RUN_NAME,
-        output_root=fixture.output_root,
-    )
+    loaded = loader.load_run_artifacts(fixture.run_dir)
 
     assert loaded.task == _TASK
     assert loaded.run_name == _RUN_NAME
@@ -469,11 +498,7 @@ def test_completed_run_admission_is_read_only_and_generation_free(
         generation_limit=1,
     )
     with pytest.raises(loader.IncompatibleEvaluationArtifactsError, match="complete saved membership"):
-        loader.load_completed_run_artifacts(
-            _TASK,
-            _RUN_NAME,
-            output_root=prefix_fixture.output_root,
-        )
+        loader.load_run_artifacts(prefix_fixture.run_dir)
 
 
 def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
@@ -484,7 +509,7 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
     missing = _build_fixture(tmp_path / "missing", monkeypatch, roles=("eval",))
     build_command = f"./scripts/docker_job.sh --queue-gpu auto artifacts --run-dir {missing.run_dir}"
     with pytest.raises(loader.MissingEvaluationArtifactsError) as captured:
-        loader.load_completed_run_artifacts(_TASK, _RUN_NAME, output_root=missing.output_root)
+        loader.load_run_artifacts(missing.run_dir)
     assert "missing" in str(captured.value)
     assert build_command in str(captured.value)
     assert "--rebuild" not in str(captured.value)
@@ -492,6 +517,7 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
 
     contradictions = (
         (("run", "best_checkpoint_sha256"), "x" * 64),
+        (("run", "lifecycle_status"), "interrupted"),
         (("dataset", "fingerprint"), "x" * 64),
         (("dataset", "data_contract_digest"), "x" * 64),
         (("dataset", "saved_membership_digest"), "x" * 64),
@@ -503,11 +529,7 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
         fixture = _build_fixture(tmp_path / f"contradiction-{index}", monkeypatch)
         _mutate_provenance(fixture.id_root, field_path, replacement)
         with pytest.raises(loader.IncompatibleEvaluationArtifactsError) as captured:
-            loader.load_completed_run_artifacts(
-                _TASK,
-                _RUN_NAME,
-                output_root=fixture.output_root,
-            )
+            loader.load_run_artifacts(fixture.run_dir)
         message = str(captured.value)
         assert "incompatible" in message
         rebuild_command = f"./scripts/docker_job.sh --queue-gpu auto artifacts --run-dir {fixture.run_dir} --rebuild"
@@ -523,11 +545,11 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
 
     monkeypatch.setattr(np, "load", unexpected_npz_open)
     with pytest.raises(loader.IncompatibleEvaluationArtifactsError, match="manifest"):
-        loader.load_completed_run_artifacts(_TASK, _RUN_NAME, output_root=changed.output_root)
+        loader.load_run_artifacts(changed.run_dir)
 
     aliased = _build_fixture(tmp_path / "aliased-root", monkeypatch)
     outside = tmp_path / "outside-id-artifact"
     aliased.id_root.rename(outside)
     aliased.id_root.symlink_to(outside, target_is_directory=True)
     with pytest.raises(loader.IncompatibleEvaluationArtifactsError, match="symbolic-link alias"):
-        loader.load_completed_run_artifacts(_TASK, _RUN_NAME, output_root=aliased.output_root)
+        loader.load_run_artifacts(aliased.run_dir)

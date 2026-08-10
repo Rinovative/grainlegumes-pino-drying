@@ -10,7 +10,7 @@ import pytest
 import torch
 from support import configs
 
-from src import experiments
+from src import datasets, experiments
 
 tracking = experiments.tracking
 
@@ -147,33 +147,49 @@ def _state_recorder() -> tuple[dict[str, Any], Any]:
 
 
 def _split_evidence(config: dict[str, Any]) -> dict[str, Any]:
+    identities = {
+        role: {
+            "dataset_id": f"artificial-{role}",
+            "task": config["task"],
+            "fingerprint": marker * 64,
+            "sample_count": 3,
+            "spatial_shape": [8, 8],
+            "data_contract_digest": config["task_contract"]["data_contract_digest"],
+            "sample_ids": ["sample-a", "sample-b", "sample-c"],
+        }
+        for role, marker in (("train", "a"), ("ood", "b"))
+    }
+    indices = {
+        "train": torch.tensor([1]),
+        "eval": torch.tensor([2, 0]),
+        "ood": torch.tensor([2]),
+    }
+    memberships = {
+        role: datasets.identity.membership_digest(
+            role=role,
+            dataset_fingerprint=identities["ood" if role == "ood" else "train"]["fingerprint"],
+            sample_ids=identities["ood" if role == "ood" else "train"]["sample_ids"],
+            indices=[int(value) for value in role_indices.tolist()],
+        )
+        for role, role_indices in indices.items()
+    }
     return {
-        "schema_version": 1,
-        "eval_indices": torch.tensor([2, 0]),
+        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
+        "task": config["task"],
+        "task_contract_digest": config["task_contract"]["digest"],
+        "train_indices": indices["train"],
+        "eval_indices": indices["eval"],
+        "ood_indices": indices["ood"],
         "metadata": {
-            "datasets": {
-                role: {
-                    "dataset_id": f"artificial-{role}",
-                    "fingerprint": marker * 64,
-                    "sample_count": 3,
-                    "spatial_shape": [8, 8],
-                    "data_contract_digest": config["task_contract"]["data_contract_digest"],
-                    "sample_ids": ["sample-a", "sample-b", "sample-c"],
-                }
-                for role, marker in (("train", "a"), ("ood", "b"))
-            },
-            "membership_digests": {
-                "train": "c" * 64,
-                "eval": "d" * 64,
-                "ood": "e" * 64,
-            },
+            "datasets": identities,
+            "membership_digests": memberships,
             "n_train_full": 3,
             "n_train": 1,
             "n_eval": 2,
             "n_ood_full": 3,
             "n_ood": 1,
-            "train_ratio": 0.8,
-            "ood_fraction": 0.2,
+            "train_ratio": 1.0 / 3.0,
+            "ood_fraction": 1.0 / 3.0,
             "split_seed": 9,
         },
     }
@@ -480,7 +496,6 @@ def test_monitor_membership_is_repeatable_and_bounded() -> None:
     config = _resolved_config()
     config["tracking"]["wandb"]["monitor"]["max_cases"] = 2
     split = _split_evidence(config)
-    split["eval_indices"] = torch.tensor([2, 0, 1])
     first = tracking.build_monitor_membership(config, split)
     assert first == tracking.build_monitor_membership(config, split)
     assert first is not None

@@ -136,6 +136,54 @@ def _text_sequence(value: Any, *, label: str, allow_empty: bool = False) -> list
     return result
 
 
+def bind_decision_source(
+    value: Any,
+    decision_source: Mapping[str, str],
+) -> dict[str, Any]:
+    """Expand the registry-owned decision identity into its provenance citation."""
+    config = _mapping(value, label="generation source registry")
+    decision = _mapping(decision_source, label="generation decision source")
+    _exact_keys(
+        decision,
+        required={"artifact", "schema_version", "sha256"},
+        optional=set(),
+        label="generation decision source",
+    )
+    if not all(isinstance(item, str) and item for item in decision.values()):
+        message = "Generation decision-source values must be non-empty text."
+        raise TypeError(message)
+    raw_sources = config.get("sources")
+    if not isinstance(raw_sources, list):
+        message = "generation source registry.sources must be a list."
+        raise TypeError(message)
+    matches = [(index, raw) for index, raw in enumerate(raw_sources) if isinstance(raw, Mapping) and raw.get("source_key") == "vp2_decision_contract"]
+    if len(matches) != 1:
+        message = "Generation source registry must declare one vp2_decision_contract citation stub."
+        raise ValueError(message)
+    index, raw = matches[0]
+    stub = _mapping(raw, label="generation source registry vp2_decision_contract")
+    _exact_keys(
+        stub,
+        required={"source_key", "decision_date", "alternate_locators", "source_type"},
+        optional=set(),
+        label="generation source registry vp2_decision_contract",
+    )
+    decision_date = _text(
+        stub["decision_date"],
+        label="generation source registry vp2_decision_contract.decision_date",
+    )
+    raw_sources[index] = {
+        "source_key": "vp2_decision_contract",
+        "citation": f"VP2 Parameter Decisions, schema {decision['schema_version']} ({decision_date}).",
+        "identifier": f"sha256:{decision['sha256']}",
+        "canonical_locator": f"artifact:{decision['artifact']}",
+        "alternate_locators": copy.deepcopy(stub["alternate_locators"]),
+        "source_type": stub["source_type"],
+    }
+    config["decision_source"] = copy.deepcopy(decision)
+    return config
+
+
 def validate_source_registry(
     value: Any,
     *,

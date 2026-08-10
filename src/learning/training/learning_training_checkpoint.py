@@ -36,7 +36,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from src import common
+from src import common, datasets
 
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
@@ -267,26 +267,15 @@ def build_checkpoint_identity(
     if not isinstance(task_digest, str) or not task_digest:
         msg = "Config task_contract.digest must be a non-empty string for checkpoint identity."
         raise TypeError(msg)
-    metadata = _required_mapping(split_indices.get("metadata"), label="split metadata")
-    datasets = _required_mapping(metadata.get("datasets"), label="split metadata.datasets")
-    memberships = _required_mapping(metadata.get("membership_digests"), label="split metadata.membership_digests")
-
-    fingerprints: dict[str, str] = {}
-    for role in ("train", "ood"):
-        dataset_identity = _required_mapping(datasets.get(role), label=f"split dataset {role}")
-        fingerprint = dataset_identity.get("fingerprint")
-        if not isinstance(fingerprint, str) or not fingerprint:
-            msg = f"Split dataset {role!r} must contain a fingerprint."
-            raise TypeError(msg)
-        fingerprints[role] = fingerprint
-
-    membership_values: dict[str, str] = {}
-    for role in ("train", "eval", "ood"):
-        digest = memberships.get(role)
-        if not isinstance(digest, str) or not digest:
-            msg = f"Split membership {role!r} must contain a digest."
-            raise TypeError(msg)
-        membership_values[role] = digest
+    split_contract = datasets.splits.admit_split_contract(split_indices)
+    if split_contract.task != task or split_contract.task_contract_digest != task_digest:
+        msg = "Split task identity must match the checkpoint config contract."
+        raise ValueError(msg)
+    fingerprints = {
+        "train": split_contract.role("train").source.fingerprint,
+        "ood": split_contract.role("ood").source.fingerprint,
+    }
+    membership_values = {role: split_contract.role(role).membership_digest for role in datasets.splits.SPLIT_ROLES}
 
     persisted = dict(persisted_config or config)
     return _validate_checkpoint_identity(

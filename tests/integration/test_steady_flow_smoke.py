@@ -822,7 +822,7 @@ def _rewrite_parquet_npz_paths(artifact_root: Path, values: list[str]) -> None:
     common.serialization.atomic_write_json(provenance_path, provenance)
 
 
-def test_completed_bundle_is_portable_and_legacy_paths_relocate_safely(
+def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
     completed_smoke: CompletedSmoke,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -861,9 +861,6 @@ def test_completed_bundle_is_portable_and_legacy_paths_relocate_safely(
     relative_paths = tuple(Path(value).parts for value in raw_id["npz_path"])
     expected_paths = tuple(("npz", f"case_{int(case_index):04d}.npz") for case_index in raw_id["case_index"])
     assert relative_paths == expected_paths
-    legacy_values = [str((id_root / value).resolve()) for value in raw_id["npz_path"].tolist()]
-    _rewrite_parquet_npz_paths(id_root, legacy_values)
-
     moved = tmp_path / "archive" / "promoted_model"
     moved.parent.mkdir()
     renamed.rename(moved)
@@ -1182,7 +1179,7 @@ def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (_mutate_task_identity, "split task identity"),
+        (_mutate_task_identity, "split_indices.pt task_contract_digest"),
         (_mutate_config_identity, "canonical generated leaf"),
         (_mutate_dataset_identity, "dataset fingerprint mismatch"),
         (_mutate_split_identity, "ordered membership digest mismatch"),

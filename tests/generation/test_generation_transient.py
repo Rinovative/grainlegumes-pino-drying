@@ -13,6 +13,8 @@ import pytest
 import torch
 
 from src import common, datasets, generation
+from src.generation import generation_profiles as profiles
+from src.generation import generation_schedule as schedule_service
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -22,6 +24,50 @@ if TYPE_CHECKING:
 def _json(value: object) -> str:
     """Return compact HDF5 JSON metadata."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _synthetic_scientific_contract() -> dict[str, Any]:
+    """Return the explicit config evidence owned by one synthetic case."""
+    return {
+        "schema_version": generation.config.CONFIG_SCHEMA_VERSION,
+        "simulation_profile": "transient_drying",
+        "grid": {
+            "nx": 401,
+            "ny": 251,
+            "Lx": 1.2,
+            "Ly": 0.75,
+            "Lz": 0.8,
+            "boundaries_included": True,
+            "dx": 0.003,
+            "dy": 0.003,
+        },
+        "time": {
+            "start": 0.0,
+            "stop": 168.0,
+            "interval": 1.0,
+            "internal_steps": "adaptive",
+            "irregular_stop_state": "diagnostic_only",
+            "regular_times": [float(index) for index in range(169)],
+        },
+        "storage": {
+            "schema_version": generation.storage.HDF5_SCHEMA_VERSION,
+            "converter_version": generation.storage.HDF5_CONVERTER_VERSION,
+            "compression": "gzip",
+            "compression_level": 4,
+            "shuffle": True,
+            "float32_rtol": 1e-6,
+            "float32_atol": 1e-7,
+            "chunk_time": 1,
+            "chunk_y": 64,
+            "chunk_x": 64,
+        },
+        "scientific_fixed_values": {
+            "T_flow_ref": 300.65,
+            "p_ref": 101325.0,
+            "p_out": 0.0,
+            "f_wet_dm_max": 0.05,
+        },
+    }
 
 
 def _hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
@@ -87,15 +133,19 @@ def _write_transient_case(
     exact_stop_time: float | None = 2.5,
     case_input_id: str = "1" * 64,
     simulation_case_id: str = "2" * 64,
+    scientific_contract: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Write one compressed schema-v1 case with an optional exact-stop state."""
-    x_axis = np.linspace(0.0, 1.2, 401, dtype=np.float64)
-    y_axis = np.linspace(0.0, 0.75, 251, dtype=np.float64)
+    scientific = _synthetic_scientific_contract() if scientific_contract is None else scientific_contract
+    grid = scientific["grid"]
+    storage = scientific["storage"]
+    x_axis = np.linspace(0.0, float(grid["Lx"]), int(grid["nx"]), dtype=np.float64)
+    y_axis = np.linspace(0.0, float(grid["Ly"]), int(grid["ny"]), dtype=np.float64)
     shape = (y_axis.size, x_axis.size)
     static_constants = (1.0e-10, 0.0, 2.0e-10, 0.4, 100.0, 0.2, 0.1, 0.05, 101325.0, 550.0)
-    assert len(static_constants) == len(generation.profiles.TRANSIENT_STATIC_FIELD_NAMES)
+    assert len(static_constants) == len(profiles.TRANSIENT_STATIC_FIELD_NAMES)
     static = np.stack([np.full(shape, value, dtype=np.float32) for value in static_constants])
-    regular_time = np.asarray([0.0, 1.0, 2.0], dtype=np.float64)
+    regular_time = np.asarray(scientific["time"]["regular_times"][:3], dtype=np.float64)
     initial_water = static_constants[-1] * static_constants[5]
     base = np.asarray([295.0, 0.4, initial_water, initial_water], dtype=np.float32)
     increments = np.asarray([1.0, 0.01, -0.5, -0.25], dtype=np.float32)
@@ -127,19 +177,20 @@ def _write_transient_case(
         "C_osw": 0.3,
         "f_wet_dm_max": 0.05,
     }
-    scalar_names = generation.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
     scalars = np.asarray([scalar_values[name] for name in scalar_names], dtype=np.float64)
-    ownership = ["package_fixed" if name in {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"} else "case_dependent" for name in scalar_names]
-    schedule = np.zeros((169, len(generation.profiles.SCHEDULE_FIELDS)), dtype=np.float64)
-    schedule[:, 0] = np.arange(169, dtype=np.float64)
+    ownership = ["package_fixed" if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS else "case_dependent" for name in scalar_names]
+    schedule_times = np.asarray(scientific["time"]["regular_times"], dtype=np.float64)
+    schedule = np.zeros((schedule_times.size, len(profiles.SCHEDULE_FIELDS)), dtype=np.float64)
+    schedule[:, 0] = schedule_times
     schedule[:, 1] = 295.0 + 0.01 * schedule[:, 0]
     schedule[:, 2] = 0.009
-    schedule[:, 3] = generation.schedule.humidity_ratio_to_relative_humidity(
+    schedule[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
         schedule[:, 2],
         schedule[:, 1],
         pressure=scalar_values["p_ref"],
     )
-    global_values = np.zeros((complete_time.size, len(generation.profiles.GLOBAL_FIELD_NAMES)), dtype=np.float64)
+    global_values = np.zeros((complete_time.size, len(profiles.GLOBAL_FIELD_NAMES)), dtype=np.float64)
     global_values[:, 0] = complete_time
     f_surf = scalar_values["f_surf"]
     rho = static_constants[-1]
@@ -150,7 +201,7 @@ def _write_transient_case(
             complete_time[index],
             x_wb,
             1.0 if index == 0 else 0.04,
-            0.8 * 1.2 * 0.75 * water,
+            float(grid["Lz"]) * float(grid["Lx"]) * float(grid["Ly"]) * water,
             1.0,
             0.1,
             0.02,
@@ -165,7 +216,7 @@ def _write_transient_case(
     final_status = np.asarray(
         [
             complete_time[-1],
-            global_values[-1, generation.profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")],
+            global_values[-1, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")],
             final_x_wb,
             final_x_wb,
             float(final_fields[0, 0, 0]),
@@ -175,17 +226,13 @@ def _write_transient_case(
         ],
         dtype=np.float64,
     )
-    profile = generation.profiles.get_profile("transient_drying")
-    scientific = {
-        "schema_version": generation.config.CONFIG_SCHEMA_VERSION,
-        "simulation_profile": "transient_drying",
-    }
+    profile = profiles.get_profile("transient_drying")
     scientific_digest = common.serialization.canonical_json_sha256(scientific)
     scalar_entries = [
         {"name": name, "value": scalar_values[name], "unit": unit, "owner": owner}
         for name, unit, owner in zip(
             scalar_names,
-            generation.profiles.TRANSIENT_SCALAR_INPUT_UNITS,
+            profiles.TRANSIENT_SCALAR_INPUT_UNITS,
             ownership,
             strict=True,
         )
@@ -214,7 +261,7 @@ def _write_transient_case(
         "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
         "conditional_supports": {},
         "sampled_values": scalar_values,
-        "sampled_units": dict(zip(scalar_names, generation.profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
+        "sampled_units": dict(zip(scalar_names, profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
         "coupled_selections": {},
         "ood": {"natural_support_state": "natural"},
         "spatial_diagnostics": {},
@@ -285,31 +332,40 @@ def _write_transient_case(
         static_dataset = handle.create_group("static").create_dataset(
             "fields",
             data=static,
-            chunks=(1, 64, 64),
-            compression="gzip",
-            compression_opts=4,
-            shuffle=True,
+            chunks=(
+                1,
+                min(int(storage["chunk_y"]), y_axis.size),
+                min(int(storage["chunk_x"]), x_axis.size),
+            ),
+            compression=str(storage["compression"]),
+            compression_opts=int(storage["compression_level"]),
+            shuffle=bool(storage["shuffle"]),
         )
-        static_dataset.attrs["field_names"] = _json(list(generation.profiles.TRANSIENT_STATIC_FIELD_NAMES))
-        static_dataset.attrs["units"] = _json(list(generation.profiles.TRANSIENT_STATIC_FIELD_UNITS))
+        static_dataset.attrs["field_names"] = _json(list(profiles.TRANSIENT_STATIC_FIELD_NAMES))
+        static_dataset.attrs["units"] = _json(list(profiles.TRANSIENT_STATIC_FIELD_UNITS))
         scalar_dataset = handle.create_group("scalar").create_dataset("values", data=scalars)
         scalar_dataset.attrs["field_names"] = _json(list(scalar_names))
-        scalar_dataset.attrs["units"] = _json(list(generation.profiles.TRANSIENT_SCALAR_INPUT_UNITS))
+        scalar_dataset.attrs["units"] = _json(list(profiles.TRANSIENT_SCALAR_INPUT_UNITS))
         scalar_dataset.attrs["ownership"] = _json(ownership)
         time_dataset = handle.create_dataset("time", data=regular_time)
         time_dataset.attrs["unit"] = "h"
-        time_dataset.attrs["classification_atol"] = generation.storage.TIME_CLASSIFICATION_ATOL
-        time_dataset.attrs["classification_basis"] = "16*float64_epsilon*168h; numerical classification only"
+        time_dataset.attrs["classification_atol"] = generation.storage.time_classification_tolerance(scientific["time"])
+        time_dataset.attrs["classification_basis"] = generation.storage._time_classification_basis(scientific["time"])
         transient_dataset = handle.create_group("transient").create_dataset(
             "fields",
             data=transient,
-            chunks=(1, 1, 64, 64),
-            compression="gzip",
-            compression_opts=4,
-            shuffle=True,
+            chunks=(
+                min(int(storage["chunk_time"]), regular_time.size),
+                1,
+                min(int(storage["chunk_y"]), y_axis.size),
+                min(int(storage["chunk_x"]), x_axis.size),
+            ),
+            compression=str(storage["compression"]),
+            compression_opts=int(storage["compression_level"]),
+            shuffle=bool(storage["shuffle"]),
         )
-        transient_dataset.attrs["field_names"] = _json(list(generation.profiles.TRANSIENT_FIELD_NAMES))
-        transient_dataset.attrs["units"] = _json(list(generation.profiles.TRANSIENT_FIELD_UNITS))
+        transient_dataset.attrs["field_names"] = _json(list(profiles.TRANSIENT_FIELD_NAMES))
+        transient_dataset.attrs["units"] = _json(list(profiles.TRANSIENT_FIELD_UNITS))
         if exact_fields is not None:
             exact_group = handle.create_group("exact_stop")
             exact_time_dataset = exact_group.create_dataset("time", data=np.asarray([exact_stop_time], dtype=np.float64))
@@ -317,38 +373,95 @@ def _write_transient_case(
             exact_dataset = exact_group.create_dataset(
                 "fields",
                 data=exact_fields,
-                chunks=(1, 64, 64),
-                compression="gzip",
-                compression_opts=4,
-                shuffle=True,
+                chunks=(
+                    1,
+                    min(int(storage["chunk_y"]), y_axis.size),
+                    min(int(storage["chunk_x"]), x_axis.size),
+                ),
+                compression=str(storage["compression"]),
+                compression_opts=int(storage["compression_level"]),
+                shuffle=bool(storage["shuffle"]),
             )
-            exact_dataset.attrs["field_names"] = _json(list(generation.profiles.TRANSIENT_FIELD_NAMES))
-            exact_dataset.attrs["units"] = _json(list(generation.profiles.TRANSIENT_FIELD_UNITS))
+            exact_dataset.attrs["field_names"] = _json(list(profiles.TRANSIENT_FIELD_NAMES))
+            exact_dataset.attrs["units"] = _json(list(profiles.TRANSIENT_FIELD_UNITS))
             exact_group.attrs["usage"] = "diagnostic_only_no_training_transition"
         schedule_dataset = handle.create_group("schedule").create_dataset(
             "values",
             data=schedule,
-            compression="gzip",
-            compression_opts=4,
-            shuffle=True,
+            compression=str(storage["compression"]),
+            compression_opts=int(storage["compression_level"]),
+            shuffle=bool(storage["shuffle"]),
         )
-        schedule_dataset.attrs["field_names"] = _json(list(generation.profiles.SCHEDULE_FIELDS))
-        schedule_dataset.attrs["units"] = _json(list(generation.profiles.SCHEDULE_UNITS))
+        schedule_dataset.attrs["field_names"] = _json(list(profiles.SCHEDULE_FIELDS))
+        schedule_dataset.attrs["units"] = _json(list(profiles.SCHEDULE_UNITS))
         schedule_dataset.attrs["conversion_pressure"] = _json(conversion_pressure)
         schedule_dataset.attrs["humidity_conversion_owner"] = "generation_schedule"
         global_dataset = handle.create_group("global").create_dataset(
             "values",
             data=global_values,
-            compression="gzip",
-            compression_opts=4,
-            shuffle=True,
+            compression=str(storage["compression"]),
+            compression_opts=int(storage["compression_level"]),
+            shuffle=bool(storage["shuffle"]),
         )
-        global_dataset.attrs["field_names"] = _json(list(generation.profiles.GLOBAL_FIELD_NAMES))
-        global_dataset.attrs["units"] = _json(list(generation.profiles.GLOBAL_FIELD_UNITS))
+        global_dataset.attrs["field_names"] = _json(list(profiles.GLOBAL_FIELD_NAMES))
+        global_dataset.attrs["units"] = _json(list(profiles.GLOBAL_FIELD_UNITS))
         final_dataset = handle.create_group("final_status").create_dataset("values", data=final_status)
-        final_dataset.attrs["field_names"] = _json(list(generation.profiles.FINAL_STATUS_FIELDS))
-        final_dataset.attrs["units"] = _json(list(generation.profiles.FINAL_STATUS_UNITS))
+        final_dataset.attrs["field_names"] = _json(list(profiles.FINAL_STATUS_FIELDS))
+        final_dataset.attrs["units"] = _json(list(profiles.FINAL_STATUS_UNITS))
     return increments
+
+
+def test_hdf5_validation_uses_embedded_noncurrent_contract(tmp_path: Path) -> None:
+    """Prove grid, time, compression, and chunks are resolved rather than frozen."""
+    scientific = _synthetic_scientific_contract()
+    scientific["grid"].update(
+        {
+            "nx": 9,
+            "ny": 7,
+            "Lx": 0.8,
+            "Ly": 0.6,
+            "Lz": 0.4,
+            "dx": 0.1,
+            "dy": 0.1,
+        }
+    )
+    scientific["time"].update(
+        {
+            "stop": 2.0,
+            "interval": 0.5,
+            "regular_times": [0.0, 0.5, 1.0, 1.5, 2.0],
+        }
+    )
+    scientific["storage"].update(
+        {
+            "compression_level": 6,
+            "chunk_time": 2,
+            "chunk_y": 3,
+            "chunk_x": 4,
+        }
+    )
+    source = tmp_path / "noncurrent.h5"
+    _write_transient_case(
+        source,
+        exact_stop_time=1.25,
+        scientific_contract=scientific,
+    )
+
+    admitted = generation.storage.validate_case_hdf5(
+        source,
+        expected_profile="transient_drying",
+    )
+    assert admitted["scientific_config_digest"] == common.serialization.canonical_json_sha256(scientific)
+    with h5py.File(source, "r") as handle:
+        assert _hdf5_dataset(handle, "coords/x").shape == (9,)
+        assert _hdf5_dataset(handle, "coords/y").shape == (7,)
+        assert _hdf5_dataset(handle, "static/fields").chunks == (1, 3, 4)
+        transient = _hdf5_dataset(handle, "transient/fields")
+        assert transient.shape == (3, 4, 7, 9)
+        assert transient.chunks == (2, 1, 3, 4)
+        assert transient.compression == "gzip"
+        assert transient.compression_opts == 6
+        assert _hdf5_dataset(handle, "schedule/values").shape[0] == 5
 
 
 def _source(path: Path, *, regime: str = "id", membership: str = "train") -> datasets.transient.TransientSourceCase:
@@ -377,9 +490,55 @@ def _build_index(source: Path, index_path: Path, *, regime: str = "id", membersh
         dataset_name=f"transient_drying__lentil__{regime}",
         dataset_id=f"transient_drying__lentil__{regime}__synthetic",
         evaluation_regime=regime,
-        contract_digest=datasets.views.get_view("transient_drying").contract_digest,
         source_root=source.parent,
     )
+
+
+def test_transient_index_selects_one_hour_steps_from_finer_regular_source(tmp_path: Path) -> None:
+    """Select the learned one-hour transition from a compatible finer source grid."""
+    scientific = _synthetic_scientific_contract()
+    scientific["time"].update(
+        {
+            "stop": 2.0,
+            "interval": 0.5,
+            "regular_times": [0.0, 0.5, 1.0, 1.5, 2.0],
+        }
+    )
+    source = tmp_path / "finer.h5"
+    increments = _write_transient_case(
+        source,
+        exact_stop_time=1.25,
+        scientific_contract=scientific,
+    )
+    payload = _build_index(source, tmp_path / "finer-index.json")
+    assert payload["sample_count"] == 1
+    assert [(sample["t_n"], sample["t_np1"]) for sample in payload["samples"]] == [(0.0, 1.0)]
+
+    dataset = datasets.transient.TransientPhysicalDataset(
+        tmp_path / "finer-index.json",
+        source_root=tmp_path,
+    )
+    item = dataset[0]
+    torch.testing.assert_close(
+        item["target"],
+        torch.from_numpy(np.broadcast_to(increments[:, None, None], item["target"].shape).copy()),
+    )
+
+
+def test_transient_index_rejects_rehashed_noncanonical_contract_digest(tmp_path: Path) -> None:
+    """Reject a coordinated index rewrite around an arbitrary contract digest."""
+    source = tmp_path / "case.h5"
+    _write_transient_case(source)
+    index_path = tmp_path / "index.json"
+    payload = _build_index(source, index_path)
+    payload["contract_digest"] = "0" * 64
+    payload["index_digest"] = common.serialization.canonical_json_sha256(datasets.transient._index_digest_payload(payload))
+    index_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(datasets.transient.TransientDataContractError, match="contract or identity"):
+        datasets.transient.TransientPhysicalDataset(index_path, source_root=tmp_path)
 
 
 def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path: Path) -> None:
@@ -469,20 +628,32 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
 
 def test_transient_time_classification_and_bad_commit(tmp_path: Path) -> None:
     """Protect no-stop, irregular-stop, regular-stop, and source-commit rejection."""
-    regular, positions, irregular = generation.storage._classify_transient_times(np.asarray([0.0, 1.0, 2.0], dtype=np.float64))
+    time_contract = _synthetic_scientific_contract()["time"]
+    tolerance = generation.storage.time_classification_tolerance(time_contract)
+    regular, positions, irregular = generation.storage._classify_transient_times(
+        np.asarray([0.0, 1.0, 2.0], dtype=np.float64),
+        time_contract,
+    )
     np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
     np.testing.assert_array_equal(positions, [0, 1, 2])
     assert irregular is None
-    regular, _positions, irregular = generation.storage._classify_transient_times(np.asarray([0.0, 1.0, 2.0, 2.5], dtype=np.float64))
+    regular, _positions, irregular = generation.storage._classify_transient_times(
+        np.asarray([0.0, 1.0, 2.0, 2.5], dtype=np.float64),
+        time_contract,
+    )
     np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
     assert irregular == 3
     regular, _positions, irregular = generation.storage._classify_transient_times(
-        np.asarray([0.0, 1.0, 2.0 + generation.storage.TIME_CLASSIFICATION_ATOL / 2.0], dtype=np.float64)
+        np.asarray([0.0, 1.0, 2.0 + tolerance / 2.0], dtype=np.float64),
+        time_contract,
     )
     np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
     assert irregular is None
-    with pytest.raises(ValueError, match="optional irregular state must be the final state"):
-        generation.storage._classify_transient_times(np.asarray([0.0, 0.5, 1.0], dtype=np.float64))
+    with pytest.raises(ValueError, match="optional irregular state must be final"):
+        generation.storage._classify_transient_times(
+            np.asarray([0.0, 0.5, 1.0], dtype=np.float64),
+            time_contract,
+        )
 
     no_exact = tmp_path / "no-exact-stop.h5"
     _write_transient_case(no_exact, exact_stop_time=None)

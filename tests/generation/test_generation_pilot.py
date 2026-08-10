@@ -13,14 +13,17 @@ import numpy as np
 import pytest
 
 from src import common
+from src.generation import generation_campaign_evidence as campaign_evidence
 from src.generation import generation_config as config_service
 from src.generation import generation_pilot as pilot_service
 from src.generation import generation_pilot_analysis as analysis_service
 from src.generation import generation_runtime as runtime_service
 from src.generation import generation_sampling as sampling_service
 from src.generation import generation_workspace as workspace_service
+from src.generation.cli import cli_generation as cli_service
 
 _PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
+_PRODUCTION_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
 
 
 def _pilot(cases_per_material: int) -> config_service.CampaignConfig:
@@ -109,18 +112,18 @@ def _physical_inputs() -> tuple[dict[str, np.ndarray], list[dict[str, np.ndarray
 
 
 def test_pilot_planning_and_nominal_sampling_are_technical_only() -> None:
-    """Protect six-family counts, technical-only membership, and explicit nominals."""
+    """Protect configured-family counts, technical-only membership, and explicit nominals."""
     one = _pilot(1)
     three = _pilot(3)
-    assert one.total_case_count == 6
-    assert three.total_case_count == 18
+    assert one.total_case_count == len(one.material_inventory)
+    assert three.total_case_count == 3 * len(three.material_inventory)
     assert one.dataset_packages == three.dataset_packages == ()
     assert one.campaign_purpose == three.campaign_purpose == "pilot_check"
     assert one.evaluation_regimes == three.evaluation_regimes == ()
     assert one.membership == three.membership == {}
     assert all(not members for members in three.material_memberships.values())
     assert three.source_path == _PILOT_CAMPAIGN.resolve()
-    assert tuple(batch.material_family for batch in three.batches) == config_service.materials.MATERIAL_FAMILIES
+    assert tuple(batch.material_family for batch in three.batches) == three.material_inventory
     for batch in three.batches:
         assert [batch.case_assignment(index)["pilot_case_kind"] for index in batch.case_indices] == [
             "nominal_reference",
@@ -187,7 +190,7 @@ def test_balance_quadrature_formulas_and_native_statistics_have_no_tolerance() -
     [
         (True, 72.0, "PASS", 72.0),
         (True, 12.0, "TOO_FAST", 12.0),
-        (False, 168.0, "NOT_DRY_WITHIN_HORIZON", None),
+        (False, 96.0, "NOT_DRY_WITHIN_HORIZON", None),
     ],
 )
 def test_nominal_duration_states_do_not_fabricate_censored_times(
@@ -201,15 +204,39 @@ def test_nominal_duration_states_do_not_fabricate_censored_times(
         case_kind="nominal_reference",
         target_reached=target_reached,
         final_time_h=final_time_h,
-        last_regular_time_h=min(final_time_h, 168.0),
+        last_regular_time_h=min(final_time_h, 96.0),
         final_x_wb_bulk=0.08,
         final_f_wet_dm=0.04 if target_reached else 0.2,
         configured_threshold=0.05,
+        configured_horizon_h=96.0,
         previous_regular_f_wet_dm=0.06,
     )
     assert result["result"] == expected
     assert result["drying_time_h"] == expected_time
     assert result["right_censored"] is (not target_reached)
+    assert result["adequacy_window_h"] == {
+        "minimum": 24.0,
+        "maximum": 96.0,
+        "minimum_basis": "pilot_protocol_lower_diagnostic",
+        "maximum_basis": "resolved_case_time_horizon",
+    }
+
+
+def test_nominal_duration_uses_configured_horizon() -> None:
+    """Protect the configured horizon as the nominal upper diagnostic bound."""
+    result = analysis_service.duration_diagnostic(
+        case_kind="nominal_reference",
+        target_reached=True,
+        final_time_h=49.0,
+        last_regular_time_h=48.0,
+        final_x_wb_bulk=0.08,
+        final_f_wet_dm=0.04,
+        configured_threshold=0.05,
+        configured_horizon_h=48.0,
+        previous_regular_f_wet_dm=0.06,
+    )
+    assert result["result"] == "INVALID_RESULT"
+    assert result["adequacy_window_h"]["maximum"] == 48.0
 
 
 @pytest.mark.parametrize(
@@ -328,35 +355,84 @@ def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None
 
 
 def test_storage_projection_uses_only_successful_measured_hdf5() -> None:
-    """Protect measured-artifact-only storage projections and exact arithmetic."""
+    """Protect measured-artifact projections against hidden target constants."""
+    records = [
+        {
+            "storage": {
+                "canonical_hdf5_bytes": 1000,
+                "regular_state_count": 10,
+                "transient_dataset_storage_bytes": 400,
+                "global_dataset_storage_bytes": 100,
+            }
+        },
+        {
+            "storage": {
+                "canonical_hdf5_bytes": 2000,
+                "regular_state_count": 20,
+                "transient_dataset_storage_bytes": 800,
+                "global_dataset_storage_bytes": 200,
+            }
+        },
+    ]
     result = analysis_service.production_storage_projection(
-        [
-            {
-                "storage": {
-                    "canonical_hdf5_bytes": 1000,
-                    "regular_state_count": 10,
-                    "transient_dataset_storage_bytes": 400,
-                    "global_dataset_storage_bytes": 100,
-                }
-            },
-            {
-                "storage": {
-                    "canonical_hdf5_bytes": 2000,
-                    "regular_state_count": 20,
-                    "transient_dataset_storage_bytes": 800,
-                    "global_dataset_storage_bytes": 200,
-                }
-            },
-        ]
+        records,
+        target_case_count=7,
+        regular_state_count=11,
     )
     assert result["basis"] == "observed_real_pilot_based_estimate"
-    assert result["mean_based_660_bytes"] == 990_000
-    assert result["median_based_660_bytes"] == 990_000
+    assert result["target_case_count"] == 7
+    assert result["regular_state_count"] == 11
+    assert result["mean_based_bytes"] == 10_500
+    assert result["median_based_bytes"] == 10_500
     assert result["min_hdf5_bytes_per_case"] == 1000
     assert result["max_hdf5_bytes_per_case"] == 2000
+    assert result["full_horizon_projection"]["projected_bytes"] == 9_100
     assert result["full_horizon_projection"]["exact"] is False
     assert result["storage_budget_guard"] is None
-    assert analysis_service.production_storage_projection([])["production_storage_projection"] == "unavailable"
+    unavailable = analysis_service.production_storage_projection(
+        [],
+        target_case_count=7,
+        regular_state_count=11,
+    )
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["mean_based_bytes"] is None
+    with pytest.raises(ValueError, match="target_case_count"):
+        analysis_service.production_storage_projection(
+            records,
+            target_case_count=0,
+            regular_state_count=11,
+        )
+
+
+def test_prepare_pilot_cli_requires_production_campaign() -> None:
+    """Protect the projection owner as an explicit CLI input."""
+    parser = cli_service._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["prepare-pilot-check", "pilot_run"])
+    args = parser.parse_args(
+        [
+            "prepare-pilot-check",
+            "pilot_run",
+            "--production-campaign",
+            str(_PRODUCTION_CAMPAIGN),
+        ]
+    )
+    assert args.production_campaign == _PRODUCTION_CAMPAIGN
+
+
+def test_production_projection_contract_comes_from_resolved_campaign() -> None:
+    """Protect the current projection result as authored configuration output."""
+    campaign = config_service.load_campaign_config(
+        _PRODUCTION_CAMPAIGN,
+        require_executable=False,
+    )
+    regular_times = campaign.batches[0].scientific_values["time"]["regular_times"]
+    contract = pilot_service._production_projection_contract(_PRODUCTION_CAMPAIGN)
+    assert contract["simulation_profile"] == campaign.profile.id
+    assert contract["target_case_count"] == campaign.total_case_count
+    assert contract["regular_state_count"] == len(regular_times)
+    assert contract["regular_time_start_h"] == regular_times[0]
+    assert contract["time_horizon_h"] == regular_times[-1]
 
 
 def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
@@ -367,7 +443,7 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     storage = tmp_path / "storage"
     storage.mkdir()
     run_id = "pilot_inventory_test"
-    campaign = pilot_service._run_directory(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     meta = storage / "01_generation/meta/batches/pilot_batch"
     raw = storage / "01_generation/raw/pilot_batch"
     processed = storage / "01_generation/processed/pilot_batch"
@@ -435,7 +511,7 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     assert pilot_service.validate_cpu_source_inventory(run_id, storage_root=storage) == result
 
     staging = workspace_service.create_transfer_staging(storage_root=storage, run_id=run_id)
-    staging_campaign = pilot_service._run_directory(run_id, storage_root=staging)
+    staging_campaign = campaign_evidence.campaign_run_directory(run_id, storage_root=staging)
     staging_campaign.mkdir(parents=True)
     (staging_campaign / "campaign_terminal.json").write_bytes(b"terminal\n")
     staging_result = pilot_service.record_transfer_staging_inventory(
@@ -553,6 +629,18 @@ def test_missing_retained_evidence_blocks_pre_cleanup(tmp_path: Path) -> None:
             "pilot_check_id": "missing_evidence",
             "cleanup": {"authorized": True},
             "cases": [_canonical_case_result()],
+            "production_storage_projection": {
+                "target_campaign_id": "transient_target",
+                "target_campaign_digest": "a" * 64,
+                "simulation_profile": "transient_drying",
+                "target_case_count": 7,
+                "regular_state_count": 11,
+                "regular_time_start_h": 0.0,
+                "time_horizon_h": 10.0,
+                "status": "unavailable",
+                "mean_based_bytes": None,
+                "median_based_bytes": None,
+            },
             "retained_evidence_paths": [str(storage / "does-not-exist")],
         },
     )

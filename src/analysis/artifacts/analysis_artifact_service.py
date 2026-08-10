@@ -49,27 +49,11 @@ from src import common, domain, experiments
 from . import contracts, generation, timing
 
 if TYPE_CHECKING:
+    from src import datasets
     from src.analysis.evaluation.evaluation_artifact_loader import LoadedRunArtifacts
-    from src.datasets.dataset_metadata import DatasetMetadata
     from src.learning.learning_device import DeviceResolution
 
 ArtifactSplit = Literal["eval", "ood"]
-_SPLIT_INDEX_KEYS: dict[ArtifactSplit, str] = {
-    "eval": "eval_indices",
-    "ood": "ood_indices",
-}
-_SPLIT_IDENTITY_KEYS: dict[ArtifactSplit, str] = {
-    "eval": "train",
-    "ood": "ood",
-}
-_SPLIT_COUNT_KEYS: dict[ArtifactSplit, str] = {
-    "eval": "n_eval",
-    "ood": "n_ood",
-}
-_SPLIT_FULL_COUNT_KEYS: dict[ArtifactSplit, str] = {
-    "eval": "n_train_full",
-    "ood": "n_ood_full",
-}
 
 
 class ArtifactCacheError(RuntimeError):
@@ -138,7 +122,7 @@ class ArtifactRequest:
     source_indices: tuple[int, ...]
     batch_size: int
     case_ids: tuple[str, ...] = ()
-    dataset_metadata: DatasetMetadata | None = None
+    dataset_metadata: datasets.metadata.DatasetMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -272,57 +256,6 @@ def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iter
         yield candidate.resolve()
 
 
-def _dataset_name_from_identity(metadata: Mapping[str, Any], *, identity_key: str) -> str:
-    """
-    Read one validated logical dataset ID from nested saved split metadata.
-
-    Missing or malformed ``metadata.datasets[identity_key].dataset_id`` values
-    fail at this boundary so config/path fallbacks cannot change cache identity.
-    """
-    datasets_meta = metadata.get("datasets")
-    if not isinstance(datasets_meta, Mapping):
-        msg = "split_indices.pt metadata.datasets must be a mapping."
-        raise TypeError(msg)
-    saved_identity = datasets_meta.get(identity_key)
-    if not isinstance(saved_identity, Mapping):
-        msg = f"split_indices.pt metadata.datasets.{identity_key} must be a mapping."
-        raise TypeError(msg)
-    dataset_id = saved_identity.get("dataset_id")
-    return common.paths.validate_logical_name(
-        dataset_id,
-        label=f"split_indices.pt metadata.datasets.{identity_key}.dataset_id",
-    )
-
-
-def _load_split_contract(run_dir: Path) -> Mapping[str, Any]:
-    """
-    Load the authoritative saved split mapping on CPU without tensor-only mode.
-
-    The complete mapping, including metadata and dataset identities, is required.
-    Non-mapping payloads fail before artifact path or membership derivation.
-    """
-    split_indices_path = common.paths.resolve_split_indices_path(run_dir)
-    split_indices = torch.load(
-        split_indices_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-    if not isinstance(split_indices, Mapping):
-        msg = f"split_indices.pt must contain a mapping: {split_indices_path}"
-        raise TypeError(msg)
-    return split_indices
-
-
-def _split_metadata(split_contract: Mapping[str, Any], *, run_dir: Path) -> Mapping[str, Any]:
-    """Return the required saved dataset/split metadata mapping."""
-    metadata = split_contract.get("metadata")
-    if not isinstance(metadata, Mapping):
-        split_indices_path = common.paths.resolve_split_indices_path(run_dir)
-        msg = f"split_indices.pt must contain metadata mapping: {split_indices_path}"
-        raise TypeError(msg)
-    return metadata
-
-
 def _load_run_config(run_dir: Path) -> Mapping[str, Any]:
     """Load and validate the top-level mapping in current config.yaml."""
     config_path = common.paths.resolve_run_config_path(run_dir)
@@ -394,20 +327,15 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     run_dir = Path(run_dir).expanduser().resolve()
     admitted = experiments.run.validate_evaluable_run(run_dir)
     data_cfg = _load_data_config(run_dir)
-    split_contract = admitted["split_indices"]
-    if not isinstance(split_contract, Mapping):
-        msg = "Evaluable run split_indices must be a mapping."
-        raise TypeError(msg)
-    split_metadata = _split_metadata(split_contract, run_dir=run_dir)
+    from src import datasets  # noqa: PLC0415
 
-    id_dataset_name = _dataset_name_from_identity(split_metadata, identity_key="train")
-    ood_dataset_name = _dataset_name_from_identity(split_metadata, identity_key="ood")
+    split_contract = datasets.splits.admit_split_contract(admitted["split_indices"])
+    id_dataset_name = split_contract.role("eval").source.dataset_id
+    ood_dataset_name = split_contract.role("ood").source.dataset_id
 
     configured_id_dataset = _required_config_dataset_name(data_cfg, "train_dataset")
     configured_ood_datasets = _required_config_ood_dataset_names(data_cfg)
-    from src import datasets  # noqa: PLC0415
-
-    configured_ood_identity = datasets.base.combined_dataset_id(configured_ood_datasets)
+    configured_ood_identity = datasets.identity.combined_dataset_id(configured_ood_datasets)
 
     if configured_id_dataset != id_dataset_name:
         msg = (
@@ -492,15 +420,6 @@ def _completion_marker_identity(path: Path) -> tuple[int, int, int, int] | None:
     return result.st_dev, result.st_ino, result.st_size, result.st_mtime_ns
 
 
-def _required_metadata_int(metadata: Mapping[str, Any], key: str) -> int:
-    """Return one non-negative integer from saved split metadata."""
-    value = metadata.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = f"split_indices.pt metadata {key!r} must be a non-negative integer."
-        raise TypeError(msg)
-    return value
-
-
 def _indices_sha256(indices: Iterable[int]) -> str:
     """Hash ordered split membership without hashing dataset tensor contents."""
     return contracts.ordered_indices_sha256(indices)
@@ -511,14 +430,14 @@ def _load_bound_dataset_metadata(
     *,
     dataset_names: Sequence[str],
     metadata_root: Path,
-) -> DatasetMetadata | None:
+) -> datasets.metadata.DatasetMetadata | None:
     """Validate every source package metadata contract and return sole timing metadata."""
     from src import datasets  # noqa: PLC0415
 
     if not source_datasets or len(source_datasets) != len(dataset_names):
         msg = "Artifact source datasets and names must be non-empty and aligned."
         raise ValueError(msg)
-    timing_packages: list[DatasetMetadata] = []
+    timing_packages: list[datasets.metadata.DatasetMetadata] = []
     for source_dataset, dataset_name in zip(source_datasets, dataset_names, strict=True):
         dataset_identity = getattr(source_dataset, "identity", None)
         if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
@@ -597,10 +516,9 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     """
     run_dir = Path(run_dir).expanduser().resolve()
     admitted = experiments.run.validate_evaluable_run(run_dir)
-    split_contract = admitted["split_indices"]
+    raw_split_contract = admitted["split_indices"]
     run_config = admitted["config"]
     summary = admitted["summary"]
-    metadata = _split_metadata(split_contract, run_dir=run_dir)
     data_cfg = run_config.get("data")
     run_cfg = run_config.get("run")
     model_cfg = run_config.get("model")
@@ -640,47 +558,46 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     source_dataset_names = (
         (_required_config_dataset_name(data_cfg, "train_dataset"),) if split == "eval" else _required_config_ood_dataset_names(data_cfg)
     )
-    expected_dataset_name = datasets.base.combined_dataset_id(source_dataset_names)
+    expected_dataset_name = datasets.identity.combined_dataset_id(source_dataset_names)
     if expected_dataset_name != dataset_name:
         msg = f"Requested dataset {dataset_name!r} does not match configured source identity {expected_dataset_name!r}."
         raise RuntimeError(msg)
     source_datasets = [
-        datasets.factory.create_steady_dataset(
+        datasets.steady.create_dataset(
             common.paths.resolve_dataset_path(source_name, dataset_root=dataset_root),
             task=task,
         )
         for source_name in source_dataset_names
     ]
-    source_dataset = datasets.base.combine_identity_datasets(source_datasets)
+    source_dataset = datasets.splits.combine_identity_datasets(source_datasets)
     expected_identity = getattr(source_dataset, "identity", None)
     if not isinstance(expected_identity, datasets.identity.DatasetIdentity):
         msg = "Combined artifact source must expose a verified DatasetIdentity."
         raise TypeError(msg)
-    validated_indices = datasets.base.validate_split_info(
-        split_contract,
+    split_contract = datasets.splits.admit_split_contract(
+        raw_split_contract,
         train_identity=expected_identity if split == "eval" else None,
         ood_identity=expected_identity if split == "ood" else None,
         expected_train_ratio=data_cfg["train_ratio"],
         expected_ood_fraction=data_cfg["ood_fraction"],
         expected_split_seed=experiments.run.build_seed_plan(int(run_cfg["seed"]))["split"],
     )
-    identity_key = _SPLIT_IDENTITY_KEYS[split]
-    saved_dataset_name = _dataset_name_from_identity(metadata, identity_key=identity_key)
+    role_evidence = split_contract.role(split)
+    saved_dataset_name = common.paths.validate_logical_name(
+        role_evidence.source.dataset_id,
+        label=f"split_indices.pt {split} dataset_id",
+    )
     if saved_dataset_name != dataset_name:
         msg = f"Requested dataset {dataset_name!r} does not match saved {split!r} dataset {saved_dataset_name!r}."
         raise RuntimeError(msg)
 
-    saved_indices = validated_indices[_SPLIT_INDEX_KEYS[split]]
-    full_source_indices = tuple(int(value) for value in saved_indices.tolist())
-    count_key = _SPLIT_COUNT_KEYS[split]
-    saved_selected_count = _required_metadata_int(metadata, count_key)
-    if saved_selected_count != len(full_source_indices):
-        msg = f"split_indices.pt metadata {count_key!r} does not match saved index count {len(full_source_indices)}."
+    full_source_indices = role_evidence.index_values
+    dataset_full_count = role_evidence.full_count
+    if role_evidence.count != len(full_source_indices):
+        msg = f"Saved {split!r} count does not match its admitted ordered membership."
         raise RuntimeError(msg)
-    full_count_key = _SPLIT_FULL_COUNT_KEYS[split]
-    dataset_full_count = _required_metadata_int(metadata, full_count_key)
     if dataset_full_count != expected_identity.sample_count:
-        msg = f"Saved {full_count_key!r} does not match the verified dataset sample count."
+        msg = f"Saved {split!r} full count does not match the verified dataset sample count."
         raise RuntimeError(msg)
 
     effective_count = len(full_source_indices)
@@ -691,10 +608,6 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
         dataset_names=source_dataset_names,
         metadata_root=metadata_root,
     )
-    membership_digests = metadata.get("membership_digests")
-    if not isinstance(membership_digests, Mapping):
-        msg = "split_indices.pt metadata.membership_digests must be a mapping."
-        raise TypeError(msg)
     metrics = evaluation_cfg.get("metrics")
     if not isinstance(metrics, list):
         msg = "config.yaml evaluation.metrics must be a list."
@@ -819,10 +732,10 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
             "full_case_count": dataset_full_count,
             "fingerprint": expected_identity.fingerprint,
             "data_contract_digest": expected_identity.data_contract_digest,
-            "saved_membership_digest": membership_digests[split],
+            "saved_membership_digest": role_evidence.membership_digest,
         },
         "selection": {
-            "index_key": _SPLIT_INDEX_KEYS[split],
+            "index_key": f"{split}_indices",
             "full_selected_case_count": len(full_source_indices),
             "effective_case_count": effective_count,
             "generation_limit": None,

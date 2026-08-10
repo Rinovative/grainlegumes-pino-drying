@@ -716,19 +716,19 @@ def _validate_saved_data_contract(
     if not isinstance(data_config, Mapping) or not isinstance(run_config, Mapping):
         msg = "Completed run config must contain data and run mappings."
         raise RunLifecycleError(msg)
-    if split_indices.get("task") != task.id or split_indices.get("task_contract_digest") != task.contract_digest:
-        msg = "Saved split task identity does not match the resolved config task contract."
-        raise RunLifecycleError(msg)
-    datasets.base.validate_split_info(
+    split_contract = datasets.splits.admit_split_contract(
         split_indices,
         expected_train_ratio=data_config.get("train_ratio"),
         expected_ood_fraction=data_config.get("ood_fraction"),
         expected_split_seed=derive_subseed(int(run_config["seed"]), "split"),
     )
-    normalizer_state = datasets.base.validate_normalizer_artifact(
+    if split_contract.task != task.id or split_contract.task_contract_digest != task.contract_digest:
+        msg = "Saved split task identity does not match the resolved config task contract."
+        raise RunLifecycleError(msg)
+    normalizer_state = datasets.normalization.validate_normalizer_artifact(
         normalizer_artifact,
         task=task,
-        split_info=split_indices,
+        split_contract=split_contract,
     )
     channel_axis = task.tensor_layout.index("channel")
     for prefix, expected_channels in (("in_normalizer", task.in_channels), ("out_normalizer", task.out_channels)):
@@ -1070,11 +1070,14 @@ def _validate_reused_data_state(
     if data_processor is not restored_data_processor:
         msg = "Resume dataloader construction replaced the saved normalizer state."
         raise RuntimeError(msg)
-    for key in ("train_indices", "eval_indices", "ood_indices"):
-        saved = saved_split_indices[key] if saved_split_indices is not None else None
-        rebuilt = rebuilt_split_indices.get(key)
-        if not isinstance(saved, torch.Tensor) or not isinstance(rebuilt, torch.Tensor) or not torch.equal(saved, rebuilt):
-            msg = f"Resume dataloader construction changed saved {key}."
+    if saved_split_indices is None:
+        msg = "Resume dataloader construction requires admitted saved split evidence."
+        raise RuntimeError(msg)
+    saved_contract = datasets.splits.admit_split_contract(saved_split_indices)
+    rebuilt_contract = datasets.splits.admit_split_contract(rebuilt_split_indices)
+    for role in datasets.splits.SPLIT_ROLES:
+        if saved_contract.role(role).index_values != rebuilt_contract.role(role).index_values:
+            msg = f"Resume dataloader construction changed saved {role} membership."
             raise RuntimeError(msg)
 
 
@@ -1165,10 +1168,11 @@ def _execute_prepared_run_locked(
         split_indices = dataloaders["split_indices"]
 
         if resume_from is None:
-            normalizer_artifact = datasets.base.build_normalizer_artifact(
+            split_contract = datasets.splits.admit_split_contract(split_indices)
+            normalizer_artifact = datasets.normalization.build_normalizer_artifact(
                 data_processor,
                 task=config_loader.validate_resolved_task_contract(config),
-                split_info=split_indices,
+                split_contract=split_contract,
             )
             common.serialization.atomic_torch_save(
                 normalizer_artifact,
@@ -1914,7 +1918,7 @@ def run_experiment(
         split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
         normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
         normalizer_state = _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
-        data_processor = datasets.base.data_processor_from_state(normalizer_state, device="cpu")
+        data_processor = datasets.normalization.data_processor_from_state(normalizer_state, device="cpu")
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,
             split_indices,

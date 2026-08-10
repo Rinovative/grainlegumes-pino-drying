@@ -1,81 +1,72 @@
 """
-Reference-simulation generation, COMSOL execution, and publication services.
+Reference-simulation configuration, execution, validation, and publication API.
 
 Provides:
-- campaign_runtime: exact-commit campaign submission and status evidence
-- case: deterministic scientific input bundles and simulation identities
-- cluster: bounded node-worker and scheduler command services
-- config: campaign, batch, scientific, and execution configuration resolution
-- fields: independent bed, pressure, and initial-moisture fields
-- inventory: mechanical parameter ownership and consumer auditing
-- mapping_probe: isolated retained COMSOL export-mapping diagnostics
-- materials: role-neutral material and authoritative sampling-block contracts
-- pilot: technical pilot terminal evidence, storage accounting, and summaries
-- pilot_analysis: generic transient physical and runtime sanity diagnostics
-- porosity: material-calibrated conditional Kozeny-Carman coupling
-- preflight: non-solving native CPU environment and path validation
-- profiles: immutable simulation-profile and logical export contracts
-- readiness: fail-closed scientific, mapping, runtime, and launch reporting
-- registry: strict typed scientific parameter schemas
-- runtime: COMSOL execution and atomic case publication
-- sampling: deterministic independent blockwise designs
-- schedule: compositional mixed inlet schedules
+- campaign_runtime: campaign planning, execution evidence, and finalization
+- case: deterministic scientific case-input generation
+- config: resolved campaign and batch configuration
+- contracts: immutable cross-package profile and vocabulary descriptors
+- pilot: transient pilot preparation, analysis, and terminal evidence
+- readiness: fail-closed production-readiness reporting
+- runtime: single-case execution and atomic terminal publication
 - sentinels: deterministic no-COMSOL scientific integration checks
-- smoke: immutable paired real-runtime smoke observations and bindings
-- source: exact source-repository commit provenance
-- storage: canonical HDF5 conversion and validation
-- workflow: transfer evidence, dataset gates, storage status, and cleanup
-- workspace: persistent-root and disposable-workspace safety
+- smoke: paired technical-runtime smoke evidence
+- storage: canonical HDF5 conversion and admission
+- workflow: transfer, package, retention, and cleanup lifecycle
 """
 
-from . import generation_campaign_runtime as campaign_runtime
-from . import generation_case as case
-from . import generation_cluster as cluster
-from . import generation_config as config
-from . import generation_fields as fields
-from . import generation_inventory as inventory
-from . import generation_mapping_probe as mapping_probe
-from . import generation_materials as materials
-from . import generation_pilot as pilot
-from . import generation_pilot_analysis as pilot_analysis
-from . import generation_porosity as porosity
-from . import generation_preflight as preflight
-from . import generation_profiles as profiles
-from . import generation_readiness as readiness
-from . import generation_registry as registry
-from . import generation_runtime as runtime
-from . import generation_sampling as sampling
-from . import generation_schedule as schedule
-from . import generation_sentinels as sentinels
-from . import generation_smoke as smoke
-from . import generation_source as source
-from . import generation_storage as storage
-from . import generation_workflow as workflow
-from . import generation_workspace as workspace
+from __future__ import annotations
 
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import generation_campaign_runtime as campaign_runtime
+    from . import generation_case as case
+    from . import generation_config as config
+    from . import generation_contracts as contracts
+    from . import generation_pilot as pilot
+    from . import generation_readiness as readiness
+    from . import generation_runtime as runtime
+    from . import generation_sentinels as sentinels
+    from . import generation_smoke as smoke
+    from . import generation_storage as storage
+    from . import generation_workflow as workflow
+
+_MODULES = {
+    "campaign_runtime": "generation_campaign_runtime",
+    "case": "generation_case",
+    "config": "generation_config",
+    "contracts": "generation_contracts",
+    "pilot": "generation_pilot",
+    "readiness": "generation_readiness",
+    "runtime": "generation_runtime",
+    "sentinels": "generation_sentinels",
+    "smoke": "generation_smoke",
+    "storage": "generation_storage",
+    "workflow": "generation_workflow",
+}
 __all__ = [
     "campaign_runtime",
     "case",
-    "cluster",
     "config",
-    "fields",
-    "inventory",
-    "mapping_probe",
-    "materials",
+    "contracts",
     "pilot",
-    "pilot_analysis",
-    "porosity",
-    "preflight",
-    "profiles",
     "readiness",
-    "registry",
     "runtime",
-    "sampling",
-    "schedule",
     "sentinels",
     "smoke",
-    "source",
     "storage",
     "workflow",
-    "workspace",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Resolve one declared public service on first access."""
+    module_name = _MODULES.get(name)
+    if module_name is None:
+        message = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(message)
+    module = import_module(f"{__name__}.{module_name}")
+    globals()[name] = module
+    return module

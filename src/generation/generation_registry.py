@@ -25,6 +25,9 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final
 
+from . import generation_porosity as porosity_service
+from . import generation_profiles as profile_service
+
 PARAMETER_KINDS: Final = (
     "fixed",
     "interval",
@@ -55,9 +58,9 @@ _SCIENTIFIC_METADATA_KEYS: Final = frozenset(
     }
 )
 _CLASSIFICATIONS: Final = ("sampled", "fixed", "derived", "coupled_record")
-_PROFILE_IDS: Final = ("steady_flow", "transient_drying")
 _MINIMUM_OOD_GAP_FRACTION: Final = 0.15
 _MINIMUM_OOD_WIDTH_FRACTION: Final = 0.25
+
 
 _KIND_KEYS: Final = MappingProxyType(
     {
@@ -288,10 +291,10 @@ def _validate_interval_ood(entry: dict[str, Any], *, label: str, allow_unresolve
         gap = id_lower_t - upper_t if upper < id_lower else lower_t - id_upper_t
         width = upper_t - lower_t
         if gap < _MINIMUM_OOD_GAP_FRACTION * id_width:
-            message = f"{label}.ood[{index}] transformed gap must be at least 0.15 of ID width."
+            message = f"{label}.ood[{index}] transformed gap must be at least {_MINIMUM_OOD_GAP_FRACTION:g} of ID width."
             raise ValueError(message)
         if width < _MINIMUM_OOD_WIDTH_FRACTION * id_width and not interval["hard_boundary"]:
-            message = f"{label}.ood[{index}] transformed width must be at least 0.25 of ID width."
+            message = f"{label}.ood[{index}] transformed width must be at least {_MINIMUM_OOD_WIDTH_FRACTION:g} of ID width."
             raise ValueError(message)
 
 
@@ -324,7 +327,7 @@ def _validate_scientific_metadata(entry: dict[str, Any], *, label: str) -> None:
         message = f"{label}.classification must be one of {list(_CLASSIFICATIONS)}."
         raise ValueError(message)
     profiles = _name_sequence(entry.get("profile_applicability"), label=f"{label}.profile_applicability")
-    if any(profile not in _PROFILE_IDS for profile in profiles):
+    if any(profile not in profile_service.available_profiles() for profile in profiles):
         message = f"{label}.profile_applicability contains an unknown profile."
         raise ValueError(message)
     entry["profile_applicability"] = list(profiles)
@@ -604,6 +607,11 @@ def _choice_identity(value: Any) -> str:
     return f"number:{float(value):.17g}"
 
 
+def ood_separation_fractions() -> tuple[float, float]:
+    """Return minimum transformed gap and width fractions for OOD tails."""
+    return _MINIMUM_OOD_GAP_FRACTION, _MINIMUM_OOD_WIDTH_FRACTION
+
+
 def validate_parameter_registry(value: Any, *, allow_unresolved: bool = False) -> dict[str, dict[str, Any]]:
     """
     Validate one complete typed parameter registry.
@@ -654,8 +662,6 @@ def resolve_conditional_support(
     if resolver != "kozeny_carman_anchor_factor":
         message = f"Unsupported conditional-support resolver {resolver!r}."
         raise ValueError(message)
-    from . import generation_porosity as porosity_service  # noqa: PLC0415 -- avoids a registry/physics import cycle
-
     registry = material_contract.get("parameter_registry")
     if not isinstance(registry, Mapping) or "kappa_mean" not in registry:
         message = "Conditional support requires the resolved material parameter registry."
@@ -671,6 +677,8 @@ def resolve_conditional_support(
         packing_porosity_mean_support=material_contract["packing_porosity_mean_support"],
         eps_min_global=float(values["eps_min_global"]),
         eps_max_global=float(values["eps_max_global"]),
+        ood_gap_fraction=_MINIMUM_OOD_GAP_FRACTION,
+        ood_width_fraction=_MINIMUM_OOD_WIDTH_FRACTION,
     )
 
 

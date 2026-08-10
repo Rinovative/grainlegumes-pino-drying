@@ -586,7 +586,15 @@ def build_campaign_slurm_submission_command(
         batch.evaluation_regime == "extreme_family_ood" for batch in campaign.batches
     ):
         worker_command.append("--skip-extreme-family-ood")
-    wrapped = f"CAMPAIGN_WORKER_COUNT={plan.effective_nodes} {shlex.join(worker_command)}"
+    site = campaign.execution_values["site"]
+    worker_environment = [
+        f"CAMPAIGN_WORKER_COUNT={plan.effective_nodes}",
+        f"GENERATION_PYTHON_MODULE={site['python_module']}",
+        f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
+        f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
+        f"GENERATION_COMSOL_EXECUTABLE={site['comsol_executable']}",
+    ]
+    wrapped = shlex.join(["env", *worker_environment, *worker_command])
     cluster = campaign.execution_values["cluster"]
     job_name = campaign.campaign_name[:_MAX_SCHEDULER_JOB_NAME_LENGTH] if scheduler_job_name is None else scheduler_job_name
     common.paths.validate_logical_name(job_name, label="scheduler_job_name")

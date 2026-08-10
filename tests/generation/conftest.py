@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
-from src import generation
+from src.generation import generation_profiles as profiles
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _SMOKE_CASE_COUNT = 2
+_TEST_MATERIAL_FAMILY = "lentil"
+_TEST_STEADY_SEED = 41001
+_TEST_TRANSIENT_SEED = 41002
+_TEST_PAIRED_SEED = 41003
 
 
-def _steady_flow_conditioning() -> dict[str, Any]:
-    """Return one explicit synthetic stationary-airflow dependency audit."""
+def _steady_flow_conditioning(
+    fixed_values: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return one synthetic stationary-airflow dependency audit."""
     dependencies = [
         {
             "name": name,
@@ -38,11 +47,7 @@ def _steady_flow_conditioning() -> dict[str, Any]:
             "unit": unit,
             "fixed_value": value,
         }
-        for name, unit, value in (
-            ("T_flow_ref", "K", 300.65),
-            ("p_ref", "Pa", 101325.0),
-            ("p_out", "Pa", 0.0),
-        )
+        for name, unit, value in ((name, str(fixed_values[name]["unit"]), fixed_values[name]["value"]) for name in ("T_flow_ref", "p_ref", "p_out"))
     )
     return {
         "schema_kind": "steady_flow_conditioning",
@@ -54,10 +59,15 @@ def _steady_flow_conditioning() -> dict[str, Any]:
     }
 
 
-def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: bool) -> dict[str, Any]:
+def _profile_configuration(
+    simulation_profile: str,
+    *,
+    repeated_airflow_times: bool,
+    fixed_values: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
     """Return complete test-owned mappings without inspecting template binaries."""
     del repeated_airflow_times
-    profile = generation.profiles.get_profile(simulation_profile)
+    profile = profiles.get_profile(simulation_profile)
     patterns = {
         "steady_flow_fields": "airflow.csv",
         "transient_fields": "transient.csv",
@@ -91,7 +101,7 @@ def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: b
         "schema_kind": "generation_profile",
         "schema_version": 1,
         "simulation_profile": simulation_profile,
-        "steady_flow_conditioning": _steady_flow_conditioning(),
+        "steady_flow_conditioning": _steady_flow_conditioning(fixed_values),
         "exports": exports,
     }
 
@@ -126,7 +136,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     sources = yaml.safe_load((repository_root / "configs/generation/sources.yaml").read_text(encoding="utf-8"))
     materials_root = project_root / "configs/generation/materials"
     materials_root.mkdir(parents=True, exist_ok=True)
-    for material_family in generation.materials.MATERIAL_FAMILIES:
+    for material_family in (_TEST_MATERIAL_FAMILY,):
         source = repository_root / "configs/generation/materials" / f"{material_family}.yaml"
         material = yaml.safe_load(source.read_text(encoding="utf-8"))
         (materials_root / f"{material_family}.yaml").write_text(
@@ -137,7 +147,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     def build(
         *,
         simulation_profile: str = "transient_drying",
-        material_families: tuple[str, ...] = ("lentil",),
+        material_families: tuple[str, ...] = (_TEST_MATERIAL_FAMILY,),
         executable: Path | None = None,
         timeout: float = 5.0,
         scheduler_kind: str = "local",
@@ -153,7 +163,11 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         directory.mkdir(parents=True)
         common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
         operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
-        profile = _profile_configuration(simulation_profile, repeated_airflow_times=repeated_airflow_times)
+        profile = _profile_configuration(
+            simulation_profile,
+            repeated_airflow_times=repeated_airflow_times,
+            fixed_values=common["scientific_fixed_values"],
+        )
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
         execution["runtime"]["timeout_seconds"] = timeout
         execution["retention"]["technical_runtime_smoke"] = {
@@ -175,9 +189,9 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 "cpu_host": "synthetic-cpu.example",
                 "scheduler": scheduler_kind,
                 "partition": "test",
-                "cores_per_node": 32,
-                "python_module": "Python/3.10",
-                "comsol_module": "Comsol/v6.4",
+                "cores_per_node": 24,
+                "python_module": "Python/test-fixture",
+                "comsol_module": "Comsol/test-fixture",
                 "python_executable": "python3",
                 "comsol_executable": "comsol" if executable is None else str(executable),
             }
@@ -193,13 +207,13 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         for name, value in layers.items():
             (directory / name).write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
 
-        if material_families != ("lentil",):
-            message = "Synthetic runtime fixtures use the canonical one-material technical smoke."
+        if material_families != (_TEST_MATERIAL_FAMILY,):
+            message = "Synthetic runtime fixtures use one explicit test-owned material."
             raise ValueError(message)
         if natural_count != _SMOKE_CASE_COUNT or parameter_ood_count != 0:
             message = "Synthetic runtime fixtures use exactly two natural cases and no parameter OOD."
             raise ValueError(message)
-        campaign_seed = 9910 if simulation_profile == "steady_flow" else 9920
+        campaign_seed = _TEST_STEADY_SEED if simulation_profile == "steady_flow" else _TEST_TRANSIENT_SEED
         campaign = {
             "schema_kind": "generation_campaign",
             "schema_version": 1,
@@ -210,9 +224,9 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             "operations_config": "operations.yaml",
             "profile_config": "profile.yaml",
             "execution_config": "execution.yaml",
-            "paired_equivalence_seed": 9930,
+            "paired_equivalence_seed": _TEST_PAIRED_SEED,
             "material_roles": {
-                "seen": ["lentil"],
+                "seen": [_TEST_MATERIAL_FAMILY],
                 "near_family_ood": [],
                 "far_family_ood": [],
                 "extreme_family_ood": [],
@@ -220,7 +234,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             "sampling": {
                 "method": "lhs",
                 "seed_base": campaign_seed,
-                "counts": {"natural": {"lentil": 2}},
+                "counts": {"natural": {_TEST_MATERIAL_FAMILY: _SMOKE_CASE_COUNT}},
             },
             "dataset_packages": [
                 {"evaluation_regime": "id", "source_role": "seen"},
@@ -228,7 +242,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         }
         config_path = directory / "campaign.yaml"
         config_path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
-        return config_path, generation.profiles.get_profile(simulation_profile).template_path
+        return config_path, profiles.get_profile(simulation_profile).template_path
 
     return build
 

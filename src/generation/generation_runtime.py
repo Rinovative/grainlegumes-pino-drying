@@ -2,11 +2,11 @@
 ===============================================================================
 generation_runtime.py
 ===============================================================================
-Run, validate, and atomically publish isolated profile-qualified COMSOL cases.
+Run, admit, and atomically publish isolated profile-qualified COMSOL cases.
 Responsibilities:
   - Execute safe one-node COMSOL commands and retain complete runtime evidence
   - Collect explicit raw adapters and convert them to canonical case.h5
-  - Atomically publish resume-safe cases and terminal batch manifests
+  - Publish cases and admit terminal batches through immutable typed evidence
 Design principles:
   - Scientific configuration and execution provenance are physically separate
   - Successful CSV and solved-model retention is explicit and off by default
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -29,21 +30,106 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from src import common
 
 from . import generation_case as case_service
 from . import generation_config as config_contract
+from . import generation_materials as materials
+from . import generation_profiles as profiles
 from . import generation_source as source_service
 from . import generation_storage as storage_service
 from . import generation_workspace as workspace_service
 
 PUBLICATION_SCHEMA_VERSION = 1
+_BATCH_MANIFEST_SCHEMA_KIND: Final = "simulation_batch_manifest"
+_BATCH_SUCCESS_SCHEMA_KIND: Final = "simulation_batch_success"
+_CASE_PUBLICATION_SCHEMA_KIND: Final = "simulation_case_publication"
+_CASE_SUCCESS_SCHEMA_KIND: Final = "simulation_case_success"
+_CASE_ID_PATTERN: Final = re.compile(r"case_[0-9]{4,}")
+_SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+_BATCH_MANIFEST_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "simulation_profile",
+        "available_learning_views",
+        "airflow_source",
+        "batch_name",
+        "batch_id",
+        "batch_identity",
+        "material_family",
+        "sampling_regime",
+        "git_commit",
+        "scientific_config_digest",
+        "template",
+        "export_contract_sha256",
+        "intended_case_indices",
+        "cases",
+    }
+)
+_BATCH_SUCCESS_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "simulation_profile",
+        "batch_id",
+        "batch_identity",
+        "manifest_sha256",
+    }
+)
+_CASE_RECORD_KEYS: Final = frozenset(
+    {
+        "case_index",
+        "case_id",
+        "material_family",
+        "case_input_id",
+        "simulation_case_id",
+        "success_sha256",
+        "provenance_sha256",
+        "case_hdf5_sha256",
+    }
+)
+_CASE_PUBLICATION_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "stage",
+        "simulation_profile",
+        "batch_id",
+        "batch_identity",
+        "case_id",
+        "case_input_id",
+        "simulation_case_id",
+        "material_family",
+        "git_commit",
+        "template_sha256",
+        "scientific_config_digest",
+        "export_contract_sha256",
+        "available_learning_views",
+        "airflow_source",
+        "artifacts",
+    }
+)
+_CASE_SUCCESS_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "stage",
+        "batch_id",
+        "case_id",
+        "case_input_id",
+        "simulation_case_id",
+        "provenance_sha256",
+    }
+)
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
 CASE_FAILURE_SCHEMA_VERSION = 3
 _CASE_FAILURE_KEYS = frozenset(
@@ -242,6 +328,182 @@ class CaseRunOutcome:
     case_id: str
     processed_directory: Path
     work_directory: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactEvidence:
+    """Describe one hash-validated file in a terminal case publication."""
+
+    relative_path: str
+    path: Path
+    sha256: str
+    size_bytes: int
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the persisted artifact-identity representation."""
+        return {"sha256": self.sha256, "size_bytes": self.size_bytes}
+
+
+@dataclass(frozen=True, slots=True)
+class HDF5IdentityEvidence:
+    """Describe identities admitted from one canonical case HDF5 payload."""
+
+    simulation_profile: str
+    git_commit: str
+    template_relative_path: str
+    template_sha256: str
+    case_input_id: str
+    simulation_case_id: str
+    scientific_config_digest: str
+    export_contract_sha256: str
+    available_learning_views: tuple[str, ...]
+    airflow_source: str
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCaseEvidence:
+    """Describe one completely admitted raw and processed terminal case."""
+
+    case_index: int
+    case_id: str
+    material_family: str
+    case_input_id: str
+    simulation_case_id: str
+    success_sha256: str
+    provenance_sha256: str
+    case_hdf5_sha256: str
+    raw_directory: Path
+    processed_directory: Path
+    hdf5_path: Path
+    raw_artifacts: tuple[ArtifactEvidence, ...]
+    processed_artifacts: tuple[ArtifactEvidence, ...]
+    hdf5_identity: HDF5IdentityEvidence
+    _case_metadata_json: str
+
+    def metadata_payload(self) -> dict[str, Any]:
+        """Return an independent mutable copy of canonical case metadata."""
+        value = json.loads(self._case_metadata_json)
+        if not isinstance(value, dict):
+            msg = f"Admitted metadata for {self.case_id!r} is no longer an object."
+            raise TypeError(msg)
+        return value
+
+    def record_payload(self) -> dict[str, Any]:
+        """Return this case's terminal-manifest record."""
+        return {
+            "case_index": self.case_index,
+            "case_id": self.case_id,
+            "material_family": self.material_family,
+            "case_input_id": self.case_input_id,
+            "simulation_case_id": self.simulation_case_id,
+            "success_sha256": self.success_sha256,
+            "provenance_sha256": self.provenance_sha256,
+            "case_hdf5_sha256": self.case_hdf5_sha256,
+        }
+
+    def artifact(self, stage: str, relative_path: str) -> ArtifactEvidence:
+        """Return one admitted artifact by publication stage and relative path."""
+        if stage == "raw":
+            artifacts = self.raw_artifacts
+        elif stage == "processed":
+            artifacts = self.processed_artifacts
+        else:
+            msg = f"Unsupported terminal publication stage: {stage!r}."
+            raise ValueError(msg)
+        matches = tuple(item for item in artifacts if item.relative_path == relative_path)
+        if len(matches) != 1:
+            msg = f"Terminal case {self.case_id!r} has no unique {stage} artifact {relative_path!r}."
+            raise ValueError(msg)
+        artifact = matches[0]
+        if (
+            not artifact.path.is_file()
+            or artifact.path.is_symlink()
+            or artifact.path.stat().st_size != artifact.size_bytes
+            or common.serialization.file_sha256(artifact.path) != artifact.sha256
+        ):
+            msg = f"Admitted terminal artifact changed after admission: {artifact.path}"
+            raise RuntimeError(msg)
+        return artifact
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalBatchEvidence:
+    """Describe one config-independent, completely admitted terminal batch."""
+
+    generation_root: Path
+    meta_directory: Path
+    raw_directory: Path
+    processed_directory: Path
+    manifest_path: Path
+    manifest_sha256: str
+    simulation_profile: str
+    available_learning_views: tuple[str, ...]
+    airflow_source: str
+    batch_name: str
+    batch_id: str
+    batch_identity: str
+    material_family: str
+    sampling_regime: str
+    git_commit: str
+    scientific_config_digest: str
+    template_relative_path: str
+    template_sha256: str
+    export_contract_sha256: str
+    cases: tuple[TerminalCaseEvidence, ...]
+    _scientific_config_json: str
+
+    def case(self, case_id: str) -> TerminalCaseEvidence:
+        """Return one admitted case by its terminal identifier."""
+        matches = tuple(item for item in self.cases if item.case_id == case_id)
+        if len(matches) != 1:
+            msg = f"Terminal batch {self.batch_id!r} has no unique case {case_id!r}."
+            raise ValueError(msg)
+        return matches[0]
+
+    def scientific_config_payload(self) -> dict[str, Any]:
+        """Return an independent mutable copy of persisted resolved science."""
+        value = json.loads(self._scientific_config_json)
+        if not isinstance(value, dict):
+            msg = f"Admitted scientific configuration for {self.batch_id!r} is no longer an object."
+            raise TypeError(msg)
+        return value
+
+    def manifest_payload(self) -> dict[str, Any]:
+        """Return the exact terminal-manifest payload represented by this evidence."""
+        return {
+            "schema_kind": _BATCH_MANIFEST_SCHEMA_KIND,
+            "schema_version": PUBLICATION_SCHEMA_VERSION,
+            "status": "complete",
+            "simulation_profile": self.simulation_profile,
+            "available_learning_views": list(self.available_learning_views),
+            "airflow_source": self.airflow_source,
+            "batch_name": self.batch_name,
+            "batch_id": self.batch_id,
+            "batch_identity": self.batch_identity,
+            "material_family": self.material_family,
+            "sampling_regime": self.sampling_regime,
+            "git_commit": self.git_commit,
+            "scientific_config_digest": self.scientific_config_digest,
+            "template": {
+                "relative_path": self.template_relative_path,
+                "sha256": self.template_sha256,
+            },
+            "export_contract_sha256": self.export_contract_sha256,
+            "intended_case_indices": [case.case_index for case in self.cases],
+            "cases": [case.record_payload() for case in self.cases],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationEvidence:
+    """Hold internally validated evidence for one publication stage."""
+
+    directory: Path
+    stage: str
+    case_payload: dict[str, Any]
+    provenance: dict[str, Any]
+    artifacts: tuple[ArtifactEvidence, ...]
+    hdf5_identity: HDF5IdentityEvidence | None
 
 
 def _utc_now() -> str:
@@ -1406,79 +1668,229 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _validate_artifacts(directory: Path, provenance: dict[str, Any]) -> None:
-    """Validate exact publication membership and all declared hashes."""
-    artifacts = provenance.get("artifacts")
-    if not isinstance(artifacts, dict) or not artifacts:
+def _canonical_json_text(payload: Mapping[str, Any]) -> str:
+    """Return one deterministic compact JSON representation."""
+    return json.dumps(dict(payload), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _require_sha256(value: object, *, label: str) -> str:
+    """Return one lowercase SHA-256 digest or fail closed."""
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        msg = f"{label} must be one lowercase SHA-256 digest."
+        raise ValueError(msg)
+    return value
+
+
+def _safe_file_sha256(path: Path, *, label: str) -> str:
+    """Return the digest of one required non-symlink regular file."""
+    if not path.is_file() or path.is_symlink():
+        msg = f"Missing or unsafe {label}: {path}"
+        raise FileNotFoundError(msg)
+    return common.serialization.file_sha256(path)
+
+
+def _admit_artifacts(directory: Path, provenance: Mapping[str, Any]) -> tuple[ArtifactEvidence, ...]:
+    """Admit exact publication membership and every declared artifact hash."""
+    raw_artifacts = provenance.get("artifacts")
+    if not isinstance(raw_artifacts, dict) or not raw_artifacts:
         msg = f"Case publication has no artifact identity map: {directory}"
+        raise RuntimeError(msg)
+    artifacts: list[ArtifactEvidence] = []
+    declared: set[str] = set()
+    for relative, raw_identity in raw_artifacts.items():
+        relative_path = Path(relative) if isinstance(relative, str) else Path()
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not isinstance(raw_identity, dict)
+            or set(raw_identity) != {"sha256", "size_bytes"}
+        ):
+            msg = f"Malformed artifact identity for {relative!r} in {directory}."
+            raise RuntimeError(msg)
+        digest = _require_sha256(raw_identity["sha256"], label=f"artifact {relative!r} sha256")
+        size_bytes = raw_identity["size_bytes"]
+        artifact_path = directory / relative_path
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            msg = f"Artifact {relative!r} has an invalid byte count in {directory}."
+            raise RuntimeError(msg)
+        if (
+            not artifact_path.is_file()
+            or artifact_path.is_symlink()
+            or artifact_path.stat().st_size != size_bytes
+            or common.serialization.file_sha256(artifact_path) != digest
+        ):
+            msg = f"Case artifact integrity failure for {artifact_path}."
+            raise RuntimeError(msg)
+        declared.add(relative)
+        artifacts.append(
+            ArtifactEvidence(
+                relative_path=relative,
+                path=artifact_path.resolve(),
+                sha256=digest,
+                size_bytes=size_bytes,
+            )
+        )
+    unsafe = tuple(path for path in directory.rglob("*") if path.is_symlink())
+    if unsafe:
+        msg = f"Case publication contains symbolic links: {[str(path) for path in unsafe]}"
         raise RuntimeError(msg)
     actual = {
         path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file() and path.name not in {"provenance.json", "_SUCCESS"}
     }
-    if actual != set(artifacts):
-        msg = f"Case publication membership mismatch in {directory}."
+    if actual != declared:
+        msg = f"Case publication membership mismatch in {directory}: missing={sorted(declared - actual)}, extra={sorted(actual - declared)}."
         raise RuntimeError(msg)
-    for relative, identity in artifacts.items():
-        path = directory / relative
-        if not isinstance(identity, dict) or set(identity) != {"sha256", "size_bytes"}:
-            msg = f"Malformed artifact identity for {relative!r} in {directory}."
-            raise RuntimeError(msg)
-        if path.stat().st_size != identity["size_bytes"] or common.serialization.file_sha256(path) != identity["sha256"]:
-            msg = f"Case artifact integrity failure for {path}."
-            raise RuntimeError(msg)
+    return tuple(sorted(artifacts, key=lambda artifact: artifact.relative_path))
 
 
-def _validate_publication_directory(
-    directory: Path,
-    *,
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    stage: str,
-) -> dict[str, Any]:
-    """Validate one exact raw or processed case publication."""
-    success = _load_json_object(directory / "_SUCCESS", label="case success marker")
+def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
+    """Normalize canonical storage validation into immutable typed evidence."""
+    views = identity.get("available_learning_views")
+    if not isinstance(views, tuple) or not all(isinstance(item, str) for item in views):
+        msg = "Canonical HDF5 validation returned malformed learning-view evidence."
+        raise RuntimeError(msg)
+    return HDF5IdentityEvidence(
+        simulation_profile=str(identity["simulation_profile"]),
+        git_commit=str(identity["git_commit"]),
+        template_relative_path=str(identity["template_relative_path"]),
+        template_sha256=_require_sha256(identity["template_sha256"], label="HDF5 template_sha256"),
+        case_input_id=_require_sha256(identity["case_input_id"], label="HDF5 case_input_id"),
+        simulation_case_id=_require_sha256(identity["simulation_case_id"], label="HDF5 simulation_case_id"),
+        scientific_config_digest=_require_sha256(
+            identity["scientific_config_digest"],
+            label="HDF5 scientific_config_digest",
+        ),
+        export_contract_sha256=_require_sha256(
+            identity["export_contract_sha256"],
+            label="HDF5 export_contract_sha256",
+        ),
+        available_learning_views=views,
+        airflow_source=str(identity["airflow_source"]),
+    )
+
+
+def _admit_publication_directory(directory: Path, *, stage: str) -> _PublicationEvidence:
+    """Admit one raw or processed case publication by producer-owned contracts."""
+    if stage not in {"raw", "processed"}:
+        msg = f"Unsupported case publication stage: {stage!r}."
+        raise ValueError(msg)
+    if not directory.is_dir() or directory.is_symlink():
+        msg = f"Case publication directory is missing or unsafe: {directory}"
+        raise FileNotFoundError(msg)
+    success_path = directory / "_SUCCESS"
     provenance_path = directory / "provenance.json"
-    provenance = _load_json_object(provenance_path, label="case publication provenance")
-    case_payload = _load_json_object(directory / "case.json", label="canonical case provenance")
-    expected = config.batch_id, config.case_id(case_index), stage
-    if (success.get("batch_id"), success.get("case_id"), success.get("stage")) != expected:
-        msg = f"Case success identity mismatch in {directory}."
+    success = _load_json_object(success_path, label=f"{stage} case success marker")
+    provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
+    case_payload = _load_json_object(directory / "case.json", label=f"{stage} canonical case provenance")
+    if (
+        set(success) != _CASE_SUCCESS_KEYS
+        or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
+        or success.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or set(provenance) != _CASE_PUBLICATION_KEYS
+        or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
+        or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or case_payload.get("schema_kind") != case_service.CASE_SCHEMA_KIND
+        or case_payload.get("schema_version") != case_service.CASE_SCHEMA_VERSION
+    ):
+        msg = f"Case publication schema is not current: {directory}"
         raise RuntimeError(msg)
-    if (provenance.get("batch_id"), provenance.get("case_id"), provenance.get("stage")) != expected:
-        msg = f"Case publication identity mismatch in {directory}."
+    case_id = case_payload.get("case_id")
+    case_index = case_payload.get("case_index")
+    if (
+        not isinstance(case_id, str)
+        or _CASE_ID_PATTERN.fullmatch(case_id) is None
+        or isinstance(case_index, bool)
+        or not isinstance(case_index, int)
+        or case_index < 1
+        or case_id != f"case_{case_index:04d}"
+    ):
+        msg = f"Canonical case identifier or index is malformed: {directory}"
         raise RuntimeError(msg)
-    if success.get("provenance_sha256") != common.serialization.file_sha256(provenance_path):
-        msg = f"Case provenance digest mismatch in {directory}."
+    batch_id = common.paths.validate_logical_name(case_payload.get("batch_id"), label="batch_id")
+    batch_identity = _require_sha256(case_payload.get("batch_identity"), label="case batch_identity")
+    scientific_digest = _require_sha256(
+        case_payload.get("scientific_config_digest"),
+        label="case scientific_config_digest",
+    )
+    if batch_identity != scientific_digest:
+        msg = f"Canonical case batch and scientific identities disagree: {directory}"
         raise RuntimeError(msg)
-    if case_service.compute_case_input_id(case_payload) != case_payload.get("case_input_id"):
+    _require_sha256(case_payload.get("case_input_config_digest"), label="case_input_config_digest")
+    case_input_id = _require_sha256(case_payload.get("case_input_id"), label="case_input_id")
+    simulation_case_id = _require_sha256(case_payload.get("simulation_case_id"), label="simulation_case_id")
+    export_contract_sha256 = _require_sha256(
+        case_payload.get("export_contract_sha256"),
+        label="case export_contract_sha256",
+    )
+    git_commit = source_service.validate_git_commit(case_payload.get("git_commit"))
+    profile_id = case_payload.get("simulation_profile")
+    if not isinstance(profile_id, str):
+        msg = f"Canonical case simulation_profile is malformed: {directory}"
+        raise TypeError(msg)
+    profile = profiles.resolve_profile(profile_id)
+    views = case_payload.get("available_learning_views")
+    template = case_payload.get("template")
+    if not isinstance(template, dict) or set(template) != {"relative_path", "filename", "sha256"}:
+        msg = f"Canonical case template descriptor is malformed: {directory}"
+        raise RuntimeError(msg)
+    template_sha256 = _require_sha256(template["sha256"], label="case template sha256")
+    if (
+        views != list(profile.available_learning_views)
+        or case_payload.get("airflow_source") != profile.airflow_source
+        or template["relative_path"] != profile.template_relative_path
+        or template["filename"] != Path(profile.template_relative_path).name
+    ):
+        msg = f"Canonical case profile or template descriptor is invalid: {directory}"
+        raise RuntimeError(msg)
+    material_family = materials.validate_material_family(case_payload.get("material_family"))
+    if case_service.compute_case_input_id(case_payload) != case_input_id:
         msg = f"Canonical case-input identity mismatch in {directory}."
         raise RuntimeError(msg)
-    if case_service.compute_simulation_case_id(case_payload) != case_payload.get("simulation_case_id"):
+    if case_service.compute_simulation_case_id(case_payload) != simulation_case_id:
         msg = f"Canonical simulation-case identity mismatch in {directory}."
         raise RuntimeError(msg)
-    for key in ("case_input_id", "simulation_case_id"):
-        if success.get(key) != case_payload.get(key) or provenance.get(key) != case_payload.get(key):
-            msg = f"Case {key} evidence disagrees in {directory}."
-            raise RuntimeError(msg)
-    git_commit = source_service.validate_git_commit(case_payload.get("git_commit"))
-    if provenance.get("git_commit") != git_commit:
-        msg = f"Case Git-commit evidence disagrees in {directory}."
+    expected_publication = {
+        "stage": stage,
+        "simulation_profile": profile.id,
+        "batch_id": batch_id,
+        "batch_identity": batch_identity,
+        "case_id": case_id,
+        "case_input_id": case_input_id,
+        "simulation_case_id": simulation_case_id,
+        "material_family": material_family,
+        "git_commit": git_commit,
+        "template_sha256": template_sha256,
+        "scientific_config_digest": scientific_digest,
+        "export_contract_sha256": export_contract_sha256,
+        "available_learning_views": list(profile.available_learning_views),
+        "airflow_source": profile.airflow_source,
+    }
+    if any(provenance.get(key) != value for key, value in expected_publication.items()):
+        msg = f"Case publication identity mismatch in {directory}."
         raise RuntimeError(msg)
-    if (
-        case_payload.get("batch_identity") != config.batch_identity
-        or case_payload.get("scientific_config_digest") != config.scientific_config_digest
-        or case_payload.get("case_input_config_digest") != config.case_input_config_digest
-        or case_payload.get("simulation_profile") != config.profile.id
-        or case_payload.get("template", {}).get("sha256") != config.template_sha256
-        or case_payload.get("available_learning_views") != list(config.profile.available_learning_views)
-        or provenance.get("export_contract_sha256") != common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
-    ):
-        msg = f"Case scientific, profile, template, or export identity mismatch in {directory}."
+    expected_success = {
+        "stage": stage,
+        "batch_id": batch_id,
+        "case_id": case_id,
+        "case_input_id": case_input_id,
+        "simulation_case_id": simulation_case_id,
+    }
+    if any(success.get(key) != value for key, value in expected_success.items()):
+        msg = f"Case success identity mismatch in {directory}."
         raise RuntimeError(msg)
-    _validate_artifacts(directory, provenance)
+    provenance_sha256 = _safe_file_sha256(provenance_path, label="case publication provenance")
+    if success.get("provenance_sha256") != provenance_sha256:
+        msg = f"Case provenance digest mismatch in {directory}."
+        raise RuntimeError(msg)
+    artifacts = _admit_artifacts(directory, provenance)
+    hdf5_identity: HDF5IdentityEvidence | None = None
     if stage == "processed":
         required = {"case.h5", "solver.log", "timing.json", "status.json", "execution_provenance.json", "case.json"}
-        if not required.issubset(provenance["artifacts"]):
+        artifact_names = {artifact.relative_path for artifact in artifacts}
+        if not required.issubset(artifact_names):
             msg = f"Processed publication lacks canonical payload or runtime evidence: {directory}"
             raise RuntimeError(msg)
         timing = _load_json_object(directory / "timing.json", label="case timing")
@@ -1486,15 +1898,84 @@ def _validate_publication_directory(
         if timing.get("git_commit") != git_commit or execution.get("git_commit") != git_commit:
             msg = f"Processed runtime Git-commit evidence disagrees in {directory}."
             raise RuntimeError(msg)
-        hdf5_identity = storage_service.validate_case_hdf5(directory / "case.h5", expected_profile=config.profile.id)
-        if (
-            hdf5_identity["case_input_id"] != case_payload["case_input_id"]
-            or hdf5_identity["simulation_case_id"] != case_payload["simulation_case_id"]
-            or hdf5_identity["git_commit"] != git_commit
-        ):
-            msg = f"Canonical HDF5 identities disagree with case.json in {directory}."
+        hdf5_identity = _hdf5_evidence(
+            storage_service.validate_case_hdf5(
+                directory / "case.h5",
+                expected_profile=profile.id,
+            )
+        )
+        expected_hdf5 = HDF5IdentityEvidence(
+            simulation_profile=profile.id,
+            git_commit=git_commit,
+            template_relative_path=profile.template_relative_path,
+            template_sha256=template_sha256,
+            case_input_id=case_input_id,
+            simulation_case_id=simulation_case_id,
+            scientific_config_digest=scientific_digest,
+            export_contract_sha256=export_contract_sha256,
+            available_learning_views=profile.available_learning_views,
+            airflow_source=profile.airflow_source,
+        )
+        if hdf5_identity != expected_hdf5:
+            msg = f"Canonical HDF5 identities disagree with case publication in {directory}."
             raise RuntimeError(msg)
-    return provenance
+    return _PublicationEvidence(
+        directory=directory.resolve(),
+        stage=stage,
+        case_payload=case_payload,
+        provenance=provenance,
+        artifacts=artifacts,
+        hdf5_identity=hdf5_identity,
+    )
+
+
+def _require_case_payload_matches_config(
+    payload: Mapping[str, Any],
+    *,
+    directory: Path,
+    config: config_contract.GenerationConfig,
+    case_index: int,
+) -> None:
+    """Require admitted case metadata to match one authored configuration."""
+    expected = {
+        "simulation_profile": config.profile.id,
+        "batch_id": config.batch_id,
+        "batch_identity": config.batch_identity,
+        "scientific_config_digest": config.scientific_config_digest,
+        "case_input_config_digest": config.case_input_config_digest,
+        "case_id": config.case_id(case_index),
+        "case_index": case_index,
+        "material_family": config.material_family,
+        "material_role": config.material_role,
+        "evaluation_regime": config.evaluation_regime,
+        "sampling_regime": config.sampling_regime,
+        "available_learning_views": list(config.profile.available_learning_views),
+        "airflow_source": config.profile.airflow_source,
+        "template": {
+            "relative_path": config.profile.template_relative_path,
+            "filename": config.template_path.name,
+            "sha256": config.template_sha256,
+        },
+        "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        msg = f"Case scientific identity disagrees with authored configuration: {directory}"
+        raise RuntimeError(msg)
+
+
+def _require_publication_matches_config(
+    evidence: _PublicationEvidence,
+    *,
+    config: config_contract.GenerationConfig,
+    case_index: int,
+) -> None:
+    """Layer exact authored-configuration expectations over admitted evidence."""
+    _require_case_payload_matches_config(
+        evidence.case_payload,
+        directory=evidence.directory,
+        config=config,
+        case_index=case_index,
+    )
 
 
 def validate_completed_case(
@@ -1503,26 +1984,21 @@ def validate_completed_case(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Validate compact input and canonical processed publications."""
-    raw = _validate_publication_directory(
+    """Validate one completed case and layer exact authored-config comparison."""
+    raw = _admit_publication_directory(
         raw_case_directory(config, case_index, storage_root=storage_root),
-        config=config,
-        case_index=case_index,
         stage="raw",
     )
-    processed = _validate_publication_directory(
+    processed = _admit_publication_directory(
         processed_case_directory(config, case_index, storage_root=storage_root),
-        config=config,
-        case_index=case_index,
         stage="processed",
     )
-    if (raw["case_input_id"], raw["simulation_case_id"]) != (
-        processed["case_input_id"],
-        processed["simulation_case_id"],
-    ):
-        msg = f"Raw and processed identities disagree for {config.case_id(case_index)}."
+    _require_publication_matches_config(raw, config=config, case_index=case_index)
+    _require_publication_matches_config(processed, config=config, case_index=case_index)
+    if raw.case_payload != processed.case_payload:
+        msg = f"Raw and processed canonical metadata disagree for {config.case_id(case_index)}."
         raise RuntimeError(msg)
-    return processed
+    return dict(processed.provenance)
 
 
 def completed_case_is_valid(
@@ -1538,7 +2014,8 @@ def completed_case_is_valid(
     processed_success = (processed / "_SUCCESS").exists()
     if not processed_success:
         if raw_success:
-            _validate_publication_directory(raw, config=config, case_index=case_index, stage="raw")
+            evidence = _admit_publication_directory(raw, stage="raw")
+            _require_publication_matches_config(evidence, config=config, case_index=case_index)
         return False
     if not raw_success:
         msg = f"Processed completion exists without input provenance: {processed}"
@@ -1591,8 +2068,9 @@ def publish_completed_case(
         _stage_raw_case(config, result, raw_stage)
         _stage_processed_case(config, result, processed_stage)
         if raw_destination.exists() and (raw_destination / "_SUCCESS").exists():
-            existing = _validate_publication_directory(raw_destination, config=config, case_index=case_index, stage="raw")
-            if existing["simulation_case_id"] != result.prepared.bundle.simulation_case_id:
+            existing = _admit_publication_directory(raw_destination, stage="raw")
+            _require_publication_matches_config(existing, config=config, case_index=case_index)
+            if existing.provenance["simulation_case_id"] != result.prepared.bundle.simulation_case_id:
                 msg = f"Existing raw case belongs to another simulation identity: {raw_destination}"
                 raise RuntimeError(msg)
             # The marked publication root owns this redundant stage until cleanup.
@@ -1858,15 +2336,17 @@ def run_case(
 
 
 def _validate_exact_batch_directory_membership(
-    config: config_contract.GenerationConfig,
+    batch_id: str,
+    case_ids: tuple[str, ...],
     *,
     storage_root: Path | str | None,
-) -> None:
+) -> tuple[Path, Path]:
     """Require raw and processed roots to contain exactly intended cases."""
-    expected = {config.case_id(case_index) for case_index in config.case_indices}
+    expected = set(case_ids)
+    roots: list[Path] = []
     for stage in ("raw", "processed"):
-        root = common.paths.resolve_generated_batch_dir(config.batch_id, stage=stage, storage_root=storage_root)
-        entries = tuple(root.iterdir()) if root.is_dir() else ()
+        root = common.paths.resolve_generated_batch_dir(batch_id, stage=stage, storage_root=storage_root)
+        entries = tuple(root.iterdir()) if root.is_dir() and not root.is_symlink() else ()
         actual = {entry.name for entry in entries}
         unsafe = sorted(entry.name for entry in entries if not entry.is_dir() or entry.is_symlink())
         if actual != expected or unsafe:
@@ -1875,6 +2355,8 @@ def _validate_exact_batch_directory_membership(
                 f"extra={sorted(actual - expected)}, unsafe={unsafe}."
             )
             raise RuntimeError(msg)
+        roots.append(root.resolve())
+    return roots[0], roots[1]
 
 
 def finalize_batch(
@@ -1902,7 +2384,11 @@ def finalize_batch(
                 "case_hdf5_sha256": common.serialization.file_sha256(success_path.parent / "case.h5"),
             }
         )
-    _validate_exact_batch_directory_membership(config, storage_root=storage_root)
+    _validate_exact_batch_directory_membership(
+        config.batch_id,
+        tuple(config.case_id(case_index) for case_index in config.case_indices),
+        storage_root=storage_root,
+    )
     if len(git_commits) != 1:
         msg = f"Completed batch contains multiple source commits: {sorted(git_commits)}."
         raise RuntimeError(msg)
@@ -1943,7 +2429,338 @@ def finalize_batch(
             raise RuntimeError(msg)
     else:
         common.serialization.atomic_write_json(success_path, success)
+    validate_terminal_batch(config, storage_root=storage_root)
     return manifest_path
+
+
+def _validate_terminal_scientific_config(
+    scientific: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    case_count: int,
+) -> None:
+    """Bind persisted resolved science to terminal profile and batch descriptors."""
+    material = scientific.get("material")
+    output_contract = scientific.get("output_contract")
+    assignments = scientific.get("assignments")
+    if (
+        scientific.get("schema_kind") != "resolved_generation_batch"
+        or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
+        or scientific.get("simulation_profile") != manifest["simulation_profile"]
+        or scientific.get("sampling_regime") != manifest["sampling_regime"]
+        or scientific.get("case_count") != case_count
+        or not isinstance(material, Mapping)
+        or material.get("material_family") != manifest["material_family"]
+        or not isinstance(output_contract, Mapping)
+        or common.serialization.canonical_json_sha256(output_contract) != manifest["export_contract_sha256"]
+        or scientific.get("available_learning_views") != manifest["available_learning_views"]
+        or scientific.get("airflow_source") != manifest["airflow_source"]
+        or not isinstance(assignments, list)
+        or len(assignments) != case_count
+    ):
+        msg = f"Persisted resolved science disagrees with terminal batch descriptors: {manifest_path}"
+        raise RuntimeError(msg)
+
+
+def _require_case_matches_terminal(
+    payload: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    scientific: Mapping[str, Any],
+    record: Mapping[str, Any],
+    directory: Path,
+) -> None:
+    """Bind one internally valid case to terminal and persisted-science evidence."""
+    assignments = scientific.get("assignments")
+    matches = (
+        [assignment for assignment in assignments if isinstance(assignment, Mapping) and assignment.get("case_index") == record["case_index"]]
+        if isinstance(assignments, list)
+        else []
+    )
+    assignment = matches[0] if len(matches) == 1 else {}
+    natural_support_state = (
+        "nominal_reference" if assignment.get("pilot_case_kind") == "nominal_reference" else scientific.get("natural_support_state")
+    )
+    expected = {
+        "simulation_profile": manifest["simulation_profile"],
+        "batch_id": manifest["batch_id"],
+        "batch_identity": manifest["batch_identity"],
+        "scientific_config_digest": manifest["scientific_config_digest"],
+        "case_input_config_digest": config_contract.compute_case_input_config_digest(scientific),
+        "case_id": record["case_id"],
+        "case_index": record["case_index"],
+        "case_input_id": record["case_input_id"],
+        "simulation_case_id": record["simulation_case_id"],
+        "generator_version": scientific.get("generator_version"),
+        "git_commit": manifest["git_commit"],
+        "material_family": record["material_family"],
+        "material_role": scientific.get("material_role"),
+        "evaluation_regime": scientific.get("evaluation_regime"),
+        "sampling_regime": manifest["sampling_regime"],
+        "natural_support_state": natural_support_state,
+        "available_learning_views": manifest["available_learning_views"],
+        "airflow_source": manifest["airflow_source"],
+        "stationary_fixed_ownership": scientific.get("stationary_fixed_ownership"),
+        "template": {
+            "relative_path": manifest["template"]["relative_path"],
+            "filename": Path(manifest["template"]["relative_path"]).name,
+            "sha256": manifest["template"]["sha256"],
+        },
+        "export_contract_sha256": manifest["export_contract_sha256"],
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        msg = f"Canonical case metadata disagrees with terminal batch evidence: {directory}"
+        raise RuntimeError(msg)
+    ood = payload.get("ood")
+    parameter_ood = scientific.get("parameter_ood")
+    allowed_groups = parameter_ood.get("groups") if isinstance(parameter_ood, Mapping) else None
+    if (
+        len(matches) != 1
+        or not isinstance(ood, Mapping)
+        or not isinstance(allowed_groups, list)
+        or ood.get("group") != matches[0].get("ood_group")
+        or ood.get("natural_support_state") != natural_support_state
+        or (ood.get("group") is not None and ood.get("group") not in allowed_groups)
+    ):
+        msg = f"Canonical case OOD group or support state disagrees with its persisted Generation assignment: {directory}"
+        raise RuntimeError(msg)
+    if "steady_flow_conditioning" in scientific and payload.get("steady_flow_conditioning") != scientific["steady_flow_conditioning"]:
+        msg = f"Canonical case conditioning disagrees with persisted resolved science: {directory}"
+        raise RuntimeError(msg)
+
+
+def admit_terminal_batch(
+    batch_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> TerminalBatchEvidence:
+    """
+    Admit one terminal batch without requiring its authored configuration.
+
+    Parameters
+    ----------
+    batch_id : str
+        Immutable generated-batch identifier.
+    storage_root : Path | str | None, optional
+        Storage root containing the Generation publication.
+
+    Returns
+    -------
+    TerminalBatchEvidence
+        Immutable evidence for the manifest, exact membership, case
+        publications, artifacts, identities, and canonical HDF5 payloads.
+
+    Raises
+    ------
+    FileNotFoundError
+        If required terminal evidence is missing or unsafe.
+    ValueError
+        If an identifier, digest, profile, or persisted value is malformed.
+    RuntimeError
+        If independently valid evidence disagrees across publication layers.
+
+    """
+    safe_batch_id = common.paths.validate_logical_name(batch_id, label="batch_id")
+    generation_root = common.paths.get_generation_root(storage_root=storage_root).expanduser().resolve()
+    meta_candidate = common.paths.get_generation_meta_root(storage_root=storage_root) / safe_batch_id
+    if not meta_candidate.is_dir() or meta_candidate.is_symlink():
+        msg = f"Terminal batch metadata directory is missing or unsafe: {meta_candidate}"
+        raise FileNotFoundError(msg)
+    meta_directory = meta_candidate.resolve()
+    manifest_path = meta_directory / "batch_manifest.json"
+    success_path = meta_directory / "_SUCCESS"
+    scientific_path = meta_directory / "resolved_generation_config.json"
+    manifest = _load_json_object(manifest_path, label="terminal batch manifest")
+    success = _load_json_object(success_path, label="terminal batch success marker")
+    scientific = _load_json_object(scientific_path, label="resolved scientific generation configuration")
+    manifest_sha256 = _safe_file_sha256(manifest_path, label="terminal batch manifest")
+    if (
+        set(manifest) != _BATCH_MANIFEST_KEYS
+        or manifest.get("schema_kind") != _BATCH_MANIFEST_SCHEMA_KIND
+        or manifest.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or manifest.get("status") != "complete"
+        or manifest.get("batch_id") != safe_batch_id
+    ):
+        msg = f"Terminal batch manifest schema or completion state is invalid: {manifest_path}"
+        raise RuntimeError(msg)
+    batch_identity = _require_sha256(manifest.get("batch_identity"), label="terminal batch_identity")
+    scientific_digest = _require_sha256(
+        manifest.get("scientific_config_digest"),
+        label="terminal scientific_config_digest",
+    )
+    export_contract_sha256 = _require_sha256(
+        manifest.get("export_contract_sha256"),
+        label="terminal export_contract_sha256",
+    )
+    if batch_identity != scientific_digest or common.serialization.canonical_json_sha256(scientific) != scientific_digest:
+        msg = f"Terminal batch identity is not bound to persisted resolved science: {manifest_path}"
+        raise RuntimeError(msg)
+    profile_id = manifest.get("simulation_profile")
+    if not isinstance(profile_id, str):
+        msg = f"Terminal simulation_profile is malformed: {manifest_path}"
+        raise TypeError(msg)
+    profile = profiles.resolve_profile(profile_id)
+    template = manifest.get("template")
+    if not isinstance(template, dict) or set(template) != {"relative_path", "sha256"}:
+        msg = f"Terminal template descriptor is malformed: {manifest_path}"
+        raise RuntimeError(msg)
+    template_sha256 = _require_sha256(template["sha256"], label="terminal template sha256")
+    if (
+        manifest.get("available_learning_views") != list(profile.available_learning_views)
+        or manifest.get("airflow_source") != profile.airflow_source
+        or template["relative_path"] != profile.template_relative_path
+    ):
+        msg = f"Terminal profile or template descriptor is invalid: {manifest_path}"
+        raise RuntimeError(msg)
+    material_family = materials.validate_material_family(manifest.get("material_family"))
+    sampling_regime = manifest.get("sampling_regime")
+    batch_name = manifest.get("batch_name")
+    batch_kind = (
+        config_contract.PILOT_CAMPAIGN_PURPOSE if scientific.get("campaign_purpose") == config_contract.PILOT_CAMPAIGN_PURPOSE else sampling_regime
+    )
+    identity_is_valid = False
+    if isinstance(material_family, str) and isinstance(sampling_regime, str) and isinstance(batch_name, str) and isinstance(batch_kind, str):
+        expected_name = config_contract.build_batch_name(profile.id, material_family, batch_kind)
+        identity_is_valid = batch_name == expected_name and safe_batch_id == config_contract.build_batch_id(expected_name, scientific_digest)
+    if not sampling_regime or not identity_is_valid:
+        msg = f"Terminal batch name, material, sampling regime, or immutable identifier is invalid: {manifest_path}"
+        raise RuntimeError(msg)
+    git_commit = source_service.validate_git_commit(manifest.get("git_commit"))
+    if set(success) != _BATCH_SUCCESS_KEYS or success != {
+        "schema_kind": _BATCH_SUCCESS_SCHEMA_KIND,
+        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "simulation_profile": profile.id,
+        "batch_id": safe_batch_id,
+        "batch_identity": batch_identity,
+        "manifest_sha256": manifest_sha256,
+    }:
+        msg = f"Terminal success marker does not bind the manifest: {success_path}"
+        raise RuntimeError(msg)
+    indices = manifest.get("intended_case_indices")
+    records = manifest.get("cases")
+    if (
+        not isinstance(indices, list)
+        or not indices
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in indices)
+        or indices != sorted(set(indices))
+        or not isinstance(records, list)
+        or len(records) != len(indices)
+    ):
+        msg = f"Terminal batch membership is malformed: {manifest_path}"
+        raise RuntimeError(msg)
+    _validate_terminal_scientific_config(
+        scientific,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        case_count=len(indices),
+    )
+    case_ids = tuple(f"case_{index:04d}" for index in indices)
+    raw_root, processed_root = _validate_exact_batch_directory_membership(
+        safe_batch_id,
+        case_ids,
+        storage_root=storage_root,
+    )
+    admitted_cases: list[TerminalCaseEvidence] = []
+    for expected_index, expected_case_id, raw_record in zip(indices, case_ids, records, strict=True):
+        if (
+            not isinstance(raw_record, dict)
+            or set(raw_record) != _CASE_RECORD_KEYS
+            or raw_record.get("case_index") != expected_index
+            or raw_record.get("case_id") != expected_case_id
+            or raw_record.get("material_family") != material_family
+        ):
+            msg = f"Terminal case record is malformed for {expected_case_id}: {manifest_path}"
+            raise RuntimeError(msg)
+        record = raw_record
+        for key in (
+            "case_input_id",
+            "simulation_case_id",
+            "success_sha256",
+            "provenance_sha256",
+            "case_hdf5_sha256",
+        ):
+            _require_sha256(record.get(key), label=f"{expected_case_id}.{key}")
+        raw = _admit_publication_directory(raw_root / expected_case_id, stage="raw")
+        processed = _admit_publication_directory(processed_root / expected_case_id, stage="processed")
+        if raw.case_payload != processed.case_payload:
+            msg = f"Raw and processed canonical metadata disagree for {expected_case_id}."
+            raise RuntimeError(msg)
+        _require_case_matches_terminal(
+            raw.case_payload,
+            manifest=manifest,
+            scientific=scientific,
+            record=record,
+            directory=raw.directory,
+        )
+        processed_success_sha256 = _safe_file_sha256(
+            processed.directory / "_SUCCESS",
+            label=f"{expected_case_id} success marker",
+        )
+        processed_provenance_sha256 = _safe_file_sha256(
+            processed.directory / "provenance.json",
+            label=f"{expected_case_id} publication provenance",
+        )
+        processed_hdf5_sha256 = _safe_file_sha256(
+            processed.directory / "case.h5",
+            label=f"{expected_case_id} canonical HDF5",
+        )
+        if (
+            processed_success_sha256 != record["success_sha256"]
+            or processed_provenance_sha256 != record["provenance_sha256"]
+            or processed_hdf5_sha256 != record["case_hdf5_sha256"]
+        ):
+            msg = f"Terminal manifest artifact digests disagree for {expected_case_id}."
+            raise RuntimeError(msg)
+        if processed.hdf5_identity is None:
+            msg = f"Processed case admission lost canonical HDF5 evidence for {expected_case_id}."
+            raise RuntimeError(msg)
+        admitted_cases.append(
+            TerminalCaseEvidence(
+                case_index=expected_index,
+                case_id=expected_case_id,
+                material_family=str(record["material_family"]),
+                case_input_id=str(record["case_input_id"]),
+                simulation_case_id=str(record["simulation_case_id"]),
+                success_sha256=str(record["success_sha256"]),
+                provenance_sha256=str(record["provenance_sha256"]),
+                case_hdf5_sha256=str(record["case_hdf5_sha256"]),
+                raw_directory=raw.directory,
+                processed_directory=processed.directory,
+                hdf5_path=(processed.directory / "case.h5").resolve(),
+                raw_artifacts=raw.artifacts,
+                processed_artifacts=processed.artifacts,
+                hdf5_identity=processed.hdf5_identity,
+                _case_metadata_json=_canonical_json_text(raw.case_payload),
+            )
+        )
+    evidence = TerminalBatchEvidence(
+        generation_root=generation_root,
+        meta_directory=meta_directory,
+        raw_directory=raw_root,
+        processed_directory=processed_root,
+        manifest_path=manifest_path.resolve(),
+        manifest_sha256=manifest_sha256,
+        simulation_profile=profile.id,
+        available_learning_views=profile.available_learning_views,
+        airflow_source=profile.airflow_source,
+        batch_name=str(batch_name),
+        batch_id=safe_batch_id,
+        batch_identity=batch_identity,
+        material_family=str(material_family),
+        sampling_regime=str(sampling_regime),
+        git_commit=git_commit,
+        scientific_config_digest=scientific_digest,
+        template_relative_path=profile.template_relative_path,
+        template_sha256=template_sha256,
+        export_contract_sha256=export_contract_sha256,
+        cases=tuple(admitted_cases),
+        _scientific_config_json=_canonical_json_text(scientific),
+    )
+    if evidence.manifest_payload() != manifest:
+        msg = f"Typed terminal evidence does not exactly represent its manifest: {manifest_path}"
+        raise RuntimeError(msg)
+    return evidence
 
 
 def validate_terminal_batch(
@@ -1951,42 +2768,44 @@ def validate_terminal_batch(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Validate a transferred or local terminal batch without mutation."""
-    meta_directory = batch_meta_directory(config, storage_root=storage_root)
-    manifest_path = meta_directory / "batch_manifest.json"
-    success = _load_json_object(meta_directory / "_SUCCESS", label="batch success marker")
-    manifest = _load_json_object(manifest_path, label="terminal batch manifest")
-    if success.get("manifest_sha256") != common.serialization.file_sha256(manifest_path):
-        msg = f"Terminal batch manifest digest mismatch: {manifest_path}"
-        raise RuntimeError(msg)
+    """Admit a terminal batch and require exact authored-config agreement."""
+    evidence = admit_terminal_batch(config.batch_id, storage_root=storage_root)
     expected = {
         "simulation_profile": config.profile.id,
-        "available_learning_views": list(config.profile.available_learning_views),
+        "available_learning_views": config.profile.available_learning_views,
         "airflow_source": config.profile.airflow_source,
-        "template": {"relative_path": config.profile.template_relative_path, "sha256": config.template_sha256},
         "batch_name": config.batch_name,
         "batch_identity": config.batch_identity,
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "scientific_config_digest": config.scientific_config_digest,
-        "intended_case_indices": list(config.case_indices),
+        "template_relative_path": config.profile.template_relative_path,
+        "template_sha256": config.template_sha256,
+        "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
+        "cases": tuple(config.case_indices),
     }
-    if any(manifest.get(key) != value for key, value in expected.items()):
-        msg = f"Terminal batch scientific identity or exact membership mismatch: {manifest_path}"
+    actual = {
+        "simulation_profile": evidence.simulation_profile,
+        "available_learning_views": evidence.available_learning_views,
+        "airflow_source": evidence.airflow_source,
+        "batch_name": evidence.batch_name,
+        "batch_identity": evidence.batch_identity,
+        "material_family": evidence.material_family,
+        "sampling_regime": evidence.sampling_regime,
+        "scientific_config_digest": evidence.scientific_config_digest,
+        "template_relative_path": evidence.template_relative_path,
+        "template_sha256": evidence.template_sha256,
+        "export_contract_sha256": evidence.export_contract_sha256,
+        "cases": tuple(case.case_index for case in evidence.cases),
+    }
+    if actual != expected or evidence.scientific_config_payload() != config.scientific_values:
+        msg = f"Terminal batch scientific identity disagrees with authored configuration: {evidence.manifest_path}"
         raise RuntimeError(msg)
-    manifest_git_commit = source_service.validate_git_commit(manifest.get("git_commit"))
-    records = manifest.get("cases")
-    if not isinstance(records, list) or [record.get("case_index") for record in records if isinstance(record, dict)] != list(config.case_indices):
-        msg = f"Terminal batch case records do not match intended order: {manifest_path}"
-        raise RuntimeError(msg)
-    _validate_exact_batch_directory_membership(config, storage_root=storage_root)
-    for case_index, record in zip(config.case_indices, records, strict=True):
-        provenance = validate_completed_case(config, case_index, storage_root=storage_root)
-        if (
-            record.get("case_input_id") != provenance["case_input_id"]
-            or record.get("simulation_case_id") != provenance["simulation_case_id"]
-            or provenance.get("git_commit") != manifest_git_commit
-        ):
-            msg = f"Terminal manifest case identities mismatch for {config.case_id(case_index)}."
-            raise RuntimeError(msg)
-    return manifest
+    for case in evidence.cases:
+        _require_case_payload_matches_config(
+            case.metadata_payload(),
+            directory=case.processed_directory,
+            config=config,
+            case_index=case.case_index,
+        )
+    return evidence.manifest_payload()

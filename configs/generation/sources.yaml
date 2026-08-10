@@ -1,9 +1,5 @@
 schema_kind: generation_sources
 schema_version: 1
-decision_source:
-  artifact: VP2_Parameter_Decisions.yaml
-  schema_version: 1.1.0
-  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 sources:
 - source_key: ba
   citation: Albertin, R. M. (2025). Trocknung von Koernerleguminosen. Bachelorarbeit,
@@ -238,8 +234,6 @@ sources:
   alternate_locators: []
   source_type: project_report
 - source_key: vp2_decision_contract
-  citation: VP2 Parameter Decisions, schema 1.1.0 (2026-08-09).
-  identifier: sha256:774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
-  canonical_locator: artifact:VP2_Parameter_Decisions.yaml
+  decision_date: '2026-08-09'
   alternate_locators: []
   source_type: project_report

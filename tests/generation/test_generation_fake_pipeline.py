@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from src import datasets, generation
+from src.generation import generation_porosity as porosity_service
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,7 +46,11 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
     config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
 
     campaign = generation.config.load_campaign_config(config_path)
-    batch = campaign.batch(f"{simulation_profile}__lentil__natural")
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+        simulation_profile=simulation_profile,
+    )
     storage = tmp_path / f"{simulation_profile} storage"
     outcomes = [
         generation.runtime.run_case(
@@ -76,7 +81,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
             assert realized["evaluation_regime"] == "id"
             assert set(batch.scientific_values["material"]["active_coordinate_names"]).issubset(realized["sampled_values"])
             assert set(realized["sampled_values"]) == set(realized["sampled_units"])
-            anchor = generation.porosity.ANCHOR_PARAMETER_NAME
+            anchor = porosity_service.ANCHOR_PARAMETER_NAME
             anchor_support = realized["conditional_supports"][anchor]
             porosity = realized["spatial_diagnostics"]["porosity"]
             assert anchor_support["support_kind"] == "natural"
@@ -89,6 +94,14 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
             assert porosity["material_support_departure_cause"] is None
     generation.runtime.finalize_batch(batch, storage_root=storage)
     generation.runtime.validate_terminal_batch(batch, storage_root=storage)
+    bounded = datasets.generated_batch.load_generated_batch(
+        batch.batch_id,
+        storage_root=storage,
+        max_cases=1,
+    )
+    assert bounded["sample_ids"] == ["case_0001"]
+    assert bounded["available_case_count"] == len(batch.case_indices)
+    assert len(bounded["rows"]) == 1
 
     results = datasets.packages.build_campaign_packages(campaign, storage_root=storage)
     assert tuple(result["dataset_view"] for result in results) == expected_views

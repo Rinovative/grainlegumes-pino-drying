@@ -411,7 +411,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
             dataset_path=contract.source.path,
         )
 
-    validated = datasets.base.validate_split_info(
+    split_contract = datasets.splits.admit_split_contract(
         split,
         train_identity=id_contract.identity,
         ood_identity=ood_contract.identity,
@@ -419,9 +419,9 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         expected_ood_fraction=effective["data"]["ood_fraction"],
         expected_split_seed=seed_plan["split"],
     )
-    train_indices = validated["train_indices"]
-    eval_indices = validated["eval_indices"]
-    ood_indices = validated["ood_indices"]
+    train_indices = split_contract.role("train").indices
+    eval_indices = split_contract.role("eval").indices
+    ood_indices = split_contract.role("ood").indices
     _require(
         not bool(torch.isin(train_indices, eval_indices).any().item()),
         "ID train/evaluation overlap",
@@ -573,7 +573,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
                 )
             )
 
-    restored_processor = datasets.base.data_processor_from_state(
+    restored_processor = datasets.normalization.data_processor_from_state(
         normalizer_state,
         device="cpu",
     )
@@ -584,7 +584,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     zero_variance_state = {key: value.clone() for key, value in normalizer_state.items()}
     zero_variance_state["in_normalizer.std"].zero_()
     zero_variance_state["out_normalizer.std"].zero_()
-    zero_variance_processor = datasets.base.data_processor_from_state(
+    zero_variance_processor = datasets.normalization.data_processor_from_state(
         zero_variance_state,
         device="cpu",
     )

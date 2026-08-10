@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from src import common
+from src import common, datasets
 
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
@@ -539,24 +539,18 @@ def build_semantic_config(
 ) -> dict[str, Any]:
     """Build one complete, nested, path-free scientific W&B configuration."""
     task_contract = config.get("task_contract")
-    split_metadata = split_indices.get("metadata")
-    if not isinstance(task_contract, Mapping) or not isinstance(split_metadata, Mapping):
-        msg = "Semantic tracking config requires resolved task and split metadata."
+    if not isinstance(task_contract, Mapping):
+        msg = "Semantic tracking config requires a resolved task contract."
         raise TypeError(msg)
-    datasets = split_metadata.get("datasets")
-    membership = split_metadata.get("membership_digests")
-    if not isinstance(datasets, Mapping) or not isinstance(membership, Mapping):
-        msg = "Semantic tracking config requires dataset identities and membership digests."
-        raise TypeError(msg)
-
+    split_contract = datasets.splits.admit_split_contract(split_indices)
     dataset_payload: dict[str, Any] = {}
-    for saved_role, tracked_role in (("train", "id"), ("ood", "ood")):
-        raw_identity = datasets.get(saved_role)
-        if not isinstance(raw_identity, Mapping):
-            msg = f"split_indices metadata dataset {saved_role!r} must be a mapping."
-            raise TypeError(msg)
+    for evidence, tracked_role in (
+        (split_contract.role("train"), "id"),
+        (split_contract.role("ood"), "ood"),
+    ):
+        raw_identity = evidence.source.as_dict()
         dataset_payload[tracked_role] = {
-            key: copy.deepcopy(raw_identity.get(key))
+            key: copy.deepcopy(raw_identity[key])
             for key in (
                 "dataset_id",
                 "fingerprint",
@@ -568,16 +562,6 @@ def build_semantic_config(
 
     data_config = cast("Mapping[str, Any]", config["data"])
     loader_keys = ("batch_size", "num_workers", "pin_memory", "persistent_workers")
-    split_keys = (
-        "n_train_full",
-        "n_train",
-        "n_eval",
-        "n_ood_full",
-        "n_ood",
-        "train_ratio",
-        "ood_fraction",
-        "split_seed",
-    )
     preprocessing = task_contract.get("preprocessing")
     physics_contract = task_contract.get("physics")
     if not isinstance(preprocessing, Mapping) or not isinstance(physics_contract, Mapping):
@@ -641,11 +625,18 @@ def build_semantic_config(
             "datasets": dataset_payload,
             "loader": {key: copy.deepcopy(data_config.get(key)) for key in loader_keys},
             "split": {
-                "schema_version": split_indices.get("schema_version"),
+                "schema_version": split_contract.schema_version,
                 "artifact": "split_indices.pt",
                 "artifact_sha256": split_indices_sha256,
-                **{key: copy.deepcopy(split_metadata.get(key)) for key in split_keys},
-                "membership_digests": copy.deepcopy(dict(membership)),
+                "n_train_full": split_contract.role("train").full_count,
+                "n_train": split_contract.role("train").count,
+                "n_eval": split_contract.role("eval").count,
+                "n_ood_full": split_contract.role("ood").full_count,
+                "n_ood": split_contract.role("ood").count,
+                "train_ratio": split_contract.train_ratio,
+                "ood_fraction": split_contract.ood_fraction,
+                "split_seed": split_contract.split_seed,
+                "membership_digests": {role: split_contract.role(role).membership_digest for role in datasets.splits.SPLIT_ROLES},
             },
             "normalization": {
                 **copy.deepcopy(dict(preprocessing)),
@@ -669,7 +660,7 @@ def build_semantic_config(
             "schema_versions": {
                 "run": 1,
                 "checkpoint": 1,
-                "split": split_indices.get("schema_version"),
+                "split": split_contract.schema_version,
                 "tracking_integration": TRACKING_INTEGRATION_VERSION,
             },
         },
@@ -713,37 +704,20 @@ def build_monitor_membership(
     monitor = cast("Mapping[str, Any]", settings["monitor"])
     if settings["mode"] == "disabled" or not bool(monitor["enabled"]):
         return None
-    raw_indices = split_indices.get("eval_indices")
-    metadata = split_indices.get("metadata")
-    if not hasattr(raw_indices, "tolist") or not isinstance(metadata, Mapping):
-        msg = "Physics monitor membership requires saved evaluation indices and metadata."
-        raise TypeError(msg)
-    datasets = metadata.get("datasets")
-    if not isinstance(datasets, Mapping) or not isinstance(datasets.get("train"), Mapping):
-        msg = "Physics monitor membership requires the saved training dataset identity."
-        raise TypeError(msg)
-    dataset_identity = cast("Mapping[str, Any]", datasets["train"])
-    sample_ids = dataset_identity.get("sample_ids")
-    fingerprint = dataset_identity.get("fingerprint")
-    if not isinstance(sample_ids, list) or not isinstance(fingerprint, str):
-        msg = "Physics monitor membership requires ordered sample IDs and fingerprint."
-        raise TypeError(msg)
-    selected = [int(value) for value in cast("Any", raw_indices).tolist()[: int(monitor["max_cases"])]]
-    from src import datasets as dataset_package  # noqa: PLC0415
-
-    digest = dataset_package.identity.membership_digest(
+    split_contract = datasets.splits.admit_split_contract(split_indices)
+    evidence = split_contract.role("eval")
+    selected = list(evidence.index_values[: int(monitor["max_cases"])])
+    digest = datasets.identity.membership_digest(
         role="wandb_physics_monitor",
-        dataset_fingerprint=fingerprint,
-        sample_ids=sample_ids,
+        dataset_fingerprint=evidence.source.fingerprint,
+        sample_ids=evidence.source.sample_ids,
         indices=selected,
     )
-    membership_digests = metadata.get("membership_digests")
-    saved_eval_digest = membership_digests.get("eval") if isinstance(membership_digests, Mapping) else None
     return {
         "source_indices": selected,
-        "sample_ids": [sample_ids[index] for index in selected],
+        "sample_ids": [evidence.source.sample_ids[index] for index in selected],
         "membership_digest": digest,
-        "saved_eval_membership_digest": saved_eval_digest,
+        "saved_eval_membership_digest": evidence.membership_digest,
         "max_cases": int(monitor["max_cases"]),
     }
 

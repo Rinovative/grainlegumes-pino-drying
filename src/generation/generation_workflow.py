@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 from src import common
 
+from . import generation_campaign_evidence as campaign_evidence
 from . import generation_campaign_runtime as campaign_runtime
 from . import generation_config as config_service
 from . import generation_pilot as pilot_service
@@ -78,12 +79,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _run_directory(run_id: str, *, storage_root: Path) -> Path:
-    """Return one validated campaign-run metadata directory."""
-    safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    return common.paths.get_generation_meta_root(storage_root=storage_root) / "campaigns" / safe_id
-
-
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     """Load one required non-symlink JSON object."""
     if not path.is_file() or path.is_symlink():
@@ -124,22 +119,22 @@ def _tree_size(path: Path) -> int:
 
 def _transfer_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the GPU transfer receipt path."""
-    return _run_directory(run_id, storage_root=storage_root) / "transfer_complete.json"
+    return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / "transfer_complete.json"
 
 
 def _dataset_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the complete dataset-gate receipt path."""
-    return _run_directory(run_id, storage_root=storage_root) / DATASET_RECEIPT_FILENAME
+    return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / DATASET_RECEIPT_FILENAME
 
 
 def _all_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the all-workflow receipt path."""
-    return _run_directory(run_id, storage_root=storage_root) / ALL_WORKFLOW_RECEIPT_FILENAME
+    return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / ALL_WORKFLOW_RECEIPT_FILENAME
 
 
 def _cleanup_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the compact CPU source-cleanup receipt path."""
-    return _run_directory(run_id, storage_root=storage_root) / CPU_CLEANUP_RECEIPT_FILENAME
+    return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / CPU_CLEANUP_RECEIPT_FILENAME
 
 
 def _package_runtime_evidence(
@@ -148,7 +143,7 @@ def _package_runtime_evidence(
     storage_root: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Return a validated manifest, inspection, and bounded loader smoke."""
-    from src.datasets import dataset_packages as package_service  # noqa: PLC0415
+    from src.datasets import packages as package_service  # noqa: PLC0415
 
     manifest = package_service.load_package_manifest(dataset_id, storage_root=storage_root)
     inspection = package_service.inspect_dataset_package(dataset_id, storage_root=storage_root)
@@ -259,7 +254,7 @@ def validate_dataset_packages_receipt(
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
     receipt = _load_json(receipt_path, label="dataset package completion receipt")
     required = {
@@ -317,12 +312,12 @@ def build_campaign_datasets(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build or exactly reuse, inspect, and loader-smoke every declared package."""
-    from src.datasets import dataset_packages as package_service  # noqa: PLC0415
+    from src.datasets import packages as package_service  # noqa: PLC0415
 
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
-    campaign = campaign_runtime.campaign_for_run(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     if terminal["dataset_packages"] != list(campaign.dataset_packages):
         message = "Terminal campaign dataset declarations differ from the repository campaign."
         raise RuntimeError(message)
@@ -762,6 +757,92 @@ def validate_completed_workflow(
     return receipt
 
 
+def _pilot_cleanup_evidence(
+    workflow: Mapping[str, Any],
+) -> pilot_service.CleanupWorkflowEvidence:
+    """Return the terminal cleanup binding from a validated workflow receipt."""
+    cleanup = workflow["cpu_cleanup_complete"]
+    status = cleanup["status"]
+    receipt = workflow["cpu_cleanup_receipt"]
+    if status == "complete":
+        if not isinstance(receipt, dict):
+            message = "Completed workflow cleanup lacks its validated receipt evidence."
+            raise RuntimeError(message)
+        receipt_sha256 = cast("str", receipt["receipt_sha256"])
+        reclaimed_bytes = cast("int", receipt["reclaimed_bytes"])
+    elif status == "skipped_by_request":
+        receipt_sha256 = None
+        reclaimed_bytes = 0
+    else:
+        message = "Pilot cleanup requires a terminal all-workflow receipt."
+        raise RuntimeError(message)
+    return pilot_service.CleanupWorkflowEvidence(
+        campaign_run_id=cast("str", workflow["campaign_run_id"]),
+        status=cast("str", status),
+        receipt_sha256=receipt_sha256,
+        reclaimed_bytes=reclaimed_bytes,
+    )
+
+
+def record_pilot_cleanup_result(
+    run_id: str,
+    *,
+    storage_root: Path | str | None,
+    cpu_source_removed: bool,
+    cpu_bytes_reclaimed: int,
+    cpu_cleanup_receipt_sha256: str | None,
+    transfer_staging_removed: bool,
+    staging_bytes_reclaimed: int,
+    staging_cleanup_receipt_sha256: str | None,
+) -> dict[str, Any]:
+    """Bind validated workflow cleanup evidence into the pilot receipt."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    workflow = validate_all_workflow_receipt(run_id, storage_root=storage)
+    return pilot_service.finalize_cleanup_receipt(
+        run_id,
+        storage_root=storage,
+        workflow_evidence=_pilot_cleanup_evidence(workflow),
+        cpu_source_removed=cpu_source_removed,
+        cpu_bytes_reclaimed=cpu_bytes_reclaimed,
+        cpu_cleanup_receipt_sha256=cpu_cleanup_receipt_sha256,
+        transfer_staging_removed=transfer_staging_removed,
+        staging_bytes_reclaimed=staging_bytes_reclaimed,
+        staging_cleanup_receipt_sha256=staging_cleanup_receipt_sha256,
+    )
+
+
+def validate_completed_pilot_receipt(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate pilot cleanup against the terminal all-workflow receipt."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    workflow = validate_all_workflow_receipt(run_id, storage_root=storage)
+    evidence = _pilot_cleanup_evidence(workflow)
+    receipt = pilot_service.validate_pilot_receipt(
+        run_id,
+        storage_root=storage,
+        require_cleanup_complete=True,
+    )
+    if evidence.campaign_run_id != run_id:
+        message = f"Pilot cleanup workflow evidence belongs to another run: {run_id}"
+        raise ValueError(message)
+    cleanup_requested = bool(receipt["cleanup"]["cleanup_requested"])
+    if cleanup_requested:
+        if (
+            evidence.status != "complete"
+            or evidence.receipt_sha256 != receipt["cleanup"]["cpu_source"]["receipt_sha256"]
+            or evidence.reclaimed_bytes != receipt["cleanup"]["cpu_source"]["bytes_reclaimed"]
+        ):
+            message = f"Pilot CPU cleanup is not bound to the all-workflow receipt: {run_id}"
+            raise ValueError(message)
+    elif evidence.status != "skipped_by_request":
+        message = f"Pilot CPU-source retention is not bound to the all-workflow receipt: {run_id}"
+        raise ValueError(message)
+    return receipt
+
+
 def _cleanup_authorization_payload(
     run_id: str,
     *,
@@ -886,7 +967,7 @@ def _other_campaign_source_references(
             message = f"Campaign metadata contains an unsafe run entry: {directory}"
             raise ValueError(message)
         other_run_id = common.paths.validate_logical_name(directory.name, label="campaign_run_id")
-        manifest = campaign_runtime.load_campaign_run(other_run_id, storage_root=storage)
+        manifest = campaign_evidence.load_campaign_run(other_run_id, storage_root=storage)
         shared: set[str] = set()
         for batch in manifest["batches"]:
             for key in ("meta_directory", "raw_directory", "processed_directory"):
@@ -1059,7 +1140,7 @@ def _cleanup_receipt_identity_is_valid(
         or common.serialization.canonical_json_sha256(_cleanup_authorization_from_identity(identity)) != authorization_sha256
     ):
         return False
-    terminal_path = _run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
+    terminal_path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
     return (
         terminal_path.is_file()
         and not terminal_path.is_symlink()
@@ -1411,7 +1492,7 @@ def _cleanup_cpu_campaign_source_locked(
     if not confirm:
         return result
 
-    terminal_path = _run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
+    terminal_path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / "campaign_terminal.json"
     receipt_identity = {
         "schema_kind": CPU_CLEANUP_SCHEMA_KIND,
         "schema_version": WORKFLOW_SCHEMA_VERSION,
@@ -1660,7 +1741,7 @@ def _manifest_source_directories(
     storage: Path,
 ) -> tuple[Path, ...]:
     """Return run-owned CPU source directories even before terminal publication."""
-    manifest = campaign_runtime.load_campaign_run(run_id, storage_root=storage)
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
     directories: list[Path] = []
     roots = {
         "meta_directory": common.paths.get_generation_meta_root(storage_root=storage).resolve(),
@@ -1689,7 +1770,7 @@ def campaign_source_status(
     """Report one host's campaign source bytes, state, and cleanup eligibility."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     cleanup_path = _cleanup_receipt_path(run_id, storage_root=storage)
-    campaign_directory = _run_directory(run_id, storage_root=storage)
+    campaign_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     if cleanup_path.exists():
         raw_receipt = _load_json(cleanup_path, label="CPU source cleanup receipt")
         authorization_sha256 = raw_receipt.get("authorization_sha256")
@@ -1832,7 +1913,7 @@ def storage_status(
     package_errors: list[dict[str, str]] = []
     metadata_root = common.paths.get_dataset_metadata_root(storage_root=storage)
     if metadata_root.is_dir():
-        from src.datasets import dataset_packages as package_service  # noqa: PLC0415
+        from src.datasets import packages as package_service  # noqa: PLC0415
 
         for directory in sorted(metadata_root.iterdir()):
             if not directory.is_dir() or directory.is_symlink():

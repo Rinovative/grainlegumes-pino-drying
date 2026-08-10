@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from src import generation
+from src.generation import generation_preflight as preflight
 
 _CAMPAIGN = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
 
@@ -27,12 +28,12 @@ def _paths(
     work.mkdir()
     (venv / "bin").mkdir(parents=True)
     monkeypatch.setattr(
-        generation.preflight.sys,
+        preflight.sys,
         "executable",
         str(venv / "bin/python3"),
     )
-    monkeypatch.setattr(generation.preflight.sys, "version_info", (3, 10, 14, "final", 0))
-    monkeypatch.setattr(generation.preflight.sys, "version", "3.10.14 (synthetic test runtime)")
+    monkeypatch.setattr(preflight.sys, "version_info", (3, 10, 14, "final", 0))
+    monkeypatch.setattr(preflight.sys, "version", "3.10.14 (synthetic test runtime)")
     return storage, work, venv
 
 
@@ -42,22 +43,23 @@ def _fake_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_which(name: str) -> str | None:
         return None if name == "quota" else f"/synthetic/bin/{name}"
 
-    def fake_version(command: list[str]) -> dict[str, Any]:
+    def fake_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        assert timeout_seconds > 0.0
         return {
             "arguments": command,
             "exit_code": 0,
             "output": "Python 3.10.14; COMSOL Multiphysics 6.4; synthetic tool",
         }
 
-    monkeypatch.setattr(generation.preflight.shutil, "which", fake_which)
-    monkeypatch.setattr(generation.preflight, "_version_output", fake_version)
+    monkeypatch.setattr(preflight.shutil, "which", fake_which)
+    monkeypatch.setattr(preflight, "_version_output", fake_version)
 
 
 def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Run one production-blocked but environment-complete preflight."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
-    return generation.preflight.run_cpu_preflight(
+    return preflight.run_cpu_preflight(
         _CAMPAIGN,
         only_batch=None,
         storage_root=storage,
@@ -115,9 +117,9 @@ def test_preflight_fails_clearly_when_native_command_is_missing(
             return None
         return f"/synthetic/bin/{name}"
 
-    monkeypatch.setattr(generation.preflight.shutil, "which", fake_which)
+    monkeypatch.setattr(preflight.shutil, "which", fake_which)
     with pytest.raises(FileNotFoundError, match=missing):
-        generation.preflight.run_cpu_preflight(
+        preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,
             storage_root=storage,
@@ -139,12 +141,12 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
     """Protect venv dependency and exact module-stack failure messages."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        generation.preflight.importlib.util,
+        preflight.importlib.util,
         "find_spec",
         lambda name: None if name == "h5py" else object(),
     )
     with pytest.raises(ModuleNotFoundError, match="h5py"):
-        generation.preflight.run_cpu_preflight(
+        preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,
             storage_root=storage,
@@ -167,12 +169,12 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
     execution["site"]["python_module"] = "Python/3.11"
     wrong = replace(campaign, execution_values=execution)
     monkeypatch.setattr(
-        generation.preflight.config_service,
+        preflight.config_service,
         "load_campaign_config",
         lambda *_args, **_kwargs: wrong,
     )
-    with pytest.raises(ValueError, match="native ICE contract"):
-        generation.preflight.run_cpu_preflight(
+    with pytest.raises(RuntimeError, match=r"Configured Python module expects version 3[.]11"):
+        preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,
             storage_root=storage,
@@ -193,22 +195,24 @@ def test_preflight_rejects_wrong_binding_runtime_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect the exact native Python 3.10 and COMSOL 6.4 runtime."""
+    """Protect configured Python and COMSOL module/runtime versions."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
-    expected = "Python 3.10 exactly"
+    expected = r"Configured Python module expects version 3[.]10"
     if wrong_runtime == "python":
-        monkeypatch.setattr(generation.preflight.sys, "version_info", (3, 11, 0, "final", 0))
-        monkeypatch.setattr(generation.preflight.sys, "version", "3.11.0 (synthetic wrong runtime)")
+        monkeypatch.setattr(preflight.sys, "version_info", (3, 11, 0, "final", 0))
+        monkeypatch.setattr(preflight.sys, "version", "3.11.0 (synthetic wrong runtime)")
     else:
-        expected = "COMSOL must report version 6.4"
-        monkeypatch.setattr(
-            generation.preflight,
-            "_version_output",
-            lambda command: {"arguments": command, "exit_code": 0, "output": "COMSOL Multiphysics 6.3"},
-        )
+        expected = r"Configured comsol module expects version 6[.]4"
+
+        def wrong_comsol_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+            assert timeout_seconds > 0.0
+            output = "COMSOL Multiphysics 6.3" if command[0].endswith("/comsol") else "Python 3.10.14; synthetic tool"
+            return {"arguments": command, "exit_code": 0, "output": output}
+
+        monkeypatch.setattr(preflight, "_version_output", wrong_comsol_version)
     with pytest.raises(RuntimeError, match=expected):
-        generation.preflight.run_cpu_preflight(
+        preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,
             storage_root=storage,
@@ -231,7 +235,7 @@ def test_preflight_rejects_resource_oversubscription_before_probe(
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
     with pytest.raises(ValueError, match="cores_per_node"):
-        generation.preflight.run_cpu_preflight(
+        preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,
             storage_root=storage,

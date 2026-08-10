@@ -1533,7 +1533,7 @@ def create_dataloaders_from_config(
     paths_test_ood = tuple(common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root) for dataset_name in ood_dataset_names)
     seeds = dict(seed_plan or {})
     run_seed = int(config["run"]["seed"])
-    train_loader, test_loaders, normalizer, split_indices = datasets.base.create_dataloaders(
+    train_loader, test_loaders, normalizer, split_indices = datasets.training.create_dataloaders(
         path_train=str(path_train),
         path_test_ood=tuple(str(path) for path in paths_test_ood),
         task=task,

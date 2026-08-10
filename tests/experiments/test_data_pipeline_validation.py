@@ -132,7 +132,7 @@ def _split_info(
         ),
     }
     return {
-        "schema_version": datasets.identity.SPLIT_SCHEMA_VERSION,
+        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
         "task": task.id,
         "task_contract_digest": task.contract_digest,
         "train_indices": train_indices,
@@ -205,7 +205,7 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
             split_seed=seed_plan["split"],
         )
         state = _normalizer_state(id_inputs, id_outputs, split["train_indices"])
-        processor = datasets.base.data_processor_from_state(state, device="cpu")
+        processor = datasets.normalization.data_processor_from_state(state, device="cpu")
         train_generator = torch.Generator().manual_seed(seed_plan["loader"])
         return {
             "train": DataLoader(

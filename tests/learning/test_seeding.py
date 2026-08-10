@@ -91,11 +91,11 @@ def test_non_strict_cuda_reproducibility_keeps_process_and_worker_seed_owners(
     assert plan == experiments.run.build_seed_plan(9)
 
     worker_calls: list[tuple[str, int]] = []
-    monkeypatch.setattr(datasets.base.random, "seed", lambda seed: worker_calls.append(("python", seed)))
-    monkeypatch.setattr(datasets.base.np.random, "seed", lambda seed: worker_calls.append(("numpy", seed)))
-    monkeypatch.setattr(datasets.base.torch, "manual_seed", lambda seed: worker_calls.append(("torch", seed)))
+    monkeypatch.setattr(datasets.training.random, "seed", lambda seed: worker_calls.append(("python", seed)))
+    monkeypatch.setattr(datasets.training.np.random, "seed", lambda seed: worker_calls.append(("numpy", seed)))
+    monkeypatch.setattr(datasets.training.torch, "manual_seed", lambda seed: worker_calls.append(("torch", seed)))
     worker_id = 3
-    datasets.base._make_worker_init_fn(plan["worker"])(worker_id)  # noqa: SLF001
+    datasets.training._make_worker_init_fn(plan["worker"])(worker_id)  # noqa: SLF001
     expected_worker_seed = plan["worker"] + worker_id
     assert worker_calls == [
         ("python", expected_worker_seed),
@@ -182,18 +182,29 @@ def test_model_subseed_is_applied_immediately_before_construction(
         lambda _config: synthetic_task,
     )
 
+    synthetic_split_contract = object()
+    monkeypatch.setattr(
+        datasets.splits,
+        "admit_split_contract",
+        lambda _payload: synthetic_split_contract,
+    )
+
     def build_normalizer_artifact(
         processor: _Processor,
         *,
         task: object,
-        split_info: dict[str, Any],
+        split_contract: object,
     ) -> dict[str, Any]:
         """Keep the construction-order test isolated from dataset identity."""
         assert task is synthetic_task
-        assert split_info["train_indices"].tolist() == [0]
+        assert split_contract is synthetic_split_contract
         return {"state": processor.state_dict()}
 
-    monkeypatch.setattr(datasets.base, "build_normalizer_artifact", build_normalizer_artifact)
+    monkeypatch.setattr(
+        datasets.normalization,
+        "build_normalizer_artifact",
+        build_normalizer_artifact,
+    )
 
     class ConstructionReached(RuntimeError):
         """Stop the orchestration immediately after the ordering assertion."""
