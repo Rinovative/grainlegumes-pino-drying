@@ -1,64 +1,190 @@
 schema_kind: generation_profile
 schema_version: 1
 simulation_profile: transient_drying
-template_ready: false
-steady_flow_conditioning: null
+steady_flow_conditioning:
+  schema_kind: steady_flow_conditioning
+  schema_version: 1
+  exhaustive: true
+  stationary_solution_contract_id: vp2_stationary_airflow_v1
+  dependencies:
+  - name: Kxx
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: Kxy
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: Kyy
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: eps_bed
+    affects_stationary_solution: true
+    owner: model_input
+    unit: '1'
+  - name: p_in_bc
+    affects_stationary_solution: true
+    owner: model_input
+    unit: Pa
+  - name: T_flow_ref
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: K
+    fixed_value: 300.65
+  - name: p_ref
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: Pa
+    fixed_value: 101325.0
+  - name: p_out
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: Pa
+    fixed_value: 0.0
+  additional_case_varying_solver_scalars: []
 exports:
 - role: steady_flow_fields
-  pattern: null
-  delimiter: ;
+  temporal_kind: stationary
+  source:
+    state: declared_unverified
+    pattern: stationary_fields.csv
+  delimiter: ','
   columns:
-    x: null
-    y: null
-    Kxx: null
-    Kxy: null
-    Kyy: null
-    eps_bed: null
-    p_in_bc: null
-    X_0_db_field: null
-    u: null
-    v: null
-    p: null
-    rho_bu_dry: null
-  time_column: null
+    x:
+      state: declared_unverified
+      source_header: x
+    y:
+      state: declared_unverified
+      source_header: y
+    Kxx:
+      state: declared_unverified
+      source_header: Kxx
+    Kxy:
+      state: declared_unverified
+      source_header: Kxy
+    Kyy:
+      state: declared_unverified
+      source_header: Kyy
+    eps_bed:
+      state: declared_unverified
+      source_header: eps_bed
+    p_in_bc:
+      state: declared_unverified
+      source_header: p_in_bc
+    X_0_db_field:
+      state: declared_unverified
+      source_header: X_0_db_field
+    u:
+      state: declared_unverified
+      source_header: u
+    v:
+      state: declared_unverified
+      source_header: v
+    p:
+      state: declared_unverified
+      source_header: p
+    rho_bu_dry:
+      state: declared_unverified
+      source_header: rho_bu_dry
 - role: transient_fields
-  pattern: null
-  delimiter: ;
+  temporal_kind: regular_time_series
+  source:
+    state: declared_unverified
+    pattern: transient_states.csv
+  delimiter: ','
   columns:
-    x: null
-    y: null
-    t: null
-    T: null
-    phi: null
-    w_surf: null
-    w_int: null
-  time_column: null
+    t:
+      state: declared_unverified
+      source_header: t
+    x:
+      state: declared_unverified
+      source_header: x
+    y:
+      state: declared_unverified
+      source_header: y
+    T:
+      state: declared_unverified
+      source_header: T
+    phi:
+      state: declared_unverified
+      source_header: mt.phi
+    w_surf:
+      state: declared_unverified
+      source_header: w_surf
+    w_int:
+      state: declared_unverified
+      source_header: w_int
 - role: global_time_series
-  pattern: null
-  delimiter: ;
+  temporal_kind: regular_time_series
+  source:
+    state: declared_unverified
+    pattern: global_timeseries.csv
+  delimiter: ','
   columns:
-    t: null
-    X_wb_bulk: null
-    f_wet_dm: null
-    m_w_gr: null
-    m_v_gas: null
-    m_dot_evap: null
-    m_dot_v_in: null
-    m_dot_v_out: null
-    mt_mass_balance: null
-    T_out_mean: null
-    phi_out_mean: null
-  time_column: null
+    t:
+      state: declared_unverified
+      source_header: t
+    X_wb_bulk:
+      state: declared_unverified
+      source_header: comp1.X_wb_bulk
+    f_wet_dm:
+      state: declared_unverified
+      source_header: comp1.f_wet_dm
+    m_w_gr:
+      state: declared_unverified
+      source_header: comp1.m_w_gr
+    m_v_gas:
+      state: mapping_probe_required
+    m_dot_evap:
+      state: declared_unverified
+      source_header: comp1.m_dot_evap
+    m_dot_v_in:
+      state: mapping_probe_required
+    m_dot_v_out:
+      state: mapping_probe_required
+    mt_mass_balance:
+      state: mapping_probe_required
+    T_out_mean:
+      state: declared_unverified
+      source_header: comp1.T_out_mean
+    phi_out_mean:
+      state: declared_unverified
+      source_header: comp1.phi_out_mean
 - role: final_status
-  pattern: null
-  delimiter: ;
+  temporal_kind: final_status
+  source:
+    state: declared_unverified
+    pattern: final_status.csv
+  delimiter: ','
   columns:
-    t_final: null
-    f_wet_dm_final: null
-    X_wb_bulk_final: null
-    X_wb_max_final: null
-    T_min_final: null
-    T_max_final: null
-    phi_min_final: null
-    phi_max_final: null
-  time_column: null
+    t_final:
+      state: declared_unverified
+      source_header: t
+    f_wet_dm_final:
+      state: declared_unverified
+      source_header: comp1.f_wet_dm
+    X_wb_bulk_final:
+      state: declared_unverified
+      source_header: comp1.X_wb_bulk
+    X_wb_max_final:
+      state: declared_unverified
+      source_header: comp1.maxop_bed(comp1.X_wb)
+    T_min_final:
+      state: declared_unverified
+      source_header: comp1.minop_bed(comp1.T)
+    T_max_final:
+      state: declared_unverified
+      source_header: comp1.maxop_bed(comp1.T)
+    phi_min_final:
+      state: declared_unverified
+      source_header: comp1.minop_bed(comp1.mt.phi)
+    phi_max_final:
+      state: declared_unverified
+      source_header: comp1.maxop_bed(comp1.mt.phi)
+- role: exact_stop_diagnostics
+  temporal_kind: irregular_stop_diagnostic
+  source:
+    state: mapping_probe_required
+  delimiter: ','
+  columns: {}

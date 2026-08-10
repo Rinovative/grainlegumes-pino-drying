@@ -1,5 +1,9 @@
 schema_kind: generation_parameter_registry
 schema_version: 1
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 parameters:
   kappa_mean:
     kind: interval
@@ -9,6 +13,10 @@ parameters:
     ood_group: bed
     report_symbol: \bar{\kappa}
     description: Mean scalar bed permeability used by the lognormal permeability field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   kappa_cv:
     kind: interval
     unit: '1'
@@ -18,6 +26,10 @@ parameters:
     report_symbol: c_{\kappa}
     description: Coefficient of variation used to derive the lognormal permeability
       spread.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.coarse_len_rel:
     kind: interval
     unit: '1'
@@ -26,6 +38,10 @@ parameters:
     ood_group: bed
     report_symbol: \ell_{b,c}/L_x
     description: Coarse bed correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.fine_len_rel:
     kind: interval
     unit: '1'
@@ -34,6 +50,10 @@ parameters:
     ood_group: bed
     report_symbol: \ell_{b,f}/L_x
     description: Fine bed correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.coarse_weight:
     kind: interval
     unit: '1'
@@ -42,6 +62,10 @@ parameters:
     ood_group: bed
     report_symbol: \alpha_{b,c}
     description: Independent coarse contribution to the bed multiscale field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.fine_ani_x:
     kind: interval
     unit: '1'
@@ -50,6 +74,10 @@ parameters:
     ood_group: bed
     report_symbol: a_{b,x}
     description: Fine bed correlation-length multiplier along x.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.fine_ani_y:
     kind: interval
     unit: '1'
@@ -58,6 +86,10 @@ parameters:
     ood_group: bed
     report_symbol: a_{b,y}
     description: Fine bed correlation-length multiplier along y.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.structure.cross_scale_corr:
     kind: interval
     unit: '1'
@@ -66,6 +98,10 @@ parameters:
     ood_group: bed
     report_symbol: \rho_b
     description: Correlation between coarse and fine bed latent seeds.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.perturbations.amplitude:
     kind: interval
     unit: '1'
@@ -74,6 +110,10 @@ parameters:
     ood_group: bed
     report_symbol: \eta_b
     description: Root-mean-square amplitude of bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.perturbations.granularity:
     kind: interval
     unit: '1'
@@ -82,6 +122,10 @@ parameters:
     ood_group: bed
     report_symbol: g_b
     description: Scale selector for bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   bed.perturbations.sign_bias:
     kind: interval
     unit: '1'
@@ -90,6 +134,10 @@ parameters:
     ood_group: bed
     report_symbol: q_b
     description: Positive-sign probability for bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   permeability.anisotropy.max_ratio:
     kind: interval
     unit: '1'
@@ -98,6 +146,10 @@ parameters:
     ood_group: bed
     report_symbol: a_{\max}
     description: Maximum permeability anisotropy ratio.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   permeability.anisotropy.exponent:
     kind: interval
     unit: '1'
@@ -106,6 +158,10 @@ parameters:
     ood_group: bed
     report_symbol: \gamma_a
     description: Exponent mapping bed structure magnitude to anisotropy.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   permeability.anisotropy.strength:
     kind: interval
     unit: '1'
@@ -114,6 +170,10 @@ parameters:
     ood_group: bed
     report_symbol: s_K
     description: Multiplier controlling permeability-tensor anisotropy.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   permeability.orientation.jitter:
     kind: interval
     unit: '1'
@@ -122,6 +182,10 @@ parameters:
     ood_group: bed
     report_symbol: j_{\theta}
     description: Random perturbation amplitude for permeability orientation.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   permeability.orientation.smooth_len_rel:
     kind: interval
     unit: '1'
@@ -130,6 +194,10 @@ parameters:
     ood_group: bed
     report_symbol: \ell_{\theta}/L_x
     description: Relative smoothing length for permeability orientation.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   porosity.anchor_rel:
     kind: interval
     unit: '1'
@@ -138,6 +206,10 @@ parameters:
     ood_group: bed
     report_symbol: A_K/\bar{\kappa}
     description: Relative Kozeny-Carman anchoring factor for the porosity map.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   porosity.smooth_len_rel:
     kind: interval
     unit: '1'
@@ -146,6 +218,10 @@ parameters:
     ood_group: bed
     report_symbol: \ell_{\varepsilon}/L_x
     description: Relative smoothing length for the porosity latent field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   porosity.texture_amp:
     kind: interval
     unit: '1'
@@ -154,6 +230,10 @@ parameters:
     ood_group: bed
     report_symbol: \Delta\varepsilon
     description: Porosity texture amplitude around the calibrated reference.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.mean:
     kind: interval
     unit: Pa
@@ -162,6 +242,10 @@ parameters:
     ood_group: operation
     report_symbol: \bar{p}_{\mathrm{in}}
     description: Mean inlet pressure boundary magnitude.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.sin_amp:
     kind: interval
     unit: '1'
@@ -170,6 +254,10 @@ parameters:
     ood_group: operation
     report_symbol: a_{p,\sin}
     description: Relative sinusoidal inlet-pressure amplitude.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.sin_freq:
     kind: interval
     unit: '1'
@@ -178,6 +266,10 @@ parameters:
     ood_group: operation
     report_symbol: f_{p,\sin}
     description: Sinusoidal inlet-pressure spatial frequency.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.sin_phase:
     kind: interval
     unit: rad
@@ -186,6 +278,10 @@ parameters:
     ood_group: operation
     report_symbol: \varphi_{p,\sin}
     description: Sinusoidal inlet-pressure phase.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.gauss_count:
     kind: integer
     unit: '1'
@@ -193,6 +289,10 @@ parameters:
     ood_group: operation
     report_symbol: n_{p,G}
     description: Number of Gaussian inlet-pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.gauss_amp:
     kind: interval
     unit: '1'
@@ -201,6 +301,10 @@ parameters:
     ood_group: operation
     report_symbol: a_{p,G}
     description: Combined relative amplitude of Gaussian pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.gauss_width:
     kind: interval
     unit: '1'
@@ -209,6 +313,10 @@ parameters:
     ood_group: operation
     report_symbol: \sigma_{p,G}
     description: Reference width of Gaussian pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.gauss_jitter:
     kind: interval
     unit: '1'
@@ -217,6 +325,10 @@ parameters:
     ood_group: operation
     report_symbol: j_{p,G}
     description: Relative Gaussian pressure-width jitter.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   pressure_bc.linear_amp:
     kind: interval
     unit: '1'
@@ -225,6 +337,10 @@ parameters:
     ood_group: operation
     report_symbol: a_{p,\mathrm{lin}}
     description: Relative linear inlet-pressure trend.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   initial_moisture.mean_db:
     kind: interval
     unit: kg/kg
@@ -233,6 +349,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: \bar{X}_{0,db}
     description: Mean initial dry-basis moisture of the generated field.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.amplitude_db:
     kind: interval
     unit: kg/kg
@@ -241,6 +360,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: \Delta X_{0,db}
     description: Maximum dry-basis deviation from the configured initial mean.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.coarse_len_rel:
     kind: interval
     unit: '1'
@@ -249,6 +371,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: \ell_{X,c}/L_x
     description: Coarse initial-moisture correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.fine_len_rel:
     kind: interval
     unit: '1'
@@ -257,6 +382,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: \ell_{X,f}/L_x
     description: Fine initial-moisture correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.coarse_weight:
     kind: interval
     unit: '1'
@@ -266,6 +394,9 @@ parameters:
     report_symbol: \alpha_{X,c}
     description: Independent coarse contribution to the initial-moisture multiscale
       field.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.fine_ani_x:
     kind: interval
     unit: '1'
@@ -274,6 +405,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: a_{X,x}
     description: Fine initial-moisture correlation-length multiplier along x.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.fine_ani_y:
     kind: interval
     unit: '1'
@@ -282,6 +416,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: a_{X,y}
     description: Fine initial-moisture correlation-length multiplier along y.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   initial_moisture.structure.cross_scale_corr:
     kind: interval
     unit: '1'
@@ -290,6 +427,9 @@ parameters:
     ood_group: initial_moisture
     report_symbol: \rho_X
     description: Correlation between coarse and fine initial-moisture latent seeds.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   T_in_base:
     kind: interval
     unit: K
@@ -298,6 +438,9 @@ parameters:
     ood_group: operation
     report_symbol: T_{\mathrm{in},0}
     description: Baseline inlet-air temperature.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   T_in_amp:
     kind: interval
     unit: K
@@ -306,6 +449,9 @@ parameters:
     ood_group: operation
     report_symbol: \Delta T_{\mathrm{in}}
     description: Inlet-temperature schedule amplitude.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   omega_in_base:
     kind: interval
     unit: kg/kg
@@ -314,6 +460,9 @@ parameters:
     ood_group: operation
     report_symbol: \omega_{\mathrm{in},0}
     description: Baseline inlet humidity ratio.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   omega_in_amp:
     kind: interval
     unit: kg/kg
@@ -322,6 +471,9 @@ parameters:
     ood_group: operation
     report_symbol: \Delta\omega_{\mathrm{in}}
     description: Inlet humidity-ratio schedule amplitude.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   schedule.corr:
     kind: interval
     unit: '1'
@@ -330,6 +482,9 @@ parameters:
     ood_group: operation
     report_symbol: \rho_{T,\omega}
     description: Cross-correlation of temperature and humidity schedule latent processes.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   schedule.timescale_rel:
     kind: interval
     unit: '1'
@@ -338,6 +493,9 @@ parameters:
     ood_group: operation
     report_symbol: \tau_{\mathrm{sched}}/t_{\max}
     description: Schedule correlation timescale divided by total duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   schedule.component_weights:
     kind: simplex
     unit: '1'
@@ -349,6 +507,10 @@ parameters:
     ood_group: operation
     report_symbol: \boldsymbol{\lambda}_{\mathrm{sched}}
     description: Smooth, event, and trend schedule simplex.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: schedule_simplex
   schedule.event_count:
     kind: integer
     unit: '1'
@@ -356,6 +518,9 @@ parameters:
     ood_group: operation
     report_symbol: n_{\mathrm{event}}
     description: Number of generated schedule events.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   schedule.event_duration_rel:
     kind: interval
     unit: '1'
@@ -364,6 +529,9 @@ parameters:
     ood_group: operation
     report_symbol: d_{\mathrm{event}}/t_{\max}
     description: Event duration divided by total schedule duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   schedule.event_width_rel:
     kind: interval
     unit: '1'
@@ -372,6 +540,9 @@ parameters:
     ood_group: operation
     report_symbol: w_{\mathrm{event}}/t_{\max}
     description: Event-edge width divided by total schedule duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   rho_bu_dry_ref:
     kind: interval
     unit: kg/m^3
@@ -380,6 +551,10 @@ parameters:
     ood_group: material_properties
     report_symbol: \rho_{\mathrm{bu,dry,ref}}
     description: Reference dry bulk density at calibration porosity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: density_calibration
   k_gr:
     kind: interval
     unit: W/(m*K)
@@ -388,6 +563,9 @@ parameters:
     ood_group: material_properties
     report_symbol: k_{\mathrm{gr}}
     description: Dry granular-phase thermal conductivity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   cp_gr_dry:
     kind: interval
     unit: J/(kg*K)
@@ -396,6 +574,9 @@ parameters:
     ood_group: material_properties
     report_symbol: c_{p,\mathrm{gr,dry}}
     description: Dry granular-phase specific heat capacity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   r_surf_0:
     kind: interval
     unit: 1/s
@@ -404,6 +585,10 @@ parameters:
     ood_group: material_properties
     report_symbol: r_{\mathrm{surf},0}
     description: Reference surface-moisture transfer rate.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
   r_int_surf:
     kind: interval
     unit: '1'
@@ -412,6 +597,10 @@ parameters:
     ood_group: material_properties
     report_symbol: r_{\mathrm{int/surf}}
     description: Internal-to-surface transfer-rate ratio.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
   f_surf:
     kind: interval
     unit: '1'
@@ -420,6 +609,10 @@ parameters:
     ood_group: material_properties
     report_symbol: f_{\mathrm{surf}}
     description: Initial surface-water fraction.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
   T_amb:
     kind: interval
     unit: K
@@ -428,18 +621,9 @@ parameters:
     ood_group: operation
     report_symbol: T_{\mathrm{amb}}
     description: Ambient temperature and initial granular-phase temperature source.
-  density_calibration:
-    kind: paired_parameter_set
-    components:
-    - rho_bu_dry_ref
-    - eps_bed_cal_ref
-    units:
-      rho_bu_dry_ref: kg/m^3
-      eps_bed_cal_ref: '1'
-    ood_group: material_properties
-    report_symbol: (\rho_{\mathrm{bu,dry,ref}},\varepsilon_{\mathrm{bed,cal,ref}})
-    description: Optional evidence-preserving paired dry-bulk-density and calibration-porosity
-      records.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
   bed.structure.fine_weight:
     kind: derived
     unit: '1'
@@ -448,6 +632,10 @@ parameters:
     - bed.structure.coarse_weight
     report_symbol: \alpha_{b,f}
     description: Derived complementary fine contribution to the bed multiscale field.
+    classification: derived
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   initial_moisture.structure.fine_weight:
     kind: derived
     unit: '1'
@@ -456,26 +644,44 @@ parameters:
     - initial_moisture.structure.coarse_weight
     report_symbol: \alpha_{X,f}
     description: Derived complementary fine contribution to initial-moisture structure.
+    classification: derived
+    profile_applicability:
+    - transient_drying
   eps_min_global:
     kind: fixed
     unit: '1'
     report_symbol: \varepsilon_{\min}
     description: Universal lower porosity bound.
+    classification: fixed
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   eps_max_global:
     kind: fixed
     unit: '1'
     report_symbol: \varepsilon_{\max}
     description: Universal upper porosity bound.
+    classification: fixed
+    profile_applicability:
+    - steady_flow
+    - transient_drying
   eps_bed_cal_ref:
     kind: fixed
     unit: '1'
     report_symbol: \varepsilon_{\mathrm{bed,cal,ref}}
     description: Material calibration porosity for dry bulk density.
+    classification: fixed
+    profile_applicability:
+    - transient_drying
+    atomic_record: density_calibration
   X_target_wb:
     kind: fixed
     unit: '1'
     report_symbol: X_{\mathrm{target,wb}}
     description: Material wet-basis target moisture.
+    classification: fixed
+    profile_applicability:
+    - transient_drying
   oswin:
     kind: parameter_set
     components:
@@ -489,6 +695,10 @@ parameters:
     ood_group: material_properties
     report_symbol: \boldsymbol{\theta}_{\mathrm{Oswin}}
     description: Coupled Oswin A, B, and C equilibrium-isotherm record.
+    classification: coupled_record
+    profile_applicability:
+    - transient_drying
+    atomic_record: oswin
   T_init:
     kind: derived
     unit: K
@@ -497,6 +707,9 @@ parameters:
     - T_amb
     report_symbol: T_{\mathrm{init}}
     description: Initial temperature derived from ambient temperature.
+    classification: derived
+    profile_applicability:
+    - transient_drying
   r_surf:
     kind: derived
     unit: 1/s
@@ -505,6 +718,9 @@ parameters:
     - r_surf_0
     report_symbol: r_{\mathrm{surf}}
     description: Surface rate copied from its reference value.
+    classification: derived
+    profile_applicability:
+    - transient_drying
   r_int:
     kind: derived
     unit: 1/s
@@ -514,6 +730,9 @@ parameters:
     - r_surf
     report_symbol: r_{\mathrm{int}}
     description: Internal rate derived from r_int_surf and r_surf.
+    classification: derived
+    profile_applicability:
+    - transient_drying
   T_in_ref:
     kind: derived
     unit: K
@@ -522,3 +741,6 @@ parameters:
     - schedule
     report_symbol: \bar{T}_{\mathrm{in}}
     description: Time-average inlet temperature derived from the schedule.
+    classification: derived
+    profile_applicability:
+    - transient_drying

@@ -1,0 +1,560 @@
+# ruff: noqa: S101, PLR2004, ARG005, SLF001
+"""Six-material transient pilot planning, diagnostics, evidence, and cleanup."""
+
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+
+from src import common
+from src.generation import generation_config as config_service
+from src.generation import generation_pilot as pilot_service
+from src.generation import generation_pilot_analysis as analysis_service
+from src.generation import generation_runtime as runtime_service
+from src.generation import generation_sampling as sampling_service
+from src.generation import generation_workspace as workspace_service
+
+_PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
+
+
+def _pilot(cases_per_material: int) -> config_service.CampaignConfig:
+    return config_service.load_campaign_config(
+        _PILOT_CAMPAIGN,
+        require_executable=False,
+        pilot_cases_per_material=cases_per_material,
+    )
+
+
+def _canonical_case_result(
+    *,
+    result_class: str = "PASS",
+    failed_stage: str | None = None,
+    solver_status: str = "success",
+) -> dict[str, Any]:
+    target_reached = None if failed_stage is not None else True
+    drying_time_h = None if target_reached is not True else 72.0
+    return {
+        "material": "lentil",
+        "material_role": "seen",
+        "case_kind": "nominal_reference",
+        "case_index": 1,
+        "case_id": "case_00001",
+        "solver_status": solver_status,
+        "result_class": result_class,
+        "target_reached": target_reached,
+        "drying_time_h": drying_time_h,
+        "drying_time_days": None if drying_time_h is None else drying_time_h / 24.0,
+        "last_valid_time_h": None if failed_stage is not None else 72.0,
+        "stop_reason": "runtime_failure" if failed_stage is not None else "target_stop",
+        "failed_stage": failed_stage,
+        "warning_count": 0,
+        "final_X_wb_bulk": None if failed_stage is not None else 0.08,
+        "final_f_wet_dm": None if failed_stage is not None else 0.04,
+        "warnings": [],
+    }
+
+
+def _physical_inputs() -> tuple[dict[str, np.ndarray], list[dict[str, np.ndarray]], dict[str, list[float]], dict[str, float]]:
+    shape = (2, 2)
+    static = {
+        "Kxx": np.full(shape, 2.0e-10),
+        "Kxy": np.zeros(shape),
+        "Kyy": np.full(shape, 2.0e-10),
+        "eps_bed": np.full(shape, 0.4),
+        "rho_bu_dry": np.full(shape, 700.0),
+        "p": np.asarray([[10.0, 9.0], [2.0, 1.0]]),
+        "u": np.full(shape, 0.1),
+        "v": np.zeros(shape),
+    }
+    states = [
+        {
+            "T": np.full(shape, 300.0),
+            "phi": np.full(shape, 0.4),
+            "w_surf": np.full(shape, 100.0),
+            "w_int": np.full(shape, 100.0),
+        },
+        {
+            "T": np.full(shape, 305.0),
+            "phi": np.full(shape, 0.3),
+            "w_surf": np.full(shape, 90.0),
+            "w_int": np.full(shape, 95.0),
+        },
+    ]
+    globals_by_name = {
+        "f_wet_dm": [1.0, 0.04],
+        "m_dot_evap": [0.01, 0.005],
+        "X_wb_bulk": [0.125, 0.115],
+        "T_out_mean": [299.0, 303.0],
+        "phi_out_mean": [0.4, 0.3],
+        "m_dot_v_in": [0.001, 0.001],
+        "m_dot_v_out": [0.01, 0.006],
+    }
+    scalars = {
+        "eps_min_global": 0.25,
+        "eps_max_global": 0.65,
+        "f_surf": 0.3,
+        "r_surf_0": 1.0e-5,
+        "A_osw": 10.0,
+        "B_osw": 0.1,
+        "C_osw": 0.5,
+        "X_target_wb": 0.06,
+    }
+    return static, states, globals_by_name, scalars
+
+
+def test_pilot_planning_and_nominal_sampling_are_technical_only() -> None:
+    """Protect six-family counts, technical-only membership, and explicit nominals."""
+    one = _pilot(1)
+    three = _pilot(3)
+    assert one.total_case_count == 6
+    assert three.total_case_count == 18
+    assert one.dataset_packages == three.dataset_packages == ()
+    assert one.campaign_purpose == three.campaign_purpose == "pilot_check"
+    assert one.evaluation_regimes == three.evaluation_regimes == ()
+    assert one.membership == three.membership == {}
+    assert all(not members for members in three.material_memberships.values())
+    assert three.source_path == _PILOT_CAMPAIGN.resolve()
+    assert tuple(batch.material_family for batch in three.batches) == config_service.materials.MATERIAL_FAMILIES
+    for batch in three.batches:
+        assert [batch.case_assignment(index)["pilot_case_kind"] for index in batch.case_indices] == [
+            "nominal_reference",
+            "natural_pilot",
+            "natural_pilot",
+        ]
+        assert all(batch.case_assignment(index)["ood_group"] is None for index in batch.case_indices)
+    batch = three.batches[0]
+    nominal = sampling_service.sample_case(batch, 1)
+    natural = sampling_service.sample_case(batch, 2)
+    registry = batch.scientific_values["material"]["parameter_registry"]
+    assert nominal.values["T_in_base"] == registry["T_in_base"]["nominal"]
+    assert nominal.values["schedule.component_weights"] == registry["schedule.component_weights"]["nominal"]
+    assert nominal.ood_provenance["seed_search"] is False
+    assert all(record["sampling_kind"] == "explicit_configured_nominal" for record in nominal.block_provenance.values())
+    assert "sampling_kind" not in next(iter(natural.block_provenance.values()))
+
+
+def test_pilot_nominal_fails_closed_without_an_explicit_value() -> None:
+    """Protect fail-closed nominal construction without hidden midpoints."""
+    batch = _pilot(1).batches[0]
+    scientific = json.loads(json.dumps(batch.scientific_values))
+    scientific["material"]["parameter_registry"]["T_in_base"].pop("nominal")
+    malformed = replace(batch, scientific_values=scientific)
+    with pytest.raises(ValueError, match="T_in_base"):
+        sampling_service.sample_case(malformed, 1)
+
+
+def test_balance_quadrature_formulas_and_native_statistics_have_no_tolerance() -> None:
+    """Protect all three water balances and tolerance-free native statistics."""
+    time_h = np.asarray([0.0, 1.0, 2.0])
+    evaporation = np.full(3, 1.0 / 3600.0)
+    vapor_in = np.full(3, 0.5 / 3600.0)
+    vapor_out = np.full(3, 0.2 / 3600.0)
+    result = analysis_service.water_balance_diagnostics(
+        time_h,
+        {
+            "m_w_gr": [10.0, 9.0, 8.0],
+            "m_v_gas": [2.0, 3.3, 4.6],
+            "m_dot_evap": evaporation,
+            "m_dot_v_in": vapor_in,
+            "m_dot_v_out": vapor_out,
+        },
+    )
+    assert analysis_service.trapezoidal_interval_integrals(time_h, evaporation) == pytest.approx([1.0, 1.0])
+    for name in ("total_water", "granular_water", "gas_water"):
+        assert result[name]["interval_residual_kg"] == pytest.approx([0.0, 0.0], abs=2.0e-15)
+        assert result[name]["acceptance_tolerance"] is None
+    native = analysis_service.native_mass_balance_statistics([-2.0, 1.0, 0.5])
+    assert native == {
+        "min": -2.0,
+        "max": 1.0,
+        "max_abs": 2.0,
+        "mean_abs": pytest.approx(7.0 / 6.0),
+        "rms": pytest.approx(np.sqrt(5.25 / 3.0)),
+        "final": 0.5,
+        "unit": "kg/s",
+        "acceptance_tolerance": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("target_reached", "final_time_h", "expected", "expected_time"),
+    [
+        (True, 72.0, "PASS", 72.0),
+        (True, 12.0, "TOO_FAST", 12.0),
+        (False, 168.0, "NOT_DRY_WITHIN_HORIZON", None),
+    ],
+)
+def test_nominal_duration_states_do_not_fabricate_censored_times(
+    target_reached: bool,
+    final_time_h: float,
+    expected: str,
+    expected_time: float | None,
+) -> None:
+    """Protect nominal duration states and uncensored-time semantics."""
+    result = analysis_service.duration_diagnostic(
+        case_kind="nominal_reference",
+        target_reached=target_reached,
+        final_time_h=final_time_h,
+        last_regular_time_h=min(final_time_h, 168.0),
+        final_x_wb_bulk=0.08,
+        final_f_wet_dm=0.04 if target_reached else 0.2,
+        configured_threshold=0.05,
+        previous_regular_f_wet_dm=0.06,
+    )
+    assert result["result"] == expected
+    assert result["drying_time_h"] == expected_time
+    assert result["right_censored"] is (not target_reached)
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "result_class", "solver_status"),
+    [
+        ("input", "INPUT_FAILED", "not_started"),
+        ("solver", "SOLVER_FAILED", "failed"),
+        ("export", "EXPORT_FAILED", "success"),
+        ("conversion", "CONVERSION_FAILED", "success"),
+        ("invalid_result", "INVALID_RESULT", "success"),
+    ],
+)
+def test_pilot_result_classes_require_matching_failure_stages(
+    failed_stage: str,
+    result_class: str,
+    solver_status: str,
+) -> None:
+    """Protect the exhaustive result vocabulary and stage-to-result mapping."""
+    assert pilot_service.PILOT_RESULT_CLASSES == (
+        "PASS",
+        "PASS_WITH_WARNINGS",
+        "TOO_FAST",
+        "NOT_DRY_WITHIN_HORIZON",
+        "INPUT_FAILED",
+        "SOLVER_FAILED",
+        "EXPORT_FAILED",
+        "CONVERSION_FAILED",
+        "INVALID_RESULT",
+        "PHYSICAL_CONTRACT_VIOLATION",
+    )
+    record = _canonical_case_result(
+        result_class=result_class,
+        failed_stage=failed_stage,
+        solver_status=solver_status,
+    )
+    pilot_service._validate_case_result(record)
+    record["result_class"] = "PASS"
+    with pytest.raises(ValueError, match="stage and result class disagree"):
+        pilot_service._validate_case_result(record)
+
+
+def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None:
+    """Protect generic physical bounds, extrema, trends, and schedule checks."""
+    static, states, globals_by_name, scalars = _physical_inputs()
+    physical, diagnostics = analysis_service.field_and_physical_diagnostics(
+        static=static,
+        transient_states=states,
+        globals_by_name=globals_by_name,
+        scalars=scalars,
+    )
+    assert physical["status"] == "pass"
+    assert physical["permeability"]["positive_definite"] is True
+    assert physical["local_m_evap"]["status"] == "derived_from_binding_formula_and_canonical_states"
+    assert physical["local_m_evap"]["nonnegative"] is True
+    assert diagnostics["run_extrema"]["T_min_run"] == 300.0
+    assert diagnostics["run_extrema"]["T_max_run"] == 305.0
+    assert diagnostics["run_extrema"]["X_target_wb"] == 0.06
+    assert diagnostics["airflow"]["velocity_magnitude_max"] == 0.1
+    trends = analysis_service.monotonicity_diagnostics(
+        {
+            "m_w_gr": [3.0, 2.0, 2.5, 2.4],
+            "X_wb_bulk": [0.3, 0.2, 0.21, 0.1],
+            "f_wet_dm": [1.0, 0.5, 0.6, 0.2],
+        }
+    )
+    assert trends["m_w_gr"] == {
+        "positive_step_count": 1,
+        "largest_positive_step": 0.5,
+        "total_positive_excursion": 0.5,
+        "automatic_failure_tolerance": None,
+    }
+    schedule = analysis_service.schedule_diagnostics(
+        [[0.0, 305.0, 0.01, 0.4], [1.0, 306.0, 0.011, 0.5]],
+        schedule_metadata={
+            "min_phi_source_air": 0.35,
+            "max_phi_source_air": 0.55,
+            "min_heater_temperature_rise": 4.0,
+        },
+        ambient_temperature=300.0,
+        phi_operational_min=0.05,
+        phi_operational_max=0.85,
+    )
+    assert schedule["status"] == "pass"
+
+    invalid_static = {name: values.copy() for name, values in static.items()}
+    invalid_states = [{name: values.copy() for name, values in state.items()} for state in states]
+    invalid_globals = {name: list(values) for name, values in globals_by_name.items()}
+    invalid_static["eps_bed"][0, 0] = 0.9
+    invalid_static["Kxy"][0, 0] = 1.0
+    invalid_static["rho_bu_dry"][0, 1] = -1.0
+    invalid_states[0]["T"][0, 0] = -2.0
+    invalid_states[0]["phi"][0, 1] = 1.2
+    invalid_states[0]["w_surf"][1, 0] = -5.0
+    invalid_globals["f_wet_dm"][0] = 1.2
+    invalid_globals["m_dot_evap"][0] = -0.1
+    invalid, _diagnostics = analysis_service.field_and_physical_diagnostics(
+        static=invalid_static,
+        transient_states=invalid_states,
+        globals_by_name=invalid_globals,
+        scalars=scalars,
+    )
+    quantities = {record["quantity"] for record in invalid["violations"]}
+    assert invalid["status"] == "violation"
+    assert {
+        "eps_bed",
+        "permeability_tensor",
+        "rho_bu_dry",
+        "T",
+        "phi",
+        "w_surf",
+        "X_db",
+        "X_wb",
+        "f_wet_dm",
+        "m_dot_evap",
+    }.issubset(quantities)
+
+
+def test_storage_projection_uses_only_successful_measured_hdf5() -> None:
+    """Protect measured-artifact-only storage projections and exact arithmetic."""
+    result = analysis_service.production_storage_projection(
+        [
+            {
+                "storage": {
+                    "canonical_hdf5_bytes": 1000,
+                    "regular_state_count": 10,
+                    "transient_dataset_storage_bytes": 400,
+                    "global_dataset_storage_bytes": 100,
+                }
+            },
+            {
+                "storage": {
+                    "canonical_hdf5_bytes": 2000,
+                    "regular_state_count": 20,
+                    "transient_dataset_storage_bytes": 800,
+                    "global_dataset_storage_bytes": 200,
+                }
+            },
+        ]
+    )
+    assert result["basis"] == "observed_real_pilot_based_estimate"
+    assert result["mean_based_660_bytes"] == 990_000
+    assert result["median_based_660_bytes"] == 990_000
+    assert result["min_hdf5_bytes_per_case"] == 1000
+    assert result["max_hdf5_bytes_per_case"] == 2000
+    assert result["full_horizon_projection"]["exact"] is False
+    assert result["storage_budget_guard"] is None
+    assert analysis_service.production_storage_projection([])["production_storage_projection"] == "unavailable"
+
+
+def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protect exact fixed-point source accounting before pilot cleanup."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_inventory_test"
+    campaign = pilot_service._run_directory(run_id, storage_root=storage)
+    meta = storage / "01_generation/meta/batches/pilot_batch"
+    raw = storage / "01_generation/raw/pilot_batch"
+    processed = storage / "01_generation/processed/pilot_batch"
+    failure = meta / "pilot_failure_evidence/case_00002/failure.json"
+    for directory in (campaign, meta, raw / "exports", processed, failure.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    (campaign / "campaign_terminal.json").write_bytes(b"terminal\n")
+    (meta / "solver.log").write_bytes(b"log\n")
+    failure.write_bytes(b"failure\n")
+    export = raw / "exports/fields.csv"
+    export.write_bytes(b"x,y\n1,2\n")
+    hdf5 = processed / "case.h5"
+    hdf5.write_bytes(b"canonical-hdf5")
+
+    def relative(path: Path) -> str:
+        return path.relative_to(storage).as_posix()
+
+    terminal = {
+        "cases": [
+            {
+                "material": "lentil",
+                "case_id": "case_00001",
+                "terminal_state": "success",
+                "raw_directory": relative(raw),
+                "processed_directory": relative(processed),
+            },
+            {
+                "material": "chickpea",
+                "case_id": "case_00002",
+                "terminal_state": "failure",
+                "failure_evidence": {"relative_path": relative(failure)},
+            },
+        ]
+    }
+    plan = {
+        "campaign_directory": relative(campaign),
+        "batches": [
+            {
+                "meta_directory": relative(meta),
+                "raw_directory": relative(raw),
+                "processed_directory": relative(processed),
+            }
+        ],
+    }
+    monkeypatch.setattr(pilot_service, "validate_pilot_terminal", lambda *args, **kwargs: terminal)
+    monkeypatch.setattr(pilot_service, "pilot_transfer_plan", lambda *args, **kwargs: plan)
+
+    result = pilot_service.record_cpu_source_inventory(run_id, storage_root=storage)
+    receipt = campaign / pilot_service.PILOT_SOURCE_INVENTORY_FILENAME
+    assert result["cpu_case_bytes_before_cleanup"] == {
+        "lentil:case_00001": export.stat().st_size + hdf5.stat().st_size,
+        "chickpea:case_00002": failure.stat().st_size,
+    }
+    assert result["cpu_case_file_counts"] == {
+        "lentil:case_00001": 2,
+        "chickpea:case_00002": 1,
+    }
+    assert result["cpu_logs_bytes"] == (meta / "solver.log").stat().st_size
+    assert result["cpu_exports_bytes"] == export.stat().st_size
+    all_files = [path for root in (campaign, meta, raw, processed) for path in root.rglob("*") if path.is_file()]
+    unique_files = {path.resolve() for path in all_files}
+    assert result["cpu_source_bytes_before_cleanup"] == sum(path.stat().st_size for path in unique_files)
+    assert result["cpu_source_file_count_before_cleanup"] == len(unique_files)
+    assert receipt.resolve() in unique_files
+    assert pilot_service.validate_cpu_source_inventory(run_id, storage_root=storage) == result
+
+    staging = workspace_service.create_transfer_staging(storage_root=storage, run_id=run_id)
+    staging_campaign = pilot_service._run_directory(run_id, storage_root=staging)
+    staging_campaign.mkdir(parents=True)
+    (staging_campaign / "campaign_terminal.json").write_bytes(b"terminal\n")
+    staging_result = pilot_service.record_transfer_staging_inventory(
+        run_id,
+        staging_root=staging,
+    )
+    staging_files = [path for path in staging.rglob("*") if path.is_file()]
+    assert staging_result["transfer_staging_bytes_before_cleanup"] == sum(path.stat().st_size for path in staging_files)
+    assert staging_result["transfer_staging_file_count"] == len(staging_files)
+    assert (
+        pilot_service.validate_transfer_staging_inventory(
+            run_id,
+            storage_root=staging,
+            require_staging_present=True,
+        )
+        == staging_result
+    )
+
+
+def test_failed_pilot_retains_compact_artifacts_before_scratch_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protect compact failed evidence before marked scratch disappears."""
+    batch = _pilot(1).batches[0]
+    storage = tmp_path / "storage"
+    work = tmp_path / "case-work"
+    (work / "runtime").mkdir(parents=True)
+    (work / "exports").mkdir()
+    (work / "case.json").write_text('{"input_files": {}}\n', encoding="utf-8")
+    for name in ("fields.csv", "scalars.csv", "schedule.csv"):
+        (work / name).write_text("header\n1\n", encoding="utf-8")
+    (work / "runtime" / "solver.log").write_text("solver failed\n", encoding="utf-8")
+    (work / "runtime" / "status.json").write_text("{}\n", encoding="utf-8")
+    (work / "exports" / "partial.csv").write_text("t,value\n0,1\n", encoding="utf-8")
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
+    runtime_service.record_case_failure(
+        batch,
+        1,
+        RuntimeError("synthetic pilot failure"),
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node01",
+        work_directory=work,
+        storage_root=storage,
+        failure_stage="solver",
+    )
+    assert runtime_service.case_failure_is_recorded(batch, 1, storage_root=storage)
+    failure = json.loads(runtime_service.case_failure_path(batch, 1, storage_root=storage).read_text(encoding="utf-8"))
+    assert {
+        "case.json",
+        "fields.csv",
+        "scalars.csv",
+        "schedule.csv",
+        "runtime/solver.log",
+        "runtime/status.json",
+        "export_inventory.json",
+    }.issubset(failure["retained_artifacts"])
+    shutil.rmtree(work)
+    assert runtime_service.case_failure_is_recorded(batch, 1, storage_root=storage)
+
+
+def test_staging_cleanup_writes_pending_transaction_before_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protect durable staging-cleanup intent before exact deletion."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_cleanup_test"
+    staging = workspace_service.create_transfer_staging(storage_root=storage, run_id=run_id)
+    (staging / "payload.bin").write_bytes(b"pilot")
+    files = [path for path in staging.rglob("*") if path.is_file()]
+    expected_bytes = sum(path.stat().st_size for path in files)
+    expected_files = len(files)
+    directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(directory / pilot_service.PILOT_PRE_CLEANUP_FILENAME, {"bound": True})
+    inventory = {
+        "transfer_staging_path": str(staging),
+        "transfer_staging_bytes_before_cleanup": expected_bytes,
+        "transfer_staging_file_count": expected_files,
+    }
+    monkeypatch.setattr(pilot_service, "validate_pilot_pre_cleanup", lambda *args, **kwargs: {"bound": True})
+    monkeypatch.setattr(pilot_service, "validate_transfer_staging_inventory", lambda *args, **kwargs: inventory)
+    original_cleanup = workspace_service.cleanup_transfer_staging
+
+    def observed_cleanup(*args: Any, **kwargs: Any) -> int:
+        pending = json.loads((directory / pilot_service.PILOT_STAGING_CLEANUP_FILENAME).read_text(encoding="utf-8"))
+        assert pending["status"] == "pending"
+        return original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_service, "cleanup_transfer_staging", observed_cleanup)
+    receipt = pilot_service.cleanup_recorded_transfer_staging(
+        run_id,
+        storage_root=storage,
+        confirm=True,
+    )
+    assert receipt["status"] == "complete"
+    assert receipt["removed"] is True
+    assert receipt["reclaimed_bytes"] == expected_bytes
+    assert not staging.exists()
+
+
+def test_missing_retained_evidence_blocks_pre_cleanup(tmp_path: Path) -> None:
+    """Protect fail-closed cleanup authorization when GPU evidence is missing."""
+    storage = tmp_path / "storage"
+    directory = pilot_service.pilot_check_directory("missing_evidence", storage_root=storage)
+    directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(
+        directory / pilot_service.PILOT_PRE_CLEANUP_FILENAME,
+        {
+            "schema_kind": pilot_service.PILOT_RECEIPT_SCHEMA_KIND,
+            "schema_version": pilot_service.PILOT_SCHEMA_VERSION,
+            "pilot_check_id": "missing_evidence",
+            "cleanup": {"authorized": True},
+            "cases": [_canonical_case_result()],
+            "retained_evidence_paths": [str(storage / "does-not-exist")],
+        },
+    )
+    with pytest.raises(ValueError, match="pre-cleanup evidence"):
+        pilot_service.validate_pilot_pre_cleanup("missing_evidence", storage_root=storage)

@@ -74,6 +74,7 @@ class DatasetRequest:
     membership: views.IdMembership | None = None
     ood_group: views.OodGroup | None = None
     storage_root: Path | str | None = None
+    allow_technical_smoke: bool = False
 
     def __post_init__(self) -> None:
         """Reject selectors that are ambiguous or invalid for their regime."""
@@ -88,6 +89,9 @@ class DatasetRequest:
         if self.evaluation_regime not in views.PACKAGE_REGIMES:
             message = f"Unsupported package regime: {self.evaluation_regime!r}."
             raise ValueError(message)
+        if not isinstance(self.allow_technical_smoke, bool):
+            message = "allow_technical_smoke must be boolean."
+            raise TypeError(message)
         if self.evaluation_regime == "id":
             if self.ood_group is not None:
                 message = "ID package selection cannot include an OOD group."
@@ -339,6 +343,9 @@ def create_dataset(
             f"Dataset request {request.dataset_view!r}/{request.evaluation_regime!r} "
             f"does not match package {manifest['dataset_view']!r}/{manifest['evaluation_regime']!r}."
         )
+        raise ValueError(message)
+    if manifest.get("campaign_purpose") == "technical_runtime_smoke" and not request.allow_technical_smoke:
+        message = "Technical-smoke package admission requires allow_technical_smoke=True."
         raise ValueError(message)
     payload_path = _payload_path(manifest, storage_root=request.storage_root)
     if request.dataset_view == "steady_flow":

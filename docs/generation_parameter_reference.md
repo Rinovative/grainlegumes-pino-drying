@@ -1,374 +1,418 @@
-# VP2 Generation Parameter and Symbol Reference
+# VP2 Generation Parameter and Config Reference
 
-Audience: implementers, evidence researchers, COMSOL adapters, report authors, and sensitivity/error analysts. This is the single catalogue for generation parameters, quantities, numerical dimensions, machine-name/report-symbol mappings, and evidence requirements. YAML and source remain executable authority; no unresolved value or literature source is supplied here.
+YAML and Python validation are the executable authority. This reference gives
+the compact scientific contract, canonical names and units, ownership rules,
+and inspection commands. Numeric material records and their source evidence
+remain in `configs/generation/materials/<family>.yaml`; they are not duplicated
+here.
 
-## Naming and catalogue conventions
+## Scientific parameter note
 
-Canonical scientific names do not encode units. Physical names are shared across Python, YAML, adapters, HDF5, datasets, evaluation, and documentation. Internal controls use the compact `bed`, `permeability`, `porosity`, `pressure_bc`, `initial_moisture`, or `schedule` namespace. Report notation remains concise and independent of machine-name length; each registry symbol maps to exactly one canonical machine name.
+> The configured values and ranges are executable modelling and sampling
+> decisions, not universal experimentally validated material constants. A value
+> may be directly reported, refitted, convention- or unit-converted, transferred,
+> engineering-calculated or inverted, selected as a calibration prior, or
+> selected as synthetic generator design. A citation therefore does not imply
+> that the final configured number appears directly in that source. The
+> machine-readable `status`, `derivation`, `confidence`, and `validity` fields
+> define the authoritative interpretation. Software, COMSOL, smoke, and pilot
+> passes validate runtime and data flow only; they do not experimentally validate
+> the configured science.
 
-In the catalogue, `d` is the effective numerical coordinate contribution. Natural support is ID support; parameter OOD uses a scientifically justified disjoint support in registry-transform coordinates, while family OOD uses the held-out family's natural support. All values/selections persist in `case.json`; the table names their principal additional effect. Exact solver equations are defined once in the [manual COMSOL checklist](simulation_generation.md#manual-comsol-64-adaptation-checklist).
+## Owners at a glance
 
-## Complete registry catalogue
-
-| Canonical name | Report symbol | Unit | Category | Block | Status | d | Transform/selection | Owner | Purpose/effect | Generation/derivation | ID/OOD | Consumer | COMSOL relevance | Persistence | Neural-operator relevance | Evidence | Report |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `kappa_mean` | $\bar{\kappa}$ | `m^2` | physical sample | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Mean scalar bed permeability used by the lognormal permeability field. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | main text |
-| `kappa_cv` | $c_{\kappa}$ | `1` | physical sample | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Coefficient of variation used to derive the lognormal permeability spread. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | main text |
-| `bed.structure.coarse_len_rel` | $\ell_{b,c}/L_x$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Coarse bed correlation length divided by bed length. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.structure.fine_len_rel` | $\ell_{b,f}/L_x$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine bed correlation length divided by bed length. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.structure.coarse_weight` | $\alpha_{b,c}$ | `1` | generator control | `airflow` | unresolved | 1 | logit coordinate | `materials/<family>.yaml` | Independent coarse contribution to the bed multiscale field. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.structure.fine_ani_x` | $a_{b,x}$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine bed correlation-length multiplier along x. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.structure.fine_ani_y` | $a_{b,y}$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine bed correlation-length multiplier along y. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.structure.cross_scale_corr` | $\rho_b$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Correlation between coarse and fine bed latent seeds. | multiscale bed field | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.perturbations.amplitude` | $\eta_b$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Root-mean-square amplitude of bed-only local perturbations. | seeded local bed perturbations | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.perturbations.granularity` | $g_b$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Scale selector for bed-only local perturbations. | seeded local bed perturbations | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `bed.perturbations.sign_bias` | $q_b$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Positive-sign probability for bed-only local perturbations. | seeded local bed perturbations | natural; disjoint `bed` OOD | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `permeability.anisotropy.max_ratio` | $a_{\max}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Base maximum ratio in the anisotropy map. | `1 + strength * (max_ratio - 1) * |z_b|^exponent` | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `permeability.anisotropy.exponent` | $\gamma_a$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Exponent mapping bed structure magnitude to anisotropy. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `permeability.anisotropy.strength` | $s_K$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Multiplier controlling permeability-tensor anisotropy. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `permeability.orientation.jitter` | $j_{\theta}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Random perturbation amplitude for permeability orientation. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `permeability.orientation.smooth_len_rel` | $\ell_{\theta}/L_x$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Relative smoothing length for permeability orientation. | lognormal/SPD permeability map | natural; disjoint `bed` OOD | `generation_fields` | indirect: tensor fields | `case.json`; permeability fields/static HDF5 | indirectly generates steady inputs; transient ablation provenance | material unresolved | appendix / implementation |
-| `porosity.anchor_rel` | $A_K/\bar{\kappa}$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Relative anchor converting mean permeability to the Kozeny–Carman factor. | `kozeny_carman_factor = anchor_rel * kappa_mean` | natural; disjoint `bed` OOD | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | indirectly generates `eps_bed`; no direct scalar channel | material unresolved | appendix / implementation |
-| `porosity.smooth_len_rel` | $\ell_{\varepsilon}/L_x$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Relative smoothing length for the porosity latent field. | Kozeny–Carman porosity map | natural; disjoint `bed` OOD | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | indirectly generates `eps_bed`; no direct scalar channel | material unresolved | appendix / implementation |
-| `porosity.texture_amp` | $\Delta\varepsilon$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Porosity texture amplitude around the calibrated reference. | Kozeny–Carman porosity map | natural; disjoint `bed` OOD | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | indirectly generates `eps_bed`; no direct scalar channel | material unresolved | appendix / implementation |
-| `pressure_bc.mean` | $\bar{p}_{\mathrm{in}}$ | `Pa` | physical sample | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Mean inlet pressure boundary magnitude. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | main text |
-| `pressure_bc.sin_amp` | $a_{p,\sin}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Relative sinusoidal inlet-pressure amplitude. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.sin_freq` | $f_{p,\sin}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Sinusoidal inlet-pressure spatial frequency. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.sin_phase` | $\varphi_{p,\sin}$ | `rad` | generator control | `airflow` | unresolved | 1 | phase coordinate | `operations/fixed_bed.yaml` | Sinusoidal inlet-pressure phase. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.gauss_count` | $n_{p,G}$ | `1` | generator control | `airflow` | unresolved | 1 | integer selection | `operations/fixed_bed.yaml` | Number of Gaussian inlet-pressure components. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.gauss_amp` | $a_{p,G}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Combined relative amplitude of Gaussian pressure components. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.gauss_width` | $\sigma_{p,G}$ | `1` | generator control | `airflow` | unresolved | 1 | log coordinate | `operations/fixed_bed.yaml` | Reference width of Gaussian pressure components. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.gauss_jitter` | $j_{p,G}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Relative Gaussian pressure-width jitter. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `pressure_bc.linear_amp` | $a_{p,\mathrm{lin}}$ | `1` | generator control | `airflow` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Relative linear inlet-pressure trend. | inlet-pressure profile | natural; disjoint `operation` OOD | `generation_fields` | indirect: `p_in_bc` | `case.json`; pressure field/static HDF5 | indirectly generates steady `p_in_bc`; transient ablation provenance | operation unresolved | appendix / implementation |
-| `initial_moisture.mean_db` | $\bar{X}_{0,db}$ | `kg/kg` | generator control | `initial_moisture` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Mean initial dry-basis moisture of the generated field. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.amplitude_db` | $\Delta X_{0,db}$ | `kg/kg` | generator control | `initial_moisture` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Maximum dry-basis deviation from the configured initial mean. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.coarse_len_rel` | $\ell_{X,c}/L_x$ | `1` | generator control | `initial_moisture` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Coarse initial-moisture correlation length divided by bed length. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.fine_len_rel` | $\ell_{X,f}/L_x$ | `1` | generator control | `initial_moisture` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine initial-moisture correlation length divided by bed length. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.coarse_weight` | $\alpha_{X,c}$ | `1` | generator control | `initial_moisture` | unresolved | 1 | logit coordinate | `materials/<family>.yaml` | Independent coarse contribution to the initial-moisture multiscale field. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.fine_ani_x` | $a_{X,x}$ | `1` | generator control | `initial_moisture` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine initial-moisture correlation-length multiplier along x. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.fine_ani_y` | $a_{X,y}$ | `1` | generator control | `initial_moisture` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Fine initial-moisture correlation-length multiplier along y. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `initial_moisture.structure.cross_scale_corr` | $\rho_X$ | `1` | generator control | `initial_moisture` | unresolved | 1 | linear coordinate | `materials/<family>.yaml` | Correlation between coarse and fine initial-moisture latent seeds. | bounded multiscale dry-basis field | natural; disjoint `initial_moisture` OOD | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | material unresolved | appendix / implementation |
-| `T_in_base` | $T_{\mathrm{in},0}$ | `K` | physical sample | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Baseline inlet-air temperature. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | main text |
-| `T_in_amp` | $\Delta T_{\mathrm{in}}$ | `K` | physical sample | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Inlet-temperature schedule amplitude. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | main text |
-| `omega_in_base` | $\omega_{\mathrm{in},0}$ | `kg/kg` | physical sample | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Baseline inlet humidity ratio. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | main text |
-| `omega_in_amp` | $\Delta\omega_{\mathrm{in}}$ | `kg/kg` | physical sample | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Inlet humidity-ratio schedule amplitude. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | main text |
-| `schedule.corr` | $\rho_{T,\omega}$ | `1` | generator control | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Cross-correlation of temperature and humidity schedule latent processes. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `schedule.timescale_rel` | $\tau_{\mathrm{sched}}/t_{\max}$ | `1` | generator control | `operation` | unresolved | 1 | log coordinate | `operations/fixed_bed.yaml` | Schedule correlation timescale divided by total duration. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `schedule.component_weights` | $\boldsymbol{\lambda}_{\mathrm{sched}}$ | `1` | generator control | `operation` | unresolved | 2 | 3-part simplex | `operations/fixed_bed.yaml` | Smooth, event, and trend schedule simplex. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `schedule.event_count` | $n_{\mathrm{event}}$ | `1` | generator control | `operation` | unresolved | 1 | integer selection | `operations/fixed_bed.yaml` | Number of generated schedule events. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `schedule.event_duration_rel` | $d_{\mathrm{event}}/t_{\max}$ | `1` | generator control | `operation` | unresolved | 1 | log coordinate | `operations/fixed_bed.yaml` | Event duration divided by total schedule duration. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `schedule.event_width_rel` | $w_{\mathrm{event}}/t_{\max}$ | `1` | generator control | `operation` | unresolved | 1 | log coordinate | `operations/fixed_bed.yaml` | Event-edge width divided by total schedule duration. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | indirectly generates transient boundary conditioning; not state | operation unresolved | appendix / implementation |
-| `rho_bu_dry_ref` | $\rho_{\mathrm{bu,dry,ref}}$ | `kg/m^3` | physical sample | `material_properties` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Reference dry bulk density at calibration porosity. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | solver/calibration provenance; not a direct baseline input | material unresolved | main text |
-| `k_gr` | $k_{\mathrm{gr}}$ | `W/(m*K)` | physical sample | `material_properties` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Dry granular-phase thermal conductivity. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | transient baseline scalar conditioning | material unresolved | main text |
-| `cp_gr_dry` | $c_{p,\mathrm{gr,dry}}$ | `J/(kg*K)` | physical sample | `material_properties` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Dry granular-phase specific heat capacity. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | transient baseline scalar conditioning | material unresolved | main text |
-| `r_surf_0` | $r_{\mathrm{surf},0}$ | `1/s` | physical sample | `material_properties` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Reference surface-moisture transfer rate. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | transient baseline scalar conditioning | material unresolved | main text |
-| `r_int_surf` | $r_{\mathrm{int/surf}}$ | `1` | physical sample | `material_properties` | unresolved | 1 | log coordinate | `materials/<family>.yaml` | Internal-to-surface transfer-rate ratio. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | transient baseline scalar conditioning | material unresolved | main text |
-| `f_surf` | $f_{\mathrm{surf}}$ | `1` | physical sample | `material_properties` | unresolved | 1 | logit coordinate | `materials/<family>.yaml` | Permanent surface-compartment/storage fraction. | material scalar/field contract | natural; disjoint `material_properties` OOD | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | transient baseline scalar conditioning | material unresolved | main text |
-| `T_amb` | $T_{\mathrm{amb}}$ | `K` | physical sample | `operation` | unresolved | 1 | linear coordinate | `operations/fixed_bed.yaml` | Ambient temperature and initial granular-phase temperature source. | compositional inlet schedule | natural; disjoint `operation` OOD | `generation_schedule` | schedule/scalar adapter | `case.json`; schedule/scalar HDF5 | transient baseline boundary conditioning | operation unresolved | main text |
-| `density_calibration` | $(\rho_{\mathrm{bu,dry,ref}},\varepsilon_{\mathrm{bed,cal,ref}})$ | `rho_bu_dry_ref: kg/m^3, eps_bed_cal_ref: 1` | coupled selection | — | unresolved | 0 | optional complete-pair mode | `materials/<family>.yaml` | Optional evidence-preserving paired dry-bulk-density and calibration-porosity records. | material scalar/field contract | alternative complete natural/OOD pairs | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | solver/calibration provenance; not a direct baseline input | material unresolved | appendix / implementation |
-| `bed.structure.fine_weight` | $\alpha_{b,f}$ | `1` | generator control | — | derived | 0 | complement_of_one(bed.structure.coarse_weight) | registry + generator derivation | Derived complementary fine contribution to the bed multiscale field. | multiscale bed field | inherits sources | `generation_fields` | indirect: `fields.csv` | `case.json`; generated field/static HDF5 | indirectly generates steady inputs; transient ablation provenance | derived; formula validation | appendix / implementation |
-| `initial_moisture.structure.fine_weight` | $\alpha_{X,f}$ | `1` | generator control | — | derived | 0 | complement_of_one(initial_moisture.structure.coarse_weight) | registry + generator derivation | Derived complementary fine contribution to initial-moisture structure. | bounded multiscale dry-basis field | inherits sources | `generation_fields` | indirect: `X_0_db_field` | `case.json`; field diagnostics/static HDF5 | transient initial-state provenance/optional ablation; not baseline input | derived; formula validation | appendix / implementation |
-| `eps_min_global` | $\varepsilon_{\min}$ | `1` | fixed support | — | unresolved | 0 | fixed value | `common.yaml` | Universal lower porosity bound. | Kozeny–Carman porosity map | fixed by owner; family OOD only | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | solver-derived or archived provenance; not a direct baseline input | global value unresolved | appendix / implementation |
-| `eps_max_global` | $\varepsilon_{\max}$ | `1` | fixed support | — | unresolved | 0 | fixed value | `common.yaml` | Universal upper porosity bound. | Kozeny–Carman porosity map | fixed by owner; family OOD only | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | solver-derived or archived provenance; not a direct baseline input | global value unresolved | appendix / implementation |
-| `eps_bed_cal_ref` | $\varepsilon_{\mathrm{bed,cal,ref}}$ | `1` | fixed support | — | unresolved | 0 | fixed value | `materials/<family>.yaml` | Material calibration porosity for dry bulk density. | Kozeny–Carman porosity map | fixed by owner; family OOD only | `generation_fields` | indirect: `eps_bed` | `case.json`; porosity/static HDF5 | solver/calibration provenance; not a direct baseline input | material unresolved | appendix / implementation |
-| `X_target_wb` | $X_{\mathrm{target,wb}}$ | `1` | fixed physical | — | unresolved | 0 | fixed value | `materials/<family>.yaml` | Material wet-basis target moisture. | material scalar/field contract | fixed by owner; family OOD only | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | stop/evaluation provenance; not a direct baseline input | material unresolved | main text |
-| `oswin` | $\boldsymbol{\theta}_{\mathrm{Oswin}}$ | `A_osw: 1, B_osw: 1/K, C_osw: 1` | coupled selection | — | unresolved | 0 | complete-set selection | `materials/<family>.yaml` | Coupled Oswin A, B, and C equilibrium-isotherm record. | material scalar/field contract | complete natural/OOD sets | case/scalar adapter | scalar/reviewed expression | `case.json`; scalar/static HDF5 | selected components are transient baseline scalar conditioning | material unresolved | appendix / implementation |
-| `T_init` | $T_{\mathrm{init}}$ | `K` | derived quantity | — | derived | 0 | copy(T_amb) | registry + generator derivation | Initial temperature derived from ambient temperature. | case/physics derivation | inherits sources | case derivation / COMSOL | reviewed expression/provenance | `case.json`; `case.json` plus derived effect | solver-derived or archived provenance; not a direct baseline input | derived; formula validation | main text |
-| `r_surf` | $r_{\mathrm{surf}}$ | `1/s` | derived quantity | — | derived | 0 | copy(r_surf_0) | registry + generator derivation | Surface rate copied from its reference value. | case/physics derivation | inherits sources | case derivation / COMSOL | reviewed expression/provenance | `case.json`; `case.json` plus derived effect | solver-derived or archived provenance; not a direct baseline input | derived; formula validation | main text |
-| `r_int` | $r_{\mathrm{int}}$ | `1/s` | derived quantity | — | derived | 0 | product(r_int_surf, r_surf) | registry + generator derivation | Internal rate derived from r_int_surf and r_surf. | case/physics derivation | inherits sources | case derivation / COMSOL | reviewed expression/provenance | `case.json`; `case.json` plus derived effect | solver-derived or archived provenance; not a direct baseline input | derived; formula validation | main text |
-| `T_in_ref` | $\bar{T}_{\mathrm{in}}$ | `K` | derived quantity | — | derived | 0 | schedule_time_average(schedule) | registry + generator derivation | Time-average inlet temperature derived from the schedule. | case/physics derivation | inherits sources | case derivation / COMSOL | reviewed expression/provenance | `case.json`; `case.json` plus derived effect | solver-derived or archived provenance; not a direct baseline input | derived; formula validation | main text |
-
-## Exact numerical coordinates
-
-Coordinates follow the source-owned ordered tuples. The three-component schedule simplex contributes exactly two coordinates; `T_amb` is operation coordinate 12.
-
-### `airflow` — 28 dimensions
-
-| Coordinate | Parameter | d | Rule | OOD group |
-| --- | --- | --- | --- | --- |
-| 1 | `kappa_mean` | 1 | log coordinate | `bed` |
-| 2 | `kappa_cv` | 1 | linear coordinate | `bed` |
-| 3 | `bed.structure.coarse_len_rel` | 1 | log coordinate | `bed` |
-| 4 | `bed.structure.fine_len_rel` | 1 | log coordinate | `bed` |
-| 5 | `bed.structure.coarse_weight` | 1 | logit coordinate | `bed` |
-| 6 | `bed.structure.cross_scale_corr` | 1 | linear coordinate | `bed` |
-| 7 | `bed.structure.fine_ani_x` | 1 | log coordinate | `bed` |
-| 8 | `bed.structure.fine_ani_y` | 1 | log coordinate | `bed` |
-| 9 | `bed.perturbations.amplitude` | 1 | linear coordinate | `bed` |
-| 10 | `bed.perturbations.granularity` | 1 | linear coordinate | `bed` |
-| 11 | `bed.perturbations.sign_bias` | 1 | linear coordinate | `bed` |
-| 12 | `permeability.anisotropy.max_ratio` | 1 | linear coordinate | `bed` |
-| 13 | `permeability.anisotropy.exponent` | 1 | linear coordinate | `bed` |
-| 14 | `permeability.anisotropy.strength` | 1 | linear coordinate | `bed` |
-| 15 | `permeability.orientation.jitter` | 1 | linear coordinate | `bed` |
-| 16 | `permeability.orientation.smooth_len_rel` | 1 | log coordinate | `bed` |
-| 17 | `porosity.anchor_rel` | 1 | log coordinate | `bed` |
-| 18 | `porosity.smooth_len_rel` | 1 | linear coordinate | `bed` |
-| 19 | `porosity.texture_amp` | 1 | linear coordinate | `bed` |
-| 20 | `pressure_bc.mean` | 1 | linear coordinate | `operation` |
-| 21 | `pressure_bc.sin_amp` | 1 | linear coordinate | `operation` |
-| 22 | `pressure_bc.sin_freq` | 1 | linear coordinate | `operation` |
-| 23 | `pressure_bc.sin_phase` | 1 | phase coordinate | `operation` |
-| 24 | `pressure_bc.gauss_count` | 1 | integer selection | `operation` |
-| 25 | `pressure_bc.gauss_amp` | 1 | linear coordinate | `operation` |
-| 26 | `pressure_bc.gauss_width` | 1 | log coordinate | `operation` |
-| 27 | `pressure_bc.gauss_jitter` | 1 | linear coordinate | `operation` |
-| 28 | `pressure_bc.linear_amp` | 1 | linear coordinate | `operation` |
-
-### `initial_moisture` — 8 dimensions
-
-| Coordinate | Parameter | d | Rule | OOD group |
-| --- | --- | --- | --- | --- |
-| 1 | `initial_moisture.mean_db` | 1 | linear coordinate | `initial_moisture` |
-| 2 | `initial_moisture.amplitude_db` | 1 | linear coordinate | `initial_moisture` |
-| 3 | `initial_moisture.structure.coarse_len_rel` | 1 | log coordinate | `initial_moisture` |
-| 4 | `initial_moisture.structure.fine_len_rel` | 1 | log coordinate | `initial_moisture` |
-| 5 | `initial_moisture.structure.coarse_weight` | 1 | logit coordinate | `initial_moisture` |
-| 6 | `initial_moisture.structure.cross_scale_corr` | 1 | linear coordinate | `initial_moisture` |
-| 7 | `initial_moisture.structure.fine_ani_x` | 1 | log coordinate | `initial_moisture` |
-| 8 | `initial_moisture.structure.fine_ani_y` | 1 | log coordinate | `initial_moisture` |
-
-### `operation` — 12 dimensions
-
-| Coordinate | Parameter | d | Rule | OOD group |
-| --- | --- | --- | --- | --- |
-| 1 | `T_in_base` | 1 | linear coordinate | `operation` |
-| 2 | `T_in_amp` | 1 | linear coordinate | `operation` |
-| 3 | `omega_in_base` | 1 | linear coordinate | `operation` |
-| 4 | `omega_in_amp` | 1 | linear coordinate | `operation` |
-| 5 | `schedule.corr` | 1 | linear coordinate | `operation` |
-| 6 | `schedule.timescale_rel` | 1 | log coordinate | `operation` |
-| 7–8 | `schedule.component_weights` | 2 | 3-part simplex | `operation` |
-| 9 | `schedule.event_count` | 1 | integer selection | `operation` |
-| 10 | `schedule.event_duration_rel` | 1 | log coordinate | `operation` |
-| 11 | `schedule.event_width_rel` | 1 | log coordinate | `operation` |
-| 12 | `T_amb` | 1 | linear coordinate | `operation` |
-
-### `material_properties` — 6 dimensions
-
-| Coordinate | Parameter | d | Rule | OOD group |
-| --- | --- | --- | --- | --- |
-| 1 | `rho_bu_dry_ref` | 1 | log coordinate | `material_properties` |
-| 2 | `k_gr` | 1 | log coordinate | `material_properties` |
-| 3 | `cp_gr_dry` | 1 | log coordinate | `material_properties` |
-| 4 | `r_surf_0` | 1 | log coordinate | `material_properties` |
-| 5 | `r_int_surf` | 1 | log coordinate | `material_properties` |
-| 6 | `f_surf` | 1 | logit coordinate | `material_properties` |
-
-Independent density therefore gives `28 + 8 + 12 + 6 = 54`. In the optional evidence-matched density-pair mode, independent density/calibration-porosity coordinates are replaced by a complete pair selection: the material block is 5 and the total 53. Pair/set selection adds no numerical coordinate. Both fine weights are derived as `fine_weight = 1 - coarse_weight` and add zero.
-
-## Fixed, support, and derived quantities outside registry coordinates
-
-Every row contributes `d = 0` and has no independent block/transform. Fixed constraints apply in ID and parameter OOD unless their owner changes; derived quantities inherit source assignment. “Formula fixed” points to the single equations in the operational guide.
-
-| Canonical name | Report symbol | Unit | Owner/category | Status | Purpose/effect | Consumer / COMSOL | Persistence | Neural-operator relevance | Evidence | Report |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `T_flow_ref` | $T_{\mathrm{flow,ref}}$ | `K` | package fixed | configured `300.65` | stationary Air-property reference temperature | canonical steady template / transient scalar handoff | config/case/HDF5 identity | package-fixed provenance; not a model channel | frozen project decision | main text |
-| `p_ref` | $p_{\mathrm{ref}}$ | `Pa` | package fixed | configured `101325` | humidity-conversion and stationary reference pressure | canonical steady template / transient scalar handoff and schedule generator | config/case/HDF5 identity | package-fixed provenance; not a model channel | operation evidence | appendix |
-| `p_out` | $p_{\mathrm{out}}$ | `Pa` | package fixed | configured `0` | stationary outlet pressure | canonical steady template / transient scalar handoff | config/case/HDF5 identity | package-fixed provenance; not a model channel | operation evidence | appendix |
-| `T_in_max` | $T_{\mathrm{in,max}}$ | `K` | common fixed | configured | inlet-temperature ceiling | schedule constraint | config/case identity | boundary-generation constraint; not a direct model input | design constraint | main text |
-| `omega_min`, `omega_max` | $\omega_{\min},\omega_{\max}$ | `kg/kg` | common fixed | unresolved | humidity-ratio bounds | schedule constraint | config/case identity | boundary-generation constraint; not a direct model input | operation evidence | appendix |
-| `phi_clip_min`, `phi_clip_max` | $\phi_{\min},\phi_{\max}$ | `1` | common fixed | unresolved | relative-humidity bounds | schedule constraint | config/case identity | boundary-generation constraint; not a direct model input | operation evidence | appendix |
-| `f_wet_dm_max` | $f_{\mathrm{wet,dm,max}}$ | `1` | common fixed | configured | dry-mass stop threshold | scalar adapter / stop | scalar HDF5 + status | solver stop/evaluation provenance; not a direct model input | design criterion | main text |
-| `Lx`, `Ly` | $L_x,L_y$ | `m` | grid fixed | configured `1.2, 0.75` | two-dimensional bed extents | fields / COMSOL geometry | coordinates + metadata | coordinate/design provenance; only `x`,`y` are learned coordinates | frozen geometry | main text |
-| `Lz` | $L_z$ | `m` | transient grid fixed | configured `0.8` | transient extrusion and integral depth; excluded from standalone steady input and equivalence | transient COMSOL geometry and integrals | transient scientific metadata | transient provenance; not a model channel | frozen transient geometry | main text |
-| `dx`, `dy` | $\Delta x,\Delta y$ | `m` | grid fixed | configured | boundary-inclusive spacing | fields/export validator | coordinate attributes | discretization provenance; not separate model channels | design geometry | appendix |
-| `nx`, `ny` | $n_x,n_y$ | `1` | grid fixed | configured | point counts | fields/storage | shape metadata | tensor-shape provenance; not model channels | design geometry | implementation |
-| `time.start`, `time.stop` | $t_0,t_{\max}$ | `h` | time fixed | configured | planned interval | schedule/study | schedule + time HDF5 | sequence-scope provenance; not model channels | design horizon | main text |
-| `time.interval` | $\Delta t$ | `h` | time fixed | configured | regular output step | schedule/index | time HDF5 | transient step definition; not a model channel | design horizon | main text |
-| `initial_moisture_bounds` | $[X_{0,db}^{\min},X_{0,db}^{\max}]$ | `kg/kg` | material support | unresolved | no-clipping envelope | moisture generator | case diagnostics | initial-state generation provenance; not baseline input | material evidence | appendix |
-| `w_gr` | $w_{\mathrm{gr}}$ | `kg/m^3` | derived physical | formula fixed | total granular water density | COMSOL/domain | on-demand | solver-derived physical quantity; not a baseline input | model validation | main text |
-| `X_db`, `X_wb` | $X_{db},X_{wb}$ | `1` | derived physical | formula fixed | local dry-/wet-basis moisture | COMSOL/domain | on-demand | solver/evaluation derivations; not baseline inputs | model validation | main text |
-| `X_wb_bulk` | $X_{\mathrm{wb,bulk}}$ | `1` | derived global | formula fixed | mass-integrated wet-basis moisture | COMSOL global | global HDF5/status | evaluation and stop provenance; not a baseline input | COMSOL validation | main text |
-| `rho_bu_dry` | $\rho_{\mathrm{bu,dry}}$ | `kg/m^3` | derived field | formula fixed | local dry bulk density | fields/COMSOL | static HDF5 | transient baseline static conditioning; not steady input | model validation | main text |
-| `w_gr_0` | $w_{\mathrm{gr},0}$ | `kg/m^3` | derived field | formula fixed | initial granular water | fields/COMSOL initial state | case diagnostics | transient initial-state derivation; not per-step baseline input | model validation | main text |
-| `cp_gr_eff` | $c_{p,\mathrm{gr,eff}}$ | `J/(kg*K)` | derived physical | formula fixed | `cp_gr_dry + X_db*cp_w`; volumetric contribution `rho_bu_dry*cp_gr_eff` | COMSOL expression | not exported | solver-derived physics; not direct baseline conditioning | COMSOL runtime validation | main text |
-| `k_eff` | $k_{\mathrm{eff}}$ | `W/(m*K)` | derived physical | formula fixed | single equivalent packed-bed conductivity using Air-material `k_air` | COMSOL expression | not exported | solver-derived physics; not a model channel | COMSOL runtime validation | main text |
-| `X_eq_db`, `w_eq` | $X_{\mathrm{eq,db}},w_{\mathrm{eq}}$ | `1`, `kg/m^3` | derived physical | Oswin formula fixed | equilibrium dry-basis moisture and water concentration | COMSOL expression | not exported | solver-derived physics; not model channels | COMSOL runtime validation | main text |
-| `m_evap` | $\dot{m}_{\mathrm{evap},V}$ | `kg/(m^3*s)` | derived physical | expression mapping unresolved | local volumetric evaporation source | COMSOL expression | not exported; only its integral is stored | solver-derived physics; not a model input | COMSOL validation | main text |
-| `f_wet_dm` | $f_{\mathrm{wet,dm}}$ | `1` | derived global | formula fixed | dry-mass fraction above target | COMSOL output/stop | global HDF5/status | solver stop/evaluation diagnostic; not a model input | COMSOL validation | main text |
-
-## Frozen formula and handoff cross-check
-
-The exact formulas, signs, time classification, and model-tree validation procedure are maintained in the [simulation generation guide](simulation_generation.md). In particular, `w_gr = f_surf*w_surf + (1-f_surf)*w_int`; both initial compartment states equal `rho_bu_dry*X_0_db_field`; `B_osw` has unit `1/K`; and `T_flow_ref` is package-fixed rather than schedule-derived.
-
-The standalone steady adapter contains only the seven spatial `fields.csv` columns; its three package-fixed values remain in template and provenance identity, not a runtime scalar file. The transient adapter adds `X_0_db_field`, the complete `t,T_in_bc,omega_in_bc,phi_in_bc` schedule, and its exact scalar rows. Raw `.mph` text extraction is not authoritative negative evidence: all COMSOL functions, variables, studies, bindings, expressions, and exports remain runtime-unverified until the real sentinel.
-
-## Adapter, state, output, and diagnostic quantities
-
-These physical/solver-facing rows have `d = 0`, no independent block/transform, inherit case ID/OOD assignment, and are owned by `generation_profiles.py` plus the confirmed profile mapping. COMSOL headers/tags remain unresolved. HDF5 persists ordered names and units; coordinates/time also carry unit attributes.
-
-| Canonical name | Report symbol | Unit | Roles | Purpose | Status/COMSOL | Persistence | Neural-operator relevance | Report |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `x` | $x$ | `m` | spatial input | Cartesian x coordinate | mapping unresolved | HDF5 role table/status | steady input; transient baseline static conditioning | appendix / implementation |
-| `y` | $y$ | `m` | spatial input | Cartesian y coordinate | mapping unresolved | HDF5 role table/status | steady input; transient baseline static conditioning | appendix / implementation |
-| `Kxx` | $K_{xx}$ | `m^2` | spatial input, static | permeability tensor xx | mapping unresolved | HDF5 role table/status | steady input; archived transient ablation, not transient baseline | main text |
-| `Kxy` | $K_{xy}$ | `m^2` | spatial input, static | symmetric permeability tensor xy | mapping unresolved | HDF5 role table/status | steady input; archived transient ablation, not transient baseline | main text |
-| `Kyy` | $K_{yy}$ | `m^2` | spatial input, static | permeability tensor yy | mapping unresolved | HDF5 role table/status | steady input; archived transient ablation, not transient baseline | main text |
-| `eps_bed` | $\varepsilon_{\mathrm{bed}}$ | `1` | spatial input, static | bed porosity | mapping unresolved | HDF5 role table/status | steady input; transient baseline static conditioning | main text |
-| `p_in_bc` | $p_{\mathrm{in,bc}}$ | `Pa` | spatial input, static | inlet-pressure boundary field | mapping unresolved | HDF5 role table/status | steady input; archived transient ablation, not transient baseline | main text |
-| `X_0_db_field` | $X_{0,db}$ | `kg/kg` | spatial input, static | initial dry-basis moisture field | mapping unresolved | HDF5 role table/status | transient initial-state provenance/optional ablation; no baseline input | main text |
-| `t` | $t$ | `h` | schedule, global | physical time | mapping unresolved | HDF5 role table/status | sequence/index provenance; not a learned state or conditioning channel | appendix / implementation |
-| `T_in_bc` | $T_{\mathrm{in}}$ | `K` | schedule | inlet temperature | mapping unresolved | HDF5 role table/status | transient boundary conditioning; not a state variable | main text |
-| `omega_in_bc` | $\omega_{\mathrm{in}}$ | `kg/kg` | schedule | inlet humidity ratio | mapping unresolved | HDF5 role table/status | schedule and conversion provenance; not baseline transient conditioning | appendix / implementation |
-| `phi_in_bc` | $\phi_{\mathrm{in}}$ | `1` | schedule | derived inlet relative humidity | mapping unresolved | HDF5 role table/status | transient boundary conditioning; not a state variable | main text |
-| `A_osw` | $A_{\mathrm{Oswin}}$ | `1` | scalar | first coefficient of the selected Oswin equilibrium-isotherm record | equation convention unresolved | case/scalar HDF5 provenance | transient baseline scalar conditioning | main text |
-| `B_osw` | $B_{\mathrm{Oswin}}$ | `1/K` | scalar | second coefficient of the selected Oswin equilibrium-isotherm record | equation convention fixed | case/scalar HDF5 provenance | transient baseline scalar conditioning | main text |
-| `C_osw` | $C_{\mathrm{Oswin}}$ | `1` | scalar | third coefficient of the selected Oswin equilibrium-isotherm record | equation convention unresolved | case/scalar HDF5 provenance | transient baseline scalar conditioning | main text |
-| `u` | $u$ | `m/s` | static | x velocity | mapping unresolved | HDF5 role table/status | steady output; transient baseline static conditioning | main text |
-| `v` | $v$ | `m/s` | static | y velocity | mapping unresolved | HDF5 role table/status | steady output; transient baseline static conditioning | main text |
-| `p` | $p$ | `Pa` | static | pressure | mapping unresolved | HDF5 role table/status | steady output; transient baseline static conditioning | main text |
-| `T` | $T$ | `K` | transient | temperature state | mapping unresolved | HDF5 role table/status | transient dynamic state | main text |
-| `phi` | $\phi$ | `1` | transient | relative-humidity state | mapping unresolved | HDF5 role table/status | transient dynamic state | main text |
-| `w_surf` | $w_{\mathrm{surf}}$ | `kg/m^3` | transient | surface-water density | mapping unresolved | HDF5 role table/status | transient dynamic state | main text |
-| `w_int` | $w_{\mathrm{int}}$ | `kg/m^3` | transient | internal-water density | mapping unresolved | HDF5 role table/status | transient dynamic state | main text |
-| `T_out_mean` | $\bar{T}_{\mathrm{out}}$ | `K` | global | outlet mean temperature | mapping unresolved | HDF5 role table/status | evaluation diagnostic; not a model input | appendix / implementation |
-| `phi_out_mean` | $\bar{\phi}_{\mathrm{out}}$ | `1` | global | outlet mean relative humidity | mapping unresolved | HDF5 role table/status | evaluation diagnostic; not a model input | appendix / implementation |
-| `m_w_gr` | $m_{w,\mathrm{gr}}$ | `kg` | global | granular water mass | mapping unresolved | HDF5 role table/status | mass-balance diagnostic; not a model input | appendix / implementation |
-| `m_v_gas` | $m_{v,\mathrm{gas}}$ | `kg` | global | gas vapor mass | mapping unresolved | HDF5 role table/status | mass-balance diagnostic; not a model input | appendix / implementation |
-| `m_dot_evap` | $\dot{m}_{\mathrm{evap}}$ | `kg/s` | global | integrated evaporation rate | mapping unresolved | HDF5 role table/status | mass-balance diagnostic; not a model input | appendix / implementation |
-| `m_dot_v_in` | $\dot{m}_{v,\mathrm{in}}$ | `kg/s` | global | inlet vapor mass-flow rate | mapping unresolved | HDF5 role table/status | mass-balance diagnostic; not a model input | appendix / implementation |
-| `m_dot_v_out` | $\dot{m}_{v,\mathrm{out}}$ | `kg/s` | global | positive external outlet vapor mass-flow rate | mapping runtime-unverified | HDF5 role table/status | mass-balance diagnostic; not a model input | appendix / implementation |
-| `mt_mass_balance` | $r_{\mathrm{mt,mass}}$ | `kg/s` | global QA | external name for native `mt.massBalance` | mapping runtime-unverified | global HDF5/status | simulation QA; never a neural channel | appendix / implementation |
-| `t_final` | $t_{\mathrm{final}}$ | `h` | final status | exact final time | mapping unresolved | HDF5 role table/status | terminal status provenance; not a model input | appendix / implementation |
-| `f_wet_dm_final` | $f_{\mathrm{wet,dm,final}}$ | `1` | final status | terminal wet dry-mass fraction | mapping runtime-unverified | HDF5 role table/status | terminal stop/evaluation provenance; not a model input | appendix / implementation |
-| `X_wb_bulk_final` | $X_{\mathrm{wb,bulk,final}}$ | `1` | final status | terminal integrated wet-basis moisture | mapping runtime-unverified | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-| `X_wb_max_final` | $X_{\mathrm{wb,max,final}}$ | `1` | final status | terminal local maximum wet-basis moisture | mapping runtime-unverified | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-| `T_min_final` | $T_{\min,\mathrm{final}}$ | `K` | final status | terminal minimum temperature | mapping unresolved | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-| `T_max_final` | $T_{\max,\mathrm{final}}$ | `K` | final status | terminal maximum temperature | mapping unresolved | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-| `phi_min_final` | $\phi_{\min,\mathrm{final}}$ | `1` | final status | terminal minimum relative humidity | mapping unresolved | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-| `phi_max_final` | $\phi_{\max,\mathrm{final}}$ | `1` | final status | terminal maximum relative humidity | mapping unresolved | HDF5 role table/status | terminal diagnostic; not a model input | appendix / implementation |
-
-Quantities already defined in earlier tables and also carried by adapters are `rho_bu_dry` (transient baseline static conditioning), `X_wb_bulk`, `f_wet_dm`, and `X_target_wb` (evaluation/stop provenance only). Their adapter roles do not create second definitions.
-
-### Learning-contract role cross-check
-
-This table adds roles only; authoritative definitions remain in the catalogues above.
-
-| Contract role | Canonical fields |
+| Owner | Scientific decision |
 | --- | --- |
-| Registered steady inputs | `x`, `y`, `Kxx`, `Kxy`, `Kyy`, `eps_bed`, `p_in_bc` |
-| Registered steady outputs | `p`, `u`, `v` |
-| Transient dynamic state | `T`, `phi`, `w_surf`, `w_int` |
-| Transient baseline static conditioning | `x`, `y`, `u`, `v`, `p`, `eps_bed`, `rho_bu_dry` |
-| Transient boundary conditioning | `T_in_bc(t_n)`, `T_in_bc(t_n+1)`, `phi_in_bc(t_n)`, `phi_in_bc(t_n+1)`, `T_amb` |
-| Transient scalar conditioning | `r_surf_0`, `r_int_surf`, `f_surf`, `A_osw`, `B_osw`, `C_osw`, `k_gr`, `cp_gr_dry` |
-| Archived transient ablation | `Kxx`, `Kxy`, `Kyy`, `p_in_bc`, `X_0_db_field` |
-| Transient increment target | `delta_T`, `delta_phi`, `delta_w_surf`, `delta_w_int`, derived as the next regular one-hour state minus the current state |
+| `configs/generation/sources.yaml` | One central bibliographic record per supplied source key |
+| `configs/generation/registry.yaml` | Parameter name, unit, kind, transform, block, OOD group, components, derivation |
+| `configs/generation/common.yaml` | Grid/time, shared fixed physics, formulas, adapters, HDF5 contract |
+| `configs/generation/operations/fixed_bed.yaml` | Apparatus/operation supports and constraints |
+| `configs/generation/materials/<family>.yaml` | Role-neutral family values, natural supports, coupled records, targets, evidence |
+| `configs/generation/profiles/<profile>.yaml` | Template, export schema, explicit mappings, stationary conditioning |
+| `configs/generation/campaigns/<profile>/<campaign>.yaml` | Roles, counts, seeds, package declarations |
+| `configs/generation/execution/cluster_cpu.yaml` | Execution only; excluded from scientific identity |
 
-### Package OOD relevance and stationary conditioning
+The decision-package digest bound into scientific provenance is:
 
-Dataset packages preserve the registry's physical OOD group and the numerical block that generated each selected unit. These are different ownership axes: for example, pressure-profile parameters belong to the `operation` OOD group but to the `airflow` numerical block because they generate the steady `p_in_bc` field.
+```text
+774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+```
 
-| Dataset view | Parameter-OOD eligibility |
+## Sampling blocks and dimensions
+
+The only active contracts are 28 dimensions for `steady_flow` (the `airflow`
+block) and 54 for `transient_drying` (all four blocks below). There is no 53D,
+pair-mode, alternate-density mode, 55th coordinate, or `alpha_duration`
+coordinate. An alternate density-calibration record remains one atomic OOD
+selection, not another dimension.
+
+| Block | Effective dimensions |
+| --- | ---: |
+| `airflow` | 28 |
+| `initial_moisture` | 8 |
+| `operation` | 12 |
+| `material_properties` | 6 |
+| Total | 54 |
+
+The operation block has eleven semantic entries because
+`schedule.component_weights` is a three-component simplex with two independent
+coordinates. Derived complements such as the fine multiscale weights add no
+coordinate.
+
+## Canonical sampled names and units
+
+`d` is the effective numerical dimension contributed by the semantic entry.
+
+### `airflow` - 28 dimensions
+
+| Name | Unit | Kind/transform | d |
+| --- | --- | --- | ---: |
+| `kappa_mean` | `m^2` | interval/log | 1 |
+| `kappa_cv` | `1` | interval/linear | 1 |
+| `bed.structure.coarse_len_rel` | `1` | interval/log | 1 |
+| `bed.structure.fine_len_rel` | `1` | interval/log | 1 |
+| `bed.structure.coarse_weight` | `1` | interval/logit | 1 |
+| `bed.structure.cross_scale_corr` | `1` | interval/linear | 1 |
+| `bed.structure.fine_ani_x` | `1` | interval/log | 1 |
+| `bed.structure.fine_ani_y` | `1` | interval/log | 1 |
+| `bed.perturbations.amplitude` | `1` | interval/linear | 1 |
+| `bed.perturbations.granularity` | `1` | interval/linear | 1 |
+| `bed.perturbations.sign_bias` | `1` | interval/linear | 1 |
+| `permeability.anisotropy.max_ratio` | `1` | interval/linear | 1 |
+| `permeability.anisotropy.exponent` | `1` | interval/linear | 1 |
+| `permeability.anisotropy.strength` | `1` | interval/linear | 1 |
+| `permeability.orientation.jitter` | `1` | interval/linear | 1 |
+| `permeability.orientation.smooth_len_rel` | `1` | interval/log | 1 |
+| `porosity.anchor_rel` | `1` | interval/log | 1 |
+| `porosity.smooth_len_rel` | `1` | interval/linear | 1 |
+| `porosity.texture_amp` | `1` | interval/linear | 1 |
+| `pressure_bc.mean` | `Pa` | interval/linear | 1 |
+| `pressure_bc.sin_amp` | `1` | interval/linear | 1 |
+| `pressure_bc.sin_freq` | `1` | interval/linear | 1 |
+| `pressure_bc.sin_phase` | `rad` | interval/phase | 1 |
+| `pressure_bc.gauss_count` | `1` | integer | 1 |
+| `pressure_bc.gauss_amp` | `1` | interval/linear | 1 |
+| `pressure_bc.gauss_width` | `1` | interval/log | 1 |
+| `pressure_bc.gauss_jitter` | `1` | interval/linear | 1 |
+| `pressure_bc.linear_amp` | `1` | interval/linear | 1 |
+
+Pressure-profile entries belong to the numerical `airflow` block because they
+generate `p_in_bc`; their physical OOD group is `operation`.
+
+### `initial_moisture` - 8 dimensions
+
+| Name | Unit | Kind/transform | d |
+| --- | --- | --- | ---: |
+| `initial_moisture.mean_db` | `kg/kg` | interval/linear | 1 |
+| `initial_moisture.amplitude_db` | `kg/kg` | interval/linear | 1 |
+| `initial_moisture.structure.coarse_len_rel` | `1` | interval/log | 1 |
+| `initial_moisture.structure.fine_len_rel` | `1` | interval/log | 1 |
+| `initial_moisture.structure.coarse_weight` | `1` | interval/logit | 1 |
+| `initial_moisture.structure.cross_scale_corr` | `1` | interval/linear | 1 |
+| `initial_moisture.structure.fine_ani_x` | `1` | interval/log | 1 |
+| `initial_moisture.structure.fine_ani_y` | `1` | interval/log | 1 |
+
+### `operation` - 12 dimensions
+
+| Name | Unit | Kind/transform | d |
+| --- | --- | --- | ---: |
+| `T_in_base` | `K` | interval/linear | 1 |
+| `T_in_amp` | `K` | interval/linear | 1 |
+| `omega_in_base` | `kg/kg` | interval/log | 1 |
+| `omega_in_amp` | `kg/kg` | interval/linear | 1 |
+| `schedule.corr` | `1` | interval/linear | 1 |
+| `schedule.timescale_rel` | `1` | interval/log | 1 |
+| `schedule.component_weights` | `1` | simplex: `smooth,event,trend` | 2 |
+| `schedule.event_count` | `1` | integer | 1 |
+| `schedule.event_duration_rel` | `1` | interval/linear | 1 |
+| `schedule.event_width_rel` | `1` | interval/linear | 1 |
+| `T_amb` | `K` | interval/linear | 1 |
+
+### `material_properties` - 6 dimensions
+
+| Name | Unit | Kind/transform | d |
+| --- | --- | --- | ---: |
+| `rho_bu_dry_ref` | `kg/m^3` | interval/log | 1 |
+| `k_gr` | `W/(m*K)` | interval/log | 1 |
+| `cp_gr_dry` | `J/(kg*K)` | interval/log | 1 |
+| `r_surf_0` | `1/s` | interval/log | 1 |
+| `r_int_surf` | `1` | interval/log | 1 |
+| `f_surf` | `1` | interval/logit | 1 |
+
+Material-specific supports, nominals, target moisture, Oswin records, density
+records, and kinetics records are owned by the six material YAML files.
+
+## Binding formulas
+
+The exact formula strings are owned by `common.yaml`; the table below is the
+short scientific cross-check.
+
+| Quantity | Binding |
 | --- | --- |
-| `transient_drying` | Valid selected units from `airflow`, `initial_moisture`, `operation`, and `material_properties`; all four physical group selectors are retained |
-| `steady_flow` | Selected units in the `airflow` block only, because their effects are represented by `Kxx`, `Kxy`, `Kyy`, `eps_bed`, or `p_in_bc` |
+| Granular water | `w_gr = f_surf*w_surf + (1-f_surf)*w_int` |
+| Surface balance | `f_surf*d(w_surf)/dt = j_int - m_evap` |
+| Internal balance | `(1-f_surf)*d(w_int)/dt = -j_int` |
+| Initial water | `w_gr_0 = rho_bu_dry*X_0_db_field; w_surf(0)=w_int(0)=w_gr_0` |
+| Internal transfer | `j_int = (1-f_surf)*r_int*(w_int-w_surf)` |
+| Evaporation | `m_evap = f_surf*r_surf*max(w_surf-w_eq,0)` |
+| Rates | `r_surf=r_surf_0; r_int=r_int_surf*r_surf` |
+| Moisture bases | `X_db=w_gr/rho_bu_dry; X_wb=X_db/(1+X_db)` |
+| Bulk moisture | `X_wb_bulk=integral(w_gr)/(integral(rho_bu_dry)+integral(w_gr))` |
+| Dry bulk density | `rho_bu_dry=rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)` |
+| Heat capacity | `cp_gr_eff=cp_gr_dry+X_db*cp_w` |
+| Conductivity | `k_eff=k_gr*(2*k_gr+k_air-2*eps_bed*(k_gr-k_air))/(2*k_gr+k_air+eps_bed*(k_gr-k_air))` |
+| Oswin equilibrium | `X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw` |
+| Equilibrium water | `w_eq=rho_bu_dry*X_eq_db` |
+| Initial humidity | `phi_init=osw_ratio_0/(1+osw_ratio_0)` with `osw_ratio_0=(100*X_0_db_field/(A_osw+B_osw*(T_init-273.15[K])))^(1/C_osw)` |
+| Latent heat | `Q_evap=-h_fg*m_evap` |
+| Total-water balance | `d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out` |
 
-One immutable parameter-OOD package stores the combined membership plus group and parameter indexes. Every included case records selected units, group, registry kind/block/transform/unit, natural support, OOD support, sampled or coupled value, and block row/design evidence. A steady-ineligible case remains in excluded-source provenance with its reason; it is not relabeled or silently returned by another group selector. Family OOD always uses the held-out family's natural support.
+`phi_eff=min(max(phi,1e-6),0.999)`. Moisture quantities carrying `_db` are dry
+basis; `_wb` are wet basis.
 
-The source profile's exhaustive `steady_flow_conditioning` record owns stationary-solution dependencies:
+The inlet schedule is heater-only: source air supplies humidity ratio,
+heating conserves `omega_in_bc`, and `phi_in_bc` is derived at the inlet
+temperature. Every accepted complete schedule satisfies `T_in_bc >= T_amb`,
+positive humidity ratio, source RH in `(0,1]`, inlet RH in `[0.05,0.85]`, and
+the configured temperature/humidity envelopes. Generation retries a whole
+schedule deterministically; it never clips individual samples.
+`phi_source_air` is validation/provenance only and is not a new adapter column.
 
-| Owner | Meaning |
-| --- | --- |
-| `model_input` | Case-varying solution dependency represented by the registered steady input contract |
-| `package_fixed` | Solution dependency fixed across the package, with exact value and unit bound into package identity |
-| `not_used` | Quantity explicitly verified not to affect the stationary solve for that profile |
+## Material schema and coupled records
 
-The required model-input inventory begins with `Kxx`, `Kxy`, `Kyy`, `eps_bed`, and `p_in_bc`; package-fixed physics is exactly `T_flow_ref = 300.65 K`, `p_ref`, and `p_out`, followed by any explicitly audited additional solver dependency. Air-material evaluation and every COMSOL-internal dependency remain runtime-unverified until the real COMSOL audit. A varying dependency absent from model inputs or package-fixed provenance is hidden conditioning and fails preflight. A stationary-solution contract ID and canonical digest make cross-profile compatibility explicit; template or profile similarity is never inferred.
+Every material YAML has these role-neutral top-level keys:
 
-The four top-level package regimes are `id`, `parameter_ood`, `near_family_ood`, and `far_family_ood`. ID membership is assigned to physical cases before temporal expansion and persists as `train`, `validation`, or `id_test` in both matched views. OOD regimes are evaluation-only by default and never fit the steady normalizer.
+```text
+schema_kind
+schema_version
+material_family
+decision_source
+material_scope
+permeability
+packing_porosity_mean_support
+density_calibration
+thermal_properties
+initial_moisture
+target_moisture
+oswin
+two_compartment_kinetics
+```
 
-## Semantic conflict decisions
+`material_scope` fixes the common name, species, market class, product form,
+coat or hull state, and concise description for each family. `decision_source`
+binds the authoritative YAML digest. Each independent value or complete record
+retains its supplied source reference, status, derivation, confidence, and
+validity. A technical smoke never upgrades evidence status.
 
-| Potential conflict | Final decision |
-| --- | --- |
-| Permeability / conductivity | `kappa_mean` is mean scalar permeability; `Kxx`, `Kxy`, `Kyy` are tensor components; `k_gr` is granular thermal conductivity. |
-| Humidity / porosity / phase | `phi` and `phi_in_bc` are relative humidity; `omega_in_bc` is humidity-ratio provenance; porosity is `eps_bed`; `pressure_bc.sin_phase` is pressure-sinusoid phase with symbol $\varphi_{p,\sin}$. |
-| Density / correlation | `rho_bu_dry_ref` and `rho_bu_dry` are densities; `schedule.corr` is a dimensionless latent correlation. |
-| Gaussian count | `pressure_bc.gauss_count` is retained as the validated pressure-profile integer count; report symbol $n_{p,G}$ removes mathematical ambiguity. |
-| Evaporation | `m_evap` is local volumetric source; `m_dot_evap` is the integrated rate. |
-| Mass / rate / fraction | `m_*` denotes mass, `m_dot_*` rate/flow, and `f_*` a dimensionless fraction. |
-| Moisture basis | `_db`/`_wb` stay explicit; `X_wb_bulk` is mass integrated, never an unweighted spatial mean. |
-| State qualifier | `_0` is initial, `_ref` reference/calibration, and `_final` terminal. |
-| Scientific / execution units | Scientific names are unit-free. `runtime_s` and `timeout_seconds` are deliberately operational timing evidence. |
+Atomic selection rules:
 
-## Execution-only configuration
+- Natural sampling varies `rho_bu_dry_ref` while its material-specific
+  `eps_bed_cal_ref` remains fixed; density parameter OOD replaces both with one
+  complete configured density-calibration record.
+- Oswin selects one complete `(A_osw, B_osw, C_osw)` record with its equation
+  convention and validity domain.
+- Kinetics selects one complete `(r_surf_0, r_int_surf, f_surf)` record.
+- `schedule.component_weights` selects the complete
+  `(smooth, event, trend)` simplex vector.
+- Components from different records are never mixed.
+- Parameter OOD selects a complete coupled record; it never creates
+  component-wise tails.
 
-All rows have `d = 0`, no scientific block/report symbol/neural input, and are owned by `execution/cluster_cpu.yaml`. They persist only in launch, execution, timing, and status evidence and never enter scientific identities or COMSOL physics.
+## Family roles and OOD
 
-| Execution path | Unit/type | Purpose | Status |
-| --- | --- | --- | --- |
-| `runtime.executable` | command | COMSOL invocation | configured |
-| `runtime.module_initialization` | commands | native modules | configured |
-| `runtime.timeout_seconds` | `s` | per-process timeout | configured |
-| `runtime.maximum_failures` | `1` | failure cap | configured |
-| `runtime.extra_arguments` | arguments | COMSOL CLI additions | configured empty |
-| `retention.retain_raw_csv`, `retention.retain_solved_model` | bool | storage policy | configured false |
-| `cluster.max_nodes`, `cluster.cases_per_node`, `cluster.cores_per_case`, `cluster.max_parallel_cases`, `cluster.cores_per_node` | `1` | campaign-wide resource plan/caps | configured |
-| `cluster.scheduler_kind`, `cluster.partition` | names | Slurm routing | configured |
-| `cluster.wall_time` | Slurm duration | job limit | unresolved |
-| `cluster.scheduler_options` | arguments | site-approved additions | configured empty |
-| `site.cpu_host` | hostname | CPU host | configured |
-| `site.scheduler`, `site.partition`, `site.cores_per_node` | names/count | site cross-check | configured |
-| `site.python_module`, `site.comsol_module` | module names | native runtime versions | configured |
-| `site.python_executable`, `site.comsol_executable` | commands | native executables | configured |
-
-## Identities and visible names
-
-Identity fields have no unit, sampling block, report symbol, or dimension.
-
-| Canonical field | Meaning | Persistence |
+| Role/evaluation regime | Materials | Support and eligibility |
 | --- | --- | --- |
-| `material_family` | role-neutral material identity | material filename, manifests, HDF5 |
-| `simulation_profile` | reference-simulation contract | campaign, case, HDF5 |
-| `dataset_view` | `steady_flow` or `transient_drying` package contract | campaign package, manifest, runtime request |
-| `evaluation_regime` | `id`, `parameter_ood`, `near_family_ood`, or `far_family_ood` | campaign package and dataset manifest |
-| `dataset_membership` | case-level `train`, `validation`, `id_test`, or owning OOD regime | dataset manifest and runtime metadata |
-| `sampling_regime` | `natural` or `parameter_ood` | batch, case, HDF5 |
-| `case_input_id` | digest of exact profile-specific generated adapter inputs and provenance | case/HDF5/dataset source |
-| `simulation_case_id` | digest including simulation profile | case/HDF5/dataset source |
-| `batch_name`, `batch_id` | readable grammar, digest-bound identity | directories/manifests |
-| `dataset_name`, `dataset_id` | readable grammar, content identity | payload/manifest |
-| `campaign_id`, `campaign_run_id` | scientific campaign, then science+commit+resources | campaign manifests |
-| `scientific_config_digest` | resolved scientific contract digest | case/HDF5 |
-| `steady_flow_conditioning_digest` | exhaustive stationary-solution dependency contract | case and dataset provenance |
-| `git_commit` | exact source commit | campaign through dataset provenance |
+| `id` | Lentil, Chickpea, Kidney bean | Natural support; eligible for train, validation, and ID test |
+| `parameter_ood` | Lentil, Chickpea, Kidney bean | Disjoint parameter support; evaluation only |
+| `near_family_ood` | Field pea | Natural support only; evaluation only |
+| `far_family_ood` | Rapeseed | Natural support only; evaluation only |
+| `extreme_family_ood` | Sunflower seed | Natural support only; evaluation only |
+
+The evaluation-regime set is exactly the five rows above. Technical smoke is a
+campaign purpose and operational membership, not an evaluation regime.
+
+Each parameter-OOD case activates exactly one unit in exactly one physical OOD
+group:
+
+| OOD group | Examples of eligible units |
+| --- | --- |
+| `bed` | Permeability and porosity structure |
+| `operation` | Pressure profile, inlet schedule, ambient temperature |
+| `initial_moisture` | Initial-moisture mean and structure |
+| `material_properties` | Density calibration, thermal properties, complete kinetics record |
+
+Eligible units are derived from registry classification, profile projection,
+parameter kind, and actual OOD tails or alternate atomic records. The
+allocation covers every eligible unit where possible and distributes remaining
+cases deterministically with counts differing by at most one; it does not use
+fixed group quotas. The selected unit persists its group, unit ID, record/tail
+ID, realized value, natural support, OOD support, transform, and
+transform-space distance. Scalar tails are nonempty, hard-gap separated, and
+disjoint from ID in the declared transform. The humidity hard-boundary
+exception is local; it does not weaken the width rule globally. Natural cases
+have no active OOD unit.
+
+Family OOD never invokes parameter OOD. In particular, Sunflower has no
+parameter-OOD, training, validation, or ID-test membership and requires no
+special generator, package builder, loader, evaluator, equation, coordinate,
+or profile.
+
+## Fields, adapters, and persistence
+
+The fixed grid is boundary-inclusive:
 
 ```text
-batch_name   = <simulation_profile>__<material_family>__<sampling_regime>
-dataset_name = <dataset_view>__<ordered-material-list>__<evaluation-regime>
+Lx=1.2 m, Ly=0.75 m, Lz=0.8 m
+nx=401, ny=251, dx=dy=0.003 m
+array order=[ny,nx]=[251,401]
+regular output time=0..168 h in 1 h steps
 ```
 
-Visible names omit versions, timestamps, seeds, counts, redundant profile words, and technical digests. Immutable IDs append digest prefixes and retain full provenance.
+`dx`, `dy`, and `U_wall` are resolved from their supplied formulas and are not
+independently authored or sampled.
 
-## Material schema and evidence research
-
-Every material file has exactly these role-neutral top-level keys:
+The steady case adapter contains only:
 
 ```text
-schema_kind, schema_version, material_family, executable,
-taxonomy, product_form, parameter_values, evidence
+fields.csv: x, y, Kxx, Kxy, Kyy, eps_bed, p_in_bc
 ```
 
-`schema_kind` is `generation_material`; filenames equal `material_family`. `taxonomy` uniformly contains `common_name`, `species`, `market_class`, `cultivar`, `specificity_status`. `product_form` uniformly contains `whole_or_split`, `shell_state`, `skin_or_seed_coat_state`, `description`, `specificity_status`. Campaigns—not materials—own family roles.
+The transient adapters add:
 
-| Material family | Common name | Species | Market class | Cultivar | Product scope | Shell state | Skin/coat |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `lentil` | Lentil | unresolved | unresolved | unresolved | Whole lentil; market class, cultivar, and seed-coat condition unresolved. | unresolved | unresolved |
-| `chickpea` | Chickpea | unresolved | Kabuli | unresolved | Whole chickpea of the intended Kabuli market class; cultivar and seed-coat condition unresolved. | unresolved | unresolved |
-| `kidney_bean` | Kidney bean | unresolved | red kidney bean | unresolved | Whole kidney bean of the intended red kidney bean market class; cultivar and seed-coat condition unresolved. | unresolved | unresolved |
-| `field_pea` | Field pea | unresolved | yellow field pea | unresolved | Whole field pea of the intended yellow field pea market class; cultivar and seed-coat condition unresolved. | unresolved | unresolved |
-| `almond` | Almond | unresolved | unresolved | unresolved | Whole almond kernel without its hard shell; cultivar and skin condition unresolved. | `hard_shell_removed` | unresolved |
+```text
+fields.csv:   X_0_db_field
+scalars.csv:  T_flow_ref, p_ref, p_out, T_init, T_amb, T_in_ref,
+              eps_bed_cal_ref, rho_bu_dry_ref, k_gr, cp_gr_dry,
+              X_target_wb, r_surf_0, r_int_surf, f_surf,
+              A_osw, B_osw, C_osw, f_wet_dm_max
+schedule.csv: t, T_in_bc, omega_in_bc, phi_in_bc
+```
 
-No species, cultivar, or skin/coat condition is inferred. Kabuli, red kidney bean, and yellow field pea are the user-selected market classes, not literature claims. `almond` means a whole kernel after hard-shell removal, not an in-shell almond, split kernel, flour, or meal.
+The canonical HDF5 persists scientific identities, `material_role`,
+`evaluation_regime`, `sampling_regime`, `natural_support_state`, realized
+sampled values and units, block and seed evidence, complete OOD and coupled
+selection provenance, inputs, outputs, diagnostics, hashes, template identity,
+and source-export identity. Dataset packages validate those values against
+their declared source role and regime before admission.
 
-Each evidence entry contains `source`, `evidence_type`, `confidence`, `temperature_range`, `humidity_range`, `cultivar_or_market_class`, `product_form`, and `status`. Evidence types distinguish measured, fitted, inferred, and explicitly justified assumed records. A material remains non-executable while any required record or specificity is unresolved.
+## Learning views
 
-Accepted evidence must record a stable citation/identifier; method, unit/equation convention, basis, confidence, and validity conditions; cultivar/market class and exact product state; conditioning, packing, geometry, scale, temperature, humidity, airflow, and moisture basis where relevant. Natural ranges and parameter-OOD ranges require defensible support and a nonzero transformed-coordinate gap. Oswin coefficients stay source-consistent complete sets; density/calibration-porosity uses either independent evidence or complete matched pairs, never mixed components. A defensible unresolved result is preferable to an invented value or source.
+The programmatic task/step contracts remain the sole authoritative channel
+owners; these tables are validated against them.
 
-Bed/permeability evidence must match packing, geometry, orientation, scale, moisture, and flow regime. Initial-moisture evidence uses dry basis and must support the analytical no-clipping envelope. Thermal/drying evidence must match method, apparatus/model, temperature, humidity, airflow, particle form, and fit equation. Oswin evidence identifies the exact convention, branch, water-activity/humidity domain, basis, and fit domain.
+### Steady learning view
 
-## Reporting use
+| Tensor | Channel order |
+| --- | --- |
+| Inputs | `x`, `y`, `Kxx`, `Kxy`, `Kyy`, `eps_bed`, `p_in_bc` |
+| Targets | `p`, `u`, `v` |
 
-Main text introduces physical inputs, governing quantities, block totals, material scopes, and major outputs. The appendix carries the full registry, morphology/realization controls, transforms, adapter schema, OOD construction, and evidence records. Execution and identity fields belong in reproducibility metadata, not the scientific dimension count.
+### Transient Neural-Operator learning view
+
+| Tensor | dtype | Shape | Channel order / definition |
+| --- | --- | --- | --- |
+| State at `t_n` | `float32` | `[4,251,401]` | `T`, `phi`, `w_surf`, `w_int` |
+| Static fields | `float32` | `[7,251,401]` | `x`, `y`, `u`, `v`, `p`, `eps_bed`, `rho_bu_dry` |
+| Boundary conditioning | `float32` | `[5]` | `T_in_bc(t_n)`, `T_in_bc(t_n+1)`, `phi_in_bc(t_n)`, `phi_in_bc(t_n+1)`, `T_amb` |
+| Material/scientific scalars | `float32` | `[8]` | `r_surf_0`, `r_int_surf`, `f_surf`, `A_osw`, `B_osw`, `C_osw`, `k_gr`, `cp_gr_dry` |
+| Target | `float32` | `[4,251,401]` | `delta_T`, `delta_phi`, `delta_w_surf`, `delta_w_int`; `q(t_n+1) - q(t_n)` |
+| Time step | — | scalar | `dt = 1 h` |
+
+`omega_in_bc` remains schedule/provenance and is not another baseline learning
+channel. Material family is metadata, not a one-hot channel. `Kxx`, `Kxy`,
+`Kyy`, `p_in_bc`, and `X_0_db_field` are source/provenance or explicit ablation
+fields, not baseline transient channels. Exact irregular stop states are
+runtime diagnostics and never regular training transitions.
+
+This evaluation/category expansion creates no model, training regime, operator
+channel, equation, sampling coordinate, or COMSOL profile.
+
+## Inspect the resolved contract
+
+Show a complete fail-closed campaign view and selected resolved provenance
+chains without changing unresolved launch state:
+
+```bash
+cd /workspace/repo
+python -m src.generation.cli.cli_generation validate-config \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --allow-incomplete \
+  --inspect-parameter A_osw \
+  --inspect-parameter density_calibration \
+  --inspect-parameter cp_w \
+  --inspect-parameter grid.dx \
+  --inspect-parameter time.stop \
+  --inspect-parameter physical_formulas.rho_bu_dry \
+  --inspect-parameter packing_porosity_mean_support
+```
+
+Atomic components expose their complete inherited record provenance. Grid and
+time components, derived physical formulas, and the family-specific porosity
+support guard are inspectable through the same view. Fixed-value inspection
+distinguishes generator consumption, scalar-adapter handoff, and constants that
+Python only binds to the canonical template without a runtime setter.
+
+Run every static scientific sentinel:
+
+```bash
+python -m src.generation.cli.cli_generation static-sentinels \
+  configs/generation/campaigns/steady_flow/family_generalization.yaml \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml
+```
+
+Show exact production, scientific, mapping, and runtime blockers:
+
+```bash
+python -m src.generation.cli.cli_generation readiness-report \
+  configs/generation/campaigns/steady_flow/family_generalization.yaml \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --run-static-sentinels
+```
+
+For execution, transfer, smoke, inspection, resume, and cleanup, use the
+[generation workflow](simulation_generation.md).
+
+## Source catalogue
+
+`configs/generation/sources.yaml` is the sole bibliographic owner. This concise
+view lists every maintained source once. The role/use column is derived from
+current executable `source_refs`; a supporting source with no direct reference
+is stated as such rather than assigned speculatively.
+
+<!-- source-catalogue:start -->
+| Source key | Full citation | Identifier | Canonical locator | Supported role/use |
+| --- | --- | --- | --- | --- |
+| `ba` | Albertin, R. M. (2025). Trocknung von Koernerleguminosen. Bachelorarbeit, OST. | SHA-256 0d59f098 (full digest recorded in input coverage) | `local:upload/Albertin_2025_Trocknung_von_Koernerleguminosen_Bachelorarbeit(3).pdf` | Executable source_refs — shared: T_in_min, T_in_max, d_wall, k_wall, h_ext; chickpea: permeability, initial_moisture; field_pea: permeability; kidney_bean: permeability, initial_moisture; lentil: permeability, packing_porosity_mean_support, density_calibration, initial_moisture; operation: T_in_base, T_in_amp, T_amb. |
+| `matouk_thermal` | Matouk, A. M. et al. (2018). Thermal Properties of Some Legume Seeds. Journal of Soil Sciences and Agricultural Engineering, 9, 261-267. | doi:10.21608/jssae.2018.35758 | `https://doi.org/10.21608/jssae.2018.35758` | Executable source_refs — chickpea: thermal_properties; field_pea: thermal_properties; kidney_bean: thermal_properties; lentil: thermal_properties. |
+| `lentil_oswin_source` | Cenkowski, S., Jayas, D. S., Pabis, S. & Muir, W. E. (2015). Sorption characteristics of red lentils during storage. Canadian Biosystems Engineering, 57, 3.1-3.8. | doi:10.7451/CBE.2015.57.3.1 | `https://library.csbe-scgab.ca/docs/journal/57/C15220.pdf` | Executable source_refs — field_pea: oswin; lentil: oswin. |
+| `lentil_sorption_menkov` | Menkov, N. D. (2000). Moisture sorption isotherms of lentil seeds at several temperatures. Journal of Food Engineering, 44, 205-211. | doi:10.1016/S0260-8774(00)00028-5 | `https://doi.org/10.1016/S0260-8774(00)00028-5` | Supplied supporting source; no current executable record directly cites this key. |
+| `lentil_drying` | Mangueira, E. R. et al. (2021). Analysis of the thin layer drying kinetic of brown lentil grains. Research, Society and Development, 10. | RSD article 19258 | `https://rsdjournal.org/rsd/article/view/19258` | Executable source_refs — lentil: two_compartment_kinetics. |
+| `swiss_crops` | swiss granum (2026). Empfehlungen fuer Uebernahmebedingungen und gesetzliche Bestimmungen von Ackerkulturen zur menschlichen Ernaehrung, Ernte 2026. | 2026-03-12 edition | `local:upload/2026-03-12_Empfehlung_Uebernahmebedingungen_Ackerkulturen_zur_menschl_Ernaehrung_2026_D(3).pdf` | Executable source_refs — chickpea: target_moisture; field_pea: target_moisture; lentil: target_moisture. |
+| `chickpea_physical` | Guerhan, R., Oezarslan, C., Topuz, N., Akbas, T. & Simsek, E. (2009). Effects of Moisture Content on Physical Properties of Black Kabuli Chickpea (Cicer arietinum L.) Seed. Asian Journal of Chemistry, 21(4), 3270-3278. | Asian Journal of Chemistry 21(4):3270-3278 | `https://asianpubs.org/index.php/ajchem/article/download/12450/12431` | Executable source_refs — chickpea: packing_porosity_mean_support, density_calibration. |
+| `chickpea_oswin_source` | Armstrong, P. R., Maghirang, E. B., Bhadriraju, S., & McNeill, S. G. (2017). Equilibrium Moisture Content of Kabuli Chickpea, Black Sesame, and White Sesame Seeds. Applied Engineering in Agriculture, 33(5), 737-742. | doi:10.13031/aea.12460 | `https://doi.org/10.13031/aea.12460` | Executable source_refs — chickpea: oswin. |
+| `chickpea_drying` | Cavalcanti-Mata, M. E. R. M. et al. (2020). A new approach to traditional drying models for thin-layer drying kinetics of chickpeas. Journal of Food Process Engineering, 43. | doi:10.1111/jfpe.13569 | `https://doi.org/10.1111/jfpe.13569` | Executable source_refs — chickpea: two_compartment_kinetics. |
+| `kidney_physical` | Isik, E. & Unal, H. (2011). Some physical properties of white kidney beans (Phaseolus vulgaris L.). African Journal of Biotechnology, 10. | stable journal PDF | `https://academicjournals.org/journal/AJB/article-full-text-pdf/A932BBF38233` | Executable source_refs — kidney_bean: packing_porosity_mean_support, density_calibration. |
+| `kidney_oswin_source` | Campos, R. C. et al. (2016). Bean grain hysteresis with induced mechanical damage. Revista Brasileira de Engenharia Agricola e Ambiental, 20(10), 930-935. | stable PDF; journal article 20(10):930-935 | `https://pdfs.semanticscholar.org/7400/4771a004cf1530362e41e9969bc9ff3551cb.pdf` | Executable source_refs — kidney_bean: oswin. |
+| `kidney_drying` | Doymaz, I. (2016). Hot-Air Drying and Rehydration Characteristics of Red Kidney Bean Seeds. Chemical Engineering Communications, 203. | doi:10.1080/00986445.2015.1056299 | `https://doi.org/10.1080/00986445.2015.1056299` | Executable source_refs — kidney_bean: two_compartment_kinetics. |
+| `manitoba_field_beans` | Province of Manitoba, Agriculture. Field Beans (official crop-management guidance; accessed 2026-08-09). | Government of Manitoba field-beans guidance | `https://www.gov.mb.ca/agriculture/crops/crop-management/print%2Cfield-beans.html` | Executable source_refs — kidney_bean: target_moisture. |
+| `pea_physical` | Yalcin, I., Ozarslan, C. & Akbas, T. (2007). Physical properties of pea (Pisum sativum) seed. Journal of Food Engineering, 79, 731-735. | Journal of Food Engineering 79:731-735 | `https://doi.org/10.1016/j.jfoodeng.2006.02.039` | Executable source_refs — field_pea: packing_porosity_mean_support, density_calibration. |
+| `pea_sorption` | Garg, M. K. & Chandra, P. (2003). Sorption Characteristics of Pea Seeds. Journal of Agricultural Engineering, 40(4). | ICAR journal record | `https://epubs.icar.org.in/index.php/JAE/article/view/14171` | Supplied supporting source; no current executable record directly cites this key. |
+| `pea_drying` | Ganesh, C. V. & Sokhansanj, S. (1997). High temperature mechanical drying of field peas (Pisum sativum L.). University of Saskatchewan proceedings/thesis record. | University of Saskatchewan repository | `https://harvest.usask.ca/bitstreams/b28e4b4a-4bbf-4e6b-8f49-d3890bd8a3a8/download` | Executable source_refs — field_pea: initial_moisture, two_compartment_kinetics. |
+| `canola_thermal` | Yu, D., Shrestha, B. L. & Baik, O.-D. (2015). Thermal conductivity, specific heat, thermal diffusivity, and bulk density of canola seeds. Journal of Food Engineering, 165, 156-165. | doi:10.1016/j.jfoodeng.2015.05.012 | `https://doi.org/10.1016/j.jfoodeng.2015.05.012` | Executable source_refs — rapeseed: packing_porosity_mean_support, density_calibration, thermal_properties. |
+| `canola_airflow` | Jayas, D. S., Sokhansanj, S., Moysey, E. B. & Barber, E. M. (1987). Airflow Resistance of Canola (Rapeseed). Transactions of the ASAE, 30(5), 1484-1488. | doi:10.13031/2013.30590 | `https://elibrary.asabe.org/azdez.asp?AID=30590&CID=t1987&JID=3&T=2&i=5&redirType=&v=30` | Executable source_refs — rapeseed: permeability. |
+| `canola_oswin` | Gazor, H. R. (2010). Moisture Isotherms and Heat of Desorption of Canola. Agricultural Engineering International: CIGR Journal, manuscript 1440. | CIGR manuscript 1440 | `https://cigrjournal.org/index.php/Ejounral/article/download/1440/1296/0` | Executable source_refs — rapeseed: oswin. |
+| `canola_drying` | Costa, L. M. et al. (2020). Drying kinetics of Hyola 430 hybrid canola (Brassica napus L.) seeds. Australian Journal of Crop Science, 14(10), 1623-1629. | AJCS 14(10):1623-1629 | `https://www.cropj.com/costa_14_10_2020_1623_1629.pdf` | Executable source_refs — rapeseed: initial_moisture, two_compartment_kinetics. |
+| `canola_drying_gazor` | Gazor, H. R. et al. (2010). Modelling the drying kinetics of canola in a fluidised bed dryer. Czech Journal of Food Sciences, 28(6), 531-537. | Czech J. Food Sci. 28(6):531-537 | `https://www.agriculturejournals.cz/artkey/cjf-201006-0009_modelling-the-drying-kinetics-of-canola-in-fluidised-bed-dryer.php` | Supplied supporting source; no current executable record directly cites this key. |
+| `swiss_oil` | swiss granum (2026). Uebernahmebedingungen Oelsaaten, Ernte 2026. | 2026-03-19 edition | `local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf` | Executable source_refs — rapeseed: target_moisture. |
+| `sunflower_sorption_drying_munder_2019` | Munder, S., Argyropoulos, D. & Müller, J. (2019). Acquisition of Sorption and Drying Data with Embedded Devices: Improving Standard Models for High Oleic Sunflower Seeds by Continuous Measurements in Dynamic Systems. Agriculture, 9(1), 1. | doi:10.3390/agriculture9010001 | `https://doi.org/10.3390/agriculture9010001` | Executable source_refs — sunflower_seed: initial_moisture, oswin, two_compartment_kinetics. |
+| `sunflower_density_isik_izli_2007` | Isik, E. & Izli, N. (2007). Physical Properties of Sunflower Seeds (Helianthus annuus L.). International Journal of Agricultural Research, 2, 677-686. | doi:10.3923/ijar.2007.677.686 | `https://scialert.net/fulltext/?doi=ijar.2007.677.686` | Executable source_refs — sunflower_seed: packing_porosity_mean_support, density_calibration. |
+| `sunflower_physical_gupta_das_1997` | Gupta, R. K. & Das, S. K. (1997). Physical Properties of Sunflower Seeds. Journal of Agricultural Engineering Research, 66(1), 1-8. | doi:10.1006/jaer.1996.0111 | `https://doi.org/10.1006/jaer.1996.0111` | Supplied supporting source; no current executable record directly cites this key. |
+| `sunflower_thermal_ince_2008` | Ince, R., Güzel, E. & Ince, A. (2008). Thermal Properties of Some Oily Seeds. Journal of Agricultural Machinery Science, 4(4), 399-405. | Journal of Agricultural Machinery Science 4(4):399-405 | `https://dergipark.org.tr/tr/download/article-file/119120` | Executable source_refs — sunflower_seed: thermal_properties. |
+| `sunflower_airflow_canada_1990` | Agriculture Canada (1990). Handling Agricultural Materials: Storage and Conditioning of Grain and Forage. Agriculture Canada Publication 1855/E. | Agriculture Canada Publication 1855/E | `https://publications.gc.ca/collections/collection_2014/aac-aafc/agrhist/A15-1855-1990-eng.pdf` | Executable source_refs — sunflower_seed: permeability. |
+| `sunflower_class_munder_2017` | Munder, S., Argyropoulos, D. & Müller, J. (2017). Class-based physical properties of air-classified sunflower seeds and kernels. Biosystems Engineering, 164, 124-134. | doi:10.1016/j.biosystemseng.2017.10.005 | `https://doi.org/10.1016/j.biosystemseng.2017.10.005` | Supplied supporting source; no current executable record directly cites this key. |
+| `swiss_oil_2026` | swiss granum (2026). Übernahmebedingungen Ölsaaten Ernte 2026, Ausgabe 19. März 2026. | 2026-03-19 edition | `local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf` | Executable source_refs — sunflower_seed: target_moisture. |
+| `pino_airflow_project` | Albertin, R. M. (2026). PINO Airflow Porous Media. Vertiefungsprojekt, OST. | SHA-256 5fcae206aff935195eea0f8b149747c1a3e83fef16899d8533c0f89b3fbd954e | `local:upload/Albertin_2026_PINO_Airflow_PorousMedia(20260809-103733).pdf` | Executable source_refs — shared: grid_provenance, eps_min_global, eps_max_global; chickpea: initial_moisture; field_pea: initial_moisture; kidney_bean: initial_moisture; lentil: initial_moisture; rapeseed: initial_moisture; operation: pressure_bc, kappa_cv, bed, permeability, porosity, initial_moisture. |
+| `transient_comsol_model_report` | COMSOL Multiphysics 6.4 model report: transient_drying_template, generated 2026-08-09. | SHA-256 463ecea45bad7c221f3c85ef53c92dbf77a603dc4b2fda2d54bf8e852d3e96a5 | `local:upload/transient_drying_template(3).docx` | Executable source_refs — shared: T_flow_ref, p_ref, p_out, omega_min, omega_max, phi_operational_min, phi_operational_max, phi_clip_min, phi_clip_max, cp_w, h_fg, D_v_air, M_v, U_wall, f_wet_dm_max, grid_provenance, time_provenance, physical_formulas_provenance; operation: omega_in_base, omega_in_amp. |
+| `vm2_project` | Albertin, R. M. (2026). VM2 Vertiefungsprojekt. OST. | local project report | `local:project_sources/02-VM2_Vertiefungsprojekt_Rino_Moreno_Albertin-3-.pdf` | Executable source_refs — operation: schedule. |
+| `vp2_decision_contract` | VP2 Parameter Decisions, schema 1.1.0 (2026-08-09). | sha256:774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5 | `artifact:VP2_Parameter_Decisions.yaml` | Executable source_refs — shared: T_in_min, phi_operational_min, phi_operational_max, schedule_interpolation, grid_provenance, time_provenance, physical_formulas_provenance. |
+<!-- source-catalogue:end -->

@@ -1,19 +1,13 @@
 schema_kind: generation_campaign
 schema_version: 1
-campaign_name: steady_flow_family_generalization
-executable: false
+campaign_purpose: family_generalization
+sources_config: configs/generation/sources.yaml
 registry_config: configs/generation/registry.yaml
 common_config: configs/generation/common.yaml
 operations_config: configs/generation/operations/fixed_bed.yaml
 profile_config: configs/generation/profiles/steady_flow.yaml
 execution_config: configs/generation/execution/cluster_cpu.yaml
-materials:
-- lentil
-- chickpea
-- kidney_bean
-- field_pea
-- almond
-roles:
+material_roles:
   seen:
   - lentil
   - chickpea
@@ -21,54 +15,38 @@ roles:
   near_family_ood:
   - field_pea
   far_family_ood:
-  - almond
+  - rapeseed
+  extreme_family_ood:
+  - sunflower_seed
 sampling:
   method: lhs
-  seed_base: null
+  seed_base: 9100
   counts:
     natural:
-      lentil: null
-      chickpea: null
-      kidney_bean: null
-      field_pea: null
-      almond: null
+      lentil: 240
+      chickpea: 240
+      kidney_bean: 240
+      field_pea: 80
+      rapeseed: 80
+      sunflower_seed: 80
     parameter_ood:
-      lentil: null
-      chickpea: null
-      kidney_bean: null
-  parameter_ood:
-    groups:
-    - bed
-    - operation
-    - initial_moisture
-    - material_properties
-    units_per_case: 1
-    balance_groups: true
-    balance_parameters: true
-duplicate_case_input_policy: reject_duplicates
+      lentil: 80
+      chickpea: 80
+      kidney_bean: 80
+membership:
+  seed: 9150
+  per_seen_material:
+    train: 192
+    validation: 24
+    id_test: 24
 dataset_packages:
-- dataset_view: steady_flow
-  evaluation_regime: id
-  materials:
-  - lentil
-  - chickpea
-  - kidney_bean
-  membership_seed: null
-  membership_counts_per_material:
-    train: null
-    validation: null
-    id_test: null
-- dataset_view: steady_flow
-  evaluation_regime: parameter_ood
-  materials:
-  - lentil
-  - chickpea
-  - kidney_bean
-- dataset_view: steady_flow
-  evaluation_regime: near_family_ood
-  materials:
-  - field_pea
-- dataset_view: steady_flow
-  evaluation_regime: far_family_ood
-  materials:
-  - almond
+- evaluation_regime: id
+  source_role: seen
+- evaluation_regime: parameter_ood
+  source_role: seen
+- evaluation_regime: near_family_ood
+  source_role: near_family_ood
+- evaluation_regime: far_family_ood
+  source_role: far_family_ood
+- evaluation_regime: extreme_family_ood
+  source_role: extreme_family_ood

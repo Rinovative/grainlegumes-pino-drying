@@ -32,7 +32,6 @@ PARAMETER_KINDS: Final = (
     "categorical",
     "simplex",
     "parameter_set",
-    "paired_parameter_set",
     "derived",
 )
 INTERVAL_TRANSFORMS: Final = ("linear", "log", "logit", "phase")
@@ -42,8 +41,22 @@ DERIVATION_IDENTIFIERS: Final = (
     "product",
     "mean",
     "schedule_time_average",
-    "selected_parameter_set_component",
 )
+
+_SCIENTIFIC_METADATA_KEYS: Final = frozenset(
+    {
+        "nominal",
+        "distribution",
+        "classification",
+        "profile_applicability",
+        "atomic_record",
+        "provenance",
+    }
+)
+_CLASSIFICATIONS: Final = ("sampled", "fixed", "derived", "coupled_record")
+_PROFILE_IDS: Final = ("steady_flow", "transient_drying")
+_MINIMUM_OOD_GAP_FRACTION: Final = 0.15
+_MINIMUM_OOD_WIDTH_FRACTION: Final = 0.25
 
 _KIND_KEYS: Final = MappingProxyType(
     {
@@ -62,15 +75,21 @@ _KIND_KEYS: Final = MappingProxyType(
         ),
         "simplex": (
             frozenset({"kind", "unit", "components"}),
-            frozenset({"block", "ood_group", "ood_values"}),
+            frozenset(
+                {
+                    "block",
+                    "ood_group",
+                    "ood_values",
+                    "selection",
+                    "alpha",
+                    "minimum_each",
+                    "maximum_each",
+                }
+            ),
         ),
         "parameter_set": (
             frozenset({"kind", "components", "units", "sets"}),
             frozenset({"ood_group", "ood_sets"}),
-        ),
-        "paired_parameter_set": (
-            frozenset({"kind", "components", "units", "pairs"}),
-            frozenset({"ood_group", "ood_pairs"}),
         ),
         "derived": (
             frozenset({"kind", "unit", "derivation", "sources"}),
@@ -119,6 +138,15 @@ def _finite(value: Any, *, label: str, allow_unresolved: bool) -> float | None:
         message = f"{label} must be one finite real value."
         raise ValueError(message)
     return float(value)
+
+
+def _required_finite(value: Any, *, label: str) -> float:
+    """Return one finite value from a configuration position that cannot be null."""
+    result = _finite(value, label=label, allow_unresolved=False)
+    if result is None:
+        message = f"{label} must be resolved."
+        raise ValueError(message)
+    return result
 
 
 def _name_sequence(value: Any, *, label: str, minimum: int = 1) -> tuple[str, ...]:
@@ -173,30 +201,122 @@ def _validate_interval_domain(lower: float, upper: float, transform: str, *, lab
 
 
 def _validate_interval_ood(entry: dict[str, Any], *, label: str, allow_unresolved: bool) -> None:
-    """Require an OOD interval with a strict transformed-coordinate gap."""
+    """Require every OOD tail to have the binding transformed separation."""
     if "ood" not in entry:
         return
-    ood = _mapping(entry["ood"], label=f"{label}.ood")
-    _exact_keys(ood, required=frozenset({"lower", "upper"}), optional=frozenset(), label=f"{label}.ood")
-    lower = _finite(ood["lower"], label=f"{label}.ood.lower", allow_unresolved=allow_unresolved)
-    upper = _finite(ood["upper"], label=f"{label}.ood.upper", allow_unresolved=allow_unresolved)
-    entry["ood"] = {"lower": lower, "upper": upper}
+    raw_intervals = entry["ood"]
+    if raw_intervals is None and allow_unresolved:
+        entry["ood"] = []
+        return
+    if not isinstance(raw_intervals, list) or not raw_intervals:
+        message = f"{label}.ood must be a non-empty list of disjoint intervals."
+        raise TypeError(message)
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_intervals):
+        ood = _mapping(raw, label=f"{label}.ood[{index}]")
+        _exact_keys(
+            ood,
+            required=frozenset({"lower", "upper"}),
+            optional=frozenset({"hard_boundary"}),
+            label=f"{label}.ood[{index}]",
+        )
+        hard_boundary = ood.get("hard_boundary", False)
+        if not isinstance(hard_boundary, bool):
+            message = f"{label}.ood[{index}].hard_boundary must be boolean."
+            raise TypeError(message)
+        normalized.append(
+            {
+                "lower": _finite(
+                    ood["lower"],
+                    label=f"{label}.ood[{index}].lower",
+                    allow_unresolved=allow_unresolved,
+                ),
+                "upper": _finite(
+                    ood["upper"],
+                    label=f"{label}.ood[{index}].upper",
+                    allow_unresolved=allow_unresolved,
+                ),
+                "hard_boundary": hard_boundary,
+            }
+        )
+    entry["ood"] = normalized
     id_lower_value = entry["lower"]
     id_upper_value = entry["upper"]
-    if lower is None or upper is None or id_lower_value is None or id_upper_value is None:
+    if id_lower_value is None or id_upper_value is None:
         return
     transform = str(entry.get("transform", "linear"))
-    _validate_interval_domain(lower, upper, transform, label=f"{label}.ood")
     id_lower = float(id_lower_value)
     id_upper = float(id_upper_value)
-    if not (upper < id_lower or lower > id_upper):
-        message = f"{label}.ood must be disjoint from the ID interval with a nonzero gap."
+    id_lower_t = _transform_coordinate(id_lower, transform)
+    id_upper_t = _transform_coordinate(id_upper, transform)
+    id_width = id_upper_t - id_lower_t
+    if id_width <= 0:
+        message = f"{label} must have positive transformed width when OOD tails are configured."
         raise ValueError(message)
-    left_gap = abs(_transform_coordinate(upper, transform) - _transform_coordinate(id_lower, transform))
-    right_gap = abs(_transform_coordinate(lower, transform) - _transform_coordinate(id_upper, transform))
-    if min(left_gap, right_gap) <= 0:
-        message = f"{label}.ood has no transformed-coordinate separation."
+    previous_upper: float | None = None
+    for index, interval in enumerate(normalized):
+        lower = interval["lower"]
+        upper = interval["upper"]
+        if lower is None or upper is None:
+            continue
+        _validate_interval_domain(lower, upper, transform, label=f"{label}.ood[{index}]")
+        if previous_upper is not None and lower <= previous_upper:
+            message = f"{label}.ood intervals must be strictly ordered and mutually disjoint."
+            raise ValueError(message)
+        previous_upper = upper
+        if not (upper < id_lower or lower > id_upper):
+            message = f"{label}.ood[{index}] must be disjoint from ID with a nonzero gap."
+            raise ValueError(message)
+        lower_t = _transform_coordinate(lower, transform)
+        upper_t = _transform_coordinate(upper, transform)
+        gap = id_lower_t - upper_t if upper < id_lower else lower_t - id_upper_t
+        width = upper_t - lower_t
+        if gap < _MINIMUM_OOD_GAP_FRACTION * id_width:
+            message = f"{label}.ood[{index}] transformed gap must be at least 0.15 of ID width."
+            raise ValueError(message)
+        if width < _MINIMUM_OOD_WIDTH_FRACTION * id_width and not interval["hard_boundary"]:
+            message = f"{label}.ood[{index}] transformed width must be at least 0.25 of ID width."
+            raise ValueError(message)
+
+
+def _validate_nominal(value: Any, *, label: str) -> Any:
+    """Validate one finite scalar or complete finite nominal structure."""
+    if isinstance(value, Mapping):
+        if not value or not all(isinstance(key, str) and key for key in value):
+            message = f"{label} nominal mappings must have non-empty string keys."
+            raise ValueError(message)
+        return {key: _validate_nominal(item, label=f"{label}.{key}") for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if not value:
+            message = f"{label} nominal sequences must not be empty."
+            raise ValueError(message)
+        return [_validate_nominal(item, label=f"{label}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        message = f"{label} must contain only finite numeric values."
         raise ValueError(message)
+    return float(value)
+
+
+def _validate_scientific_metadata(entry: dict[str, Any], *, label: str) -> None:
+    """Validate optional decision metadata retained beside runtime semantics."""
+    if "nominal" in entry:
+        entry["nominal"] = _validate_nominal(entry["nominal"], label=f"{label}.nominal")
+    if "distribution" in entry and (not isinstance(entry["distribution"], str) or not entry["distribution"]):
+        message = f"{label}.distribution must be non-empty text."
+        raise ValueError(message)
+    if entry.get("classification") not in _CLASSIFICATIONS:
+        message = f"{label}.classification must be one of {list(_CLASSIFICATIONS)}."
+        raise ValueError(message)
+    profiles = _name_sequence(entry.get("profile_applicability"), label=f"{label}.profile_applicability")
+    if any(profile not in _PROFILE_IDS for profile in profiles):
+        message = f"{label}.profile_applicability contains an unknown profile."
+        raise ValueError(message)
+    entry["profile_applicability"] = list(profiles)
+    if "atomic_record" in entry and (not isinstance(entry["atomic_record"], str) or not entry["atomic_record"]):
+        message = f"{label}.atomic_record must be non-empty text."
+        raise ValueError(message)
+    if "provenance" in entry:
+        entry["provenance"] = _mapping(entry["provenance"], label=f"{label}.provenance")
 
 
 def _validate_weight_vectors(
@@ -265,7 +385,7 @@ def _validate_coupled_sets(
     return result
 
 
-def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[str, Any]:  # noqa: C901, PLR0912
+def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
     """Validate one exact typed registry entry."""
     label = f"parameter_registry.{name}"
     entry = _mapping(value, label=label)
@@ -274,10 +394,12 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
         message = f"{label}.kind must be one of {list(PARAMETER_KINDS)}, got {kind!r}."
         raise ValueError(message)
     required, optional = _KIND_KEYS[kind]
+    optional = optional | _SCIENTIFIC_METADATA_KEYS
     _exact_keys(entry, required=required, optional=optional, label=label)
     _validate_block_metadata(entry, label=label)
+    _validate_scientific_metadata(entry, label=label)
 
-    if kind not in {"parameter_set", "paired_parameter_set"}:
+    if kind != "parameter_set":
         entry["unit"] = _unit(entry["unit"], label=f"{label}.unit")
     if kind == "fixed":
         entry["value"] = _finite(entry["value"], label=f"{label}.value", allow_unresolved=allow_unresolved)
@@ -303,12 +425,13 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
             raise ValueError(message)
         _validate_interval_ood(entry, label=label, allow_unresolved=allow_unresolved)
         if "ood" in entry:
-            for bound in ("lower", "upper"):
-                number = entry["ood"][bound]
-                if number is not None and not float(number).is_integer():
-                    message = f"{label}.ood.{bound} must be an integer value."
-                    raise ValueError(message)
-                entry["ood"][bound] = None if number is None else int(number)
+            for index, interval in enumerate(entry["ood"]):
+                for bound in ("lower", "upper"):
+                    number = interval[bound]
+                    if number is not None and not float(number).is_integer():
+                        message = f"{label}.ood[{index}].{bound} must be an integer value."
+                        raise ValueError(message)
+                    interval[bound] = None if number is None else int(number)
     elif kind == "categorical":
         choices = entry["choices"]
         if choices is None and allow_unresolved:
@@ -333,6 +456,38 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
     elif kind == "simplex":
         components = _name_sequence(entry["components"], label=f"{label}.components", minimum=2)
         entry["components"] = list(components)
+        configured_shape = {"selection", "alpha", "minimum_each", "maximum_each"}.intersection(entry)
+        if configured_shape:
+            if configured_shape != {"selection", "alpha", "minimum_each", "maximum_each"}:
+                message = f"{label} truncated-simplex configuration is incomplete."
+                raise ValueError(message)
+            if entry["selection"] != "truncated_dirichlet":
+                message = f"{label}.selection must be 'truncated_dirichlet'."
+                raise ValueError(message)
+            alpha = entry["alpha"]
+            if not isinstance(alpha, list) or len(alpha) != len(components):
+                message = f"{label}.alpha must match the simplex components."
+                raise ValueError(message)
+            entry["alpha"] = [_required_finite(item, label=f"{label}.alpha[{index}]") for index, item in enumerate(alpha)]
+            if any(item <= 0 for item in entry["alpha"]):
+                message = f"{label}.alpha values must be positive."
+                raise ValueError(message)
+            minimum = _required_finite(
+                entry["minimum_each"],
+                label=f"{label}.minimum_each",
+            )
+            maximum = _required_finite(
+                entry["maximum_each"],
+                label=f"{label}.maximum_each",
+            )
+            entry["minimum_each"] = minimum
+            entry["maximum_each"] = maximum
+            if not 0 <= entry["minimum_each"] < entry["maximum_each"] <= 1:
+                message = f"{label} simplex component bounds are invalid."
+                raise ValueError(message)
+            if len(components) * entry["minimum_each"] > 1 or len(components) * entry["maximum_each"] < 1:
+                message = f"{label} simplex component bounds have no feasible complete vector."
+                raise ValueError(message)
         if "ood_values" in entry:
             entry["ood_values"] = _validate_weight_vectors(
                 entry["ood_values"],
@@ -340,7 +495,7 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
                 label=f"{label}.ood_values",
                 allow_unresolved=allow_unresolved,
             )
-    elif kind in {"parameter_set", "paired_parameter_set"}:
+    elif kind == "parameter_set":
         components = _name_sequence(entry["components"], label=f"{label}.components")
         units = _mapping(entry["units"], label=f"{label}.units")
         if set(units) != set(components):
@@ -348,8 +503,8 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
             raise ValueError(message)
         entry["components"] = list(components)
         entry["units"] = {name: _unit(units[name], label=f"{label}.units.{name}") for name in components}
-        primary = "sets" if kind == "parameter_set" else "pairs"
-        ood_key = "ood_sets" if kind == "parameter_set" else "ood_pairs"
+        primary = "sets"
+        ood_key = "ood_sets"
         entry[primary] = _validate_coupled_sets(
             entry[primary],
             components=components,

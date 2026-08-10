@@ -1,560 +1,290 @@
 schema_kind: generation_material
 schema_version: 1
 material_family: field_pea
-executable: false
-taxonomy:
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+material_scope:
   common_name: Field pea
-  species: null
-  market_class: yellow field pea
-  cultivar: null
-  specificity_status: unresolved
-product_form:
-  whole_or_split: whole
-  shell_state: null
-  skin_or_seed_coat_state: null
-  description: Whole field pea of the intended yellow field pea market class; cultivar
-    and seed-coat condition unresolved.
-  specificity_status: unresolved
-parameter_values:
-  initial_moisture_bounds:
-    lower: null
-    upper: null
-  kappa_mean:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  kappa_cv:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.coarse_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.coarse_weight:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_ani_x:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_ani_y:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.cross_scale_corr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.amplitude:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.granularity:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.sign_bias:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.max_ratio:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.exponent:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.strength:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.orientation.jitter:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.orientation.smooth_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.anchor_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.smooth_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.texture_amp:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.mean_db:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.amplitude_db:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.coarse_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.coarse_weight:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_ani_x:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_ani_y:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.cross_scale_corr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  rho_bu_dry_ref:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
+  species: Pisum sativum L.
+  market_class: yellow_or_green_field_pea
+  product_form: whole_seed
+  coat_or_hull_state: intact
+  description: Whole mature dry field pea
+permeability:
+  nominal: 1.65e-08
+  support:
+    lower: 8.0e-09
+    upper: 4.0e-08
+  transform: log
+  distribution: uniform_in_log_space
+  provenance:
+    source_refs:
+    - ba
+    status: literature_transfer
+    derivation:
+      kind: transferred_as_supplied
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Whole-particle packed-bed mean permeability; fill-method dependence included in range.
+    confidence: medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+      temperature: generator design; not a material property
+      humidity_or_aw: generator design; not a material property
+      packing_or_flow_regime: Only for packing bands in each complete density record; generated mean eps must pass the material
+        band.
+packing_porosity_mean_support:
+  lower: 0.37
+  upper: 0.43
+  unit: '1'
+  provenance:
+    source_refs:
+    - pea_physical
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    confidence: high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+      packing_or_flow_regime: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density
+        calculated as rho_wet/(1+Xdb).
+density_calibration:
+  record_id: field_pea_density_calibration_v1
+  reference:
+    rho_bu_dry_ref: 568.1
+    eps_bed_cal_ref: 0.3938
+    inferred_rho_particle_dry: 937.149456
+  rho_bu_dry_ref_support:
+    lower: 530.0
+    upper: 620.0
+    transform: log
+  ood_records: []
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - pea_physical
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    confidence: high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+      packing_or_flow_regime: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density
+        calculated as rho_wet/(1+Xdb).
+thermal_properties:
   k_gr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
+    nominal: 0.31
+    support:
+      lower: 0.25
+      upper: 0.38
+    transform: log
+    distribution: uniform_in_log_space
+    provenance:
+      source_refs:
+      - matouk_thermal
+      status: literature_transfer
+      derivation:
+        kind: transferred_as_supplied
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Dry granular-phase conductivity used inside the binding Maxwell-Eucken relation.
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry field pea
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
   cp_gr_dry:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  r_surf_0:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  r_int_surf:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  f_surf:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  eps_bed_cal_ref:
-    value: null
-  X_target_wb:
-    value: null
-  oswin:
-    sets: null
-    ood_sets: null
-evidence:
-  kappa_mean:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  kappa_cv:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.coarse_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.coarse_weight:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_ani_x:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_ani_y:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.cross_scale_corr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.amplitude:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.granularity:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.sign_bias:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.max_ratio:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.exponent:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.strength:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.orientation.jitter:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.orientation.smooth_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.anchor_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.smooth_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.texture_amp:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.mean_db:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.amplitude_db:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.coarse_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.coarse_weight:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_ani_x:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_ani_y:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.cross_scale_corr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  rho_bu_dry_ref:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  k_gr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  cp_gr_dry:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  r_surf_0:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  r_int_surf:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  f_surf:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  eps_bed_cal_ref:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  X_target_wb:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  oswin:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture_bounds:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
+    nominal: 1950.0
+    support:
+      lower: 1650.0
+      upper: 2250.0
+    transform: log
+    distribution: uniform_in_log_space
+    provenance:
+      source_refs:
+      - matouk_thermal
+      status: literature_transfer
+      derivation:
+        kind: transferred_as_supplied
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Dry-solid specific heat; water contribution is added deterministically as X_db*cp_w.
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry field pea
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
+initial_moisture:
+  mean_db:
+    nominal: 0.25
+    support:
+      lower: 0.1904761904761905
+      upper: 0.3157894736842105
+    transform: linear
+    distribution: uniform
+    provenance:
+      source_refs:
+      - pea_drying
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope
+          around project or product-compatible drying evidence, not a market-target transfer.
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry field pea
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  amplitude_db:
+    nominal: 0.02
+    support:
+      lower: 0.005
+      upper: 0.04
+    transform: linear
+    distribution: uniform
+    provenance:
+      source_refs:
+      - pino_airflow_project
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Synthetic spatial maximum deviation in dry basis; constrained by positivity and target separation.
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry field pea
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  field_support:
+    lower: 0.1904761904761905
+    upper: 0.3157894736842105
+    unit: kg/kg
+    provenance:
+      source_refs:
+      - pea_drying
+      status: derived
+      derivation:
+        kind: derived_from_configured_value
+        origin: supplied_by_handoff
+        verification: mathematically_reproduced
+        description: X_db=X_wb/(1-X_wb)
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry field pea
+        moisture_basis: kg water/kg dry solids
+  field_constraint: min(X_0_db_field) >= 0.14636364 kg/kg
+target_moisture:
+  selected_simulation_target_wb: 0.12
+  selected_target_db: 0.13636363636363635
+  market_acceptance_moisture_wb: 0.135
+  safe_storage_moisture_wb: 0.11894
+  provenance:
+    source_refs:
+    - swiss_crops
+    status: derived
+    derivation:
+      kind: derived_from_configured_value
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Selected simulation stop target; market, safe-storage and selected values remain separate.
+    confidence: high_for_market_low_medium_for_transferred_isotherm_safe_storage
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+oswin:
+  record_id: field_pea_production_oswin_v1
+  components:
+    A_osw: 12.06202053
+    B_osw: -0.0573838
+    C_osw: 0.34338283
+  units:
+    A_osw: '1'
+    B_osw: 1/K
+    C_osw: '1'
+  equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or per degree Celsius increment
+  provenance:
+    source_refs:
+    - lentil_oswin_source
+    status: literature_transfer
+    derivation:
+      kind: transferred_as_supplied
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: No pea-specific re-fit claimed. Validate against Garg and Chandra pea data before production.
+    confidence: low_medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted by 0.01
+      equation_or_method: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+      supplied_scope: Transferred as the complete lentil tuple to whole field pea; direct pea literature supports modified
+        Oswin but accessible full coefficients were unavailable.
+two_compartment_kinetics:
+  record_id: field_pea_two_compartment_kinetics_v1
+  components:
+    r_surf_0:
+      nominal: 8.0e-06
+      support:
+        lower: 3.5e-06
+        upper: 1.6e-05
+      transform: log
+    r_int_surf:
+      nominal: 0.16
+      support:
+        lower: 0.06
+        upper: 0.3
+      transform: log
+    f_surf:
+      nominal: 0.46
+      support:
+        lower: 0.28
+        upper: 0.62
+      transform: logit
+  ood_records: []
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - pea_drying
+    status: calibration_prior
+    derivation:
+      kind: selected_calibration_prior
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim experimental
+        validation
+    confidence: low_until_calibrated
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry field pea
+      supplied_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
+        state; T(t) if available
+      transfer_limit: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim
+        experimental validation

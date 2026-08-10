@@ -45,12 +45,13 @@ from . import generation_workspace as workspace_service
 
 PUBLICATION_SCHEMA_VERSION = 1
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
-CASE_FAILURE_SCHEMA_VERSION = 1
+CASE_FAILURE_SCHEMA_VERSION = 3
 _CASE_FAILURE_KEYS = frozenset(
     {
         "schema_kind",
         "schema_version",
         "state",
+        "failure_stage",
         "simulation_profile",
         "batch_id",
         "batch_identity",
@@ -66,6 +67,7 @@ _CASE_FAILURE_KEYS = frozenset(
         "template_sha256",
         "missing_or_invalid_artifacts",
         "log_tail",
+        "retained_artifacts",
         "scratch_cleanup",
     }
 )
@@ -87,6 +89,7 @@ _FAILURE_EXECUTION_KEYS = frozenset(
         "loaded_modules",
     }
 )
+_FAILURE_STAGES = frozenset({"input", "solver", "export", "conversion", "invalid_result"})
 
 
 class CaseExecutionError(RuntimeError):
@@ -101,6 +104,7 @@ class CaseExecutionError(RuntimeError):
         exit_code: int | None = None,
         timed_out: bool = False,
         missing_or_invalid_artifacts: tuple[str, ...] = (),
+        failure_stage: str = "solver",
     ) -> None:
         """Initialize one structured case-execution failure."""
         super().__init__(message)
@@ -110,6 +114,10 @@ class CaseExecutionError(RuntimeError):
         self.exit_code = exit_code
         self.timed_out = timed_out
         self.missing_or_invalid_artifacts = missing_or_invalid_artifacts
+        if failure_stage not in _FAILURE_STAGES:
+            message = f"Unsupported case failure stage: {failure_stage!r}"
+            raise ValueError(message)
+        self.failure_stage = failure_stage
 
 
 class CaseCleanupError(RuntimeError):
@@ -135,6 +143,7 @@ class CaseInterruptedError(InterruptedError):
         self.exit_code = exit_code
         self.timed_out = False
         self.missing_or_invalid_artifacts: tuple[str, ...] = ()
+        self.failure_stage = "solver"
 
 
 _ACTIVE_SOLVER_LOCK = threading.Lock()
@@ -393,46 +402,58 @@ def collect_exports(
     config: config_contract.GenerationConfig,
     prepared: case_service.PreparedCase,
 ) -> tuple[CollectedExport, ...]:
-    """Collect every explicit profile mapping without interpreting binary template data."""
+    """Collect explicit mappings and reject unresolved required roles."""
     root = prepared.exports_directory.resolve()
     collected: dict[Path, CollectedExport] = {}
     for contract in config.scientific_values["output_contract"]["exports"]:
-        pattern = contract["pattern"]
+        role = str(contract["role"])
+        if contract["mapping_state"] == "mapping_probe_required":
+            if contract["required"]:
+                message = f"Required profile mapping for {role!r} still requires a mapping probe."
+                raise RuntimeError(message)
+            continue
+        pattern = contract.get("pattern")
         if not isinstance(pattern, str):
-            msg = f"Profile mapping for {contract['role']!r} remains unresolved."
-            raise TypeError(msg)
+            message = f"Profile mapping for {role!r} has no declared source filename."
+            raise TypeError(message)
         matches = sorted(root.glob(pattern))
-        files = [path for path in matches if path.is_file() and not path.is_symlink()]
+        files = [candidate for candidate in matches if candidate.is_file() and not candidate.is_symlink()]
         if contract["required"] and not files:
-            msg = f"Required COMSOL export pattern produced no files: {pattern!r} under {root}"
-            raise FileNotFoundError(msg)
+            message = f"Required COMSOL export pattern produced no files: {pattern!r} under {root}"
+            raise FileNotFoundError(message)
         if not contract["allow_multiple"] and len(files) > 1:
-            msg = f"COMSOL export pattern must match at most one file: {pattern!r}"
-            raise ValueError(msg)
-        for path in files:
-            canonical = path.resolve()
+            message = f"COMSOL export pattern must match at most one file: {pattern!r}"
+            raise ValueError(message)
+        for candidate in files:
+            canonical = candidate.resolve()
             if not canonical.is_relative_to(root):
-                msg = f"Configured export escapes its case-owned root: {path}"
-                raise ValueError(msg)
+                message = f"Configured export escapes its case-owned root: {candidate}"
+                raise ValueError(message)
             size = canonical.stat().st_size
             if size <= 0:
-                msg = f"Configured COMSOL export is empty: {canonical}"
-                raise ValueError(msg)
+                message = f"Configured COMSOL export is empty: {canonical}"
+                raise ValueError(message)
             relative = canonical.relative_to(root)
             if relative in collected:
-                msg = f"COMSOL export {relative} matches more than one configured role."
-                raise ValueError(msg)
+                message = f"COMSOL export {relative} matches more than one configured role."
+                raise ValueError(message)
             collected[relative] = CollectedExport(
                 source_path=canonical,
                 relative_path=relative,
-                role=contract["role"],
+                role=role,
                 sha256=common.serialization.file_sha256(canonical),
                 size_bytes=size,
             )
     if not collected:
-        msg = f"No configured COMSOL exports were collected from {root}."
-        raise FileNotFoundError(msg)
-    return tuple(collected[path] for path in sorted(collected, key=lambda item: item.as_posix()))
+        message = f"No configured COMSOL exports were collected from {root}."
+        raise FileNotFoundError(message)
+    return tuple(
+        collected[candidate]
+        for candidate in sorted(
+            collected,
+            key=lambda item: item.as_posix(),
+        )
+    )
 
 
 def _write_solver_log(prepared: case_service.PreparedCase) -> Path:
@@ -715,6 +736,16 @@ def execute_prepared_case(
         )
     try:
         exports = collect_exports(config, prepared)
+    except Exception as error:
+        raise CaseExecutionError(
+            str(error),
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+            missing_or_invalid_artifacts=(str(error),),
+            failure_stage="export",
+        ) from error
+    try:
         canonical_case = storage_service.convert_exports_to_hdf5(
             config,
             prepared.bundle.case_payload,
@@ -730,6 +761,7 @@ def execute_prepared_case(
             command=tuple(command),
             exit_code=exit_code,
             missing_or_invalid_artifacts=(str(error),),
+            failure_stage="conversion",
         ) from error
     return ExecutionResult(
         prepared=prepared,
@@ -851,6 +883,16 @@ def case_failure_path(
     return _state_batch_root(config, storage_root=storage_root) / "failures" / f"{config.case_id(case_index)}.json"
 
 
+def case_failure_artifacts_directory(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Return the private compact failure-artifact directory for one case."""
+    return _state_batch_root(config, storage_root=storage_root) / "failure_artifacts" / config.case_id(case_index)
+
+
 def _optional_json_object(path: Path) -> dict[str, Any] | None:
     """Load one optional non-symlink JSON object for failure evidence."""
     if not path.is_file() or path.is_symlink():
@@ -928,13 +970,22 @@ def _failure_missing_artifacts(
         missing.add("solved.mph")
     exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
     for contract in config.scientific_values["output_contract"]["exports"]:
+        role = str(contract["role"])
         pattern = contract.get("pattern")
-        if not isinstance(pattern, str) or not pattern:
-            missing.add(f"export:{contract['role']}:unresolved_mapping")
+        if contract["mapping_state"] == "mapping_probe_required":
+            if contract["required"]:
+                missing.add(f"export:{role}:mapping_probe_required")
             continue
-        matches = [path for path in exports_root.glob(pattern) if path.is_file() and not path.is_symlink() and path.stat().st_size > 0]
+        if not isinstance(pattern, str) or not pattern:
+            missing.add(f"export:{role}:unresolved_mapping")
+            continue
+        matches = [
+            candidate
+            for candidate in exports_root.glob(pattern)
+            if candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size > 0
+        ]
         if contract["required"] and not matches:
-            missing.add(f"export:{contract['role']}")
+            missing.add(f"export:{role}")
     return sorted(missing)
 
 
@@ -983,6 +1034,97 @@ def _failure_execution_evidence(
     }
 
 
+def _failure_export_inventory(
+    config: config_contract.GenerationConfig,
+    work_directory: Path,
+) -> list[dict[str, Any]]:
+    """Return hashes and sizes for available exports without copying large payloads."""
+    exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
+    if not exports_root.is_dir() or exports_root.is_symlink():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(exports_root.rglob("*")):
+        if path.is_symlink():
+            message = f"Failure export inventory contains a symbolic link: {path}"
+            raise ValueError(message)
+        if path.is_file():
+            records.append(
+                {
+                    "relative_path": path.relative_to(work_directory).as_posix(),
+                    "size_bytes": path.stat().st_size,
+                    "sha256": common.serialization.file_sha256(path),
+                }
+            )
+    return records
+
+
+def _retain_failure_artifacts(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    work_directory: Path | None,
+    storage_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Retain compact pilot diagnostics before marked scratch is removed."""
+    if config.scientific_values.get("campaign_purpose") != config_contract.PILOT_CAMPAIGN_PURPOSE or work_directory is None:
+        return {}
+    target = case_failure_artifacts_directory(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not target.is_dir() or target.is_symlink() or not target.resolve().is_relative_to(target.parent.resolve()):
+            message = f"Pilot failure artifact target is unsafe: {target}"
+            raise ValueError(message)
+        shutil.rmtree(target)
+    staging = Path(tempfile.mkdtemp(prefix=f"{config.case_id(case_index)}.", dir=target.parent))
+    retained_paths = (
+        Path("case.json"),
+        Path("fields.csv"),
+        Path("scalars.csv"),
+        Path("schedule.csv"),
+        Path("runtime/solver.log"),
+        Path("runtime/stdout.log"),
+        Path("runtime/stderr.log"),
+        Path("runtime/execution_provenance.json"),
+        Path("runtime/timing.json"),
+        Path("runtime/status.json"),
+    )
+    try:
+        for relative in retained_paths:
+            source = work_directory / relative
+            if not source.is_file() or source.is_symlink():
+                continue
+            destination = staging / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        export_inventory = _failure_export_inventory(config, work_directory)
+        common.serialization.atomic_write_json(
+            staging / "export_inventory.json",
+            {
+                "schema_kind": "simulation_case_failure_export_inventory",
+                "schema_version": 1,
+                "exports": export_inventory,
+            },
+        )
+        records = {
+            path.relative_to(staging).as_posix(): {
+                "sha256": common.serialization.file_sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+            for path in sorted(staging.rglob("*"))
+            if path.is_file()
+        }
+        staging.replace(target)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    return records
+
+
 def record_case_failure(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -994,8 +1136,12 @@ def record_case_failure(
     work_directory: Path | None,
     storage_root: Path | str | None = None,
     scratch_cleanup_status: str = "pending",
+    failure_stage: str,
 ) -> Path:
     """Persist compact failure evidence before node-local scratch cleanup."""
+    if failure_stage not in _FAILURE_STAGES:
+        message = f"Unsupported case failure stage: {failure_stage!r}"
+        raise ValueError(message)
     if scratch_cleanup_status not in {"pending", "not_created"}:
         message = f"Initial scratch cleanup status is invalid: {scratch_cleanup_status!r}"
         raise ValueError(message)
@@ -1007,6 +1153,7 @@ def record_case_failure(
         "schema_kind": CASE_FAILURE_SCHEMA_KIND,
         "schema_version": CASE_FAILURE_SCHEMA_VERSION,
         "state": state,
+        "failure_stage": failure_stage,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -1036,6 +1183,12 @@ def record_case_failure(
             work_directory,
         ),
         "log_tail": _failure_log_tail(work_directory),
+        "retained_artifacts": _retain_failure_artifacts(
+            config,
+            case_index,
+            work_directory=work_directory,
+            storage_root=storage,
+        ),
         "scratch_cleanup": {
             "status": scratch_cleanup_status,
             "reclaimed_bytes": 0,
@@ -1074,6 +1227,67 @@ def clear_case_failure(
 ) -> None:
     """Clear stale failure evidence after exact completion or integrity reuse."""
     case_failure_path(config, case_index, storage_root=storage_root).unlink(missing_ok=True)
+    artifacts = case_failure_artifacts_directory(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    if artifacts.exists():
+        if not artifacts.is_dir() or artifacts.is_symlink():
+            message = f"Case failure artifact path is unsafe: {artifacts}"
+            raise ValueError(message)
+        shutil.rmtree(artifacts)
+
+
+def _validate_failure_retained_artifacts(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    retained: Any,
+    *,
+    storage_root: Path | str | None,
+    failure_path: Path,
+) -> None:
+    """Validate exact compact artifact membership for one failed case."""
+    artifacts_root = case_failure_artifacts_directory(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    if not isinstance(retained, dict):
+        message = f"Case failure retained-artifact evidence is invalid: {failure_path}"
+        raise TypeError(message)
+    if not retained:
+        if artifacts_root.exists():
+            message = f"Undeclared case failure artifacts exist: {artifacts_root}"
+            raise ValueError(message)
+        return
+    if not artifacts_root.is_dir() or artifacts_root.is_symlink():
+        message = f"Case failure retained artifacts are missing or unsafe: {artifacts_root}"
+        raise ValueError(message)
+    actual_paths: set[str] = set()
+    for artifact in artifacts_root.rglob("*"):
+        if artifact.is_symlink():
+            message = f"Case failure retained artifacts contain a symbolic link: {artifact}"
+            raise ValueError(message)
+        if artifact.is_file():
+            actual_paths.add(artifact.relative_to(artifacts_root).as_posix())
+    if actual_paths != set(retained):
+        message = f"Case failure retained-artifact membership changed: {artifacts_root}"
+        raise ValueError(message)
+    for relative_value, identity in retained.items():
+        relative = Path(relative_value)
+        artifact = (artifacts_root / relative).resolve()
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not artifact.is_relative_to(artifacts_root.resolve())
+            or not isinstance(identity, dict)
+            or set(identity) != {"sha256", "size_bytes"}
+            or artifact.stat().st_size != identity["size_bytes"]
+            or common.serialization.file_sha256(artifact) != identity["sha256"]
+        ):
+            message = f"Case failure retained-artifact identity is invalid: {artifact}"
+            raise ValueError(message)
 
 
 def case_failure_is_recorded(
@@ -1095,6 +1309,7 @@ def case_failure_is_recorded(
         or payload.get("schema_kind") != CASE_FAILURE_SCHEMA_KIND
         or payload.get("schema_version") != CASE_FAILURE_SCHEMA_VERSION
         or payload.get("state") not in {"failed", "cancelled"}
+        or payload.get("failure_stage") not in _FAILURE_STAGES
         or payload.get("simulation_profile") != config.profile.id
         or payload.get("batch_id") != config.batch_id
         or payload.get("batch_identity") != config.batch_identity
@@ -1153,6 +1368,13 @@ def case_failure_is_recorded(
     ):
         msg = f"Case failure log-tail evidence is invalid: {path}"
         raise ValueError(msg)
+    _validate_failure_retained_artifacts(
+        config,
+        case_index,
+        payload.get("retained_artifacts"),
+        storage_root=storage_root,
+        failure_path=path,
+    )
     cleanup = payload.get("scratch_cleanup")
     if (
         not isinstance(cleanup, dict)
@@ -1516,6 +1738,7 @@ def run_case(
                 work_directory=None,
             )
         prepared: case_service.PreparedCase | None = None
+        failure_stage = "input"
         try:
             prepared = case_service.prepare_case_work_directory(
                 config,
@@ -1523,6 +1746,7 @@ def run_case(
                 storage_root=storage,
                 work_root=work_root,
             )
+            failure_stage = "solver"
             result = execute_prepared_case(
                 config,
                 prepared,
@@ -1531,6 +1755,7 @@ def run_case(
                 scheduler_kind=scheduler_kind,
                 allocated_node=allocated_node,
             )
+            failure_stage = "invalid_result"
             destination = publish_completed_case(
                 config,
                 result,
@@ -1566,6 +1791,7 @@ def run_case(
                     work_directory=attempt_directory,
                     storage_root=storage,
                     scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
+                    failure_stage=str(getattr(error, "failure_stage", failure_stage)),
                 )
             if attempt_directory is not None and attempt_root is not None and attempt_run_id is not None:
                 try:

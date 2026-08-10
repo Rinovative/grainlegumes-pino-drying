@@ -31,13 +31,14 @@ from src.generation import generation_profiles as profiles
 from .dataset_transient_contract import TRANSIENT_STEP_CONTRACT
 
 DatasetViewId = Literal["steady_flow", "transient_drying"]
-PackageRegime = Literal["id", "parameter_ood", "near_family_ood", "far_family_ood"]
+PackageRegime = Literal["id", "parameter_ood", "near_family_ood", "far_family_ood", "extreme_family_ood"]
 IdMembership = Literal["train", "validation", "id_test"]
 OodGroup = Literal["bed", "operation", "initial_moisture", "material_properties"]
 
 DATASET_VIEW_SCHEMA_VERSION: Final = 1
-PACKAGE_REGIMES: Final = ("id", "parameter_ood", "near_family_ood", "far_family_ood")
+PACKAGE_REGIMES: Final = ("id", "parameter_ood", "near_family_ood", "far_family_ood", "extreme_family_ood")
 ID_MEMBERSHIPS: Final = ("train", "validation", "id_test")
+TECHNICAL_SMOKE_MEMBERSHIP: Final = "technical_smoke"
 OOD_GROUPS: Final = ("bed", "operation", "initial_moisture", "material_properties")
 
 

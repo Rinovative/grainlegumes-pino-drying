@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 from typing import Any
 
@@ -11,93 +10,7 @@ import yaml
 
 from src import generation
 
-
-def _parameter_values(definitions: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Return compact test-only values for every final registry definition."""
-    intervals: dict[str, tuple[float, float, float, float]] = {
-        "kappa_mean": (4e-9, 6e-9, 7e-9, 8e-9),
-        "kappa_cv": (0.2, 0.5, 0.6, 0.8),
-        "bed.structure.coarse_len_rel": (0.02, 0.03, 0.035, 0.04),
-        "bed.structure.fine_len_rel": (0.01, 0.02, 0.025, 0.03),
-        "bed.structure.coarse_weight": (0.3, 0.7, 0.75, 0.8),
-        "bed.structure.fine_ani_x": (0.8, 1.2, 1.3, 1.5),
-        "bed.structure.fine_ani_y": (0.8, 1.2, 1.3, 1.5),
-        "bed.structure.cross_scale_corr": (0.2, 0.6, 0.7, 0.8),
-        "bed.perturbations.amplitude": (0.0, 0.01, 0.02, 0.03),
-        "bed.perturbations.granularity": (0.3, 0.6, 0.7, 0.8),
-        "bed.perturbations.sign_bias": (0.3, 0.7, 0.75, 0.8),
-        "permeability.anisotropy.max_ratio": (1.2, 1.8, 1.9, 2.1),
-        "permeability.anisotropy.exponent": (1.0, 2.0, 2.2, 2.5),
-        "permeability.anisotropy.strength": (0.3, 0.8, 0.9, 1.0),
-        "permeability.orientation.jitter": (0.0, 0.01, 0.02, 0.03),
-        "permeability.orientation.smooth_len_rel": (0.01, 0.02, 0.025, 0.03),
-        "porosity.anchor_rel": (1.5, 2.0, 2.2, 2.5),
-        "porosity.smooth_len_rel": (0.01, 0.02, 0.025, 0.03),
-        "porosity.texture_amp": (0.001, 0.002, 0.003, 0.004),
-        "pressure_bc.mean": (300.0, 400.0, 420.0, 450.0),
-        "pressure_bc.sin_amp": (0.0, 0.03, 0.04, 0.05),
-        "pressure_bc.sin_freq": (0.5, 1.0, 1.1, 1.3),
-        "pressure_bc.sin_phase": (0.0, 3.0, 3.5, 4.0),
-        "pressure_bc.gauss_amp": (0.0, 0.03, 0.04, 0.05),
-        "pressure_bc.gauss_width": (0.03, 0.05, 0.06, 0.08),
-        "pressure_bc.gauss_jitter": (0.0, 0.2, 0.25, 0.3),
-        "pressure_bc.linear_amp": (0.0, 0.02, 0.03, 0.04),
-        "initial_moisture.mean_db": (0.19, 0.21, 0.22, 0.23),
-        "initial_moisture.amplitude_db": (0.01, 0.02, 0.025, 0.03),
-        "initial_moisture.structure.coarse_len_rel": (0.02, 0.03, 0.035, 0.04),
-        "initial_moisture.structure.fine_len_rel": (0.01, 0.02, 0.025, 0.03),
-        "initial_moisture.structure.coarse_weight": (0.3, 0.7, 0.75, 0.8),
-        "initial_moisture.structure.fine_ani_x": (0.8, 1.2, 1.3, 1.5),
-        "initial_moisture.structure.fine_ani_y": (0.8, 1.2, 1.3, 1.5),
-        "initial_moisture.structure.cross_scale_corr": (0.2, 0.6, 0.7, 0.8),
-        "T_in_base": (295.0, 297.0, 298.0, 299.0),
-        "T_in_amp": (0.0, 0.5, 0.6, 0.8),
-        "omega_in_base": (0.008, 0.009, 0.0095, 0.010),
-        "omega_in_amp": (0.0, 0.0002, 0.0003, 0.0004),
-        "schedule.corr": (-0.5, 0.5, 0.6, 0.7),
-        "schedule.timescale_rel": (0.2, 0.4, 0.45, 0.6),
-        "schedule.event_duration_rel": (0.02, 0.05, 0.06, 0.08),
-        "schedule.event_width_rel": (0.005, 0.01, 0.012, 0.02),
-        "rho_bu_dry_ref": (500.0, 600.0, 620.0, 680.0),
-        "k_gr": (0.1, 0.2, 0.22, 0.3),
-        "cp_gr_dry": (1000.0, 1300.0, 1400.0, 1600.0),
-        "r_surf_0": (1e-5, 2e-5, 2.2e-5, 3e-5),
-        "r_int_surf": (0.5, 1.5, 1.7, 2.0),
-        "f_surf": (0.3, 0.7, 0.75, 0.8),
-        "T_amb": (293.0, 295.0, 296.0, 297.0),
-    }
-    integers = {"pressure_bc.gauss_count": (1, 2, 3, 3), "schedule.event_count": (0, 2, 3, 3)}
-    fixed = {
-        "eps_min_global": 0.3,
-        "eps_max_global": 0.8,
-        "eps_bed_cal_ref": 0.5,
-        "X_target_wb": 0.12,
-    }
-    result: dict[str, dict[str, Any]] = {}
-    for name, definition in definitions.items():
-        kind = definition["kind"]
-        if kind == "interval":
-            lower, upper, ood_lower, ood_upper = intervals[name]
-            result[name] = {"lower": lower, "upper": upper}
-            if "ood_group" in definition:
-                result[name]["ood"] = {"lower": ood_lower, "upper": ood_upper}
-        elif kind == "integer":
-            lower, upper, ood_lower, ood_upper = integers[name]
-            result[name] = {"lower": lower, "upper": upper}
-            if "ood_group" in definition:
-                result[name]["ood"] = {"lower": ood_lower, "upper": ood_upper}
-        elif kind == "fixed":
-            result[name] = {"value": fixed[name]}
-        elif kind == "simplex":
-            result[name] = {"ood_values": [{"smooth": 1.0, "event": 0.0, "trend": 0.0}]}
-        elif kind == "parameter_set":
-            result[name] = {
-                "sets": [{"id": "synthetic_oswin_id", "values": {"A_osw": 0.1, "B_osw": 0.2, "C_osw": 0.3}}],
-                "ood_sets": [{"id": "synthetic_oswin_ood", "values": {"A_osw": 0.4, "B_osw": 0.5, "C_osw": 0.6}}],
-            }
-        else:
-            result[name] = {}
-    return result
+_SMOKE_CASE_COUNT = 2
 
 
 def _steady_flow_conditioning() -> dict[str, Any]:
@@ -108,7 +21,6 @@ def _steady_flow_conditioning() -> dict[str, Any]:
             "affects_stationary_solution": True,
             "owner": "model_input",
             "unit": unit,
-            "fixed_value": None,
         }
         for name, unit in (
             ("Kxx", "m^2"),
@@ -136,7 +48,7 @@ def _steady_flow_conditioning() -> dict[str, Any]:
         "schema_kind": "steady_flow_conditioning",
         "schema_version": 1,
         "exhaustive": True,
-        "stationary_solution_contract_id": "synthetic_brinkman_airflow_v2",
+        "stationary_solution_contract_id": "vp2_stationary_airflow_v1",
         "dependencies": dependencies,
         "additional_case_varying_solver_scalars": [],
     }
@@ -144,6 +56,7 @@ def _steady_flow_conditioning() -> dict[str, Any]:
 
 def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: bool) -> dict[str, Any]:
     """Return complete test-owned mappings without inspecting template binaries."""
+    del repeated_airflow_times
     profile = generation.profiles.get_profile(simulation_profile)
     patterns = {
         "steady_flow_fields": "airflow.csv",
@@ -151,37 +64,35 @@ def _profile_configuration(simulation_profile: str, *, repeated_airflow_times: b
         "global_time_series": "globals.csv",
         "final_status": "status.csv",
     }
-    exports = [
-        {
-            "role": role.role,
-            "pattern": patterns[role.role],
-            "delimiter": ";",
-            "columns": {name: name for name in role.logical_fields},
-            "time_column": "stationary_time" if role.role == "steady_flow_fields" and repeated_airflow_times else None,
-        }
-        for role in profile.export_roles
-    ]
+    temporal_kinds = {
+        "steady_flow_fields": "stationary",
+        "transient_fields": "regular_time_series",
+        "global_time_series": "regular_time_series",
+        "final_status": "final_status",
+        "exact_stop_diagnostics": "irregular_stop_diagnostic",
+    }
+    exports = []
+    for role in profile.export_roles:
+        source = (
+            {"state": "mapping_probe_required"}
+            if role.role == "exact_stop_diagnostics"
+            else {"state": "runtime_confirmed", "pattern": patterns[role.role]}
+        )
+        exports.append(
+            {
+                "role": role.role,
+                "temporal_kind": temporal_kinds[role.role],
+                "source": source,
+                "delimiter": ";",
+                "columns": {name: {"state": "runtime_confirmed", "source_header": name} for name in role.logical_fields},
+            }
+        )
     return {
         "schema_kind": "generation_profile",
         "schema_version": 1,
         "simulation_profile": simulation_profile,
-        "template_ready": True,
         "steady_flow_conditioning": _steady_flow_conditioning(),
         "exports": exports,
-    }
-
-
-def _resolved_evidence() -> dict[str, Any]:
-    """Return explicit test-only evidence that cannot be mistaken for literature."""
-    return {
-        "source": "synthetic pytest fixture; not a scientific source",
-        "evidence_type": "assumed",
-        "confidence": "low",
-        "temperature_range": None,
-        "humidity_range": None,
-        "cultivar_or_market_class": "synthetic",
-        "product_form": "synthetic",
-        "status": "resolved",
     }
 
 
@@ -212,21 +123,12 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("PROJECT_ROOT", str(project_root))
 
     registry = yaml.safe_load((repository_root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))
-    parameter_values = _parameter_values(registry["parameters"])
+    sources = yaml.safe_load((repository_root / "configs/generation/sources.yaml").read_text(encoding="utf-8"))
     materials_root = project_root / "configs/generation/materials"
     materials_root.mkdir(parents=True, exist_ok=True)
     for material_family in generation.materials.MATERIAL_FAMILIES:
         source = repository_root / "configs/generation/materials" / f"{material_family}.yaml"
         material = yaml.safe_load(source.read_text(encoding="utf-8"))
-        material["executable"] = True
-        material["taxonomy"]["specificity_status"] = "resolved"
-        material["product_form"]["specificity_status"] = "resolved"
-        owned_names = tuple(name for name in material["parameter_values"] if name != "initial_moisture_bounds")
-        material["parameter_values"] = {
-            "initial_moisture_bounds": {"lower": 0.1, "upper": 0.3},
-            **{name: copy.deepcopy(parameter_values[name]) for name in owned_names},
-        }
-        material["evidence"] = {name: _resolved_evidence() for name in material["parameter_values"]}
         (materials_root / f"{material_family}.yaml").write_text(
             yaml.safe_dump(material, sort_keys=False),
             encoding="utf-8",
@@ -242,39 +144,31 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         retain_solved_model: bool = False,
         retain_raw_csv: bool = False,
         repeated_airflow_times: bool = False,
-        natural_count: int = 1,
-        parameter_ood_count: int = 4,
+        natural_count: int = _SMOKE_CASE_COUNT,
+        parameter_ood_count: int = 0,
     ) -> tuple[Path, Path]:
         tests_root = project_root / "configs/generation/campaigns/test_support"
         campaign_number = len(list(tests_root.glob("campaign_*"))) if tests_root.exists() else 0
         directory = tests_root / f"campaign_{campaign_number}"
         directory.mkdir(parents=True)
         common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
-        common["executable"] = True
-        common["scientific_fixed_values"].update(
+        operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
+        synthetic_anchor = operations["parameter_values"]["porosity.anchor_rel"]
+        synthetic_anchor.update(
             {
-                "p_ref": 101325.0,
-                "p_out": 0.0,
-                "omega_min": 0.001,
-                "omega_max": 0.02,
-                "phi_clip_min": 0.05,
-                "phi_clip_max": 0.95,
+                "lower": 12.0,
+                "upper": 18.0,
+                "nominal": 15.0,
+                "ood": [
+                    {"lower": 8.0, "upper": 10.0},
+                    {"lower": 20.0, "upper": 24.0},
+                ],
             }
         )
-        common["parameter_values"] = {name: copy.deepcopy(parameter_values[name]) for name in common["parameter_values"]}
-        operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
-        operations["executable"] = True
-        operations["parameter_values"] = {name: copy.deepcopy(parameter_values[name]) for name in operations["parameter_values"]}
         profile = _profile_configuration(simulation_profile, repeated_airflow_times=repeated_airflow_times)
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
-        execution["runtime"].update(
-            {
-                "executable": "comsol" if executable is None else str(executable),
-                "module_initialization": [],
-                "timeout_seconds": timeout,
-            }
-        )
-        execution["retention"] = {
+        execution["runtime"]["timeout_seconds"] = timeout
+        execution["retention"]["technical_runtime_smoke"] = {
             "retain_raw_csv": retain_raw_csv,
             "retain_solved_model": retain_solved_model,
         }
@@ -284,9 +178,6 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 "cases_per_node": 2,
                 "cores_per_case": 1,
                 "max_parallel_cases": 3,
-                "cores_per_node": 32,
-                "scheduler_kind": scheduler_kind,
-                "partition": "test",
                 "wall_time": None,
                 "scheduler_options": [],
             }
@@ -300,10 +191,11 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 "python_module": "Python/3.10",
                 "comsol_module": "Comsol/v6.4",
                 "python_executable": "python3",
-                "comsol_executable": "comsol",
+                "comsol_executable": "comsol" if executable is None else str(executable),
             }
         )
         layers = {
+            "sources.yaml": sources,
             "registry.yaml": registry,
             "common.yaml": common,
             "operations.yaml": operations,
@@ -313,69 +205,38 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         for name, value in layers.items():
             (directory / name).write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
 
-        selected = tuple(material_family for material_family in generation.materials.MATERIAL_FAMILIES if material_family in material_families)
-        if selected != material_families:
-            message = "Synthetic material_families must be unique and in canonical order."
+        if material_families != ("lentil",):
+            message = "Synthetic runtime fixtures use the canonical one-material technical smoke."
             raise ValueError(message)
-        seen = tuple(material_family for material_family in selected if material_family in generation.materials.MATERIAL_FAMILIES[:3])
-        near = tuple(material_family for material_family in selected if material_family == "field_pea")
-        far = tuple(material_family for material_family in selected if material_family == "almond")
-        dataset_views = ("steady_flow",) if simulation_profile == "steady_flow" else ("steady_flow", "transient_drying")
-        dataset_packages: list[dict[str, Any]] = []
-        for dataset_view in dataset_views:
-            dataset_packages.extend(
-                [
-                    {
-                        "dataset_view": dataset_view,
-                        "evaluation_regime": "id",
-                        "materials": list(seen),
-                        "membership_seed": 9101,
-                        "membership_counts_per_material": {"train": 1, "validation": 1, "id_test": 1},
-                    },
-                    {
-                        "dataset_view": dataset_view,
-                        "evaluation_regime": "parameter_ood",
-                        "materials": list(seen),
-                    },
-                ]
-            )
-            for regime, role_materials in (("near_family_ood", near), ("far_family_ood", far)):
-                if role_materials:
-                    dataset_packages.append(
-                        {
-                            "dataset_view": dataset_view,
-                            "evaluation_regime": regime,
-                            "materials": list(role_materials),
-                        }
-                    )
+        if natural_count != _SMOKE_CASE_COUNT or parameter_ood_count != 0:
+            message = "Synthetic runtime fixtures use exactly two natural cases and no parameter OOD."
+            raise ValueError(message)
+        campaign_seed = 9910 if simulation_profile == "steady_flow" else 9920
         campaign = {
             "schema_kind": "generation_campaign",
             "schema_version": 1,
-            "campaign_name": f"synthetic_{simulation_profile}_{directory.name}",
-            "executable": True,
+            "campaign_purpose": "technical_runtime_smoke",
+            "sources_config": "sources.yaml",
             "registry_config": "registry.yaml",
             "common_config": "common.yaml",
             "operations_config": "operations.yaml",
             "profile_config": "profile.yaml",
             "execution_config": "execution.yaml",
-            "materials": list(selected),
-            "roles": {"seen": list(seen), "near_family_ood": list(near), "far_family_ood": list(far)},
-            "duplicate_case_input_policy": "reject_duplicates",
+            "paired_equivalence_seed": 9930,
+            "material_roles": {
+                "seen": ["lentil"],
+                "near_family_ood": [],
+                "far_family_ood": [],
+                "extreme_family_ood": [],
+            },
             "sampling": {
                 "method": "lhs",
-                "seed_base": 3001,
-                "counts": {
-                    "natural": dict.fromkeys(selected, natural_count),
-                    "parameter_ood": dict.fromkeys(seen, parameter_ood_count),
-                },
-                "parameter_ood": {
-                    "groups": list(generation.materials.OOD_GROUPS),
-                    "units_per_case": 1,
-                    "balance_groups": True,
-                    "balance_parameters": True,
-                },
+                "seed_base": campaign_seed,
+                "counts": {"natural": {"lentil": 2}},
             },
-            "dataset_packages": dataset_packages,
+            "dataset_packages": [
+                {"evaluation_regime": "id", "source_role": "seen"},
+            ],
         }
         config_path = directory / "campaign.yaml"
         config_path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
@@ -422,6 +283,26 @@ def update_tracker(delta):
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def wait_for_expected_starts():
+    expected = int(os.environ.get("FAKE_COMSOL_EXPECT_STARTS", "1"))
+    if expected <= 1:
+        return
+    tracker = os.environ.get("FAKE_COMSOL_TRACKER")
+    if not tracker:
+        raise RuntimeError("FAKE_COMSOL_TRACKER is required for a start barrier")
+    path = pathlib.Path(tracker)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        with path.open("r", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            state = json.load(stream)
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        if state["starts"] >= expected:
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"timed out waiting for {expected} fake COMSOL starts")
+
+
 def scalar_values():
     with pathlib.Path("scalars.csv").open(encoding="utf-8", newline="") as stream:
         return {row["name"]: float(row["value"]) for row in csv.DictReader(stream, delimiter=";")}
@@ -433,6 +314,7 @@ if mode == "failure":
     raise SystemExit(7)
 update_tracker(1)
 try:
+    wait_for_expected_starts()
     if mode == "timeout":
         time.sleep(2.0)
     else:

@@ -40,7 +40,7 @@ from src.generation import generation_profiles as profiles
 from src.generation import generation_storage as storage
 
 from .dataset_transient_contract import TRANSIENT_STEP_CONTRACT
-from .dataset_views import ID_MEMBERSHIPS, PACKAGE_REGIMES
+from .dataset_views import ID_MEMBERSHIPS, PACKAGE_REGIMES, TECHNICAL_SMOKE_MEMBERSHIP
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
 TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
@@ -262,7 +262,7 @@ def _case_record(
     if source.evaluation_regime not in PACKAGE_REGIMES:
         message = f"Unsupported transient evaluation regime: {source.evaluation_regime!r}."
         raise TransientDataContractError(message)
-    valid_memberships = ID_MEMBERSHIPS if source.evaluation_regime == "id" else (source.evaluation_regime,)
+    valid_memberships = (*ID_MEMBERSHIPS, TECHNICAL_SMOKE_MEMBERSHIP) if source.evaluation_regime == "id" else (source.evaluation_regime,)
     if source.membership not in valid_memberships:
         message = f"Membership {source.membership!r} is invalid for {source.evaluation_regime!r}."
         raise TransientDataContractError(message)

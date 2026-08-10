@@ -276,12 +276,37 @@ def load_campaign_run(
 
 
 def _campaign_from_manifest(manifest: Mapping[str, Any]) -> config_service.CampaignConfig:
-    """Resolve the exact predeclared batch selection persisted by a run."""
-    campaign = config_service.load_campaign_config(_campaign_config_path(manifest["campaign_config"]))
-    if campaign.campaign_id != manifest["campaign_id"]:
-        message = "Campaign configuration identity changed after launch."
+    """Resolve the exact canonical, smoke, or pilot campaign execution view."""
+    config_path = _campaign_config_path(manifest["campaign_config"])
+    if manifest["campaign_name"] == (f"{profiles.TRANSIENT_DRYING_PROFILE}_{config_service.PILOT_CAMPAIGN_PURPOSE}"):
+        batch_records = manifest.get("batches")
+        counts = (
+            {record.get("case_count") for record in batch_records}
+            if isinstance(batch_records, list) and all(isinstance(record, dict) for record in batch_records)
+            else set()
+        )
+        if len(counts) != 1:
+            message = "Pilot campaign manifest has no uniform cases-per-material identity."
+            raise RuntimeError(message)
+        cases_per_material = next(iter(counts))
+        if isinstance(cases_per_material, bool) or not isinstance(cases_per_material, int):
+            message = "Pilot campaign manifest cases-per-material identity is malformed."
+            raise RuntimeError(message)
+        campaign = config_service.load_campaign_config(
+            config_path,
+            pilot_cases_per_material=cases_per_material,
+        )
+    else:
+        campaign = config_service.load_campaign_config(config_path)
+        campaign = campaign.select_batches(tuple(manifest["selected_batch_names"]))
+    if (
+        campaign.campaign_id != manifest["campaign_id"]
+        or campaign.campaign_digest != manifest["campaign_digest"]
+        or [batch.batch_name for batch in campaign.batches] != manifest["selected_batch_names"]
+    ):
+        message = "Campaign configuration or execution-view identity changed after launch."
         raise RuntimeError(message)
-    return campaign.select_batches(tuple(manifest["selected_batch_names"]))
+    return campaign
 
 
 def campaign_for_run(
@@ -979,9 +1004,12 @@ def campaign_status(
         for token in squeue_output.splitlines()
         if len(token.split("|")) >= _SCHEDULER_REQUIRED_FIELDS and token.split("|")[1].strip()
     }
-    complete = all(batch["terminal_manifest_available"] for batch in batches)
     completed_cases = sum(batch["completed"] for batch in batches)
     failed_cases = sum(batch["failed"] for batch in batches)
+    planned_cases = sum(batch["planned"] for batch in batches)
+    complete = all(batch["terminal_manifest_available"] for batch in batches) or (
+        campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE and completed_cases + failed_cases == planned_cases
+    )
     cancellation_receipt = (_run_directory(run_id, storage_root=storage_root) / "cancellations.json").is_file()
     transfer_receipt = (_run_directory(run_id, storage_root=storage_root) / "transfer_complete.json").is_file()
     failure_states = states.intersection(_TERMINAL_FAILURE_STATES.difference({"CANCELLED"}))
@@ -1015,6 +1043,8 @@ def campaign_status(
     return {
         "campaign_run_id": run_id,
         "campaign_state": state,
+        "campaign_purpose": campaign.campaign_purpose,
+        "cases_per_material": (len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None),
         "git_commit": manifest["git_commit"],
         "slurm_job_ids": job_ids,
         "scheduler_job_name": manifest["scheduler_job_name"],
@@ -1033,15 +1063,23 @@ def finalize_campaign_run(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Publish immutable terminal campaign evidence after all batches validate."""
+    """Publish immutable terminal campaign evidence after all cases validate."""
     manifest = load_campaign_run(run_id, storage_root=storage_root)
+    campaign = _campaign_from_manifest(manifest)
+    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+        from . import generation_pilot as pilot_service  # noqa: PLC0415
+
+        pilot_service.validate_pilot_terminal(
+            run_id,
+            storage_root=storage_root,
+        )
+        return _run_directory(run_id, storage_root=storage_root) / "campaign_terminal.json"
     if not manifest["slurm_job_ids"]:
         campaign_status(run_id, storage_root=storage_root)
         manifest = load_campaign_run(run_id, storage_root=storage_root)
         if not manifest["slurm_job_ids"]:
             message = f"Campaign scheduler identity has not been recovered for {run_id!r}."
             raise RuntimeError(message)
-    campaign = _campaign_from_manifest(manifest)
     batch_manifests: list[dict[str, Any]] = []
     for batch in campaign.batches:
         batch_manifest = batch_runtime.validate_terminal_batch(
@@ -1102,9 +1140,16 @@ def campaign_transfer_plan(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return terminally validated storage-relative directories for collection."""
-    validate_terminal_campaign(run_id, storage_root=storage_root)
     manifest = load_campaign_run(run_id, storage_root=storage_root)
     campaign = _campaign_from_manifest(manifest)
+    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+        from . import generation_pilot as pilot_service  # noqa: PLC0415
+
+        return pilot_service.pilot_transfer_plan(
+            run_id,
+            storage_root=storage_root,
+        )
+    validate_terminal_campaign(run_id, storage_root=storage_root)
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
 
     def relative_directory(directory: Path) -> str:

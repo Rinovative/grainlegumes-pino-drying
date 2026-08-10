@@ -1,33 +1,658 @@
 schema_kind: generation_common
 schema_version: 1
 generator_version: 1
-executable: false
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 scientific_fixed_values:
-  T_flow_ref: 300.65
-  p_ref: 101325.0
-  p_out: 0.0
-  T_in_max: 308.15
-  omega_min: null
-  omega_max: null
-  phi_clip_min: null
-  phi_clip_max: null
-  f_wet_dm_max: 0.05
-  schedule_interpolation: linear
+  T_flow_ref:
+    value: 300.65
+    unit: K
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: fixed_design
+        description: Package-fixed frozen-airflow material reference temperature, exactly 27.5 degC.
+      confidence: high
+      validity:
+        temperature: package fixed; not derived and not a neural-operator channel
+        humidity_or_aw: package fixed; not derived and not a neural-operator channel
+        packing_or_flow_regime: package fixed; not derived and not a neural-operator channel
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: package fixed; not derived and not a neural-operator channel
+      notes: not sampled; revisit only by explicit model-version change
+  p_ref:
+    value: 101325.0
+    unit: Pa
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: comsol_model_baseline
+        description: Absolute reference pressure for air properties and psychrometrics.
+      confidence: medium
+      validity:
+        temperature: fixed at standard atmospheric pressure
+        humidity_or_aw: fixed at standard atmospheric pressure
+        packing_or_flow_regime: fixed at standard atmospheric pressure
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: fixed at standard atmospheric pressure
+      notes: not sampled; revisit only by explicit model-version change
+  p_out:
+    value: 0.0
+    unit: Pa
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: comsol_model_baseline
+        description: Outlet gauge pressure on boundary 3.
+      confidence: medium
+      validity:
+        temperature: gauge convention; p_ref supplies absolute reference
+        humidity_or_aw: gauge convention; p_ref supplies absolute reference
+        packing_or_flow_regime: gauge convention; p_ref supplies absolute reference
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: gauge convention; p_ref supplies absolute reference
+      notes: not sampled; revisit only by explicit model-version change
+  T_in_min:
+    value: 298.15
+    unit: K
+    provenance:
+      source_refs:
+      - ba
+      - vp2_decision_contract
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Hard minimum generated inlet temperature, 25 degC.
+      confidence: high_for_generator_constraint
+      validity:
+        temperature: T_in_bc 298.15-313.15 K
+  T_in_max:
+    value: 313.15
+    unit: K
+    provenance:
+      source_refs:
+      - ba
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: fixed_design
+        description: Hard maximum generated inlet temperature, 40 degC.
+      confidence: high
+      validity:
+        temperature: quality-preserving hard bound for whole pulses/oilseed pilot
+        humidity_or_aw: quality-preserving hard bound for whole pulses/oilseed pilot
+        packing_or_flow_regime: quality-preserving hard bound for whole pulses/oilseed pilot
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: quality-preserving hard bound for whole pulses/oilseed pilot
+      notes: not sampled; revisit only by explicit model-version change
+  omega_min:
+    value: 0.0025
+    unit: kg/kg
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Hard minimum inlet humidity ratio.
+      confidence: medium
+      validity:
+        temperature: used with phi operational bound
+        humidity_or_aw: used with phi operational bound
+        packing_or_flow_regime: used with phi operational bound
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: used with phi operational bound
+      notes: not sampled; revisit only by explicit model-version change
+    boundary:
+      boundary_kind: engineering_source_air_envelope
+      boundary_basis: source_air_dew_point_range
+      hard_boundary: true
+  omega_max:
+    value: 0.0145
+    unit: kg/kg
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Hard maximum inlet humidity ratio.
+      confidence: medium
+      validity:
+        temperature: used with phi operational bound
+        humidity_or_aw: used with phi operational bound
+        packing_or_flow_regime: used with phi operational bound
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: used with phi operational bound
+      notes: not sampled; revisit only by explicit model-version change
+    boundary:
+      boundary_kind: engineering_source_air_envelope
+      boundary_basis: source_air_dew_point_range
+      hard_boundary: true
+  phi_operational_min:
+    value: 0.05
+    unit: '1'
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      - vp2_decision_contract
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Operational inlet relative-humidity bound applied to generated heater-only schedules.
+      confidence: high_for_generator_constraint
+      validity:
+        humidity_or_aw: 0.05 <= phi_in_bc <= 0.85 at p_ref
+  phi_operational_max:
+    value: 0.85
+    unit: '1'
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      - vp2_decision_contract
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Operational inlet relative-humidity bound applied to generated heater-only schedules.
+      confidence: high_for_generator_constraint
+      validity:
+        humidity_or_aw: 0.05 <= phi_in_bc <= 0.85 at p_ref
+  phi_clip_min:
+    value: 1.0e-06
+    unit: '1'
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: fixed_design
+        description: Numerical lower clamp in Oswin evaluation, not an operational RH bound.
+      confidence: high
+      validity:
+        temperature: numerical only
+        humidity_or_aw: numerical only
+        packing_or_flow_regime: numerical only
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: numerical only
+      notes: not sampled; revisit only by explicit model-version change
+  phi_clip_max:
+    value: 0.999
+    unit: '1'
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: fixed_design
+        description: Numerical upper clamp in Oswin evaluation, not an operational RH bound.
+      confidence: high
+      validity:
+        temperature: numerical only
+        humidity_or_aw: numerical only
+        packing_or_flow_regime: numerical only
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: numerical only
+      notes: not sampled; revisit only by explicit model-version change
+  cp_w:
+    value: 4180.0
+    unit: J/(kg*K)
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: comsol_model_baseline
+        description: Constant representative liquid-water heat capacity.
+      confidence: medium
+      validity:
+        temperature: constant across 5-60 degC; no sampling dimension
+        humidity_or_aw: constant across 5-60 degC; no sampling dimension
+        packing_or_flow_regime: constant across 5-60 degC; no sampling dimension
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: constant across 5-60 degC; no sampling dimension
+      notes: not sampled; revisit only by explicit model-version change
+  h_fg:
+    value: 2418200.0
+    unit: J/kg
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: comsol_model_baseline
+        description: Constant representative latent heat of vaporization.
+      confidence: medium
+      validity:
+        temperature: representative near 35 degC; deterministic T function is optional later, not sampled
+        humidity_or_aw: representative near 35 degC; deterministic T function is optional later, not sampled
+        packing_or_flow_regime: representative near 35 degC; deterministic T function is optional later, not sampled
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: representative near 35 degC; deterministic T function is optional later, not sampled
+      notes: not sampled; revisit only by explicit model-version change
+  D_v_air:
+    value: 2.811e-05
+    unit: m^2/s
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: comsol_model_baseline
+        description: Constant water-vapour diffusivity in air before Bruggeman correction.
+      confidence: medium
+      validity:
+        temperature: representative at T_flow_ref and p_ref; deterministic T,p function is optional later
+        humidity_or_aw: representative at T_flow_ref and p_ref; deterministic T,p function is optional later
+        packing_or_flow_regime: representative at T_flow_ref and p_ref; deterministic T,p function is optional later
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: representative at T_flow_ref and p_ref; deterministic T,p function is optional later
+      notes: not sampled; revisit only by explicit model-version change
+  M_v:
+    value: 0.01801528
+    unit: kg/mol
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: literature_direct
+      derivation:
+        kind: reported_directly
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Molar mass of water vapour.
+      confidence: high
+      validity:
+        temperature: universal constant
+        humidity_or_aw: universal constant
+        packing_or_flow_regime: universal constant
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: universal constant
+      notes: not sampled; revisit only by explicit model-version change
+  d_wall:
+    value: 0.019
+    unit: m
+    provenance:
+      source_refs:
+      - ba
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Wooden dryer-wall thickness.
+      confidence: medium
+      validity:
+        temperature: project pallet dryer
+        humidity_or_aw: project pallet dryer
+        packing_or_flow_regime: project pallet dryer
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: project pallet dryer
+      notes: not sampled; revisit only by explicit model-version change
+  k_wall:
+    value: 0.13
+    unit: W/(m*K)
+    provenance:
+      source_refs:
+      - ba
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Representative wood wall conductivity.
+      confidence: medium
+      validity:
+        temperature: project wall material; constant
+        humidity_or_aw: project wall material; constant
+        packing_or_flow_regime: project wall material; constant
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: project wall material; constant
+      notes: not sampled; revisit only by explicit model-version change
+  h_ext:
+    value: 8.0
+    unit: W/(m^2*K)
+    provenance:
+      source_refs:
+      - ba
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: External natural-convection film coefficient.
+      confidence: medium
+      validity:
+        temperature: indoor quiescent-air engineering baseline
+        humidity_or_aw: indoor quiescent-air engineering baseline
+        packing_or_flow_regime: indoor quiescent-air engineering baseline
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: indoor quiescent-air engineering baseline
+      notes: not sampled; revisit only by explicit model-version change
+  U_wall:
+    unit: W/(m^2*K)
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: derived
+      derivation:
+        kind: derived_from_configured_value
+        origin: supplied_by_handoff
+        verification: mathematically_reproduced
+        description: Overall wall heat-transfer coefficient 1/(d_wall/k_wall+1/h_ext).
+      confidence: high
+      validity:
+        temperature: derived exactly from the three wall constants
+        humidity_or_aw: derived exactly from the three wall constants
+        packing_or_flow_regime: derived exactly from the three wall constants
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: derived exactly from the three wall constants
+      notes: not sampled; revisit only by explicit model-version change
+  f_wet_dm_max:
+    value: 0.05
+    unit: '1'
+    provenance:
+      source_refs:
+      - transient_comsol_model_report
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        supplied_status: fixed_design
+        description: Stop threshold for dry-mass fraction above material target moisture.
+      confidence: high
+      validity:
+        temperature: binding stop contract
+        humidity_or_aw: binding stop contract
+        packing_or_flow_regime: binding stop contract
+        product_form: all campaign materials unless material table overrides
+        equation_or_method: binding stop contract
+      notes: not sampled; revisit only by explicit model-version change
+  schedule_interpolation:
+    value: linear
+    unit: method
+    provenance:
+      source_refs:
+      - vp2_decision_contract
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Linear interpolation between hourly inlet-schedule nodes.
+      confidence: high_for_generator_semantics
+      validity:
+        equation_or_method: linear interpolation between hourly schedule nodes
 grid:
   nx: 401
   ny: 251
   Lx: 1.2
   Ly: 0.75
   Lz: 0.8
-  dx: 0.003
-  dy: 0.003
   boundaries_included: true
+grid_provenance:
+  nx:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Boundary-inclusive x grid nodes.
+    confidence: high
+    validity:
+      temperature: mesh distribution uses Nx-1
+      humidity_or_aw: mesh distribution uses Nx-1
+      packing_or_flow_regime: mesh distribution uses Nx-1
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: mesh distribution uses Nx-1
+    notes: not sampled; revisit only by explicit model-version change
+  ny:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Boundary-inclusive y grid nodes.
+    confidence: high
+    validity:
+      temperature: mesh distribution uses Ny-1
+      humidity_or_aw: mesh distribution uses Ny-1
+      packing_or_flow_regime: mesh distribution uses Ny-1
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: mesh distribution uses Ny-1
+    notes: not sampled; revisit only by explicit model-version change
+  Lx:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Bed length / output-grid x extent.
+    confidence: high
+    validity:
+      temperature: binding geometry
+      humidity_or_aw: binding geometry
+      packing_or_flow_regime: binding geometry
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: binding geometry
+    notes: not sampled; revisit only by explicit model-version change
+  Ly:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Bed height / output-grid y extent.
+    confidence: high
+    validity:
+      temperature: binding geometry
+      humidity_or_aw: binding geometry
+      packing_or_flow_regime: binding geometry
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: binding geometry
+    notes: not sampled; revisit only by explicit model-version change
+  Lz:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Out-of-plane physical thickness for 2D extensive quantities.
+    confidence: high
+    validity:
+      temperature: binding geometry
+      humidity_or_aw: binding geometry
+      packing_or_flow_regime: binding geometry
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: binding geometry
+    notes: not sampled; revisit only by explicit model-version change
+  dx:
+    source_refs:
+    - transient_comsol_model_report
+    status: derived
+    derivation:
+      kind: derived_from_configured_value
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Boundary-inclusive output spacing Lx/(Nx-1).
+    confidence: high
+    validity:
+      temperature: exact from binding grid
+      humidity_or_aw: exact from binding grid
+      packing_or_flow_regime: exact from binding grid
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: exact from binding grid
+    notes: not sampled; revisit only by explicit model-version change
+  dy:
+    source_refs:
+    - transient_comsol_model_report
+    status: derived
+    derivation:
+      kind: derived_from_configured_value
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Boundary-inclusive output spacing Ly/(Ny-1).
+    confidence: high
+    validity:
+      temperature: exact from binding grid
+      humidity_or_aw: exact from binding grid
+      packing_or_flow_regime: exact from binding grid
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: exact from binding grid
+    notes: not sampled; revisit only by explicit model-version change
+  boundaries_included:
+    source_refs:
+    - pino_airflow_project
+    - vp2_decision_contract
+    status: project_baseline
+    derivation:
+      kind: selected_project_baseline
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Boundary-inclusive Cartesian grid convention.
+    confidence: high_for_grid_semantics
+    validity:
+      packing_or_flow_regime: two-dimensional fixed-bed Cartesian domain
 time:
   start: 0.0
   stop: 168.0
   interval: 1.0
   internal_steps: adaptive
   irregular_stop_state: diagnostic_only
+time_provenance:
+  start:
+    source_refs:
+    - transient_comsol_model_report
+    - vp2_decision_contract
+    status: project_baseline
+    derivation:
+      kind: selected_project_baseline
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Simulation time starts at 0 h.
+    confidence: high
+    validity:
+      equation_or_method: hourly regular output contract
+  stop:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Maximum regular simulated duration.
+    confidence: high
+    validity:
+      temperature: one week
+      humidity_or_aw: one week
+      packing_or_flow_regime: one week
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: one week
+    notes: not sampled; revisit only by explicit model-version change
+  interval:
+    source_refs:
+    - transient_comsol_model_report
+    status: synthetic_design
+    derivation:
+      kind: selected_synthetic_generator_design
+      origin: supplied_by_handoff
+      verification: declared_only
+      supplied_status: fixed_design
+      description: Regular output interval.
+    confidence: high
+    validity:
+      temperature: outputs 0,1,...,168 h; internal steps adaptive
+      humidity_or_aw: outputs 0,1,...,168 h; internal steps adaptive
+      packing_or_flow_regime: outputs 0,1,...,168 h; internal steps adaptive
+      product_form: all campaign materials unless material table overrides
+      equation_or_method: outputs 0,1,...,168 h; internal steps adaptive
+    notes: not sampled; revisit only by explicit model-version change
+  internal_steps:
+    source_refs:
+    - transient_comsol_model_report
+    - vp2_decision_contract
+    status: project_baseline
+    derivation:
+      kind: selected_project_baseline
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: COMSOL internal steps remain adaptive.
+    confidence: high_for_solver_semantics
+    validity:
+      equation_or_method: adaptive internal integration
+  irregular_stop_state:
+    source_refs:
+    - transient_comsol_model_report
+    - vp2_decision_contract
+    status: project_baseline
+    derivation:
+      kind: selected_project_baseline
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: An exact irregular stopping state is retained as diagnostic only.
+    confidence: high_for_storage_semantics
+    validity:
+      equation_or_method: regular hourly states plus optional exact-stop diagnostic
 input_contract:
   spatial:
     filename: fields.csv
@@ -78,9 +703,43 @@ storage:
   chunk_x: 64
 parameter_values:
   eps_min_global:
-    value: null
+    value: 0.2
+    nominal: 0.2
+    provenance:
+      source_refs:
+      - pino_airflow_project
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Universal generated porosity lower bound.
+      confidence: medium
+      validity:
+        temperature: physical/numerical guard, not a natural material bound
+        humidity_or_aw: physical/numerical guard, not a natural material bound
+        packing_or_flow_regime: physical/numerical guard, not a natural material bound
+        product_form: all campaign materials unless material table overrides
+      notes: not sampled; revisit only by explicit model-version change
   eps_max_global:
-    value: null
+    value: 0.8
+    nominal: 0.8
+    provenance:
+      source_refs:
+      - pino_airflow_project
+      status: project_baseline
+      derivation:
+        kind: selected_project_baseline
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Universal generated porosity upper bound.
+      confidence: medium
+      validity:
+        temperature: physical/numerical guard, not a natural material bound
+        humidity_or_aw: physical/numerical guard, not a natural material bound
+        packing_or_flow_regime: physical/numerical guard, not a natural material bound
+        product_form: all campaign materials unless material table overrides
+      notes: not sampled; revisit only by explicit model-version change
 physical_formulas:
   w_surf_balance: f_surf*d(w_surf)/dt = j_int - m_evap
   w_int_balance: (1-f_surf)*d(w_int)/dt = -j_int
@@ -108,3 +767,16 @@ physical_formulas:
   Q_evap: -h_fg*m_evap
   f_wet_dm: integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)
   total_water_balance: d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out
+physical_formulas_provenance:
+  source_refs:
+  - transient_comsol_model_report
+  - vp2_decision_contract
+  status: project_baseline
+  derivation:
+    kind: selected_project_baseline
+    origin: supplied_by_handoff
+    verification: declared_only
+    description: Binding physical formula catalogue supplied by the decision package and reviewed model report.
+  confidence: medium_to_high_by_formula
+  validity:
+    equation_or_method: binding VP2 common formula catalogue

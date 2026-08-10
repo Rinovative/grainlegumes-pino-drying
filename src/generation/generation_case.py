@@ -31,6 +31,7 @@ from src import common
 
 from . import generation_config as config_contract
 from . import generation_fields as fields_service
+from . import generation_materials as materials
 from . import generation_profiles as profiles
 from . import generation_sampling as sampling_service
 from . import generation_schedule as schedule_service
@@ -224,16 +225,47 @@ def _require_empty_destination(
         raise FileExistsError(msg)
 
 
-def _subseeds(config: config_contract.GenerationConfig, case_index: int) -> dict[str, int]:
-    """Return only the profile-owned stable case sub-seeds."""
-    seed_base = config.seed_base
-    if seed_base is None:
-        message = f"Batch {config.batch_name!r} has no resolved seed."
-        raise ValueError(message)
+def _subseeds(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+) -> dict[str, int]:
+    """Return profile substreams, sharing paired-smoke airflow only."""
+    case_seed = config.case_seed(case_index)
     labels = ["bed", "pressure_bc"]
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-        labels.extend(("initial_moisture", "schedule_shared", "schedule_independent"))
-    return {label: config_contract.derive_seed(seed_base, "case", str(case_index), label) for label in labels}
+        labels.extend(
+            (
+                "initial_moisture",
+                "schedule_shared",
+                "schedule_independent",
+            )
+        )
+    result = {
+        label: config_contract.derive_seed(
+            case_seed,
+            "case_substream",
+            label,
+        )
+        for label in labels
+    }
+    paired_seed = config.scientific_values.get("paired_equivalence_seed")
+    if paired_seed is not None:
+        assignment = config.case_assignment(case_index)
+        paired_case_seed = config_contract.derive_seed(
+            int(paired_seed),
+            "paired_equivalence_case",
+            config.material_family,
+            config.sampling_regime,
+            str(assignment["assignment_role"]),
+            str(case_index),
+        )
+        for label in ("bed", "pressure_bc"):
+            result[label] = config_contract.derive_seed(
+                paired_case_seed,
+                "paired_airflow_substream",
+                label,
+            )
+    return result
 
 
 def generate_case_input_bundle(
@@ -302,12 +334,23 @@ def generate_case_input_bundle(
     spatial_seed_names: tuple[str, ...] = ("bed", "pressure_bc")
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         spatial_seed_names = (*spatial_seed_names, "initial_moisture")
+    initial_moisture_bounds = None
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        initial_moisture_bounds = materials.initial_moisture_generation_bounds(
+            family_contract,
+            values,
+            active_ood_unit=sample.ood_provenance["active_unit_id"],
+        )
     fields = fields_service.generate_spatial_fields(
         config.profile.id,
         config.scientific_values["grid"],
         values,
         seeds={name: subseeds[name] for name in spatial_seed_names},
-        family_bounds=(family_contract["initial_moisture_bounds"] if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE else None),
+        family_bounds=initial_moisture_bounds,
+        packing_porosity_mean_support=family_contract["packing_porosity_mean_support"],
+        porosity_support_departure_authorization=(
+            "active_porosity_parameter_ood" if sample.ood_provenance["active_unit_id"] in materials.POROSITY_GENERATOR_PARAMETERS else None
+        ),
     )
     input_contract = config.scientific_values["input_contract"]
     spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
@@ -336,10 +379,23 @@ def generate_case_input_bundle(
     export_contract_sha256 = common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
     steady_flow_conditioning = config.scientific_values["steady_flow_conditioning"]
     steady_flow_conditioning_digest = common.serialization.canonical_json_sha256(steady_flow_conditioning)
+    paired_seed = config.scientific_values.get("paired_equivalence_seed")
     seed_evidence = {
+        "campaign_seed": config.scientific_values["campaign_seed"],
         "batch_seed": config.seed_base,
         "case_seed": case_seed,
-        "derivation": "sha256(generator_version|batch_seed|semantic_labels)",
+        "case_seed_labels": {
+            "simulation_profile": config.profile.id,
+            "material_family": config.material_family,
+            "sampling_regime": config.sampling_regime,
+            "assignment_role": assignment["assignment_role"],
+            "case_ordinal": case_index,
+        },
+        "paired_equivalence_seed": paired_seed,
+        "subseed_origins": {
+            name: ("paired_equivalence" if paired_seed is not None and name in {"bed", "pressure_bc"} else "profile_case") for name in subseeds
+        },
+        "derivation": ("sha256(generator_version|seed_namespace|semantic_labels)"),
         "subseeds": subseeds,
     }
     case_payload: dict[str, Any] = {
@@ -355,7 +411,10 @@ def generate_case_input_bundle(
         "generator_version": config_contract.GENERATOR_VERSION,
         "git_commit": source_service.required_git_commit(),
         "material_family": assignment["material_family"],
+        "material_role": config.material_role,
+        "evaluation_regime": config.evaluation_regime,
         "sampling_regime": assignment["sampling_regime"],
+        "natural_support_state": sample.ood_provenance["natural_support_state"],
         "ood": sample.ood_provenance,
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
@@ -378,6 +437,16 @@ def generate_case_input_bundle(
         "export_contract_sha256": export_contract_sha256,
         "input_files": input_files,
     }
+    pilot_case_kind = assignment.get("pilot_case_kind")
+    if pilot_case_kind is not None:
+        if pilot_case_kind not in config_contract.PILOT_CASE_KINDS:
+            message = f"Unsupported pilot case kind {pilot_case_kind!r}."
+            raise ValueError(message)
+        case_payload["pilot_check"] = {
+            "purpose": config_contract.PILOT_CAMPAIGN_PURPOSE,
+            "case_kind": pilot_case_kind,
+            "dataset_membership": "none",
+        }
     if scalar_path is not None and scalar_entries is not None:
         case_payload["scalar_handoff"] = {
             "mechanism": "case_local_long_form_csv",

@@ -224,6 +224,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
         executable=fake_comsol,
         natural_count=2,
         retain_raw_csv=True,
+        timeout=60.0,
     )
     config = generation.config.load_generation_config(
         config_path,
@@ -233,6 +234,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
     work = tmp_path / "concurrent work"
     tracker = tmp_path / "fake-comsol-tracker.json"
     monkeypatch.setenv("FAKE_COMSOL_TRACKER", str(tracker))
+    monkeypatch.setenv("FAKE_COMSOL_EXPECT_STARTS", "2")
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(

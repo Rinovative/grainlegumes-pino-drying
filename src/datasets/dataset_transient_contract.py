@@ -41,6 +41,8 @@ class TransientStepContract:
     scalar_conditioning: tuple[DataField, ...]
     target_increments: tuple[DataField, ...]
     archived_ablation_fields: tuple[DataField, ...]
+    tensor_dtype: str
+    spatial_shape: tuple[int, int]
     time_step: float
     time_unit: str
     canonical_storage_representation: str
@@ -94,6 +96,8 @@ TRANSIENT_STEP_CONTRACT: Final = TransientStepContract(
         DataField("p_in_bc", "Pa"),
         DataField("X_0_db_field", "kg/kg"),
     ),
+    tensor_dtype="float32",
+    spatial_shape=(251, 401),
     time_step=1.0,
     time_unit="h",
     canonical_storage_representation="absolute_physical_states",

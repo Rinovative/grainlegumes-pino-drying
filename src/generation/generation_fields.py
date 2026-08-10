@@ -21,17 +21,15 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from scipy import signal
 
 from . import generation_config as config_contract
 from . import generation_profiles as profiles
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 _MINIMUM_AXIS_POINTS = 2
 _EQUAL_PROBABILITY = 0.5
@@ -291,48 +289,144 @@ def _porosity_field(
     resolution: float,
     length_x: float,
     values: Mapping[str, Any],
+    material_mean_support: Mapping[str, Any],
+    material_support_departure_authorization: str | None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Generate the maintained globally Kozeny-Carman-anchored porosity field."""
+    """Generate porosity and enforce the supplied material mean support."""
     smooth_relative = _finite(values, "porosity.smooth_len_rel")
     if smooth_relative < 0:
-        msg = "porosity.smooth_len_rel must be non-negative."
-        raise ValueError(msg)
+        message = "porosity.smooth_len_rel must be non-negative."
+        raise ValueError(message)
     porosity_latent = (
-        _convolve(background, _gaussian_kernel(max(smooth_relative * length_x / resolution, 1.0), max(smooth_relative * length_x / resolution, 1.0)))
+        _convolve(
+            background,
+            _gaussian_kernel(
+                max(smooth_relative * length_x / resolution, 1.0),
+                max(smooth_relative * length_x / resolution, 1.0),
+            ),
+        )
         if smooth_relative > 0
         else background
     )
     centered = _standardize(porosity_latent, label="porosity structure")
     texture = centered - np.mean(centered)
-    texture /= max(math.sqrt(float(np.mean(texture**2))), np.finfo(np.float64).eps)
+    texture /= max(
+        math.sqrt(float(np.mean(texture**2))),
+        np.finfo(np.float64).eps,
+    )
     minimum = _finite(values, "eps_min_global")
     maximum = _finite(values, "eps_max_global")
     if not 0 < minimum < maximum < 1:
-        msg = "Global porosity bounds must satisfy 0 < lower < upper < 1."
-        raise ValueError(msg)
+        message = "Global porosity bounds must satisfy 0 < lower < upper < 1."
+        raise ValueError(message)
+    support_lower = _finite(
+        material_mean_support,
+        "lower",
+    )
+    support_upper = _finite(
+        material_mean_support,
+        "upper",
+    )
+    if not 0 < support_lower < support_upper < 1:
+        message = "Material packing-porosity mean support must be ordered inside (0, 1)."
+        raise ValueError(message)
+    allowed_authorizations = {
+        "active_porosity_parameter_ood",
+        "static_sentinel_diagnostic_bypass",
+    }
+    if material_support_departure_authorization is not None and material_support_departure_authorization not in allowed_authorizations:
+        message = "Porosity material-support departure authorization is unknown."
+        raise ValueError(message)
+
     permeability_mean = _finite(values, "kappa_mean")
     material_factor = _finite(values, "porosity.anchor_rel") * permeability_mean
     low = minimum + 1e-6
     high = maximum - 1e-6
     for _ in range(80):
         middle = 0.5 * (low + high)
-        mapped = material_factor * middle**3 / max((1.0 - middle) ** 2, float(np.finfo(np.float64).eps))
+        mapped = (
+            material_factor
+            * middle**3
+            / max(
+                (1.0 - middle) ** 2,
+                float(np.finfo(np.float64).eps),
+            )
+        )
         if mapped > permeability_mean:
             high = middle
         else:
             low = middle
     reference = 0.5 * (low + high)
-    porosity = np.clip(reference + _finite(values, "porosity.texture_amp") * texture, minimum, maximum)
+    unconstrained = reference + _finite(values, "porosity.texture_amp") * texture
+    clipped = (unconstrained < minimum) | (unconstrained > maximum)
+    porosity = np.clip(unconstrained, minimum, maximum)
     if not np.isfinite(porosity).all() or np.any((porosity < minimum) | (porosity > maximum)):
-        msg = "Generated porosity violates configured finite physical bounds."
-        raise ValueError(msg)
-    return porosity, {
+        message = "Generated porosity violates configured pointwise guards."
+        raise ValueError(message)
+
+    realized_minimum = float(np.min(porosity))
+    realized_maximum = float(np.max(porosity))
+    realized_mean = float(np.mean(porosity))
+    realized_standard_deviation = float(np.std(porosity))
+    q05, q50, q95 = (
+        float(value)
+        for value in np.quantile(
+            porosity,
+            (0.05, 0.5, 0.95),
+        )
+    )
+    within_support = support_lower <= realized_mean <= support_upper
+    lower_departure = max(support_lower - realized_mean, 0.0)
+    upper_departure = max(realized_mean - support_upper, 0.0)
+    diagnostics = {
         "reference": reference,
         "kozeny_carman_factor": material_factor,
-        "minimum": minimum,
-        "maximum": maximum,
-        "units": {"reference": "1", "kozeny_carman_factor": "m^2", "minimum": "1", "maximum": "1"},
+        "pointwise_guard_lower": minimum,
+        "pointwise_guard_upper": maximum,
+        "material_natural_support_lower": support_lower,
+        "material_natural_support_upper": support_upper,
+        "eps_bed_min": realized_minimum,
+        "eps_bed_max": realized_maximum,
+        "eps_bed_mean": realized_mean,
+        "eps_bed_std": realized_standard_deviation,
+        "eps_bed_q05": q05,
+        "eps_bed_q50": q50,
+        "eps_bed_q95": q95,
+        "eps_bed_clipped_fraction": float(np.mean(clipped)),
+        "eps_bed_within_material_natural_support": within_support,
+        "material_support_departure": {
+            "below_lower": lower_departure,
+            "above_upper": upper_departure,
+            "authorized": material_support_departure_authorization is not None,
+            "authorization": material_support_departure_authorization,
+        },
+        "units": {
+            "reference": "1",
+            "kozeny_carman_factor": "m^2",
+            "pointwise_guard_lower": "1",
+            "pointwise_guard_upper": "1",
+            "material_natural_support_lower": "1",
+            "material_natural_support_upper": "1",
+            "eps_bed_min": "1",
+            "eps_bed_max": "1",
+            "eps_bed_mean": "1",
+            "eps_bed_std": "1",
+            "eps_bed_q05": "1",
+            "eps_bed_q50": "1",
+            "eps_bed_q95": "1",
+            "eps_bed_clipped_fraction": "1",
+            "material_support_departure.below_lower": "1",
+            "material_support_departure.above_upper": "1",
+        },
     }
+    if not within_support and material_support_departure_authorization is None:
+        message = (
+            "Generated mean porosity violates the material natural support: "
+            f"mean={realized_mean}, support=[{support_lower}, "
+            f"{support_upper}], diagnostics={diagnostics}."
+        )
+        raise ValueError(message)
+    return porosity, diagnostics
 
 
 def _pressure_boundary(x_grid: np.ndarray, *, values: Mapping[str, Any], random: np.random.Generator) -> tuple[np.ndarray, dict[str, Any]]:
@@ -355,7 +449,10 @@ def _pressure_boundary(x_grid: np.ndarray, *, values: Mapping[str, Any], random:
         for center, sigma in zip(centers, sigmas, strict=True):
             shape += gaussian_amplitude / count * np.exp(-((normalized_x - center) ** 2) / (2.0 * sigma**2))
     shape += _finite(values, "pressure_bc.linear_amp") * (2.0 * normalized_x - 1.0)
-    inlet = np.maximum(_finite(values, "pressure_bc.mean") * (1.0 + shape), 0.0)
+    inlet = _finite(values, "pressure_bc.mean") * (1.0 + shape)
+    if not np.isfinite(inlet).all() or np.any(inlet <= 0.0):
+        msg = "Generated inlet pressure must remain finite and strictly positive without clipping."
+        raise ValueError(msg)
     field = np.zeros_like(x_grid)
     field[0, :] = inlet
     return field, {"minimum": float(np.min(inlet)), "maximum": float(np.max(inlet)), "unit": "Pa"}
@@ -367,7 +464,7 @@ def _initial_moisture(
     resolution: float,
     length_x: float,
     values: Mapping[str, Any],
-    family_bounds: Mapping[str, float],
+    family_bounds: Mapping[str, Any],
     random: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Generate the independent smooth bounded dry-basis moisture realization."""
@@ -395,9 +492,15 @@ def _initial_moisture(
     amplitude = _finite(values, "initial_moisture.amplitude_db")
     lower = float(family_bounds["lower"])
     upper = float(family_bounds["upper"])
+    natural_lower = float(family_bounds.get("natural_lower", lower))
+    natural_upper = float(family_bounds.get("natural_upper", upper))
+    allow_departure = family_bounds.get("natural_support_departure_allowed", False)
+    if not isinstance(allow_departure, bool):
+        msg = "Initial-moisture natural-support departure state must be boolean."
+        raise TypeError(msg)
     permitted = min(mean - lower, upper - mean)
     if amplitude < 0 or amplitude > permitted:
-        msg = "Initial-moisture amplitude violates the family no-clipping bound."
+        msg = "Initial-moisture amplitude violates the active analytical no-clipping bound."
         raise ValueError(msg)
     field = mean + amplitude * latent
     tolerance = 16.0 * np.finfo(np.float64).eps
@@ -405,16 +508,28 @@ def _initial_moisture(
         msg = "Initial-moisture construction escaped its analytical no-clipping bounds."
         raise RuntimeError(msg)
     realized_mean = float(np.mean(field))
-    return field, {
+    realized_minimum = float(np.min(field))
+    realized_maximum = float(np.max(field))
+    within_natural_support = bool(realized_minimum >= natural_lower - tolerance and realized_maximum <= natural_upper + tolerance)
+    if not allow_departure and not within_natural_support:
+        msg = "Initial-moisture construction escaped the material natural support."
+        raise RuntimeError(msg)
+    metadata: dict[str, Any] = {
         "configured_mean": mean,
         "configured_max_abs_deviation": amplitude,
         "mean": realized_mean,
         "standard_deviation": float(np.std(field, ddof=1)),
-        "minimum": float(np.min(field)),
-        "maximum": float(np.max(field)),
+        "minimum": realized_minimum,
+        "maximum": realized_maximum,
         "maximum_absolute_deviation": float(np.max(np.abs(field - mean))),
         "latent_mean": float(np.mean(latent)),
         "latent_maximum_absolute": float(np.max(np.abs(latent))),
+        "enforced_lower": lower,
+        "enforced_upper": upper,
+        "material_natural_lower": natural_lower,
+        "material_natural_upper": natural_upper,
+        "within_material_natural_support": within_natural_support,
+        "natural_support_departure_allowed": allow_departure,
         "field_sha256": _array_sha256(field),
         "units": {
             "configured_mean": "kg/kg",
@@ -426,8 +541,24 @@ def _initial_moisture(
             "maximum_absolute_deviation": "kg/kg",
             "latent_mean": "1",
             "latent_maximum_absolute": "1",
+            "enforced_lower": "kg/kg",
+            "enforced_upper": "kg/kg",
+            "material_natural_lower": "kg/kg",
+            "material_natural_upper": "kg/kg",
         },
     }
+    constraint = family_bounds.get("target_separation_constraint")
+    if isinstance(constraint, Mapping):
+        metadata["target_separation_constraint"] = {
+            "authored_expression": constraint["authored_expression"],
+            "minimum_db": constraint["minimum_db"],
+            "margin_above_target_db": constraint["margin_above_target_db"],
+            "unit": constraint["unit"],
+        }
+    active_ood_unit = family_bounds.get("active_ood_unit")
+    if active_ood_unit is not None:
+        metadata["active_ood_unit"] = active_ood_unit
+    return field, metadata
 
 
 def generate_spatial_fields(
@@ -436,7 +567,9 @@ def generate_spatial_fields(
     values: Mapping[str, Any],
     *,
     seeds: Mapping[str, int],
-    family_bounds: Mapping[str, float] | None,
+    family_bounds: Mapping[str, Any] | None,
+    packing_porosity_mean_support: Mapping[str, Any],
+    porosity_support_departure_authorization: str | None,
 ) -> SpatialFields:
     """Generate one deterministic profile-owned spatial input set."""
     if simulation_profile == profiles.STEADY_FLOW_PROFILE:
@@ -491,6 +624,8 @@ def generate_spatial_fields(
         resolution=resolution_x,
         length_x=length_x,
         values=values,
+        material_mean_support=packing_porosity_mean_support,
+        material_support_departure_authorization=porosity_support_departure_authorization,
     )
     pressure, pressure_metadata = _pressure_boundary(
         x_grid,

@@ -1,0 +1,245 @@
+schema_kind: generation_sources
+schema_version: 1
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+sources:
+- source_key: ba
+  citation: Albertin, R. M. (2025). Trocknung von Koernerleguminosen. Bachelorarbeit,
+    OST.
+  identifier: SHA-256 0d59f098 (full digest recorded in input coverage)
+  canonical_locator: local:upload/Albertin_2025_Trocknung_von_Koernerleguminosen_Bachelorarbeit(3).pdf
+  alternate_locators: []
+  source_type: project_report
+- source_key: matouk_thermal
+  citation: Matouk, A. M. et al. (2018). Thermal Properties of Some Legume Seeds.
+    Journal of Soil Sciences and Agricultural Engineering, 9, 261-267.
+  identifier: doi:10.21608/jssae.2018.35758
+  canonical_locator: https://doi.org/10.21608/jssae.2018.35758
+  alternate_locators: []
+  source_type: journal_article
+- source_key: lentil_oswin_source
+  citation: Cenkowski, S., Jayas, D. S., Pabis, S. & Muir, W. E. (2015). Sorption
+    characteristics of red lentils during storage. Canadian Biosystems Engineering,
+    57, 3.1-3.8.
+  identifier: doi:10.7451/CBE.2015.57.3.1
+  canonical_locator: https://library.csbe-scgab.ca/docs/journal/57/C15220.pdf
+  alternate_locators: []
+  source_type: journal_article
+- source_key: lentil_sorption_menkov
+  citation: Menkov, N. D. (2000). Moisture sorption isotherms of lentil seeds at several
+    temperatures. Journal of Food Engineering, 44, 205-211.
+  identifier: doi:10.1016/S0260-8774(00)00028-5
+  canonical_locator: https://doi.org/10.1016/S0260-8774(00)00028-5
+  alternate_locators: []
+  source_type: journal_article
+- source_key: lentil_drying
+  citation: Mangueira, E. R. et al. (2021). Analysis of the thin layer drying kinetic
+    of brown lentil grains. Research, Society and Development, 10.
+  identifier: RSD article 19258
+  canonical_locator: https://rsdjournal.org/rsd/article/view/19258
+  alternate_locators: []
+  source_type: journal_article
+- source_key: swiss_crops
+  citation: swiss granum (2026). Empfehlungen fuer Uebernahmebedingungen und gesetzliche
+    Bestimmungen von Ackerkulturen zur menschlichen Ernaehrung, Ernte 2026.
+  identifier: 2026-03-12 edition
+  canonical_locator: local:upload/2026-03-12_Empfehlung_Uebernahmebedingungen_Ackerkulturen_zur_menschl_Ernaehrung_2026_D(3).pdf
+  alternate_locators: []
+  source_type: official_guidance
+- source_key: chickpea_physical
+  citation: Guerhan, R., Oezarslan, C., Topuz, N., Akbas, T. & Simsek, E. (2009).
+    Effects of Moisture Content on Physical Properties of Black Kabuli Chickpea (Cicer
+    arietinum L.) Seed. Asian Journal of Chemistry, 21(4), 3270-3278.
+  identifier: Asian Journal of Chemistry 21(4):3270-3278
+  canonical_locator: https://asianpubs.org/index.php/ajchem/article/download/12450/12431
+  alternate_locators: []
+  source_type: journal_article
+- source_key: chickpea_oswin_source
+  citation: Armstrong, P. R., Maghirang, E. B., Bhadriraju, S., & McNeill, S. G. (2017).
+    Equilibrium Moisture Content of Kabuli Chickpea, Black Sesame, and White Sesame
+    Seeds. Applied Engineering in Agriculture, 33(5), 737-742.
+  identifier: doi:10.13031/aea.12460
+  canonical_locator: https://doi.org/10.13031/aea.12460
+  alternate_locators:
+  - https://www.ars.usda.gov/research/publications/publication/?seqNo115=341302
+  source_type: journal_article
+- source_key: chickpea_drying
+  citation: Cavalcanti-Mata, M. E. R. M. et al. (2020). A new approach to traditional
+    drying models for thin-layer drying kinetics of chickpeas. Journal of Food Process
+    Engineering, 43.
+  identifier: doi:10.1111/jfpe.13569
+  canonical_locator: https://doi.org/10.1111/jfpe.13569
+  alternate_locators: []
+  source_type: journal_article
+- source_key: kidney_physical
+  citation: Isik, E. & Unal, H. (2011). Some physical properties of white kidney beans
+    (Phaseolus vulgaris L.). African Journal of Biotechnology, 10.
+  identifier: stable journal PDF
+  canonical_locator: https://academicjournals.org/journal/AJB/article-full-text-pdf/A932BBF38233
+  alternate_locators: []
+  source_type: journal_article
+- source_key: kidney_oswin_source
+  citation: Campos, R. C. et al. (2016). Bean grain hysteresis with induced mechanical
+    damage. Revista Brasileira de Engenharia Agricola e Ambiental, 20(10), 930-935.
+  identifier: stable PDF; journal article 20(10):930-935
+  canonical_locator: https://pdfs.semanticscholar.org/7400/4771a004cf1530362e41e9969bc9ff3551cb.pdf
+  alternate_locators: []
+  source_type: journal_article
+- source_key: kidney_drying
+  citation: Doymaz, I. (2016). Hot-Air Drying and Rehydration Characteristics of Red
+    Kidney Bean Seeds. Chemical Engineering Communications, 203.
+  identifier: doi:10.1080/00986445.2015.1056299
+  canonical_locator: https://doi.org/10.1080/00986445.2015.1056299
+  alternate_locators: []
+  source_type: journal_article
+- source_key: manitoba_field_beans
+  citation: Province of Manitoba, Agriculture. Field Beans (official crop-management
+    guidance; accessed 2026-08-09).
+  identifier: Government of Manitoba field-beans guidance
+  canonical_locator: https://www.gov.mb.ca/agriculture/crops/crop-management/print%2Cfield-beans.html
+  alternate_locators: []
+  source_type: government_guidance
+- source_key: pea_physical
+  citation: Yalcin, I., Ozarslan, C. & Akbas, T. (2007). Physical properties of pea
+    (Pisum sativum) seed. Journal of Food Engineering, 79, 731-735.
+  identifier: Journal of Food Engineering 79:731-735
+  canonical_locator: https://doi.org/10.1016/j.jfoodeng.2006.02.039
+  alternate_locators: []
+  source_type: journal_article
+- source_key: pea_sorption
+  citation: Garg, M. K. & Chandra, P. (2003). Sorption Characteristics of Pea Seeds.
+    Journal of Agricultural Engineering, 40(4).
+  identifier: ICAR journal record
+  canonical_locator: https://epubs.icar.org.in/index.php/JAE/article/view/14171
+  alternate_locators: []
+  source_type: journal_article
+- source_key: pea_drying
+  citation: Ganesh, C. V. & Sokhansanj, S. (1997). High temperature mechanical drying
+    of field peas (Pisum sativum L.). University of Saskatchewan proceedings/thesis
+    record.
+  identifier: University of Saskatchewan repository
+  canonical_locator: https://harvest.usask.ca/bitstreams/b28e4b4a-4bbf-4e6b-8f49-d3890bd8a3a8/download
+  alternate_locators: []
+  source_type: institutional_record
+- source_key: canola_thermal
+  citation: Yu, D., Shrestha, B. L. & Baik, O.-D. (2015). Thermal conductivity, specific
+    heat, thermal diffusivity, and bulk density of canola seeds. Journal of Food Engineering,
+    165, 156-165.
+  identifier: doi:10.1016/j.jfoodeng.2015.05.012
+  canonical_locator: https://doi.org/10.1016/j.jfoodeng.2015.05.012
+  alternate_locators: []
+  source_type: journal_article
+- source_key: canola_airflow
+  citation: Jayas, D. S., Sokhansanj, S., Moysey, E. B. & Barber, E. M. (1987). Airflow
+    Resistance of Canola (Rapeseed). Transactions of the ASAE, 30(5), 1484-1488.
+  identifier: doi:10.13031/2013.30590
+  canonical_locator: https://elibrary.asabe.org/azdez.asp?AID=30590&CID=t1987&JID=3&T=2&i=5&redirType=&v=30
+  alternate_locators: []
+  source_type: journal_article
+- source_key: canola_oswin
+  citation: 'Gazor, H. R. (2010). Moisture Isotherms and Heat of Desorption of Canola.
+    Agricultural Engineering International: CIGR Journal, manuscript 1440.'
+  identifier: CIGR manuscript 1440
+  canonical_locator: https://cigrjournal.org/index.php/Ejounral/article/download/1440/1296/0
+  alternate_locators: []
+  source_type: journal_article
+- source_key: canola_drying
+  citation: Costa, L. M. et al. (2020). Drying kinetics of Hyola 430 hybrid canola
+    (Brassica napus L.) seeds. Australian Journal of Crop Science, 14(10), 1623-1629.
+  identifier: AJCS 14(10):1623-1629
+  canonical_locator: https://www.cropj.com/costa_14_10_2020_1623_1629.pdf
+  alternate_locators: []
+  source_type: journal_article
+- source_key: canola_drying_gazor
+  citation: Gazor, H. R. et al. (2010). Modelling the drying kinetics of canola in
+    a fluidised bed dryer. Czech Journal of Food Sciences, 28(6), 531-537.
+  identifier: Czech J. Food Sci. 28(6):531-537
+  canonical_locator: https://www.agriculturejournals.cz/artkey/cjf-201006-0009_modelling-the-drying-kinetics-of-canola-in-fluidised-bed-dryer.php
+  alternate_locators: []
+  source_type: journal_article
+- source_key: swiss_oil
+  citation: swiss granum (2026). Uebernahmebedingungen Oelsaaten, Ernte 2026.
+  identifier: 2026-03-19 edition
+  canonical_locator: local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf
+  alternate_locators: []
+  source_type: official_guidance
+- source_key: sunflower_sorption_drying_munder_2019
+  citation: 'Munder, S., Argyropoulos, D. & Müller, J. (2019). Acquisition of Sorption
+    and Drying Data with Embedded Devices: Improving Standard Models for High Oleic
+    Sunflower Seeds by Continuous Measurements in Dynamic Systems. Agriculture, 9(1),
+    1.'
+  identifier: doi:10.3390/agriculture9010001
+  canonical_locator: https://doi.org/10.3390/agriculture9010001
+  alternate_locators: []
+  source_type: journal_article
+- source_key: sunflower_density_isik_izli_2007
+  citation: Isik, E. & Izli, N. (2007). Physical Properties of Sunflower Seeds (Helianthus
+    annuus L.). International Journal of Agricultural Research, 2, 677-686.
+  identifier: doi:10.3923/ijar.2007.677.686
+  canonical_locator: https://scialert.net/fulltext/?doi=ijar.2007.677.686
+  alternate_locators: []
+  source_type: journal_article
+- source_key: sunflower_physical_gupta_das_1997
+  citation: Gupta, R. K. & Das, S. K. (1997). Physical Properties of Sunflower Seeds.
+    Journal of Agricultural Engineering Research, 66(1), 1-8.
+  identifier: doi:10.1006/jaer.1996.0111
+  canonical_locator: https://doi.org/10.1006/jaer.1996.0111
+  alternate_locators: []
+  source_type: journal_article
+- source_key: sunflower_thermal_ince_2008
+  citation: Ince, R., Güzel, E. & Ince, A. (2008). Thermal Properties of Some Oily
+    Seeds. Journal of Agricultural Machinery Science, 4(4), 399-405.
+  identifier: Journal of Agricultural Machinery Science 4(4):399-405
+  canonical_locator: https://dergipark.org.tr/tr/download/article-file/119120
+  alternate_locators: []
+  source_type: journal_article
+- source_key: sunflower_airflow_canada_1990
+  citation: 'Agriculture Canada (1990). Handling Agricultural Materials: Storage and
+    Conditioning of Grain and Forage. Agriculture Canada Publication 1855/E.'
+  identifier: Agriculture Canada Publication 1855/E
+  canonical_locator: https://publications.gc.ca/collections/collection_2014/aac-aafc/agrhist/A15-1855-1990-eng.pdf
+  alternate_locators: []
+  source_type: book_or_manual
+- source_key: sunflower_class_munder_2017
+  citation: Munder, S., Argyropoulos, D. & Müller, J. (2017). Class-based physical
+    properties of air-classified sunflower seeds and kernels. Biosystems Engineering,
+    164, 124-134.
+  identifier: doi:10.1016/j.biosystemseng.2017.10.005
+  canonical_locator: https://doi.org/10.1016/j.biosystemseng.2017.10.005
+  alternate_locators: []
+  source_type: journal_article
+- source_key: swiss_oil_2026
+  citation: swiss granum (2026). Übernahmebedingungen Ölsaaten Ernte 2026, Ausgabe
+    19. März 2026.
+  identifier: 2026-03-19 edition
+  canonical_locator: local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf
+  alternate_locators: []
+  source_type: official_guidance
+- source_key: pino_airflow_project
+  citation: Albertin, R. M. (2026). PINO Airflow Porous Media. Vertiefungsprojekt,
+    OST.
+  identifier: SHA-256 5fcae206aff935195eea0f8b149747c1a3e83fef16899d8533c0f89b3fbd954e
+  canonical_locator: local:upload/Albertin_2026_PINO_Airflow_PorousMedia(20260809-103733).pdf
+  alternate_locators: []
+  source_type: project_report
+- source_key: transient_comsol_model_report
+  citation: 'COMSOL Multiphysics 6.4 model report: transient_drying_template, generated
+    2026-08-09.'
+  identifier: SHA-256 463ecea45bad7c221f3c85ef53c92dbf77a603dc4b2fda2d54bf8e852d3e96a5
+  canonical_locator: local:upload/transient_drying_template(3).docx
+  alternate_locators: []
+  source_type: model_report
+- source_key: vm2_project
+  citation: Albertin, R. M. (2026). VM2 Vertiefungsprojekt. OST.
+  identifier: local project report
+  canonical_locator: local:project_sources/02-VM2_Vertiefungsprojekt_Rino_Moreno_Albertin-3-.pdf
+  alternate_locators: []
+  source_type: project_report
+- source_key: vp2_decision_contract
+  citation: VP2 Parameter Decisions, schema 1.1.0 (2026-08-09).
+  identifier: sha256:774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+  canonical_locator: artifact:VP2_Parameter_Decisions.yaml
+  alternate_locators: []
+  source_type: project_report

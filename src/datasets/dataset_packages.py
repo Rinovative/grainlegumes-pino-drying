@@ -74,7 +74,14 @@ _PACKAGE_PROVENANCE_KEYS: Final = frozenset(
         "material_file_identities",
         "operation_config_digests",
         "campaign_name",
+        "campaign_id",
         "campaign_digest",
+        "campaign_purpose",
+        "material_roles",
+        "evaluation_regimes",
+        "material_memberships",
+        "source_role",
+        "training_eligible",
         "duplicate_case_input_policy",
         "case_membership",
         "split_membership",
@@ -191,6 +198,9 @@ def _load_candidates(
                 "scientific_config_digest": manifest["scientific_config_digest"],
                 "git_commit": manifest["git_commit"],
                 "material_config_digest": batch.scientific_values["material_config_digest"],
+                "material_role": batch.material_role,
+                "evaluation_regime": batch.evaluation_regime,
+                "natural_support_state": batch.scientific_values["natural_support_state"],
                 "operation_config_digest": batch.scientific_values["operation_config_digest"],
                 "airflow_source": manifest["airflow_source"],
                 "available_learning_views": manifest["available_learning_views"],
@@ -208,6 +218,25 @@ def _load_candidates(
             case_directory = processed_root / case_id
             case_hdf5 = case_directory / "case.h5"
             case_payload = _json_object(case_directory / "case.json", label="Canonical case provenance")
+            expected_source = {
+                "material_family": batch.material_family,
+                "material_role": batch.material_role,
+                "evaluation_regime": str(plan["evaluation_regime"]),
+                "sampling_regime": batch.sampling_regime,
+                "natural_support_state": "natural" if batch.sampling_regime == "natural" else "parameter_ood",
+            }
+            observed_source = {name: case_payload.get(name) for name in expected_source}
+            if (
+                observed_source != expected_source
+                or batch.evaluation_regime != plan["evaluation_regime"]
+                or batch.material_role != plan["source_role"]
+                or case_payload.get("ood", {}).get("natural_support_state") != expected_source["natural_support_state"]
+            ):
+                message = (
+                    f"Case {batch.batch_name}/{case_id} disagrees with package source-role/evaluation ownership: "
+                    f"expected={expected_source}, actual={observed_source}."
+                )
+                raise ValueError(message)
             candidates.append(
                 {
                     "batch": batch,
@@ -441,17 +470,20 @@ def audit_steady_flow_conditioning(
 
 
 def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """Return registry-owned OOD group, support, transform, and sampled evidence."""
+    """Return scalar or complete-record OOD support and distance evidence."""
     case_payload = candidate["case_payload"]
     ood = case_payload.get("ood")
     if not isinstance(ood, dict):
         message = f"Case {candidate['package_case_id']!r} has malformed OOD provenance."
         raise TypeError(message)
     selected = ood.get("selected_units")
-    if not isinstance(selected, list) or not all(isinstance(name, str) for name in selected):
-        message = f"Case {candidate['package_case_id']!r} has malformed OOD selected_units."
+    selection_details = ood.get("selections")
+    if not isinstance(selected, list) or not all(isinstance(name, str) for name in selected) or not isinstance(selection_details, dict):
+        message = f"Case {candidate['package_case_id']!r} has malformed OOD selections."
         raise TypeError(message)
-    registry = candidate["batch"].scientific_values["material"]["parameter_registry"]
+    material = candidate["batch"].scientific_values["material"]
+    registry = material["parameter_registry"]
+    coupled_contracts = material["coupled_ood_records"]
     sampled_values = case_payload.get("sampled_values")
     coupled = case_payload.get("coupled_selections")
     if not isinstance(sampled_values, dict) or not isinstance(coupled, dict):
@@ -460,24 +492,45 @@ def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
     parameters: list[dict[str, Any]] = []
     for name in selected:
         entry = registry.get(name)
-        if not isinstance(entry, dict):
-            message = f"OOD parameter {name!r} is absent from the source registry."
+        if isinstance(entry, dict):
+            block = entry.get("block")
+            parameters.append(
+                {
+                    "name": name,
+                    "group": entry.get("ood_group"),
+                    "block": block,
+                    "kind": entry.get("kind"),
+                    "transform": entry.get("transform"),
+                    "unit": entry.get("unit"),
+                    "id_support": {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry},
+                    "ood_support": copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets")))),
+                    "sampled_value": copy.deepcopy(sampled_values.get(name)),
+                    "coupled_selection": coupled.get(name),
+                    "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
+                }
+            )
+            continue
+        contract = coupled_contracts.get(name)
+        if not isinstance(contract, dict):
+            message = f"OOD unit {name!r} is absent from scalar and coupled material contracts."
             raise TypeError(message)
-        block = entry.get("block")
-        block_provenance = case_payload.get("block_provenance", {}).get(block) if isinstance(block, str) else None
+        components = list(contract["components"])
         parameters.append(
             {
                 "name": name,
-                "group": entry.get("ood_group"),
-                "block": block,
-                "kind": entry.get("kind"),
-                "transform": entry.get("transform"),
-                "unit": entry.get("unit"),
-                "id_support": {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry},
-                "ood_support": copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets")))),
-                "sampled_value": copy.deepcopy(sampled_values.get(name)),
+                "group": contract["ood_group"],
+                "block": contract["block"],
+                "kind": "complete_coupled_record",
+                "transform": "component_owned",
+                "unit": copy.deepcopy(contract["units"]),
+                "id_support": {
+                    component: {key: copy.deepcopy(registry[component][key]) for key in ("lower", "upper", "value") if key in registry[component]}
+                    for component in components
+                },
+                "ood_support": copy.deepcopy(contract["records"]),
+                "sampled_value": {component: copy.deepcopy(sampled_values[component]) for component in components},
                 "coupled_selection": coupled.get(name),
-                "transformed_coordinate_evidence": copy.deepcopy(block_provenance),
+                "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
             }
         )
     return {
@@ -539,16 +592,22 @@ def _prepare_campaign_packages(
         if regime not in source_by_regime:
             source_by_regime[regime] = _load_candidates(campaign, plan, storage_root=storage_root)
     id_plans = [plan for plan in plans if plan["evaluation_regime"] == "id"]
-    if not id_plans:
-        message = "Campaign must declare at least one ID package."
+    shared_membership: dict[str, str] = {}
+    technical_smoke = campaign.campaign_purpose == "technical_runtime_smoke"
+    if id_plans:
+        _id_records, id_candidates = source_by_regime["id"]
+        physical_id_candidates, _id_decisions = resolve_duplicate_case_inputs(
+            id_candidates,
+            dataset_view="shared_id_membership",
+            policy=campaign.duplicate_case_input_policy,
+        )
+        if technical_smoke:
+            shared_membership = {str(candidate["case_input_id"]): views.TECHNICAL_SMOKE_MEMBERSHIP for candidate in physical_id_candidates}
+        else:
+            shared_membership = _shared_id_membership(id_plans[0], physical_id_candidates)
+    elif campaign.campaign_purpose == "family_generalization":
+        message = "Family-generalization campaigns must declare an ID package."
         raise ValueError(message)
-    _id_records, id_candidates = source_by_regime["id"]
-    physical_id_candidates, _id_decisions = resolve_duplicate_case_inputs(
-        id_candidates,
-        dataset_view="shared_id_membership",
-        policy=campaign.duplicate_case_input_policy,
-    )
-    shared_membership = _shared_id_membership(id_plans[0], physical_id_candidates)
     prepared: list[_PreparedPackage] = []
     for plan in plans:
         dataset_view = str(plan["dataset_view"])
@@ -565,7 +624,13 @@ def _prepare_campaign_packages(
         steady_conditioning = audit_steady_flow_conditioning(batch_records) if dataset_view == "steady_flow" else None
         included: list[dict[str, Any]] = []
         excluded: list[dict[str, Any]] = []
-        membership: dict[str, list[str]] = {role: [] for role in _ID_MEMBERSHIP_ROLES} if regime == "id" else {regime: []}
+        membership: dict[str, list[str]] = (
+            {views.TECHNICAL_SMOKE_MEMBERSHIP: []}
+            if regime == "id" and technical_smoke
+            else {role: [] for role in _ID_MEMBERSHIP_ROLES}
+            if regime == "id"
+            else {regime: []}
+        )
         for candidate in candidates:
             if regime == "id":
                 assigned = shared_membership.get(str(candidate["case_input_id"]))
@@ -723,6 +788,9 @@ def _package_provenance(
                 "simulation_case_id": candidate["simulation_case_id"],
                 "case_hdf5_sha256": candidate["case_hdf5_sha256"],
                 "material_family": candidate["material_family"],
+                "material_role": candidate["case_payload"]["material_role"],
+                "evaluation_regime": candidate["case_payload"]["evaluation_regime"],
+                "natural_support_state": candidate["case_payload"]["natural_support_state"],
                 "simulation_profile": candidate["simulation_profile"],
                 "membership": candidate["dataset_membership"],
                 "ood_group": candidate.get("ood_evidence", {}).get("group"),
@@ -745,7 +813,14 @@ def _package_provenance(
         "material_file_identities": {record["batch_name"].split("__")[1]: record["material_config_digest"] for record in prepared.batch_records},
         "operation_config_digests": operation_digests,
         "campaign_name": campaign.campaign_name,
+        "campaign_id": campaign.campaign_id,
         "campaign_digest": campaign.campaign_digest,
+        "campaign_purpose": campaign.campaign_purpose,
+        "material_roles": {name: list(values) for name, values in campaign.material_roles.items()},
+        "evaluation_regimes": list(campaign.evaluation_regimes),
+        "material_memberships": {name: list(values) for name, values in campaign.material_memberships.items()},
+        "source_role": plan["source_role"],
+        "training_eligible": bool(plan["split_eligibility"]["train"]),
         "duplicate_case_input_policy": campaign.duplicate_case_input_policy,
         "case_membership": case_membership,
         "split_membership": copy.deepcopy(prepared.membership),
@@ -1201,6 +1276,7 @@ def _runtime_request(
     storage_root: Path | str | None,
     membership: str | None = None,
     ood_group: str | None = None,
+    allow_technical_smoke: bool = False,
 ) -> Any:
     """Build one typed factory request from a validated package manifest."""
     from . import dataset_factory as factory  # noqa: PLC0415
@@ -1212,6 +1288,7 @@ def _runtime_request(
         membership=cast("views.IdMembership | None", membership),
         ood_group=cast("views.OodGroup | None", ood_group),
         storage_root=storage_root,
+        allow_technical_smoke=allow_technical_smoke,
     )
 
 
@@ -1233,7 +1310,11 @@ def inspect_dataset_package(
     from . import dataset_factory as factory  # noqa: PLC0415
 
     manifest = load_package_manifest(dataset_id, storage_root=storage_root)
-    request = _runtime_request(manifest, storage_root=storage_root)
+    request = _runtime_request(
+        manifest,
+        storage_root=storage_root,
+        allow_technical_smoke=manifest["campaign_purpose"] == "technical_runtime_smoke",
+    )
     runtime = factory.create_dataset(request, hdf5_cache_size=1)
     sample = cast("Mapping[str, Any]", runtime[0])
     if manifest["dataset_view"] == "steady_flow":
@@ -1266,7 +1347,9 @@ def inspect_dataset_package(
         if isinstance(runtime, transient.TransientPhysicalDataset):
             runtime.close()
     regime = str(manifest["evaluation_regime"])
-    if regime == "id":
+    if regime == "id" and manifest["campaign_purpose"] == "technical_runtime_smoke":
+        selectors = [views.TECHNICAL_SMOKE_MEMBERSHIP]
+    elif regime == "id":
         selectors = [f"id/{membership}" for membership in views.ID_MEMBERSHIPS]
     elif regime == "parameter_ood":
         selectors = ["parameter_ood/all", *[f"parameter_ood/{group}" for group in manifest["available_ood_groups"]]]
@@ -1311,6 +1394,7 @@ def smoke_dataset_package(
         storage_root=storage_root,
         membership=membership,
         ood_group=ood_group,
+        allow_technical_smoke=manifest["campaign_purpose"] == "technical_runtime_smoke",
     )
     settings = factory.LoaderSettings(
         batch_size=1,

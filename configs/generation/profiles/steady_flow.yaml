@@ -1,21 +1,83 @@
 schema_kind: generation_profile
 schema_version: 1
 simulation_profile: steady_flow
-template_ready: false
-steady_flow_conditioning: null
+steady_flow_conditioning:
+  schema_kind: steady_flow_conditioning
+  schema_version: 1
+  exhaustive: true
+  stationary_solution_contract_id: vp2_stationary_airflow_v1
+  dependencies:
+  - name: Kxx
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: Kxy
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: Kyy
+    affects_stationary_solution: true
+    owner: model_input
+    unit: m^2
+  - name: eps_bed
+    affects_stationary_solution: true
+    owner: model_input
+    unit: '1'
+  - name: p_in_bc
+    affects_stationary_solution: true
+    owner: model_input
+    unit: Pa
+  - name: T_flow_ref
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: K
+    fixed_value: 300.65
+  - name: p_ref
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: Pa
+    fixed_value: 101325.0
+  - name: p_out
+    affects_stationary_solution: true
+    owner: package_fixed
+    unit: Pa
+    fixed_value: 0.0
+  additional_case_varying_solver_scalars: []
 exports:
 - role: steady_flow_fields
-  pattern: null
-  delimiter: ;
+  temporal_kind: stationary
+  source:
+    state: declared_unverified
+    pattern: stationary_fields.csv
+  delimiter: ','
   columns:
-    x: null
-    y: null
-    Kxx: null
-    Kxy: null
-    Kyy: null
-    eps_bed: null
-    p_in_bc: null
-    u: null
-    v: null
-    p: null
-  time_column: null
+    x:
+      state: declared_unverified
+      source_header: x
+    y:
+      state: declared_unverified
+      source_header: y
+    Kxx:
+      state: declared_unverified
+      source_header: Kxx
+    Kxy:
+      state: declared_unverified
+      source_header: Kxy
+    Kyy:
+      state: declared_unverified
+      source_header: Kyy
+    eps_bed:
+      state: declared_unverified
+      source_header: eps_bed
+    p_in_bc:
+      state: declared_unverified
+      source_header: p_in_bc
+    u:
+      state: declared_unverified
+      source_header: u
+    v:
+      state: declared_unverified
+      source_header: v
+    p:
+      state: declared_unverified
+      source_header: p

@@ -34,14 +34,20 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     project = tmp_path / "project with spaces"
     scripts = project / "scripts"
     campaigns = project / "configs/generation/campaigns/steady_flow"
+    pilot_campaigns = project / "configs/generation/campaigns/transient_drying"
     scripts.mkdir(parents=True)
     campaigns.mkdir(parents=True)
+    pilot_campaigns.mkdir(parents=True)
     workflow = scripts / "generation_workflow.sh"
     shutil.copyfile(repository / "scripts/generation_workflow.sh", workflow)
     workflow.chmod(workflow.stat().st_mode | 0o111)
     shutil.copyfile(
         repository / "configs/generation/campaigns/steady_flow/family_generalization.yaml",
         campaigns / "family_generalization.yaml",
+    )
+    shutil.copyfile(
+        repository / "configs/generation/campaigns/transient_drying/pilot_check.yaml",
+        pilot_campaigns / "pilot_check.yaml",
     )
     log = tmp_path / "commands.log"
     fake_bin = tmp_path / "bin"
@@ -79,6 +85,8 @@ elif [[ " $* " == *' campaign-source-status '* ]]; then
   fi
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format state '* ]]; then
   printf '%s\n' "${FAKE_CAMPAIGN_STATE}"
+elif [[ " $* " == *' campaign-status '* ]]; then
+  printf '%s\n' '{"campaign_purpose":"family_generalization","cases_per_material":null}'
 elif [[ " $* " == *' storage-status '* && " $* " == *' --role cpu '* ]]; then
   printf '%s\n' '{"role":"cpu","generation_total_bytes":24,"datasets_total_bytes":0,"runs":[]}'
 elif [[ " $* " == *' cleanup-campaign-source '* ]]; then
@@ -129,7 +137,17 @@ cp -a -- "${source}" "${destination}/${relative}"
 set -euo pipefail
 printf 'local-python-start\n' >> "${FAKE_COMMAND_LOG}"
 for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
-[[ " $* " != *' -c '* ]] || exit 0
+if [[ " $* " == *' -c '* ]]; then
+  cat >/dev/null
+  if [[ " $* " == *'counts = tuple'* ]]; then
+    printf 'pilot\tpilot_check\t3\t18\n'
+  elif [[ " $* " == *'execution_resources'* ]]; then
+    printf 'resources\t1\t2\t16\t2\t-\t32\n'
+  elif [[ " $* " == *'campaign_purpose'* ]]; then
+    printf 'campaign\tfamily_generalization\t\n'
+  fi
+  exit 0
+fi
 storage=''
 directory=''
 arguments=("$@")
@@ -275,6 +293,11 @@ def _campaign(workflow: Path) -> Path:
     return workflow.parent.parent / "configs/generation/campaigns/steady_flow/family_generalization.yaml"
 
 
+def _pilot_campaign(workflow: Path) -> Path:
+    """Return the copied dedicated pilot-check configuration."""
+    return workflow.parent.parent / "configs/generation/campaigns/transient_drying/pilot_check.yaml"
+
+
 def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
     """Create one complete fake terminal transfer tree and TSV plan."""
     campaign_directory = f"01_generation/meta/campaigns/{_RUN_ID}"
@@ -335,6 +358,35 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     assert plan.returncode == 0, plan.stderr
     assert '"filesystem_mutated":false' in plan.stdout
 
+    whole_campaign_resources = _resource_options()
+    del whole_campaign_resources[-4:-2]
+    skipped = _run(
+        workflow,
+        [
+            "plan",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            *whole_campaign_resources,
+            "--skip-extreme-family-ood",
+        ],
+        environment,
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    assert " true>\n" in log.read_text(encoding="utf-8")
+    incompatible = _run(
+        workflow,
+        [
+            "plan",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            *_resource_options(),
+            "--skip-extreme-family-ood",
+        ],
+        environment,
+    )
+    assert incompatible.returncode == 2
+    assert "cannot be combined with --only-batch" in incompatible.stderr
+
     launch = _run(workflow, ["launch", str(_campaign(workflow)), *_remote_options(), *_resource_options()], environment)
     assert launch.returncode == 0, launch.stderr
     assert f"Campaign run ID: {_RUN_ID}" in launch.stdout
@@ -370,6 +422,38 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     )
     assert rejected.returncode == 2
     assert "exceeds 32" in rejected.stderr
+
+
+def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: Path) -> None:
+    """Protect the copyable pilot command without a hidden mandatory count."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    normal = _run(
+        workflow,
+        ["pilot-check", str(_pilot_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+    assert normal.returncode != 2
+    assert "Pilot cases: 6 materials x 3 = 18 total." in normal.stdout
+
+    fast_root = tmp_path / "fast"
+    fast_root.mkdir()
+    fast_workflow, _fast_log, fast_environment, _fast_storage, _fast_mirror = _harness(fast_root)
+    fast = _run(
+        fast_workflow,
+        [
+            "pilot-check",
+            str(_pilot_campaign(fast_workflow)),
+            "--cases-per-material",
+            "1",
+            *_remote_options(),
+        ],
+        fast_environment,
+    )
+    assert fast.returncode != 2
+    assert "Pilot cases: 6 materials x 1 = 6 total." in fast.stdout
+    help_result = _run(workflow, ["--help"], environment)
+    assert "pilot-check CAMPAIGN [--cases-per-material N]" in help_result.stderr
+    assert "duration-check" not in help_result.stderr
 
 
 def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_path: Path) -> None:

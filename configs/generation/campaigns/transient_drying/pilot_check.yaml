@@ -1,0 +1,28 @@
+schema_kind: generation_campaign
+schema_version: 1
+campaign_purpose: pilot_check
+sources_config: configs/generation/sources.yaml
+registry_config: configs/generation/registry.yaml
+common_config: configs/generation/common.yaml
+operations_config: configs/generation/operations/fixed_bed.yaml
+profile_config: configs/generation/profiles/transient_drying.yaml
+execution_config: configs/generation/execution/cluster_cpu.yaml
+material_roles:
+  seen:
+  - lentil
+  - chickpea
+  - kidney_bean
+  near_family_ood:
+  - field_pea
+  far_family_ood:
+  - rapeseed
+  extreme_family_ood:
+  - sunflower_seed
+sampling:
+  method: lhs
+  seed_base: 9940
+  cases_per_material: 3
+  case_semantics:
+    first: nominal_reference
+    remaining: natural_pilot
+dataset_packages: []

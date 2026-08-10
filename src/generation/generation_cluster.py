@@ -410,6 +410,12 @@ def _attempt_campaign_task(
     config = campaign.batch(task.batch_name)
     if runtime_service.runtime_cancellation_requested():
         return None
+    if campaign.campaign_purpose == config_contract.PILOT_CAMPAIGN_PURPOSE and runtime_service.case_failure_is_recorded(
+        config,
+        task.case_index,
+        storage_root=storage_root,
+    ):
+        return None
     if runtime_service.completed_case_is_valid(
         config,
         task.case_index,
@@ -434,6 +440,12 @@ def _attempt_campaign_task(
             plan,
             storage_root=storage_root,
         ) as campaign_slot:
+            if campaign.campaign_purpose == config_contract.PILOT_CAMPAIGN_PURPOSE and runtime_service.case_failure_is_recorded(
+                config,
+                task.case_index,
+                storage_root=storage_root,
+            ):
+                return None
             return runtime_service.run_case(
                 config,
                 task.case_index,
@@ -562,8 +574,18 @@ def build_campaign_slurm_submission_command(
         "--remaining-cases",
         str(plan.remaining_cases),
     ]
-    if len(campaign.batches) == 1:
+    if campaign.campaign_purpose == config_contract.PILOT_CAMPAIGN_PURPOSE:
+        case_counts = {len(batch.case_indices) for batch in campaign.batches}
+        if len(case_counts) != 1:
+            message = "Pilot worker construction requires one uniform cases-per-material count."
+            raise ValueError(message)
+        worker_command.extend(["--pilot-cases-per-material", str(next(iter(case_counts)))])
+    elif len(campaign.batches) == 1:
         worker_command.extend(["--only-batch", campaign.batches[0].batch_name])
+    elif campaign.campaign_purpose == "family_generalization" and not any(
+        batch.evaluation_regime == "extreme_family_ood" for batch in campaign.batches
+    ):
+        worker_command.append("--skip-extreme-family-ood")
     wrapped = f"CAMPAIGN_WORKER_COUNT={plan.effective_nodes} {shlex.join(worker_command)}"
     cluster = campaign.execution_values["cluster"]
     job_name = campaign.campaign_name[:_MAX_SCHEDULER_JOB_NAME_LENGTH] if scheduler_job_name is None else scheduler_job_name

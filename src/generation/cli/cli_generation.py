@@ -1,4 +1,24 @@
-"""Thin command-line interface for profile-qualified generation services."""
+"""
+===============================================================================
+cli_generation.py
+===============================================================================
+Expose the profile-qualified generation services through one thin command line.
+
+Responsibilities:
+  - Parse explicit configuration, case, campaign, pilot, and publication commands
+  - Dispatch reusable generation services without duplicating their domain logic
+  - Emit machine-readable command results and propagate terminal failures
+
+Design principles:
+  - Scientific, execution, and storage choices remain explicit command inputs
+  - Validation and lifecycle authority stay in the responsible source services
+  - Destructive cleanup requires the service-owned identity and confirmation gates
+
+This module does NOT:
+  - Define scientific values, sampling behavior, COMSOL mappings, or data schemas
+  - Implement simulation, scheduling, persistence, or cleanup domain logic
+===============================================================================
+"""
 
 from __future__ import annotations
 
@@ -11,12 +31,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src import common
 from src.generation import generation_campaign_runtime as campaign_runtime
 from src.generation import generation_case as case_service
 from src.generation import generation_cluster as cluster_service
 from src.generation import generation_config as config_service
+from src.generation import generation_inventory as inventory_service
+from src.generation import generation_mapping_probe as mapping_probe_service
+from src.generation import generation_pilot as pilot_service
 from src.generation import generation_preflight as preflight_service
+from src.generation import generation_readiness as readiness_service
 from src.generation import generation_runtime as runtime_service
+from src.generation import generation_sentinels as sentinel_service
+from src.generation import generation_smoke as smoke_service
 from src.generation import generation_workflow as workflow_service
 from src.generation import generation_workspace as workspace_service
 
@@ -56,6 +83,59 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     validate = subparsers.add_parser("validate-config", help="validate one generation configuration")
     validate.add_argument("config", type=Path)
     _add_batch_selection(validate, required=False)
+    validate.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="validate structure and report unresolved launch gates without executing",
+    )
+    validate.add_argument(
+        "--inspect-parameter",
+        action="append",
+        default=[],
+        help="include complete resolved evidence for one canonical parameter or atomic record",
+    )
+
+    static_sentinels = subparsers.add_parser(
+        "static-sentinels",
+        help="run six-family and all-OOD-group generator checks without COMSOL",
+    )
+    static_sentinels.add_argument("steady_campaign", type=Path)
+    static_sentinels.add_argument("transient_campaign", type=Path)
+
+    readiness = subparsers.add_parser(
+        "readiness-report",
+        help="report exact missing launch values, mappings, and runtime evidence",
+    )
+    readiness.add_argument("steady_primary", type=Path)
+    readiness.add_argument("transient_primary", type=Path)
+    readiness.add_argument("--run-static-sentinels", action="store_true")
+    readiness.add_argument("--real-runtime-receipt", type=Path)
+
+    mapping_probe = subparsers.add_parser(
+        "mapping-probe",
+        help="run one retained technical case and inventory actual COMSOL outputs",
+    )
+    mapping_probe.add_argument("config", type=Path)
+    _add_batch_selection(mapping_probe, required=False)
+    mapping_probe.add_argument("--storage-root", type=Path, required=True)
+    mapping_probe.add_argument("--work-root", type=Path, required=True)
+    mapping_probe.add_argument("--cores-per-case", type=int, required=True)
+
+    finalize_smoke = subparsers.add_parser(
+        "finalize-real-smoke",
+        help="write one immutable paired native runtime-smoke receipt",
+    )
+    finalize_smoke.add_argument("steady_campaign_run_id")
+    finalize_smoke.add_argument("transient_campaign_run_id")
+    finalize_smoke.add_argument("--comsol-version-output", required=True)
+    finalize_smoke.add_argument("--storage-root", type=Path, required=True)
+
+    validate_smoke = subparsers.add_parser(
+        "validate-real-smoke",
+        help="revalidate one immutable runtime-smoke receipt against current source",
+    )
+    validate_smoke.add_argument("receipt", type=Path, nargs="?")
+    validate_smoke.add_argument("--storage-root", type=Path, required=True)
 
     preflight = subparsers.add_parser(
         "preflight",
@@ -155,6 +235,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     campaign_worker = subparsers.add_parser("run-campaign-worker", help="run one node from the shared campaign worker pool")
     campaign_worker.add_argument("config", type=Path)
     _add_batch_selection(campaign_worker, required=False)
+    campaign_worker.add_argument(
+        "--skip-extreme-family-ood",
+        action="store_true",
+        help="skip the canonical extreme-family batches for this execution only",
+    )
+    campaign_worker.add_argument("--pilot-cases-per-material", type=int)
     _add_resources(campaign_worker)
     campaign_worker.add_argument("--worker-index", type=int, required=True)
     campaign_worker.add_argument("--worker-count", type=int, required=True)
@@ -168,6 +254,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     campaign_plan.add_argument("config", type=Path)
     _add_batch_selection(campaign_plan, required=False)
+    campaign_plan.add_argument(
+        "--skip-extreme-family-ood",
+        action="store_true",
+        help="skip the canonical extreme-family batches for this execution only",
+    )
+    campaign_plan.add_argument("--pilot-cases-per-material", type=int)
     campaign_plan.add_argument("--wall-time")
     campaign_plan.add_argument("--git-commit", required=True)
     _add_resources(campaign_plan)
@@ -176,6 +268,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     submit_campaign = subparsers.add_parser("submit-campaign", help="submit and persist one exact-commit campaign run")
     submit_campaign.add_argument("config", type=Path)
     _add_batch_selection(submit_campaign, required=False)
+    submit_campaign.add_argument(
+        "--skip-extreme-family-ood",
+        action="store_true",
+        help="skip the canonical extreme-family batches for this execution only",
+    )
+    submit_campaign.add_argument("--pilot-cases-per-material", type=int)
     submit_campaign.add_argument("--wall-time")
     submit_campaign.add_argument("--git-commit", required=True)
     _add_resources(submit_campaign)
@@ -242,6 +340,68 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     validate_publication.add_argument("campaign_run_id")
     _add_storage_arguments(validate_publication)
+
+    pilot_source_inventory = subparsers.add_parser(
+        "record-pilot-source-inventory",
+        help="record exact terminal pilot CPU bytes before transfer or cleanup",
+    )
+    pilot_source_inventory.add_argument("campaign_run_id")
+    _add_storage_arguments(pilot_source_inventory)
+
+    pilot_staging_inventory = subparsers.add_parser(
+        "record-pilot-staging-inventory",
+        help="record exact transfer-staging bytes before publication or cleanup",
+    )
+    pilot_staging_inventory.add_argument("campaign_run_id")
+    pilot_staging_inventory.add_argument("--staging-root", type=Path, required=True)
+
+    validate_pilot_staging = subparsers.add_parser(
+        "validate-pilot-staging-inventory",
+        help="validate and report the retained pilot transfer staging",
+    )
+    validate_pilot_staging.add_argument("campaign_run_id")
+    validate_pilot_staging.add_argument("--require-present", action="store_true")
+    validate_pilot_staging.add_argument("--format", choices=("json", "tsv"), default="json")
+    _add_storage_arguments(validate_pilot_staging)
+
+    cleanup_pilot_staging = subparsers.add_parser(
+        "cleanup-pilot-staging",
+        help="transactionally remove the exact authorized pilot transfer staging",
+    )
+    cleanup_pilot_staging.add_argument("campaign_run_id")
+    cleanup_pilot_staging.add_argument("--confirm", action="store_true")
+    cleanup_pilot_staging.add_argument("--format", choices=("json", "tsv"), default="json")
+    _add_storage_arguments(cleanup_pilot_staging)
+
+    prepare_pilot = subparsers.add_parser(
+        "prepare-pilot-check",
+        help="analyze pilot evidence and persist the immutable pre-cleanup receipt",
+    )
+    prepare_pilot.add_argument("campaign_run_id")
+    prepare_pilot.add_argument("--keep-cpu-source", action="store_true")
+    _add_storage_arguments(prepare_pilot)
+
+    record_pilot_cleanup = subparsers.add_parser(
+        "record-pilot-cleanup",
+        help="finalize verified CPU and transfer-staging cleanup in the pilot receipt",
+    )
+    record_pilot_cleanup.add_argument("campaign_run_id")
+    record_pilot_cleanup.add_argument("--cpu-source-removed", action="store_true")
+    record_pilot_cleanup.add_argument("--cpu-bytes-reclaimed", type=int, required=True)
+    record_pilot_cleanup.add_argument("--cpu-cleanup-receipt-sha256")
+    record_pilot_cleanup.add_argument("--transfer-staging-removed", action="store_true")
+    record_pilot_cleanup.add_argument("--staging-bytes-reclaimed", type=int, required=True)
+    record_pilot_cleanup.add_argument("--staging-cleanup-receipt-sha256")
+    _add_storage_arguments(record_pilot_cleanup)
+
+    validate_pilot = subparsers.add_parser(
+        "validate-pilot-check",
+        help="revalidate and display one canonical pilot receipt",
+    )
+    validate_pilot.add_argument("campaign_run_id")
+    validate_pilot.add_argument("--require-cleanup-complete", action="store_true")
+    validate_pilot.add_argument("--format", choices=("json", "summary"), default="json")
+    _add_storage_arguments(validate_pilot)
 
     build_datasets = subparsers.add_parser(
         "build-campaign-datasets",
@@ -333,7 +493,11 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
 def _load(args: argparse.Namespace) -> config_service.GenerationConfig:
     """Load one predeclared batch referenced by a parsed command."""
-    return config_service.load_generation_config(args.config, only_batch=args.only_batch)
+    return config_service.load_generation_config(
+        args.config,
+        require_executable=not getattr(args, "allow_incomplete", False),
+        only_batch=args.only_batch,
+    )
 
 
 def _selected(config: config_service.GenerationConfig, args: argparse.Namespace) -> tuple[int, ...]:
@@ -372,18 +536,117 @@ def _summary(config: config_service.GenerationConfig) -> dict[str, Any]:
     return {
         "simulation_profile": config.profile.id,
         "material_family": config.material_family,
+        "material_role": config.material_role,
+        "evaluation_regime": config.evaluation_regime,
         "sampling_regime": config.sampling_regime,
         "batch_name": config.batch_name,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
-        "case_count": len(config.case_indices),
+        "case_count": config.scientific_values["case_count"],
+        "seed_base": config.seed_base,
         "template_path": str(config.template_path),
         "template_sha256": config.template_sha256,
     }
 
 
+def _campaign_summary(
+    campaign: config_service.CampaignConfig,
+    *,
+    unresolved_gates: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Return one resolved campaign view without promoting unresolved values."""
+    summary = {
+        "campaign_name": campaign.campaign_name,
+        "campaign_id": campaign.campaign_id,
+        "campaign_purpose": campaign.campaign_purpose,
+        "simulation_profile": campaign.profile.id,
+        "material_roles": {role: list(families) for role, families in campaign.material_roles.items()},
+        "evaluation_regimes": list(campaign.evaluation_regimes),
+        "counts": {batch.batch_name: batch.scientific_values["case_count"] for batch in campaign.batches},
+        "seeds": {batch.batch_name: batch.seed_base for batch in campaign.batches},
+        "selected_batches": [_summary(batch) for batch in campaign.batches],
+        "dataset_packages": list(campaign.dataset_packages),
+        "profile": {
+            "id": campaign.profile.id,
+            "template_path": str(campaign.profile.template_path),
+            "template_sha256": campaign.profile.template_sha256,
+        },
+        "execution_resources": {
+            "site": campaign.execution_values["site"],
+            "runtime": campaign.execution_values["runtime"],
+            "cluster": campaign.execution_values["cluster"],
+            "retention_profile": campaign.execution_values["retention_profile"],
+            "retention": campaign.execution_values["retention"],
+        },
+        "unresolved_readiness_gates": unresolved_gates,
+        "executable": not any(unresolved_gates.values()),
+    }
+    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+        pilot = campaign.batches[0].scientific_values["pilot_check"]
+        summary["pilot_plan"] = {
+            "cases_per_material": pilot["cases_per_material"],
+            "total_case_count": campaign.total_case_count,
+            "seed_namespace": campaign.batches[0].scientific_values["campaign_seed"],
+            "case_semantics": pilot["case_semantics"],
+            "case_kinds": pilot["case_kinds"],
+            "training_membership": "none",
+            "dataset_package_count": len(campaign.dataset_packages),
+            "evaluation_regime": config_service.NO_EVALUATION_REGIME,
+        }
+    return summary
+
+
 def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
+    if args.command == "static-sentinels":
+        report = sentinel_service.run_static_sentinels(
+            args.steady_campaign,
+            args.transient_campaign,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["status"] == "pass" else 2
+    if args.command == "readiness-report":
+        report = readiness_service.build_readiness_report(
+            args.steady_primary,
+            args.transient_primary,
+            run_static_sentinels=args.run_static_sentinels,
+            real_runtime_receipt=args.real_runtime_receipt,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["production_ready_for_user_launch"] else 2
+    if args.command == "mapping-probe":
+        path = mapping_probe_service.run_mapping_probe(
+            args.config,
+            only_batch=args.only_batch,
+            storage_root=args.storage_root,
+            work_root=args.work_root,
+            cores_per_case=args.cores_per_case,
+        )
+        report = mapping_probe_service.load_mapping_probe(path)
+        print(json.dumps({"path": str(path), "report": report}, sort_keys=True))
+        return 0 if report["status"] == "mapping_observation_complete" and report["exit_code"] == 0 else 2
+    if args.command == "finalize-real-smoke":
+        path = smoke_service.finalize_real_smoke(
+            args.steady_campaign_run_id,
+            args.transient_campaign_run_id,
+            comsol_version_output=args.comsol_version_output,
+            storage_root=args.storage_root,
+        )
+        print(path)
+        return 0
+    if args.command == "validate-real-smoke":
+        report = (
+            smoke_service.validate_current_real_smoke_receipts(
+                storage_root=args.storage_root,
+            )
+            if args.receipt is None
+            else smoke_service.validate_real_smoke_receipt(
+                args.receipt,
+                storage_root=args.storage_root,
+            )
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
     if args.command == "preflight":
         unresolved = config_service.load_campaign_config(
             args.config,
@@ -462,19 +725,15 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         return 0
     if args.command == "validate-config" and args.only_batch is None:
-        campaign = config_service.load_campaign_config(args.config)
-        print(
-            json.dumps(
-                {
-                    "campaign_name": campaign.campaign_name,
-                    "campaign_id": campaign.campaign_id,
-                    "simulation_profile": campaign.profile.id,
-                    "batches": [_summary(batch) for batch in campaign.batches],
-                    "dataset_packages": list(campaign.dataset_packages),
-                },
-                sort_keys=True,
-            )
+        campaign = config_service.load_campaign_config(
+            args.config,
+            require_executable=not args.allow_incomplete,
         )
+        gates = readiness_service.campaign_unresolved_gates(args.config)
+        summary = _campaign_summary(campaign, unresolved_gates=gates)
+        if args.inspect_parameter:
+            summary["parameter_inspection"] = [inventory_service.inspect_campaign_parameter(campaign, name) for name in args.inspect_parameter]
+        print(json.dumps(summary, sort_keys=True))
         return 0
     if args.command == "campaign-status":
         status = campaign_runtime.campaign_status(
@@ -574,6 +833,103 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
         )
         print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "record-pilot-source-inventory":
+        inventory = pilot_service.record_cpu_source_inventory(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(inventory, sort_keys=True))
+        return 0
+    if args.command == "record-pilot-staging-inventory":
+        inventory = pilot_service.record_transfer_staging_inventory(
+            args.campaign_run_id,
+            staging_root=args.staging_root,
+        )
+        print(json.dumps(inventory, sort_keys=True))
+        return 0
+    if args.command == "validate-pilot-staging-inventory":
+        inventory = pilot_service.validate_transfer_staging_inventory(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            require_staging_present=args.require_present,
+        )
+        if args.format == "json":
+            print(json.dumps(inventory, sort_keys=True))
+        else:
+            print(
+                "\t".join(
+                    (
+                        "pilot-staging",
+                        inventory["transfer_staging_path"],
+                        str(inventory["transfer_staging_bytes_before_cleanup"]),
+                        str(inventory["transfer_staging_file_count"]),
+                    )
+                )
+            )
+        return 0
+    if args.command == "cleanup-pilot-staging":
+        receipt = pilot_service.cleanup_recorded_transfer_staging(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            confirm=args.confirm,
+        )
+        if args.format == "json":
+            print(json.dumps(receipt, sort_keys=True))
+        else:
+            print(
+                "\t".join(
+                    (
+                        "pilot-staging-cleanup",
+                        str(receipt["status"]),
+                        str(receipt["removed"]),
+                        str(receipt["reclaimed_bytes"]),
+                        (
+                            common.serialization.file_sha256(
+                                pilot_service.pilot_check_directory(
+                                    args.campaign_run_id,
+                                    storage_root=args.storage_root,
+                                )
+                                / pilot_service.PILOT_STAGING_CLEANUP_FILENAME
+                            )
+                            if receipt["status"] == "complete"
+                            else "-"
+                        ),
+                    )
+                )
+            )
+        return 0
+    if args.command == "prepare-pilot-check":
+        receipt = pilot_service.prepare_pilot_receipt(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            cleanup_requested=not args.keep_cpu_source,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "record-pilot-cleanup":
+        receipt = pilot_service.record_cleanup_result(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            cpu_source_removed=args.cpu_source_removed,
+            cpu_bytes_reclaimed=args.cpu_bytes_reclaimed,
+            cpu_cleanup_receipt_sha256=args.cpu_cleanup_receipt_sha256,
+            transfer_staging_removed=args.transfer_staging_removed,
+            staging_bytes_reclaimed=args.staging_bytes_reclaimed,
+            staging_cleanup_receipt_sha256=args.staging_cleanup_receipt_sha256,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "validate-pilot-check":
+        receipt = pilot_service.validate_pilot_receipt(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            require_cleanup_complete=args.require_cleanup_complete,
+        )
+        if args.format == "json":
+            print(json.dumps(receipt, sort_keys=True))
+        else:
+            print(pilot_service.terminal_summary(receipt))
         return 0
     if args.command == "build-campaign-datasets":
         receipt = workflow_service.build_campaign_datasets(
@@ -706,7 +1062,24 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(path)
         return 0
     if args.command in {"run-campaign-worker", "plan-campaign", "submit-campaign"}:
-        campaign = config_service.load_campaign_config(args.config).select_batches(None if args.only_batch is None else (args.only_batch,))
+        if args.skip_extreme_family_ood and args.only_batch is not None:
+            message = "--skip-extreme-family-ood cannot be combined with --only-batch."
+            raise ValueError(message)
+        if args.pilot_cases_per_material is not None and (args.skip_extreme_family_ood or args.only_batch is not None):
+            message = "--pilot-cases-per-material cannot be combined with --skip-extreme-family-ood or --only-batch."
+            raise ValueError(message)
+        campaign = config_service.load_campaign_config(
+            args.config,
+            pilot_cases_per_material=args.pilot_cases_per_material,
+        )
+        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+            if args.skip_extreme_family_ood or args.only_batch is not None:
+                message = "Pilot-check campaigns do not support extreme-family skipping or batch selection."
+                raise ValueError(message)
+        else:
+            if args.skip_extreme_family_ood:
+                campaign = campaign.without_extreme_family_ood()
+            campaign = campaign.select_batches(None if args.only_batch is None else (args.only_batch,))
         if args.command != "run-campaign-worker":
             campaign = campaign.with_wall_time(args.wall_time)
         remaining = (
@@ -855,7 +1228,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _dispatch(args)
     except Exception as error:  # noqa: BLE001 -- CLI boundary reports actionable domain errors
-        print(str(error), file=sys.stderr)
+        if args.command == "validate-config":
+            details = config_service.validation_error_details(args.config, error)
+            print(json.dumps(details, sort_keys=True), file=sys.stderr)
+        else:
+            print(str(error), file=sys.stderr)
         return 2
     finally:
         if previous_term is not None:

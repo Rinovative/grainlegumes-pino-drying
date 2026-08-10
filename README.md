@@ -18,7 +18,13 @@ Heterogeneous permeability, porosity, pressure, and initial-moisture fields are 
 
 The repository now has one Python package, one research layout, and one external scientific storage root. Existing dataset identity, train-only normalization, deterministic training, exact resume, Optuna, W&B observation, run publication, artifact generation, and ID/OOD evaluation contracts remain the stationary-airflow baseline for subsequent drying work.
 
-The final transient simulation/publication and physical Dataset contracts are implemented fail-closed. Their COMSOL model-tree behavior remains runtime-unverified until the real COMSOL 6.4 sentinel; transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
+The six-family generation/publication contract is implemented fail-closed as a 1,200-case steady campaign and a 660-trajectory transient campaign (1,860 profile-specific source cases combined). Production is currently blocked by the material packing-porosity sanity guard, unconfirmed native mappings, and missing real-smoke/pilot receipts. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
+
+> Configured scientific values are modelling and sampling decisions. Citations do
+> not imply that every final number is reported verbatim: values may be fitted,
+> converted, transferred, inverted, estimated, selected as priors, or synthetic.
+> Resolved `status`, `derivation`, `confidence`, and `validity` are authoritative;
+> technical smoke evidence does not experimentally validate the science.
 
 <details>
 <summary><strong>Current stationary-airflow workflow</strong></summary>
@@ -77,6 +83,32 @@ flowchart TD
     E --> A[Run-owned analysis artifacts]
     A --> N[Evaluation notebooks]
 ```
+
+## ⚙️ Generation Gateway
+
+Run generation orchestration on the GPU/development host outside Docker. The
+current readiness report is non-solving and will remain blocked until the
+reported scientific and native-runtime gates are cleared:
+
+```bash
+cd /workspace/repo
+python -m src.generation.cli.cli_generation readiness-report \
+  configs/generation/campaigns/steady_flow/family_generalization.yaml \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --run-static-sentinels
+```
+
+The normal six-family transient diagnostic, once those gates pass, is:
+
+```bash
+./scripts/generation_workflow.sh pilot-check \
+  configs/generation/campaigns/transient_drying/pilot_check.yaml
+```
+
+See the [generation workflow](docs/simulation_generation.md) for setup, mapping
+probe, smoke, plan, cleanup, status, and resume commands, and the
+[parameter reference](docs/generation_parameter_reference.md) for scientific
+ownership and provenance inspection.
 
 ## ⚙️ Local Execution
 
@@ -202,6 +234,7 @@ python -m pytest -q -m "not real_data" tests
 │   ├── datasets/
 │   ├── domain/
 │   ├── experiments/
+│   ├── generation/
 │   └── learning/
 ├── tests/
 ├── Dockerfile
@@ -214,7 +247,7 @@ python -m pytest -q -m "not real_data" tests
 `src` is the only importable production Python package. Supported top-level imports are:
 
 ```python
-from src import analysis, common, datasets, domain, experiments, learning
+from src import analysis, common, datasets, domain, experiments, generation, learning
 ```
 
 </details>

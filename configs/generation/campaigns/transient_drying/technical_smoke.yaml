@@ -1,0 +1,25 @@
+schema_kind: generation_campaign
+schema_version: 1
+campaign_purpose: technical_runtime_smoke
+sources_config: configs/generation/sources.yaml
+registry_config: configs/generation/registry.yaml
+common_config: configs/generation/common.yaml
+operations_config: configs/generation/operations/fixed_bed.yaml
+profile_config: configs/generation/profiles/transient_drying.yaml
+execution_config: configs/generation/execution/cluster_cpu.yaml
+paired_equivalence_seed: 9930
+material_roles:
+  seen:
+  - lentil
+  near_family_ood: []
+  far_family_ood: []
+  extreme_family_ood: []
+sampling:
+  method: lhs
+  seed_base: 9920
+  counts:
+    natural:
+      lentil: 2
+dataset_packages:
+- evaluation_regime: id
+  source_role: seen

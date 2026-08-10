@@ -6,6 +6,10 @@ HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 LOCAL_PYTHON="${GENERATION_LOCAL_PYTHON:-python3}"
 REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
 DEFAULT_CPU_HOST="sricehpc01"
+STEADY_SMOKE_CAMPAIGN="configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+TRANSIENT_SMOKE_CAMPAIGN="configs/generation/campaigns/transient_drying/technical_smoke.yaml"
+STEADY_PRIMARY_CAMPAIGN="configs/generation/campaigns/steady_flow/family_generalization.yaml"
+TRANSIENT_PRIMARY_CAMPAIGN="configs/generation/campaigns/transient_drying/family_generalization.yaml"
 GENERATION_MODULE="src.generation.cli.cli_generation"
 PYTHON_MODULE="Python/3.10"
 COMSOL_MODULE="Comsol/v6.4"
@@ -15,6 +19,13 @@ ALL_WORKFLOW_ACTIVE=false
 ALL_STAGE="not_started"
 RUN_ID=""
 CPU_BYTES_RETAINED=0
+CPU_BYTES_RECLAIMED=0
+CPU_CLEANUP_RECEIPT_SHA=""
+PILOT_CASES_PER_MATERIAL=""
+SKIP_EXTREME_FAMILY_OOD=false
+PILOT_STAGING=""
+PILOT_STAGING_BYTES=0
+PILOT_STAGING_RECLAIMED=0
 
 usage() {
   cat >&2 <<EOF
@@ -24,6 +35,8 @@ Usage:
   $0 plan CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
   $0 launch CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
   $0 all CAMPAIGN --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [--detach] [--keep-cpu-source] [options]
+  $0 smoke --max-nodes N --cases-per-node N --cores-per-case N --max-parallel-cases N [options]
+  $0 pilot-check CAMPAIGN [--cases-per-material N] [--keep-cpu-source] [options]
   $0 status [CAMPAIGN_RUN_ID] [remote options]
   $0 collect|build-datasets|resume CAMPAIGN_RUN_ID [options]
   $0 cleanup CAMPAIGN_RUN_ID [--confirm] [remote options]
@@ -34,12 +47,16 @@ Remote options:
   --remote-root PATH    default: remote HOME/grainlegumes-generation
   --git-commit COMMIT   exact lowercase 40-character commit
   --only-batch NAME     one predeclared batch
+  --skip-extreme-family-ood
+                         skip only the extreme-family batch for this execution
   --wall-time TIME      Slurm [days-]hours:minutes:seconds
 
 setup-cpu and cleanup are dry runs unless --execute or --confirm is supplied.
 collect validates and publishes GPU generation data without deleting CPU sources.
 all waits synchronously, builds every package, smokes every loader, and cleans the
 verified CPU source by default. Use only --keep-cpu-source to retain it.
+smoke owns the canonical paired two-profile technical run and always retains CPU source.
+pilot-check runs six-material transient diagnostics and safely cleans CPU/staging by default.
 EOF
 }
 fail() {
@@ -151,6 +168,36 @@ resolve_local_commit() {
   fi
 }
 
+resolve_configured_resources() {
+  resolve_local_python
+  local defaults kind configured_max_nodes configured_cases_per_node
+  local configured_cores_per_case configured_max_parallel configured_wall_time
+  local configured_cores_per_node extra
+  defaults="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
+    "${LOCAL_PYTHON}" -c 'import json, sys
+value = json.load(sys.stdin)["execution_resources"]["cluster"]
+wall = value.get("wall_time")
+print("\t".join(("resources", str(value["max_nodes"]), str(value["cases_per_node"]), str(value["cores_per_case"]), str(value["max_parallel_cases"]), "-" if wall is None else str(wall), str(value["cores_per_node"]))))')" ||
+    fail 1 "Could not resolve configured campaign resources."
+  IFS=$'\t' read -r kind configured_max_nodes configured_cases_per_node \
+    configured_cores_per_case configured_max_parallel configured_wall_time \
+    configured_cores_per_node extra <<< "${defaults}"
+  [[ "${kind}" == resources && -z "${extra:-}" ]] || fail 1 "Malformed configured resource record."
+  validate_positive "configured max_nodes" "${configured_max_nodes}"
+  validate_positive "configured cases_per_node" "${configured_cases_per_node}"
+  validate_positive "configured cores_per_case" "${configured_cores_per_case}"
+  validate_positive "configured max_parallel_cases" "${configured_max_parallel}"
+  validate_positive "configured cores_per_node" "${configured_cores_per_node}"
+  [[ "${configured_cores_per_node}" == "${CORES_PER_NODE}" ]] ||
+    fail 1 "Configured cores_per_node differs from the maintained host contract."
+  [[ "${configured_wall_time}" != - ]] || configured_wall_time=""
+  [[ -n "${MAX_NODES}" ]] || MAX_NODES="${configured_max_nodes}"
+  [[ -n "${CASES_PER_NODE}" ]] || CASES_PER_NODE="${configured_cases_per_node}"
+  [[ -n "${CORES_PER_CASE}" ]] || CORES_PER_CASE="${configured_cores_per_case}"
+  [[ -n "${MAX_PARALLEL_CASES}" ]] || MAX_PARALLEL_CASES="${configured_max_parallel}"
+  [[ -n "${WALL_TIME}" ]] || WALL_TIME="${configured_wall_time}"
+}
+
 resolve_campaign() {
   require_command realpath
   CAMPAIGN_CONFIG_PATH="$(realpath -e -- "$1")" || fail 2 "Campaign config does not exist."
@@ -164,6 +211,31 @@ resolve_campaign() {
   for component in "${components[@]}"; do
     [[ -n "${component}" && "${component}" != . && "${component}" != .. ]]       || fail 2 "Campaign path contains traversal."
   done
+}
+
+resolve_pilot_contract() {
+  resolve_local_python
+  local record kind purpose configured_count configured_total extra
+  record="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
+    "${LOCAL_PYTHON}" -c 'import json, sys
+value = json.load(sys.stdin)
+counts = tuple(value["counts"].values())
+if not counts or len(set(counts)) != 1:
+    raise SystemExit("pilot campaign must have one uniform cases-per-material count")
+print("\t".join(("pilot", str(value["campaign_purpose"]), str(counts[0]), str(sum(counts)))))')" ||
+    fail 2 "Could not resolve the dedicated pilot-check campaign contract."
+  IFS=$'\t' read -r kind purpose configured_count configured_total extra <<< "${record}"
+  [[ "${kind}" == pilot && "${purpose}" == pilot_check && -z "${extra:-}" ]] ||
+    fail 2 "pilot-check requires a dedicated campaign with campaign_purpose: pilot_check."
+  validate_positive "configured pilot cases per material" "${configured_count}"
+  validate_positive "configured pilot total" "${configured_total}"
+  (( configured_total == 6 * configured_count )) ||
+    fail 2 "The dedicated pilot campaign must contain all six materials."
+  if [[ -z "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    PILOT_CASES_PER_MATERIAL="${configured_count}"
+  else
+    validate_positive --cases-per-material "${PILOT_CASES_PER_MATERIAL}"
+  fi
 }
 
 validate_resources() {
@@ -275,11 +347,13 @@ remote_plan_submit() {
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" \
     "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" \
-    "${MAX_PARALLEL_CASES}" "${ONLY_BATCH}" "${WALL_TIME}" "${operation}" <<'REMOTE'
+    "${MAX_PARALLEL_CASES}" "${ONLY_BATCH}" "${WALL_TIME}" "${operation}" \
+    "${PILOT_CASES_PER_MATERIAL}" "${SKIP_EXTREME_FAMILY_OOD}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
 max_nodes="$6"; cases_per_node="$7"; cores_per_case="$8"; max_parallel="$9"
-only_batch="${10}"; wall_time="${11}"; operation="${12}"
+only_batch="${10}"; wall_time="${11}"; operation="${12}"; pilot_cases="${13}"
+skip_extreme="${14}"
 module load Python/3.10
 module load Comsol/v6.4
 source "${venv}/bin/activate"
@@ -293,6 +367,8 @@ command=(python -m src.generation.cli.cli_generation "${operation}" "${repositor
   --storage-root "${storage}")
 [[ -z "${only_batch}" ]] || command+=(--only-batch "${only_batch}")
 [[ -z "${wall_time}" ]] || command+=(--wall-time "${wall_time}")
+[[ -z "${pilot_cases}" ]] || command+=(--pilot-cases-per-material "${pilot_cases}")
+[[ "${skip_extreme}" != true ]] || command+=(--skip-extreme-family-ood)
 "${command[@]}"
 REMOTE
 }
@@ -324,11 +400,111 @@ sbatch --wait --parsable --partition=standard --nodes=1 --ntasks=1 \
 REMOTE
 }
 
+mapping_probe_cpu() {
+  local campaign_argument="$1"
+  resolve_campaign "${campaign_argument}"
+  resolve_remote_layout
+  remote_bash "${CPU_HOST}" \
+    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
+    "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" \
+    "${MAX_NODES}" "${CASES_PER_NODE}" "${CORES_PER_CASE}" \
+    "${MAX_PARALLEL_CASES}" "${WALL_TIME}" <<'REMOTE'
+set -euo pipefail
+repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
+max_nodes="$6"; cases_per_node="$7"; cores_per_case="$8"; max_parallel="$9"
+wall_time="${10}"
+[[ -n "${wall_time}" ]] || wall_time=01:00:00
+probe_id="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
+logs="${storage}/01_generation/meta/mapping_probe_jobs/${probe_id}"
+mkdir -p "${logs}"
+set +e
+job_id="$(sbatch --wait --parsable --partition=standard --nodes=1 --ntasks=1 \
+  --cpus-per-task="${cores_per_case}" --time="${wall_time}" \
+  --job-name=vp2-mapping-probe --export="ALL,GENERATION_GIT_COMMIT=${commit}" \
+  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err" \
+  --chdir="${repository}" "${repository}/scripts/generation_cpu_smoke.sh" \
+  "${venv}" "${repository}/${campaign}" "${storage}" - \
+  "${max_nodes}" "${cases_per_node}" "${cores_per_case}" "${max_parallel}" 32 mapping-probe)"
+status="$?"
+set -e
+job_id="${job_id%%;*}"
+[[ "${job_id}" =~ ^[0-9]+$ ]] || { printf 'Mapping-probe submission returned malformed job ID: %s\n' "${job_id}" >&2; exit 1; }
+printf 'Mapping-probe Slurm job: %s\n' "${job_id}"
+[[ ! -f "${logs}/slurm-${job_id}.out" ]] || cat "${logs}/slurm-${job_id}.out"
+[[ ! -f "${logs}/slurm-${job_id}.err" ]] || cat "${logs}/slurm-${job_id}.err" >&2
+exit "${status}"
+REMOTE
+}
+
+campaign_is_technical_smoke() {
+  [[ "${CAMPAIGN_RELATIVE_PATH}" == "${STEADY_SMOKE_CAMPAIGN}"     || "${CAMPAIGN_RELATIVE_PATH}" == "${TRANSIENT_SMOKE_CAMPAIGN}" ]]
+}
+
+validate_local_launch_gates() {
+  local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null
+  campaign_is_technical_smoke && return
+  local_cli static-sentinels "${PROJECT_DIR}/${STEADY_PRIMARY_CAMPAIGN}"     "${PROJECT_DIR}/${TRANSIENT_PRIMARY_CAMPAIGN}" >/dev/null ||
+    fail 2 "Static scientific sentinels block production planning or launch."
+  local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
+}
+
+technical_profiles_ready() {
+  resolve_local_python
+  local_cli validate-config "${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}" >/dev/null 2>&1 &&
+    local_cli validate-config "${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}" >/dev/null 2>&1
+}
+
+remote_comsol_version() {
+  remote_bash "${CPU_HOST}" <<'REMOTE'
+set -euo pipefail
+module load Comsol/v6.4
+comsol -version 2>&1
+REMOTE
+}
+
+run_smoke() {
+  [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
+    fail 2 "smoke does not support --detach, --confirm, or --only-batch."
+  resolve_local_commit true
+  validate_resources
+  resolve_remote_layout
+  KEEP_CPU_SOURCE=true
+  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}"
+  preflight_cpu
+  if ! technical_profiles_ready; then
+    printf 'Profile mappings remain unconfirmed; running isolated retained probes.\n' >&2
+    local probe_failed=false
+    mapping_probe_cpu "${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}" || probe_failed=true
+    mapping_probe_cpu "${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}" || probe_failed=true
+    if [[ "${probe_failed}" == true ]]; then
+      printf 'One or more mapping probes reported an execution or mapping failure.\n' >&2
+    fi
+    fail 2 "Mapping confirmation is required. Review mapping_probe.json artifacts, update only explicit profile mappings, commit, and rerun this smoke command."
+  fi
+  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${STEADY_SMOKE_CAMPAIGN}"
+  run_all
+  local steady_run_id="${RUN_ID}"
+  CAMPAIGN_ARGUMENT="${PROJECT_DIR}/${TRANSIENT_SMOKE_CAMPAIGN}"
+  run_all
+  local transient_run_id="${RUN_ID}"
+  local comsol_version receipt
+  comsol_version="$(remote_comsol_version)"
+  receipt="$(local_cli finalize-real-smoke "${steady_run_id}" "${transient_run_id}" \
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+  printf 'Real technical runtime-smoke receipt: %s\n' "${receipt}"
+  printf 'CPU sources retained for review for runs %s and %s.\n' \
+    "${steady_run_id}" "${transient_run_id}"
+}
+
 plan_campaign() {
   resolve_local_commit true
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   validate_resources
   resolve_remote_layout
+  resolve_local_storage
+  resolve_local_python
+  validate_local_launch_gates
   print_layout
   remote_plan_submit plan-campaign
 }
@@ -421,6 +597,11 @@ collect_campaign() {
     printf 'GPU generation publication validated and reused for %s.\n' "${RUN_ID}"
     return
   fi
+  if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    remote_cli record-pilot-source-inventory "${RUN_ID}" \
+      --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null ||
+      fail 1 "Could not record exact pre-cleanup CPU pilot storage."
+  fi
   local plan
   plan="$(remote_transfer_plan)" || fail 1 "Remote campaign is not terminally valid."
   local -a directories=()
@@ -447,12 +628,21 @@ collect_campaign() {
       "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${directory}" "${staging}/" ||
       fail 1 "Transfer failed; staging retained at ${staging}."
   done
+  if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    local_cli record-pilot-staging-inventory "${RUN_ID}" --staging-root "${staging}" >/dev/null ||
+      fail 1 "Could not record exact pilot transfer-staging storage."
+    PILOT_STAGING="${staging}"
+  fi
   receipt="$(local_cli publish-transferred-campaign "${RUN_ID}" \
     --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
     --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}")" ||
     fail 1 "GPU publication validation failed; staging retained at ${staging}."
-  local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
-    --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" --confirm >/dev/null
+  if [[ -z "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
+      --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" --confirm >/dev/null
+  else
+    printf 'Pilot transfer staging retained through analysis: %s\n' "${staging}"
+  fi
   printf '%s\nCPU source retained: %s:%s\n' "${receipt}" "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}"
 }
 
@@ -584,6 +774,8 @@ confirm_cpu_cleanup() {
     --authorization-sha256 "${AUTHORIZATION_SHA}" \
     --cleanup-receipt-sha256 "${receipt_sha}" --reclaimed-bytes "${reclaimed}"
   CPU_BYTES_RETAINED=0
+  CPU_BYTES_RECLAIMED="${reclaimed}"
+  CPU_CLEANUP_RECEIPT_SHA="${receipt_sha}"
 }
 
 cleanup_cpu_source() {
@@ -613,6 +805,11 @@ storage_status_report() {
   local_cli "${local_arguments[@]}"
   printf 'CPU storage status:\n'
   remote_cli "${remote_arguments[@]}"
+  if [[ -n "${RUN_ID}" && -f "${LOCAL_STORAGE_ROOT}/01_generation/meta/pilot_checks/${RUN_ID}/pilot_check.json" ]]; then
+    printf 'Pilot check summary:\n'
+    local_cli validate-pilot-check "${RUN_ID}" --format summary \
+      --storage-root "${LOCAL_STORAGE_ROOT}"
+  fi
 }
 
 resume_command_text() {
@@ -631,14 +828,29 @@ resume_command_text() {
 }
 
 all_command_text() {
-  local -a command=(
-    ./scripts/generation_workflow.sh all "${CAMPAIGN_ARGUMENT}"
-    --max-nodes "${MAX_NODES}" --cases-per-node "${CASES_PER_NODE}"
-    --cores-per-case "${CORES_PER_CASE}" --max-parallel-cases "${MAX_PARALLEL_CASES}"
-    --cpu-host "${CPU_HOST}" --remote-root "${REMOTE_ROOT}"
-    --git-commit "${REQUESTED_COMMIT}"
-  )
+  local -a command
+  if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    command=(
+      ./scripts/generation_workflow.sh pilot-check "${CAMPAIGN_ARGUMENT}"
+      --cases-per-material "${PILOT_CASES_PER_MATERIAL}"
+      --cpu-host "${CPU_HOST}" --remote-root "${REMOTE_ROOT}"
+      --git-commit "${REQUESTED_COMMIT}"
+    )
+    [[ -z "${MAX_NODES}" ]] || command+=(--max-nodes "${MAX_NODES}")
+    [[ -z "${CASES_PER_NODE}" ]] || command+=(--cases-per-node "${CASES_PER_NODE}")
+    [[ -z "${CORES_PER_CASE}" ]] || command+=(--cores-per-case "${CORES_PER_CASE}")
+    [[ -z "${MAX_PARALLEL_CASES}" ]] || command+=(--max-parallel-cases "${MAX_PARALLEL_CASES}")
+  else
+    command=(
+      ./scripts/generation_workflow.sh all "${CAMPAIGN_ARGUMENT}"
+      --max-nodes "${MAX_NODES}" --cases-per-node "${CASES_PER_NODE}"
+      --cores-per-case "${CORES_PER_CASE}" --max-parallel-cases "${MAX_PARALLEL_CASES}"
+      --cpu-host "${CPU_HOST}" --remote-root "${REMOTE_ROOT}"
+      --git-commit "${REQUESTED_COMMIT}"
+    )
+  fi
   [[ -z "${ONLY_BATCH}" ]] || command+=(--only-batch "${ONLY_BATCH}")
+  [[ "${SKIP_EXTREME_FAMILY_OOD}" != true ]] || command+=(--skip-extreme-family-ood)
   [[ -z "${WALL_TIME}" ]] || command+=(--wall-time "${WALL_TIME}")
   [[ "${KEEP_CPU_SOURCE}" != true ]] || command+=(--keep-cpu-source)
   local rendered="" argument quoted
@@ -665,8 +877,17 @@ workflow_failure_report() {
   else
     resume="$(all_command_text)"
   fi
-  printf 'All workflow failed.\nStage: %s\nCPU bytes retained: %s\nResume command: %s\n' \
-    "${ALL_STAGE}" "${CPU_BYTES_RETAINED}" "${resume}" >&2
+  if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    local cleanup_state=cleanup_not_authorized
+    if (( CPU_BYTES_RECLAIMED > 0 || PILOT_STAGING_RECLAIMED > 0 )); then
+      cleanup_state=cleanup_incomplete
+    fi
+    printf 'Pilot check failed.\nStage: %s\nCleanup: %s\nCPU bytes retained: %s\nResume command: %s\n' \
+      "${ALL_STAGE}" "${cleanup_state}" "${CPU_BYTES_RETAINED}" "${resume}" >&2
+  else
+    printf 'All workflow failed.\nStage: %s\nCPU bytes retained: %s\nResume command: %s\n' \
+      "${ALL_STAGE}" "${CPU_BYTES_RETAINED}" "${resume}" >&2
+  fi
   return "${status}"
 }
 
@@ -675,6 +896,156 @@ workflow_exit_handler() {
   if [[ "${ALL_WORKFLOW_ACTIVE}" == true && "${status}" -ne 0 ]]; then
     workflow_failure_report "${status}" || true
   fi
+}
+
+read_remote_campaign_identity() {
+  resolve_local_python
+  local identity kind purpose cases extra
+  identity="$(remote_cli campaign-status "${RUN_ID}" --no-scheduler \
+    --storage-root "${REMOTE_STORAGE_ROOT}" |
+    "${LOCAL_PYTHON}" -c 'import json, sys
+value = json.load(sys.stdin)
+print("\t".join(("campaign", str(value["campaign_purpose"]), "" if value["cases_per_material"] is None else str(value["cases_per_material"]))))')" ||
+    fail 1 "Could not reconstruct campaign identity for resume."
+  IFS=$'\t' read -r kind purpose cases extra <<< "${identity}"
+  [[ "${kind}" == campaign && -z "${extra:-}" ]] || fail 1 "Malformed campaign identity record."
+  if [[ "${purpose}" == pilot_check ]]; then
+    validate_positive "pilot cases per material" "${cases}"
+    PILOT_CASES_PER_MATERIAL="${cases}"
+  else
+    PILOT_CASES_PER_MATERIAL=""
+  fi
+}
+
+prepare_pilot_check_receipt() {
+  local -a arguments=(prepare-pilot-check "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
+  [[ "${KEEP_CPU_SOURCE}" != true ]] || arguments+=(--keep-cpu-source)
+  local_cli "${arguments[@]}" >/dev/null
+}
+
+cleanup_pilot_staging() {
+  local line kind status removed reclaimed receipt_sha extra
+  line="$(local_cli cleanup-pilot-staging "${RUN_ID}" --confirm --format tsv \
+    --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+    fail 1 "Authorised pilot transfer-staging cleanup failed."
+  IFS=$'\t' read -r kind status removed reclaimed receipt_sha extra <<< "${line}"
+  [[ "${kind}" == pilot-staging-cleanup && "${status}" == complete \
+    && "${removed}" == True && -z "${extra:-}" ]] ||
+    fail 1 "Malformed or incomplete pilot transfer-staging cleanup result."
+  validate_nonnegative "staging reclaimed bytes" "${reclaimed}"
+  validate_digest "${receipt_sha}"
+  PILOT_STAGING_RECLAIMED="${reclaimed}"
+  PILOT_STAGING_CLEANUP_SHA="${receipt_sha}"
+}
+
+record_pilot_cleanup_result() {
+  local -a arguments=(
+    record-pilot-cleanup "${RUN_ID}"
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+    --cpu-bytes-reclaimed "${CPU_BYTES_RECLAIMED}"
+    --transfer-staging-removed
+    --staging-bytes-reclaimed "${PILOT_STAGING_RECLAIMED}"
+    --staging-cleanup-receipt-sha256 "${PILOT_STAGING_CLEANUP_SHA}"
+  )
+  if [[ "${KEEP_CPU_SOURCE}" != true ]]; then
+    validate_digest "${CPU_CLEANUP_RECEIPT_SHA}"
+    arguments+=(
+      --cpu-source-removed
+      --cpu-cleanup-receipt-sha256 "${CPU_CLEANUP_RECEIPT_SHA}"
+    )
+  fi
+  local_cli "${arguments[@]}" >/dev/null
+}
+
+continue_pilot_workflow() {
+  ALL_WORKFLOW_ACTIVE=true
+  trap 'workflow_exit_handler $?' EXIT
+  resolve_local_python
+  resolve_local_storage
+  resolve_remote_layout
+  ALL_STAGE="existing pilot receipt validation"
+  if local_cli validate-pilot-check "${RUN_ID}" --require-cleanup-complete \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
+    local_cli validate-pilot-check "${RUN_ID}" --format summary \
+      --storage-root "${LOCAL_STORAGE_ROOT}"
+    ALL_WORKFLOW_ACTIVE=false
+    trap - EXIT
+    return
+  fi
+  ALL_STAGE="remote pilot terminal monitoring"
+  wait_for_terminal_publication
+  ALL_STAGE="pilot source inventory, transfer, and hash validation"
+  if ! gpu_publication_is_valid; then
+    [[ "${REMOTE_SOURCE_STATE}" != source_cleanup_complete ]] ||
+      fail 1 "CPU source is cleaned but no valid GPU pilot publication exists."
+    collect_campaign
+  else
+    printf 'GPU pilot publication validated and reused for %s.\n' "${RUN_ID}"
+  fi
+  ALL_STAGE="canonical HDF5 and physical/runtime pilot analysis"
+  prepare_pilot_check_receipt
+  ALL_STAGE="empty production-dataset gate bound to pilot evidence"
+  build_datasets
+  ALL_STAGE="terminal pre-cleanup workflow receipt"
+  prepare_all_receipt
+  read_remote_source_status
+  [[ "${REMOTE_SOURCE_ACTIVE}" == False ]] ||
+    fail 1 "cleanup_not_authorized: an active Slurm attempt still owns the CPU pilot source."
+  if [[ "${KEEP_CPU_SOURCE}" == true ]]; then
+    printf 'CPU pilot source retained by --keep-cpu-source.\n'
+    CPU_BYTES_RECLAIMED=0
+    CPU_CLEANUP_RECEIPT_SHA=""
+  else
+    ALL_STAGE="verified CPU pilot source cleanup"
+    confirm_cpu_cleanup
+  fi
+  ALL_STAGE="verified pilot transfer-staging cleanup"
+  cleanup_pilot_staging
+  ALL_STAGE="canonical final pilot cleanup receipt"
+  record_pilot_cleanup_result
+  ALL_STAGE="terminal pilot and workflow receipt validation"
+  local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
+  local_cli validate-pilot-check "${RUN_ID}" --require-cleanup-complete --format summary \
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+  ALL_WORKFLOW_ACTIVE=false
+  trap - EXIT
+}
+
+run_pilot_check() {
+  [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
+    fail 2 "pilot-check does not support --detach, --confirm, or --only-batch."
+  ALL_WORKFLOW_ACTIVE=true
+  trap 'workflow_exit_handler $?' EXIT
+  ALL_STAGE="local exact-commit and campaign validation"
+  resolve_local_commit true
+  resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_pilot_contract
+  resolve_local_storage
+  resolve_configured_resources
+  validate_resources
+  ALL_STAGE="CPU setup and readiness"
+  EXECUTE_SETUP=true
+  setup_cpu
+  preflight_cpu
+  ALL_STAGE="profile mapping validation"
+  if ! local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null 2>&1; then
+    printf 'Transient profile mappings remain unconfirmed; running one retained probe.\n' >&2
+    mapping_probe_cpu "${CAMPAIGN_CONFIG_PATH}" || true
+    fail 2 "Mapping confirmation is required. Review mapping_probe.json, update only explicit profile mappings, commit, and rerun pilot-check."
+  fi
+  ALL_STAGE="six-family static scientific sentinels"
+  local_cli static-sentinels "${PROJECT_DIR}/${STEADY_PRIMARY_CAMPAIGN}" \
+    "${PROJECT_DIR}/${TRANSIENT_PRIMARY_CAMPAIGN}" ||
+    fail 2 "Static scientific sentinels block pilot launch; inspect the sentinel report before rerunning."
+  print_layout
+  printf 'Pilot cases: 6 materials x %s = %s total.\n' \
+    "${PILOT_CASES_PER_MATERIAL}" "$((6 * PILOT_CASES_PER_MATERIAL))"
+  ALL_STAGE="resolved pilot campaign plan"
+  remote_plan_submit plan-campaign
+  ALL_STAGE="pilot campaign launch"
+  launch_campaign
+  ALLOW_REMOTE_RESUME=false
+  continue_pilot_workflow
 }
 
 continue_all_workflow() {
@@ -726,6 +1097,7 @@ run_all() {
   resolve_remote_layout
   resolve_local_storage
   resolve_local_python
+  validate_local_launch_gates
   print_layout
   if [[ "${KEEP_CPU_SOURCE}" == true ]]; then
     printf 'CPU source cleanup after complete success: disabled\n'
@@ -752,8 +1124,13 @@ resume_all() {
   resolve_local_commit false
   resolve_remote_layout
   resolve_local_storage
+  read_remote_campaign_identity
   ALLOW_REMOTE_RESUME=true
-  continue_all_workflow
+  if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+    continue_pilot_workflow
+  else
+    continue_all_workflow
+  fi
 }
 
 (( $# > 0 )) || { usage; exit 2; }
@@ -767,12 +1144,14 @@ EXECUTE_SETUP=false
 CONFIRM_CLEANUP=false
 DETACH=false
 KEEP_CPU_SOURCE=false
+SKIP_EXTREME_FAMILY_OOD=false
 ONLY_BATCH=""
 WALL_TIME=""
 MAX_NODES=""
 CASES_PER_NODE=""
 CORES_PER_CASE=""
 MAX_PARALLEL_CASES=""
+PILOT_CASES_PER_MATERIAL=""
 POSITIONAL=()
 
 while (( $# > 0 )); do
@@ -784,10 +1163,12 @@ while (( $# > 0 )); do
     --confirm) CONFIRM_CLEANUP=true; shift ;;
     --detach) DETACH=true; shift ;;
     --keep-cpu-source) KEEP_CPU_SOURCE=true; shift ;;
+    --skip-extreme-family-ood) SKIP_EXTREME_FAMILY_OOD=true; shift ;;
     --only-batch) (( $# >= 2 )) || fail 2 "--only-batch requires a value."; ONLY_BATCH="$2"; shift 2 ;;
     --wall-time) (( $# >= 2 )) || fail 2 "--wall-time requires a value."; WALL_TIME="$2"; shift 2 ;;
     --max-nodes) (( $# >= 2 )) || fail 2 "--max-nodes requires a value."; MAX_NODES="$2"; shift 2 ;;
     --cases-per-node) (( $# >= 2 )) || fail 2 "--cases-per-node requires a value."; CASES_PER_NODE="$2"; shift 2 ;;
+    --cases-per-material) (( $# >= 2 )) || fail 2 "--cases-per-material requires a value."; PILOT_CASES_PER_MATERIAL="$2"; shift 2 ;;
     --cores-per-case) (( $# >= 2 )) || fail 2 "--cores-per-case requires a value."; CORES_PER_CASE="$2"; shift 2 ;;
     --max-parallel-cases) (( $# >= 2 )) || fail 2 "--max-parallel-cases requires a value."; MAX_PARALLEL_CASES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -797,12 +1178,26 @@ while (( $# > 0 )); do
 done
 
 [[ -z "${REQUESTED_COMMIT}" ]] || validate_commit "${REQUESTED_COMMIT}"
+if [[ "${SUBCOMMAND}" != pilot-check && -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
+  fail 2 "--cases-per-material is supported only by pilot-check."
+fi
+if [[ "${SKIP_EXTREME_FAMILY_OOD}" == true ]]; then
+  [[ "${SUBCOMMAND}" =~ ^(plan|launch|all)$ ]] ||
+    fail 2 "--skip-extreme-family-ood is supported only by plan, launch, and all."
+  [[ -z "${ONLY_BATCH}" ]] ||
+    fail 2 "--skip-extreme-family-ood cannot be combined with --only-batch."
+fi
 
 case "${SUBCOMMAND}" in
   setup-cpu)
     (( ${#POSITIONAL[@]} == 0 )) || fail 2 "setup-cpu accepts no positional arguments."
     [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false && "${CONFIRM_CLEANUP}" == false ]]       || fail 2 "Unsupported setup-cpu option."
     setup_cpu
+    ;;
+  pilot-check)
+    (( ${#POSITIONAL[@]} == 1 )) || fail 2 "pilot-check requires the dedicated transient pilot-check campaign config."
+    CAMPAIGN_ARGUMENT="${POSITIONAL[0]}"
+    run_pilot_check
     ;;
   preflight|plan|launch|all)
     (( ${#POSITIONAL[@]} == 1 )) || fail 2 "${SUBCOMMAND} requires one campaign config."
@@ -822,6 +1217,10 @@ case "${SUBCOMMAND}" in
         ;;
       all) run_all ;;
     esac
+    ;;
+  smoke)
+    (( ${#POSITIONAL[@]} == 0 )) || fail 2 "smoke accepts no campaign positional argument."
+    run_smoke
     ;;
   status)
     (( ${#POSITIONAL[@]} <= 1 )) || fail 2 "status accepts at most one campaign-run ID."

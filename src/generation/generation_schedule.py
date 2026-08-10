@@ -29,6 +29,7 @@ import numpy as np
 from . import generation_config as config_contract
 
 _EVENT_SELECTION_THRESHOLD = 0.5
+_MAX_SCHEDULE_ATTEMPTS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,70 @@ def _schedule_class(active: Mapping[str, bool], *, temperature_amplitude: float,
     return names[0]
 
 
+def _attempt_seed(seed: int, *, attempt: int) -> int:
+    """Return the original seed first, then label-derived retry streams."""
+    if attempt == 1:
+        return seed
+    return config_contract.derive_seed(seed, "schedule_retry", str(attempt))
+
+
+def _candidate_schedule(
+    time: np.ndarray,
+    values: Mapping[str, Any],
+    weights: Mapping[str, float],
+    *,
+    temperature_amplitude: float,
+    humidity_amplitude: float,
+    correlation: float,
+    seeds: Mapping[str, int],
+    attempt: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, bool], dict[str, Any], dict[str, Any], dict[str, int]]:
+    """Realize one complete unclipped schedule candidate from deterministic streams."""
+    attempt_seeds = {name: _attempt_seed(seed, attempt=attempt) for name, seed in seeds.items()}
+    shared_random = np.random.default_rng(attempt_seeds["schedule_shared"])
+    independent_random = np.random.default_rng(attempt_seeds["schedule_independent"])
+    active = _activation(weights, random=shared_random, event_count=int(values["schedule.event_count"]))
+    shared_components, shared_details = _components(time, values, random=shared_random)
+    independent_components, independent_details = _components(time, values, random=independent_random)
+    shared_latent = _compose(shared_components, weights, active)
+    independent_latent = _compose(independent_components, weights, active)
+    humidity_latent = correlation * shared_latent + math.sqrt(max(0.0, 1.0 - correlation**2)) * independent_latent
+    humidity_maximum = float(np.max(np.abs(humidity_latent)))
+    if humidity_maximum > 1.0:
+        humidity_latent /= humidity_maximum
+    temperature = float(values["T_in_base"]) + temperature_amplitude * shared_latent
+    humidity_ratio = float(values["omega_in_base"]) + humidity_amplitude * humidity_latent
+    return temperature, humidity_ratio, active, shared_details, independent_details, attempt_seeds
+
+
+def _feasibility_reason(
+    temperature: np.ndarray,
+    humidity_ratio: np.ndarray,
+    phi_in: np.ndarray,
+    phi_source: np.ndarray,
+    *,
+    ambient_temperature: float,
+    fixed: Mapping[str, Any],
+) -> str | None:
+    """Return the first complete-schedule heater feasibility violation."""
+    arrays = (temperature, humidity_ratio, phi_in, phi_source)
+    if not all(np.isfinite(array).all() for array in arrays):
+        return "derived schedule quantities are not all finite"
+    if np.any((temperature < float(fixed["T_in_min"])) | (temperature > float(fixed["T_in_max"]))):
+        return "T_in_bc violates the configured inlet-temperature envelope"
+    if np.any((humidity_ratio < float(fixed["omega_min"])) | (humidity_ratio > float(fixed["omega_max"]))):
+        return "omega_in_bc violates the selected source-air engineering envelope"
+    if np.any(temperature < ambient_temperature):
+        return "T_in_bc is below T_amb in a heater-only apparatus"
+    if np.any(humidity_ratio <= 0.0):
+        return "omega_in_bc is not strictly positive"
+    if np.any((phi_source <= 0.0) | (phi_source > 1.0)):
+        return "phi_source_air lies outside (0, 1]"
+    if np.any((phi_in < float(fixed["phi_operational_min"])) | (phi_in > float(fixed["phi_operational_max"]))):
+        return "phi_in_bc violates the 0.05-0.85 operating envelope"
+    return None
+
+
 def generate_schedule(
     values: Mapping[str, Any],
     time_contract: Mapping[str, Any],
@@ -237,44 +302,75 @@ def generate_schedule(
     temperature_amplitude = float(values["T_in_amp"])
     humidity_amplitude = float(values["omega_in_amp"])
     correlation = float(values["schedule.corr"])
+    duration_relative = float(values["schedule.event_duration_rel"])
+    width_relative = float(values["schedule.event_width_rel"])
     if temperature_amplitude < 0 or humidity_amplitude < 0 or not -1 <= correlation <= 1:
         msg = "Schedule amplitudes must be non-negative and schedule.corr must lie in [-1, 1]."
         raise ValueError(msg)
-    shared_random = np.random.default_rng(seeds["schedule_shared"])
-    independent_random = np.random.default_rng(seeds["schedule_independent"])
-    active = _activation(weights, random=shared_random, event_count=int(values["schedule.event_count"]))
-    shared_components, shared_details = _components(time, values, random=shared_random)
-    independent_components, independent_details = _components(time, values, random=independent_random)
-    shared_latent = _compose(shared_components, weights, active)
-    independent_latent = _compose(independent_components, weights, active)
-    humidity_latent = correlation * shared_latent + math.sqrt(max(0.0, 1.0 - correlation**2)) * independent_latent
-    humidity_maximum = float(np.max(np.abs(humidity_latent)))
-    if humidity_maximum > 1.0:
-        humidity_latent /= humidity_maximum
-    temperature = float(values["T_in_base"]) + temperature_amplitude * shared_latent
-    humidity_ratio = float(values["omega_in_base"]) + humidity_amplitude * humidity_latent
-    if not np.isfinite(temperature).all() or not np.isfinite(humidity_ratio).all():
-        msg = "Generated schedule contains non-finite values."
+    if duration_relative < 2.0 * width_relative:
+        msg = "Schedule event duration must be at least twice the transition width."
         raise ValueError(msg)
-    if np.any(temperature > float(fixed["T_in_max"])):
-        msg = "Generated inlet temperature exceeds 308.15 K."
-        raise ValueError(msg)
-    if np.any((humidity_ratio < float(fixed["omega_min"])) | (humidity_ratio > float(fixed["omega_max"]))):
-        msg = "Generated inlet humidity ratio violates configured bounds."
-        raise ValueError(msg)
-    relative_humidity = humidity_ratio_to_relative_humidity(
-        humidity_ratio,
-        temperature,
-        pressure=float(fixed["p_ref"]),
-    )
-    if np.any((relative_humidity < float(fixed["phi_clip_min"])) | (relative_humidity > float(fixed["phi_clip_max"]))):
-        msg = "Thermodynamically derived inlet relative humidity violates configured bounds."
-        raise ValueError(msg)
+    ambient_temperature = float(values["T_amb"])
+    rejection_reasons: list[str] = []
+    for acceptance_attempt in range(1, _MAX_SCHEDULE_ATTEMPTS + 1):
+        temperature, humidity_ratio, active, shared_details, independent_details, attempt_seeds = _candidate_schedule(
+            time,
+            values,
+            weights,
+            temperature_amplitude=temperature_amplitude,
+            humidity_amplitude=humidity_amplitude,
+            correlation=correlation,
+            seeds=seeds,
+            attempt=acceptance_attempt,
+        )
+        try:
+            relative_humidity = humidity_ratio_to_relative_humidity(
+                humidity_ratio,
+                temperature,
+                pressure=float(fixed["p_ref"]),
+            )
+            source_relative_humidity = humidity_ratio_to_relative_humidity(
+                humidity_ratio,
+                np.full_like(temperature, ambient_temperature),
+                pressure=float(fixed["p_ref"]),
+            )
+        except ValueError as error:
+            rejection_reasons.append(str(error))
+            continue
+        reason = _feasibility_reason(
+            temperature,
+            humidity_ratio,
+            relative_humidity,
+            source_relative_humidity,
+            ambient_temperature=ambient_temperature,
+            fixed=fixed,
+        )
+        if reason is None:
+            break
+        rejection_reasons.append(reason)
+    else:
+        message = (
+            f"No feasible complete heater-only schedule after {_MAX_SCHEDULE_ATTEMPTS} deterministic attempts; last_reason={rejection_reasons[-1]!r}."
+        )
+        raise ValueError(message)
     values_array = np.column_stack((time, temperature, humidity_ratio, relative_humidity)).astype(np.float64, copy=False)
     reference_temperature = float(np.trapezoid(temperature, time) / (time[-1] - time[0]))
     component_amplitudes = {
         "temperature": {name: temperature_amplitude * weights[name] if active[name] else 0.0 for name in weights},
         "humidity_ratio": {name: humidity_amplitude * weights[name] if active[name] else 0.0 for name in weights},
+    }
+    diagnostics = {
+        "min_T_in_bc": float(np.min(temperature)),
+        "max_T_in_bc": float(np.max(temperature)),
+        "min_omega_in_bc": float(np.min(humidity_ratio)),
+        "max_omega_in_bc": float(np.max(humidity_ratio)),
+        "min_phi_in_bc": float(np.min(relative_humidity)),
+        "max_phi_in_bc": float(np.max(relative_humidity)),
+        "min_phi_source_air": float(np.min(source_relative_humidity)),
+        "max_phi_source_air": float(np.max(source_relative_humidity)),
+        "min_heater_temperature_rise": float(np.min(temperature - ambient_temperature)),
+        "schedule_rejection_count": len(rejection_reasons),
+        "schedule_acceptance_attempt": acceptance_attempt,
     }
     return Schedule(
         values=values_array,
@@ -292,10 +388,17 @@ def generate_schedule(
             "realized_component_amplitudes": component_amplitudes,
             "schedule.corr": correlation,
             "seeds": dict(seeds),
+            "accepted_attempt_seeds": attempt_seeds,
+            "schedule_rejection_reasons": rejection_reasons,
+            **diagnostics,
             "shared_realization": shared_details,
             "independent_realization": independent_details,
             "column_order": ["t", "T_in_bc", "omega_in_bc", "phi_in_bc"],
+            "heater_physics": "humidity_ratio_conserved_across_ambient_air_heater",
+            "source_air_humidity_ratio": "omega_source_air(t)=omega_in_bc(t)",
             "humidity_formula": "phi_in_bc=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_in_bc)",
+            "source_humidity_formula": "phi_source_air=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_amb)",
+            "phi_source_air_usage": "validation_and_provenance_only",
             "humidity_conversion_owner": "generation_schedule",
             "conversion_pressure": {
                 "name": "p_ref",
@@ -304,6 +407,14 @@ def generate_schedule(
                 "owner": "package_fixed",
             },
             "saturation_pressure_formula": "Magnus_610.94_17.625_243.04",
+            "relative_humidity_operational_bounds": [
+                float(fixed["phi_operational_min"]),
+                float(fixed["phi_operational_max"]),
+            ],
+            "oswin_numerical_clip_bounds": [
+                float(fixed["phi_clip_min"]),
+                float(fixed["phi_clip_max"]),
+            ],
             "planned_interval": [float(time[0]), float(time[-1])],
             "units": {
                 "values": {"t": "h", "T_in_bc": "K", "omega_in_bc": "kg/kg", "phi_in_bc": "1"},
@@ -315,6 +426,17 @@ def generate_schedule(
                     "events.width": "h",
                     "events.local_jitter": "h",
                     "planned_interval": "h",
+                    "min_T_in_bc": "K",
+                    "max_T_in_bc": "K",
+                    "min_omega_in_bc": "kg/kg",
+                    "max_omega_in_bc": "kg/kg",
+                    "min_phi_in_bc": "1",
+                    "max_phi_in_bc": "1",
+                    "min_phi_source_air": "1",
+                    "max_phi_source_air": "1",
+                    "min_heater_temperature_rise": "K",
+                    "schedule_rejection_count": "1",
+                    "schedule_acceptance_attempt": "1",
                 },
             },
         },

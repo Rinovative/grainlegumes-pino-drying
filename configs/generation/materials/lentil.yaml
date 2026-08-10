@@ -1,559 +1,325 @@
 schema_kind: generation_material
 schema_version: 1
 material_family: lentil
-executable: false
-taxonomy:
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+material_scope:
   common_name: Lentil
-  species: null
-  market_class: null
-  cultivar: null
-  specificity_status: unresolved
-product_form:
-  whole_or_split: whole
-  shell_state: null
-  skin_or_seed_coat_state: null
-  description: Whole lentil; market class, cultivar, and seed-coat condition unresolved.
-  specificity_status: unresolved
-parameter_values:
-  initial_moisture_bounds:
-    lower: null
-    upper: null
-  kappa_mean:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  kappa_cv:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.coarse_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.coarse_weight:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_ani_x:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.fine_ani_y:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.structure.cross_scale_corr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.amplitude:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.granularity:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  bed.perturbations.sign_bias:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.max_ratio:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.exponent:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.anisotropy.strength:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.orientation.jitter:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  permeability.orientation.smooth_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.anchor_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.smooth_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  porosity.texture_amp:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.mean_db:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.amplitude_db:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.coarse_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_len_rel:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.coarse_weight:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_ani_x:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.fine_ani_y:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  initial_moisture.structure.cross_scale_corr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  rho_bu_dry_ref:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
+  species: Lens culinaris Medik.
+  market_class: red_or_brown_dry_lentil
+  product_form: whole_seed
+  coat_or_hull_state: intact
+  description: Whole mature dry red or brown lentil seed
+permeability:
+  nominal: 7.88e-09
+  support:
+    lower: 5.0e-09
+    upper: 1.3e-08
+  transform: log
+  distribution: uniform_in_log_space
+  ood_supports:
+  - lower: 1.8e-09
+    upper: 3.5e-09
+  - lower: 2.0e-08
+    upper: 3.8e-08
+  provenance:
+    source_refs:
+    - ba
+    status: project_baseline
+    derivation:
+      kind: selected_project_baseline
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Whole-particle packed-bed mean permeability; fill-method dependence included in range.
+    confidence: medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+      temperature: generator design; not a material property
+      humidity_or_aw: generator design; not a material property
+      packing_or_flow_regime: Only for packing bands in each complete density record; generated mean eps must pass the material
+        band.
+packing_porosity_mean_support:
+  lower: 0.29
+  upper: 0.36
+  unit: '1'
+  provenance:
+    source_refs:
+    - ba
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    confidence: medium_high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+      packing_or_flow_regime: Project real mixed-lentil bed; dry bulk density reconstructed consistently from particle density,
+        porosity and 20% wb moisture.
+density_calibration:
+  record_id: lentil_density_calibration_v1
+  reference:
+    rho_bu_dry_ref: 630.0
+    eps_bed_cal_ref: 0.3125
+    inferred_rho_particle_dry: 916.363636
+  rho_bu_dry_ref_support:
+    lower: 590.0
+    upper: 680.0
+    transform: log
+  ood_records:
+  - record_id: loose_low_density
+    rho_bu_dry_ref: 475.0
+    eps_bed_cal_ref: 0.48164683
+    supplied_status: calibration_prior
+    supplied_derivation: same inferred dry particle density as reference; alternate complete packing record
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - ba
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    confidence: medium_high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+      packing_or_flow_regime: Project real mixed-lentil bed; dry bulk density reconstructed consistently from particle density,
+        porosity and 20% wb moisture.
+thermal_properties:
   k_gr:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
+    nominal: 0.364
+    support:
+      lower: 0.3
+      upper: 0.44
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 0.2
+      upper: 0.26
+    - lower: 0.52
+      upper: 0.65
+    provenance:
+      source_refs:
+      - matouk_thermal
+      status: literature_fit
+      derivation:
+        kind: refitted_to_binding_convention
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Dry granular-phase conductivity used inside the binding Maxwell-Eucken relation.
+      confidence: medium_high
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry red or brown lentil seed
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
   cp_gr_dry:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  r_surf_0:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  r_int_surf:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  f_surf:
-    lower: null
-    upper: null
-    ood:
-      lower: null
-      upper: null
-  eps_bed_cal_ref:
-    value: null
-  X_target_wb:
-    value: null
-  oswin:
-    sets: null
-    ood_sets: null
-evidence:
-  kappa_mean:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  kappa_cv:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.coarse_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.coarse_weight:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_ani_x:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.fine_ani_y:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.structure.cross_scale_corr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.amplitude:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.granularity:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  bed.perturbations.sign_bias:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.max_ratio:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.exponent:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.anisotropy.strength:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.orientation.jitter:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  permeability.orientation.smooth_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.anchor_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.smooth_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  porosity.texture_amp:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.mean_db:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.amplitude_db:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.coarse_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_len_rel:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.coarse_weight:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_ani_x:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.fine_ani_y:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture.structure.cross_scale_corr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  rho_bu_dry_ref:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  k_gr:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  cp_gr_dry:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  r_surf_0:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  r_int_surf:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  f_surf:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  eps_bed_cal_ref:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  X_target_wb:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  oswin:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
-  initial_moisture_bounds:
-    source: null
-    evidence_type: unresolved
-    confidence: unresolved
-    temperature_range: null
-    humidity_range: null
-    cultivar_or_market_class: null
-    product_form: null
-    status: unresolved
+    nominal: 2100.0
+    support:
+      lower: 1800.0
+      upper: 2300.0
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 1300.0
+      upper: 1600.0
+    - lower: 2600.0
+      upper: 3000.0
+    provenance:
+      source_refs:
+      - matouk_thermal
+      status: literature_fit
+      derivation:
+        kind: refitted_to_binding_convention
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Dry-solid specific heat; water contribution is added deterministically as X_db*cp_w.
+      confidence: medium_high
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry red or brown lentil seed
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
+initial_moisture:
+  mean_db:
+    nominal: 0.25
+    support:
+      lower: 0.1904761904761905
+      upper: 0.3157894736842105
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.36
+      upper: 0.45
+    provenance:
+      source_refs:
+      - ba
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope
+          around project or product-compatible drying evidence, not a market-target transfer.
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry red or brown lentil seed
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  amplitude_db:
+    nominal: 0.02
+    support:
+      lower: 0.005
+      upper: 0.04
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.055
+      upper: 0.08
+    provenance:
+      source_refs:
+      - pino_airflow_project
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Synthetic spatial maximum deviation in dry basis; constrained by positivity and target separation.
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry red or brown lentil seed
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  field_support:
+    lower: 0.1904761904761905
+    upper: 0.3157894736842105
+    unit: kg/kg
+    provenance:
+      source_refs:
+      - ba
+      status: derived
+      derivation:
+        kind: derived_from_configured_value
+        origin: supplied_by_handoff
+        verification: mathematically_reproduced
+        description: X_db=X_wb/(1-X_wb)
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Whole mature dry red or brown lentil seed
+        moisture_basis: kg water/kg dry solids
+  field_constraint: min(X_0_db_field) >= 0.14636364 kg/kg
+target_moisture:
+  selected_simulation_target_wb: 0.12
+  selected_target_db: 0.13636363636363635
+  market_acceptance_moisture_wb: 0.135
+  safe_storage_moisture_wb: 0.11894
+  provenance:
+    source_refs:
+    - swiss_crops
+    status: derived
+    derivation:
+      kind: derived_from_configured_value
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Selected simulation stop target; market, safe-storage and selected values remain separate.
+    confidence: high_for_market_medium_high_for_isotherm_derived_safe_storage
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+oswin:
+  record_id: lentil_production_oswin_v1
+  components:
+    A_osw: 12.06202053
+    B_osw: -0.0573838
+    C_osw: 0.34338283
+  units:
+    A_osw: '1'
+    B_osw: 1/K
+    C_osw: '1'
+  equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or per degree Celsius increment
+  provenance:
+    source_refs:
+    - lentil_oswin_source
+    status: literature_fit
+    derivation:
+      kind: refitted_to_binding_convention
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: 'Re-fit of 4637 reconstructed source-surface points: RMSE 0.6542 percentage points db, MRE 3.867%, R2 0.96619.
+        These statistics were calculated here, not reported by the source.'
+    confidence: high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted by 0.01
+      equation_or_method: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+      supplied_scope: 5-30 degC, RH 0.27-0.90, approximately 8-22% db; pooled equal-weight source-model surfaces of three
+        whole red-lentil cultivars
+two_compartment_kinetics:
+  record_id: lentil_two_compartment_kinetics_v1
+  components:
+    r_surf_0:
+      nominal: 1.0e-05
+      support:
+        lower: 5.0e-06
+        upper: 2.0e-05
+      transform: log
+    r_int_surf:
+      nominal: 0.2
+      support:
+        lower: 0.08
+        upper: 0.35
+      transform: log
+    f_surf:
+      nominal: 0.5
+      support:
+        lower: 0.3
+        upper: 0.65
+      transform: logit
+  ood_records:
+  - record_id: slow_internal_limited
+    r_surf_0: 2.5e-06
+    r_int_surf: 0.1
+    f_surf: 0.35
+  - record_id: fast_surface_exposed
+    r_surf_0: 3.5000000000000004e-05
+    r_int_surf: 0.30000000000000004
+    f_surf: 0.65
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - lentil_drying
+    status: calibration_prior
+    derivation:
+      kind: selected_calibration_prior
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim experimental
+        validation
+    confidence: low_until_calibrated
+    validity:
+      material_scope_ref: material_scope
+      product_form: Whole mature dry red or brown lentil seed
+      supplied_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
+        state; T(t) if available
+      transfer_limit: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim
+        experimental validation

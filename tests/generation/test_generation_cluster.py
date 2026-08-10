@@ -7,6 +7,7 @@ import json
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +16,39 @@ import pytest
 from src import generation
 from src.generation.cli import cli_generation
 
+_SYNTHETIC_CASE_COUNT = 5
+
+
+def _multi_batch_campaign(campaign: Any) -> Any:
+    """Return a small in-memory campaign for scheduler-concurrency mechanics."""
+    base = campaign.batches[0]
+    first = replace(
+        base,
+        batch_name=f"{base.batch_name}_first",
+        batch_id=f"{base.batch_id}_first",
+        case_indices=(1, 2),
+    )
+    second_indices = (3, 4, 5)
+    second = replace(
+        base,
+        batch_name=f"{base.batch_name}_second",
+        batch_id=f"{base.batch_id}_second",
+        case_indices=second_indices,
+        assignments={index: base.assignments[1 if index % 2 else 2] for index in second_indices},
+    )
+    return replace(
+        campaign,
+        total_case_count=_SYNTHETIC_CASE_COUNT,
+        batches=(first, second),
+    )
+
 
 def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory: Any) -> None:
     """Protect hard caps and one campaign submission instead of per-batch pools."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        material_families=generation.materials.MATERIAL_FAMILIES,
-    )
-    campaign = generation.config.load_campaign_config(config_path)
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
     remaining = sum(len(batch.case_indices) for batch in campaign.batches)
-    assert remaining == 17
+    assert remaining == _SYNTHETIC_CASE_COUNT
     plan = generation.cluster.build_resource_plan(
         max_nodes=2,
         cases_per_node=2,
@@ -74,14 +98,14 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
 ) -> None:
     """Protect the campaign-global slot pool when many subbatches share a worker."""
     config_path, _template = generation_config_factory()
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
     plan = generation.cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=4,
         cores_per_case=1,
         max_parallel_cases=2,
         cores_per_node=32,
-        remaining_cases=5,
+        remaining_cases=_SYNTHETIC_CASE_COUNT,
     )
     tracker = {"active": 0, "maximum": 0, "calls": 0}
     lock = threading.Lock()
@@ -110,11 +134,15 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
         storage_root=tmp_path / "storage",
         work_root=tmp_path / "work",
     )
-    assert tracker == {"active": 0, "maximum": 2, "calls": 5}
-    assert len(result.completed_tasks) == 5
+    assert tracker == {
+        "active": 0,
+        "maximum": 2,
+        "calls": _SYNTHETIC_CASE_COUNT,
+    }
+    assert len(result.completed_tasks) == _SYNTHETIC_CASE_COUNT
     assert {task.batch_name for task in result.completed_tasks} == {
-        "transient_drying__lentil__natural",
-        "transient_drying__lentil__parameter_ood",
+        "transient_drying__lentil__natural_first",
+        "transient_drying__lentil__natural_second",
     }
 
 
@@ -204,6 +232,7 @@ def test_submit_manifest_and_fake_scheduler_status(
         allocated_node="node-a",
         work_directory=tmp_path / "failed-work",
         storage_root=tmp_path / "storage",
+        failure_stage="solver",
     )
     status = generation.campaign_runtime.campaign_status(
         manifest["campaign_run_id"],

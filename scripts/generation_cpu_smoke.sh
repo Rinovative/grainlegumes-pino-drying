@@ -31,8 +31,8 @@ if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
   printf 'Generation CPU venv is missing: %s\n' "${GENERATION_CPU_VENV}" >&2
   exit 2
 fi
-if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready ]]; then
-  printf 'Preflight mode must be environment-only or production-ready.\n' >&2
+if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready && "${PREFLIGHT_MODE}" != mapping-probe ]]; then
+  printf 'Mode must be environment-only, production-ready, or mapping-probe.\n' >&2
   exit 2
 fi
 
@@ -75,24 +75,40 @@ cleanup_probe_root() {
 trap cleanup_probe_root EXIT
 
 cd "${REPOSITORY_ROOT}"
-COMMAND=(
-  "${GENERATION_CPU_VENV}/bin/python"
-  -m src.generation.cli.cli_generation
-  preflight "${CAMPAIGN_CONFIG}"
-  --storage-root "${STORAGE_ROOT}"
-  --work-root "${PROBE_ROOT}"
-  --venv-path "${GENERATION_CPU_VENV}"
-  --max-nodes "${MAX_NODES}"
-  --cases-per-node "${CASES_PER_NODE}"
-  --cores-per-case "${CORES_PER_CASE}"
-  --max-parallel-cases "${MAX_PARALLEL_CASES}"
-  --cores-per-node "${CORES_PER_NODE}"
-)
-if [[ "${ONLY_BATCH}" != - ]]; then
-  COMMAND+=(--only-batch "${ONLY_BATCH}")
+if [[ "${PREFLIGHT_MODE}" == mapping-probe ]]; then
+  COMMAND=(
+    "${GENERATION_CPU_VENV}/bin/python"
+    -m src.generation.cli.cli_generation
+    mapping-probe "${CAMPAIGN_CONFIG}"
+    --storage-root "${STORAGE_ROOT}"
+    --work-root "${PROBE_ROOT}"
+    --cores-per-case "${CORES_PER_CASE}"
+  )
+  if [[ "${ONLY_BATCH}" != - ]]; then
+    COMMAND+=(--only-batch "${ONLY_BATCH}")
+  fi
+  "${COMMAND[@]}"
+  printf 'Native COMSOL mapping probe completed on %s.\n' "$(hostname)"
+else
+  COMMAND=(
+    "${GENERATION_CPU_VENV}/bin/python"
+    -m src.generation.cli.cli_generation
+    preflight "${CAMPAIGN_CONFIG}"
+    --storage-root "${STORAGE_ROOT}"
+    --work-root "${PROBE_ROOT}"
+    --venv-path "${GENERATION_CPU_VENV}"
+    --max-nodes "${MAX_NODES}"
+    --cases-per-node "${CASES_PER_NODE}"
+    --cores-per-case "${CORES_PER_CASE}"
+    --max-parallel-cases "${MAX_PARALLEL_CASES}"
+    --cores-per-node "${CORES_PER_NODE}"
+  )
+  if [[ "${ONLY_BATCH}" != - ]]; then
+    COMMAND+=(--only-batch "${ONLY_BATCH}")
+  fi
+  if [[ "${PREFLIGHT_MODE}" == environment-only ]]; then
+    COMMAND+=(--environment-only)
+  fi
+  "${COMMAND[@]}"
+  printf 'Native CPU preflight completed on %s.\n' "$(hostname)"
 fi
-if [[ "${PREFLIGHT_MODE}" == environment-only ]]; then
-  COMMAND+=(--environment-only)
-fi
-"${COMMAND[@]}"
-printf 'Native CPU preflight completed on %s.\n' "$(hostname)"

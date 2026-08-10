@@ -80,7 +80,7 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     work = tmp_path / "node work"
     assert report["status"] == "environment_ready_production_blocked"
     assert report["production_configuration_ready"] is False
-    assert "non-executable" in report["production_configuration_blocker"]
+    assert "unconfirmed required export mappings" in report["production_configuration_blocker"]
     assert report["production_solve_started"] is False
     assert report["resource_plan"] == {
         "max_nodes": 1,
@@ -88,7 +88,7 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
         "cores_per_case": 16,
         "max_parallel_cases": 2,
         "cores_per_node": 32,
-        "effective_parallel_cases": 1,
+        "effective_parallel_cases": 2,
         "effective_nodes": 1,
     }
     assert report["path_cleanup_probe"]["probe_removed"] is True
@@ -164,14 +164,14 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
         require_executable=False,
     )
     execution = copy.deepcopy(campaign.execution_values)
-    execution["runtime"]["module_initialization"] = ["module load Python/3.11"]
+    execution["site"]["python_module"] = "Python/3.11"
     wrong = replace(campaign, execution_values=execution)
     monkeypatch.setattr(
         generation.preflight.config_service,
         "load_campaign_config",
         lambda *_args, **_kwargs: wrong,
     )
-    with pytest.raises(ValueError, match=r"exactly Python/3[.]10 and Comsol/v6[.]4"):
+    with pytest.raises(ValueError, match="native ICE contract"):
         generation.preflight.run_cpu_preflight(
             _CAMPAIGN,
             only_batch=None,

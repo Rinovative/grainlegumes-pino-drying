@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from src import common
 
 from . import generation_campaign_runtime as campaign_runtime
+from . import generation_config as config_service
+from . import generation_pilot as pilot_service
 from . import generation_workspace as workspace_service
 
 if TYPE_CHECKING:
@@ -150,14 +152,17 @@ def _package_runtime_evidence(
 
     manifest = package_service.load_package_manifest(dataset_id, storage_root=storage_root)
     inspection = package_service.inspect_dataset_package(dataset_id, storage_root=storage_root)
-    membership = "train" if manifest["evaluation_regime"] == "id" else None
-    smoke = package_service.smoke_dataset_package(
-        dataset_id,
-        storage_root=storage_root,
-        membership=membership,
-        num_workers=0,
-        hdf5_cache_size=1,
-    )
+    membership = "train" if manifest["evaluation_regime"] == "id" and manifest["campaign_purpose"] == "family_generalization" else None
+    smoke = {
+        f"workers_{num_workers}": package_service.smoke_dataset_package(
+            dataset_id,
+            storage_root=storage_root,
+            membership=membership,
+            num_workers=num_workers,
+            hdf5_cache_size=1,
+        )
+        for num_workers in (0, 2)
+    }
     return manifest, inspection, smoke
 
 
@@ -269,9 +274,16 @@ def validate_dataset_packages_receipt(
         "selected_batch_ids",
         "declared_package_count",
         "transfer_receipt_sha256",
+        "pilot_pre_cleanup_receipt_sha256",
         "packages",
     }
     packages = receipt.get("packages")
+    pilot_pre_cleanup_sha256 = None
+    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+        pilot_service.validate_pilot_pre_cleanup(run_id, storage_root=storage)
+        pilot_pre_cleanup_sha256 = common.serialization.file_sha256(
+            pilot_service.pilot_check_directory(run_id, storage_root=storage) / pilot_service.PILOT_PRE_CLEANUP_FILENAME
+        )
     if (
         set(receipt) != required
         or receipt.get("schema_kind") != DATASET_RECEIPT_SCHEMA_KIND
@@ -284,6 +296,7 @@ def validate_dataset_packages_receipt(
         or receipt.get("selected_batch_ids") != [batch["batch_id"] for batch in terminal["batches"]]
         or receipt.get("declared_package_count") != len(campaign.dataset_packages)
         or receipt.get("transfer_receipt_sha256") != common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage))
+        or receipt.get("pilot_pre_cleanup_receipt_sha256") != pilot_pre_cleanup_sha256
         or not isinstance(packages, list)
         or len(packages) != len(campaign.dataset_packages)
     ):
@@ -318,6 +331,16 @@ def build_campaign_datasets(
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         if receipt_path.exists():
             return validate_dataset_packages_receipt(run_id, storage_root=storage)
+        pilot_pre_cleanup_sha256 = None
+        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+            pilot_service.validate_pilot_pre_cleanup(
+                run_id,
+                storage_root=storage,
+                require_live_evidence=True,
+            )
+            pilot_pre_cleanup_sha256 = common.serialization.file_sha256(
+                pilot_service.pilot_check_directory(run_id, storage_root=storage) / pilot_service.PILOT_PRE_CLEANUP_FILENAME
+            )
         results = package_service.build_campaign_packages(campaign, storage_root=storage)
         package_records = [_package_record(result, storage_root=storage) for result in results]
         receipt = {
@@ -332,6 +355,7 @@ def build_campaign_datasets(
             "selected_batch_ids": [batch["batch_id"] for batch in terminal["batches"]],
             "declared_package_count": len(campaign.dataset_packages),
             "transfer_receipt_sha256": common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage)),
+            "pilot_pre_cleanup_receipt_sha256": pilot_pre_cleanup_sha256,
             "packages": package_records,
         }
         common.serialization.atomic_write_json(receipt_path, receipt)

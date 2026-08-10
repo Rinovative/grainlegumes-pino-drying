@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue] -- SciPy typing omits the public export
+from scipy.stats import beta as beta_distribution
 from scipy.stats import qmc
 
 from src import common
@@ -129,20 +130,48 @@ def _array_sha256(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def build_sampling_plan(*, registry: Mapping[str, Mapping[str, Any]], case_count: int, seed_base: int, method: str) -> dict[str, dict[str, Any]]:
-    """Build serializable independent design and permutation provenance."""
+def build_sampling_plan(
+    *,
+    registry: Mapping[str, Mapping[str, Any]],
+    case_count: int,
+    seed_base: int,
+    method: str,
+    blocks: tuple[str, ...],
+    block_seed_bases: Mapping[str, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build serializable designs for only the profile-active blocks."""
+    dimensions = materials.sampling_block_dimensions(registry, blocks=blocks)
+    overrides = {} if block_seed_bases is None else dict(block_seed_bases)
+    unknown_overrides = sorted(set(overrides).difference(blocks))
+    if unknown_overrides:
+        message = f"Sampling seed overrides target inactive blocks {unknown_overrides}."
+        raise ValueError(message)
     plan: dict[str, dict[str, Any]] = {}
-    dimensions = materials.sampling_block_dimensions(registry)
-    for block, parameters in materials.SAMPLING_BLOCKS.items():
+    for block in blocks:
+        parameters = materials.SAMPLING_BLOCKS[block]
         dimension = dimensions[block]
-        design_seed = _seed(seed_base, "sampling_block", block, "design")
-        permutation_seed = _seed(seed_base, "sampling_block", block, "permutation")
+        paired = block in overrides
+        block_seed_base = overrides.get(block, seed_base)
+        namespace = "paired_equivalence_block" if paired else "sampling_block"
+        design_seed = _seed(block_seed_base, namespace, block, "design")
+        permutation_seed = _seed(
+            block_seed_base,
+            namespace,
+            block,
+            "permutation",
+        )
         permutation = np.random.default_rng(permutation_seed).permutation(case_count).astype(np.int64)
-        design = unit_design(method, count=case_count, dimensions=dimension, seed=design_seed)
+        design = unit_design(
+            method,
+            count=case_count,
+            dimensions=dimension,
+            seed=design_seed,
+        )
         plan[block] = {
             "label": block,
             "parameters": list(parameters),
             "effective_dimension": dimension,
+            "seed_origin": ("paired_equivalence" if paired else "profile_batch"),
             "design_seed": design_seed,
             "design_sha256": _array_sha256(design),
             "permutation_seed": permutation_seed,
@@ -152,9 +181,8 @@ def build_sampling_plan(*, registry: Mapping[str, Mapping[str, Any]], case_count
     return plan
 
 
-def _interval_value(entry: Mapping[str, Any], coordinate: float, *, use_ood: bool) -> float:
-    """Map one unit coordinate through a registry-owned physical transform."""
-    bounds = entry["ood"] if use_ood else entry
+def _interval_value(entry: Mapping[str, Any], coordinate: float, *, bounds: Mapping[str, Any]) -> float:
+    """Map one unit coordinate through a selected registry-owned interval."""
     lower = float(bounds["lower"])
     upper = float(bounds["upper"])
     transform = str(entry["transform"])
@@ -173,22 +201,215 @@ def _interval_value(entry: Mapping[str, Any], coordinate: float, *, use_ood: boo
     raise ValueError(msg)
 
 
-def _integer_value(entry: Mapping[str, Any], coordinate: float, *, use_ood: bool) -> int:
-    """Map one unit coordinate onto an inclusive integer interval."""
-    bounds = entry["ood"] if use_ood else entry
+def _integer_value(coordinate: float, *, bounds: Mapping[str, Any]) -> int:
+    """Map one unit coordinate onto a selected inclusive integer interval."""
     lower = int(bounds["lower"])
     upper = int(bounds["upper"])
     width = upper - lower + 1
     return lower + min(math.floor(coordinate * width), width - 1)
 
 
-def _simplex_value(entry: Mapping[str, Any], coordinates: np.ndarray, *, ood_index: int | None) -> dict[str, float]:
-    """Map n-1 unit coordinates to one complete n-component simplex vector."""
+def _selected_interval(
+    name: str,
+    entry: Mapping[str, Any],
+    *,
+    use_ood: bool,
+    seed_base: int,
+    case_index: int,
+) -> tuple[Mapping[str, Any], dict[str, Any] | None]:
+    """Select one deterministic scalar OOD tail and report its separation."""
+    if not use_ood:
+        return entry, None
+    intervals = entry.get("ood", [])
+    if not intervals:
+        msg = f"Selected scalar OOD unit {name!r} has no configured tails."
+        raise ValueError(msg)
+    index = _seed(seed_base, "scalar_ood_tail", name, str(case_index)) % len(intervals)
+    bounds = intervals[index]
+    transform = str(entry.get("transform", "linear"))
+    id_lower = registry_service.transformed_coordinate(float(entry["lower"]), entry)
+    id_upper = registry_service.transformed_coordinate(float(entry["upper"]), entry)
+    tail_lower = registry_service.transformed_coordinate(float(bounds["lower"]), entry)
+    tail_upper = registry_service.transformed_coordinate(float(bounds["upper"]), entry)
+    gap = id_lower - tail_upper if float(bounds["upper"]) < float(entry["lower"]) else tail_lower - id_upper
+    id_width = id_upper - id_lower
+    return bounds, {
+        "selection_kind": "scalar_interval",
+        "tail_id": f"{name}__tail_{index + 1}",
+        "tail_index": index,
+        "transform": transform,
+        "id_interval": [float(entry["lower"]), float(entry["upper"])],
+        "ood_interval": [float(bounds["lower"]), float(bounds["upper"])],
+        "transformed_gap": gap,
+        "transform_space_distance": gap,
+        "transformed_gap_fraction": gap / id_width,
+        "transformed_width_fraction": (tail_upper - tail_lower) / id_width,
+        "hard_boundary": bool(bounds.get("hard_boundary", False)),
+    }
+
+
+def _remap_interval(
+    entry: Mapping[str, Any],
+    coordinate: float,
+    *,
+    lower: float,
+    upper: float,
+    label: str,
+) -> float:
+    """Map one existing DOE coordinate through a non-empty conditional interval."""
+    if lower > upper:
+        msg = f"Conditional support for {label!r} is empty: lower={lower}, upper={upper}."
+        raise ValueError(msg)
+    return _interval_value(entry, coordinate, bounds={"lower": lower, "upper": upper})
+
+
+def _condition_operation_values(
+    values: dict[str, Any],
+    *,
+    registry: Mapping[str, Mapping[str, Any]],
+    coordinates: Mapping[str, float],
+    bounds: Mapping[str, Mapping[str, Any]],
+    fixed: Mapping[str, Any],
+) -> None:
+    """Enforce joint schedule support without clipping generated schedules."""
+    for base_name, amplitude_name, minimum_name, maximum_name in (
+        ("T_in_base", "T_in_amp", "T_in_min", "T_in_max"),
+        ("omega_in_base", "omega_in_amp", "omega_min", "omega_max"),
+    ):
+        base_bounds = bounds[base_name]
+        amplitude_bounds = bounds[amplitude_name]
+        amplitude_lower = float(amplitude_bounds["lower"])
+        operational_lower = float(fixed[minimum_name])
+        operational_upper = float(fixed[maximum_name])
+        base_lower = max(float(base_bounds["lower"]), operational_lower + amplitude_lower)
+        base_upper = min(float(base_bounds["upper"]), operational_upper - amplitude_lower)
+        base = _remap_interval(
+            registry[base_name],
+            coordinates[base_name],
+            lower=base_lower,
+            upper=base_upper,
+            label=base_name,
+        )
+        amplitude_upper = min(
+            float(amplitude_bounds["upper"]),
+            base - operational_lower,
+            operational_upper - base,
+        )
+        amplitude = _remap_interval(
+            registry[amplitude_name],
+            coordinates[amplitude_name],
+            lower=amplitude_lower,
+            upper=amplitude_upper,
+            label=amplitude_name,
+        )
+        values[base_name] = base
+        values[amplitude_name] = amplitude
+
+    duration_name = "schedule.event_duration_rel"
+    width_name = "schedule.event_width_rel"
+    duration_bounds = bounds[duration_name]
+    width_bounds = bounds[width_name]
+    width_lower = float(width_bounds["lower"])
+    duration_lower = max(float(duration_bounds["lower"]), 2.0 * width_lower)
+    duration = _remap_interval(
+        registry[duration_name],
+        coordinates[duration_name],
+        lower=duration_lower,
+        upper=float(duration_bounds["upper"]),
+        label=duration_name,
+    )
+    width = _remap_interval(
+        registry[width_name],
+        coordinates[width_name],
+        lower=width_lower,
+        upper=min(float(width_bounds["upper"]), 0.5 * duration),
+        label=width_name,
+    )
+    values[duration_name] = duration
+    values[width_name] = width
+
+
+def _condition_initial_moisture_values(
+    values: dict[str, Any],
+    *,
+    registry: Mapping[str, Mapping[str, Any]],
+    coordinates: Mapping[str, float],
+    bounds: Mapping[str, Mapping[str, Any]],
+    family_bounds: Mapping[str, float],
+    field_constraint: Mapping[str, Any],
+    natural_support_departure_allowed: bool,
+) -> None:
+    """Enforce the supplied natural or high-tail field guard without clipping."""
+    mean_name = "initial_moisture.mean_db"
+    amplitude_name = "initial_moisture.amplitude_db"
+    mean_bounds = bounds[mean_name]
+    amplitude_bounds = bounds[amplitude_name]
+    amplitude_lower = float(amplitude_bounds["lower"])
+    field_upper: float | None
+    if natural_support_departure_allowed:
+        field_lower = float(field_constraint["minimum_db"])
+        field_upper = None
+        mean_upper = float(mean_bounds["upper"])
+    else:
+        field_lower = float(family_bounds["lower"])
+        field_upper = float(family_bounds["upper"])
+        mean_upper = min(float(mean_bounds["upper"]), field_upper - amplitude_lower)
+    mean = _remap_interval(
+        registry[mean_name],
+        coordinates[mean_name],
+        lower=max(float(mean_bounds["lower"]), field_lower + amplitude_lower),
+        upper=mean_upper,
+        label=mean_name,
+    )
+    if natural_support_departure_allowed:
+        amplitude_upper = min(float(amplitude_bounds["upper"]), mean - field_lower)
+    else:
+        if field_upper is None:
+            message = "Natural initial-moisture support requires a finite upper bound."
+            raise RuntimeError(message)
+        amplitude_upper = min(float(amplitude_bounds["upper"]), mean - field_lower, field_upper - mean)
+    amplitude = _remap_interval(
+        registry[amplitude_name],
+        coordinates[amplitude_name],
+        lower=amplitude_lower,
+        upper=amplitude_upper,
+        label=amplitude_name,
+    )
+    values[mean_name] = mean
+    values[amplitude_name] = amplitude
+
+
+def _simplex_value(
+    entry: Mapping[str, Any],
+    coordinates: np.ndarray,
+    *,
+    ood_index: int | None,
+    seed: int,
+) -> tuple[dict[str, float], float | None]:
+    """Map two coordinates through the binding truncated Dirichlet simplex."""
     components = tuple(entry["components"])
-    boundaries = np.concatenate(([0.0], np.sort(coordinates), [1.0]))
-    id_weights = np.diff(boundaries)
+    alpha = np.asarray(entry["alpha"], dtype=np.float64)
+    clipped = np.clip(np.asarray(coordinates, dtype=np.float64), np.finfo(np.float64).eps, 1.0 - np.finfo(np.float64).eps)
+    first = float(beta_distribution.ppf(clipped[0], alpha[0], np.sum(alpha[1:])))
+    second_fraction = float(beta_distribution.ppf(clipped[1], alpha[1], alpha[2]))
+    id_weights = np.asarray(
+        [first, (1.0 - first) * second_fraction, (1.0 - first) * (1.0 - second_fraction)],
+        dtype=np.float64,
+    )
+    minimum = float(entry["minimum_each"])
+    maximum = float(entry["maximum_each"])
+    if np.any((id_weights < minimum) | (id_weights > maximum)):
+        random = np.random.default_rng(seed)
+        for _ in range(10000):
+            candidate = random.dirichlet(alpha)
+            if np.all((candidate >= minimum) & (candidate <= maximum)):
+                id_weights = candidate
+                break
+        else:
+            msg = "Could not draw a feasible truncated Dirichlet simplex vector."
+            raise RuntimeError(msg)
     if ood_index is None:
-        return {name: float(id_weights[index]) for index, name in enumerate(components)}
+        return ({name: float(id_weights[index]) for index, name in enumerate(components)}, None)
     values = entry.get("ood_values", [])
     if not values:
         msg = "Selected simplex OOD unit has no configured OOD vector."
@@ -199,7 +420,7 @@ def _simplex_value(entry: Mapping[str, Any], coordinates: np.ndarray, *, ood_ind
     if not math.isfinite(gap) or gap <= 0.0:
         msg = "Selected simplex OOD vector has no simplex-coordinate separation from its ID block row."
         raise ValueError(msg)
-    return selected
+    return selected, gap
 
 
 def _select_coupled(
@@ -211,10 +432,10 @@ def _select_coupled(
     use_ood: bool,
 ) -> dict[str, Any]:
     """Select one complete coupled record from a label-derived stream."""
-    kind = str(entry["kind"])
-    primary = "pairs" if kind == "paired_parameter_set" else "sets"
-    ood_key = "ood_pairs" if kind == "paired_parameter_set" else "ood_sets"
-    candidates = entry.get(ood_key, []) if use_ood else entry[primary]
+    if entry["kind"] != "parameter_set":
+        message = f"Coupled selection {name!r} must be one parameter_set."
+        raise ValueError(message)
+    candidates = entry.get("ood_sets", []) if use_ood else entry["sets"]
     if not candidates:
         msg = f"Selected coupled unit {name!r} has no {'OOD' if use_ood else 'ID'} records."
         raise ValueError(msg)
@@ -230,38 +451,90 @@ def _ood_key(entry: Mapping[str, Any]) -> str | None:
         "categorical": "ood_choices",
         "simplex": "ood_values",
         "parameter_set": "ood_sets",
-        "paired_parameter_set": "ood_pairs",
     }.get(str(entry["kind"]))
 
 
+def eligible_ood_units(
+    family_contract: Mapping[str, Any],
+    *,
+    groups: tuple[str, ...],
+) -> tuple[dict[str, str], ...]:
+    """Return profile-projected OOD units in canonical registry order."""
+    registry = family_contract["parameter_registry"]
+    units: list[dict[str, str]] = []
+    for name, entry in registry.items():
+        group = entry.get("ood_group")
+        key = _ood_key(entry)
+        if group in groups and key is not None and bool(entry.get(key)):
+            units.append(
+                {
+                    "unit_id": name,
+                    "ood_group": str(group),
+                    "unit_kind": str(entry["kind"]),
+                }
+            )
+    for name, contract in family_contract["coupled_ood_records"].items():
+        group = contract["ood_group"]
+        if group in groups and contract["records"]:
+            units.append(
+                {
+                    "unit_id": name,
+                    "ood_group": str(group),
+                    "unit_kind": "complete_atomic_record",
+                }
+            )
+    identifiers = [unit["unit_id"] for unit in units]
+    if len(identifiers) != len(set(identifiers)):
+        message = "Profile-projected OOD inventory contains duplicate unit identifiers."
+        raise ValueError(message)
+    return tuple(units)
+
+
+def allocate_ood_units(
+    eligible_units: tuple[Mapping[str, str], ...],
+    *,
+    case_count: int,
+) -> tuple[dict[str, str], ...]:
+    """Allocate cases approximately evenly over every eligible atomic unit."""
+    if isinstance(case_count, bool) or not isinstance(case_count, int) or case_count < 1:
+        message = "Parameter-OOD allocation requires a positive integer case count."
+        raise ValueError(message)
+    if not eligible_units:
+        message = "Parameter-OOD allocation has no profile-eligible configured units."
+        raise ValueError(message)
+    return tuple(copy.deepcopy(dict(eligible_units[index % len(eligible_units)])) for index in range(case_count))
+
+
 def _ood_selections(
-    registry: Mapping[str, Mapping[str, Any]],
+    family_contract: Mapping[str, Any],
     assignment: Mapping[str, Any],
     *,
-    balance_parameters: bool,
-    seed_base: int,
-    case_index: int,
+    policy: Mapping[str, Any],
+    groups: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Select configured OOD units from exactly the assigned physical group."""
+    """Validate and return the one unit preallocated to this OOD case."""
     group = assignment["ood_group"]
     if group is None:
         return ()
-    candidates = [
-        name for name, entry in registry.items() if entry.get("ood_group") == group and (key := _ood_key(entry)) is not None and bool(entry.get(key))
-    ]
-    if not candidates:
-        msg = f"Parameter-OOD group {group!r} has no configured disjoint OOD units."
-        raise ValueError(msg)
-    count = int(assignment["ood_units_per_case"])
-    if count > len(candidates):
-        msg = f"Parameter-OOD case requests {count} units from only {len(candidates)} configured candidates in {group!r}."
-        raise ValueError(msg)
-    if balance_parameters:
-        offset = (int(assignment["regime_index"]) // len(materials.OOD_GROUPS)) * count
-        return tuple(candidates[(offset + index) % len(candidates)] for index in range(count))
-    rng = np.random.default_rng(_seed(seed_base, "ood_selection", group, str(case_index)))
-    indices = rng.choice(len(candidates), size=count, replace=False)
-    return tuple(candidates[int(index)] for index in indices)
+    if group not in groups:
+        message = f"Assigned OOD group {group!r} is not active for this profile."
+        raise ValueError(message)
+    eligible = eligible_ood_units(family_contract, groups=groups)
+    if list(eligible) != policy.get("eligible_units"):
+        message = "Resolved parameter-OOD eligibility changed after campaign planning."
+        raise ValueError(message)
+    by_identifier = {unit["unit_id"]: unit for unit in eligible}
+    selected = assignment.get("ood_unit_id")
+    if selected not in by_identifier:
+        message = f"Assigned parameter-OOD unit {selected!r} is not profile eligible."
+        raise ValueError(message)
+    if by_identifier[selected]["ood_group"] != group:
+        message = f"Assigned parameter-OOD unit {selected!r} disagrees with group {group!r}."
+        raise ValueError(message)
+    if assignment.get("ood_units_per_case") != 1:
+        message = "Each parameter-OOD case must activate exactly one eligible unit."
+        raise ValueError(message)
+    return (str(selected),)
 
 
 def _non_numerical_values(
@@ -285,7 +558,7 @@ def _non_numerical_values(
                 raise ValueError(msg)
             rng = np.random.default_rng(_seed(seed_base, "categorical_selection", name, str(case_index)))
             values[name] = copy.deepcopy(choices[int(rng.integers(0, len(choices)))])
-        elif kind in {"parameter_set", "paired_parameter_set"}:
+        elif kind == "parameter_set":
             record = _select_coupled(name, entry, seed_base=seed_base, case_index=case_index, use_ood=name in selected_ood)
             selections[name] = str(record["id"])
             overlap = set(values).intersection(record["values"])
@@ -304,64 +577,318 @@ def _block_values(
     selected_ood: frozenset[str],
     seed_base: int,
     case_index: int,
-) -> dict[str, Any]:
-    """Map one physical block row through its typed family registry."""
+    fixed: Mapping[str, Any],
+    family_bounds: Mapping[str, float],
+    initial_moisture_field_constraint: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Map one physical block row through typed and jointly constrained supports."""
     values: dict[str, Any] = {}
+    coordinates_by_name: dict[str, float] = {}
+    bounds_by_name: dict[str, Mapping[str, Any]] = {}
+    ood_details: dict[str, dict[str, Any]] = {}
     column = 0
     for name in materials.SAMPLING_BLOCKS[block]:
         entry = registry[name]
         dimension = registry_service.effective_dimension(entry)
         coordinates = row[column : column + dimension]
         column += dimension
-        if entry["kind"] == "interval":
-            values[name] = _interval_value(entry, float(coordinates[0]), use_ood=name in selected_ood)
-        elif entry["kind"] == "integer":
-            values[name] = _integer_value(entry, float(coordinates[0]), use_ood=name in selected_ood)
+        if entry["kind"] in {"interval", "integer"}:
+            coordinate = float(coordinates[0])
+            bounds, detail = _selected_interval(
+                name,
+                entry,
+                use_ood=name in selected_ood,
+                seed_base=seed_base,
+                case_index=case_index,
+            )
+            coordinates_by_name[name] = coordinate
+            bounds_by_name[name] = bounds
+            if entry["kind"] == "interval":
+                values[name] = _interval_value(entry, coordinate, bounds=bounds)
+            else:
+                values[name] = _integer_value(coordinate, bounds=bounds)
+            if detail is not None:
+                ood_details[name] = detail
         elif entry["kind"] == "simplex":
             ood_index = None
             if name in selected_ood:
                 count = len(entry.get("ood_values", []))
                 ood_index = 0 if count == 0 else _seed(seed_base, "simplex_ood", name, str(case_index)) % count
-            values[name] = _simplex_value(entry, coordinates, ood_index=ood_index)
+            simplex_values, transform_space_distance = _simplex_value(
+                entry,
+                coordinates,
+                ood_index=ood_index,
+                seed=_seed(seed_base, "truncated_dirichlet", name, str(case_index)),
+            )
+            values[name] = simplex_values
+            if ood_index is not None:
+                ood_details[name] = {
+                    "selection_kind": "complete_simplex",
+                    "record_index": ood_index,
+                    "values": copy.deepcopy(values[name]),
+                    "transform_space_distance": transform_space_distance,
+                }
         elif dimension != 0:
             msg = f"Registry parameter {name!r} owns an unsupported numerical dimension."
             raise RuntimeError(msg)
-    expected = materials.sampling_block_dimensions(registry)[block]
+    expected = materials.sampling_block_dimensions(
+        registry,
+        blocks=(block,),
+    )[block]
     if column != expected:
         msg = f"Sampling block {block!r} consumed {column} coordinates; expected {expected}."
         raise RuntimeError(msg)
-    return values
+    if block == "operation":
+        _condition_operation_values(
+            values,
+            registry=registry,
+            coordinates=coordinates_by_name,
+            bounds=bounds_by_name,
+            fixed=fixed,
+        )
+    elif block == "initial_moisture":
+        _condition_initial_moisture_values(
+            values,
+            registry=registry,
+            coordinates=coordinates_by_name,
+            bounds=bounds_by_name,
+            family_bounds=family_bounds,
+            field_constraint=initial_moisture_field_constraint,
+            natural_support_departure_allowed=bool(selected_ood.intersection(materials.INITIAL_MOISTURE_LEVEL_PARAMETERS)),
+        )
+    for name, detail in ood_details.items():
+        detail["realized_value"] = copy.deepcopy(values[name])
+    return values, ood_details
+
+
+def _coupled_transform_space_distance(
+    registry: Mapping[str, Mapping[str, Any]],
+    values: Mapping[str, float],
+) -> tuple[float, dict[str, float | None]]:
+    """Return normalized distance from one complete record to its ID support."""
+    component_distances: dict[str, float | None] = {}
+    squared = 0.0
+    for component, value in values.items():
+        entry = registry[component]
+        if entry["kind"] != "interval":
+            component_distances[component] = None
+            continue
+        lower_t = registry_service.transformed_coordinate(float(entry["lower"]), entry)
+        upper_t = registry_service.transformed_coordinate(float(entry["upper"]), entry)
+        value_t = registry_service.transformed_coordinate(float(value), entry)
+        width = upper_t - lower_t
+        distance = max(lower_t - value_t, value_t - upper_t, 0.0) / width
+        component_distances[component] = distance
+        squared += distance * distance
+    result = math.sqrt(squared)
+    if not math.isfinite(result) or result <= 0.0:
+        msg = "Complete coupled OOD record has no positive normalized transform-space distance."
+        raise ValueError(msg)
+    return result, component_distances
+
+
+def _apply_coupled_ood_records(
+    family_contract: Mapping[str, Any],
+    *,
+    selected_ood: frozenset[str],
+    values: dict[str, Any],
+    selections: dict[str, str],
+    seed_base: int,
+    case_index: int,
+) -> dict[str, dict[str, Any]]:
+    """Apply selected complete density or kinetics records atomically."""
+    details: dict[str, dict[str, Any]] = {}
+    for name, contract in family_contract["coupled_ood_records"].items():
+        if name not in selected_ood:
+            continue
+        records = contract["records"]
+        if not records:
+            msg = f"Selected coupled OOD unit {name!r} has no records."
+            raise ValueError(msg)
+        index = _seed(seed_base, "coupled_ood_record", name, str(case_index)) % len(records)
+        record = records[index]
+        components = tuple(contract["components"])
+        before = {component: copy.deepcopy(values[component]) for component in components}
+        values.update(copy.deepcopy(record["values"]))
+        selections[name] = str(record["id"])
+        transform_space_distance, component_distances = _coupled_transform_space_distance(
+            family_contract["parameter_registry"],
+            record["values"],
+        )
+        details[name] = {
+            "selection_kind": "complete_coupled_record",
+            "record_id": record["id"],
+            "record_index": index,
+            "components": list(components),
+            "id_row_values": before,
+            "ood_record_values": copy.deepcopy(record["values"]),
+            "transform_space_distance": transform_space_distance,
+            "component_transform_space_distances": component_distances,
+            "distance_normalization": "component_distance_to_id_support_divided_by_component_id_width",
+            "metadata": copy.deepcopy(record["metadata"]),
+        }
+    return details
 
 
 def _units(registry: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
     """Return stable scalar and coupled-component units."""
     units: dict[str, str] = {}
     for name, entry in registry.items():
-        if entry["kind"] in {"parameter_set", "paired_parameter_set"}:
+        if entry["kind"] == "parameter_set":
             units.update(entry["units"])
         else:
             units[name] = str(entry["unit"])
     return units
 
 
+def _explicit_nominal_values(
+    registry: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Resolve only authored nominal values and complete atomic records."""
+    values: dict[str, Any] = {}
+    coupled_selections: dict[str, str] = {}
+    for name, entry in registry.items():
+        kind = str(entry["kind"])
+        if kind == "derived":
+            continue
+        if kind == "fixed":
+            values[name] = copy.deepcopy(entry["value"])
+            continue
+        if kind in {"interval", "integer"}:
+            if "nominal" not in entry:
+                message = f"Explicit pilot nominal is missing for resolved parameter owner/key {name!r}."
+                raise ValueError(message)
+            nominal = entry["nominal"]
+            if isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or not math.isfinite(float(nominal)):
+                message = f"Explicit pilot nominal for {name!r} must be finite numeric data."
+                raise ValueError(message)
+            if kind == "integer":
+                integer = int(nominal)
+                if float(integer) != float(nominal):
+                    message = f"Explicit pilot nominal for integer {name!r} is not integral."
+                    raise ValueError(message)
+                values[name] = integer
+            else:
+                values[name] = float(nominal)
+            continue
+        if kind == "simplex":
+            nominal = entry.get("nominal")
+            components = tuple(entry["components"])
+            if not isinstance(nominal, dict) or set(nominal) != set(components):
+                message = f"Explicit pilot nominal simplex is missing or incomplete for owner/key {name!r}."
+                raise ValueError(message)
+            weights = {component: float(nominal[component]) for component in components}
+            if not all(math.isfinite(value) for value in weights.values()) or not math.isclose(
+                sum(weights.values()),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                message = f"Explicit pilot nominal simplex {name!r} is non-finite or does not sum to one."
+                raise ValueError(message)
+            minimum = float(entry["minimum_each"])
+            maximum = float(entry["maximum_each"])
+            if any(not minimum <= value <= maximum for value in weights.values()):
+                message = f"Explicit pilot nominal simplex {name!r} violates its configured component bounds."
+                raise ValueError(message)
+            values[name] = weights
+            continue
+        if kind == "categorical":
+            if "nominal" not in entry:
+                message = f"Explicit pilot nominal is missing for categorical owner/key {name!r}."
+                raise ValueError(message)
+            nominal = copy.deepcopy(entry["nominal"])
+            if nominal not in entry["choices"]:
+                message = f"Explicit pilot nominal for {name!r} is not a configured natural choice."
+                raise ValueError(message)
+            values[name] = nominal
+            continue
+        if kind == "parameter_set":
+            records = entry.get("sets")
+            if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+                message = (
+                    f"Explicit pilot nominal atomic record for owner/key {name!r} must resolve to exactly one complete configured natural record."
+                )
+                raise ValueError(message)
+            record = records[0]
+            components = tuple(entry["components"])
+            record_values = record.get("values")
+            if not isinstance(record_values, dict) or set(record_values) != set(components):
+                message = f"Explicit pilot nominal atomic record {name!r} is incomplete."
+                raise ValueError(message)
+            overlap = set(values).intersection(record_values)
+            if overlap:
+                message = f"Explicit pilot nominal atomic record {name!r} conflicts with values {sorted(overlap)}."
+                raise ValueError(message)
+            values.update(copy.deepcopy(record_values))
+            coupled_selections[name] = str(record["id"])
+            continue
+        message = f"Explicit pilot nominal resolution does not support registry kind {kind!r} for {name!r}."
+        raise ValueError(message)
+    return values, coupled_selections
+
+
+def _sample_nominal_case(config: GenerationConfig, case_index: int) -> CaseSample:
+    """Return one fail-closed explicit configured nominal with no seed search."""
+    registry = config.scientific_values["material"]["parameter_registry"]
+    values, coupled_selections = _explicit_nominal_values(registry)
+    values = registry_service.resolve_derived_values(
+        registry,
+        values,
+        defer_missing=True,
+    )
+    return CaseSample(
+        values=values,
+        units=_units(registry),
+        coupled_selections=coupled_selections,
+        block_provenance={
+            block: {
+                "sampling_kind": "explicit_configured_nominal",
+                "case_position": config.case_indices.index(case_index),
+                "seed_search": False,
+                "stochastic_field_seed_origin": "normal_label_derived_case_substreams",
+            }
+            for block in config.scientific_values["sampling"]["blocks"]
+        },
+        ood_provenance={
+            "group": None,
+            "active_ood_group": None,
+            "selected_units": [],
+            "active_unit_id": None,
+            "active_record_id": None,
+            "units_per_case": 0,
+            "transform_space_distance": 0.0,
+            "natural_support_state": "nominal_reference",
+            "selections": {},
+            "nominal_source": "explicit_resolved_registry_nominals_and_complete_records",
+            "seed_search": False,
+        },
+    )
+
+
 def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
-    """Resolve one deterministic case from independent physical block designs."""
+    """Resolve one deterministic case from profile-active block designs."""
     config.case_id(case_index)
     assignment = config.case_assignment(case_index)
+    pilot_kind = assignment.get("pilot_case_kind")
+    if pilot_kind == "nominal_reference":
+        return _sample_nominal_case(config, case_index)
+    if pilot_kind not in {None, "natural_pilot"}:
+        message = f"Unsupported pilot case kind {pilot_kind!r}."
+        raise ValueError(message)
     if config.seed_base is None:
-        msg = f"Batch {config.batch_name!r} has no executable sampling seed."
-        raise ValueError(msg)
-    family = assignment["material_family"]
+        message = f"Batch {config.batch_name!r} has no executable sampling seed."
+        raise ValueError(message)
     family_contract = config.scientific_values["material"]
     registry = family_contract["parameter_registry"]
     policy = config.scientific_values["parameter_ood"]
+    policy_groups = tuple(policy["groups"])
     selected = frozenset(
         _ood_selections(
-            registry,
+            family_contract,
             assignment,
-            balance_parameters=bool(policy["balance_parameters"]),
-            seed_base=config.seed_base,
-            case_index=case_index,
+            policy=policy,
+            groups=policy_groups,
         )
     )
     values, coupled_selections = _non_numerical_values(
@@ -372,6 +899,9 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
     )
     position = config.case_indices.index(case_index)
     block_provenance: dict[str, dict[str, Any]] = {}
+    ood_details: dict[str, dict[str, Any]] = {}
+    family_bounds = family_contract.get("initial_moisture_bounds", {})
+    initial_moisture_field_constraint = family_contract.get("initial_moisture_field_constraint", {})
     for block, plan in config.scientific_values["sampling"]["blocks"].items():
         row_index = int(plan["permutation"][position])
         design = unit_design(
@@ -381,24 +911,28 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
             seed=int(plan["design_seed"]),
         )
         if _array_sha256(design) != plan["design_sha256"]:
-            msg = f"Sampling design digest changed for block {block!r}."
-            raise RuntimeError(msg)
+            message = f"Sampling design digest changed for block {block!r}."
+            raise RuntimeError(message)
         numerical_block_parameters = {name for name in materials.SAMPLING_BLOCKS[block] if registry_service.effective_dimension(registry[name]) > 0}
         overlap = set(values).intersection(numerical_block_parameters)
         if overlap:
-            msg = f"Block {block!r} conflicts with coupled or fixed values {sorted(overlap)}."
-            raise ValueError(msg)
-        values.update(
-            _block_values(
-                registry,
-                block,
-                design[row_index],
-                selected_ood=selected,
-                seed_base=config.seed_base,
-                case_index=case_index,
-            )
+            message = f"Block {block!r} conflicts with coupled or fixed values {sorted(overlap)}."
+            raise ValueError(message)
+        block_values, block_ood_details = _block_values(
+            registry,
+            block,
+            design[row_index],
+            selected_ood=selected,
+            seed_base=config.seed_base,
+            case_index=case_index,
+            fixed=config.scientific_values["scientific_fixed_values"],
+            family_bounds=family_bounds,
+            initial_moisture_field_constraint=initial_moisture_field_constraint,
         )
+        values.update(block_values)
+        ood_details.update(block_ood_details)
         block_provenance[block] = {
+            "seed_origin": plan["seed_origin"],
             "design_seed": plan["design_seed"],
             "design_sha256": plan["design_sha256"],
             "permutation_seed": plan["permutation_seed"],
@@ -406,23 +940,53 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
             "case_position": position,
             "block_row_index": row_index,
         }
-    simplex = values.pop("schedule.component_weights")
-    if not isinstance(simplex, dict):
-        msg = "schedule.component_weights did not resolve to a complete simplex mapping."
-        raise TypeError(msg)
-    values["schedule.component_weights"] = simplex
-    values = registry_service.resolve_derived_values(registry, values, defer_missing=True)
-    lower = family_contract["initial_moisture_bounds"]["lower"]
-    upper = family_contract["initial_moisture_bounds"]["upper"]
-    mean = float(values["initial_moisture.mean_db"])
-    amplitude = float(values["initial_moisture.amplitude_db"])
-    if lower is None or upper is None:
-        msg = f"Executable material family {family!r} has unresolved initial-moisture bounds."
-        raise ValueError(msg)
-    maximum_amplitude = min(mean - float(lower), float(upper) - mean)
-    if amplitude < 0 or amplitude > maximum_amplitude:
-        message = f"Sampled initial-moisture amplitude {amplitude} exceeds the no-clipping bound {maximum_amplitude} for family {family!r}."
-        raise ValueError(message)
+    coupled_ood_details = _apply_coupled_ood_records(
+        family_contract,
+        selected_ood=selected,
+        values=values,
+        selections=coupled_selections,
+        seed_base=config.seed_base,
+        case_index=case_index,
+    )
+    ood_details.update(coupled_ood_details)
+    if "schedule.component_weights" in values:
+        simplex = values["schedule.component_weights"]
+        if not isinstance(simplex, dict):
+            message = "schedule.component_weights did not resolve to a complete simplex mapping."
+            raise TypeError(message)
+    values = registry_service.resolve_derived_values(
+        registry,
+        values,
+        defer_missing=True,
+    )
+    if "initial_moisture_bounds" in family_contract:
+        materials.initial_moisture_generation_bounds(
+            family_contract,
+            values,
+            active_ood_unit=next(iter(selected), None),
+        )
+    selected_units = sorted(selected)
+    if selected_units:
+        if len(selected_units) != 1:
+            message = "Parameter-OOD provenance requires exactly one active coordinate or complete record."
+            raise ValueError(message)
+        active_unit_id = selected_units[0]
+        active_detail = ood_details[active_unit_id]
+        transform_space_distance = active_detail.get("transform_space_distance")
+        if isinstance(transform_space_distance, bool) or not isinstance(transform_space_distance, (int, float)):
+            message = f"Parameter-OOD unit {active_unit_id!r} has no numeric transform-space distance."
+            raise ValueError(message)
+        active_record_id = active_detail.get(
+            "record_id",
+            active_detail.get("tail_id"),
+        )
+        if active_record_id is None and "record_index" in active_detail:
+            record_number = int(active_detail["record_index"]) + 1
+            active_record_id = f"{active_unit_id}__record_{record_number}"
+    else:
+        active_unit_id = None
+        active_record_id = None
+        transform_space_distance = 0.0
     return CaseSample(
         values=values,
         units=_units(registry),
@@ -430,8 +994,14 @@ def sample_case(config: GenerationConfig, case_index: int) -> CaseSample:
         block_provenance=block_provenance,
         ood_provenance={
             "group": assignment["ood_group"],
-            "selected_units": sorted(selected),
+            "active_ood_group": assignment["ood_group"],
+            "selected_units": selected_units,
+            "active_unit_id": active_unit_id,
+            "active_record_id": active_record_id,
             "units_per_case": assignment["ood_units_per_case"],
+            "transform_space_distance": float(transform_space_distance),
+            "natural_support_state": ("natural" if not selected_units else "parameter_ood"),
+            "selections": ood_details,
         },
     )
 

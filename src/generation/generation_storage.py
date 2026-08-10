@@ -61,6 +61,8 @@ _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 _SCALAR_COLUMN_COUNT = 3
 _TIME_CLASSIFICATION_BASIS = "16*float64_epsilon*168h; numerical classification only"
 STATUS_SCHEMA_VERSION = 1
+_CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
+_CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,27 +115,32 @@ def _role_paths(exports: Sequence[Any], role: str) -> list[Path]:
     return [Path(item.source_path) for item in exports if item.role == role]
 
 
-def _mapped_table(paths: Sequence[Path], contract: Mapping[str, Any]) -> dict[str, np.ndarray]:
-    """Read and concatenate explicitly mapped logical fields."""
+def _mapped_table(
+    paths: Sequence[Path],
+    contract: Mapping[str, Any],
+) -> dict[str, np.ndarray]:
+    """Read explicitly mapped fields after rejecting probe-state columns."""
+    role = str(contract["role"])
+    expected_logical = tuple(contract["units"])
+    if tuple(contract["columns"]) != expected_logical:
+        unresolved = [logical for logical in expected_logical if logical not in contract["columns"]]
+        message = f"Export role {role!r} cannot be ingested until mappings are confirmed for {unresolved}."
+        raise RuntimeError(message)
     if not paths:
-        msg = f"Required export role {contract['role']!r} produced no files."
-        raise FileNotFoundError(msg)
-    collected: dict[str, list[np.ndarray]] = {name: [] for name in contract["columns"]}
-    time_column = contract.get("time_column")
-    if time_column is not None:
-        collected["__stationary_time__"] = []
+        message = f"Required export role {role!r} produced no files."
+        raise FileNotFoundError(message)
+    collected: dict[str, list[np.ndarray]] = {name: [] for name in expected_logical}
     for path in paths:
-        header, values = _read_table(path, delimiter=contract["delimiter"])
+        header, values = _read_table(
+            path,
+            delimiter=contract["delimiter"],
+        )
         missing = [source for source in contract["columns"].values() if source not in header]
-        if time_column is not None and time_column not in header:
-            missing.append(time_column)
         if missing:
-            msg = f"Export {path} is missing explicitly configured headers {missing}."
-            raise ValueError(msg)
+            message = f"Export {path} is missing explicitly configured headers {missing}."
+            raise ValueError(message)
         for logical, source in contract["columns"].items():
             collected[logical].append(values[:, header.index(source)])
-        if time_column is not None:
-            collected["__stationary_time__"].append(values[:, header.index(time_column)])
     return {name: np.concatenate(parts) for name, parts in collected.items()}
 
 
@@ -172,7 +179,7 @@ def _static_fields(
     if len(coordinate_rows) != x_axis.size * y_axis.size:
         msg = "Static export does not contain one complete Cartesian grid."
         raise ValueError(msg)
-    repeated_allowed = contract.get("time_column") is not None
+    repeated_allowed = False
     field_names = profiles.static_field_names(config.profile.id)
     arrays: np.ndarray = np.empty((len(field_names), y_axis.size, x_axis.size), dtype=np.float64)
     x_lookup = {float(value): index for index, value in enumerate(actual_x)}
@@ -689,6 +696,41 @@ def _write_json_dataset(group: h5py.Group, name: str, value: Any) -> None:
     group.create_dataset(name, data=_json_attribute(value), dtype=h5py.string_dtype(encoding="utf-8"))
 
 
+def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return realized case science required inside the canonical HDF5 payload."""
+    required = (
+        "case_id",
+        "case_index",
+        "case_input_id",
+        "simulation_case_id",
+        "material_family",
+        "material_role",
+        "evaluation_regime",
+        "sampling_regime",
+        "natural_support_state",
+        "seed_evidence",
+        "block_provenance",
+        "sampled_values",
+        "sampled_units",
+        "coupled_selections",
+        "ood",
+        "spatial_diagnostics",
+    )
+    missing = [name for name in required if name not in case_payload]
+    if missing:
+        message = f"Case payload is missing realized HDF5 scientific provenance {missing}."
+        raise ValueError(message)
+    result = {
+        "schema_kind": _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND,
+        "schema_version": _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION,
+        **{name: case_payload[name] for name in required},
+    }
+    for name in ("schedule_diagnostics", "pilot_check"):
+        if name in case_payload:
+            result[name] = case_payload[name]
+    return result
+
+
 def _write_hdf5(
     path: Path,
     config: GenerationConfig,
@@ -752,8 +794,12 @@ def _write_hdf5(
         handle.attrs["converter_version"] = storage["converter_version"]
         for key in (
             "simulation_profile",
+            "case_id",
             "material_family",
+            "material_role",
+            "evaluation_regime",
             "sampling_regime",
+            "natural_support_state",
             "case_input_id",
             "simulation_case_id",
             "scientific_config_digest",
@@ -762,11 +808,21 @@ def _write_hdf5(
             "git_commit",
         ):
             handle.attrs[key] = case_payload[key]
+        case_index = case_payload["case_index"]
+        if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 1:
+            message = "Case index must be a positive integer before HDF5 publication."
+            raise ValueError(message)
+        handle.attrs["case_index"] = case_index
         handle.attrs["template_relative_path"] = case_payload["template"]["relative_path"]
         handle.attrs["template_sha256"] = case_payload["template"]["sha256"]
         handle.attrs["available_learning_views"] = _json_attribute(case_payload["available_learning_views"])
         provenance = handle.create_group("provenance")
         _write_json_dataset(provenance, "scientific_config_json", config.scientific_values)
+        _write_json_dataset(
+            provenance,
+            "case_scientific_provenance_json",
+            _case_scientific_provenance(case_payload),
+        )
         _write_json_dataset(provenance, "input_files_json", case_payload["input_files"])
         _write_json_dataset(provenance, "source_exports_json", source_hashes)
         _write_json_dataset(
@@ -961,7 +1017,7 @@ def _validate_source_export_provenance(
         role_counts[role] += 1
     for spec in profile_contract.export_roles:
         count = role_counts[spec.role]
-        if (spec.required and count < 1) or (not spec.allow_multiple and count != 1):
+        if (spec.required and count < 1) or (not spec.allow_multiple and count > 1):
             msg = f"Canonical source-export multiplicity is invalid for role {spec.role!r}: {count}."
             raise ValueError(msg)
 
@@ -1013,6 +1069,7 @@ def _validate_hdf5_provenance(
     """Validate complete scientific, input, conditioning, and template provenance."""
     expected = {
         "scientific_config_json",
+        "case_scientific_provenance_json",
         "input_files_json",
         "source_exports_json",
         "template_json",
@@ -1022,6 +1079,10 @@ def _validate_hdf5_provenance(
         expected.add("scalar_handoff_json")
     _require_group_members(handle, "provenance", expected)
     scientific = _hdf5_json_dataset(handle, "provenance/scientific_config_json")
+    case_scientific = _hdf5_json_dataset(
+        handle,
+        "provenance/case_scientific_provenance_json",
+    )
     input_files = _hdf5_json_dataset(handle, "provenance/input_files_json")
     source_exports = _hdf5_json_dataset(handle, "provenance/source_exports_json")
     template = _hdf5_json_dataset(handle, "provenance/template_json")
@@ -1048,6 +1109,85 @@ def _validate_hdf5_provenance(
         or fixed_ownership != expected_fixed
     ):
         msg = "Canonical HDF5 scientific or stationary-conditioning provenance is invalid."
+        raise ValueError(msg)
+    required_case_keys = {
+        "schema_kind",
+        "schema_version",
+        "case_id",
+        "case_index",
+        "case_input_id",
+        "simulation_case_id",
+        "material_family",
+        "material_role",
+        "evaluation_regime",
+        "sampling_regime",
+        "natural_support_state",
+        "seed_evidence",
+        "block_provenance",
+        "sampled_values",
+        "sampled_units",
+        "coupled_selections",
+        "ood",
+        "spatial_diagnostics",
+    }
+    optional_case_keys = {"schedule_diagnostics", "pilot_check"}
+    if (
+        not isinstance(case_scientific, dict)
+        or not required_case_keys.issubset(case_scientific)
+        or set(case_scientific).difference(required_case_keys | optional_case_keys)
+        or case_scientific.get("schema_kind") != _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND
+        or case_scientific.get("schema_version") != _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION
+    ):
+        msg = "Canonical HDF5 realized case-scientific provenance schema is invalid."
+        raise ValueError(msg)
+    matched_attributes = (
+        "case_id",
+        "case_input_id",
+        "simulation_case_id",
+        "material_family",
+        "material_role",
+        "evaluation_regime",
+        "sampling_regime",
+        "natural_support_state",
+    )
+    if any(case_scientific[name] != handle.attrs.get(name) for name in matched_attributes) or case_scientific["case_index"] != handle.attrs.get(
+        "case_index"
+    ):
+        msg = "Canonical HDF5 case-scientific provenance disagrees with identity attributes."
+        raise ValueError(msg)
+    sampled_values = case_scientific["sampled_values"]
+    sampled_units = case_scientific["sampled_units"]
+    block_provenance = case_scientific["block_provenance"]
+    ood = case_scientific["ood"]
+    if (
+        not isinstance(sampled_values, dict)
+        or not sampled_values
+        or not isinstance(sampled_units, dict)
+        or set(sampled_values) != set(sampled_units)
+        or not isinstance(block_provenance, dict)
+        or not block_provenance
+        or not isinstance(case_scientific["seed_evidence"], dict)
+        or not isinstance(case_scientific["coupled_selections"], dict)
+        or not isinstance(case_scientific["spatial_diagnostics"], dict)
+        or not isinstance(ood, dict)
+        or ood.get("natural_support_state") != case_scientific["natural_support_state"]
+    ):
+        msg = "Canonical HDF5 realized values, units, seeds, blocks, diagnostics, or OOD provenance are invalid."
+        raise ValueError(msg)
+    material_contract = scientific.get("material")
+    if isinstance(material_contract, dict):
+        active_names = material_contract.get("active_coordinate_names")
+        active_blocks = material_contract.get("active_sampling_blocks")
+        if (
+            not isinstance(active_names, list)
+            or not set(active_names).issubset(sampled_values)
+            or not isinstance(active_blocks, list)
+            or set(active_blocks) != set(block_provenance)
+        ):
+            msg = "Canonical HDF5 realized provenance does not cover every profile-active coordinate and block."
+            raise ValueError(msg)
+    if profile == profiles.TRANSIENT_DRYING_PROFILE and "schedule_diagnostics" not in case_scientific:
+        msg = "Canonical transient HDF5 is missing realized schedule diagnostics."
         raise ValueError(msg)
     scalar_handoff: dict[str, Any] | None = None
     if profile == profiles.TRANSIENT_DRYING_PROFILE:

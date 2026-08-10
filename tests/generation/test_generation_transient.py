@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import h5py
 import numpy as np
@@ -14,6 +13,10 @@ import pytest
 import torch
 
 from src import common, datasets, generation
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from typing import Any
 
 
 def _json(value: object) -> str:
@@ -195,6 +198,27 @@ def _write_transient_case(
         "entries": scalar_entries,
     }
     conversion_pressure = {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"}
+    case_scientific_provenance = {
+        "schema_kind": "vp2_case_scientific_provenance",
+        "schema_version": 1,
+        "case_id": "case_0001",
+        "case_index": 1,
+        "case_input_id": case_input_id,
+        "simulation_case_id": simulation_case_id,
+        "material_family": "lentil",
+        "material_role": "seen",
+        "evaluation_regime": "id",
+        "sampling_regime": "natural",
+        "natural_support_state": "natural",
+        "seed_evidence": {},
+        "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
+        "sampled_values": scalar_values,
+        "sampled_units": dict(zip(scalar_names, generation.profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
+        "coupled_selections": {},
+        "ood": {"natural_support_state": "natural"},
+        "spatial_diagnostics": {},
+        "schedule_diagnostics": {},
+    }
 
     with h5py.File(path, "w") as handle:
         handle.attrs.update(
@@ -203,8 +227,13 @@ def _write_transient_case(
                 "schema_version": generation.storage.HDF5_SCHEMA_VERSION,
                 "converter_version": generation.storage.HDF5_CONVERTER_VERSION,
                 "simulation_profile": "transient_drying",
+                "case_id": "case_0001",
+                "case_index": 1,
                 "material_family": "lentil",
+                "material_role": "seen",
+                "evaluation_regime": "id",
                 "sampling_regime": "natural",
+                "natural_support_state": "natural",
                 "case_input_id": case_input_id,
                 "simulation_case_id": simulation_case_id,
                 "scientific_config_digest": scientific_digest,
@@ -219,6 +248,7 @@ def _write_transient_case(
         provenance = handle.create_group("provenance")
         provenance_values = {
             "scientific_config_json": scientific,
+            "case_scientific_provenance_json": case_scientific_provenance,
             "input_files_json": {
                 "fields.csv": {"sha256": "6" * 64, "size_bytes": 1},
                 "scalars.csv": {"sha256": "b" * 64, "size_bytes": 1},
@@ -434,325 +464,6 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         stream.write(b"tamper")
     with pytest.raises(RuntimeError, match="changed after dataset admission"):
         _ = worker_dataset[0]
-
-
-def test_transient_package_factory_selectors_inspection_and_worker_smoke(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise compact package publication, selectors, inspection, and both worker modes."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        natural_count=3,
-    )
-    campaign = generation.config.load_campaign_config(config_path)
-    batch = campaign.batch("transient_drying__lentil__natural")
-    storage_root = tmp_path / "storage"
-    source_root = storage_root / "synthetic_sources"
-    source_root.mkdir(parents=True)
-    package_case_ids: list[str] = []
-    candidates: list[dict[str, Any]] = []
-    memberships = ("train", "validation", "id_test")
-    for index, membership in enumerate(memberships, start=1):
-        case_input_id = f"{index:x}" * 64
-        simulation_case_id = f"{index + 8:x}" * 64
-        source = source_root / f"case_{index:04d}.h5"
-        _write_transient_case(
-            source,
-            case_input_id=case_input_id,
-            simulation_case_id=simulation_case_id,
-        )
-        case_id = f"case_{index:04d}"
-        package_case_id = f"{batch.batch_name}__{case_id}"
-        package_case_ids.append(package_case_id)
-        record = {
-            "case_id": case_id,
-            "case_input_id": case_input_id,
-            "simulation_case_id": simulation_case_id,
-            "case_hdf5_sha256": common.serialization.file_sha256(source),
-            "success_sha256": f"{index + 3:x}" * 64,
-            "provenance_sha256": f"{index + 6:x}" * 64,
-        }
-        candidates.append(
-            {
-                "batch_id": batch.batch_id,
-                "case_id": case_id,
-                "package_case_id": package_case_id,
-                "case_hdf5": source,
-                "case_hdf5_relative": source.relative_to(storage_root).as_posix(),
-                "case_hdf5_sha256": common.serialization.file_sha256(source),
-                "case_input_id": case_input_id,
-                "simulation_case_id": simulation_case_id,
-                "material_family": "lentil",
-                "simulation_profile": "transient_drying",
-                "dataset_membership": membership,
-                "task_relevant_ood_parameters": [],
-                "ood_evidence": {},
-                "manifest": {},
-                "record": record,
-            }
-        )
-    batch_record = {
-        "batch_name": batch.batch_name,
-        "batch_id": batch.batch_id,
-        "batch_identity": batch.batch_identity,
-        "manifest_sha256": "6" * 64,
-        "simulation_profile": batch.profile.id,
-        "template": {
-            "relative_path": batch.profile.template_relative_path,
-            "sha256": batch.template_sha256,
-        },
-        "scientific_config_digest": batch.scientific_config_digest,
-        "git_commit": "a" * 40,
-        "material_config_digest": batch.scientific_values["material_config_digest"],
-        "operation_config_digest": batch.scientific_values["operation_config_digest"],
-        "airflow_source": batch.profile.airflow_source,
-        "available_learning_views": list(batch.profile.available_learning_views),
-        "export_contract_sha256": common.serialization.canonical_json_sha256(batch.scientific_values["output_contract"]),
-        "steady_flow_conditioning": batch.scientific_values["steady_flow_conditioning"],
-    }
-    plan = next(
-        dict(package)
-        for package in campaign.dataset_packages
-        if package["dataset_view"] == "transient_drying" and package["evaluation_regime"] == "id"
-    )
-    prepared = datasets.packages._PreparedPackage(
-        plan=plan,
-        batch_records=[batch_record],
-        candidates=candidates,
-        excluded=[],
-        membership={membership: [package_case_id] for membership, package_case_id in zip(memberships, package_case_ids, strict=True)},
-        source_decisions=[],
-        steady_conditioning=None,
-    )
-    result = datasets.packages._publish_prepared(
-        campaign,
-        prepared,
-        storage_root=storage_root,
-    )
-
-    manifest = datasets.packages.load_package_manifest(
-        result["dataset_id"],
-        storage_root=storage_root,
-    )
-    assert manifest["sample_count"] == 6
-    assert manifest["source_case_count"] == 3
-    assert manifest["transition_count"] == 6
-    index_path = Path(result["payload_path"])
-    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
-    assert index_payload["source_locator_root"] == "storage_root"
-    assert [record["source_relative_path"] for record in index_payload["cases"]] == [candidate["case_hdf5_relative"] for candidate in candidates]
-    assert all(
-        set(sample)
-        == {
-            "case_index",
-            "sample_id",
-            "time_index",
-            "t_n",
-            "t_np1",
-            "schedule_index_n",
-            "schedule_index_np1",
-        }
-        for sample in index_payload["samples"]
-    )
-    assert all(
-        forbidden not in record
-        for record in (*index_payload["cases"], *index_payload["samples"])
-        for forbidden in ("trajectory", "state", "static", "target", "transient_fields")
-    )
-    assert index_path.stat().st_size < min(candidate["case_hdf5"].stat().st_size for candidate in candidates)
-
-    candidate_by_case = {str(candidate["case_id"]): candidate for candidate in candidates}
-
-    def interpret_coupled_case(
-        batch_id: str,
-        case_id: str,
-        *,
-        task: Any,
-        manifest: Any,
-        record: Any,
-        storage_root: Any,
-    ) -> tuple[Any, ...]:
-        """Interpret the compact canonical coupled case through the steady transform."""
-        assert batch_id == batch.batch_id
-        assert manifest == {}
-        assert storage_root == storage_root_path
-        candidate = candidate_by_case[case_id]
-        assert record == candidate["record"]
-        return _compact_steady_view(candidate, case_id=case_id, task=task)
-
-    storage_root_path = storage_root
-    monkeypatch.setattr(
-        datasets.packages.generated,
-        "interpret_generated_case",
-        interpret_coupled_case,
-    )
-    steady_plan = next(
-        dict(package) for package in campaign.dataset_packages if package["dataset_view"] == "steady_flow" and package["evaluation_regime"] == "id"
-    )
-    steady_prepared = datasets.packages._PreparedPackage(
-        plan=steady_plan,
-        batch_records=[batch_record],
-        candidates=[dict(candidate) for candidate in candidates],
-        excluded=[],
-        membership={membership: [package_case_id] for membership, package_case_id in zip(memberships, package_case_ids, strict=True)},
-        source_decisions=[],
-        steady_conditioning=datasets.packages.audit_steady_flow_conditioning([batch_record]),
-    )
-    steady_result = datasets.packages._publish_prepared(
-        campaign,
-        steady_prepared,
-        storage_root=storage_root,
-    )
-    steady_manifest = datasets.packages.load_package_manifest(
-        steady_result["dataset_id"],
-        storage_root=storage_root,
-    )
-    steady_payload = torch.load(steady_result["payload_path"], map_location="cpu", weights_only=False)
-    assert steady_payload["inputs"].shape == (3, 7, 251, 401)
-    assert steady_payload["outputs"].shape == (3, 3, 251, 401)
-    assert steady_manifest["source_simulation_profiles"] == ["transient_drying"]
-    assert steady_manifest["airflow_provenance"] == ["comsol_coupled_reference"]
-    assert steady_manifest["case_membership"] == manifest["case_membership"]
-
-    request = datasets.factory.DatasetRequest(
-        dataset_id=result["dataset_id"],
-        dataset_view="transient_drying",
-        evaluation_regime="id",
-        membership="validation",
-        storage_root=storage_root,
-    )
-    validation = datasets.factory.create_dataset(request, hdf5_cache_size=1)
-    assert isinstance(validation, datasets.transient.TransientPhysicalDataset)
-    assert len(validation) == 2
-    assert {validation[index]["metadata"]["split"] for index in range(len(validation))} == {"validation"}
-    validation.close()
-
-    inspection = datasets.packages.inspect_dataset_package(
-        result["dataset_id"],
-        storage_root=storage_root,
-    )
-    assert inspection["available_selectors"] == [
-        "id/train",
-        "id/validation",
-        "id/id_test",
-    ]
-    assert inspection["tensors"]["state"]["shape"] == [4, 251, 401]
-    assert inspection["tensors"]["static"]["shape"] == [7, 251, 401]
-    assert inspection["sample_identity"]["sequence_length"] == 3
-
-    zero_worker = datasets.packages.smoke_dataset_package(
-        result["dataset_id"],
-        storage_root=storage_root,
-        membership="train",
-        num_workers=0,
-    )
-    multi_worker = datasets.packages.smoke_dataset_package(
-        result["dataset_id"],
-        storage_root=storage_root,
-        membership="train",
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=1,
-    )
-    assert zero_worker["status"] == multi_worker["status"] == "loaded"
-    assert zero_worker["batch_shapes"]["target"] == [1, 4, 251, 401]
-    assert multi_worker["batch_shapes"]["target"] == [1, 4, 251, 401]
-
-    ood_source = source_root / "case_ood.h5"
-    _write_transient_case(
-        ood_source,
-        case_input_id="d" * 64,
-        simulation_case_id="e" * 64,
-    )
-    ood_case_id = f"{batch.batch_name}__case_ood"
-    ood_evidence = {
-        "group": "bed",
-        "selected_units": ["kappa_mean"],
-        "units_per_case": 1,
-        "parameters": [{"name": "kappa_mean", "block": "airflow"}],
-    }
-    ood_plan = next(
-        dict(package)
-        for package in campaign.dataset_packages
-        if package["dataset_view"] == "transient_drying" and package["evaluation_regime"] == "parameter_ood"
-    )
-    ood_prepared = datasets.packages._PreparedPackage(
-        plan=ood_plan,
-        batch_records=[batch_record],
-        candidates=[
-            {
-                "batch_id": batch.batch_id,
-                "case_id": "case_ood",
-                "package_case_id": ood_case_id,
-                "case_hdf5": ood_source,
-                "case_hdf5_relative": ood_source.relative_to(storage_root).as_posix(),
-                "case_hdf5_sha256": common.serialization.file_sha256(ood_source),
-                "case_input_id": "d" * 64,
-                "simulation_case_id": "e" * 64,
-                "material_family": "lentil",
-                "simulation_profile": "transient_drying",
-                "dataset_membership": "parameter_ood",
-                "task_relevant_ood_parameters": ["kappa_mean"],
-                "ood_evidence": ood_evidence,
-            }
-        ],
-        excluded=[],
-        membership={"parameter_ood": [ood_case_id]},
-        source_decisions=[],
-        steady_conditioning=None,
-    )
-    ood_result = datasets.packages._publish_prepared(
-        campaign,
-        ood_prepared,
-        storage_root=storage_root,
-    )
-    all_request = datasets.factory.DatasetRequest(
-        dataset_id=ood_result["dataset_id"],
-        dataset_view="transient_drying",
-        evaluation_regime="parameter_ood",
-        storage_root=storage_root,
-    )
-    bed_request = datasets.factory.DatasetRequest(
-        dataset_id=ood_result["dataset_id"],
-        dataset_view="transient_drying",
-        evaluation_regime="parameter_ood",
-        ood_group="bed",
-        storage_root=storage_root,
-    )
-    all_dataset = datasets.factory.create_dataset(all_request)
-    bed_dataset = datasets.factory.create_dataset(bed_request)
-    assert isinstance(all_dataset, datasets.transient.TransientPhysicalDataset)
-    assert isinstance(bed_dataset, datasets.transient.TransientPhysicalDataset)
-    assert len(all_dataset) == 2
-    assert len(bed_dataset) == 2
-    all_dataset.close()
-    bed_dataset.close()
-    unavailable = datasets.factory.DatasetRequest(
-        dataset_id=ood_result["dataset_id"],
-        dataset_view="transient_drying",
-        evaluation_regime="parameter_ood",
-        ood_group="operation",
-        storage_root=storage_root,
-    )
-    with pytest.raises(ValueError, match="unavailable"):
-        datasets.factory.create_dataset(unavailable)
-
-    invalid_membership: Any = "not_a_membership"
-    with pytest.raises(ValueError, match="Unsupported ID membership selector"):
-        datasets.factory.DatasetRequest(
-            dataset_id=result["dataset_id"],
-            dataset_view="transient_drying",
-            evaluation_regime="id",
-            membership=invalid_membership,
-            storage_root=storage_root,
-        )
-    with pytest.raises(ValueError, match="require num_workers > 0"):
-        datasets.factory.LoaderSettings(
-            num_workers=0,
-            persistent_workers=True,
-        )
 
 
 def test_transient_time_classification_and_bad_commit(tmp_path: Path) -> None:

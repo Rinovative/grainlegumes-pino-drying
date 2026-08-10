@@ -1,0 +1,299 @@
+schema_kind: generation_material
+schema_version: 1
+material_family: sunflower_seed
+decision_source:
+  artifact: VP2_Parameter_Decisions.yaml
+  schema_version: 1.1.0
+  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
+material_scope:
+  common_name: Sunflower seed
+  species: Helianthus annuus L.
+  market_class: high_oleic_oil_type
+  product_form: whole_achene
+  coat_or_hull_state: hull_intact
+  description: Cleaned whole mature high-oleic sunflower achene
+permeability:
+  nominal: 8.0e-08
+  support:
+    lower: 4.0e-08
+    upper: 1.5e-07
+  transform: log
+  distribution: uniform_in_log_space
+  provenance:
+    source_refs:
+    - sunflower_airflow_canada_1990
+    status: engineering_estimate
+    derivation:
+      kind: selected_engineering_estimate
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Kozeny-Carman-scale and airflow-envelope inversion for a loose bed of large elongated hull-intact achenes;
+        exact fill pressure-drop data were not available.
+    confidence: low_medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+      temperature: generator design; not a material property
+      humidity_or_aw: generator design; not a material property
+      packing_or_flow_regime: Only for packing bands in each complete density record; generated mean eps must pass the material
+        band.
+packing_porosity_mean_support:
+  lower: 0.5
+  upper: 0.57
+  unit: '1'
+  provenance:
+    source_refs:
+    - sunflower_density_isik_izli_2007
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select the complete rho-eps pair atomically. Never combine density and porosity from different source states.
+      supplied_status: coupled_record_with_dry_basis_conversion
+    confidence: medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+      packing_or_flow_regime: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density divided by 1+X_db while
+        porosity remains unchanged under the paired bulk/true-density conversion.
+density_calibration:
+  record_id: sunflower_seed_density_calibration_v1
+  reference:
+    rho_bu_dry_ref: 377.4
+    eps_bed_cal_ref: 0.5306
+    inferred_rho_particle_dry: 804.005113
+  rho_bu_dry_ref_support:
+    lower: 330.0
+    upper: 410.0
+    transform: log
+  ood_records: []
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - sunflower_density_isik_izli_2007
+    status: coupled_record
+    derivation:
+      kind: complete_atomic_record
+      origin: supplied_by_handoff
+      verification: mathematically_reproduced
+      description: Select the complete rho-eps pair atomically. Never combine density and porosity from different source states.
+      supplied_status: coupled_record_with_dry_basis_conversion
+    confidence: medium
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+      packing_or_flow_regime: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density divided by 1+X_db while
+        porosity remains unchanged under the paired bulk/true-density conversion.
+thermal_properties:
+  k_gr:
+    nominal: 0.2
+    support:
+      lower: 0.16
+      upper: 0.3
+    transform: log
+    distribution: uniform_in_log_space
+    provenance:
+      source_refs:
+      - sunflower_thermal_ince_2008
+      status: engineering_inversion
+      derivation:
+        kind: inverted_to_binding_model_convention
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Dry granular-phase conductivity selected by inverting the binding Maxwell-Eucken relation so the packed
+          effective conductivity matches the low-moisture sunflower measurements near VP2 temperatures.
+        supplied_status: engineering_inversion_from_literature
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Cleaned whole mature high-oleic sunflower achene
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
+  cp_gr_dry:
+    nominal: 700.0
+    support:
+      lower: 500.0
+      upper: 1000.0
+    transform: log
+    distribution: uniform_in_log_space
+    provenance:
+      source_refs:
+      - sunflower_thermal_ince_2008
+      status: engineering_conversion
+      derivation:
+        kind: converted_from_supplied_literature_value
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: The source reports wet-product heat capacity. The nominal was converted to the model dry-solid basis
+          after removing the explicit X_db*cp_w contribution at low moisture and 25-40 degC; this avoids double counting water
+          heat capacity.
+        supplied_status: engineering_conversion_from_literature
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Cleaned whole mature high-oleic sunflower achene
+        temperature: material-specific evidence; VP2 operation 25-40 degC
+        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
+        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
+        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
+initial_moisture:
+  mean_db:
+    nominal: 0.14942528735632185
+    support:
+      lower: 0.0989010989010989
+      upper: 0.2195121951219512
+    transform: linear
+    distribution: uniform
+    provenance:
+      source_refs:
+      - sunflower_sorption_drying_munder_2019
+      status: engineering_estimate
+      derivation:
+        kind: selected_engineering_estimate
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Natural whole-seed starting-moisture envelope chosen inside the product-compatible sorption/drying domain
+          and above the 6% wb target; no measurement of the future lot is claimed.
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Cleaned whole mature high-oleic sunflower achene
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  amplitude_db:
+    nominal: 0.015
+    support:
+      lower: 0.003
+      upper: 0.03
+    transform: linear
+    distribution: uniform
+    provenance:
+      source_refs:
+      - sunflower_sorption_drying_munder_2019
+      status: synthetic_design
+      derivation:
+        kind: selected_synthetic_generator_design
+        origin: supplied_by_handoff
+        verification: declared_only
+        description: Synthetic maximum spatial deviation in dry basis, scaled to the sunflower natural moisture band and constrained
+          above the target.
+      confidence: medium
+      validity:
+        material_scope_ref: material_scope
+        product_form: Cleaned whole mature high-oleic sunflower achene
+        temperature: generator design; not a material property
+        humidity_or_aw: generator design; not a material property
+        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
+        packing_or_flow_regime: packed-bed continuum; material validation applies
+  field_support:
+    lower: 0.0989010989010989
+    upper: 0.2195121951219512
+    unit: kg/kg
+    provenance:
+      source_refs:
+      - sunflower_sorption_drying_munder_2019
+      status: derived
+      derivation:
+        kind: derived_from_configured_value
+        origin: supplied_by_handoff
+        verification: mathematically_reproduced
+        description: X_db=X_wb/(1-X_wb)
+      confidence: medium_low
+      validity:
+        material_scope_ref: material_scope
+        product_form: Cleaned whole mature high-oleic sunflower achene
+        moisture_basis: kg water/kg dry solids
+  field_constraint: min(X_0_db_field) >= 0.07382979 kg/kg
+target_moisture:
+  selected_simulation_target_wb: 0.06
+  selected_target_db: 0.06382978723404255
+  market_acceptance_moisture_wb: 0.06
+  safe_storage_moisture_wb: 0.06
+  provenance:
+    source_refs:
+    - swiss_oil_2026
+    status: official_industry_target
+    derivation:
+      kind: selected_official_target
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Official Swiss maximum intake moisture for sunflower, expressed as wet-basis fraction.
+    confidence: high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+oswin:
+  record_id: sunflower_seed_production_oswin_v1
+  components:
+    A_osw: 4.8
+    B_osw: -0.0158
+    C_osw: 0.622278
+  units:
+    A_osw: '1'
+    B_osw: 1/K
+    C_osw: '1'
+  equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+  temperature_variable: T_C=T_K-273.15 K; numerical B is per kelvin or per degree Celsius increment
+  provenance:
+    source_refs:
+    - sunflower_sorption_drying_munder_2019
+    status: literature_convention_conversion
+    derivation:
+      kind: converted_to_binding_convention
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: Exact equation-convention conversion into the binding A/B/C form; no new fit and no coefficient mixing
+        are claimed.
+      supplied_status: literature_direct_convention_conversion
+    confidence: medium_high
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+      moisture_basis: kg water/kg dry solids; source kg/kg dry-matter coefficient scale converted to the binding percent-db
+        prefactor
+      equation_or_method: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
+      supplied_scope: Whole high-oleic hull-intact sunflower seed; 25-50 degC and aw 0.10-0.95.
+two_compartment_kinetics:
+  record_id: sunflower_seed_two_compartment_kinetics_v1
+  components:
+    r_surf_0:
+      nominal: 8.0e-06
+      support:
+        lower: 3.0e-06
+        upper: 1.6e-05
+      transform: log
+    r_int_surf:
+      nominal: 0.15
+      support:
+        lower: 0.05
+        upper: 0.3
+      transform: log
+    f_surf:
+      nominal: 0.45
+      support:
+        lower: 0.25
+        upper: 0.65
+      transform: logit
+  ood_records: []
+  selection_rule: complete_record_atomic
+  provenance:
+    source_refs:
+    - sunflower_sorption_drying_munder_2019
+    status: hierarchical_engineering_prior
+    derivation:
+      kind: selected_hierarchical_engineering_prior
+      origin: supplied_by_handoff
+      verification: declared_only
+      description: use the pilot nominal unchanged; label all results engineering stress-test only
+    confidence: low_until_calibrated
+    validity:
+      material_scope_ref: material_scope
+      product_form: Cleaned whole mature high-oleic sunflower achene
+      supplied_scope: A desired nominal drying duration, or preferably independent whole-seed X_db(t) curves at known T, RH/omega
+        and airflow.
+      transfer_limit: use the pilot nominal unchanged; label all results engineering stress-test only
