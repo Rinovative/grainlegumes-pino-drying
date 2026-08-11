@@ -558,7 +558,7 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     index_path = tmp_path / "index.json"
     payload = _build_index(source, index_path)
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 1
     assert payload["sample_count"] == 2
     assert [(sample["time_index_n"], sample["time_index_n_plus_1"]) for sample in payload["samples"]] == [(0, 1), (1, 2)]
     assert set(payload["samples"][0]) == {
@@ -912,9 +912,9 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         _ = worker_dataset[0]
 
 
-def test_transient_hdf5_rejects_an_extra_legacy_scalar_entry(tmp_path: Path) -> None:
-    """Reject an obsolete extra-entry source at canonical HDF5 admission."""
-    source = tmp_path / "legacy-scalar-shape.h5"
+def test_transient_hdf5_rejects_an_unknown_scalar_entry(tmp_path: Path) -> None:
+    """Reject an unknown scalar entry at canonical HDF5 admission."""
+    source = tmp_path / "unknown-scalar-entry.h5"
     _write_transient_case(source)
     with h5py.File(source, "r+") as handle:
         scalar_dataset = handle["provenance/scalar_handoff_json"]
@@ -928,7 +928,7 @@ def test_transient_hdf5_rejects_an_extra_legacy_scalar_entry(tmp_path: Path) -> 
         handoff = json.loads(raw_text)
         handoff["entries"].append(
             {
-                "name": "retired_scalar",
+                "name": "unknown_scalar",
                 "value": 1.0,
                 "unit": "1",
                 "owner": "case_dependent",

@@ -28,7 +28,6 @@ from src import common
 
 from . import generation_smoke as smoke_service
 from .cases import generation_cases_config as config_service
-from .contracts import generation_contracts_materials as materials
 from .contracts import generation_contracts_profiles as profiles
 from .validation import generation_validation_sentinels as sentinel_service
 
@@ -50,24 +49,6 @@ def _yaml(path: Path) -> dict[str, Any]:
 def _relative(path: Path) -> str:
     """Return one stable repository-relative configuration path."""
     return path.resolve().relative_to(common.paths.get_project_root().resolve()).as_posix()
-
-
-def _resolved_decision_source(
-    campaigns: tuple[config_service.CampaignConfig, ...],
-) -> dict[str, str]:
-    """Return the one registry-owned decision identity shared by all batches."""
-    decision_source: dict[str, str] | None = None
-    for campaign in campaigns:
-        for batch in campaign.batches:
-            decision_source = materials.validate_decision_source(
-                batch.scientific_values["material"]["decision_source"],
-                label=f"resolved batch {batch.batch_name!r} decision_source",
-                expected=decision_source,
-            )
-    if decision_source is None:
-        message = "Production readiness campaigns contain no resolved batch decision evidence."
-        raise ValueError(message)
-    return decision_source
 
 
 def _primary_missing(path: Path) -> list[str]:
@@ -204,7 +185,6 @@ def build_readiness_report(
             )
             raise ValueError(message)
     campaign_contracts = {campaign.profile.id: _campaign_contract(campaign) for campaign in campaigns}
-    decision_source = _resolved_decision_source(campaigns)
     campaign_resolution_complete = len(campaign_contracts) == len(campaigns)
     resolved_ownership_complete = campaign_resolution_complete
 
@@ -245,8 +225,7 @@ def build_readiness_report(
     )
     return {
         "schema_kind": "vp2_production_readiness",
-        "schema_version": 2,
-        "decision_sha256": decision_source["sha256"],
+        "schema_version": 1,
         "campaign_contracts": campaign_contracts,
         "campaign_ids": [campaign.campaign_id for campaign in campaigns],
         "campaign_config_resolution_complete": campaign_resolution_complete,

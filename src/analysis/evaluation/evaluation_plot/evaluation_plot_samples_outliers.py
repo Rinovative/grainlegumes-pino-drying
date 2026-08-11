@@ -2,12 +2,12 @@
 ===============================================================================
 evaluation_plot_samples_outliers.py
 ===============================================================================
-Restore case, permeability, outlier, and input-extreme presentation.
+Render case, permeability, outlier, and input-extreme views.
 
 Responsibilities:
   - Rank explicit predictive and physical metrics with canonical identity ties
   - Rank supported scientific metadata independently at low and high extremes
-  - Render fixed historical sample, permeability, and two-model field layouts
+  - Render fixed sample, permeability, and two-model field layouts
   - Overlay velocity streamlines on regular display-only physical coordinates
   - Build colored outlier and side-by-side metadata-extreme tables
 
@@ -155,7 +155,7 @@ def build_input_extremes_table(
 
 
 def _fmt_number(value: Any) -> str:
-    """Format one table value with the compact historical numerical style."""
+    """Format one table value with the compact numerical style."""
     if value is None or pd.isna(value):
         return ""
     if isinstance(value, str):
@@ -170,7 +170,7 @@ def _fmt_number(value: Any) -> str:
 
 
 def _rank_style(table: pd.DataFrame, *, reference_row: int) -> pd.DataFrame:
-    """Return historical blue/purple cell fills diverging from the reference."""
+    """Return blue/purple cell fills diverging from the reference."""
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     blue = colormaps["Blues"]
     purple = colormaps["Purples"]
@@ -204,7 +204,7 @@ def _rank_style(table: pd.DataFrame, *, reference_row: int) -> pd.DataFrame:
 
 
 def _channel_outlier_styler(frame: pd.DataFrame, field: presentation.DisplayField, *, top_k: int) -> Styler:
-    """Build one historical worst-five-plus-reference channel table."""
+    """Build one worst-five-plus-reference channel table."""
     values = np.asarray(pd.to_numeric(frame[field.metric_column], errors="raise"), dtype=float)
     positions = list(_rank_positions(frame, values, descending=True)[:top_k])
     reference_position = presentation.reference_case_position(frame)
@@ -236,7 +236,7 @@ def plot_outlier_table(
     """Return automatically rendered colored channel outlier tables."""
     dataframe.validate_comparison(datasets)
     if len(datasets) != 1:
-        msg = "The historical outlier-table view displays one selected dataset."
+        msg = "The outlier-table view displays one selected dataset."
         raise ValueError(msg)
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
         msg = "top_k must be a positive integer."
@@ -251,7 +251,7 @@ def plot_outlier_table(
 
 
 def plot_input_extremes_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
-    """Return historical side-by-side min/reference/max metadata tables."""
+    """Return side-by-side min/reference/max metadata tables."""
     dataframe.validate_comparison(datasets)
     parameters = presentation.metadata_parameters(tuple(datasets.values()))
     if not parameters:
@@ -309,10 +309,10 @@ def _selected_position(frame: pd.DataFrame, row_position: int) -> int:
 
 
 def _single_dataset(datasets: Mapping[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
-    """Return the one dataset selected by a historical local dropdown."""
+    """Return the one dataset selected by a local dropdown."""
     dataframe.validate_comparison(datasets)
     if len(datasets) != 1:
-        msg = "This historical case view requires one selected dataset."
+        msg = "This case view requires one selected dataset."
         raise ValueError(msg)
     return next(iter(datasets.items()))
 
@@ -358,7 +358,7 @@ def _contour(
     title: str,
     case: cases.EvaluationCase,
 ) -> Any:
-    """Draw one historical filled-contour panel and colorbar."""
+    """Draw one filled-contour panel and colorbar."""
     displayed = _clip_to_levels(values, levels)
     image = axis.contourf(x_grid, y_grid, displayed, levels=levels, cmap=cmap)
     axis.set_title(title)
@@ -393,7 +393,7 @@ def _overlay_streamlines(axis: Axes, frame: pd.DataFrame, case: cases.Evaluation
 
 
 def _aggregate_diagonal_permeability(case: cases.EvaluationCase) -> np.ndarray:
-    """Return the historical diagonal-only permeability display aggregate."""
+    """Return the diagonal-only permeability display aggregate."""
     if case.permeability is None:
         msg = "Permeability context is unavailable."
         raise dataframe.ComparisonCompatibilityError(msg)
@@ -453,12 +453,12 @@ def _plot_prediction_overview(
     scale_mode: str,
     title: str,
 ) -> Figure:
-    """Render the restored fixed 4 x 4 prediction/reference/error/input figure."""
+    """Render the fixed 4 x 4 prediction/reference/error/input figure."""
     position = _selected_position(frame, row_position)
     case = cases.load_case(frame, position)
     fields = presentation.display_fields(frame)
     if len(fields) != _REQUIRED_DISPLAY_FIELDS:
-        msg = "The restored overview requires four supported display fields."
+        msg = "The overview requires four supported display fields."
         raise dataframe.ComparisonCompatibilityError(msg)
     scale = _require_scale_mode(scale_mode)
     error = _require_error_mode(error_mode)
@@ -566,7 +566,7 @@ def plot_sample_prediction_overview(
     error_mode: str = "MAE",
     scale_mode: str = "Independent",
 ) -> Figure:
-    """Plot the restored 4 x 4 selected-case prediction overview."""
+    """Plot the 4 x 4 selected-case prediction overview."""
     _label, frame = _single_dataset(datasets)
     return _plot_prediction_overview(
         frame=frame,
@@ -585,7 +585,7 @@ def plot_permeability_error_overlay(
     kappa_scale: str = "log10(kappa)",
     error_mode: str = "MAE",
 ) -> Figure:
-    """Plot the restored 2 x 3 permeability tensor, target, and error view."""
+    """Plot the 2 x 3 permeability tensor, target, and error view."""
     _label, frame = _single_dataset(datasets)
     position = _selected_position(frame, row_position)
     case = cases.load_case(frame, position)
@@ -674,7 +674,7 @@ def plot_pressure_velocity_comparison(
     model_2: str | None = None,
     scale_mode: str = "Independent",
 ) -> Figure:
-    """Plot restored 3 x 2 pressure/speed truth and two-model predictions."""
+    """Plot 3 x 2 pressure/speed truth and two-model predictions."""
     dataframe.validate_comparison(datasets)
     if len(datasets) < _MINIMUM_COMPARISON_MODELS:
         msg = "Pressure/velocity comparison requires at least two models."

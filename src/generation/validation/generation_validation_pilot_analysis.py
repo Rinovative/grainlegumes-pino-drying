@@ -6,7 +6,7 @@ Analyze successful transient pilot cases from canonical HDF5 evidence.
 Responsibilities:
   - Compute exact physical-bound, duration, balance, trend, and extrema diagnostics
   - Derive storage projections only from measured successful pilot artifacts
-  - Preserve supplied validity metadata without inventing scientific domains
+  - Preserve configured applicability metadata without inventing scientific domains
 Design principles:
   - Every material follows one generic diagnostic implementation
   - Conservation residuals remain measurements with no invented pass tolerance
@@ -610,28 +610,26 @@ def schedule_diagnostics(
     }
 
 
-def _validity_overlap(provenance: Mapping[str, Any]) -> str:
-    """Classify only semantics explicitly supplied by status/derivation metadata."""
-    status = str(provenance.get("status", ""))
-    derivation = provenance.get("derivation")
-    kind = str(derivation.get("kind", "")) if isinstance(derivation, Mapping) else ""
-    if "transfer" in status or "transfer" in kind:
+def _applicability_overlap(provenance: Mapping[str, Any]) -> str:
+    """Classify an evidence record without interpreting applicability prose."""
+    evidence = str(provenance.get("evidence", ""))
+    if "transfer" in evidence:
         return "material_transfer"
-    if status.startswith("engineering_") or status in {
+    if evidence.startswith("engineering_") or evidence in {
         "calibration_prior",
         "hierarchical_engineering_prior",
         "synthetic_design",
     }:
         return "engineering_extension"
-    return "not_evaluable_from_supplied_metadata"
+    return "not_evaluable_from_evidence"
 
 
-def scientific_validity_diagnostics(
+def scientific_applicability_diagnostics(
     scientific: Mapping[str, Any],
     *,
     operating_domain: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Expose supplied record validity beside observed pilot extrema without parsing prose."""
+    """Expose record applicability beside observed pilot extrema without parsing prose."""
     material = scientific.get("material")
     registry = material.get("parameter_registry") if isinstance(material, Mapping) else None
     if not isinstance(registry, Mapping):
@@ -661,19 +659,20 @@ def scientific_validity_diagnostics(
             {
                 "record": concern_name,
                 "representative_parameter": str(name),
-                "status": provenance.get("status"),
-                "derivation": provenance.get("derivation"),
-                "confidence": provenance.get("confidence"),
-                "supplied_validity": provenance.get("validity"),
-                "overlap": _validity_overlap(provenance),
-                "classification_basis": "supplied_status_and_derivation_only",
+                "evidence": provenance.get("evidence"),
+                "method": provenance.get("method"),
+                "verification": provenance.get("verification"),
+                "applicability": provenance.get("applicability"),
+                "note": provenance.get("note"),
+                "overlap": _applicability_overlap(provenance),
+                "classification_basis": "configured_evidence_only",
             }
         )
     return {
         "observed_operating_domain": dict(operating_domain),
         "records": selected,
-        "numeric_validity_parsing": "not_performed",
-        "reason": "supplied validity is retained verbatim; absent numeric domains are not fabricated",
+        "numeric_applicability_parsing": "not_performed",
+        "reason": "Configured applicability is exposed verbatim; absent numeric domains are not fabricated.",
     }
 
 
@@ -867,7 +866,7 @@ def analyze_successful_case(
         message = f"Validated canonical case failed a pilot hard-contract reconstruction: {directory}"
         raise ValueError(message)
 
-    validity = scientific_validity_diagnostics(
+    applicability = scientific_applicability_diagnostics(
         scientific,
         operating_domain={
             "T_min_run_K": spatial["run_extrema"]["T_min_run"],
@@ -895,8 +894,8 @@ def analyze_successful_case(
         warnings.append("schedule_feasibility_violation")
     if any(record["positive_step_count"] for record in monotonicity.values()):
         warnings.append("positive_moisture_steps_observed")
-    if any(record["overlap"] != "not_evaluable_from_supplied_metadata" for record in validity["records"]):
-        warnings.append("non_direct_scientific_validity")
+    if any(record["overlap"] != "not_evaluable_from_evidence" for record in applicability["records"]):
+        warnings.append("non_direct_scientific_applicability")
     if physical["status"] == "violation" or not duration["stop_consistent"] or schedule_result["status"] != "pass":
         result_class = "PHYSICAL_CONTRACT_VIOLATION"
     elif duration["result"] == "INVALID_RESULT":
@@ -939,7 +938,7 @@ def analyze_successful_case(
         "trend_diagnostic": monotonicity,
         "extrema_diagnostic": spatial,
         "schedule_input_sanity": schedule_result,
-        "validity_domain_diagnostic": validity,
+        "applicability_domain_diagnostic": applicability,
         "numerical_runtime": {
             "runtime_s": status["runtime_s"],
             "regular_state_count": int(status["n_regular_states"]),

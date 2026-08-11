@@ -773,8 +773,8 @@ def validate_resume_config(
 
     ``training.epochs`` may remain equal or increase. Decreases and every
     task/data/model/loss/optimizer/scheduler change are rejected. The requested
-    derived ``run.name`` may differ from a historical saved naming version; the
-    saved name remains authoritative. ``run.device`` and resolved paths are
+    derived ``run.name`` may differ from the saved name; the saved name remains
+    authoritative for that run bundle. ``run.device`` and resolved paths are
     runtime metadata handled separately.
     """
     differences = _different_fields(

@@ -26,6 +26,13 @@ _PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_chec
 _PRODUCTION_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
 
 
+def test_applicability_overlap_uses_only_the_canonical_evidence_class() -> None:
+    """Avoid warning on direct evidence while retaining transfer and engineering flags."""
+    assert analysis_service._applicability_overlap({"evidence": "literature_direct"}) == "not_evaluable_from_evidence"
+    assert analysis_service._applicability_overlap({"evidence": "literature_transfer"}) == "material_transfer"
+    assert analysis_service._applicability_overlap({"evidence": "engineering_estimate"}) == "engineering_extension"
+
+
 def _pilot(cases_per_material: int) -> config_service.CampaignConfig:
     return config_service.load_campaign_config(
         _PILOT_CAMPAIGN,

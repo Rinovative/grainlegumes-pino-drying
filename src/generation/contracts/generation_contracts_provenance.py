@@ -5,11 +5,11 @@ generation_contracts_provenance.py
 Validate central scientific sources and effective parameter provenance.
 Responsibilities:
   - Validate one unique source register with plain canonical locators
-  - Validate supplied status, derivation, confidence, and validity structures
+  - Validate compact evidence, method, verification, and applicability records
   - Expand source references for resolved inspection without duplicating citations
 Design principles:
-  - Scientific interpretation is supplied by the validated handoff package
-  - Missing derivation inputs remain missing rather than being reconstructed
+  - Scientific interpretation is explicit in canonical provenance records
+  - Optional detail is admitted only when it has a distinct scientific purpose
   - Atomic-record components inherit their complete record provenance
 This module does NOT:
   - Search for evidence, invent derivations, or change scientific values
@@ -20,11 +20,11 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final
 
-EVIDENCE_STATUSES: Final = (
+EVIDENCE_CLASSES: Final = (
     "literature_direct",
     "literature_fit",
     "literature_transfer",
@@ -40,8 +40,17 @@ EVIDENCE_STATUSES: Final = (
     "derived",
     "coupled_record",
 )
-DERIVATION_ORIGIN: Final = "supplied_by_handoff"
-DERIVATION_VERIFICATIONS: Final = ("declared_only", "mathematically_reproduced")
+REPRODUCED_VERIFICATION: Final = "mathematically_reproduced"
+SOURCE_REQUIRED_EVIDENCE_CLASSES: Final = frozenset(
+    {
+        "coupled_record",
+        "literature_convention_conversion",
+        "literature_direct",
+        "literature_fit",
+        "literature_transfer",
+        "official_industry_target",
+    }
+)
 SOURCE_TYPES: Final = (
     "journal_article",
     "project_report",
@@ -51,30 +60,13 @@ SOURCE_TYPES: Final = (
     "book_or_manual",
     "institutional_record",
 )
-VALIDITY_KEYS: Final = frozenset(
+APPLICABILITY_KEYS: Final = frozenset(
     {
-        "material_scope_ref",
-        "product_form",
-        "temperature",
-        "humidity_or_aw",
-        "moisture",
+        "evidence_scope",
+        "general",
+        "limitation",
         "moisture_basis",
-        "packing_or_flow_regime",
-        "equation_or_method",
-        "transfer_limit",
-        "supplied_scope",
-    }
-)
-_DERIVATION_KEYS: Final = frozenset(
-    {
-        "kind",
-        "origin",
-        "verification",
-        "description",
-        "inputs",
-        "formula_or_method",
-        "assumptions",
-        "supplied_status",
+        "packing",
     }
 )
 _SOURCE_KEYS: Final = frozenset(
@@ -85,16 +77,6 @@ _SOURCE_KEYS: Final = frozenset(
         "canonical_locator",
         "alternate_locators",
         "source_type",
-    }
-)
-_PROVENANCE_KEYS: Final = frozenset(
-    {
-        "source_refs",
-        "status",
-        "derivation",
-        "confidence",
-        "validity",
-        "notes",
     }
 )
 
@@ -136,71 +118,18 @@ def _text_sequence(value: Any, *, label: str, allow_empty: bool = False) -> list
     return result
 
 
-def bind_decision_source(
-    value: Any,
-    decision_source: Mapping[str, str],
-) -> dict[str, Any]:
-    """Expand the registry-owned decision identity into its provenance citation."""
-    config = _mapping(value, label="generation source registry")
-    decision = _mapping(decision_source, label="generation decision source")
-    _exact_keys(
-        decision,
-        required={"artifact", "schema_version", "sha256"},
-        optional=set(),
-        label="generation decision source",
-    )
-    if not all(isinstance(item, str) and item for item in decision.values()):
-        message = "Generation decision-source values must be non-empty text."
-        raise TypeError(message)
-    raw_sources = config.get("sources")
-    if not isinstance(raw_sources, list):
-        message = "generation source registry.sources must be a list."
-        raise TypeError(message)
-    matches = [(index, raw) for index, raw in enumerate(raw_sources) if isinstance(raw, Mapping) and raw.get("source_key") == "vp2_decision_contract"]
-    if len(matches) != 1:
-        message = "Generation source registry must declare one vp2_decision_contract citation stub."
-        raise ValueError(message)
-    index, raw = matches[0]
-    stub = _mapping(raw, label="generation source registry vp2_decision_contract")
-    _exact_keys(
-        stub,
-        required={"source_key", "decision_date", "alternate_locators", "source_type"},
-        optional=set(),
-        label="generation source registry vp2_decision_contract",
-    )
-    decision_date = _text(
-        stub["decision_date"],
-        label="generation source registry vp2_decision_contract.decision_date",
-    )
-    raw_sources[index] = {
-        "source_key": "vp2_decision_contract",
-        "citation": f"VP2 Parameter Decisions, schema {decision['schema_version']} ({decision_date}).",
-        "identifier": f"sha256:{decision['sha256']}",
-        "canonical_locator": f"artifact:{decision['artifact']}",
-        "alternate_locators": copy.deepcopy(stub["alternate_locators"]),
-        "source_type": stub["source_type"],
-    }
-    config["decision_source"] = copy.deepcopy(decision)
-    return config
-
-
-def validate_source_registry(
-    value: Any,
-    *,
-    decision_validator: Callable[[Any], Mapping[str, str]],
-) -> dict[str, dict[str, Any]]:
+def validate_source_registry(value: Any) -> dict[str, dict[str, Any]]:
     """Validate one central source registry and return it keyed by source key."""
     config = _mapping(value, label="generation source registry")
     _exact_keys(
         config,
-        required={"schema_kind", "schema_version", "decision_source", "sources"},
+        required={"schema_kind", "schema_version", "sources"},
         optional=set(),
         label="generation source registry",
     )
     if config["schema_kind"] != "generation_sources" or config["schema_version"] != 1:
         message = "Unsupported generation source-registry schema."
         raise ValueError(message)
-    decision_validator(config["decision_source"])
     raw_sources = config["sources"]
     if not isinstance(raw_sources, list) or not raw_sources:
         message = "generation source registry.sources must be a non-empty list."
@@ -237,79 +166,53 @@ def validate_provenance(
     sources: Mapping[str, Mapping[str, Any]],
     label: str,
 ) -> dict[str, Any]:
-    """Validate one handoff-supplied scientific provenance chain."""
+    """Validate one compact scientific provenance record."""
     provenance = _mapping(value, label=label)
     _exact_keys(
         provenance,
-        required={"source_refs", "status", "derivation", "confidence", "validity"},
-        optional={"notes"},
+        required={"evidence", "source_refs"},
+        optional={"method", "verification", "applicability", "note"},
         label=label,
     )
-    source_refs = _text_sequence(provenance["source_refs"], label=f"{label}.source_refs")
+    evidence = provenance["evidence"]
+    if evidence not in EVIDENCE_CLASSES:
+        message = f"{label}.evidence must be one of {list(EVIDENCE_CLASSES)}, got {evidence!r}."
+        raise ValueError(message)
+    source_refs = _text_sequence(
+        provenance["source_refs"],
+        label=f"{label}.source_refs",
+        allow_empty=True,
+    )
     unknown_sources = sorted(set(source_refs).difference(sources))
     if unknown_sources:
         message = f"{label}.source_refs contains unknown keys {unknown_sources}."
         raise ValueError(message)
-    status = provenance["status"]
-    if status not in EVIDENCE_STATUSES:
-        message = f"{label}.status must be one of {list(EVIDENCE_STATUSES)}, got {status!r}."
+    if not source_refs and evidence in SOURCE_REQUIRED_EVIDENCE_CLASSES:
+        message = f"{label}.source_refs must identify evidence for {evidence!r}."
         raise ValueError(message)
-    derivation = _mapping(provenance["derivation"], label=f"{label}.derivation")
-    _exact_keys(
-        derivation,
-        required={"kind", "origin", "verification"},
-        optional=set(_DERIVATION_KEYS).difference({"kind", "origin", "verification"}),
-        label=f"{label}.derivation",
-    )
-    derivation["kind"] = _text(derivation["kind"], label=f"{label}.derivation.kind")
-    if derivation["origin"] != DERIVATION_ORIGIN:
-        message = f"{label}.derivation.origin must be {DERIVATION_ORIGIN!r}."
-        raise ValueError(message)
-    if derivation["verification"] not in DERIVATION_VERIFICATIONS:
-        message = f"{label}.derivation.verification must be one of {list(DERIVATION_VERIFICATIONS)}."
-        raise ValueError(message)
-    for name in ("description", "formula_or_method", "supplied_status"):
-        if name in derivation:
-            derivation[name] = _text(derivation[name], label=f"{label}.derivation.{name}")
-    for name in ("inputs", "assumptions"):
-        if name in derivation:
-            derivation[name] = _text_sequence(
-                derivation[name],
-                label=f"{label}.derivation.{name}",
-                allow_empty=True,
-            )
-    confidence = _text(provenance["confidence"], label=f"{label}.confidence")
-    validity = _mapping(provenance["validity"], label=f"{label}.validity")
-    unknown_validity = sorted(set(validity).difference(VALIDITY_KEYS))
-    if unknown_validity:
-        message = f"{label}.validity contains unknown structured fields {unknown_validity}."
-        raise ValueError(message)
-    for name, item in validity.items():
-        if item is None:
-            message = f"{label}.validity.{name} must be omitted rather than null."
-            raise ValueError(message)
-        if isinstance(item, str):
-            validity[name] = _text(item, label=f"{label}.validity.{name}")
-        elif isinstance(item, Mapping):
-            nested = _mapping(item, label=f"{label}.validity.{name}")
-            if not nested or any(value is None for value in nested.values()):
-                message = f"{label}.validity.{name} must be a non-empty mapping without null values."
-                raise ValueError(message)
-            validity[name] = nested
-        elif isinstance(item, list):
-            validity[name] = _text_sequence(item, label=f"{label}.validity.{name}")
-        else:
-            message = f"{label}.validity.{name} has unsupported type {type(item).__name__}."
-            raise TypeError(message)
-    result = {
+    result: dict[str, Any] = {
+        "evidence": evidence,
         "source_refs": source_refs,
-        "status": status,
-        "derivation": derivation,
-        "confidence": confidence,
-        "validity": validity,
     }
-    if "notes" in provenance:
-        result["notes"] = _text(provenance["notes"], label=f"{label}.notes")
+    if "method" in provenance:
+        result["method"] = _text(provenance["method"], label=f"{label}.method")
+    if "verification" in provenance:
+        if provenance["verification"] != REPRODUCED_VERIFICATION:
+            message = f"{label}.verification must be {REPRODUCED_VERIFICATION!r} when present."
+            raise ValueError(message)
+        result["verification"] = REPRODUCED_VERIFICATION
+    if "applicability" in provenance:
+        applicability = _mapping(provenance["applicability"], label=f"{label}.applicability")
+        if not applicability:
+            message = f"{label}.applicability must be omitted rather than empty."
+            raise ValueError(message)
+        unknown = sorted(set(applicability).difference(APPLICABILITY_KEYS))
+        if unknown:
+            message = f"{label}.applicability contains unknown fields {unknown}."
+            raise ValueError(message)
+        result["applicability"] = {name: _text(item, label=f"{label}.applicability.{name}") for name, item in applicability.items()}
+    if "note" in provenance:
+        result["note"] = _text(provenance["note"], label=f"{label}.note")
     return result
 
 

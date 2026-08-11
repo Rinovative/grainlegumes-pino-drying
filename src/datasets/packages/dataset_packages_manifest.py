@@ -13,7 +13,7 @@ Design principles:
   - Unsafe, missing, malformed, or mismatched artifacts fail closed
 This module does NOT:
   - Build packages, select source cases, construct Datasets, or create DataLoaders
-  - Support historical schemas, aliases, fallback paths, or partial admission
+  - Support alternate schemas, aliases, fallback paths, or partial admission
 ===============================================================================
 """
 

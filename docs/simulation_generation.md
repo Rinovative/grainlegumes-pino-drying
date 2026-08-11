@@ -1,23 +1,72 @@
-# VP2 Simulation Generation and Campaign Workflow
+# Generation Operations and Campaign Workflow
 
 ## Quick start
 
-Run local commands from `/workspace/repo` in the development container. The
-workflow connects to the native CPU/COMSOL host declared by the resolved
-execution configuration; it publishes validated results into the local
-`STORAGE_ROOT`.
+Run public workflow commands from the `hpc115` GPU/development host, outside
+Docker, in the repository checkout. The wrapper uses the local native Python
+environment for orchestration and Dataset packaging, then owns non-interactive
+SSH and rsync to the configured native CPU/COMSOL host `sricehpc01`. COMSOL 6.4
+and Slurm run only on `sricehpc01`; users do not manually SSH for normal
+workflow stages. Validated Generation publications return to the canonical
+`STORAGE_ROOT` on `hpc115`. Docker remains the development and learning
+environment, not a CPU COMSOL requirement.
 
 > Configured scientific values are modelling and sampling decisions. A citation
 > does not imply that every final number appears verbatim in its source. The
-> authoritative interpretation is the resolved `status`, `derivation`,
-> `confidence`, and `validity`; technical runtime evidence does not constitute
-> experimental validation.
+> authoritative interpretation is the resolved `evidence` classification,
+> source references, and any explicit method or applicability limit; technical
+> runtime evidence does not constitute experimental validation.
+
+## Where do I change what?
+
+> User decisions live in config. Rules and invariants live in code. Derived
+> outputs are not separately authored.
+
+| Intent | Canonical owner | What the user changes | Derived automatically |
+| --- | --- | --- | --- |
+| Domain dimensions and grid resolution | `configs/generation/common.yaml` (`grid`) | `Lx`, `Ly`, `Lz`, `nx`, `ny`, boundary inclusion | `dx`, `dy`, coordinates, shapes |
+| Regular output interval and maximum horizon | `configs/generation/common.yaml` (`time`) | `start`, `interval`, `stop`, step and exact-stop policy | Regular time axis and diagnostic-stop handling |
+| Shared fixed scientific values | `configs/generation/common.yaml` (`scientific_fixed_values`) | Validated value, unit, and provenance | Formula-derived fixed values such as `U_wall` |
+| Parameter definitions, transforms, sampling order, and OOD policy | `configs/generation/registry.yaml` | Typed parameter and OOD declarations | Profile projections, active blocks, dimensions, eligible OOD units |
+| Material values, supports, evidence, targets, complete records | `configs/generation/materials/<family>.yaml` | One role-neutral family record | Effective registry, material digest, atomic OOD admission |
+| Operation and boundary-condition ranges | `configs/generation/operations/fixed_bed.yaml` | Natural/OOD supports, nominals, schedules, constraints | Case schedules and operation digest |
+| Profile I/O, mappings, exports, template identity | `configs/generation/profiles/steady_flow.yaml` or `transient_drying.yaml` | Explicit mapping state and profile contract | Runtime adapter and export admission plan |
+| Material roles and family OOD | Selected `configs/generation/campaigns/<profile>/<campaign>.yaml` | `material_roles` | Evaluation regimes and package materials |
+| Source-case counts | Production campaign `sampling.counts` | Counts by regime and family | Total, batches, indices, OOD allocation |
+| Train, validation, ID membership | Production campaign `membership.per_seen_material` | Split counts | Split membership and package eligibility |
+| Campaign and membership seeds | Selected campaign YAML | `sampling.seed_base`, `membership.seed`, paired seed | Batch, block, permutation, and case seeds |
+| Technical-smoke cases | Both profile `technical_smoke.yaml` files | Natural counts and paired seed | Paired two-profile plan and retained packages |
+| Pilot cases | `configs/generation/campaigns/transient_drying/pilot_check.yaml` | `sampling.cases_per_material` and seed | Default 18; fast override is 6 |
+| Dataset package requests | Campaign `dataset_packages` | Source role and evaluation regime | Package names, materials, views, counts |
+| Slurm resources | `configs/generation/execution/cluster_cpu.yaml` (`cluster`) | Nodes, packing, cores, parallelism, wall time | Validated `sbatch` arguments and worker pool |
+| CPU site, modules, partition | `configs/generation/execution/cluster_cpu.yaml` (`site`) | Site values only when infrastructure changes | Remote setup, module loads, executables |
+| Timeout and failure policy | `configs/generation/execution/cluster_cpu.yaml` (`runtime`) | Timeout, maximum failures, extra arguments | Runtime and campaign stop behavior |
+| Solved-model and raw-CSV retention | `configs/generation/execution/cluster_cpu.yaml` (`retention`) | Purpose-specific booleans | Per-case retained evidence |
+| CPU source retention | Workflow invocation | Only `--keep-cpu-source` | `all` and pilot clean by default; smoke retains |
+| Transfer and storage | `STORAGE_ROOT` and wrapper-managed remote layout | Optional `STORAGE_ROOT` and `--remote-root` | Staging, rsync, atomic publication, receipts |
+| Source bibliography | `configs/generation/sources.yaml` | Source key and bibliographic metadata | Reference resolution and inspection evidence |
+
+Scientific definitions, ranges, equations, provenance classifications, and
+source references are documented only in
+`docs/generation_parameter_reference.md`.
+
+## Host responsibilities
+
+| Host | Responsibility | User interaction |
+| --- | --- | --- |
+| `hpc115` | Repository/config review, wrapper invocation, canonical `01_generation`, Dataset packages in `02_datasets`, Docker-backed development and training | Type every `generation_workflow.sh` command here; provide native Generation Python dependencies |
+| `sricehpc01` | Native Python 3.10, `Comsol/v6.4`, COMSOL, Slurm, isolated workspaces, CPU source | Wrapper-owned batch SSH and rsync; manual SSH only for requested inspection of retained evidence |
+
+The default remote layout is `$HOME/grainlegumes-generation/{repo,storage,venv}`
+on `sricehpc01`. Override it only with `--remote-root`. The local storage root
+defaults to the `storage` sibling of the checkout and may be overridden with
+`STORAGE_ROOT`.
 
 Set the shared local values first:
 
 ```bash
-cd /workspace/repo
-export STORAGE_ROOT=/workspace/storage
+# from the repository checkout on hpc115
+export STORAGE_ROOT="$(realpath ../storage)"
 STEADY_CAMPAIGN=configs/generation/campaigns/steady_flow/family_generalization.yaml
 TRANSIENT_CAMPAIGN=configs/generation/campaigns/transient_drying/family_generalization.yaml
 PILOT_CAMPAIGN=configs/generation/campaigns/transient_drying/pilot_check.yaml
@@ -52,6 +101,17 @@ counts and their derived total, memberships, authored and derived seed plans,
 package requests and resolved package inventory, eligible parameter-OOD units and
 allocations, purpose-specific pilot or smoke scope, bounded static-sentinel work,
 execution resources, and exact readiness gates.
+
+Run the non-solving native preflight for each campaign after local validation:
+
+```bash
+./scripts/generation_workflow.sh preflight "$STEADY_CAMPAIGN"
+./scripts/generation_workflow.sh preflight "$TRANSIENT_CAMPAIGN"
+```
+
+Preflight is remotely executed on `sricehpc01` and audits the configured modules,
+executables, Slurm capacity, venv, paths, and template/config binding without a
+COMSOL solve or job submission.
 
 3. Preview the resolved Slurm plan after every primary gate is filled:
 
@@ -93,7 +153,7 @@ GENERATION_RUN_ID='<campaign_run_id>'
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID"
 ```
 
-7. Execute only the previously authorized cleanup:
+7. Execute only the authorized cleanup:
 
 ```bash
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
@@ -145,8 +205,8 @@ The owners are:
 
 | Owner | Controls | Excludes |
 | --- | --- | --- |
-| `configs/generation/sources.yaml` | Supplied bibliographic records keyed once | Parameter values, inferred assignments, roles, execution |
-| `configs/generation/registry.yaml` | Canonical decision identity, parameter names, units, kinds, transforms, sampling order, OOD groups, components, derivations | Material supports, campaign counts, mappings, cluster resources |
+| `configs/generation/sources.yaml` | Bibliographic records keyed once | Parameter values, inferred assignments, roles, execution |
+| `configs/generation/registry.yaml` | Parameter names, units, kinds, transforms, sampling order, OOD groups, components, derivations | Material supports, campaign counts, mappings, cluster resources |
 | `configs/generation/common.yaml` | Grid, time, shared fixed physics, formulas, adapter and storage contracts | Material values, roles, counts, learning choices |
 | `configs/generation/operations/<operation>.yaml` | Operation supports and constraints | Material values, template mappings, execution resources |
 | `configs/generation/materials/<family>.yaml` | Role-neutral material scope, natural supports, coupled records, targets, evidence | Campaign role, membership, count, profile, execution |
@@ -179,126 +239,69 @@ Validation errors identify the exact file, key, rule, actual value, and owner to
 edit. Resolved identities, allocation evidence, and the effective scientific
 configuration persist with generated artifacts.
 
-## Python responsibility boundaries
+## Supported progression and evidence
 
-The Generation source layout follows the lifecycle: `generation_contracts_*`
-own scientific contracts; `generation_cases_*` own config resolution and case
-inputs; `generation_runtime_*` own native execution;
-`generation_publication_*` own HDF5 and campaign evidence; and
-`generation_validation_*` own sentinels and pilot checks. These visible prefixes
-keep ownership clear when a module is imported away from its directory.
+| Stage | Public action on `hpc115` | Work performed | Required evidence before continuing |
+| ---: | --- | --- | --- |
+| 1 | Edit the authoritative YAML | User decisions only | Reviewed diff and clean commit before remote execution |
+| 2 | `validate-config ... --allow-incomplete` | Resolves all owners without solving | Counts, dimensions, roles, seeds, packages, OOD plan, template and exact gates |
+| 3 | `setup-cpu` then `preflight` | Bootstraps exact commit/venv; audits modules, executables, storage and Slurm | Successful setup and preflight reports |
+| 4 | `smoke` when mappings need confirmation | Runs retained one-case native mapping probes and inventories real output names/headers | Human-reviewed profile mapping YAML; rerun from a clean committed state |
+| 5 | `smoke` | Paired steady/transient native technical campaign, transfer, publication, packages and loader smokes | Source-current immutable real-smoke receipt; CPU source retained |
+| 6 | `pilot-check .../pilot_check.yaml` | Six-material transient diagnostics and storage measurement | Accepted pilot receipt and reviewed diagnostics |
+| 7 | `all <production campaign>` | Preflight, plan, Slurm run, monitor, terminal validation, collection, package build, loader smokes and gated cleanup | Terminal all-workflow, transfer, Dataset, and cleanup receipts |
+| 8 | `validate`, `status`, or direct receipt validators | Revalidates publication and lifecycle evidence | Exact successful receipt/digest state |
+| 9 | `cleanup RUN_ID` then `--confirm` when needed | Preview then execute digest-authorized CPU cleanup | No active job; all transfer, Dataset, workflow and inventory digests agree |
 
-`src.generation` is the stable facade, and
-`python -m src.generation.cli.cli_generation` remains the supported command.
-Concrete dependencies flow from contracts to cases to publication, then to
-runtime and validation; top-level campaign, workflow, smoke, readiness, and CLI
-services orchestrate those owners. Lower packages never import workflow or CLI
-layers.
+No native COMSOL, Slurm, pilot, or production step is implied by a static test.
 
-After terminal publication, the workflow invokes `src.datasets.packages`. Dataset
-code mirrors the split through `dataset_contracts_*`, `dataset_packages_*`,
-`dataset_preprocessing_*`, and `dataset_runtime_*`. The canonical package facade
-and CLI remain `src.datasets.dataset_packages`, preserving the persisted
-`src.datasets.dataset_packages.build_campaign_packages` identity while delegating
-to one implementation. Training, EDA, and Evaluation import the public
-`datasets` alias with `from src import datasets`, not package directories or HDF5
-internals. The exact consumer aliases and Dataset responsibility table are in the
-[README](../README.md#-python-ownership-and-public-apis).
+## Current native production gate
 
-## Transient scalar execution boundary
+Static contracts agree on the corrected transient interface:
 
-Every transient case publishes an ordered 12-row `scalars.csv` file containing
-only values that vary by case and are actually supplied through COMSOL runtime
-parameter overrides. The exact order and units are in the
-[parameter reference](generation_parameter_reference.md#transient-scalar-handoff).
-One immutable admission in
-`generation.contracts.generation_contracts_scalar_handoff` validates the file
-and case provenance before execution, and runtime emits the same 12 entries
-through `-pname`, `-plist`, and `-pindex`. A steady command has none of these
-parameter flags.
+- `schedule.csv` has four total columns: argument `t` and values `T_in_bc`,
+  `omega_in_bc`, `phi_in_bc`;
+- native interpolation is linear;
+- the runtime scalar handoff contains exactly 12 ordered case-dependent COMSOL
+  parameter overrides;
+- the template derives `T_init = T_amb`.
 
-Python supplies `T_amb`; the corrected canonical template owns the derived alias
-`T_init = T_amb`. The fixed values `T_flow_ref`, `p_ref`, `p_out`, and
-`f_wet_dm_max` retain their existing scientific-configuration/template owners
-and are not duplicated into the case scalar handoff or its HDF5 vector. The
-canonical HDF5 runtime-scalar dataset therefore contains exactly the admitted
-12 case-dependent entries. The learned eight-scalar Dataset projection remains
-separate and unchanged.
+Production remains blocked until real native COMSOL evidence proves that the
+saved template reloads the four-column schedule, consumes all three functions,
+accepts all 12 overrides, preserves `T_init = T_amb`, solves, produces the
+expected exports, and passes canonical HDF5/publication/package admission. That
+native gate has not been executed merely because the template checksum, static
+archive inspection, fake runtime, or unit tests pass. Scientific details and
+the exact scalar order are owned by the parameter reference.
 
-The schedule adapter has four total columns: one `t` argument column and three
-function-value columns `T_in_bc`, `omega_in_bc`, and `phi_in_bc`. The corrected
-saved template maps them to `T_in_bc_file`, `omega_in_bc_file`, and
-`phi_in_bc_file`, with linear interpolation and constant extrapolation. Adjacent
-hourly endpoints are sufficient to represent each interval; no interval
-aggregate is duplicated into the Dataset.
+## Canonical command surface
 
-COMSOL may add a suffix to a parameterized output. Runtime inventories only
-`solved*.mph` before launch, rejects unchanged or unsafe candidates after a zero
-exit, requires exactly one new or replaced nonempty regular file, and atomically
-canonicalizes it to `solved.mph`. Execution provenance preserves both filenames
-and the exact scalar CLI binding.
+All wrapper commands below are invoked on `hpc115`. Commands that would solve or
+submit are shown for syntax and must run only after their gates are accepted.
 
-The test-owned fake executable parses and uses the CLI values; static archive
-inspection verifies the saved descriptor; and the sidecar validates the exact
-canonical template bytes. These are contract and byte-identity evidence, not
-native solver evidence. A real transient technical smoke remains required to
-prove native parameter application, schedule-file reload, retained output, and
-the downstream HDF5/package/loader path.
+| Command | Effect and evidence | Mutation/retention |
+| --- | --- | --- |
+| `./scripts/generation_workflow.sh setup-cpu` | Prints exact remote bootstrap plan | Read-only until `--execute` |
+| `... setup-cpu --execute` | Creates/updates exact remote checkout, storage and venv | Mutates configured remote layout, no solve |
+| `... preflight CAMPAIGN` | Audits resolved config, native environment and resources | No solve or Slurm submission |
+| `... plan CAMPAIGN` | Prints exact paths and Slurm arguments | Read-only, fails closed on unresolved gates |
+| `... smoke` | Owns mapping probes when required, then paired native technical gate | Native/Slurm; always retains CPU source |
+| `... pilot-check configs/generation/campaigns/transient_drying/pilot_check.yaml` | Runs transient diagnostic lifecycle | Native/Slurm; cleans CPU/staging after validated analysis by default |
+| `... launch CAMPAIGN` | Submits one campaign and prints run ID | Native/Slurm primitive; does not perform full local lifecycle |
+| `... all CAMPAIGN` | Full synchronous production through Dataset receipts and cleanup | Native/Slurm; cleans verified CPU source unless `--keep-cpu-source` |
+| `... collect RUN_ID` | Validates terminal CPU source, rsyncs to marked staging, atomically publishes | Nondestructive to CPU source; cleans successful non-pilot staging |
+| `... build-datasets RUN_ID` | Builds/reuses every requested package and smokes loaders | Writes immutable `02_datasets` packages; preserves `01_generation` |
+| `... status RUN_ID` / `... accounting RUN_ID` | Reconstructs local/remote state or prints scheduler evidence | Read-only |
+| `... resume RUN_ID` | Resumes the persisted incomplete workflow/stage | Submits only validated incomplete membership when required |
+| `... validate RUN_ID` | Revalidates remote terminal campaign | Read-only |
+| `... cancel RUN_ID` | Cancels every persisted active Slurm attempt | Mutates scheduler state, not data |
+| `... cleanup RUN_ID` | Prints exact authorized CPU deletion plan | Dry-run |
+| `... cleanup RUN_ID --confirm` | Deletes only digest-authorized inactive CPU source and records receipt | Destructive and gated; GPU publication remains |
 
-## Transient Dataset time and sampling views
-
-The compact transient index stores only authoritative HDF5 and schedule indices.
-The shared `datasets.runtime.transient.TransientPhysicalDataset` reads physical
-`t_n`, `t_n_plus_1`, and `dt` directly from the regular HDF5 time axis as
-float32 tensors in hours. The configured normalization horizon comes from the
-embedded resolved `scientific_config.time.stop`; it is never inferred from an
-early case stop, exact-stop diagnostic, trajectory length, or rollout length.
-
-`datasets.contracts.transient.TransientSamplingSpec` requires an explicit mode:
-
-- `one_step_transition` returns ground-truth `state`, shared `static` and eight
-  scientific `scalars`, endpoint `boundary`, scalar time tensors, and the target
-  increment `q_(n+1) - q_n`;
-- `rollout_window` returns one initial ground-truth state plus consecutive
-  boundary, time, and target-increment sequences for an explicit length, stride,
-  and offset.
-
-Both modes share one package interpreter, HDF5 reader, bounded process-local
-handle cache, source mutation checks, channel contract, and case membership.
-They never cross a case boundary or include an irregular exact-stop state. The
-hourly boundary channels remain adjacent `T_in_bc` and `phi_in_bc` endpoints: a
-linear interval is uniquely determined by those endpoints, so no mean, integral,
-or sub-hour feature is added.
-
-Learning exposes an explicit `normalized_current_time` or `none` policy through
-`learning.temporal`; `experiments.config.temporal` validates it together with
-the sampling mode without a hidden default. These APIs prepare the stable
-Dataset/config boundary only. No transient TaskSpec, full transient trainer,
-autoregressive optimization loop, EDA extension, or Evaluation extension is
-claimed here.
-
-## Resolved campaign and package semantics
-
-Campaign YAML owns role assignment, sampling counts and seed namespaces,
-learning membership, and package requests. Resolution derives material and
-evaluation inventories, batch names and identities, source-case totals, package
-materials, split eligibility, and profile-expanded package names. A pilot
-campaign resolves no normal dataset packages; a technical runtime smoke keeps
-its operational membership distinct from learning membership.
-
-Parameter-OOD planning derives profile-applicable units from the projected
-registry and the material's actual tails or alternate atomic records. Each case
-activates one unit. The deterministic allocation covers every eligible unit
-when capacity permits and distributes remaining cases evenly. The exact unit
-inventory, group, per-unit counts, and per-case allocation appear under
-`parameter_ood` and persist in resolved scientific provenance. A profile cannot
-select a unit that its registry projection excludes.
-
-Static sentinels are deliberately independent of production counts. The
-`static_sentinel_workload` view reports their bounded natural-material and
-eligible-OOD coverage before the sentinels run. This keeps scientific checks
-complete when campaign counts or material inventories change without turning
-production configuration into a golden fixture.
+Resource overrides are `--wall-time`, `--only-batch`, and the validated node,
+case, core, and parallelism flags shown by `--help`. `--skip-extreme-family-ood`
+is a one-run omission and cannot be combined with `--only-batch`. `--detach`
+applies to `all`; `--keep-cpu-source` is the sole source-retention override.
 
 ## CPU/GPU path and lifecycle
 
@@ -311,7 +314,7 @@ configured native CPU / COMSOL host
                  |
                  | validated rsync staging and atomic publication
                  v
-GPU/container storage
+hpc115 canonical storage
   01_generation
   -> immutable packages in 02_datasets
   -> learning runs and artifacts in 03_experiments
@@ -332,6 +335,17 @@ Cleanup is dry-run by default. Confirmation is accepted only after source
 inventory, transfer, dataset, and workflow digests agree and no active job owns
 the source. The technical smoke overrides cleanup to retain source evidence for
 manual review.
+
+On `sricehpc01`, the wrapper owns campaign source below the remote
+`$HOME/grainlegumes-generation/storage/01_generation` root and creates isolated
+worker directories with guarded markers. On `hpc115`, collection creates marked
+`01_generation/.state/transfer-staging` content, validates every declared byte,
+and atomically publishes the immutable campaign under canonical `01_generation`
+paths. Existing successful cases and valid publications are reused rather than
+overwritten. `collect` never deletes CPU source. Dataset packages are built on
+`hpc115` under `02_datasets`; transient indexes continue to reference canonical
+`01_generation` case files. `resume` reconstructs persisted stage evidence and
+submits only incomplete validated membership.
 
 ## Smoke versus production
 
@@ -391,7 +405,7 @@ batch assignment. The pilot uses natural support only and performs no parameter
 OOD, family-OOD sampling, training membership, or automatic calibration. Its
 generic analysis checks runtime and conversion contracts, drying duration,
 natural-support robustness, physical bounds, water balances without an invented
-tolerance, run-wide extrema, heterogeneity, schedules, supplied validity
+tolerance, run-wide extrema, heterogeneity, schedules, configured applicability
 metadata, and measured storage for every resolved material.
 
 A smaller diagnostic can override the resolved cases-per-material value for that
@@ -430,6 +444,27 @@ after validation. There is no storage-budget pass/fail guard. The command stops
 before native execution whenever the current readiness report has an unresolved
 gate.
 
+## Production generation
+
+Production prerequisites are both accepted gates: the source-current paired
+native COMSOL technical smoke and the transient pilot receipt. Do not infer
+acceptance from static tests or checksums, and do not claim that production has
+already run.
+
+```bash
+./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN"
+./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"
+```
+
+The wrapper uses campaign-owned counts, roles, seeds, package requests and
+execution defaults. It fails closed on a dirty checkout, commit/config/template
+mismatch, unresolved mapping, native or HDF5 admission failure, incomplete
+Slurm membership, transfer mismatch, package failure, or loader-smoke failure.
+The resulting canonical evidence is an immutable `01_generation` publication,
+transfer receipt, requested `02_datasets` packages, loader-smoke receipt, and
+all-workflow receipt. Use `--keep-cpu-source` only when native source must remain
+for review; otherwise CPU cleanup occurs only after every local gate passes.
+
 ## Readiness gates
 
 Run:
@@ -443,7 +478,7 @@ python -m src.generation.cli.cli_generation readiness-report \
 The report owns its status vocabulary and includes one structured record for
 each configuration, static-science, mapping, native-runtime, and launch gate.
 Treat its current JSON as authoritative; do not infer readiness from a template
-hash, a historical receipt, or documentation text. Launch is ready only when
+hash, a cached receipt, or documentation text. Launch is ready only when
 the resolved production configuration, static scientific checks, reviewed
 mappings, native profile reloads, scalar handoff, paired-equivalence
 observations, HDF5/package/loader validation, and a source-current real-smoke

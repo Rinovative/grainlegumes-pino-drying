@@ -54,7 +54,7 @@ PILOT_PRE_CLEANUP_FILENAME: Final = "pilot_check_pre_cleanup.json"
 PILOT_STAGING_CLEANUP_FILENAME: Final = "pilot_staging_cleanup.json"
 PILOT_SUMMARY_CSV: Final = "summary.csv"
 PILOT_SUMMARY_MARKDOWN: Final = "summary.md"
-PILOT_SCHEMA_VERSION: Final = 3
+PILOT_SCHEMA_VERSION: Final = 1
 _MIN_REGULAR_STATE_COUNT: Final = 2
 PILOT_RESULT_CLASSES: Final = (
     "PASS",
@@ -1093,7 +1093,7 @@ def _failure_case_result(record: Mapping[str, Any], *, storage: Path) -> dict[st
         "trend_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
         "extrema_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
         "schedule_input_sanity": {"status": "unavailable_due_to_runtime_failure"},
-        "validity_domain_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
+        "applicability_domain_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
         "numerical_runtime": {"status": "failed"},
         "storage": {
             "canonical_hdf5_bytes": None,
@@ -1149,7 +1149,7 @@ def _invalid_success_case_result(
         "trend_diagnostic": {"status": "unavailable_due_to_invalid_result"},
         "extrema_diagnostic": {"status": "unavailable_due_to_invalid_result"},
         "schedule_input_sanity": {"status": "unavailable_due_to_invalid_result"},
-        "validity_domain_diagnostic": {"status": "unavailable_due_to_invalid_result"},
+        "applicability_domain_diagnostic": {"status": "unavailable_due_to_invalid_result"},
         "numerical_runtime": {"status": "analysis_failed"},
         "storage": {"canonical_hdf5_bytes": None},
         "warnings": [],
@@ -1310,13 +1310,13 @@ def _problems(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         problems.extend(
             {
                 **common_fields,
-                "problem_category": "validity_domain_diagnostic",
-                "explanation": f"{validity['record']} uses {validity['overlap']}",
-                "actual_value": validity["status"],
-                "reference_value": validity["supplied_validity"],
+                "problem_category": "applicability_domain_diagnostic",
+                "explanation": f"{applicability['record']} uses {applicability['overlap']}",
+                "actual_value": applicability["evidence"],
+                "reference_value": applicability["applicability"],
             }
-            for validity in record["validity_domain_diagnostic"]["records"]
-            if validity["overlap"]
+            for applicability in record["applicability_domain_diagnostic"]["records"]
+            if applicability["overlap"]
             in {
                 "material_transfer",
                 "product_form_transfer",

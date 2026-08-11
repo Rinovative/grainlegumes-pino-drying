@@ -19,7 +19,7 @@ Design principles:
 
 This module does NOT:
   - Load models, infer, generate, repair, mutate, or admit artifacts
-  - Recreate a historical dataframe or compatibility API
+  - Create an alternate dataframe or compatibility API
   - Own public view composition or plot-specific widget behavior
 ===============================================================================
 """

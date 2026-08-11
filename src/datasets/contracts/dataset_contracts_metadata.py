@@ -16,7 +16,7 @@ Design principles:
   - Metadata-only summaries do not deserialize training tensors
 
 This module does NOT:
-  - Admit historical generated-batch, sampling, dataset, or timing schemas
+  - Admit generated-batch, sampling, dataset, or timing schemas other than the current contract
   - Construct final datasets, splits, normalizers, checkpoints, or artifacts
   - Define a transient-drying tensor contract
 ===============================================================================

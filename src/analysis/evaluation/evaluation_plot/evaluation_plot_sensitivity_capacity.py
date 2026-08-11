@@ -298,7 +298,7 @@ def plot_metadata_error_heatmap(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = 100,
 ) -> Figure:
-    """Restore the all-channel metadata association heatmaps and exclusions."""
+    """Render the all-channel metadata association heatmaps and exclusions."""
     dataframe.validate_comparison(datasets)
     fields = presentation.shared_display_fields(tuple(datasets.values()))
     parameters = presentation.metadata_parameters(tuple(datasets.values()), max_cases=max_cases)
@@ -344,7 +344,7 @@ def plot_metadata_error_heatmap(
 
 
 def _sensitivity(x_values: np.ndarray, y_values: np.ndarray) -> float:
-    """Return historical P90-P10 of quantile-binned response medians."""
+    """Return P90-P10 of quantile-binned response medians."""
     if x_values.size < _MINIMUM_SENSITIVITY_CASES or np.std(x_values) < _VARIATION_FLOOR or np.std(y_values) < _VARIATION_FLOOR:
         return float("nan")
     edges = np.unique(np.quantile(x_values, np.linspace(0.0, 1.0, 13)))
@@ -367,7 +367,7 @@ def plot_metadata_error_trends(
     max_cases: int = 100,
     channels: tuple[str, ...] = ("p", "u", "v", "U"),
 ) -> Figure:
-    """Restore original-order metadata sensitivities with channel checkboxes."""
+    """Render registry-order metadata sensitivities with channel checkboxes."""
     dataframe.validate_comparison(datasets)
     fields = _selected_fields(datasets, channels)
     parameters = presentation.metadata_parameters(tuple(datasets.values()), max_cases=max_cases)

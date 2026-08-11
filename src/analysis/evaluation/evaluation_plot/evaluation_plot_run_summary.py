@@ -188,7 +188,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
 
 
 def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
-    """Return the historical quantile-bounded blue numeric cell fills."""
+    """Return quantile-bounded blue numeric cell fills."""
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     cmap = plt.get_cmap("Blues")
     for column in table.columns:
@@ -208,7 +208,7 @@ def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def _styled_table(table: pd.DataFrame, *, title: str) -> widgets.VBox:
-    """Render one automatically displayed historical blue table."""
+    """Render one automatically displayed blue table."""
     styles = _blue_style(table)
     formats: dict[Any, Any] = {column: "{:.4g}" for column in table.columns if pd.api.types.is_numeric_dtype(table[column])}
     styler = table.style
@@ -218,7 +218,7 @@ def _styled_table(table: pd.DataFrame, *, title: str) -> widgets.VBox:
 
 
 def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
-    """Show current authoritative metrics using the historical colored table."""
+    """Show current authoritative metrics using the defined colored table."""
     summary = build_run_summary_table(datasets)
     hidden_identity = {
         "task_id",

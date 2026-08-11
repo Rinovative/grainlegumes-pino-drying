@@ -1211,7 +1211,7 @@ def initialize_wandb(
 
     run_id = persisted_run_id if resume else uuid.uuid4().hex
     if not isinstance(run_id, str) or not run_id:
-        msg = "Exact W&B resume requires the previously persisted non-empty run ID."
+        msg = "Exact W&B resume requires the persisted non-empty run ID."
         raise TrackingInitializationError(msg)
     resume_policy: str | None
     offline_fallback: str | None = None

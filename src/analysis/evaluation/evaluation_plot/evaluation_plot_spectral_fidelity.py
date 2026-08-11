@@ -2,7 +2,7 @@
 ===============================================================================
 evaluation_plot_spectral_fidelity.py
 ===============================================================================
-Restore historical output-spectrum presentation on current bounded reducers.
+Render output-spectrum views from current bounded reducers.
 
 Responsibilities:
   - Compute Hann-windowed radial spectra from physical coordinate spacing
@@ -20,7 +20,7 @@ Design principles:
 This module does NOT:
   - Parse artifact cases or invent physical coordinate spacing
   - Inspect learned layers, latent activations, or model internals
-  - Restore the intentionally omitted learned-layer or latent spectral hooks
+  - Provide learned-layer or latent spectral hooks
   - Own notebook controls or public panel composition
 ===============================================================================
 """
@@ -133,7 +133,7 @@ def _plot_band(
     linestyle: str,
     linewidth: float = 2.2,
 ) -> None:
-    """Plot current casewise median and q10-q90 band in historical styling."""
+    """Plot current casewise median and q10-q90 band in the defined styling."""
     q10, median, q90 = _quantiles(values)
     valid = (frequencies > 0.0) & np.isfinite(median) & (median > 0.0)
     if not valid.any():
@@ -170,7 +170,7 @@ def _active_fields(
     datasets: Mapping[str, pd.DataFrame],
     channels: Sequence[str],
 ) -> tuple[presentation.DisplayField, ...]:
-    """Resolve a non-empty ordered historical channel checkbox selection."""
+    """Resolve a non-empty ordered channel checkbox selection."""
     fields = presentation.shared_display_fields(tuple(datasets.values()))
     by_label = {field.label: field for field in fields}
     magnitude = next((field for field in fields if field.key == "velocity_magnitude"), None)
@@ -185,7 +185,7 @@ def _active_fields(
 
 
 def _colors(fields: Sequence[presentation.DisplayField]) -> dict[str, tuple[float, float, float, float]]:
-    """Return stable channel colors in selected historical order."""
+    """Return stable channel colors in selected order."""
     cmap = plt.get_cmap("tab10")
     return {field.label: cmap(index % cmap.N) for index, field in enumerate(fields)}
 
@@ -197,7 +197,7 @@ def plot_spectral_demand_prediction_error(
     channels: Sequence[str] = ("p", "u", "v", "U"),
     normalize: bool = True,
 ) -> Figure:
-    """Restore two-row dataset columns for demand/prediction and error spectra."""
+    """Render two-row dataset columns for demand/prediction and error spectra."""
     fields = _active_fields(datasets, channels)
     summaries = _summaries(datasets, max_cases)
     colors = _colors(fields)

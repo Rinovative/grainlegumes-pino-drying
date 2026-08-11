@@ -16,41 +16,24 @@ permeability:
   transform: log
   distribution: uniform_in_log_space
   provenance:
+    evidence: literature_transfer
     source_refs:
     - ba
-    status: literature_transfer
-    derivation:
-      kind: transferred_as_supplied
-      origin: supplied_by_handoff
-      verification: declared_only
-      description: Whole-particle packed-bed mean permeability; fill-method dependence included in range.
-    confidence: medium
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
-      temperature: generator design; not a material property
-      humidity_or_aw: generator design; not a material property
-      packing_or_flow_regime: Only for packing bands in each complete density record; generated mean eps must pass the material
-        band.
+    applicability:
+      packing: Only for packing bands in each complete density record; generated mean eps must pass the material band.
 packing_porosity_mean_support:
   lower: 0.37
   upper: 0.43
   unit: '1'
   provenance:
+    evidence: coupled_record
     source_refs:
     - pea_physical
-    status: coupled_record
-    derivation:
-      kind: complete_atomic_record
-      origin: supplied_by_handoff
-      verification: mathematically_reproduced
-      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
-    confidence: high
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
-      packing_or_flow_regime: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density
-        calculated as rho_wet/(1+Xdb).
+    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    verification: mathematically_reproduced
+    applicability:
+      packing: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density calculated as
+        rho_wet/(1+Xdb).
 density_calibration:
   record_id: field_pea_density_calibration_v1
   reference:
@@ -63,20 +46,14 @@ density_calibration:
   ood_records: []
   selection_rule: complete_record_atomic
   provenance:
+    evidence: coupled_record
     source_refs:
     - pea_physical
-    status: coupled_record
-    derivation:
-      kind: complete_atomic_record
-      origin: supplied_by_handoff
-      verification: mathematically_reproduced
-      description: Select a complete record atomically. Never combine rho from one source/record with eps from another.
-    confidence: high
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
-      packing_or_flow_regime: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density
-        calculated as rho_wet/(1+Xdb).
+    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    verification: mathematically_reproduced
+    applicability:
+      packing: Yalcin et al. wet bulk density and porosity regressions evaluated at 20% db; dry bulk density calculated as
+        rho_wet/(1+Xdb).
 thermal_properties:
   k_gr:
     nominal: 0.31
@@ -86,22 +63,9 @@ thermal_properties:
     transform: log
     distribution: uniform_in_log_space
     provenance:
+      evidence: literature_transfer
       source_refs:
       - matouk_thermal
-      status: literature_transfer
-      derivation:
-        kind: transferred_as_supplied
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: Dry granular-phase conductivity used inside the binding Maxwell-Eucken relation.
-      confidence: medium_low
-      validity:
-        material_scope_ref: material_scope
-        product_form: Whole mature dry field pea
-        temperature: material-specific evidence; VP2 operation 25-40 degC
-        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
-        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
-        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
   cp_gr_dry:
     nominal: 1950.0
     support:
@@ -110,22 +74,9 @@ thermal_properties:
     transform: log
     distribution: uniform_in_log_space
     provenance:
+      evidence: literature_transfer
       source_refs:
       - matouk_thermal
-      status: literature_transfer
-      derivation:
-        kind: transferred_as_supplied
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: Dry-solid specific heat; water contribution is added deterministically as X_db*cp_w.
-      confidence: medium_low
-      validity:
-        material_scope_ref: material_scope
-        product_form: Whole mature dry field pea
-        temperature: material-specific evidence; VP2 operation 25-40 degC
-        humidity_or_aw: kinetics coupled to current Oswin equilibrium; otherwise not directly RH-dependent
-        moisture_basis: rates act on volumetric water concentrations; cp_gr_dry is dry-solid basis
-        packing_or_flow_regime: complete material density record; do not mix rho and eps sources
 initial_moisture:
   mean_db:
     nominal: 0.25
@@ -135,23 +86,11 @@ initial_moisture:
     transform: linear
     distribution: uniform
     provenance:
+      evidence: engineering_estimate
       source_refs:
       - pea_drying
-      status: engineering_estimate
-      derivation:
-        kind: selected_engineering_estimate
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope
-          around project or product-compatible drying evidence, not a market-target transfer.
-      confidence: medium
-      validity:
-        material_scope_ref: material_scope
-        product_form: Whole mature dry field pea
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
-        packing_or_flow_regime: packed-bed continuum; material validation applies
+      note: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope around project
+        or product-compatible drying evidence, not a market-target transfer.
   amplitude_db:
     nominal: 0.02
     support:
@@ -160,58 +99,29 @@ initial_moisture:
     transform: linear
     distribution: uniform
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: Synthetic spatial maximum deviation in dry basis; constrained by positivity and target separation.
-      confidence: medium
-      validity:
-        material_scope_ref: material_scope
-        product_form: Whole mature dry field pea
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        moisture_basis: kg water per kg dry solids (db); source wb values converted explicitly
-        packing_or_flow_regime: packed-bed continuum; material validation applies
   field_support:
     lower: 0.1904761904761905
     upper: 0.3157894736842105
     unit: kg/kg
     provenance:
+      evidence: derived
       source_refs:
       - pea_drying
-      status: derived
-      derivation:
-        kind: derived_from_configured_value
-        origin: supplied_by_handoff
-        verification: mathematically_reproduced
-        description: X_db=X_wb/(1-X_wb)
-      confidence: medium
-      validity:
-        material_scope_ref: material_scope
-        product_form: Whole mature dry field pea
-        moisture_basis: kg water/kg dry solids
+      method: X_db=X_wb/(1-X_wb)
+      verification: mathematically_reproduced
   margin_above_target_db: 0.01
 target_moisture:
   selected_simulation_target_wb: 0.12
   market_acceptance_moisture_wb: 0.135
   safe_storage_moisture_wb: 0.11894
   provenance:
+    evidence: derived
     source_refs:
     - swiss_crops
-    status: derived
-    derivation:
-      kind: derived_from_configured_value
-      origin: supplied_by_handoff
-      verification: declared_only
-      description: Selected simulation stop target; market, safe-storage and selected values remain separate.
-    confidence: high_for_market_low_medium_for_transferred_isotherm_safe_storage
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
+    note: Selected simulation stop target; market, safe-storage and selected values remain separate.
 oswin:
   record_id: field_pea_production_oswin_v1
   components:
@@ -225,22 +135,14 @@ oswin:
   equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
   temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or per degree Celsius increment
   provenance:
+    evidence: literature_transfer
     source_refs:
     - lentil_oswin_source
-    status: literature_transfer
-    derivation:
-      kind: transferred_as_supplied
-      origin: supplied_by_handoff
-      verification: declared_only
-      description: No pea-specific re-fit claimed. Validate against Garg and Chandra pea data before production.
-    confidence: low_medium
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
+    applicability:
       moisture_basis: kg water/kg dry solids; source percent-db prefactor converted by 0.01
-      equation_or_method: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
-      supplied_scope: Transferred as the complete lentil tuple to whole field pea; direct pea literature supports modified
+      evidence_scope: Transferred as the complete lentil tuple to whole field pea; direct pea literature supports modified
         Oswin but accessible full coefficients were unavailable.
+    note: No pea-specific re-fit claimed. Validate against Garg and Chandra pea data before production.
 two_compartment_kinetics:
   record_id: field_pea_two_compartment_kinetics_v1
   components:
@@ -265,20 +167,11 @@ two_compartment_kinetics:
   ood_records: []
   selection_rule: complete_record_atomic
   provenance:
+    evidence: calibration_prior
     source_refs:
     - pea_drying
-    status: calibration_prior
-    derivation:
-      kind: selected_calibration_prior
-      origin: supplied_by_handoff
-      verification: declared_only
-      description: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim experimental
-        validation
-    confidence: low_until_calibrated
-    validity:
-      material_scope_ref: material_scope
-      product_form: Whole mature dry field pea
-      supplied_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
+    applicability:
+      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
         state; T(t) if available
-      transfer_limit: use pilot nominal, run only engineering preflight, retain calibration_prior status and do not claim
-        experimental validation
+      limitation: use pilot nominal, run only engineering preflight, treat as a calibration prior and do not claim experimental
+        validation

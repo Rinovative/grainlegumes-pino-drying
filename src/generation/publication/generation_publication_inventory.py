@@ -463,8 +463,8 @@ def _inspect_fixed_value(
         "profile_applicability": applicability,
         "effective_dimension": 0,
         "coordinate_labels": [],
-        "kind": "derived" if provenance["status"] == "derived" else "fixed",
-        "classification": "derived" if provenance["status"] == "derived" else "fixed",
+        "kind": "derived" if provenance["evidence"] == "derived" else "fixed",
+        "classification": "derived" if provenance["evidence"] == "derived" else "fixed",
         "unit": record["unit"],
         "configured": _configured_without_provenance(record),
         "provenance": provenance,
@@ -538,7 +538,7 @@ def _inspect_common_record(
                 "generation.publication.generation_publication_storage exact-stop and maximum-duration validation",
             ]
             runtime_state = "generator_and_storage_consumed_requires_native_time_reload_evidence"
-        record_kind = "derived" if provenance["status"] == "derived" else "fixed"
+        record_kind = "derived" if provenance["evidence"] == "derived" else "fixed"
     return {
         "schema_kind": "vp2_resolved_parameter_inspection",
         "schema_version": 1,

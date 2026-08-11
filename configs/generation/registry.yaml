@@ -1,9 +1,5 @@
 schema_kind: generation_parameter_registry
 schema_version: 1
-decision_source:
-  artifact: VP2_Parameter_Decisions.yaml
-  schema_version: 1.1.0
-  sha256: 774ce0e39bf989ad77b5fe80e37c364f46ff83b3c6be1bd7410ea4c72d7269f5
 parameters:
   kappa_mean:
     kind: interval

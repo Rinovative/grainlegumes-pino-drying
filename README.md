@@ -23,8 +23,9 @@ Generation and publication are fail-closed. Campaign inventories, roles, counts,
 > Configured scientific values are modelling and sampling decisions. Citations do
 > not imply that every final number is reported verbatim: values may be fitted,
 > converted, transferred, inverted, estimated, selected as priors, or synthetic.
-> Resolved `status`, `derivation`, `confidence`, and `validity` are authoritative;
-> technical smoke evidence does not experimentally validate the science.
+> Resolved `evidence`, source references, and any explicit method or applicability
+> limit are authoritative; technical smoke evidence does not experimentally
+> validate the science.
 
 <details>
 <summary><strong>Current stationary-airflow workflow</strong></summary>
@@ -158,29 +159,19 @@ is in the [generation workflow](docs/simulation_generation.md).
 
 ## ⚙️ Generation Gateway
 
-Run generation orchestration on the GPU/development host outside Docker. The
-current readiness report is non-solving and will remain blocked until the
-reported scientific and native-runtime gates are cleared:
+Generation resolves scientific inputs, campaign membership, native COMSOL
+execution, atomic publication, and requested Dataset packages from validated
+YAML. Run the host-side workflow from `hpc115`; it owns remote work on the
+configured `sricehpc01` COMSOL/Slurm host.
+
+- [Scientific and technical parameter reference](docs/generation_parameter_reference.md): parameter meanings, ranges, equations, provenance, caveats, and sources.
+- [Generation operational guide](docs/simulation_generation.md): configuration ownership, hosts, commands, gates, smoke, pilot, production, transfer, resume, retention, and cleanup.
+
+The public entry point is:
 
 ```bash
-cd /workspace/repo
-python -m src.generation.cli.cli_generation readiness-report \
-  configs/generation/campaigns/steady_flow/family_generalization.yaml \
-  configs/generation/campaigns/transient_drying/family_generalization.yaml \
-  --run-static-sentinels
+./scripts/generation_workflow.sh --help
 ```
-
-The configured transient diagnostic, once those gates pass, is:
-
-```bash
-./scripts/generation_workflow.sh pilot-check \
-  configs/generation/campaigns/transient_drying/pilot_check.yaml
-```
-
-See the [generation workflow](docs/simulation_generation.md) for setup, mapping
-probe, smoke, plan, cleanup, status, and resume commands, and the
-[parameter reference](docs/generation_parameter_reference.md) for scientific
-ownership and provenance inspection.
 
 ## ⚙️ Local Execution
 
@@ -229,7 +220,7 @@ STORAGE_ROOT/
     └── .state/
 ```
 
-`01_generation` is the retained high-fidelity source/provenance archive. `02_datasets` contains immutable learning views addressed by `dataset_id`; it is not a renamed campaign directory. The steady view materializes its task-owned tensor payload, while transient packages keep compact indexes with storage-relative `case.h5` paths and open those canonical sources lazily and read-only. Transient samples derive float32 `t_n`, `t_n_plus_1`, and `dt` in hours from the authoritative regular HDF5 axis and expose either one transition or one consecutive regular rollout window; exact-stop diagnostics remain excluded. Consequently, successful package construction never removes GPU `01_generation`. Experiment bundles and analysis artifacts remain under `03_experiments`.
+`01_generation` is the retained high-fidelity source/provenance archive. `02_datasets` contains immutable learning views addressed by `dataset_id`, distinct from mutable campaign execution directories. The steady view materializes its task-owned tensor payload, while transient packages keep compact indexes with storage-relative `case.h5` paths and open those canonical sources lazily and read-only. Transient samples derive float32 `t_n`, `t_n_plus_1`, and `dt` in hours from the authoritative regular HDF5 axis and expose either one transition or one consecutive regular rollout window; exact-stop diagnostics remain excluded. Consequently, successful package construction never removes GPU `01_generation`. Experiment bundles and analysis artifacts remain under `03_experiments`.
 
 ### Dataset publication
 

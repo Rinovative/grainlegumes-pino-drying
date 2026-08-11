@@ -172,7 +172,7 @@ def make_controlled_viewer(
     export_plot_name: str | None = None,
     export_title: str | None = None,
 ) -> widgets.VBox:
-    """Build an immediately rendered view with optional historical selectors."""
+    """Build an immediately rendered view with optional selectors."""
     if not datasets:
         msg = "Controlled analysis viewers require at least one labelled dataset."
         raise ValueError(msg)
@@ -447,7 +447,7 @@ def make_casecount_viewer(
     export_title: str | None = None,
     **plot_kwargs: Any,
 ) -> widgets.VBox:
-    """Build and immediately render the historical shared-prefix control."""
+    """Build and immediately render the shared-prefix control."""
     if not datasets or any(frame.empty for frame in datasets.values()):
         msg = "Case-count viewers require non-empty labelled datasets."
         raise ValueError(msg)
@@ -503,7 +503,7 @@ def make_casecount_viewer(
         )
 
     def _step(delta: int) -> None:
-        """Change prefix size by one historical step within the shared bound."""
+        """Change prefix size by one step within the shared bound."""
         new_value = case_count.value + delta * step_size
         case_count.value = max(1, min(max_cases_global, new_value))
 

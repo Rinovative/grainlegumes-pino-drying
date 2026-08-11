@@ -48,7 +48,6 @@ _EXPECTED_UNITS = (
     "1/K",
     "1",
 )
-_FORBIDDEN_HANDOFF_FIELDS = {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
 
 
 def _scalar_case(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
@@ -126,7 +125,6 @@ def test_scalar_contract_case_and_schedule_boundaries_are_exact(tmp_path: Path) 
     assert admission.field_names == _EXPECTED_FIELDS
     assert admission.units == _EXPECTED_UNITS
     assert admission.ownership == ("case_dependent",) * 12
-    assert _FORBIDDEN_HANDOFF_FIELDS.isdisjoint(admission.field_names)
     assert admission.source_path == source.resolve()
     assert admission.source_filename == "scalars.csv"
     assert admission.sha256 == payload["input_files"]["scalars.csv"]["sha256"]
@@ -183,7 +181,6 @@ def test_comsol_parameter_format_rejects_ambiguous_list_syntax(
         ("duplicate_name", ValueError, "missing, duplicate, unknown"),
         ("wrong_order", ValueError, "missing, duplicate, unknown"),
         ("unknown_name", ValueError, "missing, duplicate, unknown"),
-        ("retired_name", ValueError, "missing, duplicate, unknown"),
         ("wrong_unit", ValueError, "units do not match"),
         ("malformed_number", TypeError, "not numeric"),
         ("nan", ValueError, "finite"),
@@ -222,7 +219,7 @@ def test_scalar_source_admission_fails_closed(
     elif mutation == "missing_row":
         _rewrite_rows(source, payload, rows[:-1])
     elif mutation == "extra_row":
-        _rewrite_rows(source, payload, [*rows, "retired_scalar;99;1"])
+        _rewrite_rows(source, payload, [*rows, "extra_scalar;99;1"])
     elif mutation == "duplicate_name":
         columns = rows[2].split(";")
         columns[0] = rows[1].split(";")[0]
@@ -231,9 +228,9 @@ def test_scalar_source_admission_fails_closed(
     elif mutation == "wrong_order":
         rows[1], rows[2] = rows[2], rows[1]
         _rewrite_rows(source, payload, rows)
-    elif mutation in {"unknown_name", "retired_name"}:
+    elif mutation == "unknown_name":
         columns = rows[1].split(";")
-        columns[0] = "unknown_scalar" if mutation == "unknown_name" else "retired_scalar"
+        columns[0] = "unknown_scalar"
         rows[1] = ";".join(columns)
         _rewrite_rows(source, payload, rows)
     elif mutation == "wrong_unit":

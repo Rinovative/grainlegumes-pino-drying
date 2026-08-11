@@ -77,28 +77,6 @@ def test_sentinel_workload_is_independent_of_production_case_counts() -> None:
     assert baseline["production_case_count_independent"] is True
 
 
-def test_readiness_uses_resolved_decision_evidence() -> None:
-    """Derive readiness identity from the batch contract instead of Python literals."""
-    decision_source = {
-        "artifact": "synthetic-decision.json",
-        "schema_version": "synthetic-v1",
-        "sha256": "1" * 64,
-    }
-    batch = cast(
-        "generation.cases.config.GenerationConfig",
-        SimpleNamespace(
-            batch_name="synthetic-batch",
-            scientific_values={"material": {"decision_source": decision_source}},
-        ),
-    )
-    campaign = cast(
-        "generation.cases.config.CampaignConfig",
-        SimpleNamespace(batches=(batch,)),
-    )
-
-    assert generation.readiness._resolved_decision_source((campaign,)) == decision_source
-
-
 def test_smoke_variation_accepts_configured_case_inventory() -> None:
     """Measure contrasts across every configured case, not a fixed pair."""
     report = smoke._variation_report(

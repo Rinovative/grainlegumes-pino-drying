@@ -19,14 +19,14 @@ import torch
 from src import common
 
 
-def test_failed_atomic_save_preserves_previous_checkpoint(
+def test_failed_atomic_save_preserves_published_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Inject serialization failure after corrupt bytes reach a temporary checkpoint.
 
-    The previously published destination must remain byte-identical and loadable,
+    The published destination must remain byte-identical and loadable,
     and temporary state must be removed, protecting resume continuity.
     """
     destination = tmp_path / "checkpoint.pt"

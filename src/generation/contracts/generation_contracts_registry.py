@@ -316,7 +316,7 @@ def _validate_nominal(value: Any, *, label: str) -> Any:
 
 
 def _validate_scientific_metadata(entry: dict[str, Any], *, label: str) -> None:
-    """Validate optional decision metadata retained beside runtime semantics."""
+    """Validate optional scientific metadata beside runtime semantics."""
     if "nominal" in entry:
         entry["nominal"] = _validate_nominal(entry["nominal"], label=f"{label}.nominal")
     if "distribution" in entry and (not isinstance(entry["distribution"], str) or not entry["distribution"]):

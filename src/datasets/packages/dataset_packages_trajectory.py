@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
-TRANSIENT_INDEX_SCHEMA_VERSION: Final = 2
+TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
 _SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(
     transient_contract.TRANSIENT_PROFILE_ID,
 )

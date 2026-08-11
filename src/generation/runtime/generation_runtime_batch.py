@@ -134,7 +134,7 @@ _CASE_SUCCESS_KEYS: Final = frozenset(
     }
 )
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
-CASE_FAILURE_SCHEMA_VERSION = 3
+CASE_FAILURE_SCHEMA_VERSION = 1
 _CASE_FAILURE_KEYS = frozenset(
     {
         "schema_kind",
@@ -988,7 +988,7 @@ def _execution_provenance(
     execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
     payload = {
         "schema_kind": "simulation_execution_provenance",
-        "schema_version": 2,
+        "schema_version": 1,
         "case_id": prepared.bundle.case_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "execution_config_digest": execution_digest,
@@ -1734,7 +1734,7 @@ def _complete_failure_cleanup(
     reclaimed_bytes: int,
     error: str | None,
 ) -> None:
-    """Atomically complete one previously persisted scratch-cleanup receipt."""
+    """Atomically complete one persisted scratch-cleanup receipt."""
     if status not in {"complete", "failed", "not_created"}:
         message = f"Completed scratch cleanup status is invalid: {status!r}"
         raise ValueError(message)

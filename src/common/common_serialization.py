@@ -11,7 +11,7 @@ Responsibilities:
   - Provide canonical JSON and file SHA-256 helpers for lifecycle identities
 
 Design principles:
-  - A failed publication never damages the previously published destination
+  - A failed publication never damages the published destination
   - Same-directory temporary files keep replacement on one filesystem
   - Callers decide whether replacement is permitted by their lifecycle contract
 

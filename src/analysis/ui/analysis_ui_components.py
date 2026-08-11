@@ -426,7 +426,7 @@ def ui_dropdown_channel(
     channels: Sequence[str] | None = None,
     default: str = "|u|",
 ) -> widgets.Dropdown:
-    """Build the compact historical output-channel dropdown."""
+    """Build the compact output-channel dropdown."""
     resolved = list(channels or ("p", "u", "v", "|u|"))
     if not resolved or default not in resolved:
         msg = "Channel dropdown requires a non-empty option list containing its default."
@@ -557,7 +557,7 @@ def ui_checkbox_channels(
     channels: Sequence[str] | None = None,
     default_on: Sequence[str] | None = None,
 ) -> _CheckboxGroupVBox:
-    """Build the compact historical multi-channel checkbox grid."""
+    """Build the compact multi-channel checkbox grid."""
     resolved = list(channels or ("p", "u", "v", "|u|"))
     defaults = list(resolved if default_on is None else default_on)
     if not resolved or not set(defaults).issubset(resolved):

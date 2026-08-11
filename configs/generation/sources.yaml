@@ -233,7 +233,3 @@ sources:
   canonical_locator: local:project_sources/02-VM2_Vertiefungsprojekt_Rino_Moreno_Albertin-3-.pdf
   alternate_locators: []
   source_type: project_report
-- source_key: vp2_decision_contract
-  decision_date: '2026-08-09'
-  alternate_locators: []
-  source_type: project_report

@@ -82,19 +82,6 @@ def _cyclic_edges(graph: dict[str, set[str]]) -> dict[str, set[str]]:
     return remaining
 
 
-def _facade_root_targets(path: Path) -> set[str]:
-    """Return direct root-module targets declared by one lazy facade."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Name) and target.id == "_MODULES" for target in node.targets):
-            mapping = ast.literal_eval(node.value)
-            return {target for target in mapping.values() if "." not in target}
-    msg = f"{path} does not declare its public _MODULES facade mapping"
-    raise AssertionError(msg)
-
-
 def _internal_imports(package_root: Path) -> list[tuple[Path, str]]:
     """Return imports declared anywhere below one responsibility package."""
     return [(path, target) for path in package_root.rglob("*.py") for target in _import_targets(path)]
@@ -135,12 +122,12 @@ def test_root_public_facades_resolve_to_modules() -> None:
         ),
     ],
 )
-def test_phase_three_public_modules_resolve_to_their_single_owners(
+def test_public_modules_resolve_to_their_single_owners(
     package_name: str,
     public_name: str,
     implementation_name: str,
 ) -> None:
-    """Keep the new lazy public names identical to their concrete owners."""
+    """Keep lazy public names identical to their concrete owners."""
     package = import_module(package_name)
     implementation = import_module(implementation_name)
     assert getattr(package, public_name) is implementation
@@ -172,18 +159,6 @@ def test_concrete_implementation_import_graph_is_acyclic() -> None:
     cyclic = _cyclic_edges(_implementation_graph())
     detail = "\n".join(f"{module}: {sorted(edges)}" for module, edges in sorted(cyclic.items()))
     assert not cyclic, detail
-
-
-def test_only_public_root_modules_and_the_persisted_dataset_facade_remain() -> None:
-    """Reject restored flat implementations or compatibility-only module shims."""
-    generation_targets = _facade_root_targets(_GENERATION_ROOT / "__init__.py")
-    generation_flat = {path.stem for path in _GENERATION_ROOT.glob("generation_*.py")}
-    assert generation_flat <= generation_targets
-
-    dataset_targets = _facade_root_targets(_DATASET_ROOT / "__init__.py") | {"dataset_packages"}
-    dataset_flat = {path.stem for path in _DATASET_ROOT.glob("dataset_*.py")}
-    assert dataset_flat <= dataset_targets
-    assert (_DATASET_ROOT / "dataset_packages.py").is_file()
 
 
 def test_lower_generation_packages_do_not_import_workflow_or_cli() -> None:

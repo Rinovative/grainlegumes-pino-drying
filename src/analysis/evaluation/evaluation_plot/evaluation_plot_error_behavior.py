@@ -2,7 +2,7 @@
 ===============================================================================
 evaluation_plot_error_behavior.py
 ===============================================================================
-Restore historical predictive-error presentation on current session reducers.
+Render predictive-error views from current session reducers.
 
 Responsibilities:
   - Compare secondary relative L2 and H1 metrics without redefining the objective
@@ -107,7 +107,7 @@ def _prefix_field(
 
 
 def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Compare current secondary relative L2/H1 in the historical 3 x 2 layout."""
+    """Compare current secondary relative L2/H1 in the fixed 3 x 2 layout."""
     dataframe.validate_comparison(datasets)
     names = tuple(datasets)
     title, count_headings = layout.aggregate_title_context(
@@ -252,7 +252,7 @@ def plot_mean_field_bias(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DISTRIBUTION_DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Restore four-row ground-truth versus prediction case-mean panels."""
+    """Render four-row ground-truth versus prediction case-mean panels."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
@@ -303,7 +303,7 @@ def _map_figure(
     title: str,
     relative_percent: bool = False,
 ) -> Figure:
-    """Render one historical four-row spatial statistic family."""
+    """Render one four-row spatial statistic family."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
@@ -350,7 +350,7 @@ def plot_mean_error_maps(
     max_cases: int = _DEFAULT_CASE_LIMIT,
     error_mode: str = "MAE",
 ) -> Figure:
-    """Plot current MAE or field-RMS-relative mean maps in historical layout."""
+    """Plot current MAE or field-RMS-relative mean maps in the fixed layout."""
     if error_mode == "MAE":
         return _map_figure(
             datasets=datasets,
@@ -377,7 +377,7 @@ def plot_std_error_maps(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Plot current signed-error standard deviation in historical layout."""
+    """Plot current signed-error standard deviation in the fixed layout."""
     return _map_figure(
         datasets=datasets,
         max_cases=max_cases,
@@ -392,7 +392,7 @@ def plot_error_vs_target_magnitude(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _TARGET_MAGNITUDE_DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Restore four-channel target-magnitude trends with a dedicated legend."""
+    """Render four-channel target-magnitude trends with a dedicated legend."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
@@ -440,7 +440,7 @@ def plot_boundary_error_decomposition(
     max_cases: int = _DEFAULT_CASE_LIMIT,
     channels: Sequence[str] = ("p", "u", "v", "U"),
 ) -> Figure:
-    """Restore channel-checkbox left/right boundary ratios and external legend."""
+    """Render channel-checkbox left/right boundary ratios and an external legend."""
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     by_label = {field.label: field for field in fields}

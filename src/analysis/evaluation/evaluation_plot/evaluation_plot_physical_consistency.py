@@ -2,11 +2,11 @@
 ===============================================================================
 evaluation_plot_physical_consistency.py
 ===============================================================================
-Restore physical-consistency CDFs, maps, and tables on current evidence.
+Render physical-consistency CDFs, maps, and tables from current evidence.
 
 Responsibilities:
   - Summarize named momentum, dual-continuity, and pressure-boundary metrics
-  - Plot scalar residual CDFs with historically separate axes and legends
+  - Plot scalar residual CDFs with separate axes and legends
   - Render full-grid momentum, div_u, and div_eps_u magnitude maps
   - Calculate pressure-drop mismatch from admitted pressure and boundary fields
   - Pair only scalar distributions and maps that represent the same quantity
@@ -75,7 +75,7 @@ def _values(frame: pd.DataFrame, column: str, max_cases: int) -> np.ndarray:
 
 
 def _cdf(axis: Axes, values: np.ndarray, *, label: str, color: object | None = None) -> Line2D:
-    """Draw one historical log-safe empirical CDF."""
+    """Draw one log-safe empirical CDF."""
     ordered = np.maximum(np.sort(np.asarray(values, dtype=float)), _POSITIVE_FLOOR)
     cumulative = np.linspace(0.0, 1.0, ordered.size)
     (line,) = axis.plot(ordered, cumulative, linewidth=2, label=label, color=color)
@@ -90,7 +90,7 @@ def _cdf_figure(
     xlabel: str,
     title: str,
 ) -> Figure:
-    """Render one historical CDF with a dedicated legend column."""
+    """Render one CDF with a dedicated legend column."""
     figure_title, count_headings = layout.aggregate_title_context(
         title,
         {label: len(values[label][:max_cases]) for label in datasets},
@@ -132,7 +132,7 @@ def build_physical_consistency_summary_table(datasets: Mapping[str, pd.DataFrame
 
 
 def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
-    """Return historical quantile-bounded blue numeric cell fills."""
+    """Return quantile-bounded blue numeric cell fills."""
     styles = pd.DataFrame("", index=table.index, columns=table.columns)
     cmap = plt.get_cmap("Blues")
     for column in table.columns:
@@ -154,7 +154,7 @@ def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def plot_physical_consistency_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
-    """Return the automatically rendered historical colored summary table."""
+    """Return the automatically rendered colored summary table."""
     summary = build_physical_consistency_summary_table(datasets)
     title, count_headings = layout.aggregate_title_context(
         "Physical consistency summary",
@@ -175,7 +175,7 @@ def _metric_cdf(
     metric: str,
     title: str,
 ) -> Figure:
-    """Render one current scalar residual on the historical CDF surface."""
+    """Render one current scalar residual on the shared CDF surface."""
     dataframe.validate_comparison(datasets, require_physics=True)
     label, unit = _RESIDUAL_LABELS[metric]
     values = {name: _values(frame, metric, max_cases) for name, frame in datasets.items()}
@@ -256,7 +256,7 @@ def plot_pressure_drop_consistency(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Plot current pressure-drop relative mismatch on the historical CDF."""
+    """Plot current pressure-drop relative mismatch on the shared CDF."""
     return _cdf_figure(
         datasets=datasets,
         max_cases=max_cases,
@@ -322,7 +322,7 @@ def _map_figure(
     colorbar_label: str,
     title: str,
 ) -> Figure:
-    """Render one current mean full-grid residual in historical dataset columns."""
+    """Render one current mean full-grid residual in dataset columns."""
     dataframe.validate_comparison(datasets, require_physics=True)
     with sessions.scoped_session(datasets) as active_session:
         summaries = {id(frame): active_session.full_summary(frame, max_cases).require_residuals() for frame in datasets.values()}
@@ -460,7 +460,7 @@ def plot_physical_consistency_cdf_grid(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """Restore the approved 2 x 2 current residual grid and external legend."""
+    """Render the approved 2 x 2 residual grid and external legend."""
     dataframe.validate_comparison(datasets, require_physics=True)
     colors = {label: plt.get_cmap("tab10")(index % 10) for index, label in enumerate(datasets)}
     pressure_drop = _pressure_drop_values(datasets, max_cases)

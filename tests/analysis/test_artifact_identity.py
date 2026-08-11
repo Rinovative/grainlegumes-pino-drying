@@ -500,7 +500,7 @@ def test_atomic_publication_rejects_incomplete_stage_without_touching_target(
     target = common.paths.resolve_id_analysis_dir(run_dir)
     target.mkdir(parents=True)
     marker = target / "complete.txt"
-    marker.write_text("old", encoding="utf-8")
+    marker.write_text("published", encoding="utf-8")
     stage = analysis.artifacts.service._create_artifact_staging_root(target)
     (stage / "partial.txt").write_text("partial", encoding="utf-8")
 
@@ -511,7 +511,7 @@ def test_atomic_publication_rejects_incomplete_stage_without_touching_target(
             staging_root=stage,
         )
 
-    assert marker.read_text(encoding="utf-8") == "old"
+    assert marker.read_text(encoding="utf-8") == "published"
     assert (stage / "partial.txt").is_file()
 
 
@@ -520,16 +520,16 @@ def test_atomic_publication_rolls_back_when_replacement_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Restore the previous target when the staged replacement rename fails.
+    Preserve the published target when the staged replacement rename fails.
 
-    An injected filesystem error must leave old content published, retain the
+    An injected filesystem error must leave published content intact, retain the
     stage for diagnosis, and clean any temporary backup directory.
     """
     run_dir = tmp_path / "run"
     target = common.paths.resolve_id_analysis_dir(run_dir)
     target.mkdir(parents=True)
     marker = target / "complete.txt"
-    marker.write_text("old", encoding="utf-8")
+    marker.write_text("published", encoding="utf-8")
     stage = analysis.artifacts.service._create_artifact_staging_root(target)
     analysis.artifacts.contracts.artifact_provenance_path(stage).write_text("{}\n", encoding="utf-8")
     (stage / "new.txt").write_text("new", encoding="utf-8")
@@ -550,13 +550,13 @@ def test_atomic_publication_rolls_back_when_replacement_fails(
             staging_root=stage,
         )
 
-    assert marker.read_text(encoding="utf-8") == "old"
+    assert marker.read_text(encoding="utf-8") == "published"
     assert not (target / "new.txt").exists()
     assert stage.is_dir()
     assert not list(target.parent.glob(".id.backup.*"))
 
 
-def test_failed_rebuild_generation_preserves_previous_complete_target(
+def test_failed_rebuild_generation_preserves_published_complete_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -564,14 +564,14 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
     Preserve the complete cache when rebuild generation fails.
 
     The injected generator error occurs after request setup. Only staging may be
-    cleaned, while the prior marker remains the externally visible artifact.
+    cleaned, while the published marker remains the externally visible artifact.
     """
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     target = common.paths.resolve_id_analysis_dir(run_dir)
     target.mkdir(parents=True)
     marker = target / "complete.txt"
-    marker.write_text("old", encoding="utf-8")
+    marker.write_text("published", encoding="utf-8")
 
     monkeypatch.setattr(
         analysis.artifacts.service,
@@ -595,7 +595,7 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
     )
 
     def fail_generation(**_kwargs: Any) -> None:
-        """Model a generator failure after the prior target is established."""
+        """Model a generator failure after the published target is established."""
         message = "injected generation failure"
         raise RuntimeError(message)
 
@@ -613,7 +613,7 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
             rebuild=True,
         )
 
-    assert marker.read_text(encoding="utf-8") == "old"
+    assert marker.read_text(encoding="utf-8") == "published"
     assert not list(target.parent.glob(".id.staging.*"))
 
 
@@ -784,12 +784,12 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
     assert provenance_path.is_file()
 
 
-def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
+def test_rebuild_waiter_recovers_when_completion_disappears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Keep rebuild intent when the preceding owner removed completion.
+    Keep rebuild intent when completion disappears before lock acquisition.
 
     The waiter observes a changed completion identity and must enter the locked
     path with ``rebuild=True`` rather than accepting a partial predecessor state.

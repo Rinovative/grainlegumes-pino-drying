@@ -37,7 +37,6 @@ from src import common, domain
 
 from . import generation_campaign as campaign_runtime
 from . import generation_workflow as workflow_service
-from .contracts import generation_contracts_materials as materials
 from .contracts import generation_contracts_profiles as profiles
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .publication import generation_publication_storage as storage_service
@@ -70,7 +69,6 @@ _RECEIPT_KEYS: Final = frozenset(
         "status",
         "recorded_at",
         "git_commit",
-        "decision_source",
         "material_family_inventory",
         "source_binding",
         "templates",
@@ -982,22 +980,12 @@ def _build_payload(
     transient_variation = _variation_report(transient_cases, profile_id=profiles.TRANSIENT_DRYING_PROFILE)
     all_cases = (*steady_cases, *transient_cases)
     profile_mappings = _profile_mapping_binding((steady_campaign, transient_campaign))
-    decision_source = materials.validate_decision_source(
-        steady_batch.scientific_values["material"]["decision_source"],
-        label=f"resolved batch {steady_batch.batch_name!r} decision_source",
-    )
-    materials.validate_decision_source(
-        transient_batch.scientific_values["material"]["decision_source"],
-        label=f"resolved batch {transient_batch.batch_name!r} decision_source",
-        expected=decision_source,
-    )
     payload: dict[str, Any] = {
         "schema_kind": REAL_SMOKE_SCHEMA_KIND,
         "schema_version": REAL_SMOKE_SCHEMA_VERSION,
         "status": "observations_complete_no_scientific_acceptance_threshold",
         "recorded_at": recorded_at,
         "git_commit": current_commit,
-        "decision_source": decision_source,
         "material_family_inventory": [steady_batch.material_family],
         "source_binding": _source_binding((steady_campaign, transient_campaign)),
         "templates": _template_binding((steady_campaign, transient_campaign)),

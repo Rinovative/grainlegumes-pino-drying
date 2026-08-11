@@ -544,7 +544,7 @@ def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
     assert timing["working_directory"] == str(outcome.work_directory)
     assert execution["invocation"]["working_directory"] == str(outcome.work_directory)
-    assert execution["schema_version"] == 2
+    assert execution["schema_version"] == 1
     assert execution["result"]["state"] == "succeeded"
     assert execution["result"]["exit_code"] == 0
     solved_model = outcome.processed_directory / "solved.mph"

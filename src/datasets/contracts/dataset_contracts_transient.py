@@ -32,7 +32,7 @@ TransientSampleMode: TypeAlias = Literal["one_step_transition", "rollout_window"
 
 TRANSIENT_PROFILE_ID: Final = "transient_drying"
 TRANSIENT_VIEW_ID: Final = "transient_drying"
-TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION: Final = 2
+TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION: Final = 1
 TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "one_step_transition",
     "rollout_window",

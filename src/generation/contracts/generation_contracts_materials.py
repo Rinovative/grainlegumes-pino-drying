@@ -10,7 +10,7 @@ Responsibilities:
 Design principles:
   - Material files contain family science and no campaign roles or shared controls
   - Density calibration is always sampled-rho/fixed-reference-epsilon in natural data
-  - Every effective parameter exposes its supplied source and interpretation
+  - Every effective parameter exposes its scientific source and interpretation
 This module does NOT:
   - Assign campaign roles, counts, seeds, dataset membership, or runtime mappings
   - Invent scientific values, derivations, sources, or compatibility modes
@@ -34,7 +34,7 @@ from . import generation_contracts_provenance as provenance_service
 from . import generation_contracts_registry as registry_service
 
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
-_SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+_PARAMETER_REGISTRY_SCHEMA_VERSION: Final = 1
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.kc_anchor_factor",
     "porosity.smooth_len_rel",
@@ -201,25 +201,6 @@ def _finite(value: Any, *, label: str) -> float:
     return float(value)
 
 
-def validate_decision_source(
-    value: Any,
-    *,
-    label: str,
-    expected: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Validate one decision identity and optionally bind it to the registry owner."""
-    decision = _mapping(value, label=label)
-    _exact_keys(decision, {"artifact", "schema_version", "sha256"}, label=label)
-    normalized = {key: str(item) for key, item in decision.items()}
-    if any(not item for item in normalized.values()) or _SHA256_PATTERN.fullmatch(normalized["sha256"]) is None:
-        message = f"{label} must contain non-empty artifact/schema identifiers and one lowercase SHA-256 digest."
-        raise ValueError(message)
-    if expected is not None and normalized != dict(expected):
-        message = f"{label} must equal the registry-owned decision identity {dict(expected)}."
-        raise ValueError(message)
-    return normalized
-
-
 def _semantic_entry(
     value: Any,
     *,
@@ -291,23 +272,18 @@ def validate_semantic_registry(
 ) -> tuple[
     dict[str, dict[str, Any]],
     dict[str, dict[str, str]],
-    dict[str, str],
     dict[str, tuple[str, ...]],
 ]:
-    """Validate registry-owned parameter semantics and decision provenance."""
+    """Validate registry-owned parameter semantics and sampling order."""
     config = _mapping(value, label="generation parameter registry")
     _exact_keys(
         config,
-        {"schema_kind", "schema_version", "decision_source", "parameters"},
+        {"schema_kind", "schema_version", "parameters"},
         label="generation parameter registry",
     )
-    if config["schema_kind"] != "generation_parameter_registry" or config["schema_version"] != 1:
+    if config["schema_kind"] != "generation_parameter_registry" or config["schema_version"] != _PARAMETER_REGISTRY_SCHEMA_VERSION:
         message = "Unsupported generation parameter-registry schema."
         raise ValueError(message)
-    decision_source = validate_decision_source(
-        config["decision_source"],
-        label="generation parameter registry.decision_source",
-    )
     raw = _mapping(config["parameters"], label="generation parameter registry.parameters")
     if not raw:
         message = "generation parameter registry.parameters must be non-empty."
@@ -328,7 +304,7 @@ def validate_semantic_registry(
             raise ValueError(message)
         symbols[symbol] = name
     block_contract = _validate_sampling_block_contract(definitions, sampling_orders)
-    return definitions, metadata, decision_source, block_contract
+    return definitions, metadata, block_contract
 
 
 def resolve_value_record(
@@ -482,7 +458,7 @@ def _validate_density_record(
         _exact_keys(
             item,
             {"record_id", "rho_bu_dry_ref", "eps_bed_cal_ref"},
-            optional={"supplied_status", "supplied_derivation"},
+            optional={"basis"},
             label=item_label,
         )
         identity = item["record_id"]
@@ -500,7 +476,7 @@ def _validate_density_record(
         if lower <= values["rho_bu_dry_ref"] <= upper:
             message = f"{item_label}.rho_bu_dry_ref must be disjoint from natural support."
             raise ValueError(message)
-        metadata = {key: copy.deepcopy(item[key]) for key in ("supplied_status", "supplied_derivation") if key in item}
+        metadata = {"basis": copy.deepcopy(item["basis"])} if "basis" in item else {}
         ood_records.append({"id": identity, "values": values, "metadata": metadata})
     density["reference"] = {"rho_bu_dry_ref": rho, "eps_bed_cal_ref": eps, "inferred_rho_particle_dry": particle}
     density["rho_bu_dry_ref_support"] = {"lower": lower, "upper": upper, "transform": "log"}
@@ -679,7 +655,7 @@ def _derived_provenance(
     metadata: Mapping[str, Mapping[str, str]],
     sources: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Build deterministic inherited provenance for one supplied derivation rule."""
+    """Build deterministic inherited provenance for one configured derivation rule."""
     source_refs: list[str] = []
     for source_name in registry[name]["sources"]:
         source_entry = registry.get(source_name)
@@ -688,19 +664,11 @@ def _derived_provenance(
             for source_ref in provenance.get("source_refs", []):
                 if isinstance(source_ref, str) and source_ref not in source_refs:
                     source_refs.append(source_ref)
-    if "vp2_decision_contract" not in source_refs:
-        source_refs.append("vp2_decision_contract")
     value = {
+        "evidence": "derived",
         "source_refs": source_refs,
-        "status": "derived",
-        "derivation": {
-            "kind": "derived_from_configured_value",
-            "origin": "supplied_by_handoff",
-            "verification": "declared_only",
-            "description": metadata[name]["description"],
-        },
-        "confidence": "inherits_configured_source_confidence",
-        "validity": {"equation_or_method": metadata[name]["description"]},
+        "method": metadata[name]["description"],
+        "verification": provenance_service.REPRODUCED_VERIFICATION,
     }
     return provenance_service.resolve_provenance(value, sources=sources, label=f"derived parameter {name} provenance")
 
@@ -821,7 +789,6 @@ def project_material_for_profile(
     extra_provenance = {"A_osw", "B_osw", "C_osw"} if "oswin" in active_name_set else set()
     projected = {
         "material_family": material["material_family"],
-        "decision_source": copy.deepcopy(material["decision_source"]),
         "material_scope": copy.deepcopy(material["material_scope"]),
         "packing_porosity_mean_support": copy.deepcopy(material["packing_porosity_mean_support"]),
         "parameter_registry": projected_registry,
@@ -895,7 +862,6 @@ def resolve_material_definition(
     material_config: Any,
     *,
     sources: Mapping[str, Mapping[str, Any]],
-    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Resolve one compact role-neutral material file with complete provenance."""
     material = _mapping(material_config, label="material configuration")
@@ -918,7 +884,6 @@ def resolve_material_definition(
     if material["schema_kind"] != "generation_material" or material["schema_version"] != 1:
         message = "Unsupported role-neutral material configuration schema."
         raise ValueError(message)
-    decision = copy.deepcopy(dict(decision_source))
     scope = _validate_material_scope(material["material_scope"], label=f"material {family}.material_scope")
     packing = _validate_packing_support(
         material["packing_porosity_mean_support"],
@@ -1037,12 +1002,10 @@ def resolve_material_definition(
         "unit": "kg/kg",
         "derivation": {
             "kind": "derived_from_configured_target",
-            "origin": "supplied_by_handoff",
             "verification": "mathematically_reproduced",
             "inputs": ["X_target_db", f"{margin_above_target_db:g} kg/kg"],
             "formula_or_method": f"minimum_db = X_target_db + {margin_above_target_db:g} kg/kg",
         },
-        "decision_source": copy.deepcopy(decision),
     }
     owners["X_target_wb"] = {"value": target_wb, "nominal": target_wb, "provenance": copy.deepcopy(target["provenance"])}
     registry = _merge_registry(definitions, owners)
@@ -1062,7 +1025,6 @@ def resolve_material_definition(
         effective[component] = copy.deepcopy(effective["oswin"])
     return {
         "material_family": family,
-        "decision_source": decision,
         "material_scope": scope,
         "packing_porosity_mean_support": packing,
         "initial_moisture_bounds": initial_bounds,

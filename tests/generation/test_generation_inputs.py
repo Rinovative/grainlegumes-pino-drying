@@ -18,6 +18,7 @@ from src.generation.cases import generation_cases_sampling as sampling
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.cases import generation_cases_seeding as seeding
 from src.generation.contracts import generation_contracts_materials as materials
+from src.generation.contracts import generation_contracts_provenance as provenance_service
 from src.generation.publication import generation_publication_inventory as inventory
 
 if TYPE_CHECKING:
@@ -37,6 +38,48 @@ def test_semantic_seed_derivation_is_version_bound() -> None:
         )
         == 2107745129
     )
+
+
+def test_generation_provenance_is_compact_controlled_and_source_resolved() -> None:
+    """Validate the canonical scientific provenance vocabulary and references."""
+    root = Path.cwd()
+    registry = yaml.safe_load((root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))
+    source_config = yaml.safe_load((root / "configs/generation/sources.yaml").read_text(encoding="utf-8"))
+    source_keys = {source["source_key"] for source in source_config["sources"]}
+    assert registry["schema_version"] == 1
+    assert set(registry) == {"schema_kind", "schema_version", "parameters"}
+
+    allowed = {"evidence", "source_refs", "method", "verification", "applicability", "note"}
+    provenance_count = 0
+
+    def visit(value: Any) -> None:
+        nonlocal provenance_count
+        if isinstance(value, dict):
+            if {"evidence", "source_refs"}.issubset(value):
+                provenance_count += 1
+                assert set(value).issubset(allowed)
+                assert value["evidence"] in provenance_service.EVIDENCE_CLASSES
+                assert set(value["source_refs"]).issubset(source_keys)
+                if "verification" in value:
+                    assert value["verification"] == provenance_service.REPRODUCED_VERIFICATION
+                if "applicability" in value:
+                    assert value["applicability"]
+                    assert set(value["applicability"]).issubset(provenance_service.APPLICABILITY_KEYS)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for config_path in sorted((root / "configs/generation").rglob("*.yaml")):
+        visit(yaml.safe_load(config_path.read_text(encoding="utf-8")))
+    assert provenance_count > 0
+    with pytest.raises(ValueError, match="source_refs must identify evidence"):
+        provenance_service.validate_provenance(
+            {"evidence": "literature_direct", "source_refs": []},
+            sources={},
+            label="source-free literature",
+        )
 
 
 def test_generation_public_facade_is_explicit_and_narrow() -> None:
@@ -467,16 +510,16 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         "generation.cases.generation_cases_fields._porosity_field",
     ]
     assert template_fixed["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
-    assert template_fixed["provenance"]["derivation"]["origin"] == "supplied_by_handoff"
+    assert set(template_fixed["provenance"]).issubset({"evidence", "source_refs", "method", "verification", "applicability", "note", "sources"})
     authored_common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
     expected_dx = authored_common["grid"]["Lx"] / (authored_common["grid"]["nx"] - 1)
     assert grid_spacing["configured"] == {"dx": expected_dx}
-    assert grid_spacing["provenance"]["status"] == "derived"
-    assert grid_spacing["provenance"]["derivation"]["verification"] == "mathematically_reproduced"
+    assert grid_spacing["provenance"]["evidence"] == "derived"
+    assert grid_spacing["provenance"]["verification"] == "mathematically_reproduced"
     fixed = authored_common["scientific_fixed_values"]
     expected_u_wall = 1.0 / (1.0 / fixed["h_ext"]["value"] + fixed["d_wall"]["value"] / fixed["k_wall"]["value"])
     assert wall_coefficient["configured"]["value"] == pytest.approx(expected_u_wall)
-    assert wall_coefficient["provenance"]["derivation"]["verification"] == "mathematically_reproduced"
+    assert wall_coefficient["provenance"]["verification"] == "mathematically_reproduced"
     assert "dx" not in authored_common["grid"]
     assert "dy" not in authored_common["grid"]
     assert "value" not in authored_common["scientific_fixed_values"]["U_wall"]
@@ -524,18 +567,18 @@ def test_scalar_handoff_rejects_an_unknown_name(
     assert bundle.scalar_handoff is not None
     assert bundle.scalar_handoff.field_names == generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
     assert len(bundle.scalar_handoff.entries) == 12
-    forbidden = {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
-    assert forbidden.isdisjoint(bundle.scalar_handoff.field_names)
-    assert all(f"{name};" not in content for name in forbidden)
+    non_handoff_fields = {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
+    assert non_handoff_fields.isdisjoint(bundle.scalar_handoff.field_names)
+    assert all(f"{name};" not in content for name in non_handoff_fields)
     assert bundle.case_payload["sampled_values"]["T_init"] == bundle.case_payload["sampled_values"]["T_amb"]
     assert {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}.isdisjoint(bundle.case_payload["sampled_values"])
     registry_entry = config.scientific_values["material"]["parameter_registry"]["T_init"]
     assert registry_entry["kind"] == "derived"
     assert registry_entry["derivation"] == "copy"
     assert registry_entry["sources"] == ["T_amb"]
-    old = "T_amb;"
-    assert content.count(old) == 1
-    scalar_path.write_text(content.replace(old, "unexpected_flow_temperature;"), encoding="utf-8")
+    field_prefix = "T_amb;"
+    assert content.count(field_prefix) == 1
+    scalar_path.write_text(content.replace(field_prefix, "unexpected_flow_temperature;"), encoding="utf-8")
     payload = copy.deepcopy(bundle.case_payload)
     payload["input_files"]["scalars.csv"] = {
         "sha256": common.serialization.file_sha256(scalar_path),

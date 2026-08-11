@@ -39,7 +39,7 @@ Provides:
 - case_failure_path: persistent case-failure path resolution
 - case_failure_artifacts_directory: retained failure-artifact path resolution
 - record_case_failure: durable failed-case evidence publication
-- clear_case_failure: validated obsolete failure-evidence removal
+- clear_case_failure: validated failure-evidence cleanup
 - case_failure_is_recorded: failed-case evidence admission
 - validate_completed_case: completed-case publication validation
 - completed_case_is_valid: completed-case validity inspection

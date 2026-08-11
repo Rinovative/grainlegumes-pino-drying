@@ -656,7 +656,7 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
     Notes
     -----
     Values are clipped to the 1st--99th percentile for display only. Source
-    frames are not mutated. Previously cached observations remain when a user
+    frames are not mutated. Cached observations remain when a user
     lowers the case-count control.
 
     """

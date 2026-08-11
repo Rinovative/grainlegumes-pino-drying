@@ -2,11 +2,11 @@
 ===============================================================================
 evaluation_panel.py
 ===============================================================================
-Compose historical evaluation panels over current admitted artifacts.
+Compose curated evaluation panels over admitted artifacts.
 
 Responsibilities:
   - Keep the approved single-model and comparison view order explicit
-  - Bind every view to its historically appropriate local controls and defaults
+  - Bind every view to its defined local controls and defaults
   - Accept caller-provided context labels and session-owned canonical frames
   - Keep comparison roles separate without an outer dataset selector
   - Preserve lazy first rendering and panel-local figure export
@@ -19,7 +19,7 @@ Design principles:
 
 This module does NOT:
   - Discover, generate, repair, rebuild, or admit artifact payloads
-  - Recreate a historical dataframe or generic interaction registry
+  - Create an alternate dataframe or generic interaction registry
   - Infer dataset identity from display names, paths, or row positions
   - Cache figures, case arrays, or numerical reductions
 ===============================================================================
@@ -76,7 +76,7 @@ def _dropdown(
     description: str,
     value: str | None = None,
 ) -> widgets.Dropdown:
-    """Build one compact historical scientific dropdown."""
+    """Build one compact scientific dropdown."""
     resolved = tuple(options)
     if not resolved:
         msg = f"No options are available for {description.rstrip(':').lower()}."
@@ -101,7 +101,7 @@ def _physics_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
 
 
 def _permeability_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
-    """Return whether every frame declares the historical permeability tensor inputs."""
+    """Return whether every frame declares the required permeability tensor inputs."""
     required = {"Kxx", "Kxy", "Kyy"}
     return all(required.issubset(frame.attrs.get("input_fields", ())) for frame in datasets.values())
 
@@ -133,7 +133,7 @@ def _make_outlier_table_viewer(
     export_plot_name: str | None = None,
     export_title: str | None = None,
 ) -> widgets.VBox:
-    """Render the historical automatic outlier tables with one local dropdown."""
+    """Render the automatic outlier tables with one local dropdown."""
     if not datasets:
         msg = "Outlier tables require at least one labelled dataset."
         raise ValueError(msg)
@@ -173,7 +173,7 @@ def _build_sections(
     *,
     comparison: bool,
 ) -> dict[str, tuple[list[tuple[str, Callable[..., Any], str]], str]]:
-    """Bind the approved views directly to their historical per-view controls."""
+    """Bind the approved views directly to their view-specific controls."""
     plots = analysis.evaluation.plots
     viewers = analysis.ui.viewers
     controls = analysis.ui.components
@@ -609,7 +609,7 @@ def build_single_model_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
 ) -> widgets.Widget:
-    """Build one historical single-model panel containing every supplied dataset."""
+    """Build one single-model panel containing every supplied dataset."""
     normalized = _normalize_contexts(session, contexts, comparison=False)
     model_labels = tuple(next(iter(context.datasets)) for context in normalized)
     if len(set(model_labels)) != 1:
@@ -625,7 +625,7 @@ def build_comparison_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
 ) -> widgets.Widget:
-    """Build separate historical role-local comparison panels without a selector."""
+    """Build separate role-local comparison panels without a selector."""
     normalized = _normalize_contexts(session, contexts, comparison=True)
     panels = [_build_panel(datasets=context.datasets, comparison=True, sections=sections) for context in normalized]
     if len(panels) == 1:

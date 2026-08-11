@@ -18,22 +18,11 @@ parameter_values:
     nominal: 500.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Mean inlet gauge-pressure field p_in_bc. Expected visible effect: Dominant airflow-rate control.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Not redundant; strongest VP1 scalar association. The low-pressure tail is rejected because
-        its stable support would be narrow relative to ID.'
+      note: Not redundant; strongest VP1 scalar association. The low-pressure tail is rejected because its stable support
+        would be narrow relative to ID.
   pressure_bc.sin_amp:
     lower: -0.02
     upper: 0.02
@@ -45,21 +34,10 @@ parameter_values:
     nominal: 0.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Relative sinusoidal pressure modulation. Expected visible effect: Creates long-wave inlet nonuniformity.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Can overlap Gaussian and linear shapes; field-level orthogonality monitor recommended.'
+      note: Can overlap Gaussian and linear shapes; field-level orthogonality monitor recommended.
   pressure_bc.sin_freq:
     lower: 0.5
     upper: 1.5
@@ -69,44 +47,21 @@ parameter_values:
     nominal: 1.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Spatial sinusoid cycles across normalized inlet. Expected visible effect: Controls inlet modulation
-          wavelength.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Low when sinusoidal amplitude is near zero; conditional sensitivity. The short low-frequency
-        tail is rejected by the tail-width rule.'
+      note: Low when sinusoidal amplitude is near zero; conditional sensitivity. The short low-frequency tail is rejected
+        by the tail-width rule.
   pressure_bc.sin_phase:
     lower: 0.0
     upper: 6.283185307179586
     nominal: 3.141592653589793
     distribution: circular_uniform_on_[0,2*pi)
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Circular phase of inlet sinusoid. Expected visible effect: Translates sinusoidal features.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: No disjoint physical tail exists on a complete circle.'
+      note: No disjoint physical tail exists on a complete circle.
   pressure_bc.gauss_count:
     lower: 1
     upper: 5
@@ -116,21 +71,10 @@ parameter_values:
     nominal: 3
     distribution: discrete_uniform_inclusive
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Number of Gaussian inlet components. Expected visible effect: Controls localized inlet complexity.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Interacts with Gaussian width/amplitude.'
+      note: Interacts with Gaussian width/amplitude.
   pressure_bc.gauss_amp:
     lower: -0.06
     upper: 0.06
@@ -142,21 +86,10 @@ parameter_values:
     nominal: 0.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Combined relative Gaussian amplitude. Expected visible effect: Adds localized inlet peaks or depressions.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Interacts with count and width.'
+      note: Interacts with count and width.
   pressure_bc.gauss_width:
     lower: 0.02
     upper: 0.1
@@ -168,22 +101,10 @@ parameter_values:
     nominal: 0.05
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Reference Gaussian width in normalized inlet coordinate. Expected visible effect: Controls localization
-          scale.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Count-width interaction; below-grid supports rejected.'
+      note: Count-width interaction; below-grid supports rejected.
   pressure_bc.gauss_jitter:
     lower: 0.1
     upper: 0.5
@@ -193,21 +114,10 @@ parameter_values:
     nominal: 0.3
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Relative component-width jitter. Expected visible effect: Breaks repeated Gaussian scales.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Potentially weak after component aggregation; the narrow near-zero tail is rejected.'
+      note: Potentially weak after component aggregation; the narrow near-zero tail is rejected.
   pressure_bc.linear_amp:
     lower: -0.03
     upper: 0.03
@@ -219,21 +129,10 @@ parameter_values:
     nominal: 0.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Relative linear inlet ramp. Expected visible effect: Creates one-sided distributor bias.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Distinct first-order mode but can correlate with broad Gaussian terms.'
+      note: Distinct first-order mode but can correlate with broad Gaussian terms.
   T_in_base:
     lower: 303.15
     upper: 309.15
@@ -245,22 +144,9 @@ parameter_values:
     nominal: 308.15
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - ba
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Baseline dry-bulb inlet temperature. Constraint: Every generated T_in_bc(t) must be 298.15-313.15 K
-          and <= T_in_max.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   T_in_amp:
     lower: 0.0
     upper: 4.0
@@ -270,22 +156,9 @@ parameter_values:
     nominal: 2.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - ba
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Temperature schedule amplitude. Constraint: Amplitude is not an independent hard excursion; base/event
-          combination must satisfy T bounds.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   omega_in_base:
     lower: 0.0045
     upper: 0.0115
@@ -299,22 +172,9 @@ parameter_values:
     nominal: 0.0075
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: engineering_estimate
       source_refs:
       - transient_comsol_model_report
-      status: engineering_estimate
-      derivation:
-        kind: selected_engineering_estimate
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Baseline humidity ratio, kg water per kg dry air. Constraint: Derived phi_in_bc(t) must remain operationally
-          0.05-0.85 at p_ref.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   omega_in_amp:
     lower: 0.0
     upper: 0.003
@@ -324,21 +184,9 @@ parameter_values:
     nominal: 0.0015
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - transient_comsol_model_report
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Humidity-ratio schedule amplitude. Constraint: All omega_in_bc(t) values must be 0.0025-0.0145 kg/kg.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   schedule.corr:
     lower: -0.75
     upper: 0.25
@@ -348,23 +196,9 @@ parameter_values:
     nominal: -0.35
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Correlation of latent temperature and humidity processes. Constraint: Correlation matrix must remain
-          positive semidefinite; phi remains derived. The lower tail near the -1 correlation boundary is rejected because
-          it cannot meet the non-marginal width rule.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   schedule.timescale_rel:
     lower: 0.03
     upper: 0.18
@@ -376,22 +210,9 @@ parameter_values:
     nominal: 0.08
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Schedule correlation time divided by t_max. Constraint: Generator output is evaluated hourly but built
-          continuously enough for COMSOL linear interpolation.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   schedule.component_weights:
     selection: truncated_dirichlet
     alpha:
@@ -406,22 +227,9 @@ parameter_values:
       trend: 0.15
     distribution: Dirichlet_with_truncation_and_full_simplex_selection
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Full simplex over smooth, event and trend components. Constraint: Sample the complete simplex; never
-          treat components independently.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
     record_id: schedule_component_simplex_v1
   schedule.event_count:
     lower: 0
@@ -432,22 +240,9 @@ parameter_values:
     nominal: 2
     distribution: discrete_uniform_inclusive
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Number of discrete schedule events. Constraint: Integer selection; zero is valid only if event weight
-          is retained as an inactive latent component.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   schedule.event_duration_rel:
     lower: 0.015
     upper: 0.08
@@ -459,22 +254,9 @@ parameter_values:
     nominal: 0.04
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Event duration divided by t_max. Constraint: Duration must exceed two event widths and remain resolvable
-          at 1 h output.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   schedule.event_width_rel:
     lower: 0.003
     upper: 0.02
@@ -486,21 +268,9 @@ parameter_values:
     nominal: 0.008
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - vm2_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Smooth event-edge width divided by t_max. Constraint: Positive; event duration >= 2*event width.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   T_amb:
     lower: 288.15
     upper: 298.15
@@ -512,22 +282,9 @@ parameter_values:
     nominal: 293.15
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - ba
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Ambient and initial bed temperature owner. Constraint: T_init is a derived exact copy; do not sample
-          it separately.'
-      confidence: medium_high_for_hard_bounds_medium_for_distribution
-      validity:
-        temperature: T_in_bc 298.15-313.15 K; T_amb 281.15-303.15 K only in its OOD case
-        humidity_or_aw: omega and derived phi constraints apply at p_ref
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Weather and available conditioning hardware vary; hard psychrometric constraints dominate.
   kappa_cv:
     lower: 0.25
     upper: 0.65
@@ -537,23 +294,11 @@ parameter_values:
     nominal: 0.45
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Lognormal permeability coefficient of variation. Expected visible effect: Changes field contrast while
-          preserving arithmetic mean permeability.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Correlated in effect with perturbation amplitude but acts after structure normalization.
-        The narrow near-zero low tail is rejected because it would not meet the non-marginal tail-width rule.'
+      note: Correlated in effect with perturbation amplitude but acts after structure normalization. The narrow near-zero
+        low tail is rejected because it would not meet the non-marginal tail-width rule.
   bed.structure.coarse_len_rel:
     lower: 0.06
     upper: 0.16
@@ -565,21 +310,10 @@ parameter_values:
     nominal: 0.1
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Coarse GRF correlation length relative to Lx. Expected visible effect: Controls visible large bed structures.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Partly coupled to coarse weight.'
+      note: Partly coupled to coarse weight.
   bed.structure.fine_len_rel:
     lower: 0.02
     upper: 0.07
@@ -591,22 +325,10 @@ parameter_values:
     nominal: 0.04
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine GRF correlation length relative to Lx. Expected visible effect: Controls resolvable small structures;
-          ID lower bound remains >6 grid cells.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Partly coupled to perturbation granularity.'
+      note: Partly coupled to perturbation granularity.
   bed.structure.coarse_weight:
     lower: 0.35
     upper: 0.7
@@ -618,22 +340,10 @@ parameter_values:
     nominal: 0.55
     distribution: uniform_in_logit_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Independent coarse contribution; fine weight is its complement. Expected visible effect: Moves variance
-          between coarse and fine scales.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Strongly redundant if fine weight were independently sampled; complement prevents that.'
+      note: Strongly redundant if fine weight were independently sampled; complement prevents that.
   bed.structure.fine_ani_x:
     lower: 0.65
     upper: 1.55
@@ -645,21 +355,10 @@ parameter_values:
     nominal: 1.0
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine-scale x correlation-length multiplier. Expected visible effect: Elongates fine features along x.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Together with y multiplier only their ratio controls aspect while product controls area.'
+      note: Together with y multiplier only their ratio controls aspect while product controls area.
   bed.structure.fine_ani_y:
     lower: 0.65
     upper: 1.55
@@ -671,21 +370,10 @@ parameter_values:
     nominal: 1.0
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine-scale y correlation-length multiplier. Expected visible effect: Elongates fine features along y.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Same scale/aspect coupling as fine_ani_x; candidate for later reparameterization.'
+      note: Same scale/aspect coupling as fine_ani_x; candidate for later reparameterization.
   bed.structure.cross_scale_corr:
     lower: 0.25
     upper: 0.7
@@ -697,22 +385,10 @@ parameter_values:
     nominal: 0.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Correlation of the two latent GRF seeds. Expected visible effect: Controls whether fine features reinforce
-          coarse structures.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Low direct scalar sensitivity but visible topology effect.'
+      note: Low direct scalar sensitivity but visible topology effect.
   bed.perturbations.amplitude:
     lower: 0.08
     upper: 0.28
@@ -722,23 +398,11 @@ parameter_values:
     nominal: 0.18
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'RMS amplitude of local Gaussian bed perturbations. Expected visible effect: Adds localized defects after
-          the background field.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Can resemble high kappa_cv; retain because it changes localization, not only contrast.
-        The narrow near-zero low tail is rejected by the non-marginal tail-width rule.'
+      note: Can resemble high kappa_cv; retain because it changes localization, not only contrast. The narrow near-zero low
+        tail is rejected by the non-marginal tail-width rule.
   bed.perturbations.granularity:
     lower: 0.3
     upper: 0.7
@@ -750,22 +414,10 @@ parameter_values:
     nominal: 0.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Local perturbation scale/count selector. Expected visible effect: Higher values produce finer/more numerous
-          defects under the VP1 formula.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Partly overlaps fine_len_rel.'
+      note: Partly overlaps fine_len_rel.
   bed.perturbations.sign_bias:
     lower: 0.35
     upper: 0.65
@@ -777,22 +429,10 @@ parameter_values:
     nominal: 0.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Positive perturbation probability. Expected visible effect: Changes skew and defect sign while global
-          normalization preserves mean/variance.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: May be visually weak after normalization; sentinel field test required.'
+      note: May be visually weak after normalization; sentinel field test required.
   permeability.anisotropy.max_ratio:
     lower: 1.2
     upper: 3.0
@@ -802,21 +442,10 @@ parameter_values:
     nominal: 2.0
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Maximum principal-permeability ratio. Expected visible effect: Controls tensor eigenvalue separation.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Interacts with tensor strength.'
+      note: Interacts with tensor strength.
   permeability.anisotropy.exponent:
     lower: 0.8
     upper: 2.5
@@ -826,23 +455,10 @@ parameter_values:
     nominal: 1.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Nonlinear mapping of structure magnitude to anisotropy. Expected visible effect: Concentrates anisotropy
-          in strong structures.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Interacts with max ratio and strength; the low tail is rejected because it is too narrow
-        relative to the ID support.'
+      note: Interacts with max ratio and strength; the low tail is rejected because it is too narrow relative to the ID support.
   permeability.anisotropy.strength:
     lower: 0.4
     upper: 1.0
@@ -852,22 +468,10 @@ parameter_values:
     nominal: 0.7
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Overall tensor anisotropy activation. Expected visible effect: Interpolates from nearly isotropic to
-          full configured anisotropy.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: High interaction with max ratio; values above one rejected as outside VP1 formula semantics.'
+      note: High interaction with max ratio; values above one rejected as outside VP1 formula semantics.
   permeability.orientation.jitter:
     lower: 0.005
     upper: 0.02
@@ -877,22 +481,10 @@ parameter_values:
     nominal: 0.012
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Stochastic director-field perturbation. Expected visible effect: Avoids over-regular gradient alignment.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Can be visually weak after orientation smoothing; the near-zero low tail is rejected
-        by the tail-width rule.'
+      note: Can be visually weak after orientation smoothing; the near-zero low tail is rejected by the tail-width rule.
   permeability.orientation.smooth_len_rel:
     lower: 0.04
     upper: 0.16
@@ -904,42 +496,21 @@ parameter_values:
     nominal: 0.08
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Director-field smoothing length. Expected visible effect: Controls spatial turning scale of anisotropy.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Interacts with coarse/fine field scales.'
+      note: Interacts with coarse/fine field scales.
   porosity.kc_anchor_factor:
     nominal: 1.0
     distribution: uniform_in_conditional_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: mathematically_reproduced
-        description: The dimensionless factor scales A_KC_ref; its natural support is derived from sampled kappa_mean and material packing support.
-        formula_or_method: A_KC_case = kc_anchor_factor*A_KC_ref with conditional log-space ID support and relative OOD tails.
-        assumptions:
-        - Local porosity morphology is generated only from the shared background field.
-      confidence: high_for_generator_semantics
-      validity:
-        packing_or_flow_regime: material-calibrated packed-bed continuum with case-resolved natural packing support
-        product_form: material-specific whole-particle record
-        equation_or_method: corrected non-cancelling Kozeny-Carman global anchor
-      notes: OOD tails are synthetic generator design and are not experimentally observed packing ranges.
+      method: A_KC_case = kc_anchor_factor*A_KC_ref with conditional log-space ID support and relative OOD tails.
+      verification: mathematically_reproduced
+      note: OOD tails are synthetic generator design and are not experimentally observed packing ranges. Local porosity morphology
+        is generated only from the shared background field.
   porosity.smooth_len_rel:
     lower: 0.03
     upper: 0.09
@@ -949,23 +520,11 @@ parameter_values:
     nominal: 0.055
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Porosity-texture smoothing length. Expected visible effect: Controls porosity patch size independently
-          of K contrast.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Partly shares bed backbone but preserves distinct texture; the short low tail is rejected
-        by the non-marginal tail-width rule.'
+      note: Partly shares bed backbone but preserves distinct texture; the short low tail is rejected by the non-marginal
+        tail-width rule.
   porosity.texture_amp:
     lower: 0.003
     upper: 0.015
@@ -975,23 +534,10 @@ parameter_values:
     nominal: 0.008
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: project_baseline
       source_refs:
       - pino_airflow_project
-      status: project_baseline
-      derivation:
-        kind: selected_project_baseline
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Absolute porosity-texture amplitude. Expected visible effect: Controls local eps variation around the
-          global anchor.'
-      confidence: high_for_generator_semantics_medium_for_final_range
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: 'Redundancy assessment: Low amplitude may be invisible; require RMS and clipping diagnostics. Only the clearly
-        visible high tail is retained.'
+      note: Low amplitude may be invisible; require RMS and clipping diagnostics. Only the clearly visible high tail is retained.
   initial_moisture.structure.coarse_len_rel:
     lower: 0.08
     upper: 0.24
@@ -1003,21 +549,10 @@ parameter_values:
     nominal: 0.14
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Coarse initial-moisture correlation length. Expected visible effect: Controls large wet/dry zones.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Interacts with coarse weight.
+      note: Interacts with coarse weight.
   initial_moisture.structure.fine_len_rel:
     lower: 0.025
     upper: 0.08
@@ -1029,21 +564,10 @@ parameter_values:
     nominal: 0.045
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine initial-moisture correlation length. Expected visible effect: Controls small initial-moisture structure.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Field can be diffusion-smoothed rapidly; pilot sensitivity needed.
+      note: Field can be diffusion-smoothed rapidly; pilot sensitivity needed.
   initial_moisture.structure.coarse_weight:
     lower: 0.4
     upper: 0.75
@@ -1055,22 +579,10 @@ parameter_values:
     nominal: 0.58
     distribution: uniform_in_logit_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Coarse moisture-field weight; fine weight is complement. Expected visible effect: Allocates moisture
-          heterogeneity across scales.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Complement removes exact redundancy.
+      note: Complement removes exact redundancy.
   initial_moisture.structure.fine_ani_x:
     lower: 0.7
     upper: 1.4
@@ -1082,21 +594,10 @@ parameter_values:
     nominal: 1.0
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine moisture x-scale multiplier. Expected visible effect: Controls x elongation of moisture structures.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Area/aspect coupling with y multiplier.
+      note: Area/aspect coupling with y multiplier.
   initial_moisture.structure.fine_ani_y:
     lower: 0.7
     upper: 1.4
@@ -1108,21 +609,10 @@ parameter_values:
     nominal: 1.0
     distribution: uniform_in_log_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Fine moisture y-scale multiplier. Expected visible effect: Controls y elongation of moisture structures.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: Area/aspect coupling with x multiplier.
+      note: Area/aspect coupling with x multiplier.
   initial_moisture.structure.cross_scale_corr:
     lower: 0.25
     upper: 0.7
@@ -1134,19 +624,7 @@ parameter_values:
     nominal: 0.5
     distribution: uniform_in_registry_transform_space
     provenance:
+      evidence: synthetic_design
       source_refs:
       - pino_airflow_project
-      status: synthetic_design
-      derivation:
-        kind: selected_synthetic_generator_design
-        origin: supplied_by_handoff
-        verification: declared_only
-        description: 'Cross-scale moisture latent correlation. Expected visible effect: Controls reinforcement of wet/dry
-          structures across scales.'
-      confidence: medium
-      validity:
-        temperature: generator design; not a material property
-        humidity_or_aw: generator design; not a material property
-        packing_or_flow_regime: packed-bed continuum; material validation applies
-        product_form: material-specific whole-particle record
-      notes: May have weak scalar output effect but affects topology.
+      note: May have weak scalar output effect but affects topology.

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-_STATIC_SENTINEL_SCHEMA_VERSION: Final = 4
+_STATIC_SENTINEL_SCHEMA_VERSION: Final = 1
 _PRIMARY_SENTINEL_SEED: Final = 202608090
 _ID_SENTINEL_CASE_COUNT: Final = 8
 
@@ -738,24 +738,6 @@ def _campaign_inventory(campaign: config_service.CampaignConfig) -> tuple[str, .
     return inventory
 
 
-def _resolved_decision_source(
-    campaigns: Mapping[str, config_service.CampaignConfig],
-) -> dict[str, str]:
-    """Return the one registry-owned decision identity shared by all batches."""
-    decision_source: dict[str, str] | None = None
-    for campaign in campaigns.values():
-        for batch in campaign.batches:
-            decision_source = materials.validate_decision_source(
-                batch.scientific_values["material"]["decision_source"],
-                label=f"resolved batch {batch.batch_name!r} decision_source",
-                expected=decision_source,
-            )
-    if decision_source is None:
-        message = "Static-sentinel campaigns contain no resolved batch decision evidence."
-        raise ValueError(message)
-    return decision_source
-
-
 def _parameter_ood_source(
     natural_batch: config_service.GenerationConfig,
 ) -> config_service.GenerationConfig:
@@ -850,7 +832,6 @@ def run_static_sentinels(
             require_executable=False,
         ),
     }
-    decision_source = _resolved_decision_source(campaigns)
     campaign_contracts: dict[str, Any] = {}
     profile_evidence: dict[str, Any] = {}
     support_failures: list[dict[str, Any]] = []
@@ -942,7 +923,6 @@ def run_static_sentinels(
         "schema_version": _STATIC_SENTINEL_SCHEMA_VERSION,
         "status": status,
         "implementation_checks_complete": True,
-        "decision_sha256": decision_source["sha256"],
         "campaign_contracts": campaign_contracts,
         "profile_dimensions": {profile_id: contract["sampling_dimension"] for profile_id, contract in campaign_contracts.items()},
         "profile_evidence": profile_evidence,

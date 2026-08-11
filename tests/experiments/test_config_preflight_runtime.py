@@ -29,7 +29,7 @@ def _load_runtime() -> ModuleType:
 
 
 @pytest.mark.parametrize("runtime_version", [(3, 8, 20), (3, 9, 19)])
-def test_old_runtime_fails_before_project_import(
+def test_unsupported_runtime_fails_before_project_import(
     runtime_version: tuple[int, int, int],
     monkeypatch: MonkeyPatch,
 ) -> None:

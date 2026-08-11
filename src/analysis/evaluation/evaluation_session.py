@@ -996,7 +996,7 @@ def _boundary_region_mean(
     fractions: np.ndarray,
     absolute_error: np.ndarray,
 ) -> BinnedMeanSummary:
-    """Reduce fixed historical left/right distance bands without another case scan."""
+    """Reduce fixed left/right distance bands without another case scan."""
     fraction_values = np.asarray(fractions, dtype=float)
     error_values = np.asarray(absolute_error, dtype=float)
     if fraction_values.shape != error_values.shape or not np.isfinite(fraction_values).all() or not np.isfinite(error_values).all():
@@ -1812,7 +1812,7 @@ class EvaluationSession:
         Parameters
         ----------
         size : int
-            Previously reserved byte charge.
+            Reserved byte charge being released.
         path : pathlib.Path
             Session-private projection path to unlink when present.
 

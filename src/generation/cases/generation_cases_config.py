@@ -650,18 +650,13 @@ def _validate_scientific_fixed(
                 or boundary["boundary_basis"] != "source_air_dew_point_range"
                 or boundary["hard_boundary"] is not True
             ):
-                message = f"common.scientific_fixed_values.{name}.boundary violates the supplied hard-envelope contract."
+                message = f"common.scientific_fixed_values.{name}.boundary violates the configured hard-envelope contract."
                 raise GenerationConfigError(message)
             record["boundary"] = boundary
         if name == "U_wall":
             provenance = record["provenance"]
-            derivation = provenance["derivation"]
-            if (
-                provenance["status"] != "derived"
-                or derivation["kind"] != "derived_from_configured_value"
-                or derivation["verification"] != "mathematically_reproduced"
-            ):
-                message = "common.scientific_fixed_values.U_wall must retain its reproduced supplied derivation."
+            if provenance["evidence"] != "derived" or provenance.get("verification") != "mathematically_reproduced":
+                message = "common.scientific_fixed_values.U_wall must retain its mathematically reproduced derivation."
                 raise GenerationConfigError(message)
         elif name == "schedule_interpolation":
             if record["value"] != "linear":
@@ -828,7 +823,6 @@ def _validate_common(
     value: Any,
     *,
     sources: Mapping[str, Mapping[str, Any]],
-    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Validate the global material-independent scientific owner."""
     common_config = _mapping(value, label="generation common configuration")
@@ -859,7 +853,6 @@ def _validate_common(
     if common_config["generator_version"] != seeding.GENERATOR_VERSION:
         message = f"generator_version must be {seeding.GENERATOR_VERSION!r}."
         raise GenerationConfigError(message)
-    common_config["decision_source"] = copy.deepcopy(dict(decision_source))
     common_config["parameter_values"] = _mapping(common_config["parameter_values"], label="common.parameter_values")
     if set(common_config["parameter_values"]) != {"eps_min_global", "eps_max_global"}:
         message = "common.parameter_values must own exactly the two global porosity guards."
@@ -1228,7 +1221,6 @@ def _validate_operations(
     *,
     sources: Mapping[str, Mapping[str, Any]],
     definitions: Mapping[str, Mapping[str, Any]],
-    decision_source: Mapping[str, str],
 ) -> dict[str, Any]:
     """Validate material-independent operating-distribution ownership."""
     operations = _mapping(value, label="generation operations configuration")
@@ -1246,7 +1238,6 @@ def _validate_operations(
     if operations["operation_id"] != "fixed_bed":
         message = "The maintained operation configuration must use operation_id fixed_bed."
         raise GenerationConfigError(message)
-    operations["decision_source"] = copy.deepcopy(dict(decision_source))
     constraints = _mapping(operations["constraints"], label="operations.constraints")
     expected_constraints = {
         "heater_only": True,
@@ -2115,29 +2106,18 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         campaign["registry_config"],
         label="generation parameter registry",
     )
-    definitions, registry_metadata, decision_source, sampling_block_contract = materials.validate_semantic_registry(registry_config)
-    source_config = provenance_service.bind_decision_source(
-        _load_yaml(
-            campaign["sources_config"],
-            label="generation scientific source registry",
-        ),
-        decision_source,
+    definitions, registry_metadata, sampling_block_contract = materials.validate_semantic_registry(registry_config)
+    source_config = _load_yaml(
+        campaign["sources_config"],
+        label="generation scientific source registry",
     )
-    sources = provenance_service.validate_source_registry(
-        source_config,
-        decision_validator=lambda value: materials.validate_decision_source(
-            value,
-            label="generation source registry decision_source",
-            expected=decision_source,
-        ),
-    )
+    sources = provenance_service.validate_source_registry(source_config)
     common_config = _validate_common(
         _load_yaml(
             campaign["common_config"],
             label="generation common configuration",
         ),
         sources=sources,
-        decision_source=decision_source,
     )
     operations = _validate_operations(
         _load_yaml(
@@ -2146,7 +2126,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         ),
         sources=sources,
         definitions=definitions,
-        decision_source=decision_source,
     )
     profile_raw = _load_yaml(
         campaign["profile_config"],
@@ -2206,7 +2185,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             operations["parameter_values"],
             material_raw,
             sources=sources,
-            decision_source=decision_source,
         )
         projected = materials.project_material_for_profile(
             full_material,

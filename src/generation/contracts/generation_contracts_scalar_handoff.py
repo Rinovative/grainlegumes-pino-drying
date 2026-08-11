@@ -198,7 +198,7 @@ def _validated_entries(
     normalized = tuple(_as_entry(entry) for entry in entries)
     names = tuple(entry.name for entry in normalized)
     if names != profiles.TRANSIENT_SCALAR_INPUT_FIELDS:
-        message = "Scalar handoff contains missing, duplicate, unknown, obsolete, or misordered names."
+        message = "Scalar handoff contains missing, duplicate, unknown, or misordered names."
         raise ValueError(message)
     units = tuple(entry.unit for entry in normalized)
     if units != profiles.TRANSIENT_SCALAR_INPUT_UNITS:
