@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -62,9 +63,13 @@ def test_one_case_submission_and_local_only_concurrency(
     assert "--exclusive" not in command
     assert f"--output={tmp_path.resolve()}/slurm-%j.out" in command
     wrapped = command[-1]
-    assert "generation_campaign_node.sh" in wrapped
-    assert task.batch_name in wrapped
-    assert str(task.case_index) in wrapped
+    assert wrapped.startswith("--wrap=")
+    worker_arguments = shlex.split(wrapped.removeprefix("--wrap="))
+    launcher_index = next(index for index, argument in enumerate(worker_arguments) if argument.endswith("generation_campaign_node.sh"))
+    launcher = Path(worker_arguments[launcher_index])
+    assert worker_arguments[launcher_index + 1] == str(launcher.parents[1])
+    assert task.batch_name in worker_arguments
+    assert str(task.case_index) in worker_arguments
 
     plan = cluster.build_local_resource_plan(
         cores_per_case=1,

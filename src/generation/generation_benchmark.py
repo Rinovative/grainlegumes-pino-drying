@@ -808,7 +808,7 @@ def build_core_benchmark_slurm_command(
             message = "Preparation submission cannot select a variant or repetition."
             raise ValueError(message)
         cpus = 1
-        worker = [str(launcher), run_id, "prepare"]
+        worker = [str(launcher), str(repository), run_id, "prepare"]
         job_suffix = "prep"
     else:
         if variant is None or repetition is None:
@@ -818,6 +818,7 @@ def build_core_benchmark_slurm_command(
         cpus = variant.cores_per_case
         worker = [
             str(launcher),
+            str(repository),
             run_id,
             "measure",
             variant.variant_id,

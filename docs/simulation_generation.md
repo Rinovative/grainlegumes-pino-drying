@@ -167,7 +167,10 @@ including the exact checkout, venv, scheduler commands, and rsync. Only after
 that gate passes does it submit one environment-only Slurm allocation to audit
 the configured Python and COMSOL modules/executables, project imports, readable
 source/templates, writable scratch and durable storage, and template/config
-binding. It starts no COMSOL solve and submits no scientific case.
+binding. Submitted Slurm workers may execute from scheduler-managed script
+locations, so every repository dependency is resolved through the explicit exact
+CPU checkout rather than the worker script directory or current working directory.
+The preflight starts no COMSOL solve and submits no scientific case.
 
 3. Preview the resolved Slurm plan after every primary gate is filled:
 

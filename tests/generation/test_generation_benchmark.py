@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import shlex
 import statistics
 from dataclasses import replace
 from pathlib import Path
@@ -136,8 +137,14 @@ def test_maintained_suite_is_config_owned_same_case_and_serially_isolated(tmp_pa
         assert not any(argument.startswith("--dependency") for argument in command)
         assert "--exclusive" not in command
         assert f"--output={(tmp_path / 'logs').resolve()}/slurm-%j.out" in command
-        assert variant.variant_id in command[-1]
-        assert str(repetition) in command[-1]
+        wrapped = command[-1]
+        assert wrapped.startswith("--wrap=")
+        worker_arguments = shlex.split(wrapped.removeprefix("--wrap="))
+        launcher_index = next(index for index, argument in enumerate(worker_arguments) if argument.endswith("generation_benchmark_node.sh"))
+        launcher = Path(worker_arguments[launcher_index])
+        assert worker_arguments[launcher_index + 1] == str(launcher.parents[1])
+        assert variant.variant_id in worker_arguments
+        assert str(repetition) in worker_arguments
 
 
 def test_benchmark_rejects_nonordinary_scheduler_options() -> None:

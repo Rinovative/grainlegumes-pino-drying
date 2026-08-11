@@ -552,12 +552,13 @@ preflight_cpu() {
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${remote_campaign}" "${ONLY_BATCH}" "${CORES_PER_CASE}" \
     "${PARTITION}" "${WALL_TIME}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
-    "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" <<'REMOTE'
+    "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" \
+    "${REQUESTED_COMMIT}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; campaign="$4"; only_batch="$5"
 cores_per_case="$6"; partition="$7"; wall_time="$8"; python_module="$9"
 comsol_module="${10}"; python_executable="${11}"; comsol_executable="${12}"
-scheduler="${13}"
+scheduler="${13}"; commit="${14}"
 preflight_id="$(date -u +%Y%m%dT%H%M%SZ)"
 cd "${repository}"
 meta_root="$("${venv}/bin/python" -c 'import sys; from src import common; print(common.paths.get_generation_meta_root(storage_root=sys.argv[1]))' "${storage}")"
@@ -567,12 +568,13 @@ mkdir -p "${logs}"
 printf 'Preflight log root: %s\n' "${logs}"
 submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntasks=1
   --cpus-per-task=1 --job-name=vp2-generation-preflight
+  --export="ALL,GENERATION_GIT_COMMIT=${commit}"
   --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err"
   --chdir="${repository}")
 [[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
 set +e
 job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
-  "${venv}" "${campaign}" "${storage}" "${only_batch}" \
+  "${repository}" "${venv}" "${campaign}" "${storage}" "${only_batch}" \
   "${cores_per_case}" environment-only "${python_module}" "${comsol_module}" \
   "${python_executable}" "${comsol_executable}" "${scheduler}")"
 status="$?"
@@ -626,7 +628,7 @@ submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntas
 [[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
 set +e
 job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
-  "${venv}" "${campaign}" "${storage}" - \
+  "${repository}" "${venv}" "${campaign}" "${storage}" - \
   "${cores_per_case}" mapping-probe "${python_module}" "${comsol_module}" \
   "${python_executable}" "${comsol_executable}" "${scheduler}")"
 status="$?"

@@ -560,6 +560,25 @@ def test_preflight_stops_on_missing_login_rsync_before_slurm_submission(tmp_path
     assert "sbatch --wait --parsable" not in log_text
 
 
+def test_preflight_passes_exact_cpu_checkout_to_relocated_worker(tmp_path: Path) -> None:
+    """Bind the direct sbatch worker to the explicit repository and launch commit."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+
+    result = _run(
+        workflow,
+        ["preflight", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.rstrip().endswith("12345")
+    log_text = log.read_text(encoding="utf-8")
+    assert '--export="ALL,GENERATION_GIT_COMMIT=${commit}"' in log_text
+    worker_index = log_text.index('"${repository}/scripts/generation_cpu_smoke.sh"')
+    repository_index = log_text.index('"${repository}" "${venv}"', worker_index)
+    assert repository_index - worker_index < 100
+
+
 def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -> None:
     """Protect setup dry-run, exact modules, and noninteractive SSH execution."""
     workflow, log, environment, storage, _mirror = _harness(tmp_path)

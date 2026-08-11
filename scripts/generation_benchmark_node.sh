@@ -1,8 +1,8 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 2 && $# != 4 )); then
-  printf 'Usage: %s BENCHMARK_RUN_ID prepare | BENCHMARK_RUN_ID measure VARIANT_ID REPETITION\n' "$0" >&2
+if (( $# != 3 && $# != 5 )); then
+  printf 'Usage: %s REPOSITORY BENCHMARK_RUN_ID prepare | REPOSITORY BENCHMARK_RUN_ID measure VARIANT_ID REPETITION\n' "$0" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -18,10 +18,10 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 2
 fi
 
-RUN_ID="$1"
-MODE="$2"
-VARIANT_ID="${3:-}"
-REPETITION="${4:-}"
+RUN_ID="$2"
+MODE="$3"
+VARIANT_ID="${4:-}"
+REPETITION="${5:-}"
 if [[ ! "${RUN_ID}" =~ ^core_scaling_transient__[0-9a-f]{16}$ ]]; then
   printf 'Benchmark run ID is malformed: %s\n' "${RUN_ID}" >&2
   exit 2
@@ -63,10 +63,22 @@ case "${MODE}" in
     ;;
 esac
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+REPOSITORY_ROOT="$1"
+PREREQUISITE_HELPER="${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
+if [[ "${REPOSITORY_ROOT}" != /* || "${REPOSITORY_ROOT}" == / ]]; then
+  printf 'CPU compute-node prerequisite failed: explicit canonical CPU repository required: %s (Slurm script: %s).\n' \
+    "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+if [[ ! -f "${PREREQUISITE_HELPER}" || -L "${PREREQUISITE_HELPER}" || ! -r "${PREREQUISITE_HELPER}" ]]; then
+  printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (canonical CPU checkout: %s; Slurm script: %s).\n' \
+    "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+/bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
+  "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "${BASH_SOURCE[0]}"
 # shellcheck source=generation_prerequisites.sh
-source "${SCRIPT_DIR}/generation_prerequisites.sh"
+source "${PREREQUISITE_HELPER}"
 COMPUTE_DOMAIN="CPU compute-node"
 generation_require_command "${COMPUTE_DOMAIN}" git "benchmark checkout validation"
 [[ -d "${REPOSITORY_ROOT}/.git" ]] || {

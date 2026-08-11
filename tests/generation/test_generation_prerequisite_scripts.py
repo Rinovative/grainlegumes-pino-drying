@@ -9,6 +9,13 @@ from pathlib import Path
 
 _COMMIT = "a" * 40
 _REPOSITORY_URL = "https://github.com/Rinovative/grainlegumes-pino-drying.git"
+_CAMPAIGN_RUN_ID = "synthetic__0123456789abcdef"
+_BENCHMARK_RUN_ID = "core_scaling_transient__0123456789abcdef"
+_WORKER_SCRIPTS = (
+    "generation_cpu_smoke.sh",
+    "generation_campaign_node.sh",
+    "generation_benchmark_node.sh",
+)
 
 
 def _executable(path: Path, body: str) -> Path:
@@ -72,11 +79,42 @@ fi""",
     return environment, venv, log
 
 
-def _compute_command(repository: Path, venv: Path, tmp_path: Path, storage: Path) -> list[str]:
-    """Return the exact fake compute preflight command."""
+def _fake_checkout(tmp_path: Path) -> Path:
+    """Create one detached exact checkout containing only worker-owned scripts."""
+    source_repository = Path(__file__).resolve().parents[2]
+    repository = tmp_path / "fake/home/grainlegumes-generation/repo"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    git_directory = repository / ".git"
+    git_directory.mkdir()
+    (git_directory / "HEAD").write_text(f"{_COMMIT}\n", encoding="utf-8")
+    for name in (*_WORKER_SCRIPTS, "generation_prerequisites.sh"):
+        shutil.copy2(source_repository / "scripts" / name, scripts / name)
+    return repository
+
+
+def _spooled_script(repository: Path, name: str, tmp_path: Path) -> Path:
+    """Copy one submitted worker to the scheduler-managed runtime location."""
+    spool = tmp_path / "var/spool/slurmd/job123"
+    spool.mkdir(parents=True)
+    runtime_script = spool / "slurm_script"
+    shutil.copy2(repository / "scripts" / name, runtime_script)
+    assert not (spool / "generation_prerequisites.sh").exists()
+    return runtime_script
+
+
+def _compute_command(
+    runtime_script: Path,
+    repository: Path,
+    venv: Path,
+    tmp_path: Path,
+    storage: Path,
+) -> list[str]:
+    """Return the exact relocated fake compute preflight command."""
     return [
         "/bin/bash",
-        str(repository / "scripts/generation_cpu_smoke.sh"),
+        str(runtime_script),
+        str(repository),
         str(venv),
         str(tmp_path / "campaign.yaml"),
         str(storage),
@@ -88,6 +126,30 @@ def _compute_command(repository: Path, venv: Path, tmp_path: Path, storage: Path
         "python3",
         "comsol",
         "slurm",
+    ]
+
+
+def _campaign_command(runtime_script: Path, repository: Path) -> list[str]:
+    """Return one relocated production-worker startup command."""
+    return [
+        "/bin/bash",
+        str(runtime_script),
+        str(repository),
+        _CAMPAIGN_RUN_ID,
+        "synthetic.batch",
+        "1",
+        "16",
+    ]
+
+
+def _benchmark_command(runtime_script: Path, repository: Path) -> list[str]:
+    """Return one relocated benchmark preparation-worker startup command."""
+    return [
+        "/bin/bash",
+        str(runtime_script),
+        str(repository),
+        _BENCHMARK_RUN_ID,
+        "prepare",
     ]
 
 
@@ -106,18 +168,25 @@ def _login_command(repository: Path, venv: Path, storage: Path) -> list[str]:
     ]
 
 
-def test_compute_preflight_requires_only_compute_capabilities(tmp_path: Path) -> None:
-    """Pass with login rsync and scheduler commands absent from the allocation."""
-    repository = Path(__file__).resolve().parents[2]
+def test_compute_preflight_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
+    """Pass beyond helper loading when Slurm relocates the submitted preflight."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
     environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
     scratch = tmp_path / "scratch"
     storage = tmp_path / "storage"
     scratch.mkdir()
     storage.mkdir()
-    environment.update({"SLURM_JOB_ID": "123", "TMPDIR": str(scratch)})
+    environment.update(
+        {
+            "SLURM_JOB_ID": "123",
+            "TMPDIR": str(scratch),
+            "GENERATION_GIT_COMMIT": _COMMIT,
+        }
+    )
 
     result = subprocess.run(
-        _compute_command(repository, venv, tmp_path, storage),
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
         check=False,
         capture_output=True,
         text=True,
@@ -125,7 +194,9 @@ def test_compute_preflight_requires_only_compute_capabilities(tmp_path: Path) ->
     )
 
     assert result.returncode == 0, result.stderr
+    assert "check=exact-worker-checkout status=pass" in result.stdout
     assert "Native CPU environment-only completed" in result.stdout
+    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
     evidence = result.stdout + result.stderr + log.read_text(encoding="utf-8")
     for login_only in ("rsync", "sbatch", "squeue", "sacct", "scancel"):
         assert login_only not in evidence
@@ -173,7 +244,8 @@ def test_login_preflight_accepts_complete_control_plane(tmp_path: Path) -> None:
 
 def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> None:
     """Surface a project/dependency import failure as a compute prerequisite."""
-    repository = Path(__file__).resolve().parents[2]
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
     environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
     scratch = tmp_path / "scratch"
     storage = tmp_path / "storage"
@@ -184,11 +256,12 @@ def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> Non
             "SLURM_JOB_ID": "123",
             "TMPDIR": str(scratch),
             "FAKE_VENV_IMPORT_FAIL": "true",
+            "GENERATION_GIT_COMMIT": _COMMIT,
         }
     )
 
     result = subprocess.run(
-        _compute_command(repository, venv, tmp_path, storage),
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
         check=False,
         capture_output=True,
         text=True,
@@ -197,3 +270,193 @@ def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> Non
 
     assert result.returncode == 1
     assert "CPU compute-node prerequisite failed: Generation CPU venv package/imports" in result.stderr
+
+
+def _worker_environment(
+    environment: dict[str, str],
+    *,
+    venv: Path,
+    storage: Path,
+    scratch: Path,
+) -> dict[str, str]:
+    """Bind the shared compute values supplied by the control plane."""
+    return {
+        **environment,
+        "SLURM_JOB_ID": "123",
+        "TMPDIR": str(scratch),
+        "GENERATION_GIT_COMMIT": _COMMIT,
+        "GENERATION_CPU_VENV": str(venv),
+        "STORAGE_ROOT": str(storage),
+        "GENERATION_PYTHON_MODULE": "Python/3.10",
+        "GENERATION_COMSOL_MODULE": "Comsol/v6.4",
+        "GENERATION_PYTHON_EXECUTABLE": "python3",
+        "GENERATION_COMSOL_EXECUTABLE": "comsol",
+    }
+
+
+def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
+    """Start the real campaign worker from a spool copy with no sibling helper."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_campaign_node.sh", tmp_path)
+    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
+    scratch = tmp_path / "scratch"
+    storage = tmp_path / "storage"
+    scratch.mkdir()
+    storage.mkdir()
+    worker_environment = _worker_environment(
+        environment,
+        venv=venv,
+        storage=storage,
+        scratch=scratch,
+    )
+    worker_environment.update(
+        {
+            "SLURM_CPUS_PER_TASK": "16",
+            "GENERATION_CAMPAIGN_RUN_ID": _CAMPAIGN_RUN_ID,
+        }
+    )
+
+    result = subprocess.run(
+        _campaign_command(runtime_script, repository),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=worker_environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "check=exact-worker-checkout status=pass" in result.stdout
+    assert "initialize-worker-workspace" in log.read_text(encoding="utf-8")
+    assert "run-campaign-case" in log.read_text(encoding="utf-8")
+    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+
+
+def test_benchmark_worker_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
+    """Start benchmark preparation from a spool copy with no sibling helper."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_benchmark_node.sh", tmp_path)
+    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
+    scratch = tmp_path / "scratch"
+    storage = tmp_path / "storage"
+    scratch.mkdir()
+    storage.mkdir()
+    worker_environment = _worker_environment(
+        environment,
+        venv=venv,
+        storage=storage,
+        scratch=scratch,
+    )
+    worker_environment.update(
+        {
+            "SLURM_CPUS_PER_TASK": "1",
+            "GENERATION_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
+        }
+    )
+
+    result = subprocess.run(
+        _benchmark_command(runtime_script, repository),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=worker_environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "check=exact-worker-checkout status=pass" in result.stdout
+    assert "prepare-core-benchmark-case" in log.read_text(encoding="utf-8")
+    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+
+
+def test_relocated_worker_reports_missing_repository_helper(tmp_path: Path) -> None:
+    """Fail explicitly instead of letting source report a spool sibling error."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
+    (repository / "scripts/generation_prerequisites.sh").unlink()
+    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
+
+    result = subprocess.run(
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "CPU compute-node prerequisite failed: repository helper missing or unreadable" in result.stderr
+    assert f"canonical CPU checkout: {repository}" in result.stderr
+    assert f"Slurm script: {runtime_script}" in result.stderr
+    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+
+
+def test_worker_repository_rejects_unsafe_paths_and_wrong_commit(tmp_path: Path) -> None:
+    """Reject relative, symlinked, helper-symlinked, and wrong-commit checkouts."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
+    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
+
+    relative = subprocess.run(
+        _compute_command(runtime_script, Path("relative/repo"), venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert relative.returncode == 1
+    assert "explicit canonical CPU repository required" in relative.stderr
+
+    alias = tmp_path / "checkout-alias"
+    alias.symlink_to(repository, target_is_directory=True)
+    linked_repository = subprocess.run(
+        _compute_command(runtime_script, alias, venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert linked_repository.returncode == 1
+    assert "safe canonical CPU checkout" in linked_repository.stderr
+
+    helper = repository / "scripts/generation_prerequisites.sh"
+    external_helper = tmp_path / "external-prerequisites.sh"
+    shutil.copy2(helper, external_helper)
+    helper.unlink()
+    helper.symlink_to(external_helper)
+    linked_helper = subprocess.run(
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert linked_helper.returncode == 1
+    assert "repository helper missing or unreadable" in linked_helper.stderr
+
+    helper.unlink()
+    shutil.copy2(external_helper, helper)
+    (repository / ".git/HEAD").write_text(f"{'b' * 40}\n", encoding="utf-8")
+    wrong_commit = subprocess.run(
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert wrong_commit.returncode == 1
+    assert f"checkout commit {_COMMIT}" in wrong_commit.stderr
+
+
+def test_submitted_workers_source_only_the_explicit_checkout_helper() -> None:
+    """Protect every maintained worker from script-directory sibling loading."""
+    repository = Path(__file__).resolve().parents[2]
+    for name in _WORKER_SCRIPTS:
+        source = (repository / "scripts" / name).read_text(encoding="utf-8")
+        assert 'source "${PREREQUISITE_HELPER}"' in source
+        assert 'source "${SCRIPT_DIR}/generation_prerequisites.sh"' not in source
+        assert 'dirname "${BASH_SOURCE[0]}"' not in source

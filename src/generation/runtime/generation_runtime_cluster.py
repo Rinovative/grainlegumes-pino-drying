@@ -276,6 +276,7 @@ def build_campaign_case_slurm_submission_command(
     ]
     worker_command = [
         str(launcher),
+        str(repository),
         run_id,
         task.batch_name,
         str(task.case_index),

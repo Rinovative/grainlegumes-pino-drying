@@ -1,9 +1,9 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 11 )); then
+if (( $# != 12 )); then
   printf '%s\n' \
-    "Usage: $0 VENV CAMPAIGN STORAGE ONLY_BATCH CORES_PER_CASE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER" >&2
+    "Usage: $0 REPOSITORY VENV CAMPAIGN STORAGE ONLY_BATCH CORES_PER_CASE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -11,21 +11,33 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   exit 2
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+REPOSITORY_ROOT="$1"
+PREREQUISITE_HELPER="${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
+if [[ "${REPOSITORY_ROOT}" != /* || "${REPOSITORY_ROOT}" == / ]]; then
+  printf 'CPU compute-node prerequisite failed: explicit canonical CPU repository required: %s (Slurm script: %s).\n' \
+    "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+if [[ ! -f "${PREREQUISITE_HELPER}" || -L "${PREREQUISITE_HELPER}" || ! -r "${PREREQUISITE_HELPER}" ]]; then
+  printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (canonical CPU checkout: %s; Slurm script: %s).\n' \
+    "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+/bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
+  "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "${BASH_SOURCE[0]}"
 # shellcheck source=generation_prerequisites.sh
-source "${SCRIPT_DIR}/generation_prerequisites.sh"
-GENERATION_CPU_VENV="$1"
-CAMPAIGN_CONFIG="$2"
-STORAGE_ROOT="$3"
-ONLY_BATCH="$4"
-CORES_PER_CASE="$5"
-PREFLIGHT_MODE="$6"
-PYTHON_MODULE="$7"
-COMSOL_MODULE="$8"
-PYTHON_EXECUTABLE="$9"
-COMSOL_EXECUTABLE="${10}"
-SCHEDULER_KIND="${11}"
+source "${PREREQUISITE_HELPER}"
+GENERATION_CPU_VENV="$2"
+CAMPAIGN_CONFIG="$3"
+STORAGE_ROOT="$4"
+ONLY_BATCH="$5"
+CORES_PER_CASE="$6"
+PREFLIGHT_MODE="$7"
+PYTHON_MODULE="$8"
+COMSOL_MODULE="$9"
+PYTHON_EXECUTABLE="${10}"
+COMSOL_EXECUTABLE="${11}"
+SCHEDULER_KIND="${12}"
 
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_CONFIG}" != /* ]]; then
   printf 'Venv, campaign, and storage paths must be absolute.\n' >&2
