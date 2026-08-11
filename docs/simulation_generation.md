@@ -77,6 +77,27 @@ source references are documented only in
 | `sricehpc01` login | Exact checkout, native `.[generation-cpu]` venv, compact plans/manifests, Slurm submission/status, and durable CPU storage | Wrapper-owned batch SSH and rsync; manual SSH only for requested evidence inspection |
 | CPU Slurm compute node | Per-case `$TMPDIR` materialization, native COMSOL, export collection, HDF5 conversion/admission, and durable result publication | Scheduler-owned; no Docker and no manual login in the normal workflow |
 
+### Prerequisites by execution domain
+
+| Domain | Required capabilities | Not required there |
+| --- | --- | --- |
+| Bare `hpc115` | Bash and ordinary core utilities; Git and `realpath` for checkout/path admission; SSH for CPU control; rsync for transfer; Docker and the canonical image for local project Python | Native Generation venv, scientific Python packages, COMSOL, Slurm commands |
+| `hpc115` Docker | Project Python plus the configured local NumPy, SciPy, h5py, PyYAML, Generation, Dataset, and validation dependencies | SSH, rsync, Slurm control, COMSOL |
+| `sricehpc01` login | Module command; Git/HTTPS checkout access; exact clean checkout; native `.[generation-cpu]` venv and imports; writable durable CPU storage; `sbatch`, `squeue`, `sacct`, and `scancel`; rsync for the remote side of transfers | Per-case scratch or a compute-node COMSOL executable for ordinary orchestration |
+| CPU Slurm compute node | Module command; configured native Python and COMSOL executables/versions; CPU Generation venv and project imports; NumPy, SciPy, h5py, and PyYAML; readable checkout/templates; writable durable storage; writable `$TMPDIR` (or `/tmp` fallback); owned temporary-directory creation/removal | rsync and scheduler-control commands (`sbatch`, `squeue`, `sacct`, `scancel`) |
+
+rsync is intentionally present at both transfer endpoints: bare `hpc115` runs
+the client command, and the CPU login environment serves the remote side. A
+scientific allocation neither transfers campaign data nor invokes rsync.
+Scheduler submission, polling, accounting, and cancellation likewise remain on
+the CPU login/control plane. Native-smoke finalization also queries the COMSOL
+version on the login host explicitly; ordinary login orchestration does not
+otherwise require the compute executable. Compute jobs use Python filesystem operations for
+case materialization, HDF5 conversion/admission, and durable publication; they
+do not shell out to rsync, `tar`, `find`, `stat`, or `sha256sum`. The compute
+launchers invoke `mktemp` for owned scratch, while Python owns hashing and tree
+inspection. `srun` is not part of the maintained one-task job workflow.
+
 The CPU checkout is read-only with respect to GitHub and uses the public HTTPS
 repository URL, so GitHub SSH credentials are not required on `sricehpc01`.
 CPU paths are rooted under the `$HOME` resolved by the remote environment:
@@ -141,9 +162,12 @@ Run the non-solving native preflight for each campaign after local validation:
 ./scripts/generation_workflow.sh preflight "$TRANSIENT_CAMPAIGN"
 ```
 
-Preflight is remotely executed on `sricehpc01` and audits the configured modules,
-executables, Slurm capacity, venv, paths, and template/config binding without a
-COMSOL solve or job submission.
+Preflight first validates CPU login/control capabilities on `sricehpc01`,
+including the exact checkout, venv, scheduler commands, and rsync. Only after
+that gate passes does it submit one environment-only Slurm allocation to audit
+the configured Python and COMSOL modules/executables, project imports, readable
+source/templates, writable scratch and durable storage, and template/config
+binding. It starts no COMSOL solve and submits no scientific case.
 
 3. Preview the resolved Slurm plan after every primary gate is filled:
 
@@ -401,10 +425,11 @@ source and marked staging; successful cases and publications are reused rather
 than overwritten.
 
 The remote layout is `$HOME/grainlegumes-generation/{repo,storage,venv}`. The
-compute launcher loads the configured Python and COMSOL modules, activates the
-native venv, checks the exact commit and Slurm allocation, creates a guarded
-worker root under `$TMPDIR`, and removes only that owned temporary tree after
-success or recorded failure. `$TMPDIR` is never durable evidence. CPU source is
+login preflight checks the exact commit before submission. The compute launcher
+loads the configured Python and COMSOL modules, activates the native venv,
+checks the Slurm allocation, creates a guarded worker root under `$TMPDIR`, and
+removes only that owned temporary tree after success or recorded failure.
+`$TMPDIR` is never durable evidence. CPU source is
 deleted only through the existing inactive-job, source-inventory, transfer,
 HDF5, Dataset, workflow-receipt, and digest authorization gates. `collect` and
 the core benchmark always retain their CPU source; `--keep-cpu-source` remains

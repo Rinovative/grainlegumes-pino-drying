@@ -13,6 +13,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=generation_prerequisites.sh
+source "${SCRIPT_DIR}/generation_prerequisites.sh"
 GENERATION_CPU_VENV="$1"
 CAMPAIGN_CONFIG="$2"
 STORAGE_ROOT="$3"
@@ -30,8 +32,9 @@ if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_C
   exit 2
 fi
 if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
-  printf 'Generation CPU venv is missing: %s\n' "${GENERATION_CPU_VENV}" >&2
-  exit 2
+  printf 'CPU compute-node prerequisite missing: Generation CPU venv %s (blocks compute).\n' \
+    "${GENERATION_CPU_VENV}" >&2
+  exit 1
 fi
 if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready && "${PREFLIGHT_MODE}" != mapping-probe ]]; then
   printf 'Mode must be environment-only, production-ready, or mapping-probe.\n' >&2
@@ -49,28 +52,47 @@ done
   exit 2
 }
 
-module load "${PYTHON_MODULE}"
-module load "${COMSOL_MODULE}"
-command -v "${PYTHON_EXECUTABLE}"
-"${PYTHON_EXECUTABLE}" --version
-command -v "${COMSOL_EXECUTABLE}"
-"${COMSOL_EXECUTABLE}" -version
-command -v sbatch
-sbatch --version
-command -v squeue
-command -v sacct
-command -v scancel
-command -v rsync
-rsync --version
+COMPUTE_DOMAIN="CPU compute-node"
+generation_require_command "${COMPUTE_DOMAIN}" module "compute bootstrap"
+generation_require_command "${COMPUTE_DOMAIN}" mktemp "scratch probe"
+generation_require_command "${COMPUTE_DOMAIN}" rmdir "scratch probe cleanup"
+generation_require_command "${COMPUTE_DOMAIN}" hostname "compute-node identity"
+if ! module load "${PYTHON_MODULE}"; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "Python module ${PYTHON_MODULE}" "compute"
+fi
+generation_report_pass "${COMPUTE_DOMAIN}" "module:${PYTHON_MODULE}"
+if ! module load "${COMSOL_MODULE}"; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "COMSOL module ${COMSOL_MODULE}" "native smoke and compute"
+fi
+generation_report_pass "${COMPUTE_DOMAIN}" "module:${COMSOL_MODULE}"
+generation_require_command \
+  "${COMPUTE_DOMAIN}" "${PYTHON_EXECUTABLE}" "case materialization and HDF5 admission"
+generation_run_check \
+  "${COMPUTE_DOMAIN}" "python-version:${PYTHON_EXECUTABLE}" "compute" \
+  "${PYTHON_EXECUTABLE}" --version
+generation_require_command \
+  "${COMPUTE_DOMAIN}" "${COMSOL_EXECUTABLE}" "native smoke and compute"
+generation_run_check \
+  "${COMPUTE_DOMAIN}" "comsol-version:${COMSOL_EXECUTABLE}" "native smoke and compute" \
+  "${COMSOL_EXECUTABLE}" -version
 source "${GENERATION_CPU_VENV}/bin/activate"
-"${GENERATION_CPU_VENV}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+if ! "${GENERATION_CPU_VENV}/bin/python" -c \
+  'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "Generation CPU venv package/imports" \
+    "case materialization and HDF5 conversion/admission"
+fi
+generation_report_pass "${COMPUTE_DOMAIN}" "Generation-venv-imports"
 
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
 if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then
-  printf 'Preflight scratch parent is unavailable: %s\n' "${SCRATCH_PARENT}" >&2
-  exit 1
+  generation_prerequisite_missing \
+    "${COMPUTE_DOMAIN}" "writable scratch parent: ${SCRATCH_PARENT}" "compute"
 fi
 PROBE_ROOT="$(mktemp -d "${SCRATCH_PARENT%/}/vp2-preflight-${SLURM_JOB_ID}.XXXXXX")"
+generation_report_pass "${COMPUTE_DOMAIN}" "owned-scratch-probe" "${PROBE_ROOT}"
 cleanup_probe_root() {
   local status="$?"
   trap - EXIT
@@ -110,5 +132,8 @@ fi
 if [[ "${ONLY_BATCH}" != - ]]; then
   COMMAND+=(--only-batch "${ONLY_BATCH}")
 fi
-"${COMMAND[@]}"
+if ! "${COMMAND[@]}"; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "Generation environment validation" "native smoke and compute"
+fi
 printf 'Native CPU %s completed on %s.\n' "${PREFLIGHT_MODE}" "$(hostname)"

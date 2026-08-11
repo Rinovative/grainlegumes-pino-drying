@@ -4,7 +4,7 @@ generation_runtime_preflight.py
 ===============================================================================
 Audit the native CPU generation environment without starting a COMSOL solve.
 Responsibilities:
-  - Validate Python, COMSOL, Slurm, rsync, modules, templates, and resources
+  - Validate compute Python, COMSOL, modules, templates, scratch, and storage
   - Validate user-owned persistent roots and node-local scratch containment
   - Exercise one collision-safe marked directory creation and cleanup lifecycle
 Design principles:
@@ -35,8 +35,7 @@ from src.generation.contracts import generation_contracts_profiles as profiles
 
 from . import generation_runtime_workspace as workspace_service
 
-_REQUIRED_IMPORTS = ("numpy", "scipy", "yaml", "h5py")
-_SLURM_COMMANDS = ("sbatch", "squeue", "sacct", "scancel")
+_REQUIRED_IMPORTS = ("numpy", "scipy", "h5py", "yaml", "src.generation.cli.cli_generation")
 _MODULE_VERSION_PATTERN = re.compile(r"/v?([0-9]+(?:\.[0-9]+)*)$", re.IGNORECASE)
 
 
@@ -65,13 +64,13 @@ def _owned_writable_directory(path: Path, *, label: str) -> dict[str, Any]:
     """Validate one existing absolute user-owned writable directory."""
     resolved = path.expanduser().resolve()
     if not path.expanduser().is_absolute() or not resolved.is_dir() or resolved.is_symlink():
-        message = f"{label} must be one existing safe absolute directory: {resolved}"
+        message = f"CPU compute-node prerequisite failed: {label} must be one existing safe absolute directory: {resolved}"
         raise ValueError(message)
     if resolved.stat().st_uid != os.getuid():
-        message = f"{label} is not owned by the current user: {resolved}"
+        message = f"CPU compute-node prerequisite failed: {label} is not owned by the current user: {resolved}"
         raise PermissionError(message)
     if not os.access(resolved, os.W_OK | os.X_OK):
-        message = f"{label} is not writable and searchable: {resolved}"
+        message = f"CPU compute-node prerequisite failed: {label} is not writable and searchable: {resolved}"
         raise PermissionError(message)
     return {
         "path": str(resolved),
@@ -103,13 +102,11 @@ def _command_versions(
     arguments = {
         "python": [commands["python"], "--version"],
         "comsol": [commands["comsol"], "-version"],
-        "scheduler": [commands["sbatch"], "--version"],
-        "rsync": [commands["rsync"], "--version"],
     }
     results = {name: _version_output(command, timeout_seconds=timeout_seconds) for name, command in arguments.items()}
     failures = [name for name, result in results.items() if result["exit_code"] != 0]
     if failures:
-        message = f"Required version commands failed: {failures}."
+        message = f"CPU compute-node prerequisite failed: version checks {failures} (blocks compute)."
         raise RuntimeError(message)
     expected_versions = {
         "python": configured_module_version(python_module),
@@ -117,7 +114,10 @@ def _command_versions(
     }
     for name, expected in expected_versions.items():
         if expected is not None and not reported_version_matches(results[name]["output"], expected):
-            message = f"Configured {name} module expects version {expected}, but the active executable reported {results[name]['output']!r}."
+            message = (
+                f"CPU compute-node prerequisite failed: Configured {name} module expects version {expected}, "
+                f"but the active executable reported {results[name]['output']!r}."
+            )
             raise RuntimeError(message)
     return results
 
@@ -229,7 +229,7 @@ def run_cpu_preflight(
         create=False,
     )
     if not storage.is_dir():
-        message = f"Preflight requires the prepared storage root: {storage}"
+        message = f"CPU compute-node prerequisite missing: prepared durable storage root {storage} (blocks compute)."
         raise FileNotFoundError(message)
     work = workspace_service.resolve_work_root(
         storage_root=storage,
@@ -263,30 +263,37 @@ def run_cpu_preflight(
     try:
         Path(sys.executable).resolve().relative_to(venv)
     except ValueError as error:
-        message = f"Active Python executable {sys.executable} is not inside venv {venv}."
+        message = f"CPU compute-node prerequisite failed: active Python executable {sys.executable} is not inside venv {venv}."
         raise RuntimeError(message) from error
     configured_python_version = configured_module_version(str(site["python_module"]))
     if configured_python_version is not None:
         expected_python = tuple(int(component) for component in configured_python_version.split("."))
         active_python = tuple(sys.version_info[: len(expected_python)])
         if active_python != expected_python:
-            message = f"Configured Python module expects version {configured_python_version}, but the active interpreter is {sys.version}."
+            message = (
+                "CPU compute-node prerequisite failed: Configured Python module expects version "
+                f"{configured_python_version}, but the active interpreter is {sys.version}."
+            )
             raise RuntimeError(message)
     missing_imports = [name for name in _REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
     if missing_imports:
-        message = f"Generation CPU venv is missing imports: {missing_imports}."
+        message = (
+            "CPU compute-node prerequisite missing: Generation CPU venv imports "
+            f"{missing_imports} (blocks case materialization and HDF5 conversion/admission)."
+        )
         raise ModuleNotFoundError(message)
     command_names = {
         "python": str(site["python_executable"]),
         "comsol": str(site["comsol_executable"]),
-        "rsync": "rsync",
-        **{name: name for name in _SLURM_COMMANDS},
     }
     commands: dict[str, str] = {}
     for label, command_name in command_names.items():
         executable = shutil.which(command_name)
         if executable is None:
-            message = f"Required native CPU command is unavailable: {command_name}"
+            message = (
+                f"CPU compute-node prerequisite missing: {command_name} "
+                f"(blocks {'native solve' if label == 'comsol' else 'case materialization and admission'})."
+            )
             raise FileNotFoundError(message)
         commands[label] = executable
     versions = _command_versions(
@@ -313,6 +320,7 @@ def run_cpu_preflight(
         "status": ("environment_ready" if production_blocker is None else "environment_ready_production_blocked"),
         "production_configuration_ready": production_blocker is None,
         "production_configuration_blocker": production_blocker,
+        "domain": "CPU compute-node",
         "host": socket.gethostname(),
         "python": {
             "executable": str(Path(sys.executable).resolve()),
@@ -328,6 +336,12 @@ def run_cpu_preflight(
         "quota": _quota_evidence(home, timeout_seconds=timeout_seconds),
         "commands": commands,
         "versions": versions,
+        "checks": {
+            "Generation-venv-imports": {"status": "pass", "imports": list(_REQUIRED_IMPORTS)},
+            "repository-and-templates": {"status": "pass", "repository": str(repository)},
+            "durable-storage": {"status": "pass", "path": str(storage)},
+            "owned-scratch": {"status": "pass", "path": str(work)},
+        },
         "configured_modules": list(modules),
         "loaded_modules": os.environ.get("LOADEDMODULES"),
         "templates": _template_evidence(),

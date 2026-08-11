@@ -82,7 +82,10 @@ fail() {
 }
 
 require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail 1 "Required command was not found: $1"
+  local command_name="$1"
+  local blocked_operation="${2:-host control}"
+  command -v "${command_name}" >/dev/null 2>&1 ||
+    fail 1 "Bare hpc115 prerequisite missing: ${command_name} (blocks ${blocked_operation})."
 }
 
 validate_host() {
@@ -216,6 +219,7 @@ REMOTE
 
 resolve_remote_layout() {
   ensure_execution_bootstrap
+  require_command ssh "CPU login control"
   validate_host "${CPU_HOST}"
   REMOTE_HOME="$(read_remote_home "${CPU_HOST}")" || fail 1 "Could not resolve remote HOME."
   validate_path "remote HOME" "${REMOTE_HOME}"
@@ -425,28 +429,13 @@ verify_remote_setup() {
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${PYTHON_MODULE}" \
-    "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
+    "${PYTHON_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; repository_url="$5"
-python_module="$6"; comsol_module="$7"; python_executable="$8"; comsol_executable="$9"
-[[ -d "${repository}/.git" && -d "${storage}" && -x "${venv}/bin/python" ]]
-[[ ! -L "${repository}" && ! -L "${storage}" && ! -L "${venv}" ]]
-[[ "$(stat -c %u "${repository}")" -eq "${UID}" ]]
-[[ "$(stat -c %u "${storage}")" -eq "${UID}" ]]
-[[ "$(stat -c %u "${venv}")" -eq "${UID}" ]]
-[[ -z "$(git -C "${repository}" status --porcelain)" ]]
-[[ "$(git -C "${repository}" rev-parse HEAD)" == "${commit}" ]]
-[[ "$(git -C "${repository}" remote get-url origin)" == "${repository_url}" ]]
-module load "${python_module}"
-module load "${comsol_module}"
-command -v "${python_executable}" >/dev/null
-command -v "${comsol_executable}" >/dev/null
-"${python_executable}" --version
-"${comsol_executable}" -version 2>&1
-for name in sbatch squeue sacct scancel rsync; do command -v "${name}" >/dev/null; done
-source "${venv}/bin/activate"
-cd "${repository}"
-"${venv}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+python_module="$6"; python_executable="$7"
+"${repository}/scripts/generation_cpu_login_preflight.sh" \
+  "${repository}" "${storage}" "${venv}" "${commit}" "${repository_url}" \
+  "${python_module}" "${python_executable}"
 REMOTE
 }
 
@@ -476,6 +465,13 @@ setup_cpu() {
 set -euo pipefail
 root="$1"; repository="$2"; storage="$3"; venv="$4"; commit="$5"; repository_url="$6"
 python_module="$7"; comsol_module="$8"; python_executable="$9"; comsol_executable="${10}"
+setup_require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'CPU login prerequisite missing: %s (blocks setup).\n' "$1" >&2
+    exit 1
+  }
+}
+for name in git stat module; do setup_require_command "${name}"; done
 [[ "${root}" != / && "${root}" != "${HOME}" ]]
 parent="${root}"
 while [[ ! -e "${parent}" ]]; do parent="$(dirname "${parent}")"; done
@@ -492,20 +488,25 @@ fi
 git -C "${repository}" fetch origin "${commit}"
 git -C "${repository}" cat-file -e "${commit}^{commit}"
 git -C "${repository}" checkout --detach "${commit}"
-module load "${python_module}"
+if ! module load "${python_module}"; then
+  printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
+    "${python_module}" >&2
+  exit 1
+fi
+setup_require_command "${python_executable}"
 [[ -x "${venv}/bin/python" ]] || "${python_executable}" -m venv "${venv}"
 source "${venv}/bin/activate"
 "${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
-module load "${comsol_module}"
-"${python_executable}" --version
+if ! module load "${comsol_module}"; then
+  printf 'CPU login prerequisite failed: COMSOL module %s (blocks setup capability check).\n' \
+    "${comsol_module}" >&2
+  exit 1
+fi
+setup_require_command "${comsol_executable}"
 "${comsol_executable}" -version 2>&1
-sbatch --version
-rsync --version
-for name in squeue sacct scancel; do command -v "${name}" >/dev/null; done
-cd "${repository}"
-"${venv}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
 printf 'CPU setup complete: %s\n' "${root}"
 REMOTE
+  verify_remote_setup
 }
 
 remote_plan_submit() {
@@ -517,14 +518,12 @@ remote_plan_submit() {
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${remote_campaign}" "${ONLY_BATCH}" \
     "${operation}" "${PILOT_CASES_PER_MATERIAL}" \
-    "${SKIP_EXTREME_FAMILY_OOD}" "${PYTHON_MODULE}" \
-    "${COMSOL_MODULE}" <<'REMOTE'
+    "${SKIP_EXTREME_FAMILY_OOD}" "${PYTHON_MODULE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
 only_batch="$6"; operation="$7"; pilot_cases="$8"; skip_extreme="$9"
-python_module="${10}"; comsol_module="${11}"
+python_module="${10}"
 module load "${python_module}"
-module load "${comsol_module}"
 source "${venv}/bin/activate"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
@@ -571,10 +570,27 @@ submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntas
   --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err"
   --chdir="${repository}")
 [[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
-"${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
+set +e
+job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
   "${venv}" "${campaign}" "${storage}" "${only_batch}" \
   "${cores_per_case}" environment-only "${python_module}" "${comsol_module}" \
-  "${python_executable}" "${comsol_executable}" "${scheduler}"
+  "${python_executable}" "${comsol_executable}" "${scheduler}")"
+status="$?"
+set -e
+job_id="${job_id%%;*}"
+if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
+  printf 'CPU login Slurm submission failed: malformed preflight job ID %s.\n' \
+    "${job_id}" >&2
+  exit 1
+fi
+printf 'CPU compute-node preflight Slurm job: %s\n' "${job_id}"
+[[ ! -f "${logs}/slurm-${job_id}.out" ]] || cat "${logs}/slurm-${job_id}.out"
+[[ ! -f "${logs}/slurm-${job_id}.err" ]] || cat "${logs}/slurm-${job_id}.err" >&2
+if (( status != 0 )); then
+  printf 'CPU compute-node preflight failed in Slurm job %s; logs: %s\n' \
+    "${job_id}" "${logs}" >&2
+  exit "${status}"
+fi
 REMOTE
 }
 
@@ -650,8 +666,20 @@ remote_comsol_version() {
   remote_bash "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 comsol_module="$1"; comsol_executable="$2"
-module load "${comsol_module}"
-"${comsol_executable}" -version 2>&1
+if ! module load "${comsol_module}"; then
+  printf 'CPU login prerequisite failed: COMSOL module %s (blocks native smoke finalization).\n' \
+    "${comsol_module}" >&2
+  exit 1
+fi
+if ! command -v "${comsol_executable}" >/dev/null 2>&1; then
+  printf 'CPU login prerequisite missing: %s (blocks native smoke finalization).\n' \
+    "${comsol_executable}" >&2
+  exit 1
+fi
+if ! "${comsol_executable}" -version 2>&1; then
+  printf 'CPU login prerequisite failed: COMSOL version query (blocks native smoke finalization).\n' >&2
+  exit 1
+fi
 REMOTE
 }
 
@@ -829,7 +857,7 @@ collect_campaign() {
   (( ${#directories[@]} >= 4 )) || fail 1 "Transfer plan is empty."
   local directory
   for directory in "${directories[@]}"; do validate_transfer_path "${directory}"; done
-  require_command rsync
+  require_command rsync "campaign transfer"
   local staging receipt
   staging="$(local_cli create-transfer-staging "${RUN_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}")" ||
@@ -1433,7 +1461,7 @@ print("\t".join(("smoke", *fields)))')" ||
 }
 
 sync_runtime_smoke_receipt() {
-  require_command rsync
+  require_command rsync "runtime-smoke receipt transfer"
   local destination="${REMOTE_STORAGE_ROOT}/${RUNTIME_SMOKE_RELATIVE}"
   local temporary="${destination}.incoming.$$"
   remote_bash "${CPU_HOST}" "$(dirname "${destination}")" <<'REMOTE'
@@ -1512,6 +1540,7 @@ wait_for_core_benchmark() {
 
 
 collect_core_benchmark() {
+  require_command rsync "core benchmark transfer"
   if local_cli validate-core-benchmark "${RUN_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
     printf 'GPU benchmark publication validated and reused for %s.\n' "${RUN_ID}"

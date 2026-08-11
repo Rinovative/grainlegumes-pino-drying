@@ -161,6 +161,11 @@ payload="$(cat)"
 printf 'ssh-start\n' >> "${FAKE_COMMAND_LOG}"
 for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
 printf 'ssh-stdin-start\n%s\nssh-stdin-end\n' "${payload}" >> "${FAKE_COMMAND_LOG}"
+if [[ "${FAKE_CPU_LOGIN_RSYNC_MISSING:-false}" == true \
+  && "${payload}" == *'generation_cpu_login_preflight.sh'* ]]; then
+  printf 'CPU login prerequisite missing: rsync (blocks transfer).\n' >&2
+  exit 71
+fi
 if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
   printf '%s\n' '/remote/home'
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
@@ -535,6 +540,24 @@ def test_repository_admission_rejects_escape_ambiguous_and_container_paths(tmp_p
         assert result.returncode == 2, (campaign, result.stderr)
 
     assert "ssh-start" not in log.read_text(encoding="utf-8")
+
+
+def test_preflight_stops_on_missing_login_rsync_before_slurm_submission(tmp_path: Path) -> None:
+    """Route transfer requirements through the login gate before allocation."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_CPU_LOGIN_RSYNC_MISSING"] = "true"
+
+    result = _run(
+        workflow,
+        ["preflight", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "CPU login prerequisite missing: rsync (blocks transfer)." in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "generation_cpu_login_preflight.sh" in log_text
+    assert "sbatch --wait --parsable" not in log_text
 
 
 def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -> None:

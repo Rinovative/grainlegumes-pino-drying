@@ -38,6 +38,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=generation_prerequisites.sh
+source "${SCRIPT_DIR}/generation_prerequisites.sh"
 GENERATION_CPU_VENV="${GENERATION_CPU_VENV:-}"
 STORAGE_ROOT="${STORAGE_ROOT:-}"
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
@@ -45,8 +47,8 @@ if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
   exit 2
 fi
 if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
-  printf 'Prepared CPU generation venv is missing: %s\n' "${GENERATION_CPU_VENV}" >&2
-  exit 1
+  generation_prerequisite_missing \
+    "CPU compute-node" "Generation CPU venv: ${GENERATION_CPU_VENV}" "compute"
 fi
 for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
   GENERATION_PYTHON_EXECUTABLE GENERATION_COMSOL_EXECUTABLE; do
@@ -57,22 +59,40 @@ for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
   fi
 done
 
-module load "${GENERATION_PYTHON_MODULE}"
-module load "${GENERATION_COMSOL_MODULE}"
-command -v "${GENERATION_PYTHON_EXECUTABLE}"
-"${GENERATION_PYTHON_EXECUTABLE}" --version
-command -v "${GENERATION_COMSOL_EXECUTABLE}"
-"${GENERATION_COMSOL_EXECUTABLE}" -version
-command -v rsync
-rsync --version
+COMPUTE_DOMAIN="CPU compute-node"
+generation_require_command "${COMPUTE_DOMAIN}" module "compute bootstrap"
+generation_require_command "${COMPUTE_DOMAIN}" mktemp "case scratch creation"
+if ! module load "${GENERATION_PYTHON_MODULE}"; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "Python module ${GENERATION_PYTHON_MODULE}" "compute"
+fi
+if ! module load "${GENERATION_COMSOL_MODULE}"; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "COMSOL module ${GENERATION_COMSOL_MODULE}" "compute"
+fi
+generation_require_command \
+  "${COMPUTE_DOMAIN}" "${GENERATION_PYTHON_EXECUTABLE}" "case materialization and HDF5 admission"
+generation_run_check \
+  "${COMPUTE_DOMAIN}" "python-version:${GENERATION_PYTHON_EXECUTABLE}" "compute" \
+  "${GENERATION_PYTHON_EXECUTABLE}" --version
+generation_require_command \
+  "${COMPUTE_DOMAIN}" "${GENERATION_COMSOL_EXECUTABLE}" "compute"
+generation_run_check \
+  "${COMPUTE_DOMAIN}" "comsol-version:${GENERATION_COMSOL_EXECUTABLE}" "compute" \
+  "${GENERATION_COMSOL_EXECUTABLE}" -version
 source "${GENERATION_CPU_VENV}/bin/activate"
-"${GENERATION_CPU_VENV}/bin/python" -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'
+if ! "${GENERATION_CPU_VENV}/bin/python" -c \
+  'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'; then
+  generation_prerequisite_failed \
+    "${COMPUTE_DOMAIN}" "Generation CPU venv package/imports" \
+    "case materialization and HDF5 conversion/admission"
+fi
 
 export STORAGE_ROOT
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
 if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then
-  printf 'Slurm scratch parent is unavailable: %s\n' "${SCRATCH_PARENT}" >&2
-  exit 1
+  generation_prerequisite_missing \
+    "${COMPUTE_DOMAIN}" "writable scratch parent: ${SCRATCH_PARENT}" "compute"
 fi
 WORK_ROOT="$(mktemp -d "${SCRATCH_PARENT%/}/vp2-generation-${SLURM_JOB_ID}.XXXXXX")"
 MARKER_READY=false

@@ -41,7 +41,8 @@ def _fake_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide non-solving native command and version evidence."""
 
     def fake_which(name: str) -> str | None:
-        return None if name == "quota" else f"/synthetic/bin/{name}"
+        login_only = {"quota", "rsync", "sbatch", "squeue", "sacct", "scancel"}
+        return None if name in login_only else f"/synthetic/bin/{name}"
 
     def fake_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
         assert timeout_seconds > 0.0
@@ -79,6 +80,10 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert report["production_configuration_ready"] is False
     assert "unconfirmed required export mappings" in report["production_configuration_blocker"]
     assert report["production_solve_started"] is False
+    assert report["domain"] == "CPU compute-node"
+    assert set(report["commands"]) == {"python", "comsol"}
+    assert set(report["versions"]) == {"python", "comsol"}
+    assert report["checks"]["Generation-venv-imports"]["status"] == "pass"
     assert report["submission_plan"] == {
         "cases_per_job": 1,
         "cores_per_case": 16,
@@ -166,6 +171,50 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
             venv_path=venv,
         )
     assert not tuple(work.iterdir())
+
+
+def test_preflight_fails_clearly_when_project_package_import_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require the project Generation package in the compute venv."""
+    storage, work, venv = _paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        preflight.importlib.util,
+        "find_spec",
+        lambda name: None if name == "src.generation.cli.cli_generation" else object(),
+    )
+    with pytest.raises(ModuleNotFoundError, match=r"CPU compute-node prerequisite missing.*src[.]generation"):
+        preflight.run_cpu_preflight(
+            _CAMPAIGN,
+            only_batch=None,
+            storage_root=storage,
+            work_root=work,
+            venv_path=venv,
+        )
+    assert not tuple(work.iterdir())
+
+
+def test_preflight_fails_clearly_when_scratch_is_not_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require writable compute scratch before any runtime command checks."""
+    storage, work, venv = _paths(tmp_path, monkeypatch)
+    real_access = preflight.os.access
+
+    def fake_access(path: Path | str, mode: int) -> bool:
+        return False if Path(path).resolve() == work.resolve() else real_access(path, mode)
+
+    monkeypatch.setattr(preflight.os, "access", fake_access)
+    with pytest.raises(PermissionError, match="work_root is not writable"):
+        preflight.run_cpu_preflight(
+            _CAMPAIGN,
+            only_batch=None,
+            storage_root=storage,
+            work_root=work,
+            venv_path=venv,
+        )
 
 
 @pytest.mark.parametrize("wrong_runtime", ["python", "comsol"])
