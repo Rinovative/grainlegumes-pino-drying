@@ -75,7 +75,7 @@ def test_dataset_preview_distinguishes_absent_and_invalid_metadata(
     task: Any = SimpleNamespace(id="steady_flow")
 
     monkeypatch.setattr(
-        datasets.metadata,
+        datasets.contracts.metadata,
         "load_dataset_metadata_summary",
         lambda *_args, **_kwargs: pytest.fail("absent metadata must not be loaded"),
     )
@@ -101,7 +101,7 @@ def test_dataset_preview_distinguishes_absent_and_invalid_metadata(
         raise ValueError(invalid_message)
 
     monkeypatch.setattr(
-        datasets.metadata,
+        datasets.contracts.metadata,
         "load_dataset_metadata_summary",
         invalid_summary,
     )

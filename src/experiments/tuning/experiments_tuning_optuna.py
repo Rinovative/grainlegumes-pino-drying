@@ -911,7 +911,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = _as_mapping(config.get("paths"), label="experiment.paths")
 
     def summarize(dataset_id: str) -> dict[str, Any]:
-        summary = datasets.metadata.load_dataset_metadata_summary(
+        summary = datasets.contracts.metadata.load_dataset_metadata_summary(
             dataset_id,
             task=task,
             dataset_root=Path(paths["dataset_root"]),

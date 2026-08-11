@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from src import datasets, generation
-from src.generation import generation_porosity as porosity_service
+from src.generation.contracts import generation_contracts_porosity as porosity_service
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,7 +45,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
     authored["dataset_packages"] = [{"evaluation_regime": "id", "source_role": "seen"}]
     config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
 
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.require_batch(
         material_family="lentil",
         sampling_regime="natural",
@@ -94,7 +94,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
             assert porosity["material_support_departure_cause"] is None
     generation.runtime.finalize_batch(batch, storage_root=storage)
     generation.runtime.validate_terminal_batch(batch, storage_root=storage)
-    bounded = datasets.generated_batch.load_generated_batch(
+    bounded = datasets.packages.generated_batch.load_generated_batch(
         batch.batch_id,
         storage_root=storage,
         max_cases=1,
@@ -110,10 +110,10 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
         assert manifest["campaign_purpose"] == "technical_runtime_smoke"
         assert manifest["evaluation_regime"] == "id"
         assert manifest["training_eligible"] is False
-        assert manifest["split_membership"] == {datasets.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
+        assert manifest["split_membership"] == {datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
         with pytest.raises(ValueError, match="allow_technical_smoke"):
-            datasets.factory.create_dataset(
-                datasets.factory.DatasetRequest(
+            datasets.runtime.factory.create_dataset(
+                datasets.runtime.factory.DatasetRequest(
                     dataset_id=result["dataset_id"],
                     dataset_view=result["dataset_view"],
                     evaluation_regime="id",
@@ -121,7 +121,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
                 )
             )
         inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
-        assert inspection["available_selectors"] == [datasets.views.TECHNICAL_SMOKE_MEMBERSHIP]
+        assert inspection["available_selectors"] == [datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP]
         for workers in (0, 2):
             smoke = datasets.packages.smoke_dataset_package(
                 result["dataset_id"],

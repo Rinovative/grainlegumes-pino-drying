@@ -671,7 +671,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
     expected_metadata = {
         "generator": {"parameters": {"scalar_parameter": _SYNTHETIC_METADATA_VALUE}},
     }
-    fingerprint = datasets.identity.compute_case_fingerprint(
+    fingerprint = datasets.contracts.identity.compute_case_fingerprint(
         task=synthetic_task,
         case_id="case_0000",
         source_identity=source_identity,
@@ -679,7 +679,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         inputs=inputs[0],
         outputs=outputs[0],
     )
-    payload = datasets.identity.build_training_dataset_payload(
+    payload = datasets.contracts.identity.build_training_dataset_payload(
         task=synthetic_task,
         dataset_id="synthetic_train",
         sample_ids=("case_0000",),
@@ -694,7 +694,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         inputs=inputs,
         outputs=outputs,
     )
-    loaded = datasets.steady.create_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
+    loaded = datasets.runtime.steady.create_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
     generator = sample["meta"].get("generator")

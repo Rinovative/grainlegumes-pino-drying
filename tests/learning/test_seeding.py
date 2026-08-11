@@ -91,11 +91,11 @@ def test_non_strict_cuda_reproducibility_keeps_process_and_worker_seed_owners(
     assert plan == experiments.run.build_seed_plan(9)
 
     worker_calls: list[tuple[str, int]] = []
-    monkeypatch.setattr(datasets.training.random, "seed", lambda seed: worker_calls.append(("python", seed)))
-    monkeypatch.setattr(datasets.training.np.random, "seed", lambda seed: worker_calls.append(("numpy", seed)))
-    monkeypatch.setattr(datasets.training.torch, "manual_seed", lambda seed: worker_calls.append(("torch", seed)))
+    monkeypatch.setattr(datasets.runtime.training.random, "seed", lambda seed: worker_calls.append(("python", seed)))
+    monkeypatch.setattr(datasets.runtime.training.np.random, "seed", lambda seed: worker_calls.append(("numpy", seed)))
+    monkeypatch.setattr(datasets.runtime.training.torch, "manual_seed", lambda seed: worker_calls.append(("torch", seed)))
     worker_id = 3
-    datasets.training._make_worker_init_fn(plan["worker"])(worker_id)  # noqa: SLF001
+    datasets.runtime.training._make_worker_init_fn(plan["worker"])(worker_id)  # noqa: SLF001
     expected_worker_seed = plan["worker"] + worker_id
     assert worker_calls == [
         ("python", expected_worker_seed),
@@ -184,7 +184,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
 
     synthetic_split_contract = object()
     monkeypatch.setattr(
-        datasets.splits,
+        datasets.preprocessing.splits,
         "admit_split_contract",
         lambda _payload: synthetic_split_contract,
     )
@@ -201,7 +201,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
         return {"state": processor.state_dict()}
 
     monkeypatch.setattr(
-        datasets.normalization,
+        datasets.preprocessing.normalization,
         "build_normalizer_artifact",
         build_normalizer_artifact,
     )

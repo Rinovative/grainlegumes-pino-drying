@@ -152,7 +152,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         "best_checkpoint": {"model_state_dict": model.state_dict()},
         "normalizer_state": normalizer_state,
     }
-    source_identity = datasets.identity.DatasetIdentity(
+    source_identity = datasets.contracts.identity.DatasetIdentity(
         dataset_id="synthetic",
         task="synthetic",
         data_contract_digest="d" * 64,
@@ -161,7 +161,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         sample_count=1,
         spatial_shape=(1, 1),
     )
-    evidence = datasets.splits.SplitRoleEvidence(
+    evidence = datasets.preprocessing.splits.SplitRoleEvidence(
         name="eval",
         source=source_identity,
         index_values=(0,),
@@ -202,8 +202,8 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
 
     monkeypatch.setattr(context, "_build_model_from_config", build_model)
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
-    monkeypatch.setattr(context.datasets.steady, "create_dataset", create_dataset)
-    monkeypatch.setattr(context.datasets.splits, "combine_identity_datasets", lambda _sources: dataset)
+    monkeypatch.setattr(context.datasets.runtime.steady, "create_dataset", create_dataset)
+    monkeypatch.setattr(context.datasets.preprocessing.splits, "combine_identity_datasets", lambda _sources: dataset)
     monkeypatch.setattr(context, "_validate_split_indices_for_dataset", lambda **_kwargs: None)
 
     def unexpected_torch_load(*_args: Any, **_kwargs: Any) -> Any:

@@ -13,7 +13,7 @@ import pytest
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from src import analysis
+from src import analysis, datasets
 from src.domain.tasks.domain_task_steady_flow import STEADY_FLOW
 
 
@@ -294,7 +294,7 @@ def test_eda_dataframe_derives_speed_without_mutating_velocity(
             "generation_root": Path("synthetic-generation-root"),
         }
 
-    monkeypatch.setattr("src.datasets.dataset_generated_batch.load_generated_batch", fake_load)
+    monkeypatch.setattr(datasets.packages.generated_batch, "load_generated_batch", fake_load)
     frame, _logs = analysis.eda.dataframe.generate_eda_dataframe(
         "synthetic-batch",
         task=STEADY_FLOW,

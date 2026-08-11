@@ -115,7 +115,7 @@ def _dataset_preview(
             metadata_validated=False,
         )
 
-    summary = datasets.metadata.load_dataset_metadata_summary(
+    summary = datasets.contracts.metadata.load_dataset_metadata_summary(
         dataset_id,
         task=task,
         dataset_root=dataset_root,

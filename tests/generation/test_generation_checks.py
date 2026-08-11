@@ -44,9 +44,9 @@ def _batch(
     case_indices: tuple[int, ...],
     *,
     grid: dict[str, Any] | None = None,
-) -> generation.config.GenerationConfig:
+) -> generation.cases.config.GenerationConfig:
     return cast(
-        "generation.config.GenerationConfig",
+        "generation.cases.config.GenerationConfig",
         SimpleNamespace(
             material_family=material_family,
             material_role="seen",
@@ -58,11 +58,11 @@ def _batch(
 
 def test_sentinel_workload_is_independent_of_production_case_counts() -> None:
     """Keep bounded validation mechanics separate from campaign allocation."""
-    campaign = generation.config.load_campaign_config(
+    campaign = generation.cases.config.load_campaign_config(
         Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
         require_executable=False,
     )
-    baseline = generation.sentinels.inspect_sentinel_workload(campaign)
+    baseline = generation.validation.sentinels.inspect_sentinel_workload(campaign)
     reduced_batches = tuple(replace(batch, case_indices=(1,)) for batch in campaign.batches)
     reduced = replace(
         campaign,
@@ -70,7 +70,7 @@ def test_sentinel_workload_is_independent_of_production_case_counts() -> None:
         batches=reduced_batches,
     )
 
-    assert generation.sentinels.inspect_sentinel_workload(reduced) == baseline
+    assert generation.validation.sentinels.inspect_sentinel_workload(reduced) == baseline
     assert baseline["natural_materials"] == list(campaign.material_inventory)
     assert baseline["natural_case_count"] == (baseline["natural_cases_per_material"] * len(campaign.material_inventory))
     assert baseline["parameter_ood_case_count"] == sum(evidence["case_count"] for evidence in baseline["parameter_ood"].values())
@@ -85,14 +85,14 @@ def test_readiness_uses_resolved_decision_evidence() -> None:
         "sha256": "1" * 64,
     }
     batch = cast(
-        "generation.config.GenerationConfig",
+        "generation.cases.config.GenerationConfig",
         SimpleNamespace(
             batch_name="synthetic-batch",
             scientific_values={"material": {"decision_source": decision_source}},
         ),
     )
     campaign = cast(
-        "generation.config.CampaignConfig",
+        "generation.cases.config.CampaignConfig",
         SimpleNamespace(batches=(batch,)),
     )
 
@@ -131,14 +131,14 @@ def test_smoke_pairing_derives_material_count_seed_and_grid() -> None:
     steady_batch = _batch("configured_material", indices, grid=grid)
     transient_batch = _batch("configured_material", indices, grid=grid)
     steady_campaign = cast(
-        "generation.config.CampaignConfig",
+        "generation.cases.config.CampaignConfig",
         SimpleNamespace(
             batches=(steady_batch,),
             paired_equivalence_seed=42,
         ),
     )
     transient_campaign = cast(
-        "generation.config.CampaignConfig",
+        "generation.cases.config.CampaignConfig",
         SimpleNamespace(
             batches=(transient_batch,),
             paired_equivalence_seed=42,
@@ -172,7 +172,7 @@ def test_smoke_pairing_derives_material_count_seed_and_grid() -> None:
     assert report["grid_extent_m"] == {"x": 2.0, "y": 1.0, "z": 0.5}
 
     mismatched_campaign = cast(
-        "generation.config.CampaignConfig",
+        "generation.cases.config.CampaignConfig",
         SimpleNamespace(
             batches=(_batch("different_material", indices),),
             paired_equivalence_seed=42,

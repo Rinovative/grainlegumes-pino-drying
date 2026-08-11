@@ -3,6 +3,7 @@ Scientific presentation services.
 
 Provides:
 - curated: fixed local scientific media rendering
+- field_labels: canonical user-facing scientific field labels
 - registry: numbered EDA and evaluation presentation definitions
 """
 
@@ -11,13 +12,17 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from . import analysis_presentation_registry as registry
-
 if TYPE_CHECKING:
+    from . import analysis_field_labels as field_labels
     from . import analysis_presentation_curated as curated
+    from . import analysis_presentation_registry as registry
 
-_MODULES = {"curated": "analysis_presentation_curated"}
-__all__ = ["curated", "registry"]
+_MODULES = {
+    "curated": "analysis_presentation_curated",
+    "field_labels": "analysis_field_labels",
+    "registry": "analysis_presentation_registry",
+}
+__all__ = ["curated", "field_labels", "registry"]
 
 
 def __getattr__(name: str) -> object:

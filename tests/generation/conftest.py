@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import yaml
 
-from src.generation import generation_profiles as profiles
+from src.generation.contracts import generation_contracts_profiles as profiles
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

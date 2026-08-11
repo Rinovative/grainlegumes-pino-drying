@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from src import analysis
-from src.datasets.dataset_metadata import DatasetMetadata
+from src.datasets.contracts.dataset_contracts_metadata import DatasetMetadata
 
 
 class _IdentityNormalizer:

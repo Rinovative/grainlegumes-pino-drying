@@ -80,14 +80,14 @@ class SplitSelection:
         Semantic saved membership being reconstructed.
     dataset_paths : tuple[pathlib.Path, ...]
         Current package files resolved for the saved logical dataset selection.
-    evidence : datasets.splits.SplitRoleEvidence
+    evidence : datasets.preprocessing.splits.SplitRoleEvidence
         Admitted source identity, ordered membership, counts, and digest.
 
     """
 
     role: SplitRole
     dataset_paths: tuple[Path, ...]
-    evidence: datasets.splits.SplitRoleEvidence
+    evidence: datasets.preprocessing.splits.SplitRoleEvidence
 
     @property
     def indices(self) -> torch.Tensor:
@@ -228,8 +228,8 @@ def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, tuple[
 
 def _validate_split_role(split: str) -> SplitRole:
     """Validate the requested split role."""
-    if split not in datasets.splits.SPLIT_ROLES:
-        allowed = ", ".join(datasets.splits.SPLIT_ROLES)
+    if split not in datasets.preprocessing.splits.SPLIT_ROLES:
+        allowed = ", ".join(datasets.preprocessing.splits.SPLIT_ROLES)
         msg = f"Unknown inference split {split!r}. Expected one of: {allowed}."
         raise ValueError(msg)
     return cast("SplitRole", split)
@@ -289,7 +289,7 @@ def _select_split(
     """
     role = _validate_split_role(split)
     train_ratio, ood_fraction, split_seed = _split_settings(config)
-    split_contract = datasets.splits.admit_split_contract(
+    split_contract = datasets.preprocessing.splits.admit_split_contract(
         split_indices,
         expected_train_ratio=train_ratio,
         expected_ood_fraction=ood_fraction,
@@ -298,7 +298,7 @@ def _select_split(
     role_evidence = split_contract.role(role)
     configured_dataset_ids = _configured_dataset_ids(config)[role]
     saved_dataset_id = role_evidence.source.dataset_id
-    expected_dataset_id = datasets.identity.combined_dataset_id(configured_dataset_ids)
+    expected_dataset_id = datasets.contracts.identity.combined_dataset_id(configured_dataset_ids)
     if saved_dataset_id != expected_dataset_id:
         msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {expected_dataset_id!r}."
         raise RuntimeError(msg)
@@ -322,7 +322,7 @@ def _validate_split_indices_for_dataset(
 ) -> None:
     """Bind admitted role evidence to the loaded dataset identity."""
     dataset_identity = getattr(dataset, "identity", None)
-    if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
+    if not isinstance(dataset_identity, datasets.contracts.identity.DatasetIdentity):
         msg = "Inference dataset must expose a verified DatasetIdentity."
         raise TypeError(msg)
     if selection.evidence.source != dataset_identity:
@@ -518,11 +518,11 @@ def load_inference_context_with_resolution(
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = model.to(device)
 
-    processor = datasets.normalization.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
+    processor = datasets.preprocessing.normalization.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
 
     task = experiments.config.loader.validate_resolved_task_contract(cfg)
-    source_packages = [datasets.steady.create_dataset(path, task=task) for path in split_selection.dataset_paths]
-    source_dataset = datasets.splits.combine_identity_datasets(source_packages)
+    source_packages = [datasets.runtime.steady.create_dataset(path, task=task) for path in split_selection.dataset_paths]
+    source_dataset = datasets.preprocessing.splits.combine_identity_datasets(source_packages)
     _validate_split_indices_for_dataset(
         selection=split_selection,
         dataset=source_dataset,

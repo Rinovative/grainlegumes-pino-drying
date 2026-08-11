@@ -542,7 +542,7 @@ def build_semantic_config(
     if not isinstance(task_contract, Mapping):
         msg = "Semantic tracking config requires a resolved task contract."
         raise TypeError(msg)
-    split_contract = datasets.splits.admit_split_contract(split_indices)
+    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     dataset_payload: dict[str, Any] = {}
     for evidence, tracked_role in (
         (split_contract.role("train"), "id"),
@@ -636,7 +636,7 @@ def build_semantic_config(
                 "train_ratio": split_contract.train_ratio,
                 "ood_fraction": split_contract.ood_fraction,
                 "split_seed": split_contract.split_seed,
-                "membership_digests": {role: split_contract.role(role).membership_digest for role in datasets.splits.SPLIT_ROLES},
+                "membership_digests": {role: split_contract.role(role).membership_digest for role in datasets.preprocessing.splits.SPLIT_ROLES},
             },
             "normalization": {
                 **copy.deepcopy(dict(preprocessing)),
@@ -704,10 +704,10 @@ def build_monitor_membership(
     monitor = cast("Mapping[str, Any]", settings["monitor"])
     if settings["mode"] == "disabled" or not bool(monitor["enabled"]):
         return None
-    split_contract = datasets.splits.admit_split_contract(split_indices)
+    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     evidence = split_contract.role("eval")
     selected = list(evidence.index_values[: int(monitor["max_cases"])])
-    digest = datasets.identity.membership_digest(
+    digest = datasets.contracts.identity.membership_digest(
         role="wandb_physics_monitor",
         dataset_fingerprint=evidence.source.fingerprint,
         sample_ids=evidence.source.sample_ids,

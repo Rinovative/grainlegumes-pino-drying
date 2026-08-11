@@ -6,9 +6,9 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from src import domain, generation
-from src.datasets import dataset_transient as transient_runtime
-from src.datasets import dataset_transient_contract as transient_contract
-from src.datasets import dataset_views as views
+from src.datasets.runtime import dataset_runtime_transient as transient_runtime
+from src.datasets.contracts import dataset_contracts_transient as transient_contract
+from src.datasets.contracts import dataset_contracts_views as views
 
 _STEADY_DIGEST = "d40dc74f5f8e70dc19a7e592e4d720ff27ca6131b70bd64d88556791566fac0a"
 _TRANSIENT_DIGEST = "73ff7473076e5ed7fc4f64bd13bffba53a8bdb34c52f0e9bf351e603f72206b2"

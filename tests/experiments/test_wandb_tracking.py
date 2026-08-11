@@ -165,7 +165,7 @@ def _split_evidence(config: dict[str, Any]) -> dict[str, Any]:
         "ood": torch.tensor([2]),
     }
     memberships = {
-        role: datasets.identity.membership_digest(
+        role: datasets.contracts.identity.membership_digest(
             role=role,
             dataset_fingerprint=identities["ood" if role == "ood" else "train"]["fingerprint"],
             sample_ids=identities["ood" if role == "ood" else "train"]["sample_ids"],
@@ -174,7 +174,7 @@ def _split_evidence(config: dict[str, Any]) -> dict[str, Any]:
         for role, role_indices in indices.items()
     }
     return {
-        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
+        "schema_version": datasets.preprocessing.splits.SPLIT_SCHEMA_VERSION,
         "task": config["task"],
         "task_contract_digest": config["task_contract"]["digest"],
         "train_indices": indices["train"],

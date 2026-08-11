@@ -19,6 +19,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import analysis, common, datasets, domain, experiments, generation, learning
 
+_MODULES = {
+    "analysis": "analysis",
+    "common": "common",
+    "datasets": "datasets",
+    "domain": "domain",
+    "experiments": "experiments",
+    "generation": "generation",
+    "learning": "learning",
+}
 __all__ = [
     "analysis",
     "common",
@@ -32,9 +41,10 @@ __all__ = [
 
 def __getattr__(name: str) -> object:
     """Resolve one declared public name on first access."""
-    if name not in __all__:
+    module_name = _MODULES.get(name)
+    if module_name is None:
         message = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(message)
-    module = import_module(f"{__name__}.{name}")
+    module = import_module(f"{__name__}.{module_name}")
     globals()[name] = module
     return module

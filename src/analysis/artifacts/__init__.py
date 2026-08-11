@@ -13,14 +13,14 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from . import analysis_artifact_contracts as contracts
-
 if TYPE_CHECKING:
+    from . import analysis_artifact_contracts as contracts
     from . import analysis_artifact_generation as generation
     from . import analysis_artifact_service as service
     from . import analysis_artifact_timing as timing
 
 _MODULES = {
+    "contracts": "analysis_artifact_contracts",
     "generation": "analysis_artifact_generation",
     "service": "analysis_artifact_service",
     "timing": "analysis_artifact_timing",

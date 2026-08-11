@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from src import generation
-from src.generation import generation_preflight as preflight
+from src.generation.runtime import generation_runtime_preflight as preflight
 
 _CAMPAIGN = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
 
@@ -161,7 +161,7 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
     monkeypatch.undo()
     storage, work, venv = _paths(tmp_path / "wrong modules", monkeypatch)
     _fake_capabilities(monkeypatch)
-    campaign = generation.config.load_campaign_config(
+    campaign = generation.cases.config.load_campaign_config(
         _CAMPAIGN,
         require_executable=False,
     )

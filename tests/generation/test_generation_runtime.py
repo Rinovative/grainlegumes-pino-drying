@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 
 from src import common, generation
-from src.generation import generation_workspace as workspace
+from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_workspace as workspace
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
 
 def _natural_batch_name(simulation_profile: str) -> str:
     """Return one canonical synthetic natural-batch selector."""
-    return generation.config.build_batch_name(
+    return generation.cases.config.build_batch_name(
         simulation_profile,
         "lentil",
         "natural",
@@ -31,10 +32,10 @@ def _natural_batch_name(simulation_profile: str) -> str:
 def test_float32_conversion_requires_explicit_tolerance() -> None:
     """Protect validated conversion rather than silent precision loss."""
     values = np.asarray([1.0, 1.0e-9, 123.456789], dtype=np.float64)
-    converted = generation.storage.validate_float32_conversion(values, rtol=1e-6, atol=1e-12, label="synthetic")
+    converted = generation.publication.storage.validate_float32_conversion(values, rtol=1e-6, atol=1e-12, label="synthetic")
     assert converted.dtype == np.float32
     with pytest.raises(ValueError, match="exceeds configured tolerance"):
-        generation.storage.validate_float32_conversion(values, rtol=0.0, atol=0.0, label="synthetic")
+        generation.publication.storage.validate_float32_conversion(values, rtol=0.0, atol=0.0, label="synthetic")
 
 
 def test_resolved_science_and_execution_are_persisted_separately(
@@ -43,7 +44,7 @@ def test_resolved_science_and_execution_are_persisted_separately(
 ) -> None:
     """Protect scientific identity from site and resource settings."""
     config_path, _template = generation_config_factory()
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
@@ -65,11 +66,11 @@ def test_terminal_case_identity_binds_persisted_input_configuration(
 ) -> None:
     """Reject case identities recomputed around an arbitrary input-config digest."""
     config_path, _template = generation_config_factory()
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
-    bundle = generation.case.generate_case_input_bundle(config, 1, tmp_path / "case identity")
+    bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case identity")
     payload = bundle.case_payload
     manifest = {
         "simulation_profile": config.profile.id,
@@ -94,7 +95,7 @@ def test_terminal_case_identity_binds_persisted_input_configuration(
         "simulation_case_id": bundle.simulation_case_id,
         "material_family": config.material_family,
     }
-    generation.runtime._require_case_matches_terminal(  # noqa: SLF001
+    runtime_service._require_case_matches_terminal(  # noqa: SLF001
         payload,
         manifest=manifest,
         scientific=config.scientific_values,
@@ -105,15 +106,15 @@ def test_terminal_case_identity_binds_persisted_input_configuration(
     tampered = json.loads(json.dumps(payload))
     tampered["case_input_config_digest"] = "0" * 64
     assert tampered["case_input_config_digest"] != config.case_input_config_digest
-    tampered["case_input_id"] = generation.case.compute_case_input_id(tampered)
-    tampered["simulation_case_id"] = generation.case.compute_simulation_case_id(tampered)
+    tampered["case_input_id"] = generation.cases.case.compute_case_input_id(tampered)
+    tampered["simulation_case_id"] = generation.cases.case.compute_simulation_case_id(tampered)
     tampered_record = {
         **record,
         "case_input_id": tampered["case_input_id"],
         "simulation_case_id": tampered["simulation_case_id"],
     }
     with pytest.raises(RuntimeError, match="metadata disagrees"):
-        generation.runtime._require_case_matches_terminal(  # noqa: SLF001
+        runtime_service._require_case_matches_terminal(  # noqa: SLF001
             tampered,
             manifest=manifest,
             scientific=config.scientific_values,
@@ -132,7 +133,7 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         simulation_profile="transient_drying",
         executable=fake_comsol,
     )
-    original = generation.config.load_generation_config(
+    original = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
@@ -142,7 +143,7 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         "regime_index": 0,
         "material_family": "lentil",
         "material_role": "seen",
-        "evaluation_regime": generation.config.NO_EVALUATION_REGIME,
+        "evaluation_regime": generation.cases.config.NO_EVALUATION_REGIME,
         "sampling_regime": "natural",
         "assignment_role": "nominal_reference",
         "ood_group": None,
@@ -152,13 +153,13 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
     }
     scientific.update(
         {
-            "campaign_purpose": generation.config.PILOT_CAMPAIGN_PURPOSE,
-            "evaluation_regime": generation.config.NO_EVALUATION_REGIME,
+            "campaign_purpose": generation.cases.config.PILOT_CAMPAIGN_PURPOSE,
+            "evaluation_regime": generation.cases.config.NO_EVALUATION_REGIME,
             "case_count": 1,
             "assignments": [assignment],
             "pilot_check": {
                 "cases_per_material": 1,
-                "case_kinds": list(generation.config.PILOT_CASE_KINDS),
+                "case_kinds": list(generation.cases.config.PILOT_CASE_KINDS),
                 "case_semantics": {"first": "nominal_reference", "remaining": "natural_pilot"},
                 "nominal_case_index": 1,
                 "dataset_membership": "none",
@@ -168,15 +169,15 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
     )
     scientific.pop("paired_equivalence_seed", None)
     scientific_digest = common.serialization.canonical_json_sha256(scientific)
-    case_input_digest = generation.config.compute_case_input_config_digest(scientific)
-    batch_name = generation.config.build_batch_name(
+    case_input_digest = generation.cases.config.compute_case_input_config_digest(scientific)
+    batch_name = generation.cases.config.build_batch_name(
         original.profile.id,
         original.material_family,
-        generation.config.PILOT_CAMPAIGN_PURPOSE,
+        generation.cases.config.PILOT_CAMPAIGN_PURPOSE,
     )
     batch = replace(
         original,
-        evaluation_regime=generation.config.NO_EVALUATION_REGIME,
+        evaluation_regime=generation.cases.config.NO_EVALUATION_REGIME,
         batch_name=batch_name,
         scientific_values=scientific,
         case_indices=(1,),
@@ -184,7 +185,7 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         scientific_config_digest=scientific_digest,
         case_input_config_digest=case_input_digest,
         batch_identity=scientific_digest,
-        batch_id=generation.config.build_batch_id(batch_name, scientific_digest),
+        batch_id=generation.cases.config.build_batch_id(batch_name, scientific_digest),
     )
     storage = tmp_path / "pilot terminal storage"
     generation.runtime.run_case(
@@ -208,7 +209,7 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
 ) -> None:
     """Protect durable status evidence when case preparation itself fails."""
     config_path, _template = generation_config_factory()
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
@@ -218,7 +219,7 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
         message = "synthetic preparation failure"
         raise OSError(message)
 
-    monkeypatch.setattr(generation.case, "prepare_case_work_directory", reject_preparation)
+    monkeypatch.setattr(runtime_service, "prepare_case_work_directory", reject_preparation)
     with pytest.raises(OSError, match="synthetic preparation failure"):
         generation.runtime.run_case(
             config,
@@ -242,7 +243,7 @@ def test_failure_timeout_missing_export_and_case_lock(
 ) -> None:
     """Protect evidence-first cleanup, timeout handling, exports, and locking."""
     config_path, _template = generation_config_factory(executable=fake_comsol, timeout=0.1)
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
@@ -280,7 +281,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     assert not timed_out.value.work_directory.exists()
 
     monkeypatch.setenv("FAKE_COMSOL_MODE", "success")
-    prepared = generation.case.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work)
+    prepared = runtime_service.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work)
     with pytest.raises(FileNotFoundError, match=r"airflow\.csv"):
         generation.runtime.collect_exports(config, prepared)
     workspace.cleanup_case_workspace(
@@ -317,7 +318,7 @@ def test_solver_receives_exact_isolated_cwd_and_relative_files(
         simulation_profile="steady_flow",
         executable=fake_comsol,
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
@@ -379,7 +380,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
         retain_raw_csv=True,
         timeout=60.0,
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
@@ -439,7 +440,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         simulation_profile="steady_flow",
         executable=fake_comsol,
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
@@ -463,7 +464,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         return original_cleanup(*args, **kwargs)
 
     monkeypatch.setattr(
-        generation.runtime,
+        runtime_service,
         "publish_completed_case",
         fail_publication,
     )
@@ -511,7 +512,7 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
         executable=fake_comsol,
         timeout=5.0,
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )

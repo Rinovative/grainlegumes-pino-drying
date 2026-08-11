@@ -267,7 +267,7 @@ def build_checkpoint_identity(
     if not isinstance(task_digest, str) or not task_digest:
         msg = "Config task_contract.digest must be a non-empty string for checkpoint identity."
         raise TypeError(msg)
-    split_contract = datasets.splits.admit_split_contract(split_indices)
+    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     if split_contract.task != task or split_contract.task_contract_digest != task_digest:
         msg = "Split task identity must match the checkpoint config contract."
         raise ValueError(msg)
@@ -275,7 +275,7 @@ def build_checkpoint_identity(
         "train": split_contract.role("train").source.fingerprint,
         "ood": split_contract.role("ood").source.fingerprint,
     }
-    membership_values = {role: split_contract.role(role).membership_digest for role in datasets.splits.SPLIT_ROLES}
+    membership_values = {role: split_contract.role(role).membership_digest for role in datasets.preprocessing.splits.SPLIT_ROLES}
 
     persisted = dict(persisted_config or config)
     return _validate_checkpoint_identity(

@@ -261,7 +261,7 @@ def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
         pytest.fail("dry-run reached a side-effecting runtime boundary")
 
     runtime = experiments.tuning.optuna
-    monkeypatch.setattr(runtime.datasets.metadata, "load_dataset_metadata_summary", describe)
+    monkeypatch.setattr(runtime.datasets.contracts.metadata, "load_dataset_metadata_summary", describe)
     monkeypatch.setattr(runtime, "_optuna_module", reject_side_effect)
     monkeypatch.setattr(experiments.run, "prepare_fresh_run", reject_side_effect)
     monkeypatch.setattr(experiments.tracking, "initialize_wandb", reject_side_effect)
@@ -309,7 +309,7 @@ def test_optuna_dry_run_dataset_failure_is_nonzero_without_output(
         raise FileNotFoundError(f"configured dataset missing: {dataset_id}")
 
     monkeypatch.setattr(
-        experiments.tuning.optuna.datasets.metadata,
+        experiments.tuning.optuna.datasets.contracts.metadata,
         "load_dataset_metadata_summary",
         reject_dataset,
     )

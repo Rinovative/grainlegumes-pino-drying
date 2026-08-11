@@ -72,17 +72,82 @@ G --> D
 
 ```mermaid
 flowchart TD
-    M[Python profile-specific case generation] --> G[01_generation]
+    CG[configs/generation] --> P[src.generation public services]
+    P --> M[Profile-specific case generation]
+    M --> G[01_generation]
     G --> C[COMSOL reference solve]
     C --> G
-    G --> B[src.datasets.dataset_packages]
+    G --> B[src.datasets.packages<br/>through the dataset_packages facade]
     B --> D[02_datasets]
-    X[Root configs] --> T[Training or Optuna]
+    CL[configs/learning] --> T[Training or Optuna]
     D --> T
     T --> E[03_experiments]
     E --> A[Run-owned analysis artifacts]
     A --> N[Evaluation notebooks]
 ```
+
+## 🧩 Python Ownership and Public APIs
+
+Production filenames retain both their domain and responsibility prefix so their
+ownership remains visible outside the immediate directory. The responsibility
+packages are implementation and navigation boundaries; normal consumers import
+the stable `src.generation` and `src.datasets` facades.
+
+### Generation responsibilities
+
+| Area | Visible module family | Owns |
+| --- | --- | --- |
+| Public orchestration | `src.generation`, `generation_campaign.py`, `generation_readiness.py`, `generation_smoke.py`, `generation_workflow.py` | Stable facade aliases and cross-responsibility campaign lifecycles |
+| `contracts/` | `generation_contracts_*` | Vocabularies, profiles, materials, paths, provenance, source identity, and scientific registry contracts |
+| `cases/` | `generation_cases_*` | Campaign/config resolution, deterministic seeding and sampling, fields, schedules, and case inputs |
+| `runtime/` | `generation_runtime_*` | Native execution, cluster planning, preflight, mapping probes, preparation, workspaces, and terminal batch evidence |
+| `publication/` | `generation_publication_*` | Canonical HDF5 admission, inventories, campaign manifests, and transfer evidence |
+| `validation/` | `generation_validation_*` | Static sentinels and transient pilot validation/analysis |
+| `cli/` | `cli_generation.py` | Thin argument parsing for the supported Generation command |
+
+### Dataset responsibilities
+
+| Area | Visible module family | Owns |
+| --- | --- | --- |
+| Public facade | `src.datasets` | Stable aliases for contracts, packages, preprocessing, and runtimes |
+| `contracts/` | `dataset_contracts_*` | View inspection, identity, persisted metadata, and transient channel contracts |
+| `packages/` | `dataset_packages_*` | Generated-batch admission, package planning/manifests, trajectory indexes, immutable building, and publication |
+| `preprocessing/` | `dataset_preprocessing_*` | Identity-bound splits and train-only normalizer fitting/artifacts |
+| `runtime/` | `dataset_runtime_*` | Unified requests/factory, steady and transient Datasets, DataLoaders, and package smoke validation |
+| Package facade and CLI | `dataset_packages.py` | The canonical persisted builder identity and the supported `build`, `inspect`, and `smoke` commands |
+
+Dependencies point from stable owners toward their consumers: Generation
+`contracts` feed `cases`, then `runtime`; publication and validation consume
+those lower contracts, and top-level orchestration is the only layer that spans
+the complete lifecycle. Dataset `contracts` feed `packages` and `preprocessing`;
+`runtime` consumes those three areas. Generation publication evidence feeds
+Dataset package admission, while the Generation workflow invokes the public
+Dataset package service only after terminal publication. Lower responsibility
+packages do not import workflow or CLI layers.
+
+Supported public boundaries are:
+
+- `from src import generation`: `campaign`, `cases`, `contracts`, `publication`,
+  `readiness`, `runtime`, `smoke`, `validation`, and `workflow`. The stable CLI
+  remains `python -m src.generation.cli.cli_generation`.
+- `from src import datasets`: `contracts`, `dataset_packages`, `packages`,
+  `preprocessing`, and `runtime`. The canonical Dataset package facade and CLI
+  remain `datasets.dataset_packages` and
+  `python -m src.datasets.dataset_packages`; the CLI exposes `build`, `inspect`,
+  and `smoke` subcommands.
+- Training orchestration under `src/experiments` and `src/learning` uses
+  `datasets.contracts.views`, `datasets.runtime.training`,
+  `datasets.preprocessing.normalization`, and `datasets.preprocessing.splits`.
+- EDA under `src/analysis/eda` uses `datasets.packages.generated_batch`.
+- Evaluation and artifact admission under `src/analysis` use
+  `datasets.contracts.identity`, `datasets.contracts.metadata`,
+  `datasets.preprocessing.splits`, and `datasets.runtime.steady`. These consumers
+  do not import private implementation paths or HDF5 internals.
+
+Edit simulation science, source, profile, campaign, and execution decisions only
+under `configs/generation`. Edit model, optimization, training, and evaluation
+choices under `configs/learning/<task>`. The detailed Generation ownership table
+is in the [generation workflow](docs/simulation_generation.md).
 
 ## ⚙️ Generation Gateway
 
@@ -190,7 +255,9 @@ From the host, use the GPU queue wrapper. It additionally requires `nvidia-smi` 
 ./scripts/docker_job.sh artifacts --task steady_flow --queue-gpu auto
 ```
 
-Production configurations are under `configs/tasks/steady_flow`. The maintained notebooks are under `notebooks`.
+Production learning configurations are under
+`configs/learning/steady_flow`. Generation configuration is under
+`configs/generation`, and maintained notebooks are under `notebooks`.
 
 ### Maintained validation
 
@@ -217,7 +284,9 @@ python -m pytest -q -m "not real_data" tests
 ├── .github/workflows/quality.yml
 ├── .vscode/settings.json
 ├── configs/
-│   └── tasks/steady_flow/
+│   ├── generation/
+│   └── learning/
+│       └── steady_flow/
 ├── docs/
 ├── notebooks/
 ├── scripts/

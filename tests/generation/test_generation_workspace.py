@@ -10,12 +10,14 @@ from typing import Any
 import pytest
 
 from src import common, generation
-from src.generation import generation_workspace as workspace
+from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_preparation as preparation
+from src.generation.runtime import generation_runtime_workspace as workspace
 
 
 def _steady_natural_batch_name() -> str:
     """Return the canonical synthetic steady natural-batch selector."""
-    return generation.config.build_batch_name(
+    return generation.cases.config.build_batch_name(
         "steady_flow",
         "lentil",
         "natural",
@@ -48,19 +50,19 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
         simulation_profile="steady_flow",
         natural_count=2,
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_steady_natural_batch_name(),
     )
     storage = tmp_path / "storage root"
     work = tmp_path / "scratch root with spaces"
-    first = generation.case.prepare_case_work_directory(
+    first = runtime_service.prepare_case_work_directory(
         config,
         1,
         storage_root=storage,
         work_root=work,
     )
-    second = generation.case.prepare_case_work_directory(
+    second = runtime_service.prepare_case_work_directory(
         config,
         2,
         storage_root=storage,
@@ -97,13 +99,13 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_steady_natural_batch_name(),
     )
     storage = (tmp_path / "storage").resolve()
     work = (tmp_path / "work").resolve()
-    prepared = generation.case.prepare_case_work_directory(
+    prepared = runtime_service.prepare_case_work_directory(
         config,
         1,
         storage_root=storage,
@@ -193,7 +195,7 @@ def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
     )
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_steady_natural_batch_name(),
     )
@@ -202,14 +204,14 @@ def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
 
     def interrupt(
         _config: Any,
-        prepared: generation.case.PreparedCase,
+        prepared: preparation.PreparedCase,
         **_kwargs: Any,
     ) -> None:
         observed["work"] = prepared.work_directory
         raise KeyboardInterrupt
 
     monkeypatch.setattr(
-        generation.runtime,
+        runtime_service,
         "execute_prepared_case",
         interrupt,
     )

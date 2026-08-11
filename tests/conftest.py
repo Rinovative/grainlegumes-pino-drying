@@ -104,7 +104,7 @@ def training_dataset_payload_factory(
         identities = [{"case_id": sample_id, "token": tokens[index]} for index, sample_id in enumerate(sample_ids)]
         metadata = [{"case_id": sample_id, "parameters": {"sample_index": index}} for index, sample_id in enumerate(sample_ids)]
         fingerprints = [
-            datasets.identity.compute_case_fingerprint(
+            datasets.contracts.identity.compute_case_fingerprint(
                 task=steady_task,
                 case_id=sample_id,
                 source_identity=identities[index],
@@ -114,7 +114,7 @@ def training_dataset_payload_factory(
             )
             for index, sample_id in enumerate(sample_ids)
         ]
-        return datasets.identity.build_training_dataset_payload(
+        return datasets.contracts.identity.build_training_dataset_payload(
             task=steady_task,
             dataset_id=dataset_id,
             sample_ids=sample_ids,

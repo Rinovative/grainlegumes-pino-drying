@@ -42,7 +42,6 @@ import numpy as np
 import torch
 
 from src import common, datasets, learning
-from src.learning import learning_device_policy as device_policy
 
 from . import experiments_console as console
 from . import experiments_tracking as tracking
@@ -362,7 +361,7 @@ def _validated_runtime_device(
     if not isinstance(run, Mapping):
         msg = "Resolved config must contain a run mapping."
         raise TypeError(msg)
-    requested = device_policy.validate_device_policy(run.get("device"), path="run.device")
+    requested = learning.device_policy.validate_device_policy(run.get("device"), path="run.device")
     if resolution.requested_policy != requested:
         msg = f"Runtime device resolution does not match the requested config policy: {resolution.requested_policy!r} != {requested!r}."
         raise ValueError(msg)
@@ -716,7 +715,7 @@ def _validate_saved_data_contract(
     if not isinstance(data_config, Mapping) or not isinstance(run_config, Mapping):
         msg = "Completed run config must contain data and run mappings."
         raise RunLifecycleError(msg)
-    split_contract = datasets.splits.admit_split_contract(
+    split_contract = datasets.preprocessing.splits.admit_split_contract(
         split_indices,
         expected_train_ratio=data_config.get("train_ratio"),
         expected_ood_fraction=data_config.get("ood_fraction"),
@@ -725,7 +724,7 @@ def _validate_saved_data_contract(
     if split_contract.task != task.id or split_contract.task_contract_digest != task.contract_digest:
         msg = "Saved split task identity does not match the resolved config task contract."
         raise RunLifecycleError(msg)
-    normalizer_state = datasets.normalization.validate_normalizer_artifact(
+    normalizer_state = datasets.preprocessing.normalization.validate_normalizer_artifact(
         normalizer_artifact,
         task=task,
         split_contract=split_contract,
@@ -1073,9 +1072,9 @@ def _validate_reused_data_state(
     if saved_split_indices is None:
         msg = "Resume dataloader construction requires admitted saved split evidence."
         raise RuntimeError(msg)
-    saved_contract = datasets.splits.admit_split_contract(saved_split_indices)
-    rebuilt_contract = datasets.splits.admit_split_contract(rebuilt_split_indices)
-    for role in datasets.splits.SPLIT_ROLES:
+    saved_contract = datasets.preprocessing.splits.admit_split_contract(saved_split_indices)
+    rebuilt_contract = datasets.preprocessing.splits.admit_split_contract(rebuilt_split_indices)
+    for role in datasets.preprocessing.splits.SPLIT_ROLES:
         if saved_contract.role(role).index_values != rebuilt_contract.role(role).index_values:
             msg = f"Resume dataloader construction changed saved {role} membership."
             raise RuntimeError(msg)
@@ -1168,8 +1167,8 @@ def _execute_prepared_run_locked(
         split_indices = dataloaders["split_indices"]
 
         if resume_from is None:
-            split_contract = datasets.splits.admit_split_contract(split_indices)
-            normalizer_artifact = datasets.normalization.build_normalizer_artifact(
+            split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
+            normalizer_artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
                 data_processor,
                 task=config_loader.validate_resolved_task_contract(config),
                 split_contract=split_contract,
@@ -1918,7 +1917,7 @@ def run_experiment(
         split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
         normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
         normalizer_state = _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
-        data_processor = datasets.normalization.data_processor_from_state(normalizer_state, device="cpu")
+        data_processor = datasets.preprocessing.normalization.data_processor_from_state(normalizer_state, device="cpu")
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,
             split_indices,

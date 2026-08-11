@@ -29,21 +29,21 @@ from pathlib import Path
 from typing import Any
 
 from src import common
-from src.generation import generation_campaign_runtime as campaign_runtime
-from src.generation import generation_case as case_service
-from src.generation import generation_cluster as cluster_service
-from src.generation import generation_config as config_service
-from src.generation import generation_contracts as contracts_service
-from src.generation import generation_inventory as inventory_service
-from src.generation import generation_mapping_probe as mapping_probe_service
-from src.generation import generation_pilot as pilot_service
-from src.generation import generation_preflight as preflight_service
+from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_readiness as readiness_service
-from src.generation import generation_runtime as runtime_service
-from src.generation import generation_sentinels as sentinel_service
 from src.generation import generation_smoke as smoke_service
 from src.generation import generation_workflow as workflow_service
-from src.generation import generation_workspace as workspace_service
+from src.generation.cases import generation_cases_case as case_service
+from src.generation.cases import generation_cases_config as config_service
+from src.generation.contracts import generation_contracts_descriptors as contracts_service
+from src.generation.publication import generation_publication_inventory as inventory_service
+from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_cluster as cluster_service
+from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe_service
+from src.generation.runtime import generation_runtime_preflight as preflight_service
+from src.generation.runtime import generation_runtime_workspace as workspace_service
+from src.generation.validation import generation_validation_pilot as pilot_service
+from src.generation.validation import generation_validation_sentinels as sentinel_service
 
 
 def _add_storage_arguments(parser: argparse.ArgumentParser, *, include_work: bool = False) -> None:
@@ -1356,7 +1356,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(bundle.directory)
         return 0
     if args.command == "prepare-case":
-        prepared = case_service.prepare_case_work_directory(
+        prepared = runtime_service.prepare_case_work_directory(
             config,
             args.case_index,
             storage_root=args.storage_root,

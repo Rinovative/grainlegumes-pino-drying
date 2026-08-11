@@ -2,8 +2,8 @@
 Experiment configuration, execution, tracking, tuning, and validation services.
 
 Provides:
-- cli: command-line experiment workflows
 - config: strict defaults and YAML configuration resolution
+- console: persistent line-oriented experiment lifecycle reporting
 - notebook_support: read-only notebook context and presentation preparation
 - run: experiment lifecycle, identity, persistence, and resume
 - tracking: W&B observer lifecycle and metric publication
@@ -17,14 +17,14 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import cli, config, tuning, validation
+    from . import config, tuning, validation
     from . import experiments_console as console
     from . import experiments_notebook_support as notebook_support
     from . import experiments_run as run
     from . import experiments_tracking as tracking
 
+# The cli subpackage is executable-only and intentionally absent from the public surface.
 _MODULES = {
-    "cli": "cli",
     "config": "config",
     "console": "experiments_console",
     "notebook_support": "experiments_notebook_support",
@@ -34,7 +34,6 @@ _MODULES = {
     "validation": "validation",
 }
 __all__ = [
-    "cli",
     "config",
     "console",
     "notebook_support",
@@ -47,9 +46,10 @@ __all__ = [
 
 def __getattr__(name: str) -> object:
     """Resolve one declared public name on first access."""
-    if name not in _MODULES:
+    module_name = _MODULES.get(name)
+    if module_name is None:
         message = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(message)
-    module = import_module(f"{__name__}.{_MODULES[name]}")
+    module = import_module(f"{__name__}.{module_name}")
     globals()[name] = module
     return module

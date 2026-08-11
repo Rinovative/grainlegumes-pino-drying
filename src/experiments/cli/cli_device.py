@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.learning.learning_device_policy import DEVICE_POLICIES
+from src import learning
 
 if TYPE_CHECKING:
     import argparse
@@ -52,7 +52,7 @@ def add_device_argument(
     """
     parser.add_argument(
         "--device",
-        choices=DEVICE_POLICIES,
+        choices=learning.device_policy.DEVICE_POLICIES,
         default=default,
         help=(f"{help_prefix}: auto chooses CUDA when usable, otherwise CPU. cuda is strict and never falls back. cpu avoids CUDA use"),
     )

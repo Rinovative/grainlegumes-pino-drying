@@ -26,11 +26,11 @@ import yaml
 
 from src import common
 
-from . import generation_config as config_service
-from . import generation_materials as materials
-from . import generation_profiles as profiles
-from . import generation_sentinels as sentinel_service
 from . import generation_smoke as smoke_service
+from .cases import generation_cases_config as config_service
+from .contracts import generation_contracts_materials as materials
+from .contracts import generation_contracts_profiles as profiles
+from .validation import generation_validation_sentinels as sentinel_service
 
 _STATUS_COMPLETE: Final = "COMPLETE"
 _STATUS_INCOMPLETE: Final = "INCOMPLETE"

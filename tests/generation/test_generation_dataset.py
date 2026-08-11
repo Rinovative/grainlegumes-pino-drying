@@ -34,7 +34,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         natural_count=2,
         retain_raw_csv=True,
     )
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.require_batch(
         material_family="lentil",
         sampling_regime="natural",
@@ -76,7 +76,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         "raw_csv/exports/airflow.csv",
         "raw_csv/inputs/fields.csv",
     ]
-    identity = generation.storage.validate_case_hdf5(completed / "case.h5", expected_profile="steady_flow")
+    identity = generation.publication.storage.validate_case_hdf5(completed / "case.h5", expected_profile="steady_flow")
     assert identity["git_commit"] == "a" * 40
     with h5py.File(completed / "case.h5", "r") as handle:
         assert set(handle) == {
@@ -133,7 +133,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     assert result["sample_count"] == 2
     payload = torch.load(result["payload_path"], map_location="cpu", weights_only=False)
     task = domain.tasks.registry.get_task("steady_flow")
-    dataset_identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
+    dataset_identity = datasets.contracts.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
     assert dataset_identity.sample_count == 2
     assert payload["inputs"].shape == (2, task.in_channels, ny, nx)
     assert payload["outputs"].shape == (2, task.out_channels, ny, nx)
@@ -144,7 +144,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     )
     assert manifest["training_eligible"] is False
     assert manifest["builder_identity"] == "src.datasets.dataset_packages.build_campaign_packages"
-    assert manifest["split_membership"] == {datasets.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
+    assert manifest["split_membership"] == {datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
     assert manifest["source_git_commits"] == ["a" * 40]
     conditioning = manifest["steady_flow_conditioning"]
     assert conditioning["hidden_conditioning"] is False
@@ -160,7 +160,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
 
     inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
     assert inspection["dataset_view"] == "steady_flow"
-    assert inspection["available_selectors"] == [datasets.views.TECHNICAL_SMOKE_MEMBERSHIP]
+    assert inspection["available_selectors"] == [datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP]
     assert inspection["tensors"]["input"]["shape"] == [task.in_channels, ny, nx]
     assert inspection["tensors"]["target"]["shape"] == [task.out_channels, ny, nx]
     assert inspection["sample_identity"]["source_hdf5_sha256"] == manifest["source_case_identities"][0]["case_hdf5_sha256"]

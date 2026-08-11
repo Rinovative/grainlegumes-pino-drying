@@ -13,14 +13,14 @@ import numpy as np
 import pytest
 
 from src import common
-from src.generation import generation_campaign_evidence as campaign_evidence
-from src.generation import generation_config as config_service
-from src.generation import generation_pilot as pilot_service
-from src.generation import generation_pilot_analysis as analysis_service
-from src.generation import generation_runtime as runtime_service
-from src.generation import generation_sampling as sampling_service
-from src.generation import generation_workspace as workspace_service
+from src.generation.cases import generation_cases_config as config_service
+from src.generation.cases import generation_cases_sampling as sampling_service
 from src.generation.cli import cli_generation as cli_service
+from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
+from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_workspace as workspace_service
+from src.generation.validation import generation_validation_pilot as pilot_service
+from src.generation.validation import generation_validation_pilot_analysis as analysis_service
 
 _PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
 _PRODUCTION_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")

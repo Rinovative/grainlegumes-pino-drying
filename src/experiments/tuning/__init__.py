@@ -11,12 +11,14 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from . import experiments_tuning_search_space as search_space
-
 if TYPE_CHECKING:
     from . import experiments_tuning_optuna as optuna
+    from . import experiments_tuning_search_space as search_space
 
-_MODULES = {"optuna": "experiments_tuning_optuna"}
+_MODULES = {
+    "optuna": "experiments_tuning_optuna",
+    "search_space": "experiments_tuning_search_space",
+}
 __all__ = ["optuna", "search_space"]
 
 

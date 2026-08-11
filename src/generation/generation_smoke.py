@@ -35,19 +35,20 @@ import numpy as np
 
 from src import common, domain
 
-from . import generation_campaign_evidence as campaign_evidence
-from . import generation_campaign_runtime as campaign_runtime
-from . import generation_config as config_service
-from . import generation_materials as materials
-from . import generation_preflight as preflight_service
-from . import generation_profiles as profiles
-from . import generation_runtime as runtime_service
-from . import generation_storage as storage_service
+from . import generation_campaign as campaign_runtime
 from . import generation_workflow as workflow_service
-from . import generation_workspace as workspace_service
+from .contracts import generation_contracts_materials as materials
+from .contracts import generation_contracts_profiles as profiles
+from .publication import generation_publication_campaign_evidence as campaign_evidence
+from .publication import generation_publication_storage as storage_service
+from .runtime import generation_runtime_batch as runtime_service
+from .runtime import generation_runtime_preflight as preflight_service
+from .runtime import generation_runtime_workspace as workspace_service
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from .cases import generation_cases_config as config_service
 
 REAL_SMOKE_SCHEMA_KIND: Final = "vp2_real_runtime_smoke"
 REAL_SMOKE_SCHEMA_VERSION: Final = 1

@@ -234,7 +234,7 @@ def _validate_tensor_contract(
     _require(source.output_fields == list(task.output_names), f"{role} output field order changed")
     _require(identity.task == task.id, f"{role} task identity changed")
     try:
-        datasets.identity.validate_dataset_data_contract_digest(
+        datasets.contracts.identity.validate_dataset_data_contract_digest(
             identity.data_contract_digest,
             task=task,
             label=f"{role} dataset data_contract_digest",
@@ -404,14 +404,14 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     ood_contract = _validate_tensor_contract(loader=ood_loader, role="OOD", task=task)
     metadata_root = Path(effective["paths"]["dataset_metadata_root"])
     for contract in (id_contract, ood_contract):
-        datasets.metadata.load_dataset_metadata(
+        datasets.contracts.metadata.load_dataset_metadata(
             contract.identity.dataset_id,
             dataset_identity=contract.identity,
             metadata_root=metadata_root,
             dataset_path=contract.source.path,
         )
 
-    split_contract = datasets.splits.admit_split_contract(
+    split_contract = datasets.preprocessing.splits.admit_split_contract(
         split,
         train_identity=id_contract.identity,
         ood_identity=ood_contract.identity,
@@ -573,7 +573,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
                 )
             )
 
-    restored_processor = datasets.normalization.data_processor_from_state(
+    restored_processor = datasets.preprocessing.normalization.data_processor_from_state(
         normalizer_state,
         device="cpu",
     )
@@ -584,7 +584,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     zero_variance_state = {key: value.clone() for key, value in normalizer_state.items()}
     zero_variance_state["in_normalizer.std"].zero_()
     zero_variance_state["out_normalizer.std"].zero_()
-    zero_variance_processor = datasets.normalization.data_processor_from_state(
+    zero_variance_processor = datasets.preprocessing.normalization.data_processor_from_state(
         zero_variance_state,
         device="cpu",
     )

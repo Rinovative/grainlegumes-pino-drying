@@ -179,6 +179,31 @@ Validation errors identify the exact file, key, rule, actual value, and owner to
 edit. Resolved identities, allocation evidence, and the effective scientific
 configuration persist with generated artifacts.
 
+## Python responsibility boundaries
+
+The Generation source layout follows the lifecycle: `generation_contracts_*`
+own scientific contracts; `generation_cases_*` own config resolution and case
+inputs; `generation_runtime_*` own native execution;
+`generation_publication_*` own HDF5 and campaign evidence; and
+`generation_validation_*` own sentinels and pilot checks. These visible prefixes
+keep ownership clear when a module is imported away from its directory.
+
+`src.generation` is the stable facade, and
+`python -m src.generation.cli.cli_generation` remains the supported command.
+Dependencies flow from contracts to cases to runtime, then into publication,
+validation, and top-level orchestration; lower packages never import workflow or
+CLI layers.
+
+After terminal publication, the workflow invokes `src.datasets.packages`. Dataset
+code mirrors the split through `dataset_contracts_*`, `dataset_packages_*`,
+`dataset_preprocessing_*`, and `dataset_runtime_*`. The canonical package facade
+and CLI remain `src.datasets.dataset_packages`, preserving the persisted
+`src.datasets.dataset_packages.build_campaign_packages` identity while delegating
+to one implementation. Training, EDA, and Evaluation import the public
+`datasets` alias with `from src import datasets`, not package directories or HDF5
+internals. The exact consumer aliases and Dataset responsibility table are in the
+[README](../README.md#-python-ownership-and-public-apis).
+
 ## Resolved campaign and package semantics
 
 Campaign YAML owns role assignment, sampling counts and seed namespaces,

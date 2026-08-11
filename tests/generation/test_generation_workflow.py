@@ -13,7 +13,7 @@ from src import generation
 
 _COMMIT = "a" * 40
 _RUN_ID = "steady_flow_family_generalization__0123456789abcdef"
-_BATCH_NAME = generation.config.build_batch_name(
+_BATCH_NAME = generation.cases.config.build_batch_name(
     "steady_flow",
     "synthetic_material",
     "natural",
@@ -320,7 +320,7 @@ def _pilot_campaign(workflow: Path) -> Path:
 def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
     """Create one complete fake terminal transfer tree and TSV plan."""
     campaign_directory = f"01_generation/meta/campaigns/{_RUN_ID}"
-    batch_id = generation.config.build_batch_id(
+    batch_id = generation.cases.config.build_batch_id(
         _BATCH_NAME,
         "fedcba9876543210" + "0" * 48,
     )

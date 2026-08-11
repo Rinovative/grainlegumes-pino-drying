@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from src import common, generation
-from src.generation import generation_campaign_evidence as campaign_evidence
-from src.generation import generation_workspace as workspace
+from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
+from src.generation.runtime import generation_runtime_workspace as workspace
 
 _RUN_ID = "synthetic_workflow__0123456789abcdef"
 _COMMIT = "a" * 40
@@ -93,17 +93,17 @@ def _mock_local_gates(
         ],
     }
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "validate_transferred_campaign",
         lambda *_args, **_kwargs: transfer,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "validate_terminal_campaign",
         lambda *_args, **_kwargs: terminal,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_transfer_plan",
         lambda *_args, **_kwargs: plan,
     )
@@ -229,22 +229,22 @@ def _remote_cleanup_fixture(
         "inventory_sha256": common.serialization.canonical_json_sha256(files),
     }
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "validate_terminal_campaign",
         lambda *_args, **_kwargs: terminal,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_transfer_plan",
         lambda *_args, **_kwargs: plan,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_transfer_inventory",
         lambda *_args, **_kwargs: inventory,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_status",
         lambda *_args, **_kwargs: {
             "campaign_state": "publication_complete",
@@ -367,7 +367,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
     )
     for status, expected_message in unsafe_statuses:
         monkeypatch.setattr(
-            generation.campaign_runtime,
+            generation.campaign,
             "campaign_status",
             lambda *_args, _status=status, **_kwargs: _status,
         )
@@ -386,7 +386,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
         },
     }
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_status",
         lambda *_args, **_kwargs: resumed_status,
     )

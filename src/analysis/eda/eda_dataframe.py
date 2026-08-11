@@ -52,7 +52,7 @@ def generate_eda_dataframe(
     """
     from src import datasets  # noqa: PLC0415
 
-    loaded: dict[str, Any] = datasets.generated_batch.load_generated_batch(
+    loaded: dict[str, Any] = datasets.packages.generated_batch.load_generated_batch(
         batch_name,
         task_id=task.id,
         storage_root=storage_root,

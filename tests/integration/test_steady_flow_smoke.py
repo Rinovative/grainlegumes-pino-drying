@@ -99,7 +99,7 @@ def _case_components(
     outputs = torch.stack([output_fields[name] for name in task.output_names])
     source_identity = {"generator": "synthetic-smoke", "case": case_id}
     source_metadata = {"offset": offset, "case_id": case_id, "parameters": {"synthetic_parameter": 1.0}}
-    fingerprint = datasets.identity.compute_case_fingerprint(
+    fingerprint = datasets.contracts.identity.compute_case_fingerprint(
         task=task,
         case_id=case_id,
         source_identity=source_identity,
@@ -119,7 +119,7 @@ def _training_dataset_payload(
     """Build one final version-1 synthetic dataset entirely in memory."""
     sample_ids = [f"case_{index + 1:04d}" for index in range(len(offsets))]
     cases = [_case_components(task, case_id=case_id, offset=offset) for case_id, offset in zip(sample_ids, offsets, strict=True)]
-    return datasets.identity.build_training_dataset_payload(
+    return datasets.contracts.identity.build_training_dataset_payload(
         task=task,
         dataset_id=dataset_id,
         sample_ids=sample_ids,
@@ -149,8 +149,8 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
         case_indices.append(case_index)
         case_records.append({"case_index": case_index, **case})
     manifest = {
-        "schema_kind": datasets.metadata.SOURCE_MANIFEST_SCHEMA_KIND,
-        "schema_version": datasets.metadata.SOURCE_MANIFEST_SCHEMA_VERSION,
+        "schema_kind": datasets.contracts.metadata.SOURCE_MANIFEST_SCHEMA_KIND,
+        "schema_version": datasets.contracts.metadata.SOURCE_MANIFEST_SCHEMA_VERSION,
         "status": "complete",
         "simulation_profile": generated_identity["simulation_profile"],
         "available_learning_views": generated_identity["available_learning_views"],
@@ -165,19 +165,19 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
     }
     metadata_dir = metadata_root / dataset_id
     metadata_dir.mkdir(parents=True)
-    manifest_path = metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME
+    manifest_path = metadata_dir / datasets.contracts.metadata.SOURCE_MANIFEST_FILENAME
     common.serialization.atomic_write_json(manifest_path, manifest)
     manifest_sha256 = common.serialization.file_sha256(manifest_path)
     payload["source_provenance"]["batch_manifest_sha256"] = manifest_sha256
     destination = root / dataset_id / f"{dataset_id}.pt"
     common.serialization.atomic_torch_save(payload, destination)
-    identity = datasets.identity.validate_training_dataset_payload(
+    identity = datasets.contracts.identity.validate_training_dataset_payload(
         payload,
         task=task,
         verify_content=True,
     )
     snapshots = {
-        datasets.metadata.SOURCE_MANIFEST_FILENAME: {
+        datasets.contracts.metadata.SOURCE_MANIFEST_FILENAME: {
             "sha256": manifest_sha256,
             "size_bytes": manifest_path.stat().st_size,
             "required": True,
@@ -185,13 +185,13 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
         }
     }
     common.serialization.atomic_write_json(
-        metadata_dir / datasets.metadata.METADATA_FILENAME,
+        metadata_dir / datasets.contracts.metadata.METADATA_FILENAME,
         {
-            "schema_kind": datasets.metadata.METADATA_SCHEMA_KIND,
-            "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
+            "schema_kind": datasets.contracts.metadata.METADATA_SCHEMA_KIND,
+            "schema_version": datasets.contracts.metadata.METADATA_SCHEMA_VERSION,
             "dataset_id": dataset_id,
             "scientific_identity": {
-                "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
+                "dataset_schema_version": datasets.contracts.identity.TRAINING_DATASET_SCHEMA_VERSION,
                 "dataset_fingerprint": identity.fingerprint,
                 "task_id": task.id,
                 "data_contract_digest": identity.data_contract_digest,
@@ -213,8 +213,8 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
                 "snapshots": snapshots,
             },
             "operational_provenance": {
-                "builder_module": datasets.metadata.BUILDER_MODULE,
-                "publication_method": datasets.metadata.PUBLICATION_METHOD,
+                "builder_module": datasets.contracts.metadata.BUILDER_MODULE,
+                "publication_method": datasets.contracts.metadata.PUBLICATION_METHOD,
                 "source_manifest_sha256": manifest_sha256,
                 "timing": {
                     "status": "unavailable",
@@ -224,7 +224,7 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
             },
         },
     )
-    datasets.metadata.validate_dataset_metadata_directory(
+    datasets.contracts.metadata.validate_dataset_metadata_directory(
         metadata_dir,
         dataset_identity=identity,
         dataset_path=destination,

@@ -12,13 +12,13 @@ import pytest
 import yaml
 
 from src import common, datasets, domain, generation
-from src.datasets import dataset_package_planning as package_planning
-from src.generation import generation_fields as fields
-from src.generation import generation_inventory as inventory
-from src.generation import generation_materials as materials
-from src.generation import generation_sampling as sampling
-from src.generation import generation_schedule as schedule_service
-from src.generation import generation_seeding as seeding
+from src.datasets.packages import dataset_packages_planning as package_planning
+from src.generation.cases import generation_cases_fields as fields
+from src.generation.cases import generation_cases_sampling as sampling
+from src.generation.cases import generation_cases_schedule as schedule_service
+from src.generation.cases import generation_cases_seeding as seeding
+from src.generation.contracts import generation_contracts_materials as materials
+from src.generation.publication import generation_publication_inventory as inventory
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -40,25 +40,23 @@ def test_semantic_seed_derivation_is_version_bound() -> None:
 
 
 def test_generation_public_facade_is_explicit_and_narrow() -> None:
-    """Protect stable services without exposing implementation module layout."""
+    """Protect the lazy same-level package and orchestration surface."""
     expected = {
-        "campaign_runtime",
-        "case",
-        "config",
+        "campaign",
+        "cases",
         "contracts",
-        "pilot",
+        "publication",
         "readiness",
         "runtime",
-        "sentinels",
         "smoke",
-        "storage",
+        "validation",
         "workflow",
     }
     assert set(generation.__all__) == expected
     assert all(getattr(generation, name) is not None for name in expected)
-    assert not hasattr(generation, "materials")
-    assert not hasattr(generation, "profiles")
-    assert not hasattr(generation, "workspace")
+    assert "cli" not in generation.__all__
+    assert not hasattr(generation, "config")
+    assert not hasattr(generation, "storage")
 
 
 def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
@@ -71,14 +69,14 @@ def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
         Path("configs/generation/campaigns/transient_drying/pilot_check.yaml"): (18, 54),
     }
     for path, (case_count, dimension) in expected.items():
-        campaign = generation.config.load_campaign_config(path, require_executable=False)
+        campaign = generation.cases.config.load_campaign_config(path, require_executable=False)
         assert campaign.total_case_count == case_count
         assert sum(campaign.batches[0].scientific_values["sampling"]["block_dimensions"].values()) == dimension
         inventory_names = tuple(family for role in generation.contracts.material_roles() for family in campaign.material_roles[role])
         assert len(inventory_names) == len(set(inventory_names))
         assert set(inventory_names) <= set(generation.contracts.available_material_families())
     pilot_path = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
-    fast = generation.config.load_campaign_config(
+    fast = generation.cases.config.load_campaign_config(
         pilot_path,
         require_executable=False,
         pilot_cases_per_material=1,
@@ -87,10 +85,10 @@ def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
 
     for path in tuple(expected)[:4]:
         with pytest.raises(
-            generation.config.GenerationConfigError,
+            generation.cases.config.GenerationConfigError,
             match="unconfirmed required export mappings",
         ):
-            generation.config.load_campaign_config(path)
+            generation.cases.config.load_campaign_config(path)
 
 
 def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None:
@@ -100,7 +98,7 @@ def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None
         Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
     )
     for path in paths:
-        campaign = generation.config.load_campaign_config(path, require_executable=False)
+        campaign = generation.cases.config.load_campaign_config(path, require_executable=False)
         for batch in (item for item in campaign.batches if item.sampling_regime == "parameter_ood"):
             policy = batch.scientific_values["parameter_ood"]
             eligible = policy["eligible_units"]
@@ -125,7 +123,7 @@ def test_generation_and_hdf5_versions_are_integer_one(
 ) -> None:
     """Reject pre-dataset named version strings at the owning config loader."""
     config_path, _template = generation_config_factory()
-    batch = generation.config.load_campaign_config(config_path).batches[0]
+    batch = generation.cases.config.load_campaign_config(config_path).batches[0]
     versions = (
         batch.scientific_values["generator_version"],
         batch.scientific_values["storage"]["schema_version"],
@@ -138,14 +136,14 @@ def test_generation_and_hdf5_versions_are_integer_one(
     common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
     common["generator_version"] = "named-version"
     common_path.write_text(yaml.safe_dump(common, sort_keys=False), encoding="utf-8")
-    with pytest.raises(generation.config.GenerationConfigError, match="generator_version must be an integer"):
-        generation.config.load_campaign_config(config_path)
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="generator_version must be an integer"):
+        generation.cases.config.load_campaign_config(config_path)
 
     common["generator_version"] = 1
     common["storage"]["converter_version"] = "named-version"
     common_path.write_text(yaml.safe_dump(common, sort_keys=False), encoding="utf-8")
-    with pytest.raises(generation.config.GenerationConfigError, match="converter_version must be an integer"):
-        generation.config.load_campaign_config(config_path)
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="converter_version must be an integer"):
+        generation.cases.config.load_campaign_config(config_path)
 
 
 def _temporary_family_campaign(
@@ -252,7 +250,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     _write_yaml(execution_path, execution)
     _write_yaml(campaign_path, campaign)
 
-    resolved = generation.config.load_campaign_config(
+    resolved = generation.cases.config.load_campaign_config(
         campaign_path,
         require_executable=False,
     )
@@ -306,7 +304,7 @@ def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
     _write_yaml(registry_path, registry)
     _write_yaml(campaign_path, campaign)
 
-    original = generation.config.load_campaign_config(campaign_path, require_executable=False)
+    original = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
     original_family = original.material_inventory[0]
     original_batch = original.require_batch(
         material_family=original_family,
@@ -322,7 +320,7 @@ def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
     registry["parameters"][right]["sampling_order"] = left_order
     _write_yaml(registry_path, registry)
 
-    reordered = generation.config.load_campaign_config(campaign_path, require_executable=False)
+    reordered = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
     reordered_batch = reordered.require_batch(
         material_family=original_family,
         sampling_regime="natural",
@@ -351,12 +349,12 @@ def test_invalid_config_combinations_report_authoritative_owner(
         _write_yaml(common_path, common)
         _write_yaml(execution_path, execution)
         _write_yaml(campaign_path, campaign)
-        with pytest.raises(generation.config.GenerationConfigError) as caught:
-            generation.config.load_campaign_config(
+        with pytest.raises(generation.cases.config.GenerationConfigError) as caught:
+            generation.cases.config.load_campaign_config(
                 campaign_path,
                 require_executable=False,
             )
-        details = generation.config.validation_error_details(campaign_path, caught.value)
+        details = generation.cases.config.validation_error_details(campaign_path, caught.value)
         assert details["file"] == str(campaign_path)
         assert details["owner_to_edit"] == str(campaign_path)
         resolved_expected_key = expected_key(campaign) if callable(expected_key) else expected_key
@@ -418,7 +416,7 @@ def test_readiness_distinguishes_failed_static_sentinels_from_pending(
 
 def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates() -> None:
     """Expose true design coordinates and inherited complete-record provenance."""
-    transient = generation.config.load_campaign_config(
+    transient = generation.cases.config.load_campaign_config(
         Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
         require_executable=False,
     )
@@ -457,16 +455,16 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         "schedule.component_weights[1]",
         "schedule.component_weights[2]",
     ]
-    assert "generation_schedule.generate_schedule" in simplex["producer_to_consumer_path"]["effective_downstream_consumers"]
+    assert "generation.cases.generation_cases_schedule.generate_schedule" in simplex["producer_to_consumer_path"]["effective_downstream_consumers"]
     assert schedule_bound["producer_to_consumer_path"]["runtime_mapping_state"] == "generator_consumed"
     assert clip_bound["producer_to_consumer_path"]["runtime_mapping_state"] == ("generator_consumed_and_template_fixed_requires_native_verification")
     assert clip_bound["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "generation_schedule feasibility or psychrometric conversion",
+        "generation.cases.generation_cases_schedule feasibility or psychrometric conversion",
         "canonical COMSOL template fixed physics; Python has no runtime setter",
     ]
     assert permeability_mean["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "generation_fields._permeability_fields",
-        "generation_fields._porosity_field",
+        "generation.cases.generation_cases_fields._permeability_fields",
+        "generation.cases.generation_cases_fields._porosity_field",
     ]
     assert template_fixed["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
     assert template_fixed["provenance"]["derivation"]["origin"] == "supplied_by_handoff"
@@ -491,7 +489,7 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         assert oswin_component["materials"][family]["provenance"] == oswin["materials"][family]["provenance"]
         assert density_component["materials"][family]["provenance"] == density["materials"][family]["provenance"]
 
-    steady = generation.config.load_campaign_config(
+    steady = generation.cases.config.load_campaign_config(
         Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
         require_executable=False,
     )
@@ -512,15 +510,15 @@ def test_scalar_handoff_rejects_an_unknown_name(
 ) -> None:
     """Protect the exact scalar schema after a modified file receives a fresh hash."""
     config_path, _template = generation_config_factory(simulation_profile="transient_drying")
-    config = generation.config.load_generation_config(
+    config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch=generation.config.build_batch_name(
+        only_batch=generation.cases.config.build_batch_name(
             "transient_drying",
             "lentil",
             "natural",
         ),
     )
-    bundle = generation.case.generate_case_input_bundle(config, 1, tmp_path / "case")
+    bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case")
     scalar_path = bundle.directory / "scalars.csv"
     content = scalar_path.read_text(encoding="utf-8")
     old = "T_flow_ref;"
@@ -532,7 +530,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
         "size_bytes": scalar_path.stat().st_size,
     }
     with pytest.raises(ValueError, match="missing, duplicate, unknown"):
-        generation.storage._transient_scalar_values(
+        generation.publication.storage._transient_scalar_values(
             payload,
             bundle.directory,
         )
@@ -541,7 +539,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
 def test_each_sampled_morphology_control_changes_its_owned_field(generation_config_factory: Any) -> None:
     """Protect material consumption of all 17 independent morphology controls."""
     config_path, _template = generation_config_factory()
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.require_batch(
         material_family="lentil",
         sampling_regime="natural",
@@ -666,7 +664,7 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
 ) -> None:
     """Require every varying stationary dependency to be a declared task input."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.require_batch(
         material_family="lentil",
         sampling_regime="natural",
@@ -697,7 +695,7 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
 def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     """Include airflow OOD in both views while excluding transient-only changes from steady."""
     config_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-    campaign = generation.config.load_campaign_config(config_path, require_executable=False)
+    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
     batch = campaign.require_batch(
         material_family="lentil",
         sampling_regime="parameter_ood",
@@ -730,11 +728,11 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     airflow = candidate("pressure_bc.mean")
     steady_eligible, steady_parameters, steady_evidence, _reason = package_planning._ood_eligibility(
         airflow,
-        view=datasets.views.get_view("steady_flow"),
+        view=datasets.contracts.views.get_view("steady_flow"),
     )
     transient_eligible, transient_parameters, _transient_evidence, _reason = package_planning._ood_eligibility(
         airflow,
-        view=datasets.views.get_view("transient_drying"),
+        view=datasets.contracts.views.get_view("transient_drying"),
     )
     assert steady_eligible is transient_eligible is True
     assert steady_parameters == transient_parameters == ("pressure_bc.mean",)
@@ -743,7 +741,7 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     moisture = candidate("initial_moisture.mean_db")
     eligible, parameters, evidence, reason = package_planning._ood_eligibility(
         moisture,
-        view=datasets.views.get_view("steady_flow"),
+        view=datasets.contracts.views.get_view("steady_flow"),
     )
     assert eligible is False
     assert parameters == ()
@@ -752,7 +750,7 @@ def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
     assert (
         package_planning._ood_eligibility(
             moisture,
-            view=datasets.views.get_view("transient_drying"),
+            view=datasets.contracts.views.get_view("transient_drying"),
         )[0]
         is True
     )
@@ -833,9 +831,9 @@ def test_heater_schedule_retries_complete_realization_deterministically(
 ) -> None:
     """Reject an infeasible whole schedule and replay the accepted retry exactly."""
     config_path, _template = generation_config_factory(simulation_profile="transient_drying")
-    batch = generation.config.load_generation_config(
+    batch = generation.cases.config.load_generation_config(
         config_path,
-        only_batch=generation.config.build_batch_name(
+        only_batch=generation.cases.config.build_batch_name(
             "transient_drying",
             "lentil",
             "natural",

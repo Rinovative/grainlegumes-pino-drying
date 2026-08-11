@@ -2,7 +2,8 @@
 Neural-operator device, inference, loss, metric, model, and training services.
 
 Provides:
-- device: runtime device-policy resolution
+- device: concrete runtime device resolution and runtime inspection
+- device_policy: dependency-free device-policy vocabulary and validation
 - inference: saved-run inference reconstruction
 - losses: supervised and physics-informed loss construction
 - metrics: task-resolved training and evaluation metrics
@@ -18,16 +19,18 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import inference, losses, metrics, models, training
     from . import learning_device as device
+    from . import learning_device_policy as device_policy
 
 _MODULES = {
     "device": "learning_device",
+    "device_policy": "learning_device_policy",
     "inference": "inference",
     "losses": "losses",
     "metrics": "metrics",
     "models": "models",
     "training": "training",
 }
-__all__ = ["device", "inference", "losses", "metrics", "models", "training"]
+__all__ = ["device", "device_policy", "inference", "losses", "metrics", "models", "training"]
 
 
 def __getattr__(name: str) -> object:

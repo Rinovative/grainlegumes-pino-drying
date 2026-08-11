@@ -48,7 +48,7 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
         self.input_fields = ["input"]
         self.output_fields = ["output"]
         self.path = path
-        self.identity = datasets.identity.DatasetIdentity(
+        self.identity = datasets.contracts.identity.DatasetIdentity(
             dataset_id=dataset_id,
             task=task_id,
             data_contract_digest=data_digest,
@@ -112,19 +112,19 @@ def _split_info(
     eval_indices = torch.tensor([2, 3], dtype=torch.long)
     ood_indices = torch.tensor([0, 2], dtype=torch.long)
     memberships = {
-        "train": datasets.identity.membership_digest(
+        "train": datasets.contracts.identity.membership_digest(
             role="train",
             dataset_fingerprint=id_source.identity.fingerprint,
             sample_ids=id_source.identity.sample_ids,
             indices=train_indices.tolist(),
         ),
-        "eval": datasets.identity.membership_digest(
+        "eval": datasets.contracts.identity.membership_digest(
             role="eval",
             dataset_fingerprint=id_source.identity.fingerprint,
             sample_ids=id_source.identity.sample_ids,
             indices=eval_indices.tolist(),
         ),
-        "ood": datasets.identity.membership_digest(
+        "ood": datasets.contracts.identity.membership_digest(
             role="ood",
             dataset_fingerprint=ood_source.identity.fingerprint,
             sample_ids=ood_source.identity.sample_ids,
@@ -132,7 +132,7 @@ def _split_info(
         ),
     }
     return {
-        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
+        "schema_version": datasets.preprocessing.splits.SPLIT_SCHEMA_VERSION,
         "task": task.id,
         "task_contract_digest": task.contract_digest,
         "train_indices": train_indices,
@@ -205,7 +205,7 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
             split_seed=seed_plan["split"],
         )
         state = _normalizer_state(id_inputs, id_outputs, split["train_indices"])
-        processor = datasets.normalization.data_processor_from_state(state, device="cpu")
+        processor = datasets.preprocessing.normalization.data_processor_from_state(state, device="cpu")
         train_generator = torch.Generator().manual_seed(seed_plan["loader"])
         return {
             "train": DataLoader(
@@ -245,7 +245,7 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
     monkeypatch.setattr(validation.config_loader, "validate_resolved_config", dict)
     monkeypatch.setattr(validation.config_loader, "validate_resolved_task_contract", lambda _value: task)
     monkeypatch.setattr(validation.config_loader, "create_dataloaders_from_config", build_loaders)
-    monkeypatch.setattr(datasets.metadata, "load_dataset_metadata", load_metadata)
+    monkeypatch.setattr(datasets.contracts.metadata, "load_dataset_metadata", load_metadata)
 
     result = validation.validate_full_data_pipeline(config)
 

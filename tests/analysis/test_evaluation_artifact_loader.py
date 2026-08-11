@@ -153,7 +153,7 @@ def _split(task_spec: TaskSpec) -> dict[str, Any]:
         "ood": torch.tensor([3, 1], dtype=torch.long),
     }
     memberships = {
-        role: datasets.identity.membership_digest(
+        role: datasets.contracts.identity.membership_digest(
             role=role,
             dataset_fingerprint=(ood_identity if role == "ood" else train_identity)["fingerprint"],
             sample_ids=(ood_identity if role == "ood" else train_identity)["sample_ids"],
@@ -162,7 +162,7 @@ def _split(task_spec: TaskSpec) -> dict[str, Any]:
         for role, role_indices in indices.items()
     }
     return {
-        "schema_version": datasets.splits.SPLIT_SCHEMA_VERSION,
+        "schema_version": datasets.preprocessing.splits.SPLIT_SCHEMA_VERSION,
         "task": task_spec.id,
         "task_contract_digest": task_spec.contract_digest,
         "train_indices": indices["train"],

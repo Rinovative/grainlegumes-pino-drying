@@ -3,6 +3,7 @@ Completed-epoch training, optimization, and persistence services.
 
 Provides:
 - checkpoint: atomic checkpoint and continuation-state persistence
+- events: phase-aware progress and metric event contracts
 - loop: training and evaluation epoch execution
 - optim: optimizer and scheduler construction
 """

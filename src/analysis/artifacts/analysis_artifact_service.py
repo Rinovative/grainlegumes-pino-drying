@@ -122,7 +122,7 @@ class ArtifactRequest:
     source_indices: tuple[int, ...]
     batch_size: int
     case_ids: tuple[str, ...] = ()
-    dataset_metadata: datasets.metadata.DatasetMetadata | None = None
+    dataset_metadata: datasets.contracts.metadata.DatasetMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -329,13 +329,13 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     data_cfg = _load_data_config(run_dir)
     from src import datasets  # noqa: PLC0415
 
-    split_contract = datasets.splits.admit_split_contract(admitted["split_indices"])
+    split_contract = datasets.preprocessing.splits.admit_split_contract(admitted["split_indices"])
     id_dataset_name = split_contract.role("eval").source.dataset_id
     ood_dataset_name = split_contract.role("ood").source.dataset_id
 
     configured_id_dataset = _required_config_dataset_name(data_cfg, "train_dataset")
     configured_ood_datasets = _required_config_ood_dataset_names(data_cfg)
-    configured_ood_identity = datasets.identity.combined_dataset_id(configured_ood_datasets)
+    configured_ood_identity = datasets.contracts.identity.combined_dataset_id(configured_ood_datasets)
 
     if configured_id_dataset != id_dataset_name:
         msg = (
@@ -430,17 +430,17 @@ def _load_bound_dataset_metadata(
     *,
     dataset_names: Sequence[str],
     metadata_root: Path,
-) -> datasets.metadata.DatasetMetadata | None:
+) -> datasets.contracts.metadata.DatasetMetadata | None:
     """Validate every source package metadata contract and return sole timing metadata."""
     from src import datasets  # noqa: PLC0415
 
     if not source_datasets or len(source_datasets) != len(dataset_names):
         msg = "Artifact source datasets and names must be non-empty and aligned."
         raise ValueError(msg)
-    timing_packages: list[datasets.metadata.DatasetMetadata] = []
+    timing_packages: list[datasets.contracts.metadata.DatasetMetadata] = []
     for source_dataset, dataset_name in zip(source_datasets, dataset_names, strict=True):
         dataset_identity = getattr(source_dataset, "identity", None)
-        if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
+        if not isinstance(dataset_identity, datasets.contracts.identity.DatasetIdentity):
             msg = f"Dataset package {dataset_name!r} must expose a verified identity."
             raise TypeError(msg)
         source_payload = getattr(source_dataset, "data", None)
@@ -456,7 +456,7 @@ def _load_bound_dataset_metadata(
                 metadata_root=metadata_root,
             )
             continue
-        package = datasets.metadata.load_dataset_metadata(
+        package = datasets.contracts.metadata.load_dataset_metadata(
             dataset_name,
             dataset_identity=dataset_identity,
             metadata_root=metadata_root,
@@ -558,23 +558,23 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     source_dataset_names = (
         (_required_config_dataset_name(data_cfg, "train_dataset"),) if split == "eval" else _required_config_ood_dataset_names(data_cfg)
     )
-    expected_dataset_name = datasets.identity.combined_dataset_id(source_dataset_names)
+    expected_dataset_name = datasets.contracts.identity.combined_dataset_id(source_dataset_names)
     if expected_dataset_name != dataset_name:
         msg = f"Requested dataset {dataset_name!r} does not match configured source identity {expected_dataset_name!r}."
         raise RuntimeError(msg)
     source_datasets = [
-        datasets.steady.create_dataset(
+        datasets.runtime.steady.create_dataset(
             common.paths.resolve_dataset_path(source_name, dataset_root=dataset_root),
             task=task,
         )
         for source_name in source_dataset_names
     ]
-    source_dataset = datasets.splits.combine_identity_datasets(source_datasets)
+    source_dataset = datasets.preprocessing.splits.combine_identity_datasets(source_datasets)
     expected_identity = getattr(source_dataset, "identity", None)
-    if not isinstance(expected_identity, datasets.identity.DatasetIdentity):
+    if not isinstance(expected_identity, datasets.contracts.identity.DatasetIdentity):
         msg = "Combined artifact source must expose a verified DatasetIdentity."
         raise TypeError(msg)
-    split_contract = datasets.splits.admit_split_contract(
+    split_contract = datasets.preprocessing.splits.admit_split_contract(
         raw_split_contract,
         train_identity=expected_identity if split == "eval" else None,
         ood_identity=expected_identity if split == "ood" else None,

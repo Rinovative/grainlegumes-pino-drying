@@ -28,11 +28,11 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 from src import common
 
-from . import generation_campaign_evidence as campaign_evidence
-from . import generation_campaign_runtime as campaign_runtime
-from . import generation_config as config_service
-from . import generation_pilot as pilot_service
-from . import generation_workspace as workspace_service
+from . import generation_campaign as campaign_runtime
+from .cases import generation_cases_config as config_service
+from .publication import generation_publication_campaign_evidence as campaign_evidence
+from .runtime import generation_runtime_workspace as workspace_service
+from .validation import generation_validation_pilot as pilot_service
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

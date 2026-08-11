@@ -35,8 +35,7 @@ from typing import Any
 
 import yaml
 
-from src import common, datasets, domain
-from src.learning import learning_device_policy
+from src import common, datasets, domain, learning
 from src.learning.losses import learning_losses_factory as loss_factory
 from src.learning.metrics import learning_metrics as metric_registry
 from src.learning.models import learning_models_factory as model_factory
@@ -1162,7 +1161,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
 
     run = _as_mapping(config["run"], path="run")
     try:
-        run["device"] = learning_device_policy.validate_device_policy(
+        run["device"] = learning.device_policy.validate_device_policy(
             run.get("device"),
             path="run.device",
         )
@@ -1533,7 +1532,7 @@ def create_dataloaders_from_config(
     paths_test_ood = tuple(common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root) for dataset_name in ood_dataset_names)
     seeds = dict(seed_plan or {})
     run_seed = int(config["run"]["seed"])
-    train_loader, test_loaders, normalizer, split_indices = datasets.training.create_dataloaders(
+    train_loader, test_loaders, normalizer, split_indices = datasets.runtime.training.create_dataloaders(
         path_train=str(path_train),
         path_test_ood=tuple(str(path) for path in paths_test_ood),
         task=task,

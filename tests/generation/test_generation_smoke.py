@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 from src import generation
-from src.generation import generation_mapping_probe as mapping_probe
-from src.generation import generation_profiles as profiles
+from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe
 
 
 def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance() -> None:
@@ -125,11 +125,11 @@ exports:
 def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None:
     """Bind receipt version evidence to configured paired execution contracts."""
     root = Path("configs/generation/campaigns")
-    steady = generation.config.load_campaign_config(
+    steady = generation.cases.config.load_campaign_config(
         root / "steady_flow/technical_smoke.yaml",
         require_executable=False,
     )
-    transient = generation.config.load_campaign_config(
+    transient = generation.cases.config.load_campaign_config(
         root / "transient_drying/technical_smoke.yaml",
         require_executable=False,
     )

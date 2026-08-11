@@ -381,7 +381,7 @@ def _saved_roles(
 ) -> tuple[_SavedRole, _SavedRole]:
     """Resolve admitted ID and OOD artifact roles from typed split evidence."""
     config = _mapping(completed.get("config"), label="completed config")
-    split_contract = datasets.splits.admit_split_contract(_mapping(completed.get("split_indices"), label="completed split_indices"))
+    split_contract = datasets.preprocessing.splits.admit_split_contract(_mapping(completed.get("split_indices"), label="completed split_indices"))
     if split_contract.task != task or split_contract.task_contract_digest != task_spec.contract_digest:
         msg = "Saved split task identity contradicts the evaluable run task contract."
         raise ValueError(msg)
@@ -413,7 +413,7 @@ def _saved_roles(
         common.paths.validate_logical_name(dataset_id, label=f"config.yaml data.ood_datasets[{index}]")
         for index, dataset_id in enumerate(raw_configured_ood)
     )
-    if len(configured_ood) != len(set(configured_ood)) or datasets.identity.combined_dataset_id(configured_ood) != ood_name:
+    if len(configured_ood) != len(set(configured_ood)) or datasets.contracts.identity.combined_dataset_id(configured_ood) != ood_name:
         msg = "config.yaml data.ood_datasets do not match the saved OOD package-combination identity."
         raise ValueError(msg)
 

@@ -12,12 +12,12 @@ import pytest
 import yaml
 
 from src import generation
-from src.datasets import dataset_package_planning as package_planning
-from src.generation import generation_fields as fields
-from src.generation import generation_inventory as inventory
-from src.generation import generation_porosity as porosity
-from src.generation import generation_registry as registry_service
-from src.generation import generation_sampling as sampling
+from src.datasets.packages import dataset_packages_planning as package_planning
+from src.generation.cases import generation_cases_fields as fields
+from src.generation.cases import generation_cases_sampling as sampling
+from src.generation.contracts import generation_contracts_porosity as porosity
+from src.generation.contracts import generation_contracts_registry as registry_service
+from src.generation.publication import generation_publication_inventory as inventory
 
 
 def _campaign_path(profile: str) -> Path:
@@ -27,7 +27,7 @@ def _campaign_path(profile: str) -> Path:
 
 def test_conditional_anchor_support_reconstructs_configured_material_records() -> None:
     """Protect nominal calibration and exact transformed tails for every configured family."""
-    campaign = generation.config.load_campaign_config(
+    campaign = generation.cases.config.load_campaign_config(
         _campaign_path("transient_drying"),
         require_executable=False,
     )
@@ -94,7 +94,7 @@ def test_conditional_anchor_support_reconstructs_configured_material_records() -
             else:
                 assert reference < float(packing_support["lower"])
 
-    steady_campaign = generation.config.load_campaign_config(
+    steady_campaign = generation.cases.config.load_campaign_config(
         _campaign_path("steady_flow"),
         require_executable=False,
     )
@@ -106,11 +106,13 @@ def test_conditional_anchor_support_reconstructs_configured_material_records() -
         campaign,
         "eps_bed_cal_ref",
     )
-    assert steady_reference["producer_to_consumer_path"]["effective_downstream_consumers"] == ["generation_fields._porosity_field"]
+    assert steady_reference["producer_to_consumer_path"]["effective_downstream_consumers"] == [
+        "generation.cases.generation_cases_fields._porosity_field"
+    ]
     assert transient_reference["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "generation_fields._porosity_field",
-        "generation_fields derived dry-density fields",
-        "generation_case transient scalar COMSOL adapter",
+        "generation.cases.generation_cases_fields._porosity_field",
+        "generation.cases.generation_cases_fields derived dry-density fields",
+        "generation.cases.generation_cases_case transient scalar COMSOL adapter",
     ]
 
 
@@ -119,7 +121,7 @@ def test_anchor_ood_is_seen_only_and_uses_one_active_unit() -> None:
     anchor = porosity.ANCHOR_PARAMETER_NAME
     ood_gap_fraction, ood_width_fraction = registry_service.ood_separation_fractions()
     for profile in generation.contracts.available_profile_ids():
-        campaign = generation.config.load_campaign_config(
+        campaign = generation.cases.config.load_campaign_config(
             _campaign_path(profile),
             require_executable=False,
         )
@@ -168,7 +170,7 @@ def test_anchor_ood_is_seen_only_and_uses_one_active_unit() -> None:
 
 def test_global_coupling_and_local_permeability_paths_are_distinct() -> None:
     """Protect kappa/factor mean effects and bitwise local-porosity independence."""
-    campaign = generation.config.load_campaign_config(
+    campaign = generation.cases.config.load_campaign_config(
         _campaign_path("transient_drying"),
         require_executable=False,
     )

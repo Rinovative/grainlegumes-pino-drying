@@ -62,8 +62,8 @@ def require_real_metadata_package(dataset_id: str) -> Path:
     require_real_data_root()
     metadata_dir = common.paths.resolve_dataset_metadata_dir(dataset_id)
     required = (
-        metadata_dir / datasets.metadata.METADATA_FILENAME,
-        metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME,
+        metadata_dir / datasets.contracts.metadata.METADATA_FILENAME,
+        metadata_dir / datasets.contracts.metadata.SOURCE_MANIFEST_FILENAME,
     )
     if not all(path.is_file() for path in required):
         message = f"Required real production package {dataset_id!r} is missing"

@@ -14,11 +14,11 @@ from typing import Any
 import pytest
 
 from src import generation
-from src.generation import generation_campaign_evidence as campaign_evidence
-from src.generation import generation_cluster as cluster
-from src.generation import generation_profiles as profiles
-from src.generation import generation_workspace as workspace
 from src.generation.cli import cli_generation
+from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
+from src.generation.runtime import generation_runtime_cluster as cluster
+from src.generation.runtime import generation_runtime_workspace as workspace
 
 _SYNTHETIC_CASE_COUNT = 5
 
@@ -50,7 +50,7 @@ def _multi_batch_campaign(campaign: Any) -> Any:
 def test_resource_equations_and_one_shared_slurm_pool(generation_config_factory: Any) -> None:
     """Protect hard caps and one campaign submission instead of per-batch pools."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
+    campaign = _multi_batch_campaign(generation.cases.config.load_campaign_config(config_path))
     remaining = sum(len(batch.case_indices) for batch in campaign.batches)
     assert remaining == _SYNTHETIC_CASE_COUNT
     plan = cluster.build_resource_plan(
@@ -109,7 +109,7 @@ def test_campaign_worker_enforces_one_cap_across_subbatches(
 ) -> None:
     """Protect the campaign-global slot pool when many subbatches share a worker."""
     config_path, _template = generation_config_factory()
-    campaign = _multi_batch_campaign(generation.config.load_campaign_config(config_path))
+    campaign = _multi_batch_campaign(generation.cases.config.load_campaign_config(config_path))
     plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=4,
@@ -161,7 +161,7 @@ def test_submit_manifest_and_fake_scheduler_status(
 ) -> None:
     """Protect exact-commit submission evidence and resumable scheduler queries."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=2,
@@ -171,7 +171,7 @@ def test_submit_manifest_and_fake_scheduler_status(
         remaining_cases=5,
     )
     commit = "a" * 40
-    run_id = generation.campaign_runtime.campaign_run_id(
+    run_id = generation.campaign.campaign_run_id(
         campaign,
         git_commit=commit,
         resource_plan=plan,
@@ -199,9 +199,9 @@ def test_submit_manifest_and_fake_scheduler_status(
             return subprocess.CompletedProcess(command, 0, stdout="12345|RUNNING|0:0\n", stderr="")
         raise AssertionError(command)
 
-    monkeypatch.setattr(generation.campaign_runtime, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign_runtime.subprocess, "run", fake_run)
-    manifest = generation.campaign_runtime.submit_campaign(
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_run)
+    manifest = generation.campaign.submit_campaign(
         campaign,
         resource_plan=plan,
         git_commit=commit,
@@ -217,7 +217,7 @@ def test_submit_manifest_and_fake_scheduler_status(
     assert manifest["scheduler_job_name"].startswith("vp2-")
     assert Path(manifest["scheduler_log_directory"]).is_dir()
     assert len(manifest["submission_command"]) > 1
-    reused = generation.campaign_runtime.submit_campaign(
+    reused = generation.campaign.submit_campaign(
         campaign,
         resource_plan=plan,
         git_commit=commit,
@@ -242,7 +242,7 @@ def test_submit_manifest_and_fake_scheduler_status(
         storage_root=tmp_path / "storage",
         failure_stage="solver",
     )
-    status = generation.campaign_runtime.campaign_status(
+    status = generation.campaign.campaign_status(
         manifest["campaign_run_id"],
         storage_root=tmp_path / "storage",
     )
@@ -262,7 +262,7 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
 ) -> None:
     """Protect durable intent and scheduler-name recovery after a lost response."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     plan = cluster.build_resource_plan(
         max_nodes=1,
         cases_per_node=1,
@@ -272,7 +272,7 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
         remaining_cases=5,
     )
     commit = "b" * 40
-    run_id = generation.campaign_runtime.campaign_run_id(
+    run_id = generation.campaign.campaign_run_id(
         campaign,
         git_commit=commit,
         resource_plan=plan,
@@ -283,10 +283,10 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
         message = "synthetic lost sbatch response"
         raise OSError(message)
 
-    monkeypatch.setattr(generation.campaign_runtime, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign_runtime.subprocess, "run", lose_submission_response)
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", lose_submission_response)
     with pytest.raises(OSError, match="synthetic lost sbatch response"):
-        generation.campaign_runtime.submit_campaign(
+        generation.campaign.submit_campaign(
             campaign,
             resource_plan=plan,
             git_commit=commit,
@@ -304,8 +304,8 @@ def test_interrupted_submission_receipt_is_recovered_by_status(
             return subprocess.CompletedProcess(command, 0, stdout="98765|RUNNING|0:0\n", stderr="")
         raise AssertionError(command)
 
-    monkeypatch.setattr(generation.campaign_runtime.subprocess, "run", fake_scheduler)
-    status = generation.campaign_runtime.campaign_status(run_id, storage_root=storage)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_scheduler)
+    status = generation.campaign.campaign_status(run_id, storage_root=storage)
     assert status["campaign_state"] == "running"
     assert status["slurm_job_ids"] == ["98765"]
     recovered = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
@@ -322,7 +322,7 @@ def test_campaign_discovery_uses_schema_kind_and_deterministic_paths(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     (tmp_path / "unrelated.yaml").write_text("schema_kind: unrelated\n", encoding="utf-8")
 
-    discovered = generation.config.discover_campaign_configs(tmp_path)
+    discovered = generation.cases.config.discover_campaign_configs(tmp_path)
 
     assert tuple(campaign.source_path for campaign in discovered) == (config_path.resolve(),)
     status = cli_generation.main(["list-campaigns"])
@@ -339,7 +339,7 @@ def test_workflow_catalog_rejects_duplicate_profile_purpose_matches(
 ) -> None:
     """Require unambiguous semantic campaign selection for the no-argument workflow."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path, require_executable=False)
+    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
     stationary = profiles.resolve_profile(profiles.STEADY_FLOW_PROFILE)
     transient = profiles.resolve_profile(profiles.TRANSIENT_DRYING_PROFILE)
 
@@ -375,7 +375,7 @@ def test_validate_config_exposes_resolved_campaign_ownership(
 ) -> None:
     """Expose resolved counts, seeds, packages, and purpose scope without mutation."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path, require_executable=False)
+    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
     monkeypatch.setattr(
         cli_generation.readiness_service,
         "campaign_unresolved_gates",
@@ -409,19 +409,19 @@ def test_cli_allows_only_execution_overrides(
 ) -> None:
     """Protect nonmutating planning and prohibit ad hoc scientific selectors."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     modified = campaign.with_wall_time("01:30:00")
     assert modified.campaign_digest == campaign.campaign_digest
     assert [batch.scientific_config_digest for batch in modified.batches] == [batch.scientific_config_digest for batch in campaign.batches]
     commit = "a" * 40
-    batch_name = generation.config.build_batch_name(
+    batch_name = generation.cases.config.build_batch_name(
         campaign.profile.id,
         "lentil",
         "natural",
     )
     storage = tmp_path / "storage"
     storage.mkdir()
-    monkeypatch.setattr(generation.campaign_runtime, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     status = cli_generation.main(
         [
             "plan-campaign",
@@ -465,7 +465,7 @@ def test_cancel_then_resume_submits_only_incomplete_validated_membership(
 ) -> None:
     """Protect active-attempt refusal, cancellation evidence, and exact resume size."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.config.load_campaign_config(config_path)
+    campaign = generation.cases.config.load_campaign_config(config_path)
     total_cases = sum(len(batch.case_indices) for batch in campaign.batches)
     plan = cluster.build_resource_plan(
         max_nodes=2,
@@ -493,21 +493,21 @@ def test_cancel_then_resume_submits_only_incomplete_validated_membership(
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         raise AssertionError(command)
 
-    monkeypatch.setattr(generation.campaign_runtime, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_run)
     storage = tmp_path / "storage"
-    manifest = generation.campaign_runtime.submit_campaign(
+    manifest = generation.campaign.submit_campaign(
         campaign,
         resource_plan=plan,
         git_commit=commit,
         storage_root=storage,
     )
     with pytest.raises(RuntimeError, match="previous campaign Slurm attempt is active"):
-        generation.campaign_runtime.resume_campaign(
+        generation.campaign.resume_campaign(
             manifest["campaign_run_id"],
             storage_root=storage,
         )
-    receipt = generation.campaign_runtime.cancel_campaign(
+    receipt = generation.campaign.cancel_campaign(
         manifest["campaign_run_id"],
         storage_root=storage,
     )
@@ -521,11 +521,11 @@ def test_cancel_then_resume_submits_only_incomplete_validated_membership(
     completed_batch = campaign.batches[0]
     completed_index = completed_batch.case_indices[0]
     monkeypatch.setattr(
-        generation.campaign_runtime.batch_runtime,
+        generation.campaign.batch_runtime,
         "completed_case_is_valid",
         lambda batch, case_index, **_kwargs: batch.batch_id == completed_batch.batch_id and case_index == completed_index,
     )
-    resumed = generation.campaign_runtime.resume_campaign(
+    resumed = generation.campaign.resume_campaign(
         manifest["campaign_run_id"],
         storage_root=storage,
     )
@@ -610,16 +610,16 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
         return terminal
 
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "validate_terminal_campaign",
         fake_terminal,
     )
     monkeypatch.setattr(
-        generation.campaign_runtime,
+        generation.campaign,
         "campaign_transfer_plan",
         lambda *_args, **_kwargs: plan,
     )
-    receipt = generation.campaign_runtime.publish_transferred_campaign(
+    receipt = generation.campaign.publish_transferred_campaign(
         run_id,
         staging_root=staging,
         destination_root=destination,
@@ -635,7 +635,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     assert all((staging / relative).is_dir() for relative in relative_directories)
     assert all((destination / relative).is_dir() for relative in relative_directories)
 
-    repeated = generation.campaign_runtime.publish_transferred_campaign(
+    repeated = generation.campaign.publish_transferred_campaign(
         run_id,
         staging_root=staging,
         destination_root=destination,
@@ -647,7 +647,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     unmarked = tmp_path / "unmarked staging"
     unmarked.mkdir()
     with pytest.raises(ValueError, match="marker"):
-        generation.campaign_runtime.publish_transferred_campaign(
+        generation.campaign.publish_transferred_campaign(
             run_id,
             staging_root=unmarked,
             destination_root=destination,
