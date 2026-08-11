@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 DOCKER_PYTHON="${PROJECT_DIR}/scripts/docker_python.sh"
-REPOSITORY_URL="${GENERATION_REPOSITORY_URL:-}"
+CPU_BOOTSTRAP_REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
 GENERATION_MODULE="src.generation.cli.cli_generation"
 BENCHMARK_SUITE_RELATIVE_PATH="configs/generation/benchmarks/transient_core_scaling/suite.yaml"
 STATIONARY_SMOKE_CAMPAIGN_PATH=""
@@ -170,13 +170,6 @@ resolve_local_commit() {
   validate_commit "${head}"
   [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]]     || fail 1 "Requested commit differs from local HEAD."
   REQUESTED_COMMIT="${head}"
-  if [[ -z "${REPOSITORY_URL}" ]]; then
-    REPOSITORY_URL="$(git -C "${PROJECT_DIR}" remote get-url origin)" ||
-      fail 1 "Could not resolve the repository origin URL."
-  fi
-  [[ -n "${REPOSITORY_URL}" && "${REPOSITORY_URL}" != *$'\n'* \
-    && "${REPOSITORY_URL}" != *$'\r'* && "${REPOSITORY_URL}" != *$'\t'* ]] ||
-    fail 2 "Repository URL must be safe non-empty bootstrap text."
   if [[ "${clean}" == true ]]; then
     status="$(git -C "${PROJECT_DIR}" status --porcelain)"
     [[ -z "${status}" ]] || fail 1 "This operation requires a clean local worktree."
@@ -350,7 +343,9 @@ validate_resources() {
 
 print_layout() {
   printf 'CPU host: %s\nRemote HOME: %s\nRepository: %s\n'     "${CPU_HOST}" "${REMOTE_HOME}" "${REMOTE_REPOSITORY}"
-  printf 'Persistent storage: %s\nVenv: %s\nExact commit: %s\n'     "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${REQUESTED_COMMIT}"
+  printf 'Persistent storage: %s\nVenv: %s\nRepository source: %s\nExact commit: %s\n' \
+    "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" \
+    "${REQUESTED_COMMIT}"
   printf 'Modules: %s, %s\n' "${PYTHON_MODULE}" "${COMSOL_MODULE}"
 }
 
@@ -358,7 +353,7 @@ verify_remote_setup() {
   resolve_remote_layout
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" "${PYTHON_MODULE}" \
+    "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${PYTHON_MODULE}" \
     "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; repository_url="$5"
@@ -391,7 +386,7 @@ setup_cpu() {
   print_layout
   printf 'Mode: %s\n' "$([[ "${EXECUTE_SETUP}" == true ]] && printf execute || printf dry-run)"
   print_command mkdir -p "${REMOTE_ROOT}" "${REMOTE_STORAGE_ROOT}"
-  print_command git clone --no-checkout "${REPOSITORY_URL}" "${REMOTE_REPOSITORY}"
+  print_command git clone --no-checkout "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${REMOTE_REPOSITORY}"
   print_command git -C "${REMOTE_REPOSITORY}" fetch origin "${REQUESTED_COMMIT}"
   print_command git -C "${REMOTE_REPOSITORY}" checkout --detach "${REQUESTED_COMMIT}"
   print_command module load "${PYTHON_MODULE}"
@@ -404,7 +399,7 @@ setup_cpu() {
   fi
   remote_bash "${CPU_HOST}" \
     "${REMOTE_ROOT}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${REPOSITORY_URL}" \
+    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" \
     "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
     "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail

@@ -67,10 +67,18 @@ source references are documented only in
 | `sricehpc01` login | Exact checkout, native `.[generation-cpu]` venv, compact plans/manifests, Slurm submission/status, and durable CPU storage | Wrapper-owned batch SSH and rsync; manual SSH only for requested evidence inspection |
 | CPU Slurm compute node | Per-case `$TMPDIR` materialization, native COMSOL, export collection, HDF5 conversion/admission, and durable result publication | Scheduler-owned; no Docker and no manual login in the normal workflow |
 
-The default remote layout is `$HOME/grainlegumes-generation/{repo,storage,venv}`
-on `sricehpc01`. Override it only with `--remote-root`. The local storage root
-defaults to the `storage` sibling of the checkout and may be overridden with
-`STORAGE_ROOT`.
+The CPU checkout is read-only with respect to GitHub and uses the public HTTPS
+repository URL, so GitHub SSH credentials are not required on `sricehpc01`.
+CPU paths are rooted under the `$HOME` resolved by the remote environment:
+
+- `$HOME/grainlegumes-generation/repo`
+- `$HOME/grainlegumes-generation/storage`
+- `$HOME/grainlegumes-generation/venv`
+
+The resolved absolute home is environment-specific and is not a maintained
+path. Override the default root only with `--remote-root`. The local storage
+root defaults to the `storage` sibling of the checkout and may be overridden
+with `STORAGE_ROOT`.
 
 Set the shared local values first:
 

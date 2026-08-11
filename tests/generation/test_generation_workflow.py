@@ -30,6 +30,7 @@ _BENCHMARK_INVENTORY_SHA = "8" * 64
 _BENCHMARK_FILE_COUNT = 1
 _BENCHMARK_SIZE_BYTES = 3
 _AUTHORIZED_BYTES = 24
+_CPU_BOOTSTRAP_URL = "https://github.com/Rinovative/grainlegumes-pino-drying.git"
 
 
 def _executable(path: Path, content: str) -> Path:
@@ -126,7 +127,7 @@ printf 'git <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
 case " $* " in
   *" rev-parse HEAD "*) printf '%s\n' "${FAKE_GIT_COMMIT}" ;;
   *" status --porcelain "*) ;;
-  *" remote get-url origin "*) printf '%s\n' 'https://github.com/Rinovative/grainlegumes-pino-drying.git' ;;
+  *" remote get-url origin "*) printf '%s\n' 'git@github.com:Rinovative/grainlegumes-pino-drying.git' ;;
   *) ;;
 esac
 """,
@@ -349,6 +350,7 @@ fi
             "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             "FAKE_COMMAND_LOG": str(log),
             "FAKE_GIT_COMMIT": _COMMIT,
+            "GENERATION_REPOSITORY_URL": "git@github.com:Rinovative/grainlegumes-pino-drying.git",
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
             "FAKE_RUN_ID": _RUN_ID,
@@ -467,6 +469,14 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert "Dry run: no remote files or jobs were created." in dry_run.stdout
     assert "Python/fixture-3.12" in dry_run.stdout
     assert "Comsol/fixture-9.9" in dry_run.stdout
+    assert f"Repository source: {_CPU_BOOTSTRAP_URL}" in dry_run.stdout
+    assert f"git clone --no-checkout {_CPU_BOOTSTRAP_URL}" in dry_run.stdout
+    assert f"fetch origin {_COMMIT}" in dry_run.stdout
+    assert f"checkout --detach {_COMMIT}" in dry_run.stdout
+    assert "git@github.com" not in dry_run.stdout
+    assert "ssh-agent" not in dry_run.stdout
+    assert "ssh-add" not in dry_run.stdout
+    assert "known_hosts" not in dry_run.stdout
     assert storage.is_dir()
     assert not any(storage.iterdir())
     dry_log = log.read_text(encoding="utf-8")
@@ -477,6 +487,8 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert "<type=bind,source=" in dry_log
     assert ",target=/workspace/repo,readonly>" in dry_log
     assert ",target=/workspace/storage>" in dry_log
+    assert "remote set-url" not in dry_log
+    assert "remote get-url origin" not in dry_log
 
     execute = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
     assert execute.returncode == 0, execute.stderr
@@ -498,6 +510,10 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert "Repository: /remote/home/grainlegumes-generation/repo" in home_based.stdout
     assert "Persistent storage: /remote/home/grainlegumes-generation/storage" in home_based.stdout
     assert "Venv: /remote/home/grainlegumes-generation/venv" in home_based.stdout
+    assert f"Repository source: {_CPU_BOOTSTRAP_URL}" in home_based.stdout
+    assert (f"git clone --no-checkout {_CPU_BOOTSTRAP_URL} /remote/home/grainlegumes-generation/repo") in home_based.stdout
+    assert (f"git -C /remote/home/grainlegumes-generation/repo fetch origin {_COMMIT}") in home_based.stdout
+    assert (f"git -C /remote/home/grainlegumes-generation/repo checkout --detach {_COMMIT}") in home_based.stdout
 
     unsafe = _run(workflow, ["setup-cpu", "--cpu-host", "bad;host"], environment)
     assert unsafe.returncode == 2
