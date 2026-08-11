@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,16 +35,17 @@ from src.datasets.contracts import dataset_contracts_transient as transient_cont
 from src.datasets.contracts import dataset_contracts_views as views
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
-TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
+TRANSIENT_INDEX_SCHEMA_VERSION: Final = 2
 _SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(
     transient_contract.TRANSIENT_PROFILE_ID,
 )
 _SOURCE_TRANSIENT_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.transient_fields)
 _SOURCE_SCHEDULE_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.schedule_fields)
 _SOURCE_SCALAR_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.scalar_inputs)
+_MINIMUM_TRANSIENT_STATE_COUNT: Final = 2
 
 
 class TransientDataContractError(ValueError):
@@ -99,6 +101,86 @@ def require_hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
         message = f"Transient HDF5 entry {name!r} must be a dataset: {handle.filename}."
         raise TransientDataContractError(message)
     return value
+
+
+def _scientific_config(
+    handle: h5py.File,
+    *,
+    path: Path,
+) -> Mapping[str, Any]:
+    """Admit the embedded scientific config against its source identity."""
+    dataset = require_hdf5_dataset(handle, "provenance/scientific_config_json")
+    value = dataset[()]
+    if isinstance(value, np.ndarray) and value.shape == ():
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        message = f"Transient scientific config provenance must be JSON text: {path}."
+        raise TransientDataContractError(message)
+    try:
+        scientific = json.loads(value)
+    except json.JSONDecodeError as error:
+        message = f"Transient scientific config provenance is invalid JSON: {path}."
+        raise TransientDataContractError(message) from error
+    digest = _text_attribute(handle.attrs.get("scientific_config_digest"), label="scientific_config_digest")
+    if not isinstance(scientific, dict) or common.serialization.canonical_json_sha256(scientific) != digest:
+        message = f"Transient scientific config provenance disagrees with its HDF5 identity: {path}."
+        raise TransientDataContractError(message)
+    return scientific
+
+
+def _configured_time_number(value: Any, *, label: str, path: Path) -> float:
+    """Return one finite non-boolean configured temporal number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        message = f"Transient configured time value {label!r} is invalid: {path}."
+        raise TransientDataContractError(message)
+    return float(value)
+
+
+def configured_regular_horizon(
+    handle: h5py.File,
+    time: np.ndarray,
+    *,
+    path: Path,
+    tolerance: float,
+) -> float:
+    """Return and validate the configured regular-time horizon from provenance."""
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        message = f"Transient time classification tolerance is invalid: {path}."
+        raise TransientDataContractError(message)
+    scientific = _scientific_config(handle, path=path)
+    time_config = scientific.get("time")
+    if not isinstance(time_config, Mapping):
+        message = f"Transient scientific config lacks one time mapping: {path}."
+        raise TransientDataContractError(message)
+    start = _configured_time_number(time_config.get("start"), label="start", path=path)
+    horizon = _configured_time_number(time_config.get("stop"), label="stop", path=path)
+    interval = _configured_time_number(time_config.get("interval"), label="interval", path=path)
+    regular_values = time_config.get("regular_times")
+    if (
+        not math.isclose(start, 0.0, rel_tol=0.0, abs_tol=tolerance)
+        or horizon <= 0.0
+        or interval <= 0.0
+        or not isinstance(regular_values, list)
+        or not regular_values
+    ):
+        message = f"Transient configured regular-time axis is invalid: {path}."
+        raise TransientDataContractError(message)
+    configured = np.asarray(
+        [_configured_time_number(value, label="regular_times", path=path) for value in regular_values],
+        dtype=np.float64,
+    )
+    expected = np.arange(configured.size, dtype=np.float64) * interval
+    if (
+        time.size > configured.size
+        or not np.allclose(configured, expected, rtol=0.0, atol=tolerance)
+        or not math.isclose(float(configured[-1]), horizon, rel_tol=0.0, abs_tol=tolerance)
+        or not np.allclose(time, configured[: time.size], rtol=0.0, atol=tolerance)
+    ):
+        message = f"Transient HDF5 regular time is not a prefix of its configured horizon: {path}."
+        raise TransientDataContractError(message)
+    return horizon
 
 
 def _regular_time_contract(
@@ -237,8 +319,8 @@ def _case_record(
     source: TransientSourceCase,
     *,
     source_root: Path,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Validate one source and return compact case and transition records."""
+) -> tuple[dict[str, Any], list[dict[str, Any]], float]:
+    """Validate one source and return case, transition, and horizon records."""
     path = source.path.expanduser().resolve()
     if source.evaluation_regime not in views.PACKAGE_REGIMES:
         message = f"Unsupported transient evaluation regime: {source.evaluation_regime!r}."
@@ -256,9 +338,16 @@ def _case_record(
         time_dataset = require_hdf5_dataset(handle, "time")
         time = np.asarray(time_dataset, dtype=np.float64)
         tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
-        if not math.isfinite(tolerance) or tolerance <= 0.0:
-            message = f"Transient time classification tolerance is invalid: {path}."
+        time_unit = _text_attribute(time_dataset.attrs.get("unit"), label="time.unit")
+        if not math.isfinite(tolerance) or tolerance <= 0.0 or time_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
+            message = f"Transient time tolerance or unit is invalid: {path}."
             raise TransientDataContractError(message)
+        configured_horizon = configured_regular_horizon(
+            handle,
+            time,
+            path=path,
+            tolerance=tolerance,
+        )
         regular_count, transition_stride = _regular_time_contract(
             time,
             path=path,
@@ -271,10 +360,14 @@ def _case_record(
                 message = f"Transient exact-stop time must be a dataset: {path}."
                 raise TransientDataContractError(message)
             exact_values = np.asarray(exact_stop_dataset, dtype=np.float64)
-            if exact_values.shape != (1,):
-                message = f"Transient exact-stop time must contain one value: {path}."
+            exact_unit = _text_attribute(exact_stop_dataset.attrs.get("unit"), label="exact_stop.time.unit")
+            if exact_values.shape != (1,) or exact_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
+                message = f"Transient exact-stop time must contain one value in the canonical unit: {path}."
                 raise TransientDataContractError(message)
             exact_stop = float(exact_values[0])
+            if not math.isfinite(exact_stop) or exact_stop <= float(time[-1]) + tolerance or exact_stop > configured_horizon + tolerance:
+                message = f"Transient exact-stop time must follow the regular prefix within the configured horizon: {path}."
+                raise TransientDataContractError(message)
         transient_dataset = require_hdf5_dataset(handle, "transient/fields")
         static_dataset = require_hdf5_dataset(handle, "static/fields")
         schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
@@ -306,11 +399,10 @@ def _case_record(
             samples.append(
                 {
                     "sample_id": f"{source.package_case_id}__step_{time_index:04d}",
-                    "time_index": time_index,
-                    "t_n": t_n,
-                    "t_np1": t_np1,
+                    "time_index_n": time_index,
+                    "time_index_n_plus_1": time_index + transition_stride,
                     "schedule_index_n": int(current[0]),
-                    "schedule_index_np1": int(following[0]),
+                    "schedule_index_n_plus_1": int(following[0]),
                 }
             )
     if not samples:
@@ -338,7 +430,7 @@ def _case_record(
         "t_stop_exact": status["t_stop_exact"],
         "irregular_stop_time": exact_stop,
     }
-    return record, samples
+    return record, samples, configured_horizon
 
 
 def _index_digest_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -373,8 +465,14 @@ def build_transient_index(
     samples: list[dict[str, Any]] = []
     simulation_ids: set[str] = set()
     sample_ids: set[str] = set()
+    configured_horizon: float | None = None
     for case_index, source in enumerate(sources):
-        record, case_samples = _case_record(source, source_root=root)
+        record, case_samples, case_horizon = _case_record(source, source_root=root)
+        if configured_horizon is None:
+            configured_horizon = case_horizon
+        elif not math.isclose(case_horizon, configured_horizon, rel_tol=0.0, abs_tol=1.0e-12):
+            message = "Transient package sources must share one configured regular-time horizon."
+            raise TransientDataContractError(message)
         simulation_id = str(record["simulation_case_id"])
         if simulation_id in simulation_ids:
             message = f"Transient source simulation identity is duplicated: {simulation_id}."
@@ -397,6 +495,11 @@ def build_transient_index(
         "evaluation_regime": evaluation_regime,
         "contract_digest": transient_contract.transient_contract_digest(),
         "contract": transient_contract.transient_contract_payload(),
+        "configured_regular_horizon": {
+            "value": configured_horizon,
+            "unit": transient_contract.TRANSIENT_STEP_CONTRACT.time_unit,
+            "source": transient_contract.TRANSIENT_STEP_CONTRACT.temporal.configured_horizon_source,
+        },
         "source_locator_root": "storage_root",
         "cases": cases,
         "samples": samples,
@@ -434,6 +537,7 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         "evaluation_regime",
         "contract_digest",
         "contract",
+        "configured_regular_horizon",
         "source_locator_root",
         "cases",
         "samples",
@@ -445,32 +549,169 @@ def load_transient_index(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != required:
         message = f"Transient dataset index keys do not match the current schema: {path}."
         raise TransientDataContractError(message)
+    horizon = payload["configured_regular_horizon"]
     if (
         payload["schema_kind"] != TRANSIENT_INDEX_SCHEMA_KIND
         or payload["schema_version"] != TRANSIENT_INDEX_SCHEMA_VERSION
         or payload["dataset_view"] != "transient_drying"
         or payload["evaluation_regime"] not in views.PACKAGE_REGIMES
+        or not isinstance(payload["dataset_name"], str)
+        or not payload["dataset_name"]
+        or not isinstance(payload["dataset_id"], str)
+        or not payload["dataset_id"]
         or payload["contract_digest"] != transient_contract.transient_contract_digest()
         or payload["contract"] != transient_contract.transient_contract_payload()
+        or not isinstance(horizon, dict)
+        or set(horizon) != {"value", "unit", "source"}
+        or isinstance(horizon.get("value"), bool)
+        or not isinstance(horizon.get("value"), (int, float))
+        or not math.isfinite(float(horizon["value"]))
+        or float(horizon["value"]) <= 0.0
+        or horizon.get("unit") != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit
+        or horizon.get("source") != transient_contract.TRANSIENT_STEP_CONTRACT.temporal.configured_horizon_source
         or payload["source_locator_root"] != "storage_root"
         or not isinstance(payload["cases"], list)
         or not isinstance(payload["samples"], list)
+        or isinstance(payload["source_case_count"], bool)
         or payload["source_case_count"] != len(payload["cases"])
+        or isinstance(payload["sample_count"], bool)
         or payload["sample_count"] != len(payload["samples"])
+        or isinstance(payload["transition_count"], bool)
         or payload["transition_count"] != len(payload["samples"])
         or payload["index_digest"] != common.serialization.canonical_json_sha256(_index_digest_payload(payload))
     ):
         message = f"Transient dataset index contract or identity is invalid: {path}."
         raise TransientDataContractError(message)
-    case_count = len(payload["cases"])
-    sample_ids: set[str] = set()
-    for sample in payload["samples"]:
-        if not isinstance(sample, dict) or not isinstance(sample.get("case_index"), int) or not 0 <= sample["case_index"] < case_count:
-            message = f"Transient sample references an invalid source case: {path}."
+    case_keys = {
+        "package_case_id",
+        "source_relative_path",
+        "source_hdf5_sha256",
+        "source_status_sha256",
+        "case_input_id",
+        "simulation_case_id",
+        "source_batch_id",
+        "source_simulation_profile",
+        "material_family",
+        "evaluation_regime",
+        "membership",
+        "ood_group",
+        "ood_parameters",
+        "ood_evidence",
+        "sequence_length",
+        "stored_state_count",
+        "transition_count",
+        "t_stop_exact",
+        "irregular_stop_time",
+    }
+    sample_keys = {
+        "case_index",
+        "sample_id",
+        "time_index_n",
+        "time_index_n_plus_1",
+        "schedule_index_n",
+        "schedule_index_n_plus_1",
+    }
+    package_case_ids: set[str] = set()
+    simulation_case_ids: set[str] = set()
+    for case in payload["cases"]:
+        if not isinstance(case, dict) or set(case) != case_keys:
+            message = f"Transient case records do not match the current schema: {path}."
             raise TransientDataContractError(message)
-        sample_id = sample.get("sample_id")
-        if not isinstance(sample_id, str) or not sample_id or sample_id in sample_ids:
+        sequence_length = case["sequence_length"]
+        stored_state_count = case["stored_state_count"]
+        transition_count = case["transition_count"]
+        irregular_stop = case["irregular_stop_time"]
+        t_stop_exact = case["t_stop_exact"]
+        package_case_id = case["package_case_id"]
+        simulation_case_id = case["simulation_case_id"]
+        numeric_stop = (
+            not isinstance(t_stop_exact, bool)
+            and isinstance(t_stop_exact, (int, float))
+            and math.isfinite(float(t_stop_exact))
+            and 0.0 <= float(t_stop_exact) <= float(horizon["value"])
+        )
+        irregular_valid = irregular_stop is None or (
+            not isinstance(irregular_stop, bool)
+            and isinstance(irregular_stop, (int, float))
+            and math.isfinite(float(irregular_stop))
+            and float(irregular_stop) == float(t_stop_exact)
+        )
+        if (
+            not isinstance(package_case_id, str)
+            or not package_case_id
+            or package_case_id in package_case_ids
+            or not isinstance(simulation_case_id, str)
+            or not simulation_case_id
+            or simulation_case_id in simulation_case_ids
+            or case["source_simulation_profile"] != transient_contract.TRANSIENT_PROFILE_ID
+            or case["evaluation_regime"] != payload["evaluation_regime"]
+            or isinstance(sequence_length, bool)
+            or not isinstance(sequence_length, int)
+            or sequence_length < _MINIMUM_TRANSIENT_STATE_COUNT
+            or isinstance(stored_state_count, bool)
+            or not isinstance(stored_state_count, int)
+            or stored_state_count != sequence_length + int(irregular_stop is not None)
+            or isinstance(transition_count, bool)
+            or not isinstance(transition_count, int)
+            or transition_count < 1
+            or not numeric_stop
+            or not irregular_valid
+        ):
+            message = f"Transient case temporal identity is invalid: {path}."
+            raise TransientDataContractError(message)
+        package_case_ids.add(package_case_id)
+        simulation_case_ids.add(simulation_case_id)
+    case_count = len(payload["cases"])
+    samples_by_case: list[list[dict[str, Any]]] = [[] for _ in range(case_count)]
+    sample_ids: set[str] = set()
+    previous_case_index = -1
+    for sample in payload["samples"]:
+        if not isinstance(sample, dict) or set(sample) != sample_keys:
+            message = f"Transient sample records do not match the current schema: {path}."
+            raise TransientDataContractError(message)
+        case_index = sample["case_index"]
+        positions = tuple(sample[key] for key in ("time_index_n", "time_index_n_plus_1", "schedule_index_n", "schedule_index_n_plus_1"))
+        if (
+            isinstance(case_index, bool)
+            or not isinstance(case_index, int)
+            or not 0 <= case_index < case_count
+            or case_index < previous_case_index
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in positions)
+        ):
+            message = f"Transient sample references invalid or unordered source indices: {path}."
+            raise TransientDataContractError(message)
+        sample_id = sample["sample_id"]
+        expected_id = f"{payload['cases'][case_index]['package_case_id']}__step_{sample['time_index_n']:04d}"
+        if not isinstance(sample_id, str) or sample_id != expected_id or sample_id in sample_ids:
             message = f"Transient sample identities are invalid or duplicated: {path}."
             raise TransientDataContractError(message)
+        if not sample["time_index_n"] < sample["time_index_n_plus_1"] < payload["cases"][case_index]["sequence_length"]:
+            message = f"Transient sample time indices leave the regular HDF5 sequence: {path}."
+            raise TransientDataContractError(message)
+        if not sample["schedule_index_n"] < sample["schedule_index_n_plus_1"]:
+            message = f"Transient sample schedule endpoints are not forward ordered: {path}."
+            raise TransientDataContractError(message)
         sample_ids.add(sample_id)
+        samples_by_case[case_index].append(sample)
+        previous_case_index = case_index
+    for case_index, case_samples in enumerate(samples_by_case):
+        case = payload["cases"][case_index]
+        if len(case_samples) != case["transition_count"]:
+            message = f"Transient case transition counts disagree with indexed samples: {path}."
+            raise TransientDataContractError(message)
+        time_stride = case_samples[0]["time_index_n_plus_1"] - case_samples[0]["time_index_n"]
+        schedule_stride = case_samples[0]["schedule_index_n_plus_1"] - case_samples[0]["schedule_index_n"]
+        for step_index, sample in enumerate(case_samples):
+            if (
+                sample["time_index_n"] != step_index * time_stride
+                or sample["time_index_n_plus_1"] != (step_index + 1) * time_stride
+                or sample["schedule_index_n"] != step_index * schedule_stride
+                or sample["schedule_index_n_plus_1"] != (step_index + 1) * schedule_stride
+            ):
+                message = f"Transient samples are not one deterministic consecutive regular prefix: {path}."
+                raise TransientDataContractError(message)
+        unused_regular_steps = case["sequence_length"] - 1 - case_samples[-1]["time_index_n_plus_1"]
+        if not 0 <= unused_regular_steps < time_stride:
+            message = f"Transient samples omit a complete regular transition: {path}."
+            raise TransientDataContractError(message)
     return payload

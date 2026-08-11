@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, SLF001
 """Authoritative steady and transient Dataset contract inspection."""
 
 from dataclasses import FrozenInstanceError
@@ -6,12 +6,26 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from src import domain, generation
-from src.datasets.runtime import dataset_runtime_transient as transient_runtime
+from src.datasets.contracts import dataset_contracts_identity as dataset_identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
+from src.datasets.packages import dataset_packages_builder as package_builder
+from src.datasets.packages import dataset_packages_trajectory as trajectory
+from src.datasets.runtime import dataset_runtime_transient as transient_runtime
 
 _STEADY_DIGEST = "d40dc74f5f8e70dc19a7e592e4d720ff27ca6131b70bd64d88556791566fac0a"
-_TRANSIENT_DIGEST = "73ff7473076e5ed7fc4f64bd13bffba53a8bdb34c52f0e9bf351e603f72206b2"
+_TRANSIENT_DIGEST = "f970493bde4cc5ce87c390ce0833aa7a11b4138ccc0224e4513a72a0c1535c80"
+
+
+def test_package_payload_schema_identity_is_view_specific() -> None:
+    """Keep steady package identity independent of transient-index evolution."""
+    steady = package_builder._schema_identity("steady_flow")
+    transient = package_builder._schema_identity("transient_drying")
+    assert steady["transient_index"] == dataset_identity.TRAINING_DATASET_SCHEMA_VERSION
+    assert transient["transient_index"] == trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
+    assert {key: value for key, value in steady.items() if key != "transient_index"} == {
+        key: value for key, value in transient.items() if key != "transient_index"
+    }
 
 
 def test_contract_inspection_is_uniform_immutable_and_preserves_persisted_identity() -> None:
@@ -52,6 +66,13 @@ def test_contract_inspection_is_uniform_immutable_and_preserves_persisted_identi
         step.time_step,
         step.time_unit,
     )
+    assert transient.temporal is not None
+    assert tuple(field.name for field in transient.temporal.fields) == ("t_n", "t_n_plus_1", "dt")
+    assert transient.temporal.authoritative_source == "canonical_hdf5_regular_time_axis"
+    assert transient.temporal.configured_horizon_source == "generation_scientific_config.time.stop"
+    assert transient.temporal.boundary_interval_interpolation == "linear_between_regular_schedule_nodes"
+    assert transient.temporal.boundary_interval_representation == "endpoint_values_complete_no_redundant_interval_features"
+    assert transient.sampling_modes == ("one_step_transition", "rollout_window")
     assert transient.storage_representation == step.canonical_storage_representation
     assert transient.target_semantics == "next_state_minus_current_state"
     assert transient.target_derivation == step.target_derivation_stage
@@ -74,5 +95,28 @@ def test_transient_contract_derives_source_fields_and_owns_persisted_serializer(
     ):
         source_field = source.field(field.name)
         assert (field.name, field.unit) == (source_field.name, source_field.unit)
-    assert transient_contract.transient_contract_payload()["dt"] == {"value": 1.0, "unit": "h"}
+    assert tuple(field.name for field in contract.scalar_conditioning) == (
+        "r_surf_0",
+        "r_int_surf",
+        "f_surf",
+        "A_osw",
+        "B_osw",
+        "C_osw",
+        "k_gr",
+        "cp_gr_dry",
+    )
+    payload = transient_contract.transient_contract_payload()
+    assert payload["time"]["fields"] == [
+        {"name": "t_n", "unit": "h"},
+        {"name": "t_n_plus_1", "unit": "h"},
+        {"name": "dt", "unit": "h"},
+    ]
+    assert payload["time"]["configured_horizon_source"] == "generation_scientific_config.time.stop"
+    assert payload["boundary_interval"] == {
+        "interpolation": "linear_between_regular_schedule_nodes",
+        "representation": "endpoint_values_complete_no_redundant_interval_features",
+    }
+    assert not {"interval_mean", "interval_integral", "interval_sequence"}.intersection(field["name"] for field in payload["boundary"])
+    assert payload["sampling"]["modes"] == ["one_step_transition", "rollout_window"]
+    assert "dt" not in payload
     assert not hasattr(transient_runtime, "transient_contract_payload")

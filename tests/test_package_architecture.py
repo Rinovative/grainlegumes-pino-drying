@@ -115,6 +115,32 @@ def test_root_public_facades_resolve_to_modules() -> None:
         assert all(isinstance(getattr(root_package, name), ModuleType) for name in root_package.__all__)
 
 
+@pytest.mark.parametrize(
+    ("package_name", "public_name", "implementation_name"),
+    [
+        (
+            "src.experiments.config",
+            "temporal",
+            "src.experiments.config.experiments_config_temporal",
+        ),
+        (
+            "src.learning",
+            "temporal",
+            "src.learning.learning_temporal",
+        ),
+    ],
+)
+def test_phase_three_public_modules_resolve_to_their_single_owners(
+    package_name: str,
+    public_name: str,
+    implementation_name: str,
+) -> None:
+    """Keep the new lazy public names identical to their concrete owners."""
+    package = import_module(package_name)
+    implementation = import_module(implementation_name)
+    assert getattr(package, public_name) is implementation
+
+
 def test_canonical_cli_modules_are_discoverable() -> None:
     """Keep the two maintained ``python -m`` module paths discoverable."""
     for module_name in ("src.generation.cli.cli_generation", "src.datasets.dataset_packages"):

@@ -86,6 +86,22 @@ class DatasetGroupInspection:
 
 
 @dataclass(frozen=True, slots=True)
+class DatasetTemporalInspection:
+    """Describe authoritative temporal coordinates and supported sample modes."""
+
+    fields: tuple[DatasetFieldInspection, ...]
+    tensor_dtype: str
+    regular_transition_step: float
+    time_unit: str
+    authoritative_source: str
+    configured_horizon_source: str
+    exact_stop_usage: str
+    boundary_interval_interpolation: str
+    boundary_interval_representation: str
+    sampling_modes: tuple[transient_contract.TransientSampleMode, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetContractInspection:
     """Expose one authoritative contract through uniform immutable semantics."""
 
@@ -94,8 +110,7 @@ class DatasetContractInspection:
     groups: tuple[DatasetGroupInspection, ...]
     tensor_dtype: str
     temporal_semantics: TemporalSemantics
-    time_step: float | None
-    time_unit: str | None
+    temporal: DatasetTemporalInspection | None
     storage_representation: str
     target_semantics: TargetSemantics
     target_derivation: str
@@ -108,8 +123,23 @@ class DatasetContractInspection:
 
     @property
     def fields(self) -> tuple[DatasetFieldInspection, ...]:
-        """Return every inspected field in group and channel order."""
+        """Return every inspected state, conditioning, target, and archive field."""
         return tuple(field for group in self.groups for field in group.fields)
+
+    @property
+    def time_step(self) -> float | None:
+        """Return the regular transition duration when this view is temporal."""
+        return None if self.temporal is None else self.temporal.regular_transition_step
+
+    @property
+    def time_unit(self) -> str | None:
+        """Return the physical time unit when this view is temporal."""
+        return None if self.temporal is None else self.temporal.time_unit
+
+    @property
+    def sampling_modes(self) -> tuple[transient_contract.TransientSampleMode, ...]:
+        """Return explicit runtime sampling modes supported by this view."""
+        return () if self.temporal is None else self.temporal.sampling_modes
 
     def group(self, name: str) -> DatasetGroupInspection:
         """Return one exact inspected tensor group by name."""
@@ -187,8 +217,7 @@ def _steady_inspection(view: DatasetViewSpec, task: domain.tasks.spec.TaskSpec) 
         groups=tuple(groups),
         tensor_dtype=identity.TRAINING_TENSOR_DTYPE,
         temporal_semantics="static_snapshot",
-        time_step=None,
-        time_unit=None,
+        temporal=None,
         storage_representation="task_declared_field_representations",
         target_semantics="direct_task_outputs",
         target_derivation="generated_reference_fields",
@@ -245,8 +274,18 @@ def _transient_inspection(
         groups=groups,
         tensor_dtype=contract.tensor_dtype,
         temporal_semantics="fixed_step_transition",
-        time_step=contract.time_step,
-        time_unit=contract.time_unit,
+        temporal=DatasetTemporalInspection(
+            fields=_transient_fields(contract.temporal.fields, role="temporal_coordinate"),
+            tensor_dtype=contract.temporal.tensor_dtype,
+            regular_transition_step=contract.time_step,
+            time_unit=contract.time_unit,
+            authoritative_source=contract.temporal.authoritative_source,
+            configured_horizon_source=contract.temporal.configured_horizon_source,
+            exact_stop_usage=contract.temporal.exact_stop_usage,
+            boundary_interval_interpolation=contract.boundary_interval_interpolation,
+            boundary_interval_representation=contract.boundary_interval_representation,
+            sampling_modes=contract.sampling_modes,
+        ),
         storage_representation=contract.canonical_storage_representation,
         target_semantics="next_state_minus_current_state",
         target_derivation=contract.target_derivation_stage,

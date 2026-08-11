@@ -5,6 +5,7 @@ Provides:
 - defaults: canonical experiment defaults
 - loader: YAML admission, resolution, and semantic validation
 - preflight: resolved configuration and runtime-device preflight
+- temporal: explicit transient sampling and time-conditioning composition
 """
 
 from __future__ import annotations
@@ -16,13 +17,15 @@ if TYPE_CHECKING:
     from . import experiments_config_defaults as defaults
     from . import experiments_config_loader as loader
     from . import experiments_config_preflight as preflight
+    from . import experiments_config_temporal as temporal
 
 _MODULES = {
     "defaults": "experiments_config_defaults",
     "loader": "experiments_config_loader",
     "preflight": "experiments_config_preflight",
+    "temporal": "experiments_config_temporal",
 }
-__all__ = ["defaults", "loader", "preflight"]
+__all__ = ["defaults", "loader", "preflight", "temporal"]
 
 
 def __getattr__(name: str) -> object:

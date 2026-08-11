@@ -86,6 +86,22 @@ def _case_indexes(
     )
 
 
+def _schema_identity(dataset_view: str) -> dict[str, int]:
+    """Return view-specific payload schema identity in the package-v1 envelope."""
+    if dataset_view == "transient_drying":
+        payload_schema_version = trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
+    elif dataset_view == "steady_flow":
+        payload_schema_version = identity.TRAINING_DATASET_SCHEMA_VERSION
+    else:
+        message = f"Unsupported Dataset view {dataset_view!r}."
+        raise ValueError(message)
+    return {
+        "package": DATASET_PACKAGE_SCHEMA_VERSION,
+        "case_hdf5": storage_schema_version(),
+        "transient_index": payload_schema_version,
+    }
+
+
 def _package_provenance(
     campaign: generation.cases.config.CampaignConfig,
     prepared: planning.PreparedPackage,
@@ -176,11 +192,7 @@ def _package_provenance(
         "source_profile_counts": dict(sorted(profile_counts.items())),
         "candidate_source_case_count": len(prepared.candidates) + len(prepared.excluded),
         "builder_identity": "src.datasets.dataset_packages.build_campaign_packages",
-        "schema_identity": {
-            "package": DATASET_PACKAGE_SCHEMA_VERSION,
-            "case_hdf5": storage_schema_version(),
-            "transient_index": trajectory.TRANSIENT_INDEX_SCHEMA_VERSION,
-        },
+        "schema_identity": _schema_identity(view.id),
     }
 
 

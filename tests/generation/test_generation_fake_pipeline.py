@@ -117,6 +117,11 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
                     dataset_id=result["dataset_id"],
                     dataset_view=result["dataset_view"],
                     evaluation_regime="id",
+                    transient_sampling=(
+                        datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
+                        if result["dataset_view"] == "transient_drying"
+                        else None
+                    ),
                     storage_root=storage,
                 )
             )

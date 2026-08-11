@@ -8,6 +8,7 @@ Provides:
 - losses: supervised and physics-informed loss construction
 - metrics: task-resolved training and evaluation metrics
 - models: semantic neural-operator model construction
+- temporal: explicit transient time-conditioning validation and transforms
 - training: optimization, checkpoint, and completed-epoch execution
 """
 
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from . import inference, losses, metrics, models, training
     from . import learning_device as device
     from . import learning_device_policy as device_policy
+    from . import learning_temporal as temporal
 
 _MODULES = {
     "device": "learning_device",
@@ -28,9 +30,10 @@ _MODULES = {
     "losses": "losses",
     "metrics": "metrics",
     "models": "models",
+    "temporal": "learning_temporal",
     "training": "training",
 }
-__all__ = ["device", "device_policy", "inference", "losses", "metrics", "models", "training"]
+__all__ = ["device", "device_policy", "inference", "losses", "metrics", "models", "temporal", "training"]
 
 
 def __getattr__(name: str) -> object:

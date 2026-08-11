@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_manifest as package_manifest
 
@@ -50,6 +51,9 @@ def _runtime_request(
         evaluation_regime=cast("views.PackageRegime", manifest["evaluation_regime"]),
         membership=cast("views.IdMembership | None", membership),
         ood_group=ood_group,
+        transient_sampling=(
+            transient_contract.TransientSamplingSpec(mode="one_step_transition") if manifest["dataset_view"] == "transient_drying" else None
+        ),
         storage_root=storage_root,
         allow_technical_smoke=allow_technical_smoke,
     )
@@ -103,7 +107,8 @@ def inspect_dataset_package(
             name: _tensor_description(sample[name], manifest["channel_contract"][name])
             for name in ("state", "static", "boundary", "scalars", "target")
         }
-        tensor_report["dt"] = _tensor_description(sample["dt"], manifest["channel_contract"]["dt"])
+        temporal_contract = {field["name"]: field for field in manifest["channel_contract"]["time"]["fields"]}
+        tensor_report["time"] = {name: _tensor_description(sample["time"][name], temporal_contract[name]) for name in ("t_n", "t_n_plus_1", "dt")}
         sample_identity = dict(sample["metadata"])
         if isinstance(runtime, transient.TransientPhysicalDataset):
             runtime.close()
@@ -164,8 +169,10 @@ def smoke_dataset_package(
     )
     loader = factory.create_data_loader(request, settings)
     batch = next(iter(loader))
-    tensor_keys = ("x", "y") if manifest["dataset_view"] == "steady_flow" else ("state", "static", "boundary", "scalars", "target", "dt")
-    shapes = {key: list(value.shape) for key in tensor_keys if isinstance((value := batch.get(key)), torch.Tensor)}
+    tensor_keys = ("x", "y") if manifest["dataset_view"] == "steady_flow" else ("state", "static", "boundary", "scalars", "target")
+    shapes: dict[str, Any] = {key: list(value.shape) for key in tensor_keys if isinstance((value := batch.get(key)), torch.Tensor)}
+    if manifest["dataset_view"] == "transient_drying":
+        shapes["time"] = {name: list(value.shape) for name, value in batch["time"].items() if isinstance(value, torch.Tensor)}
     return {
         "dataset_id": dataset_id,
         "dataset_view": manifest["dataset_view"],

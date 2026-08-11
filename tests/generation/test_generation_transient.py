@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import json
 import shutil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import h5py
 import numpy as np
 import pytest
 import torch
 
-from src import common, datasets, generation
+from src import common, datasets, generation, learning
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 
@@ -134,8 +134,9 @@ def _write_transient_case(
     case_input_id: str = "1" * 64,
     simulation_case_id: str = "2" * 64,
     scientific_contract: dict[str, Any] | None = None,
+    regular_state_count: int = 3,
 ) -> np.ndarray:
-    """Write one compressed schema-v1 case with an optional exact-stop state."""
+    """Write one compressed canonical case with an optional exact-stop state."""
     scientific = _synthetic_scientific_contract() if scientific_contract is None else scientific_contract
     grid = scientific["grid"]
     storage = scientific["storage"]
@@ -145,7 +146,7 @@ def _write_transient_case(
     static_constants = (1.0e-10, 0.0, 2.0e-10, 0.4, 100.0, 0.2, 0.1, 0.05, 101325.0, 550.0)
     assert len(static_constants) == len(profiles.TRANSIENT_STATIC_FIELD_NAMES)
     static = np.stack([np.full(shape, value, dtype=np.float32) for value in static_constants])
-    regular_time = np.asarray(scientific["time"]["regular_times"][:3], dtype=np.float64)
+    regular_time = np.asarray(scientific["time"]["regular_times"][:regular_state_count], dtype=np.float64)
     initial_water = static_constants[-1] * static_constants[5]
     base = np.asarray([295.0, 0.4, initial_water, initial_water], dtype=np.float32)
     increments = np.asarray([1.0, 0.01, -0.5, -0.25], dtype=np.float32)
@@ -464,17 +465,25 @@ def test_hdf5_validation_uses_embedded_noncurrent_contract(tmp_path: Path) -> No
         assert _hdf5_dataset(handle, "schedule/values").shape[0] == 5
 
 
-def _source(path: Path, *, regime: str = "id", membership: str = "train") -> datasets.packages.trajectory.TransientSourceCase:
+def _source(
+    path: Path,
+    *,
+    regime: str = "id",
+    membership: str = "train",
+    package_case_id: str = "synthetic_transient__case_0001",
+    case_input_id: str = "1" * 64,
+    simulation_case_id: str = "2" * 64,
+) -> datasets.packages.trajectory.TransientSourceCase:
     """Return one typed source bound to the synthetic HDF5 identities."""
     return datasets.packages.trajectory.TransientSourceCase(
         path=path,
-        package_case_id="synthetic_transient__case_0001",
+        package_case_id=package_case_id,
         source_batch_id="synthetic_transient_batch",
         membership=membership,
         evaluation_regime=regime,
         expected_sha256=common.serialization.file_sha256(path),
-        expected_case_input_id="1" * 64,
-        expected_simulation_case_id="2" * 64,
+        expected_case_input_id=case_input_id,
+        expected_simulation_case_id=simulation_case_id,
         material_family="lentil",
         ood_group=None if regime == "id" else "bed",
         ood_parameters=() if regime == "id" else ("kappa_mean",),
@@ -492,6 +501,11 @@ def _build_index(source: Path, index_path: Path, *, regime: str = "id", membersh
         evaluation_regime=regime,
         source_root=source.parent,
     )
+
+
+def _one_step_sampling() -> datasets.contracts.transient.TransientSamplingSpec:
+    """Return the explicit one-step runtime sampling choice."""
+    return datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
 
 
 def test_transient_index_selects_one_hour_steps_from_finer_regular_source(tmp_path: Path) -> None:
@@ -512,10 +526,11 @@ def test_transient_index_selects_one_hour_steps_from_finer_regular_source(tmp_pa
     )
     payload = _build_index(source, tmp_path / "finer-index.json")
     assert payload["sample_count"] == 1
-    assert [(sample["t_n"], sample["t_np1"]) for sample in payload["samples"]] == [(0.0, 1.0)]
+    assert [(sample["time_index_n"], sample["time_index_n_plus_1"]) for sample in payload["samples"]] == [(0, 2)]
 
     dataset = datasets.runtime.transient.TransientPhysicalDataset(
         tmp_path / "finer-index.json",
+        sampling=_one_step_sampling(),
         source_root=tmp_path,
     )
     item = dataset[0]
@@ -538,7 +553,7 @@ def test_transient_index_rejects_rehashed_noncanonical_contract_digest(tmp_path:
         encoding="utf-8",
     )
     with pytest.raises(datasets.packages.trajectory.TransientDataContractError, match="contract or identity"):
-        datasets.runtime.transient.TransientPhysicalDataset(index_path, source_root=tmp_path)
+        datasets.runtime.transient.TransientPhysicalDataset(index_path, sampling=_one_step_sampling(), source_root=tmp_path)
 
 
 def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path: Path) -> None:
@@ -549,29 +564,62 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     index_path = tmp_path / "index.json"
     payload = _build_index(source, index_path)
 
+    assert payload["schema_version"] == 2
     assert payload["sample_count"] == 2
-    assert [(sample["t_n"], sample["t_np1"]) for sample in payload["samples"]] == [(0.0, 1.0), (1.0, 2.0)]
+    assert [(sample["time_index_n"], sample["time_index_n_plus_1"]) for sample in payload["samples"]] == [(0, 1), (1, 2)]
+    assert set(payload["samples"][0]) == {
+        "case_index",
+        "sample_id",
+        "time_index_n",
+        "time_index_n_plus_1",
+        "schedule_index_n",
+        "schedule_index_n_plus_1",
+    }
+    assert payload["configured_regular_horizon"] == {
+        "value": 168.0,
+        "unit": "h",
+        "source": "generation_scientific_config.time.stop",
+    }
     assert payload["cases"][0]["sequence_length"] == 3
     assert payload["cases"][0]["stored_state_count"] == 4
     assert payload["cases"][0]["irregular_stop_time"] == 2.5
     assert payload["cases"][0]["transition_count"] == 2
-    assert payload["contract"]["dt"] == {"value": 1.0, "unit": "h"}
+    assert payload["contract"]["time"]["regular_transition_step"] == {"value": 1.0, "unit": "h"}
 
-    dataset = datasets.runtime.transient.TransientPhysicalDataset(index_path, source_root=tmp_path, hdf5_cache_size=1)
+    dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=_one_step_sampling(),
+        source_root=tmp_path,
+        hdf5_cache_size=1,
+    )
     assert len(dataset) == 2
     first = dataset[0]
     assert first["state"].shape == (4, 251, 401)
     assert first["static"].shape == (7, 251, 401)
     assert first["boundary"].shape == (5,)
     assert first["scalars"].shape == (8,)
+    torch.testing.assert_close(
+        first["scalars"],
+        torch.tensor([2.0e-5, 1.5, 0.4, 0.1, 0.002, 0.3, 0.2, 1300.0]),
+    )
     assert first["target"].shape == (4, 251, 401)
-    assert first["dt"].shape == ()
+    first_time = cast("dict[str, torch.Tensor]", first["time"])
+    assert {name: value.shape for name, value in first_time.items()} == {
+        "t_n": (),
+        "t_n_plus_1": (),
+        "dt": (),
+    }
     torch.testing.assert_close(
         first["target"],
         torch.from_numpy(np.broadcast_to(increments[:, None, None], (4, 251, 401)).copy()),
     )
-    assert first["metadata"]["t_n"] == 0.0
-    assert first["metadata"]["t_np1"] == 1.0
+    assert first_time["t_n"].item() == 0.0
+    assert first_time["t_n_plus_1"].item() == 1.0
+    assert first_time["dt"].item() == 1.0
+    assert first["metadata"]["sample_mode"] == "one_step_transition"
+    assert first["metadata"]["has_exact_stop_state"] is True
+    assert first["metadata"]["t_stop_exact"] == 2.5
+    assert first["metadata"]["stored_state_count"] == 4
     assert first["metadata"]["split"] == "train"
     assert first["metadata"]["material_family"] == "lentil"
     assert len(dataset._handles) == 1
@@ -585,6 +633,241 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     assert relocated_payload["index_digest"] == payload["index_digest"]
 
 
+def test_temporal_policy_and_sampling_preserve_source_hdf5_identity(tmp_path: Path) -> None:
+    """Keep training-only time choices out of source and physical HDF5 identity."""
+    scientific = _synthetic_scientific_contract()
+    scientific["grid"].update(
+        {
+            "nx": 5,
+            "ny": 4,
+            "Lx": 0.4,
+            "Ly": 0.3,
+            "Lz": 0.2,
+            "dx": 0.1,
+            "dy": 0.1,
+        }
+    )
+    scientific["time"].update(
+        {
+            "stop": 4.0,
+            "interval": 1.0,
+            "regular_times": [0.0, 1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    source = tmp_path / "policy-invariant.h5"
+    _write_transient_case(
+        source,
+        exact_stop_time=3.5,
+        scientific_contract=scientific,
+        regular_state_count=4,
+    )
+    source_sha256 = common.serialization.file_sha256(source)
+    identity_names = (
+        "case_input_id",
+        "simulation_case_id",
+        "scientific_config_digest",
+        "export_contract_sha256",
+    )
+    with h5py.File(source, "r") as handle:
+        source_identities = tuple(str(handle.attrs[name]) for name in identity_names)
+
+    index_path = tmp_path / "policy-invariant-index.json"
+    payload = _build_index(source, index_path)
+    one_step = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=_one_step_sampling(),
+        source_root=tmp_path,
+    )
+    rollout = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=datasets.contracts.transient.TransientSamplingSpec(
+            mode="rollout_window",
+            rollout_length=2,
+            window_stride=1,
+            window_offset=0,
+        ),
+        source_root=tmp_path,
+    )
+
+    assert one_step.dataset_id == rollout.dataset_id == payload["dataset_id"]
+    assert one_step.payload["index_digest"] == rollout.payload["index_digest"] == payload["index_digest"]
+    assert one_step.payload["cases"] == rollout.payload["cases"] == payload["cases"]
+    assert payload["cases"][0]["source_hdf5_sha256"] == source_sha256
+    assert one_step[1]["metadata"]["simulation_case_id"] == rollout[0]["metadata"]["simulation_case_id"]
+
+    current_time = one_step[1]["time"]["t_n"]
+    normalized = learning.temporal.apply_temporal_conditioning(
+        current_time,
+        learning.temporal.TemporalConditioningSpec(kind="normalized_current_time"),
+        configured_regular_horizon=one_step.configured_regular_horizon,
+    )
+    disabled = learning.temporal.apply_temporal_conditioning(
+        current_time,
+        learning.temporal.TemporalConditioningSpec(kind="none"),
+        configured_regular_horizon=one_step.configured_regular_horizon,
+    )
+    assert normalized is not None
+    torch.testing.assert_close(normalized, torch.tensor(0.25))
+    exact_stop_time = float(one_step[1]["metadata"]["t_stop_exact"])
+    assert not torch.isclose(normalized, current_time / exact_stop_time)
+    assert disabled is None
+
+    with h5py.File(source, "r") as handle:
+        assert tuple(str(handle.attrs[name]) for name in identity_names) == source_identities
+    assert common.serialization.file_sha256(source) == source_sha256
+
+
+def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path: Path) -> None:
+    """Protect deterministic aligned windows, time tensors, and regular-only endpoints."""
+    scientific = _synthetic_scientific_contract()
+    scientific["grid"].update(
+        {
+            "nx": 5,
+            "ny": 4,
+            "Lx": 0.4,
+            "Ly": 0.3,
+            "Lz": 0.2,
+            "dx": 0.1,
+            "dy": 0.1,
+        }
+    )
+    scientific["time"].update(
+        {
+            "stop": 6.0,
+            "interval": 1.0,
+            "regular_times": [float(index) for index in range(7)],
+        }
+    )
+    source = tmp_path / "rollout.h5"
+    increments = _write_transient_case(
+        source,
+        exact_stop_time=5.5,
+        scientific_contract=scientific,
+        regular_state_count=6,
+    )
+    second_source = tmp_path / "rollout-second.h5"
+    _write_transient_case(
+        second_source,
+        exact_stop_time=5.5,
+        case_input_id="3" * 64,
+        simulation_case_id="4" * 64,
+        scientific_contract=scientific,
+        regular_state_count=6,
+    )
+    index_path = tmp_path / "rollout-index.json"
+    payload = datasets.packages.trajectory.build_transient_index(
+        [
+            _source(source),
+            _source(
+                second_source,
+                package_case_id="synthetic_transient__case_0002",
+                case_input_id="3" * 64,
+                simulation_case_id="4" * 64,
+            ),
+        ],
+        index_path,
+        dataset_name="transient_drying__lentil__id",
+        dataset_id="transient_drying__lentil__id__synthetic",
+        evaluation_regime="id",
+        source_root=tmp_path,
+    )
+    assert payload["transition_count"] == 10
+    sampling = datasets.contracts.transient.TransientSamplingSpec(
+        mode="rollout_window",
+        rollout_length=2,
+        window_stride=2,
+        window_offset=1,
+    )
+    dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=sampling,
+        source_root=tmp_path,
+        hdf5_cache_size=1,
+    )
+
+    assert dataset.configured_regular_horizon == 6.0
+    assert len(dataset) == 4
+    first = dataset[0]
+    second = dataset[1]
+    third = dataset[2]
+    assert first["state"].shape == (4, 4, 5)
+    assert first["static"].shape == (7, 4, 5)
+    assert first["boundary"].shape == (2, 5)
+    assert first["scalars"].shape == (8,)
+    assert first["target"].shape == (2, 4, 4, 5)
+    first_time = cast("dict[str, torch.Tensor]", first["time"])
+    torch.testing.assert_close(first["state"][:, 0, 0], torch.tensor([296.0, 0.41, 109.5, 109.75]))
+    torch.testing.assert_close(first["boundary"][:, :2], torch.tensor([[295.01, 295.02], [295.02, 295.03]]))
+    torch.testing.assert_close(first["boundary"][0, 3], first["boundary"][1, 2])
+    assert {name: value.shape for name, value in first_time.items()} == {
+        "t_n": (2,),
+        "t_n_plus_1": (2,),
+        "dt": (2,),
+    }
+    torch.testing.assert_close(first_time["t_n"], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(first_time["t_n_plus_1"], torch.tensor([2.0, 3.0]))
+    torch.testing.assert_close(first_time["dt"], torch.ones(2))
+    torch.testing.assert_close(
+        first["target"],
+        torch.from_numpy(np.broadcast_to(increments[None, :, None, None], (2, 4, 4, 5)).copy()),
+    )
+    assert first["metadata"]["sample_mode"] == "rollout_window"
+    assert first["metadata"]["rollout_length"] == 2
+    assert first["metadata"]["sample_id"].endswith("__window_0001_0003")
+    assert second["metadata"]["sample_id"].endswith("__window_0003_0005")
+    assert first["metadata"]["simulation_case_id"] == second["metadata"]["simulation_case_id"] == "2" * 64
+    assert third["metadata"]["sample_id"].endswith("case_0002__window_0001_0003")
+    assert third["metadata"]["simulation_case_id"] == "4" * 64
+    assert second["metadata"]["time_index_n_plus_1"] == 5
+    assert second["metadata"]["has_exact_stop_state"] is True
+    assert second["metadata"]["t_stop_exact"] == 5.5
+    assert second["time"]["t_n_plus_1"][-1].item() == 5.0
+    assert len(dataset._handles) == 1
+
+    duplicate = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=sampling,
+        source_root=tmp_path,
+    )
+    assert [dataset[index]["metadata"]["sample_id"] for index in range(len(dataset))] == [
+        duplicate[index]["metadata"]["sample_id"] for index in range(len(duplicate))
+    ]
+    for num_workers in (0, 2):
+        worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(
+            index_path,
+            sampling=sampling,
+            source_root=tmp_path,
+            hdf5_cache_size=1,
+        )
+        loader = datasets.runtime.factory.make_data_loader(
+            worker_dataset,
+            datasets.runtime.factory.LoaderSettings(
+                batch_size=2,
+                num_workers=num_workers,
+                persistent_workers=num_workers > 0,
+                prefetch_factor=1 if num_workers > 0 else None,
+                hdf5_cache_size=1,
+            ),
+        )
+        batch = next(iter(loader))
+        assert batch["state"].shape == (2, 4, 4, 5)
+        assert batch["target"].shape == (2, 2, 4, 4, 5)
+        assert batch["time"]["t_n"].shape == (2, 2)
+        del loader
+        worker_dataset.close()
+    with pytest.raises(ValueError, match="no complete rollout window"):
+        datasets.runtime.transient.TransientPhysicalDataset(
+            index_path,
+            sampling=datasets.contracts.transient.TransientSamplingSpec(
+                mode="rollout_window",
+                rollout_length=6,
+                window_stride=1,
+                window_offset=0,
+            ),
+            source_root=tmp_path,
+        )
+
+
 def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: Path) -> None:
     """Protect zero/multi-worker collation, bounded handles, and source integrity."""
     source = tmp_path / "case.h5"
@@ -592,7 +875,11 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
     index_path = tmp_path / "index.json"
     _build_index(source, index_path)
 
-    zero_worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(index_path, source_root=tmp_path)
+    zero_worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=_one_step_sampling(),
+        source_root=tmp_path,
+    )
     zero_loader = datasets.runtime.factory.make_data_loader(
         zero_worker_dataset,
         datasets.runtime.factory.LoaderSettings(batch_size=2),
@@ -604,7 +891,12 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         "synthetic_transient__case_0001__step_0001",
     ]
 
-    worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(index_path, source_root=tmp_path, hdf5_cache_size=1)
+    worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=_one_step_sampling(),
+        source_root=tmp_path,
+        hdf5_cache_size=1,
+    )
     _ = worker_dataset[0]
     worker_loader = datasets.runtime.factory.make_data_loader(
         worker_dataset,

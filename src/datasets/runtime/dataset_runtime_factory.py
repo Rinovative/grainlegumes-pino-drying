@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 
 from src import common
 from src.datasets.contracts import dataset_contracts_identity as identity
+from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_manifest as package_manifest
 
@@ -49,6 +50,7 @@ class DatasetRequest:
     evaluation_regime: views.PackageRegime
     membership: views.IdMembership | None = None
     ood_group: str | None = None
+    transient_sampling: transient_contract.TransientSamplingSpec | None = None
     storage_root: Path | str | None = None
     allow_technical_smoke: bool = False
 
@@ -56,6 +58,13 @@ class DatasetRequest:
         """Reject selectors that are ambiguous or invalid for their regime."""
         common.paths.validate_logical_name(self.dataset_id, label="dataset_id")
         views.get_view(self.dataset_view)
+        if self.dataset_view == "transient_drying":
+            if not isinstance(self.transient_sampling, transient_contract.TransientSamplingSpec):
+                message = "Transient Dataset requests require one explicit transient_sampling specification."
+                raise TypeError(message)
+        elif self.transient_sampling is not None:
+            message = "Steady-flow Dataset requests cannot include transient_sampling."
+            raise ValueError(message)
         if self.membership is not None and self.membership not in views.ID_MEMBERSHIPS:
             message = f"Unsupported ID membership selector: {self.membership!r}."
             raise ValueError(message)
@@ -138,6 +147,7 @@ def _select_transient(
     dataset.close()
     return transient.TransientPhysicalDataset(
         dataset.index_path,
+        sampling=dataset.sampling,
         source_root=dataset.source_root,
         hdf5_cache_size=dataset.hdf5_cache_size,
         sample_indices=indices,
@@ -181,8 +191,13 @@ def create_dataset(
     if request.ood_group is not None and request.ood_group not in manifest["available_ood_groups"]:
         message = f"Transient parameter-OOD group {request.ood_group!r} is unavailable; available selectors are {manifest['available_ood_groups']}."
         raise ValueError(message)
+    sampling = request.transient_sampling
+    if sampling is None:
+        message = "Validated transient Dataset request lost its explicit sampling specification."
+        raise RuntimeError(message)
     transient_dataset = transient.TransientPhysicalDataset(
         payload_path,
+        sampling=sampling,
         source_root=request.storage_root,
         hdf5_cache_size=hdf5_cache_size,
         transform=transient_transform,

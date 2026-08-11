@@ -93,6 +93,9 @@ import h5py
 import src
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
+from src.experiments import config as experiment_config
+from src.experiments.config import experiments_config_temporal
+from src.learning import learning_temporal
 from src.datasets import contracts as dataset_contracts
 from src.datasets import dataset_packages
 from src.datasets import packages as dataset_package_services
@@ -153,6 +156,9 @@ modules = (
     dataset_runtime_training,
     dataset_runtime_transient,
     eda_dataframe,
+    experiment_config,
+    experiments_config_temporal,
+    learning_temporal,
 )
 for module in modules:
     path = Path(module.__file__).resolve()
@@ -191,6 +197,9 @@ assert dataset_packages.build_campaign_packages.__module__ == "src.datasets.data
 assert not hasattr(datasets, "base")
 assert datasets.contracts.views.inspect_contract("steady_flow").contract_digest
 assert generation.contracts.get_profile_contract("transient_drying").id == "transient_drying"
+assert experiments.config.temporal is experiments_config_temporal
+assert experiment_config.temporal is experiments_config_temporal
+assert learning.temporal is learning_temporal
 assert h5py.version.version
 print(src.__file__)
 print(dataset_packages.__file__)

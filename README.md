@@ -18,7 +18,7 @@ Heterogeneous permeability, porosity, pressure, and initial-moisture fields are 
 
 The repository now has one Python package, one research layout, and one external scientific storage root. Existing dataset identity, train-only normalization, deterministic training, exact resume, Optuna, W&B observation, run publication, artifact generation, and ID/OOD evaluation contracts remain the stationary-airflow baseline for subsequent drying work.
 
-Generation and publication are fail-closed. Campaign inventories, roles, counts, memberships, seeds, package requests, OOD allocations, and execution resources are resolved from their authoritative YAML owners instead of being repeated in documentation. `validate-config` displays the complete effective plan and current launch gates before any runtime work. Transient learning, rollout, tuning, EDA, and evaluation are intentionally not implemented.
+Generation and publication are fail-closed. Campaign inventories, roles, counts, memberships, seeds, package requests, OOD allocations, and execution resources are resolved from their authoritative YAML owners instead of being repeated in documentation. `validate-config` displays the complete effective plan and current launch gates before any runtime work. Transient packages now expose explicit one-step and consecutive rollout-window Dataset views plus physical time metadata and a learning-owned time-conditioning policy. A trainable transient TaskSpec, transient trainer, tuning, EDA, and Evaluation extensions are intentionally not implemented.
 
 > Configured scientific values are modelling and sampling decisions. Citations do
 > not imply that every final number is reported verbatim: values may be fitted,
@@ -138,6 +138,13 @@ Supported public boundaries are:
 - Training orchestration under `src/experiments` and `src/learning` uses
   `datasets.contracts.views`, `datasets.runtime.training`,
   `datasets.preprocessing.normalization`, and `datasets.preprocessing.splits`.
+- Transient consumers use `datasets.contracts.transient.TransientSamplingSpec`
+  and `datasets.runtime.transient.TransientPhysicalDataset`; the public sample
+  time keys are `t_n`, `t_n_plus_1`, and `dt`.
+- `experiments.config.temporal` validates explicit sampling and
+  `temporal_conditioning`, while `learning.temporal` owns
+  `normalized_current_time` and the explicit `none` ablation. Neither surface
+  supplies a hidden transient default.
 - EDA under `src/analysis/eda` uses `datasets.packages.generated_batch`.
 - Evaluation and artifact admission under `src/analysis` use
   `datasets.contracts.identity`, `datasets.contracts.metadata`,
@@ -222,7 +229,7 @@ STORAGE_ROOT/
     └── .state/
 ```
 
-`01_generation` is the retained high-fidelity source/provenance archive. `02_datasets` contains immutable learning views addressed by `dataset_id`; it is not a renamed campaign directory. The steady view materializes its task-owned tensor payload, while transient packages keep compact indexes with storage-relative `case.h5` paths and open those canonical sources lazily and read-only. Consequently, successful package construction never removes GPU `01_generation`. Experiment bundles and analysis artifacts remain under `03_experiments`.
+`01_generation` is the retained high-fidelity source/provenance archive. `02_datasets` contains immutable learning views addressed by `dataset_id`; it is not a renamed campaign directory. The steady view materializes its task-owned tensor payload, while transient packages keep compact indexes with storage-relative `case.h5` paths and open those canonical sources lazily and read-only. Transient samples derive float32 `t_n`, `t_n_plus_1`, and `dt` in hours from the authoritative regular HDF5 axis and expose either one transition or one consecutive regular rollout window; exact-stop diagnostics remain excluded. Consequently, successful package construction never removes GPU `01_generation`. Experiment bundles and analysis artifacts remain under `03_experiments`.
 
 ### Dataset publication
 

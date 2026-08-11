@@ -204,6 +204,38 @@ to one implementation. Training, EDA, and Evaluation import the public
 internals. The exact consumer aliases and Dataset responsibility table are in the
 [README](../README.md#-python-ownership-and-public-apis).
 
+## Transient Dataset time and sampling views
+
+The compact transient index stores only authoritative HDF5 and schedule indices.
+The shared `datasets.runtime.transient.TransientPhysicalDataset` reads physical
+`t_n`, `t_n_plus_1`, and `dt` directly from the regular HDF5 time axis as
+float32 tensors in hours. The configured normalization horizon comes from the
+embedded resolved `scientific_config.time.stop`; it is never inferred from an
+early case stop, exact-stop diagnostic, trajectory length, or rollout length.
+
+`datasets.contracts.transient.TransientSamplingSpec` requires an explicit mode:
+
+- `one_step_transition` returns ground-truth `state`, shared `static` and eight
+  scientific `scalars`, endpoint `boundary`, scalar time tensors, and the target
+  increment `q_(n+1) - q_n`;
+- `rollout_window` returns one initial ground-truth state plus consecutive
+  boundary, time, and target-increment sequences for an explicit length, stride,
+  and offset.
+
+Both modes share one package interpreter, HDF5 reader, bounded process-local
+handle cache, source mutation checks, channel contract, and case membership.
+They never cross a case boundary or include an irregular exact-stop state. The
+hourly boundary channels remain adjacent `T_in_bc` and `phi_in_bc` endpoints: a
+linear interval is uniquely determined by those endpoints, so no mean, integral,
+or sub-hour feature is added.
+
+Learning exposes an explicit `normalized_current_time` or `none` policy through
+`learning.temporal`; `experiments.config.temporal` validates it together with
+the sampling mode without a hidden default. These APIs prepare the stable
+Dataset/config boundary only. No transient TaskSpec, full transient trainer,
+autoregressive optimization loop, EDA extension, or Evaluation extension is
+claimed here.
+
 ## Resolved campaign and package semantics
 
 Campaign YAML owns role assignment, sampling counts and seed namespaces,
