@@ -24,14 +24,23 @@ def _paths(
     storage = tmp_path / "persistent storage"
     work = tmp_path / "node work"
     venv = tmp_path / "native venv"
+    base_prefix = tmp_path / "software/Python/3.10"
+    base_python = base_prefix / "bin/python3.10"
     storage.mkdir(parents=True)
     work.mkdir()
     (venv / "bin").mkdir(parents=True)
-    monkeypatch.setattr(
-        preflight.sys,
-        "executable",
-        str(venv / "bin/python3"),
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("synthetic module Python\n", encoding="utf-8")
+    base_python.chmod(0o755)
+    (venv / "bin/python").symlink_to(base_python)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {base_python.parent}\nversion = 3.10.14\n",
+        encoding="utf-8",
     )
+    monkeypatch.setattr(preflight.sys, "executable", str(venv / "bin/python"))
+    monkeypatch.setattr(preflight.sys, "prefix", str(venv))
+    monkeypatch.setattr(preflight.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(preflight.sys, "exec_prefix", str(venv))
     monkeypatch.setattr(preflight.sys, "version_info", (3, 10, 14, "final", 0))
     monkeypatch.setattr(preflight.sys, "version", "3.10.14 (synthetic test runtime)")
     return storage, work, venv
@@ -69,6 +78,99 @@ def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     )
 
 
+def test_generation_venv_accepts_external_module_python_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept a venv launcher whose physical target is the module Python."""
+    _storage, _work, venv = _paths(tmp_path, monkeypatch)
+
+    evidence = preflight.validate_generation_venv(
+        venv,
+        domain="CPU compute-node",
+    )
+
+    launcher = venv / "bin/python"
+    assert launcher.is_symlink()
+    assert launcher.resolve().parent.parent == tmp_path / "software/Python/3.10"
+    assert launcher.resolve().is_relative_to(venv) is False
+    assert evidence["launcher"] == str(launcher)
+    assert evidence["resolved_launcher_target"] == str(launcher.resolve())
+    assert evidence["sys_prefix"] == str(venv)
+    assert evidence["sys_base_prefix"] == str(tmp_path / "software/Python/3.10")
+
+
+def test_generation_venv_rejects_system_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject an interpreter whose runtime prefix is its base prefix."""
+    _storage, _work, venv = _paths(tmp_path, monkeypatch)
+    base_prefix = tmp_path / "software/Python/3.10"
+    monkeypatch.setattr(preflight.sys, "executable", str(base_prefix / "bin/python3.10"))
+    monkeypatch.setattr(preflight.sys, "prefix", str(base_prefix))
+    monkeypatch.setattr(preflight.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(preflight.sys, "exec_prefix", str(base_prefix))
+
+    with pytest.raises(RuntimeError, match=r"sys[.]prefix == sys[.]base_prefix.*not active"):
+        preflight.validate_generation_venv(venv, domain="CPU compute-node")
+
+
+def test_generation_venv_rejects_wrong_runtime_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject an active interpreter belonging to a different venv."""
+    _storage, _work, venv = _paths(tmp_path, monkeypatch)
+    other = tmp_path / "another venv"
+    monkeypatch.setattr(preflight.sys, "prefix", str(other))
+    monkeypatch.setattr(preflight.sys, "exec_prefix", str(other))
+
+    with pytest.raises(RuntimeError, match=rf"configured Generation venv is {venv}.*sys[.]prefix={other}"):
+        preflight.validate_generation_venv(venv, domain="CPU compute-node")
+
+
+@pytest.mark.parametrize("broken", ["launcher", "non_executable_launcher", "metadata"])
+def test_generation_venv_rejects_broken_runtime_files(
+    broken: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require the configured launcher and standard Python venv metadata."""
+    _storage, _work, venv = _paths(tmp_path, monkeypatch)
+    if broken == "launcher":
+        (venv / "bin/python").unlink()
+    elif broken == "non_executable_launcher":
+        (venv / "bin/python").resolve().chmod(0o644)
+    else:
+        (venv / "pyvenv.cfg").unlink()
+
+    expected = "metadata" if broken == "metadata" else "launcher"
+    with pytest.raises(FileNotFoundError, match=expected):
+        preflight.validate_generation_venv(venv, domain="CPU compute-node")
+
+
+def test_generation_venv_rejects_missing_configured_root(tmp_path: Path) -> None:
+    """Report a configured venv directory that does not exist."""
+    missing = tmp_path / "missing venv"
+
+    with pytest.raises(FileNotFoundError, match="configured Generation venv root"):
+        preflight.validate_generation_venv(missing, domain="CPU compute-node")
+
+
+def test_generation_venv_rejects_unsafe_configured_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a configured venv root that is itself a symlink."""
+    _storage, _work, venv = _paths(tmp_path, monkeypatch)
+    alias = tmp_path / "venv alias"
+    alias.symlink_to(venv, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root must not be a symlink"):
+        preflight.validate_generation_venv(alias, domain="CPU compute-node")
+
+
 def test_preflight_separates_environment_from_runtime_and_removes_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -84,6 +186,9 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert set(report["commands"]) == {"python", "comsol"}
     assert set(report["versions"]) == {"python", "comsol"}
     assert report["checks"]["Generation-venv-imports"]["status"] == "pass"
+    assert report["python"]["executable"].endswith("native venv/bin/python")
+    assert report["python"]["resolved_executable"].endswith("software/Python/3.10/bin/python3.10")
+    assert report["python"]["venv_runtime"]["sys_prefix"].endswith("native venv")
     assert report["submission_plan"] == {
         "cases_per_job": 1,
         "cores_per_case": 16,

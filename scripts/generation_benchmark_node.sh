@@ -101,10 +101,6 @@ if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
   printf 'GENERATION_CPU_VENV and STORAGE_ROOT must be explicit absolute paths.\n' >&2
   exit 2
 fi
-if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
-  generation_prerequisite_missing \
-    "${COMPUTE_DOMAIN}" "Generation CPU venv: ${GENERATION_CPU_VENV}" "benchmark compute"
-fi
 for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
   GENERATION_PYTHON_EXECUTABLE GENERATION_COMSOL_EXECUTABLE; do
   value="${!variable_name:-}"
@@ -134,13 +130,10 @@ generation_require_command \
 generation_run_check \
   "${COMPUTE_DOMAIN}" "comsol-version:${GENERATION_COMSOL_EXECUTABLE}" "benchmark compute" \
   "${GENERATION_COMSOL_EXECUTABLE}" -version
-source "${GENERATION_CPU_VENV}/bin/activate"
-if ! "${GENERATION_CPU_VENV}/bin/python" -c \
-  'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'; then
-  generation_prerequisite_failed \
-    "${COMPUTE_DOMAIN}" "Generation CPU venv package/imports" \
-    "benchmark preparation and HDF5 conversion/admission"
-fi
+cd "${REPOSITORY_ROOT}"
+generation_validate_cpu_venv \
+  "${COMPUTE_DOMAIN}" "${GENERATION_CPU_VENV}" \
+  "benchmark preparation and HDF5 conversion/admission"
 
 export STORAGE_ROOT
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
@@ -191,7 +184,6 @@ trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
 trap on_exit EXIT
 
-cd "${REPOSITORY_ROOT}"
 "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation \
   initialize-worker-workspace "${WORK_ROOT}" \
   --campaign-run-id "${RUN_ID}" \

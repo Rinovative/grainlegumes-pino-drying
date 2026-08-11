@@ -495,7 +495,6 @@ if ! module load "${python_module}"; then
 fi
 setup_require_command "${python_executable}"
 [[ -x "${venv}/bin/python" ]] || "${python_executable}" -m venv "${venv}"
-source "${venv}/bin/activate"
 "${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
 if ! module load "${comsol_module}"; then
   printf 'CPU login prerequisite failed: COMSOL module %s (blocks setup capability check).\n' \
@@ -524,7 +523,6 @@ repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
 only_batch="$6"; operation="$7"; pilot_cases="$8"; skip_extreme="$9"
 python_module="${10}"
 module load "${python_module}"
-source "${venv}/bin/activate"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
 cd "${repository}"
@@ -760,7 +758,6 @@ set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; python_module="$4"
 shift 4
 module load "${python_module}"
-source "${venv}/bin/activate"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
 cd "${repository}"

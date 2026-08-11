@@ -60,16 +60,22 @@ esac""",
         _executable(binary / "rsync", "printf 'rsync version 3.2.7\\n'")
 
     venv = tmp_path / "venv"
+    base_python = tmp_path / "software/Python/3.10/bin/python3.10"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "activate").write_text("", encoding="utf-8")
+    base_python.parent.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {base_python.parent}\nversion = 3.10.13\n",
+        encoding="utf-8",
+    )
     _executable(
-        venv / "bin" / "python",
-        """printf 'venv-python <%s>\\n' "$*" >> "${FAKE_COMMAND_LOG}"
+        base_python,
+        """printf 'venv-python <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
 if [[ "${FAKE_VENV_IMPORT_FAIL:-false}" == true && " $* " == *" -c "* ]]; then
-  printf 'synthetic package import failure\\n' >&2
+  printf 'synthetic package import failure\n' >&2
   exit 17
 fi""",
     )
+    (venv / "bin/python").symlink_to(base_python)
     environment = {
         "PATH": str(binary),
         "FAKE_COMMAND_LOG": str(log),
@@ -109,6 +115,8 @@ def _compute_command(
     venv: Path,
     tmp_path: Path,
     storage: Path,
+    *,
+    mode: str = "environment-only",
 ) -> list[str]:
     """Return the exact relocated fake compute preflight command."""
     return [
@@ -120,7 +128,7 @@ def _compute_command(
         str(storage),
         "-",
         "16",
-        "environment-only",
+        mode,
         "Python/3.10",
         "Comsol/v6.4",
         "python3",
@@ -168,6 +176,12 @@ def _login_command(repository: Path, venv: Path, storage: Path) -> list[str]:
     ]
 
 
+def _assert_canonical_venv_validation(log: Path) -> None:
+    """Prove one shell entry point invoked the sole semantic validator."""
+    command_log = log.read_text(encoding="utf-8")
+    assert "preflight.validate_generation_venv" in command_log
+
+
 def test_compute_preflight_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
     """Pass beyond helper loading when Slurm relocates the submitted preflight."""
     repository = _fake_checkout(tmp_path)
@@ -197,10 +211,48 @@ def test_compute_preflight_is_independent_of_slurm_spool_location(tmp_path: Path
     assert "check=exact-worker-checkout status=pass" in result.stdout
     assert "Native CPU environment-only completed" in result.stdout
     assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+    _assert_canonical_venv_validation(log)
     evidence = result.stdout + result.stderr + log.read_text(encoding="utf-8")
     for login_only in ("rsync", "sbatch", "squeue", "sacct", "scancel"):
         assert login_only not in evidence
     assert not tuple(scratch.iterdir())
+
+
+def test_mapping_probe_uses_canonical_venv_validation(tmp_path: Path) -> None:
+    """Validate the venv before the relocated mapping-probe path starts."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
+    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
+    scratch = tmp_path / "scratch"
+    storage = tmp_path / "storage"
+    scratch.mkdir()
+    storage.mkdir()
+    environment.update(
+        {
+            "SLURM_JOB_ID": "123",
+            "TMPDIR": str(scratch),
+            "GENERATION_GIT_COMMIT": _COMMIT,
+        }
+    )
+
+    result = subprocess.run(
+        _compute_command(
+            runtime_script,
+            repository,
+            venv,
+            tmp_path,
+            storage,
+            mode="mapping-probe",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Native CPU mapping-probe completed" in result.stdout
+    _assert_canonical_venv_validation(log)
 
 
 def test_login_preflight_requires_rsync_with_explicit_diagnostic(tmp_path: Path) -> None:
@@ -225,7 +277,7 @@ def test_login_preflight_requires_rsync_with_explicit_diagnostic(tmp_path: Path)
 def test_login_preflight_accepts_complete_control_plane(tmp_path: Path) -> None:
     """Pass the authoritative login gate when all used capabilities exist."""
     repository = Path(__file__).resolve().parents[2]
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=True)
+    environment, venv, log = _fake_environment(tmp_path, include_rsync=True)
     storage = tmp_path / "storage"
     storage.mkdir()
 
@@ -239,7 +291,31 @@ def test_login_preflight_accepts_complete_control_plane(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "domain=CPU login check=transfer-version:rsync status=pass" in result.stdout
-    assert "domain=CPU login check=Generation-venv-imports status=pass" in result.stdout
+    assert "domain=CPU login check=Generation-venv-runtime status=pass" in result.stdout
+    _assert_canonical_venv_validation(log)
+
+
+def test_compute_preflight_reports_missing_venv_launcher(tmp_path: Path) -> None:
+    """Report a missing launcher before attempting canonical Python validation."""
+    repository = _fake_checkout(tmp_path)
+    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
+    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
+    (venv / "bin/python").unlink()
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
+
+    result = subprocess.run(
+        _compute_command(runtime_script, repository, venv, tmp_path, storage),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "CPU compute-node prerequisite missing: executable Generation venv launcher" in result.stderr
+    assert "No such file or directory" not in result.stderr
 
 
 def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> None:
@@ -269,7 +345,8 @@ def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 1
-    assert "CPU compute-node prerequisite failed: Generation CPU venv package/imports" in result.stderr
+    assert "synthetic package import failure" in result.stderr
+    assert "CPU compute-node prerequisite failed: Generation-venv-runtime" in result.stderr
 
 
 def _worker_environment(
@@ -328,6 +405,7 @@ def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) 
     assert "check=exact-worker-checkout status=pass" in result.stdout
     assert "initialize-worker-workspace" in log.read_text(encoding="utf-8")
     assert "run-campaign-case" in log.read_text(encoding="utf-8")
+    _assert_canonical_venv_validation(log)
     assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
 
 
@@ -364,6 +442,7 @@ def test_benchmark_worker_is_independent_of_slurm_spool_location(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert "check=exact-worker-checkout status=pass" in result.stdout
     assert "prepare-core-benchmark-case" in log.read_text(encoding="utf-8")
+    _assert_canonical_venv_validation(log)
     assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
 
 
@@ -458,5 +537,7 @@ def test_submitted_workers_source_only_the_explicit_checkout_helper() -> None:
     for name in _WORKER_SCRIPTS:
         source = (repository / "scripts" / name).read_text(encoding="utf-8")
         assert 'source "${PREREQUISITE_HELPER}"' in source
+        assert "generation_validate_cpu_venv" in source
+        assert 'source "${GENERATION_CPU_VENV}/bin/activate"' not in source
         assert 'source "${SCRIPT_DIR}/generation_prerequisites.sh"' not in source
         assert 'dirname "${BASH_SOURCE[0]}"' not in source

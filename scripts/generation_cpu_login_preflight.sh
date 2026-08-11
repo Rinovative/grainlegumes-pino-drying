@@ -43,8 +43,7 @@ if [[ ! -d "${STORAGE_ROOT}" || -L "${STORAGE_ROOT}" || ! -w "${STORAGE_ROOT}" |
   generation_prerequisite_missing \
     "CPU login" "writable durable storage: ${STORAGE_ROOT}" "compute publication and transfer"
 fi
-if [[ ! -d "${GENERATION_CPU_VENV}" || -L "${GENERATION_CPU_VENV}" \
-  || ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
+if [[ ! -d "${GENERATION_CPU_VENV}" || -L "${GENERATION_CPU_VENV}" ]]; then
   generation_prerequisite_missing \
     "CPU login" "Generation CPU venv: ${GENERATION_CPU_VENV}" "Slurm orchestration"
 fi
@@ -85,11 +84,6 @@ generation_run_check "CPU login" "scheduler-version:sbatch" "Slurm control" \
 generation_run_check "CPU login" "transfer-version:rsync" "transfer" \
   rsync --version
 
-source "${GENERATION_CPU_VENV}/bin/activate"
 cd "${REPOSITORY}"
-if ! "${GENERATION_CPU_VENV}/bin/python" -c \
-  'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'; then
-  generation_prerequisite_failed \
-    "CPU login" "Generation CPU venv package/imports" "Slurm orchestration"
-fi
-generation_report_pass "CPU login" "Generation-venv-imports"
+generation_validate_cpu_venv \
+  "CPU login" "${GENERATION_CPU_VENV}" "Slurm orchestration"

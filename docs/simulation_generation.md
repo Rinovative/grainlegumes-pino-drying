@@ -107,7 +107,12 @@ CPU paths are rooted under the `$HOME` resolved by the remote environment:
 - `$HOME/grainlegumes-generation/venv`
 
 The resolved absolute home is environment-specific and is not a maintained
-path. Override the default root only with `--remote-root`. The local host
+path. The CPU venv launcher may be a symlink to the module-provided base Python.
+Validation therefore requires the configured venv root and Python's runtime
+prefix evidence (`sys.prefix` at that root and distinct from `sys.base_prefix`),
+not physical containment of the resolved base interpreter. `pyvenv.cfg`, the
+exact launcher, and the required Generation/scientific imports remain mandatory.
+Override the default root only with `--remote-root`. The local host
 storage root defaults to the `storage` sibling of the dynamically resolved
 checkout and may be overridden with `STORAGE_ROOT`; Docker sees that same
 content at `/workspace/storage`, while CPU storage remains under the remote

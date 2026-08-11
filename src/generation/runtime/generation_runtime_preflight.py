@@ -5,6 +5,7 @@ generation_runtime_preflight.py
 Audit the native CPU generation environment without starting a COMSOL solve.
 Responsibilities:
   - Validate compute Python, COMSOL, modules, templates, scratch, and storage
+  - Validate the configured Generation venv through Python runtime prefixes
   - Validate user-owned persistent roots and node-local scratch containment
   - Exercise one collision-safe marked directory creation and cleanup lifecycle
 Design principles:
@@ -37,6 +38,96 @@ from . import generation_runtime_workspace as workspace_service
 
 _REQUIRED_IMPORTS = ("numpy", "scipy", "h5py", "yaml", "src.generation.cli.cli_generation")
 _MODULE_VERSION_PATTERN = re.compile(r"/v?([0-9]+(?:\.[0-9]+)*)$", re.IGNORECASE)
+
+
+def validate_generation_venv(
+    venv_path: Path | str,
+    *,
+    domain: str,
+) -> dict[str, Any]:
+    """Validate the configured Generation venv using Python runtime identity."""
+    configured = Path(venv_path).expanduser()
+    if not configured.is_absolute() or configured == Path("/"):
+        message = f"{domain} prerequisite failed: configured Generation venv must be one safe absolute path: {configured}."
+        raise ValueError(message)
+    if configured.is_symlink():
+        message = f"{domain} prerequisite failed: configured Generation venv root must not be a symlink: {configured}."
+        raise ValueError(message)
+    try:
+        root = configured.resolve(strict=True)
+    except FileNotFoundError as error:
+        message = f"{domain} prerequisite missing: configured Generation venv root: {configured}."
+        raise FileNotFoundError(message) from error
+    if not root.is_dir():
+        message = f"{domain} prerequisite failed: configured Generation venv root is not a directory: {configured}."
+        raise ValueError(message)
+    if root.stat().st_uid != os.getuid():
+        message = f"{domain} prerequisite failed: configured Generation venv is not owned by the current user: {root}."
+        raise PermissionError(message)
+    if not os.access(root, os.R_OK | os.X_OK):
+        message = f"{domain} prerequisite failed: configured Generation venv is not readable and searchable: {root}."
+        raise PermissionError(message)
+
+    metadata = root / "pyvenv.cfg"
+    if not metadata.is_file() or metadata.is_symlink() or not os.access(metadata, os.R_OK):
+        message = f"{domain} prerequisite missing: regular readable Generation venv metadata: {metadata}."
+        raise FileNotFoundError(message)
+    launcher = configured / "bin/python"
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        message = f"{domain} prerequisite missing: executable Generation venv launcher: {launcher}."
+        raise FileNotFoundError(message)
+
+    reported_prefix = Path(sys.prefix).expanduser()
+    reported_base_prefix = Path(sys.base_prefix).expanduser()
+    reported_exec_prefix = Path(sys.exec_prefix).expanduser()
+    if not all(path.is_absolute() for path in (reported_prefix, reported_base_prefix, reported_exec_prefix)):
+        message = f"{domain} prerequisite failed: Python reported non-absolute runtime prefix evidence."
+        raise RuntimeError(message)
+    runtime_prefix = reported_prefix.resolve()
+    runtime_base_prefix = reported_base_prefix.resolve()
+    runtime_exec_prefix = reported_exec_prefix.resolve()
+    if runtime_prefix == runtime_base_prefix:
+        message = (
+            f"{domain} prerequisite failed: interpreter reports sys.prefix == sys.base_prefix ({reported_prefix}); "
+            f"configured Generation venv {root} is not active."
+        )
+        raise RuntimeError(message)
+    if runtime_prefix != root:
+        message = f"{domain} prerequisite failed: configured Generation venv is {root}, but interpreter reports sys.prefix={reported_prefix}."
+        raise RuntimeError(message)
+    if runtime_exec_prefix != root:
+        message = (
+            f"{domain} prerequisite failed: configured Generation venv is {root}, but interpreter reports sys.exec_prefix={reported_exec_prefix}."
+        )
+        raise RuntimeError(message)
+
+    runtime_executable = Path(sys.executable).expanduser()
+    expected_launcher = launcher
+    if not runtime_executable.is_absolute() or runtime_executable != expected_launcher:
+        message = (
+            f"{domain} prerequisite failed: configured Generation venv launcher is {expected_launcher}, "
+            f"but interpreter reports sys.executable={sys.executable}."
+        )
+        raise RuntimeError(message)
+
+    missing_imports = [name for name in _REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
+    if missing_imports:
+        message = (
+            f"{domain} prerequisite missing: Generation CPU venv imports {missing_imports} "
+            "(blocks case materialization and HDF5 conversion/admission)."
+        )
+        raise ModuleNotFoundError(message)
+    return {
+        "configured_venv": str(root),
+        "launcher": str(expected_launcher),
+        "resolved_launcher_target": str(launcher.resolve(strict=True)),
+        "pyvenv_cfg": str(metadata),
+        "sys_executable": sys.executable,
+        "sys_prefix": str(reported_prefix),
+        "sys_base_prefix": str(reported_base_prefix),
+        "sys_exec_prefix": str(reported_exec_prefix),
+        "required_imports": list(_REQUIRED_IMPORTS),
+    }
 
 
 def _version_output(
@@ -236,7 +327,11 @@ def run_cpu_preflight(
         work_root=work_root,
         create=False,
     )
-    venv = Path(venv_path).expanduser().resolve()
+    venv_identity = validate_generation_venv(
+        venv_path,
+        domain="CPU compute-node",
+    )
+    venv = Path(venv_identity["configured_venv"])
     paths = {
         "home": _owned_writable_directory(home, label="HOME"),
         "repository": _owned_writable_directory(
@@ -260,11 +355,6 @@ def run_cpu_preflight(
     modules = tuple(campaign.execution_values["runtime"]["module_initialization"])
     timeout_seconds = float(campaign.execution_values["runtime"]["timeout_seconds"])
 
-    try:
-        Path(sys.executable).resolve().relative_to(venv)
-    except ValueError as error:
-        message = f"CPU compute-node prerequisite failed: active Python executable {sys.executable} is not inside venv {venv}."
-        raise RuntimeError(message) from error
     configured_python_version = configured_module_version(str(site["python_module"]))
     if configured_python_version is not None:
         expected_python = tuple(int(component) for component in configured_python_version.split("."))
@@ -275,13 +365,6 @@ def run_cpu_preflight(
                 f"{configured_python_version}, but the active interpreter is {sys.version}."
             )
             raise RuntimeError(message)
-    missing_imports = [name for name in _REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
-    if missing_imports:
-        message = (
-            "CPU compute-node prerequisite missing: Generation CPU venv imports "
-            f"{missing_imports} (blocks case materialization and HDF5 conversion/admission)."
-        )
-        raise ModuleNotFoundError(message)
     command_names = {
         "python": str(site["python_executable"]),
         "comsol": str(site["comsol_executable"]),
@@ -323,8 +406,10 @@ def run_cpu_preflight(
         "domain": "CPU compute-node",
         "host": socket.gethostname(),
         "python": {
-            "executable": str(Path(sys.executable).resolve()),
+            "executable": sys.executable,
+            "resolved_executable": str(Path(sys.executable).resolve()),
             "version": sys.version,
+            "venv_runtime": venv_identity,
             "required_imports": list(_REQUIRED_IMPORTS),
         },
         "paths": paths,

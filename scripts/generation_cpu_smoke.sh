@@ -43,11 +43,6 @@ if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_C
   printf 'Venv, campaign, and storage paths must be absolute.\n' >&2
   exit 2
 fi
-if [[ ! -x "${GENERATION_CPU_VENV}/bin/python" ]]; then
-  printf 'CPU compute-node prerequisite missing: Generation CPU venv %s (blocks compute).\n' \
-    "${GENERATION_CPU_VENV}" >&2
-  exit 1
-fi
 if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready && "${PREFLIGHT_MODE}" != mapping-probe ]]; then
   printf 'Mode must be environment-only, production-ready, or mapping-probe.\n' >&2
   exit 2
@@ -89,14 +84,10 @@ generation_require_command \
 generation_run_check \
   "${COMPUTE_DOMAIN}" "comsol-version:${COMSOL_EXECUTABLE}" "native smoke and compute" \
   "${COMSOL_EXECUTABLE}" -version
-source "${GENERATION_CPU_VENV}/bin/activate"
-if ! "${GENERATION_CPU_VENV}/bin/python" -c \
-  'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation'; then
-  generation_prerequisite_failed \
-    "${COMPUTE_DOMAIN}" "Generation CPU venv package/imports" \
-    "case materialization and HDF5 conversion/admission"
-fi
-generation_report_pass "${COMPUTE_DOMAIN}" "Generation-venv-imports"
+cd "${REPOSITORY_ROOT}"
+generation_validate_cpu_venv \
+  "${COMPUTE_DOMAIN}" "${GENERATION_CPU_VENV}" \
+  "case materialization and HDF5 conversion/admission"
 
 SCRATCH_PARENT="${TMPDIR:-/tmp}"
 if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then
@@ -118,7 +109,6 @@ cleanup_probe_root() {
 }
 trap cleanup_probe_root EXIT
 
-cd "${REPOSITORY_ROOT}"
 if [[ "${PREFLIGHT_MODE}" == mapping-probe ]]; then
   COMMAND=(
     "${GENERATION_CPU_VENV}/bin/python"

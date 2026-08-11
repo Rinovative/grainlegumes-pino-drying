@@ -65,6 +65,29 @@ generation_run_check() {
   [[ -z "${output}" ]] || printf '%s\n' "${output}"
 }
 
+generation_validate_cpu_venv() {
+  local domain="$1"
+  local venv="$2"
+  local blocked_operation="$3"
+  if [[ ! -f "${venv}/bin/python" || ! -x "${venv}/bin/python" ]]; then
+    generation_prerequisite_missing \
+      "${domain}" "executable Generation venv launcher: ${venv}/bin/python" \
+      "${blocked_operation}"
+    return 1
+  fi
+  generation_run_check \
+    "${domain}" "Generation-venv-runtime" "${blocked_operation}" \
+    "${venv}/bin/python" -c \
+    'import sys
+from src.generation.runtime import preflight
+try:
+    preflight.validate_generation_venv(sys.argv[1], domain=sys.argv[2])
+except Exception as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1) from None' \
+    "${venv}" "${domain}"
+}
+
 generation_validate_worker_repository() {
   local repository="$1"
   local expected_commit="$2"
