@@ -56,14 +56,17 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     docker_python = scripts / "docker_python.sh"
     shutil.copyfile(repository / "scripts/docker_python.sh", docker_python)
     docker_python.chmod(docker_python.stat().st_mode | 0o111)
-    shutil.copyfile(
-        repository / "configs/generation/campaigns/steady_flow/family_generalization.yaml",
-        campaigns / "family_generalization.yaml",
-    )
-    shutil.copyfile(
-        repository / "configs/generation/campaigns/transient_drying/pilot_check.yaml",
-        pilot_campaigns / "pilot_check.yaml",
-    )
+    for relative in (
+        "configs/generation/campaigns/steady_flow/family_generalization.yaml",
+        "configs/generation/campaigns/steady_flow/technical_smoke.yaml",
+        "configs/generation/campaigns/transient_drying/family_generalization.yaml",
+        "configs/generation/campaigns/transient_drying/technical_smoke.yaml",
+        "configs/generation/campaigns/transient_drying/pilot_check.yaml",
+    ):
+        source = repository / relative
+        destination = project / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
     shutil.copytree(
         repository / "configs/generation/benchmarks/transient_core_scaling",
         project / "configs/generation/benchmarks/transient_core_scaling",
@@ -120,11 +123,29 @@ exit 93
 """,
         )
     _executable(
+        fake_bin / "realpath",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'realpath-start\n' >> "${FAKE_COMMAND_LOG}"
+for argument in "$@"; do
+  printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"
+  case "${argument}" in
+    /workspace/repo|/workspace/repo/*|/workspace/storage|/workspace/storage/*)
+      printf 'Bare-host realpath received a Docker-only path: %s\n' "${argument}" >&2
+      exit 94
+      ;;
+  esac
+done
+exec "${FAKE_REALPATH}" "$@"
+""",
+    )
+    _executable(
         fake_bin / "git",
         r"""#!/usr/bin/env bash
 set -euo pipefail
 printf 'git <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
 case " $* " in
+  *" rev-parse --show-toplevel "*) printf '%s\n' "${FAKE_PROJECT_ROOT}" ;;
   *" rev-parse HEAD "*) printf '%s\n' "${FAKE_GIT_COMMIT}" ;;
   *" status --porcelain "*) ;;
   *" remote get-url origin "*) printf '%s\n' 'git@github.com:Rinovative/grainlegumes-pino-drying.git' ;;
@@ -251,12 +272,17 @@ if [[ " $* " == *' -c '* ]]; then
   elif [[ " $* " == *'valid = value'* ]]; then
     printf 'smoke\t/workspace/storage/01_generation/meta/smoke_receipts/current.json\t%s\n' "${FAKE_SMOKE_SHA}"
   elif [[ " $* " == *'workflow = value'* ]]; then
+    if [[ " $* " == *'repository_path'* ]]; then
+      catalog_prefix=''
+    else
+      catalog_prefix='/workspace/repo/'
+    fi
     printf 'workflow\t%s\t%s\t%s\t%s\tfixture.cluster\tslurm\tfixture\t48\t'\
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' \
-      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/steady_flow/technical_smoke.yaml" \
-      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/transient_drying/technical_smoke.yaml" \
-      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/steady_flow/family_generalization.yaml" \
-      "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/transient_drying/family_generalization.yaml"
+      "${catalog_prefix}configs/generation/campaigns/steady_flow/technical_smoke.yaml" \
+      "${catalog_prefix}configs/generation/campaigns/transient_drying/technical_smoke.yaml" \
+      "${catalog_prefix}configs/generation/campaigns/steady_flow/family_generalization.yaml" \
+      "${catalog_prefix}configs/generation/campaigns/transient_drying/family_generalization.yaml"
   elif [[ " $* " == *'counts = tuple'* ]]; then
     printf 'pilot\tpilot_check\t4\t20\n'
   elif [[ " $* " == *'execution_resources'* ]]; then
@@ -286,7 +312,7 @@ if [[ " $* " == *' validate-real-smoke '* ]]; then
 elif [[ " $* " == *' validate-core-benchmark '* ]]; then
   [[ -f "${FAKE_BENCHMARK_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' validate-published-campaign '* ]]; then
-  [[ -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
+  [[ "${FAKE_GPU_ALWAYS_VALID:-false}" == true || -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' create-transfer-staging '* ]]; then
   staging="${storage}/01_generation/.state/transfer-staging/${FAKE_RUN_ID}.synthetic"
   mkdir -p "${staging}"
@@ -334,6 +360,8 @@ elif [[ " $* " == *' record-cpu-cleanup '* ]]; then
   printf '%s\n' '{"workflow_result":"success","cpu_cleanup_complete":{"status":"complete"}}'
 elif [[ " $* " == *' storage-status '* ]]; then
   printf '%s\n' '{"role":"gpu","generation_total_bytes":48,"datasets_total_bytes":12,"runs":[]}'
+elif [[ " $* " == *' finalize-real-smoke '* ]]; then
+  printf '%s\n' '/workspace/storage/01_generation/meta/smoke_receipts/current.json'
 elif [[ " $* " == *' record-workflow-failure '* ]]; then
   printf '%s\n' "${storage}/failure.json"
 fi
@@ -350,6 +378,7 @@ fi
             "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             "FAKE_COMMAND_LOG": str(log),
             "FAKE_GIT_COMMIT": _COMMIT,
+            "FAKE_REALPATH": shutil.which("realpath", path=os.defpath) or "/usr/bin/realpath",
             "GENERATION_REPOSITORY_URL": "git@github.com:Rinovative/grainlegumes-pino-drying.git",
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
@@ -460,6 +489,54 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
     return source_directories
 
 
+def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Path) -> None:
+    """Reproduce the native smoke path boundary from an arbitrary host checkout."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+
+    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+
+    assert result.returncode == 0, result.stderr
+    host_root = workflow.parent.parent
+    remote_root = Path("/remote/home/grainlegumes-generation/repo")
+    relative_campaigns = (
+        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"),
+        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"),
+    )
+    log_text = log.read_text(encoding="utf-8")
+    for relative in relative_campaigns:
+        assert f"<{host_root / relative}>" in log_text
+        assert f"</workspace/repo/{relative.as_posix()}>" in log_text
+        assert str(remote_root / relative) in log_text
+    assert "Bare-host realpath received a Docker-only path" not in result.stderr
+    assert "forbidden-host-python" not in log_text
+    assert "submit-campaign" in log_text
+
+
+def test_repository_admission_rejects_escape_ambiguous_and_container_paths(tmp_path: Path) -> None:
+    """Reject traversal, outside absolutes, symlinks, and foreign-domain paths."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    project = workflow.parent.parent
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("schema_kind: outside\n", encoding="utf-8")
+    symlink = project / "configs/generation/campaigns/steady_flow/escape.yaml"
+    symlink.symlink_to(outside)
+    arguments = (
+        "../outside.yaml",
+        "../../outside.yaml",
+        str(outside),
+        "./configs/generation/campaigns/steady_flow/family_generalization.yaml",
+        str(symlink),
+        "/workspace/repo/configs/generation/campaigns/steady_flow/family_generalization.yaml",
+    )
+
+    for campaign in arguments:
+        result = _run(workflow, ["plan", campaign, *_remote_options()], environment)
+        assert result.returncode == 2, (campaign, result.stderr)
+
+    assert "ssh-start" not in log.read_text(encoding="utf-8")
+
+
 def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -> None:
     """Protect setup dry-run, exact modules, and noninteractive SSH execution."""
     workflow, log, environment, storage, _mirror = _harness(tmp_path)
@@ -538,6 +615,9 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     plan = _run(workflow, ["plan", str(_campaign(workflow)), *_remote_options(), *_selection_options()], environment)
     assert plan.returncode == 0, plan.stderr
     assert '"filesystem_mutated":false' in plan.stdout
+    logical_campaign = _campaign(workflow).relative_to(workflow.parent.parent).as_posix()
+    logical_plan = _run(workflow, ["plan", logical_campaign, *_remote_options()], environment)
+    assert logical_plan.returncode == 0, logical_plan.stderr
 
     configured = _run(
         workflow,
@@ -718,6 +798,9 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     assert all((mirror / relative).is_dir() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("rsync-start") == 4
+    assert f"<{storage}/01_generation/.state/transfer-staging/{_RUN_ID}.synthetic/>" in log_text
+    assert "<cpu.example:/remote/generation root/storage/./" in log_text
+    assert "cpu.example:/workspace/storage" not in log_text
     assert "<--delete>" not in log_text
     assert "<--remove-source-files>" not in log_text
     assert "<cleanup-campaign-source>" not in log_text

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
+HOST_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+HOST_STORAGE_ROOT="${STORAGE_ROOT:-${HOST_REPO_ROOT}/../storage}"
 IMAGE_NAME="grainlegumes-pino-drying"
 
 fail() {
@@ -22,10 +22,10 @@ STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 
 translate_argument() {
   local argument="$1"
-  if [[ "${argument}" == "${PROJECT_DIR}" ]]; then
+  if [[ "${argument}" == "${HOST_REPO_ROOT}" ]]; then
     printf '/workspace/repo'
-  elif [[ "${argument}" == "${PROJECT_DIR}/"* ]]; then
-    printf '/workspace/repo/%s' "${argument#"${PROJECT_DIR}/"}"
+  elif [[ "${argument}" == "${HOST_REPO_ROOT}/"* ]]; then
+    printf '/workspace/repo/%s' "${argument#"${HOST_REPO_ROOT}/"}"
   elif [[ "${argument}" == "${STORAGE_DIR}" ]]; then
     printf '/workspace/storage'
   elif [[ "${argument}" == "${STORAGE_DIR}/"* ]]; then
@@ -50,7 +50,7 @@ exec docker run --rm -i \
   -e STORAGE_ROOT=/workspace/storage \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -e PYTHONNOUSERSITE=1 \
-  --mount "type=bind,source=${PROJECT_DIR},target=/workspace/repo,readonly" \
+  --mount "type=bind,source=${HOST_REPO_ROOT},target=/workspace/repo,readonly" \
   --mount "type=bind,source=${STORAGE_DIR},target=/workspace/storage" \
   "${IMAGE_NAME}" \
   python "${PYTHON_ARGUMENTS[@]}"

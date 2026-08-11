@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
-DOCKER_PYTHON="${PROJECT_DIR}/scripts/docker_python.sh"
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+HOST_REPO_ROOT=""
+HOST_STORAGE_ROOT=""
+DOCKER_PYTHON=""
 CPU_BOOTSTRAP_REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
 GENERATION_MODULE="src.generation.cli.cli_generation"
 BENCHMARK_SUITE_RELATIVE_PATH="configs/generation/benchmarks/transient_core_scaling/suite.yaml"
@@ -11,6 +12,10 @@ STATIONARY_SMOKE_CAMPAIGN_PATH=""
 TRANSIENT_SMOKE_CAMPAIGN_PATH=""
 STATIONARY_PRIMARY_CAMPAIGN_PATH=""
 TRANSIENT_PRIMARY_CAMPAIGN_PATH=""
+STATIONARY_SMOKE_CAMPAIGN_HOST_PATH=""
+TRANSIENT_SMOKE_CAMPAIGN_HOST_PATH=""
+STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH=""
+TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH=""
 CAMPAIGN_PURPOSE=""
 SCHEDULER_KIND=""
 PARTITION=""
@@ -96,6 +101,69 @@ validate_path() {
   done
 }
 
+validate_logical_path() {
+  local label="$1"
+  local value="$2"
+  [[ -n "${value}" && "${value}" != /* ]] ||
+    fail 2 "${label} must be a non-empty repository-relative path."
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* && "${value}" != *$'\t'* ]] ||
+    fail 2 "${label} contains a control character."
+  local component
+  IFS='/' read -r -a components <<< "${value}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" && "${component}" != . && "${component}" != .. ]] ||
+      fail 2 "${label} contains an unsafe path component."
+  done
+}
+
+resolve_host_layout() {
+  require_command git
+  require_command realpath
+  local discovered_root script_relative
+  discovered_root="$(git -C "${SCRIPT_DIRECTORY}" rev-parse --show-toplevel)" ||
+    fail 1 "Could not resolve the bare-host repository root."
+  HOST_REPO_ROOT="$(realpath -e -- "${discovered_root}")" ||
+    fail 1 "Could not canonicalize the bare-host repository root."
+  [[ -d "${HOST_REPO_ROOT}" && ! -L "${HOST_REPO_ROOT}" ]] ||
+    fail 1 "Bare-host repository root is not a safe directory."
+  script_relative="$(realpath --relative-to="${HOST_REPO_ROOT}" -- "${SCRIPT_DIRECTORY}")" ||
+    fail 1 "Could not locate the workflow script inside the repository."
+  [[ "${script_relative}" != .. && "${script_relative}" != ../* ]] ||
+    fail 1 "Generation workflow script is outside the resolved repository."
+  HOST_STORAGE_ROOT="${STORAGE_ROOT:-${HOST_REPO_ROOT}/../storage}"
+  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
+}
+
+admit_repository_file() {
+  local value="$1"
+  local label="$2"
+  local candidate lexical resolved relative
+  if [[ "${value}" == /* ]]; then
+    candidate="${value}"
+  else
+    validate_logical_path "${label}" "${value}"
+    candidate="${HOST_REPO_ROOT}/${value}"
+  fi
+  lexical="$(realpath -ms -- "${candidate}")" ||
+    fail 2 "Could not normalize ${label}."
+  resolved="$(realpath -e -- "${candidate}")" ||
+    fail 2 "${label} does not exist."
+  [[ "${lexical}" == "${resolved}" ]] ||
+    fail 2 "${label} must not traverse a symbolic link."
+  [[ -f "${resolved}" && ! -L "${resolved}" ]] ||
+    fail 2 "${label} is not a safe regular file."
+  relative="$(realpath --relative-to="${HOST_REPO_ROOT}" -- "${resolved}")" ||
+    fail 2 "Could not reduce ${label} to a repository-relative path."
+  validate_logical_path "${label}" "${relative}"
+  ADMITTED_HOST_PATH="${resolved}"
+  ADMITTED_REPOSITORY_PATH="${relative}"
+}
+
+remote_repository_path() {
+  validate_logical_path "remote repository input" "$1"
+  printf '%s/%s' "${REMOTE_REPOSITORY}" "$1"
+}
+
 validate_commit() {
   [[ "$1" =~ ^[0-9a-f]{40}$ ]] || fail 2 "Git commit must be one lowercase 40-character identifier."
 }
@@ -166,12 +234,12 @@ resolve_local_commit() {
   local clean="$1"
   require_command git
   local head status
-  head="$(git -C "${PROJECT_DIR}" rev-parse HEAD)" || fail 1 "Could not resolve Git HEAD."
+  head="$(git -C "${HOST_REPO_ROOT}" rev-parse HEAD)" || fail 1 "Could not resolve Git HEAD."
   validate_commit "${head}"
   [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]]     || fail 1 "Requested commit differs from local HEAD."
   REQUESTED_COMMIT="${head}"
   if [[ "${clean}" == true ]]; then
-    status="$(git -C "${PROJECT_DIR}" status --porcelain)"
+    status="$(git -C "${HOST_REPO_ROOT}" status --porcelain)"
     [[ -z "${status}" ]] || fail 1 "This operation requires a clean local worktree."
   fi
 }
@@ -187,10 +255,10 @@ value = json.load(sys.stdin)
 workflow = value["workflow"]
 site = value["shared_execution_site"]
 fields = (
-    workflow["technical_runtime_smoke"]["stationary"]["source_path"],
-    workflow["technical_runtime_smoke"]["transient"]["source_path"],
-    workflow["family_generalization"]["stationary"]["source_path"],
-    workflow["family_generalization"]["transient"]["source_path"],
+    workflow["technical_runtime_smoke"]["stationary"]["repository_path"],
+    workflow["technical_runtime_smoke"]["transient"]["repository_path"],
+    workflow["family_generalization"]["stationary"]["repository_path"],
+    workflow["family_generalization"]["transient"]["repository_path"],
     site["cpu_host"], site["scheduler"], site["partition"], str(site["cores_per_node"]),
     site["python_module"], site["comsol_module"],
     site["python_executable"], site["comsol_executable"],
@@ -207,6 +275,18 @@ print("\t".join(("workflow", *(str(item) for item in fields))))')" ||
     configured_comsol_executable extra <<< "${record}"
   [[ "${kind}" == workflow && -z "${extra:-}" ]] ||
     fail 1 "Malformed workflow campaign catalog record."
+  admit_repository_file "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "stationary technical-smoke campaign"
+  STATIONARY_SMOKE_CAMPAIGN_HOST_PATH="${ADMITTED_HOST_PATH}"
+  STATIONARY_SMOKE_CAMPAIGN_PATH="${ADMITTED_REPOSITORY_PATH}"
+  admit_repository_file "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "transient technical-smoke campaign"
+  TRANSIENT_SMOKE_CAMPAIGN_HOST_PATH="${ADMITTED_HOST_PATH}"
+  TRANSIENT_SMOKE_CAMPAIGN_PATH="${ADMITTED_REPOSITORY_PATH}"
+  admit_repository_file "${STATIONARY_PRIMARY_CAMPAIGN_PATH}" "stationary production campaign"
+  STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH="${ADMITTED_HOST_PATH}"
+  STATIONARY_PRIMARY_CAMPAIGN_PATH="${ADMITTED_REPOSITORY_PATH}"
+  admit_repository_file "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}" "transient production campaign"
+  TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH="${ADMITTED_HOST_PATH}"
+  TRANSIENT_PRIMARY_CAMPAIGN_PATH="${ADMITTED_REPOSITORY_PATH}"
   [[ -n "${CPU_HOST}" ]] || CPU_HOST="${configured_cpu_host}"
   [[ -n "${SCHEDULER_KIND}" ]] || SCHEDULER_KIND="${configured_scheduler}"
   [[ -n "${PARTITION}" ]] || PARTITION="${configured_partition}"
@@ -289,18 +369,9 @@ ensure_execution_bootstrap() {
 
 
 resolve_campaign() {
-  require_command realpath
-  CAMPAIGN_CONFIG_PATH="$(realpath -e -- "$1")" || fail 2 "Campaign config does not exist."
-  [[ -f "${CAMPAIGN_CONFIG_PATH}" && ! -L "${CAMPAIGN_CONFIG_PATH}" ]]     || fail 2 "Campaign config is not a safe regular file."
-  [[ "${CAMPAIGN_CONFIG_PATH}" == "${PROJECT_DIR}/"* ]]     || fail 2 "Campaign config must be inside the repository."
-  CAMPAIGN_RELATIVE_PATH="${CAMPAIGN_CONFIG_PATH#"${PROJECT_DIR}/"}"
-  [[ "${CAMPAIGN_RELATIVE_PATH}" != *$'\n'* && "${CAMPAIGN_RELATIVE_PATH}" != *$'\r'* && "${CAMPAIGN_RELATIVE_PATH}" != *$'\t'* ]] ||
-    fail 2 "Campaign path contains a control character."
-  local component
-  IFS='/' read -r -a components <<< "${CAMPAIGN_RELATIVE_PATH}"
-  for component in "${components[@]}"; do
-    [[ -n "${component}" && "${component}" != . && "${component}" != .. ]]       || fail 2 "Campaign path contains traversal."
-  done
+  admit_repository_file "$1" "campaign config"
+  CAMPAIGN_CONFIG_PATH="${ADMITTED_HOST_PATH}"
+  CAMPAIGN_RELATIVE_PATH="${ADMITTED_REPOSITORY_PATH}"
 }
 
 resolve_pilot_contract() {
@@ -440,9 +511,11 @@ REMOTE
 remote_plan_submit() {
   local operation="$1"
   verify_remote_setup
+  local remote_campaign
+  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" "${ONLY_BATCH}" \
+    "${REQUESTED_COMMIT}" "${remote_campaign}" "${ONLY_BATCH}" \
     "${operation}" "${PILOT_CASES_PER_MATERIAL}" \
     "${SKIP_EXTREME_FAMILY_OOD}" "${PYTHON_MODULE}" \
     "${COMSOL_MODULE}" <<'REMOTE'
@@ -457,7 +530,7 @@ export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
 cd "${repository}"
 command=("${venv}/bin/python" -m src.generation.cli.cli_generation
-  "${operation}" "${repository}/${campaign}"
+  "${operation}" "${campaign}"
   --git-commit "${commit}" --storage-root "${storage}")
 [[ -z "${only_batch}" ]] || command+=(--only-batch "${only_batch}")
 [[ -z "${pilot_cases}" ]] || command+=(--pilot-cases-per-material "${pilot_cases}")
@@ -474,9 +547,11 @@ preflight_cpu() {
   validate_resources
   verify_remote_setup
   print_layout
+  local remote_campaign
+  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${CAMPAIGN_RELATIVE_PATH}" "${ONLY_BATCH}" "${CORES_PER_CASE}" \
+    "${remote_campaign}" "${ONLY_BATCH}" "${CORES_PER_CASE}" \
     "${PARTITION}" "${WALL_TIME}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
     "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" <<'REMOTE'
 set -euo pipefail
@@ -497,7 +572,7 @@ submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntas
   --chdir="${repository}")
 [[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
 "${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
-  "${venv}" "${repository}/${campaign}" "${storage}" "${only_batch}" \
+  "${venv}" "${campaign}" "${storage}" "${only_batch}" \
   "${cores_per_case}" environment-only "${python_module}" "${comsol_module}" \
   "${python_executable}" "${comsol_executable}" "${scheduler}"
 REMOTE
@@ -510,9 +585,11 @@ mapping_probe_cpu() {
   resolve_configured_resources
   validate_resources
   resolve_remote_layout
+  local remote_campaign
+  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${CAMPAIGN_RELATIVE_PATH}" "${CORES_PER_CASE}" \
+    "${REQUESTED_COMMIT}" "${remote_campaign}" "${CORES_PER_CASE}" \
     "${WALL_TIME}" "${PARTITION}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
     "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" <<'REMOTE'
 set -euo pipefail
@@ -533,7 +610,7 @@ submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntas
 [[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
 set +e
 job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
-  "${venv}" "${repository}/${campaign}" "${storage}" - \
+  "${venv}" "${campaign}" "${storage}" - \
   "${cores_per_case}" mapping-probe "${python_module}" "${comsol_module}" \
   "${python_executable}" "${comsol_executable}" "${scheduler}")"
 status="$?"
@@ -555,8 +632,8 @@ validate_local_launch_gates() {
   local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null
   [[ "${CAMPAIGN_PURPOSE}" == technical_runtime_smoke ]] && return
   resolve_workflow_campaigns
-  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_PATH}" \
-    "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}" >/dev/null ||
+  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
+    "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" >/dev/null ||
     fail 2 "Static scientific sentinels block production planning or launch."
   local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
@@ -565,8 +642,8 @@ validate_local_launch_gates() {
 technical_profiles_ready() {
   resolve_local_python
   resolve_workflow_campaigns
-  local_cli validate-config "${STATIONARY_SMOKE_CAMPAIGN_PATH}" >/dev/null 2>&1 &&
-    local_cli validate-config "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" >/dev/null 2>&1
+  local_cli validate-config "${STATIONARY_SMOKE_CAMPAIGN_HOST_PATH}" >/dev/null 2>&1 &&
+    local_cli validate-config "${TRANSIENT_SMOKE_CAMPAIGN_HOST_PATH}" >/dev/null 2>&1
 }
 
 remote_comsol_version() {
@@ -687,14 +764,19 @@ local_cli() {
 
 container_path_to_host() {
   local value="$1"
+  local relative
   if [[ "${value}" == /workspace/storage ]]; then
     printf '%s' "${LOCAL_STORAGE_ROOT}"
   elif [[ "${value}" == /workspace/storage/* ]]; then
-    printf '%s/%s' "${LOCAL_STORAGE_ROOT}" "${value#/workspace/storage/}"
+    relative="${value#/workspace/storage/}"
+    validate_logical_path "container storage output" "${relative}"
+    printf '%s/%s' "${LOCAL_STORAGE_ROOT}" "${relative}"
   elif [[ "${value}" == /workspace/repo ]]; then
-    printf '%s' "${PROJECT_DIR}"
+    printf '%s' "${HOST_REPO_ROOT}"
   elif [[ "${value}" == /workspace/repo/* ]]; then
-    printf '%s/%s' "${PROJECT_DIR}" "${value#/workspace/repo/}"
+    relative="${value#/workspace/repo/}"
+    validate_logical_path "container repository output" "${relative}"
+    printf '%s/%s' "${HOST_REPO_ROOT}" "${relative}"
   else
     printf '%s' "${value}"
   fi
@@ -1059,7 +1141,7 @@ prepare_pilot_check_receipt() {
   resolve_workflow_campaigns
   local -a arguments=(
     prepare-pilot-check "${RUN_ID}"
-    --production-campaign "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}"
+    --production-campaign "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}"
     --storage-root "${LOCAL_STORAGE_ROOT}"
   )
   [[ "${KEEP_CPU_SOURCE}" != true ]] || arguments+=(--keep-cpu-source)
@@ -1178,8 +1260,8 @@ run_pilot_check() {
   fi
   ALL_STAGE="configured-material static scientific sentinels"
   resolve_workflow_campaigns
-  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_PATH}" \
-    "${TRANSIENT_PRIMARY_CAMPAIGN_PATH}" ||
+  local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
+    "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" ||
     fail 2 "Static scientific sentinels block pilot launch; inspect the sentinel report before rerunning."
   print_layout
   printf 'Pilot cases: %s materials x %s = %s total.\n' \
@@ -1279,9 +1361,8 @@ resume_all() {
 }
 
 resolve_benchmark_contract() {
-  BENCHMARK_SUITE_PATH="${PROJECT_DIR}/${BENCHMARK_SUITE_RELATIVE_PATH}"
-  [[ -f "${BENCHMARK_SUITE_PATH}" && ! -L "${BENCHMARK_SUITE_PATH}" ]] ||
-    fail 1 "Maintained core benchmark suite is missing: ${BENCHMARK_SUITE_PATH}"
+  admit_repository_file "${BENCHMARK_SUITE_RELATIVE_PATH}" "maintained core benchmark suite"
+  BENCHMARK_SUITE_PATH="${ADMITTED_HOST_PATH}"
   local -a inspect_arguments=(inspect-core-benchmark "${BENCHMARK_SUITE_PATH}")
   [[ -z "${BENCHMARK_VARIANT}" ]] || inspect_arguments+=(--variant "${BENCHMARK_VARIANT}")
   local inspection record kind extra configured_cpu_host configured_scheduler
@@ -1384,8 +1465,10 @@ REMOTE
 
 remote_benchmark_plan_submit() {
   local operation="$1"
+  local remote_suite
+  remote_suite="$(remote_repository_path "${BENCHMARK_SUITE_RELATIVE_PATH}")"
   local -a arguments=(
-    "${operation}" "${REMOTE_REPOSITORY}/${BENCHMARK_SUITE_RELATIVE_PATH}"
+    "${operation}" "${remote_suite}"
     --git-commit "${REQUESTED_COMMIT}"
     --storage-root "${REMOTE_STORAGE_ROOT}"
   )
@@ -1570,6 +1653,8 @@ if [[ "${SKIP_EXTREME_FAMILY_OOD}" == true ]]; then
   [[ -z "${ONLY_BATCH}" ]] ||
     fail 2 "--skip-extreme-family-ood cannot be combined with --only-batch."
 fi
+
+resolve_host_layout
 
 case "${SUBCOMMAND}" in
   setup-cpu)

@@ -10,6 +10,16 @@ local Python operation through `scripts/docker_python.sh`, which starts the
 canonical `grainlegumes-pino-drying` image with `/workspace/repo` mounted
 read-only and `STORAGE_ROOT` mounted at `/workspace/storage`.
 
+The wrapper resolves the bare-host checkout with Git; the checkout may live at
+any host-native absolute path. Campaign and benchmark arguments remain
+repository-relative logical paths such as
+`configs/generation/campaigns/steady_flow/technical_smoke.yaml`. The wrapper
+admits each file against the host checkout, translates it to
+`/workspace/repo/<logical-path>` only at the Docker boundary, and translates it
+to the CPU checkout only at the SSH boundary. `/workspace/repo` and
+`/workspace/storage` are Docker-only mount destinations, never bare-host path
+requirements. Users do not manually translate configuration paths.
+
 The wrapper owns non-interactive SSH and rsync to `sricehpc01`. Its native
 `.[generation-cpu]` venv plans Slurm work, while CPU compute nodes materialize
 case inputs, run `Comsol/v6.4`, convert and validate results, and publish durable
@@ -76,9 +86,12 @@ CPU paths are rooted under the `$HOME` resolved by the remote environment:
 - `$HOME/grainlegumes-generation/venv`
 
 The resolved absolute home is environment-specific and is not a maintained
-path. Override the default root only with `--remote-root`. The local storage
-root defaults to the `storage` sibling of the checkout and may be overridden
-with `STORAGE_ROOT`.
+path. Override the default root only with `--remote-root`. The local host
+storage root defaults to the `storage` sibling of the dynamically resolved
+checkout and may be overridden with `STORAGE_ROOT`; Docker sees that same
+content at `/workspace/storage`, while CPU storage remains under the remote
+root. Host-side admission, `realpath`, rsync, and staging operations always use
+the host-native storage path.
 
 Set the shared local values first:
 
