@@ -25,6 +25,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_storage as storage_service
 
@@ -294,6 +296,34 @@ def _terminate_solver_and_wait(process: subprocess.Popen[str]) -> int:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         return process.wait()
+
+
+class _SolvedModelOutputError(RuntimeError):
+    """Report an unsafe or ambiguous solver-produced model output."""
+
+    def __init__(self, message: str, *, artifacts: tuple[str, ...]) -> None:
+        """Initialize one solved-model output failure."""
+        super().__init__(message)
+        self.artifacts = artifacts
+
+
+@dataclass(frozen=True, slots=True)
+class _SolvedModelInventoryEntry:
+    """Identify one immediate solved-model candidate without following links."""
+
+    relative_path: str
+    mode: int
+    device: int
+    inode: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+    sha256: str | None
+
+    @property
+    def is_valid(self) -> bool:
+        """Return whether the candidate is a non-empty regular file."""
+        return stat.S_ISREG(self.mode) and self.size_bytes > 0 and self.sha256 is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,10 +635,47 @@ def resolve_comsol_executable(config: config_contract.GenerationConfig) -> str:
     return str(executable)
 
 
+def _comsol_parameter_arguments(
+    config: config_contract.GenerationConfig,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None,
+) -> list[str]:
+    """Return the exact admitted transient runtime vector or no steady flags."""
+    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+        if scalar_handoff is not None:
+            message = "Steady-flow COMSOL commands cannot receive a transient scalar handoff."
+            raise ValueError(message)
+        return []
+    if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
+        message = f"Unsupported simulation profile for COMSOL execution: {config.profile.id!r}."
+        raise ValueError(message)
+    if scalar_handoff is None:
+        message = "Transient COMSOL commands require one admitted scalar handoff."
+        raise ValueError(message)
+    if scalar_handoff.profile_id != config.profile.id:
+        message = "Scalar-handoff profile identity disagrees with the generation configuration."
+        raise ValueError(message)
+    entries = scalar_handoff.entries
+    names = tuple(entry.name for entry in entries)
+    if names != profiles.TRANSIENT_SCALAR_INPUT_FIELDS:
+        message = "Transient COMSOL runtime overrides do not match the canonical case-dependent contract."
+        raise ValueError(message)
+    values = tuple(scalar_handoff_contract.format_comsol_parameter(entry) for entry in entries)
+    indices = tuple(str(index) for index in range(1, len(entries) + 1))
+    return [
+        "-pname",
+        ",".join(names),
+        "-plist",
+        ",".join(values),
+        "-pindex",
+        ",".join(indices),
+    ]
+
+
 def build_comsol_command(
     config: config_contract.GenerationConfig,
     *,
     cores_per_case: int,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
     scheduler_kind: str = "local",
     node_hostname: str | None = None,
 ) -> list[str]:
@@ -616,6 +683,7 @@ def build_comsol_command(
     if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
         msg = f"cores_per_case must be a positive integer, got {cores_per_case!r}."
         raise ValueError(msg)
+    parameter_arguments = _comsol_parameter_arguments(config, scalar_handoff)
     command = [
         resolve_comsol_executable(config),
         "batch",
@@ -623,6 +691,7 @@ def build_comsol_command(
         "model.mph",
         "-outputfile",
         "solved.mph",
+        *parameter_arguments,
         "-np",
         str(cores_per_case),
         *config.execution_values["runtime"]["extra_arguments"],
@@ -659,6 +728,139 @@ def _require_executable(command: list[str], *, comsol_executable: str) -> None:
         elif shutil.which(name) is None:
             msg = f"Required executable is not available on PATH: {name}"
             raise FileNotFoundError(msg)
+
+
+def _solved_model_entry(path: Path) -> _SolvedModelInventoryEntry:
+    """Return a stable no-follow identity for one solved-model candidate."""
+    try:
+        before = path.lstat()
+        digest = common.serialization.file_sha256(path) if stat.S_ISREG(before.st_mode) and before.st_size > 0 else None
+        after = path.lstat()
+    except OSError as error:
+        message = f"Could not inspect solver-produced model candidate {path.name!r}: {error}"
+        raise _SolvedModelOutputError(message, artifacts=(path.name,)) from error
+    before_identity = (
+        before.st_mode,
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_mode,
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        message = f"Solver-produced model candidate changed during inspection: {path.name!r}."
+        raise _SolvedModelOutputError(message, artifacts=(path.name,))
+    return _SolvedModelInventoryEntry(
+        relative_path=path.name,
+        mode=after.st_mode,
+        device=after.st_dev,
+        inode=after.st_ino,
+        size_bytes=after.st_size,
+        modified_ns=after.st_mtime_ns,
+        changed_ns=after.st_ctime_ns,
+        sha256=digest,
+    )
+
+
+def _solved_model_inventory(work_directory: Path) -> dict[str, _SolvedModelInventoryEntry]:
+    """Inventory immediate solved*.mph candidates without trusting stale files."""
+    inventory: dict[str, _SolvedModelInventoryEntry] = {}
+    for candidate in sorted(work_directory.glob("solved*.mph"), key=lambda item: item.name):
+        entry = _solved_model_entry(candidate)
+        inventory[entry.relative_path] = entry
+    return inventory
+
+
+def _canonicalize_solved_model(
+    work_directory: Path,
+    before: Mapping[str, _SolvedModelInventoryEntry],
+) -> tuple[Path, dict[str, Any]]:
+    """Admit exactly one new or replaced solved output and canonicalize its name."""
+    after = _solved_model_inventory(work_directory)
+    changed = tuple(entry for name, entry in sorted(after.items()) if before.get(name) != entry)
+    invalid = tuple(entry.relative_path for entry in changed if not entry.is_valid)
+    if invalid:
+        message = "COMSOL produced unsafe or empty solved-model candidate(s): " + ", ".join(invalid)
+        raise _SolvedModelOutputError(message, artifacts=invalid)
+    if len(changed) != 1:
+        names = tuple(entry.relative_path for entry in changed)
+        observed = "none" if not names else ", ".join(names)
+        message = f"COMSOL must produce exactly one new or replaced non-empty solved*.mph candidate; observed {observed}."
+        raise _SolvedModelOutputError(message, artifacts=names or ("solved*.mph",))
+
+    admitted = changed[0]
+    observed_path = work_directory / admitted.relative_path
+    canonical_path = work_directory / "solved.mph"
+    canonicalized = admitted.relative_path != canonical_path.name
+    if canonicalized:
+        try:
+            observed_path.replace(canonical_path)
+        except OSError as error:
+            message = f"Could not atomically canonicalize {admitted.relative_path!r} as {canonical_path.name!r}: {error}"
+            raise _SolvedModelOutputError(
+                message,
+                artifacts=(admitted.relative_path, canonical_path.name),
+            ) from error
+    try:
+        canonical_stat = canonical_path.lstat()
+        canonical_parent = canonical_path.resolve(strict=True).parent
+    except OSError as error:
+        message = f"Could not revalidate canonical solved.mph: {error}"
+        raise _SolvedModelOutputError(message, artifacts=(canonical_path.name,)) from error
+    expected_identity = (
+        admitted.mode,
+        admitted.device,
+        admitted.inode,
+        admitted.size_bytes,
+        admitted.modified_ns,
+    )
+    canonical_identity = (
+        canonical_stat.st_mode,
+        canonical_stat.st_dev,
+        canonical_stat.st_ino,
+        canonical_stat.st_size,
+        canonical_stat.st_mtime_ns,
+    )
+    if (
+        not stat.S_ISREG(canonical_stat.st_mode)
+        or canonical_stat.st_size <= 0
+        or canonical_parent != work_directory.resolve()
+        or canonical_identity != expected_identity
+    ):
+        message = "Canonical solved.mph does not preserve the admitted in-workspace solver output identity."
+        raise _SolvedModelOutputError(message, artifacts=(canonical_path.name,))
+    disposition = "new" if admitted.relative_path not in before else "replaced"
+    evidence = {
+        "requested_relative_path": "solved.mph",
+        "observed_relative_path": admitted.relative_path,
+        "canonical_relative_path": canonical_path.name,
+        "disposition": disposition,
+        "canonicalized": canonicalized,
+        "size_bytes": admitted.size_bytes,
+        "sha256": admitted.sha256,
+    }
+    return canonical_path, evidence
+
+
+def _record_solved_model_provenance(path: Path, evidence: Mapping[str, Any]) -> None:
+    """Attach canonical solved-model identity to completed execution evidence."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    scalar_handoff = payload.get("scalar_handoff") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict) or not isinstance(scalar_handoff, dict):
+        message = f"Execution provenance became malformed before output admission: {path}"
+        raise TypeError(message)
+    payload["result"]["solved_model"] = dict(evidence)
+    scalar_handoff["original_comsol_output_filename"] = evidence["observed_relative_path"]
+    scalar_handoff["canonical_solved_model_filename"] = evidence["canonical_relative_path"]
+    common.serialization.atomic_write_json(path, payload)
 
 
 def collect_exports(
@@ -734,6 +936,44 @@ def _write_solver_log(prepared: PreparedCase) -> Path:
     return path
 
 
+def _scalar_handoff_execution_provenance(
+    config: config_contract.GenerationConfig,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None,
+) -> dict[str, Any]:
+    """Return explicit runtime-binding evidence for steady or transient execution."""
+    output_names = {
+        "original_comsol_output_filename": None,
+        "canonical_solved_model_filename": None,
+    }
+    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+        if scalar_handoff is not None:
+            message = "Steady execution provenance cannot receive a transient scalar handoff."
+            raise ValueError(message)
+        return {
+            "state": "not_applicable",
+            "mechanism": "parameter_free",
+            "reason": "steady_flow_has_no_transient_scalar_runtime_overrides",
+            **output_names,
+        }
+    if scalar_handoff is None:
+        message = "Transient execution provenance requires an admitted scalar handoff."
+        raise ValueError(message)
+    runtime_entries = scalar_handoff.entries
+    payload = scalar_handoff.provenance_payload(include_source_path=True)
+    payload.update(
+        {
+            "state": "applied",
+            "mechanism": "comsol_cli_pname_plist",
+            "runtime_override_names": [entry.name for entry in runtime_entries],
+            "runtime_override_values": [entry.value for entry in runtime_entries],
+            "formatted_plist_expressions": [scalar_handoff_contract.format_comsol_parameter(entry) for entry in runtime_entries],
+            "pindex_values": list(range(1, len(runtime_entries) + 1)),
+            **output_names,
+        }
+    )
+    return payload
+
+
 def _execution_provenance(
     config: config_contract.GenerationConfig,
     prepared: PreparedCase,
@@ -748,12 +988,16 @@ def _execution_provenance(
     execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
     payload = {
         "schema_kind": "simulation_execution_provenance",
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": prepared.bundle.case_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "execution_config_digest": execution_digest,
         "git_commit": prepared.bundle.case_payload["git_commit"],
         "execution_config": config.execution_values,
+        "scalar_handoff": _scalar_handoff_execution_provenance(
+            config,
+            prepared.bundle.scalar_handoff,
+        ),
         "invocation": {
             "arguments": command,
             "working_directory": str(prepared.work_directory),
@@ -780,6 +1024,7 @@ def _execution_provenance(
             "started_at": None,
             "ended_at": None,
             "runtime_s": None,
+            "solved_model": None,
         },
     }
     return common.serialization.atomic_write_json(prepared.runtime_directory / "execution_provenance.json", payload)
@@ -807,6 +1052,7 @@ def _complete_execution_provenance(
         "started_at": started_at,
         "ended_at": ended_at,
         "runtime_s": runtime_seconds,
+        "solved_model": None,
     }
     common.serialization.atomic_write_json(path, payload)
 
@@ -834,9 +1080,13 @@ def execute_prepared_case(
     allocated_node: str | None = None,
 ) -> ExecutionResult:
     """Run one isolated COMSOL process and create its validated canonical HDF5."""
+    scalar_handoff = prepared.bundle.scalar_handoff
+    if scalar_handoff is not None:
+        scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
     command = build_comsol_command(
         config,
         cores_per_case=cores_per_case,
+        scalar_handoff=scalar_handoff,
         scheduler_kind=scheduler_kind,
         node_hostname=allocated_node,
     )
@@ -847,6 +1097,23 @@ def execute_prepared_case(
             str(error),
             work_directory=prepared.work_directory,
             command=tuple(command),
+        ) from error
+    if runtime_cancellation_requested():
+        message = "Campaign cancellation was requested before COMSOL launch."
+        raise CaseInterruptedError(
+            message,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=None,
+        )
+    try:
+        solved_models_before = _solved_model_inventory(prepared.work_directory)
+    except _SolvedModelOutputError as error:
+        raise CaseExecutionError(
+            str(error),
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            missing_or_invalid_artifacts=error.artifacts,
         ) from error
     execution_provenance = _execution_provenance(
         config,
@@ -865,14 +1132,6 @@ def execute_prepared_case(
     process: subprocess.Popen[str] | None = None
     timed_out = False
     exit_code: int | None = None
-    if runtime_cancellation_requested():
-        message = "Campaign cancellation was requested before COMSOL launch."
-        raise CaseInterruptedError(
-            message,
-            work_directory=prepared.work_directory,
-            command=tuple(command),
-            exit_code=None,
-        )
     with (
         stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
         stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
@@ -987,16 +1246,21 @@ def execute_prepared_case(
             command=tuple(command),
             exit_code=exit_code,
         )
-    solved_model = prepared.work_directory / "solved.mph"
-    if not solved_model.is_file() or solved_model.stat().st_size <= 0:
-        msg = "COMSOL completed without a non-empty solved.mph output."
+    try:
+        solved_model, solved_model_evidence = _canonicalize_solved_model(
+            prepared.work_directory,
+            solved_models_before,
+        )
+        _record_solved_model_provenance(execution_provenance, solved_model_evidence)
+    except (_SolvedModelOutputError, OSError, TypeError, ValueError) as error:
+        artifacts = error.artifacts if isinstance(error, _SolvedModelOutputError) else ("solved.mph",)
         raise CaseExecutionError(
-            msg,
+            str(error),
             work_directory=prepared.work_directory,
             command=tuple(command),
             exit_code=exit_code,
-            missing_or_invalid_artifacts=("solved.mph",),
-        )
+            missing_or_invalid_artifacts=artifacts,
+        ) from error
     try:
         exports = collect_exports(config, prepared)
     except Exception as error:
@@ -1013,6 +1277,7 @@ def execute_prepared_case(
             config,
             prepared.bundle.case_payload,
             exports,
+            scalar_handoff=prepared.bundle.scalar_handoff,
             work_directory=prepared.work_directory,
             runtime_directory=prepared.runtime_directory,
             runtime_seconds=elapsed,

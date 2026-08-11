@@ -798,14 +798,3 @@ parameters:
     classification: derived
     profile_applicability:
     - transient_drying
-  T_in_ref:
-    kind: derived
-    unit: K
-    derivation: schedule_time_average
-    sources:
-    - schedule
-    report_symbol: \bar{T}_{\mathrm{in}}
-    description: Time-average inlet temperature derived from the schedule.
-    classification: derived
-    profile_applicability:
-    - transient_drying

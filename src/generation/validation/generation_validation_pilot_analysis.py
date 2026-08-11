@@ -802,7 +802,7 @@ def analyze_successful_case(
     target_reached = bool(status["target_reached"])
     final_time_h = float(status["t_stop_exact"])
     final_f_wet = float(status["f_wet_dm_final"])
-    threshold = float(case_payload["sampled_values"]["f_wet_dm_max"])
+    threshold = float(fixed["f_wet_dm_max"])
     previous_regular = None
     if global_columns["f_wet_dm"].size >= _MINIMUM_BALANCE_STATES:
         previous_regular = float(global_columns["f_wet_dm"][-2] if exact_time is not None else global_columns["f_wet_dm"][-1])

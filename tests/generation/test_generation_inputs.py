@@ -521,7 +521,19 @@ def test_scalar_handoff_rejects_an_unknown_name(
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case")
     scalar_path = bundle.directory / "scalars.csv"
     content = scalar_path.read_text(encoding="utf-8")
-    old = "T_flow_ref;"
+    assert bundle.scalar_handoff is not None
+    assert bundle.scalar_handoff.field_names == generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    assert len(bundle.scalar_handoff.entries) == 12
+    forbidden = {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}
+    assert forbidden.isdisjoint(bundle.scalar_handoff.field_names)
+    assert all(f"{name};" not in content for name in forbidden)
+    assert bundle.case_payload["sampled_values"]["T_init"] == bundle.case_payload["sampled_values"]["T_amb"]
+    assert {"T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}.isdisjoint(bundle.case_payload["sampled_values"])
+    registry_entry = config.scientific_values["material"]["parameter_registry"]["T_init"]
+    assert registry_entry["kind"] == "derived"
+    assert registry_entry["derivation"] == "copy"
+    assert registry_entry["sources"] == ["T_amb"]
+    old = "T_amb;"
     assert content.count(old) == 1
     scalar_path.write_text(content.replace(old, "unexpected_flow_temperature;"), encoding="utf-8")
     payload = copy.deepcopy(bundle.case_payload)
@@ -530,7 +542,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
         "size_bytes": scalar_path.stat().st_size,
     }
     with pytest.raises(ValueError, match="missing, duplicate, unknown"):
-        generation.publication.storage._transient_scalar_values(
+        generation.contracts.scalar_handoff.admit_case_scalar_handoff(
             payload,
             bundle.directory,
         )

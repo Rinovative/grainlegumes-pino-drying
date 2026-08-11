@@ -119,6 +119,11 @@ def test_root_public_facades_resolve_to_modules() -> None:
     ("package_name", "public_name", "implementation_name"),
     [
         (
+            "src.generation.contracts",
+            "scalar_handoff",
+            "src.generation.contracts.generation_contracts_scalar_handoff",
+        ),
+        (
             "src.experiments.config",
             "temporal",
             "src.experiments.config.experiments_config_temporal",

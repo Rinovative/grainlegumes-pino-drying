@@ -112,7 +112,7 @@ def test_conditional_anchor_support_reconstructs_configured_material_records() -
     assert transient_reference["producer_to_consumer_path"]["effective_downstream_consumers"] == [
         "generation.cases.generation_cases_fields._porosity_field",
         "generation.cases.generation_cases_fields derived dry-density fields",
-        "generation.cases.generation_cases_case transient scalar COMSOL adapter",
+        "generation.runtime.generation_runtime_batch admitted COMSOL CLI scalar override",
     ]
 
 

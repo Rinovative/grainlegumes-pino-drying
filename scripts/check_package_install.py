@@ -95,6 +95,8 @@ from src import analysis, common, datasets, domain, experiments, generation, lea
 from src.analysis.eda import eda_dataframe
 from src.experiments import config as experiment_config
 from src.experiments.config import experiments_config_temporal
+from src.generation import contracts as generation_contracts
+from src.generation.contracts import generation_contracts_scalar_handoff
 from src.learning import learning_temporal
 from src.datasets import contracts as dataset_contracts
 from src.datasets import dataset_packages
@@ -158,6 +160,8 @@ modules = (
     eda_dataframe,
     experiment_config,
     experiments_config_temporal,
+    generation_contracts,
+    generation_contracts_scalar_handoff,
     learning_temporal,
 )
 for module in modules:
@@ -199,6 +203,8 @@ assert datasets.contracts.views.inspect_contract("steady_flow").contract_digest
 assert generation.contracts.get_profile_contract("transient_drying").id == "transient_drying"
 assert experiments.config.temporal is experiments_config_temporal
 assert experiment_config.temporal is experiments_config_temporal
+assert generation.contracts.scalar_handoff is generation_contracts_scalar_handoff
+assert generation_contracts.scalar_handoff is generation_contracts_scalar_handoff
 assert learning.temporal is learning_temporal
 assert h5py.version.version
 print(src.__file__)

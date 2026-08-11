@@ -25,6 +25,7 @@ import os
 import shlex
 import signal
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ from src.generation import generation_workflow as workflow_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_descriptors as contracts_service
+from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.publication import generation_publication_inventory as inventory_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
@@ -1365,8 +1368,32 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(prepared.work_directory)
         return 0
     if args.command == "print-command":
-        config.case_id(args.case_index)
-        print(shlex.join(runtime_service.build_comsol_command(config, cores_per_case=args.cores_per_case, scheduler_kind=args.scheduler_kind)))
+        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+            with tempfile.TemporaryDirectory(prefix="generation-print-command-") as temporary_directory:
+                bundle = case_service.generate_case_input_bundle(
+                    config,
+                    args.case_index,
+                    Path(temporary_directory),
+                )
+                scalar_handoff = bundle.scalar_handoff
+                if scalar_handoff is None:
+                    message = "Transient print-command generation produced no scalar handoff."
+                    raise RuntimeError(message)
+                scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
+                command = runtime_service.build_comsol_command(
+                    config,
+                    cores_per_case=args.cores_per_case,
+                    scalar_handoff=scalar_handoff,
+                    scheduler_kind=args.scheduler_kind,
+                )
+        else:
+            config.case_id(args.case_index)
+            command = runtime_service.build_comsol_command(
+                config,
+                cores_per_case=args.cores_per_case,
+                scheduler_kind=args.scheduler_kind,
+            )
+        print(shlex.join(command))
         return 0
     if args.command == "run-case":
         outcome = runtime_service.run_case(

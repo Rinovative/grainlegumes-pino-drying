@@ -34,6 +34,7 @@ import yaml
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
 from . import generation_runtime_batch as runtime_service
@@ -276,10 +277,14 @@ def run_mapping_probe(
         storage_root=storage,
         work_root=work_root,
     )
+    scalar_handoff = prepared.bundle.scalar_handoff
+    if scalar_handoff is not None:
+        scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
     before = _snapshot(prepared.work_directory)
     command = runtime_service.build_comsol_command(
         config,
         cores_per_case=cores_per_case,
+        scalar_handoff=scalar_handoff,
         scheduler_kind="slurm",
         node_hostname=socket.gethostname(),
     )

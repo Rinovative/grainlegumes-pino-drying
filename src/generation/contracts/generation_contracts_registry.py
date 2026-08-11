@@ -44,7 +44,6 @@ DERIVATION_IDENTIFIERS: Final = (
     "complement_of_one",
     "product",
     "mean",
-    "schedule_time_average",
 )
 
 _SCIENTIFIC_METADATA_KEYS: Final = frozenset(

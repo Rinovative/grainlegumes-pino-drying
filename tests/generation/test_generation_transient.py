@@ -159,12 +159,7 @@ def _write_transient_case(
     complete_time = regular_time if exact_stop_time is None else np.concatenate((regular_time, [exact_stop_time]))
     complete_fields = transient if exact_fields is None else np.concatenate((transient, exact_fields[np.newaxis, ...]))
     scalar_values = {
-        "T_flow_ref": 300.65,
-        "p_ref": 101325.0,
-        "p_out": 0.0,
-        "T_init": 295.0,
         "T_amb": 295.0,
-        "T_in_ref": 295.84,
         "eps_bed_cal_ref": 0.5,
         "rho_bu_dry_ref": 550.0,
         "k_gr": 0.2,
@@ -176,11 +171,10 @@ def _write_transient_case(
         "A_osw": 0.1,
         "B_osw": 0.002,
         "C_osw": 0.3,
-        "f_wet_dm_max": 0.05,
     }
     scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
     scalars = np.asarray([scalar_values[name] for name in scalar_names], dtype=np.float64)
-    ownership = ["package_fixed" if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS else "case_dependent" for name in scalar_names]
+    ownership = ["case_dependent"] * len(scalar_names)
     schedule_times = np.asarray(scientific["time"]["regular_times"], dtype=np.float64)
     schedule = np.zeros((schedule_times.size, len(profiles.SCHEDULE_FIELDS)), dtype=np.float64)
     schedule[:, 0] = schedule_times
@@ -189,7 +183,7 @@ def _write_transient_case(
     schedule[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
         schedule[:, 2],
         schedule[:, 1],
-        pressure=scalar_values["p_ref"],
+        pressure=float(scientific["scientific_fixed_values"]["p_ref"]),
     )
     global_values = np.zeros((complete_time.size, len(profiles.GLOBAL_FIELD_NAMES)), dtype=np.float64)
     global_values[:, 0] = complete_time
@@ -261,7 +255,7 @@ def _write_transient_case(
         "seed_evidence": {},
         "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
         "conditional_supports": {},
-        "sampled_values": scalar_values,
+        "sampled_values": {name: scalar_values[name] for name in scalar_names},
         "sampled_units": dict(zip(scalar_names, profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
         "coupled_selections": {},
         "ood": {"natural_support_state": "natural"},
@@ -916,6 +910,44 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         stream.write(b"tamper")
     with pytest.raises(RuntimeError, match="changed after dataset admission"):
         _ = worker_dataset[0]
+
+
+def test_transient_hdf5_rejects_an_extra_legacy_scalar_entry(tmp_path: Path) -> None:
+    """Reject an obsolete extra-entry source at canonical HDF5 admission."""
+    source = tmp_path / "legacy-scalar-shape.h5"
+    _write_transient_case(source)
+    with h5py.File(source, "r+") as handle:
+        scalar_dataset = handle["provenance/scalar_handoff_json"]
+        assert isinstance(scalar_dataset, h5py.Dataset)
+        raw_value = scalar_dataset[()]
+        if isinstance(raw_value, bytes):
+            raw_text = raw_value.decode("utf-8")
+        else:
+            assert isinstance(raw_value, str)
+            raw_text = raw_value
+        handoff = json.loads(raw_text)
+        handoff["entries"].append(
+            {
+                "name": "retired_scalar",
+                "value": 1.0,
+                "unit": "1",
+                "owner": "case_dependent",
+            }
+        )
+        del handle["provenance/scalar_handoff_json"]
+        provenance = handle["provenance"]
+        assert isinstance(provenance, h5py.Group)
+        provenance.create_dataset(
+            "scalar_handoff_json",
+            data=_json(handoff),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+
+    with pytest.raises(ValueError, match="missing, duplicate, unknown"):
+        generation.publication.storage.validate_case_hdf5(
+            source,
+            expected_profile="transient_drying",
+        )
 
 
 def test_transient_time_classification_and_bad_commit(tmp_path: Path) -> None:

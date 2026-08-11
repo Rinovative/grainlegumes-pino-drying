@@ -116,14 +116,14 @@ the stable `src.generation` and `src.datasets` facades.
 | `runtime/` | `dataset_runtime_*` | Unified requests/factory, steady and transient Datasets, DataLoaders, and package smoke validation |
 | Package facade and CLI | `dataset_packages.py` | The canonical persisted builder identity and the supported `build`, `inspect`, and `smoke` commands |
 
-Dependencies point from stable owners toward their consumers: Generation
-`contracts` feed `cases`, then `runtime`; publication and validation consume
-those lower contracts, and top-level orchestration is the only layer that spans
-the complete lifecycle. Dataset `contracts` feed `packages` and `preprocessing`;
-`runtime` consumes those three areas. Generation publication evidence feeds
-Dataset package admission, while the Generation workflow invokes the public
-Dataset package service only after terminal publication. Lower responsibility
-packages do not import workflow or CLI layers.
+Dependencies point from stable owners toward their consumers: concrete
+Generation modules flow from `contracts` to `cases`, `publication`, `runtime`,
+and `validation`; top-level campaign, workflow, smoke, readiness, and CLI
+services span those owners. Dataset `contracts` feed `packages` and
+`preprocessing`; `runtime` consumes those three areas. Generation publication
+evidence feeds Dataset package admission, while the Generation workflow invokes
+the public Dataset package service only after terminal publication. Lower
+responsibility packages do not import workflow or CLI layers.
 
 Supported public boundaries are:
 

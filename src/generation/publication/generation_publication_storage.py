@@ -35,6 +35,7 @@ from src import common, domain
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
@@ -54,7 +55,6 @@ _TIME_CLASSIFICATION_FACTOR = 16.0
 _THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
-_SCALAR_COLUMN_COUNT = 3
 STATUS_SCHEMA_VERSION = 1
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION = 1
@@ -448,64 +448,25 @@ def _stationary_fixed_values(
         msg = "Stationary package-fixed provenance disagrees with the configured template contract."
         raise ValueError(msg)
     sampled = case_payload.get("sampled_values")
-    if not isinstance(sampled, Mapping) or any(sampled.get(name) != fixed_values[name] for name in profiles.STATIONARY_FIXED_FIELDS):
-        msg = "Stationary package-fixed values are missing from case identity provenance."
-        raise ValueError(msg)
+    profile_id = case_payload.get("simulation_profile")
+    if not isinstance(sampled, Mapping):
+        message = "Case sampled-value provenance must be a mapping."
+        raise TypeError(message)
+    if profile_id == profiles.STEADY_FLOW_PROFILE:
+        if any(sampled.get(name) != fixed_values[name] for name in profiles.STATIONARY_FIXED_FIELDS):
+            message = "Stationary package-fixed values are missing from steady case identity provenance."
+            raise ValueError(message)
+    elif profile_id == profiles.TRANSIENT_DRYING_PROFILE:
+        if any(name in sampled for name in (*profiles.STATIONARY_FIXED_FIELDS, "f_wet_dm_max")):
+            message = "Template-fixed values cannot be duplicated into transient sampled-value provenance."
+            raise ValueError(message)
+    else:
+        message = f"Unsupported simulation profile in fixed-value provenance: {profile_id!r}."
+        raise ValueError(message)
     return np.asarray(
         [fixed_values[name] for name in profiles.STATIONARY_FIXED_FIELDS],
         dtype=np.float64,
     )
-
-
-def _transient_scalar_values(
-    case_payload: Mapping[str, Any],
-    work_directory: Path,
-) -> np.ndarray:
-    """Read and revalidate the transient case-local scalar handoff."""
-    spec = case_payload["input_contract"]["scalar"]
-    path = work_directory / spec["filename"]
-    identity = case_payload["input_files"][path.name]
-    if common.serialization.file_sha256(path) != identity["sha256"] or path.stat().st_size != identity["size_bytes"]:
-        msg = "Scalar adapter bytes changed after case-input identity was computed."
-        raise RuntimeError(msg)
-    try:
-        rows = list(csv.reader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=spec["delimiter"]))
-    except (OSError, UnicodeDecodeError, csv.Error) as error:
-        msg = f"Scalar adapter is not readable deterministic CSV: {path}"
-        raise ValueError(msg) from error
-    names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
-    units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
-    if not rows or rows[0] != ["name", "value", "unit"] or len(rows) != len(names) + 1:
-        msg = "Scalar adapter header or row count does not match its profile contract."
-        raise ValueError(msg)
-    observed_names = [row[0] for row in rows[1:] if len(row) == _SCALAR_COLUMN_COUNT]
-    observed_units = [row[2] for row in rows[1:] if len(row) == _SCALAR_COLUMN_COUNT]
-    if len(observed_names) != len(names) or tuple(observed_names) != names or tuple(observed_units) != units:
-        msg = "Scalar adapter contains missing, duplicate, unknown, obsolete, or mis-unitized entries."
-        raise ValueError(msg)
-    try:
-        values = np.asarray([float(row[1]) for row in rows[1:]], dtype=np.float64)
-    except ValueError as error:
-        msg = "Scalar adapter contains a malformed numeric value."
-        raise ValueError(msg) from error
-    if not np.isfinite(values).all():
-        msg = "Scalar adapter values must be finite."
-        raise ValueError(msg)
-    entries = case_payload.get("scalars")
-    if (
-        not isinstance(entries, list)
-        or [entry.get("name") for entry in entries if isinstance(entry, dict)] != list(names)
-        or [entry.get("unit") for entry in entries if isinstance(entry, dict)] != list(units)
-        or [entry.get("owner") for entry in entries if isinstance(entry, dict)]
-        != ["package_fixed" if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS else "case_dependent" for name in names]
-    ):
-        msg = "Case scalar provenance does not match the exact names, units, and ownership classes."
-        raise ValueError(msg)
-    recorded = np.asarray([entry["value"] for entry in entries], dtype=np.float64)
-    if not np.array_equal(values, recorded):
-        msg = "Scalar adapter values disagree with case.json provenance."
-        raise ValueError(msg)
-    return values
 
 
 def _schedule_values(
@@ -680,7 +641,6 @@ def _source_hashes(exports: Sequence[Any]) -> dict[str, dict[str, Any]]:
 
 def _status(
     config: GenerationConfig,
-    case_payload: Mapping[str, Any],
     *,
     transient_time: np.ndarray | None,
     exact_stop_time: float | None,
@@ -701,7 +661,7 @@ def _status(
         values = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
         t_final = float(values["t_final"])
         wet_final = float(values["f_wet_dm_final"])
-        limit = float(case_payload["sampled_values"]["f_wet_dm_max"])
+        limit = float(config.scientific_values["scientific_fixed_values"]["f_wet_dm_max"])
         target_reached = wet_final <= limit
         hit_t_max = t_final >= float(config.scientific_values["time"]["stop"])
         regular_states = int(transient_time.size)
@@ -784,6 +744,22 @@ def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, An
     return result
 
 
+def _hdf5_scalar_contract(
+    profile_id: str,
+    admission: scalar_handoff_contract.ScalarHandoffAdmission | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return exact scalar names and units after profile-specific admission."""
+    if profile_id == profiles.STEADY_FLOW_PROFILE:
+        if admission is not None:
+            message = "Steady HDF5 publication cannot receive a transient scalar handoff."
+            raise ValueError(message)
+        return profiles.STATIONARY_FIXED_FIELDS, profiles.STATIONARY_FIXED_UNITS
+    if admission is None:
+        message = "Transient HDF5 publication requires admitted scalar metadata."
+        raise ValueError(message)
+    return admission.field_names, admission.units
+
+
 def _write_hdf5(
     path: Path,
     config: GenerationConfig,
@@ -793,6 +769,7 @@ def _write_hdf5(
     y_axis: np.ndarray,
     static_fields: np.ndarray,
     scalar_values: np.ndarray,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None,
     transient_time: np.ndarray | None,
     transient_fields: np.ndarray | None,
     exact_stop_time: float | None,
@@ -833,14 +810,10 @@ def _write_hdf5(
     }
     static_names = profiles.static_field_names(config.profile.id)
     static_units = profiles.static_field_units(config.profile.id)
-    scalar_names: tuple[str, ...]
-    scalar_units: tuple[str, ...]
-    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
-        scalar_names = profiles.STATIONARY_FIXED_FIELDS
-        scalar_units = profiles.STATIONARY_FIXED_UNITS
-    else:
-        scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
-        scalar_units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
+    scalar_names, scalar_units = _hdf5_scalar_contract(
+        config.profile.id,
+        scalar_handoff,
+    )
     with h5py.File(path, "w") as handle:
         handle.attrs["schema_kind"] = HDF5_SCHEMA_KIND
         handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
@@ -924,7 +897,10 @@ def _write_hdf5(
             scalar_dataset.attrs["ownership"] = _json_attribute(["package_fixed"] * len(scalar_names))
             scalar_dataset.attrs["runtime_source"] = "canonical_template"
         else:
-            scalar_dataset.attrs["ownership"] = _json_attribute([entry["owner"] for entry in case_payload["scalars"]])
+            if scalar_handoff is None:
+                message = "Transient HDF5 publication requires admitted scalar ownership."
+                raise ValueError(message)
+            scalar_dataset.attrs["ownership"] = _json_attribute(list(scalar_handoff.ownership))
         if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
             if transient_time is None or transient_float32 is None or schedule_values is None or global_values is None or final_status is None:
                 msg = "Transient HDF5 publication requires every regular, schedule, global, and final-status value."
@@ -1119,7 +1095,7 @@ def _validate_hdf5_provenance(
     handle: h5py.File,
     profile: str,
     profile_contract: profiles.SimulationProfile,
-) -> tuple[dict[str, Any], str, dict[str, Any] | None, dict[str, Any]]:
+) -> tuple[dict[str, Any], str, scalar_handoff_contract.ScalarHandoffAdmission | None, dict[str, Any]]:
     """Validate complete scientific, input, conditioning, and template provenance."""
     expected = {
         "scientific_config_json",
@@ -1254,7 +1230,8 @@ def _validate_hdf5_provenance(
     if profile == profiles.TRANSIENT_DRYING_PROFILE and "schedule_diagnostics" not in case_scientific:
         msg = "Canonical transient HDF5 is missing realized schedule diagnostics."
         raise ValueError(msg)
-    scalar_handoff: dict[str, Any] | None = None
+    _validate_input_file_provenance(input_files, profile=profile)
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None
     if profile == profiles.TRANSIENT_DRYING_PROFILE:
         raw_handoff = _hdf5_json_dataset(
             handle,
@@ -1277,8 +1254,14 @@ def _validate_hdf5_provenance(
         ):
             msg = "Canonical transient scalar-handoff provenance is invalid."
             raise ValueError(msg)
-        scalar_handoff = raw_handoff
-    _validate_input_file_provenance(input_files, profile=profile)
+        scalar_identity = input_files[raw_handoff["filename"]]
+        scalar_handoff = scalar_handoff_contract.admit_transient_scalar_handoff(
+            raw_handoff["entries"],
+            source_path=Path(raw_handoff["filename"]),
+            source_filename=raw_handoff["filename"],
+            sha256=scalar_identity["sha256"],
+            size_bytes=scalar_identity["size_bytes"],
+        )
     _validate_source_export_provenance(
         source_exports,
         profile_contract=profile_contract,
@@ -1307,7 +1290,7 @@ def _validate_hdf5_provenance(
 def _validate_hdf5_static_and_parameters(
     handle: h5py.File,
     profile: str,
-    scalar_handoff: Mapping[str, Any] | None,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None,
     scientific: Mapping[str, Any],
 ) -> tuple[h5py.Dataset, tuple[str, ...]]:
     """Validate configured grid, static fields, and parameter provenance."""
@@ -1397,10 +1380,13 @@ def _validate_hdf5_static_and_parameters(
         )
         return scalar, scalar_names
 
+    if scalar_handoff is None:
+        message = "Canonical transient HDF5 is missing admitted scalar provenance."
+        raise ValueError(message)
     _require_group_members(handle, "scalar", {"values"})
     scalar = _hdf5_dataset(handle, "scalar/values")
-    scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
-    scalar_units = profiles.TRANSIENT_SCALAR_INPUT_UNITS
+    scalar_names = scalar_handoff.field_names
+    scalar_units = scalar_handoff.units
     scalar_values = np.asarray(scalar, dtype=np.float64)
     ownership = json.loads(
         _hdf5_text_attribute(
@@ -1408,30 +1394,18 @@ def _validate_hdf5_static_and_parameters(
             label="scalar.ownership",
         )
     )
-    package_fixed_names = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
-    expected_ownership = ["package_fixed" if name in package_fixed_names else "case_dependent" for name in scalar_names]
-    entries = None if scalar_handoff is None else scalar_handoff.get("entries")
-    expected_entries = [
-        {"name": name, "value": float(value), "unit": unit, "owner": owner}
-        for name, value, unit, owner in zip(
-            scalar_names,
-            scalar_values,
-            scalar_units,
-            expected_ownership,
-            strict=True,
-        )
-    ]
-    fixed_values_match = all(scalar_values[scalar_names.index(name)] == float(fixed_values[name]) for name in package_fixed_names)
+    expected_values = np.asarray(scalar_handoff.values, dtype=np.float64)
     if (
         scalar.dtype != np.float64
-        or scalar.shape != (len(scalar_names),)
-        or ownership != expected_ownership
+        or scalar.shape != (len(profiles.TRANSIENT_SCALAR_INPUT_FIELDS),)
+        or scalar_names != profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+        or scalar_units != profiles.TRANSIENT_SCALAR_INPUT_UNITS
+        or ownership != list(scalar_handoff.ownership)
         or not np.isfinite(scalar_values).all()
-        or entries != expected_entries
-        or not fixed_values_match
+        or not np.array_equal(scalar_values, expected_values)
     ):
-        msg = "Canonical transient scalar values or handoff provenance are invalid."
-        raise ValueError(msg)
+        message = "Canonical transient scalar values or handoff provenance are invalid."
+        raise ValueError(message)
     _dataset_contract(
         scalar,
         names=scalar_names,
@@ -1503,8 +1477,6 @@ def _validate_hdf5_regular_trajectory(
 
 def _validate_hdf5_schedule(
     handle: h5py.File,
-    scalar: h5py.Dataset,
-    scalar_names: tuple[str, ...],
     scientific: Mapping[str, Any],
 ) -> None:
     """Validate configured schedule fields and thermodynamic conversion."""
@@ -1530,7 +1502,7 @@ def _validate_hdf5_schedule(
         units=profiles.SCHEDULE_UNITS,
         label="schedule",
     )
-    p_ref = float(np.asarray(scalar, dtype=np.float64)[scalar_names.index("p_ref")])
+    p_ref = float(scientific["scientific_fixed_values"]["p_ref"])
     conversion = json.loads(
         _hdf5_text_attribute(
             schedule.attrs.get("conversion_pressure", ""),
@@ -1669,13 +1641,11 @@ def _validate_hdf5_diagnostics(
 
 def _validate_hdf5_transient(
     handle: h5py.File,
-    scalar: h5py.Dataset,
-    scalar_names: tuple[str, ...],
     scientific: Mapping[str, Any],
 ) -> None:
     """Validate all transient-only schema-v1 members."""
     regular_time = _validate_hdf5_regular_trajectory(handle, scientific)
-    _validate_hdf5_schedule(handle, scalar, scalar_names, scientific)
+    _validate_hdf5_schedule(handle, scientific)
     complete_time = _complete_hdf5_time(handle, regular_time, scientific)
     _validate_hdf5_diagnostics(handle, complete_time, scientific)
 
@@ -1709,14 +1679,14 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
             profile,
             profile_contract,
         )
-        scalar, scalar_names = _validate_hdf5_static_and_parameters(
+        _validate_hdf5_static_and_parameters(
             handle,
             profile,
             scalar_handoff,
             scientific,
         )
         if profile == profiles.TRANSIENT_DRYING_PROFILE:
-            _validate_hdf5_transient(handle, scalar, scalar_names, scientific)
+            _validate_hdf5_transient(handle, scientific)
         identities = {
             name: _hdf5_text_attribute(handle.attrs[name], label=name)
             for name in ("case_input_id", "simulation_case_id", "scientific_config_digest", "template_sha256")
@@ -1760,6 +1730,7 @@ def convert_exports_to_hdf5(
     work_directory: Path,
     runtime_directory: Path,
     runtime_seconds: float,
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
 ) -> CanonicalCase:
     """Validate all adapters and atomically create the sole canonical payload."""
     x_axis, y_axis, static_fields = _static_fields(config, exports)
@@ -1767,7 +1738,21 @@ def convert_exports_to_hdf5(
         case_payload,
         config.scientific_values["scientific_fixed_values"],
     )
-    scalar_values = stationary_values if config.profile.id == profiles.STEADY_FLOW_PROFILE else _transient_scalar_values(case_payload, work_directory)
+    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+        if scalar_handoff is not None:
+            message = "Steady HDF5 publication cannot receive a transient scalar handoff."
+            raise ValueError(message)
+        scalar_values = stationary_values
+    else:
+        admitted = scalar_handoff_contract.admit_case_scalar_handoff(
+            case_payload,
+            work_directory,
+        )
+        if scalar_handoff is not None and scalar_handoff != admitted:
+            message = "Runtime and publication scalar admissions disagree."
+            raise ValueError(message)
+        scalar_handoff = admitted
+        scalar_values = np.asarray(admitted.values, dtype=np.float64)
     transient_time: np.ndarray | None = None
     transient_fields: np.ndarray | None = None
     exact_stop_time: float | None = None
@@ -1783,7 +1768,7 @@ def convert_exports_to_hdf5(
             y_axis=y_axis,
         )
         scalar_names = profiles.scalar_input_fields(config.profile.id)
-        p_ref = float(scalar_values[scalar_names.index("p_ref")])
+        p_ref = float(config.scientific_values["scientific_fixed_values"]["p_ref"])
         f_surf = float(scalar_values[scalar_names.index("f_surf")])
         schedule_values = _schedule_values(
             case_payload,
@@ -1826,6 +1811,7 @@ def convert_exports_to_hdf5(
             y_axis=y_axis,
             static_fields=static_fields,
             scalar_values=scalar_values,
+            scalar_handoff=scalar_handoff,
             transient_time=transient_time,
             transient_fields=transient_fields,
             exact_stop_time=exact_stop_time,
@@ -1842,7 +1828,6 @@ def convert_exports_to_hdf5(
         temporary.unlink(missing_ok=True)
     status = _status(
         config,
-        case_payload,
         transient_time=transient_time,
         exact_stop_time=exact_stop_time,
         final_status=final_status,

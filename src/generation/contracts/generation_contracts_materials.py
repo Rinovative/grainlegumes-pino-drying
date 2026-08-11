@@ -730,7 +730,6 @@ def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
         "T_init": ("copy", ("T_amb",)),
         "r_surf": ("copy", ("r_surf_0",)),
         "r_int": ("product", ("r_int_surf", "r_surf")),
-        "T_in_ref": ("schedule_time_average", ("schedule",)),
     }
     required = {
         "rho_bu_dry_ref",

@@ -72,8 +72,9 @@ python -m src.generation.cli.cli_generation validate-config \
 ```
 
 Inspection distinguishes authored, inherited, selected, and derived evidence.
-It also distinguishes generator consumption, scalar-adapter handoff, and fixed
-values that Python binds to a hashed native template without setting at runtime.
+It also distinguishes generator consumption, admitted COMSOL CLI overrides, and
+package-fixed values bound to the hashed native template without a Python
+runtime override.
 Use the same command after every valid configuration edit; derived totals,
 dimensions, memberships, packages, and identities must change from the edited
 owners without synchronized Python or documentation edits.
@@ -167,6 +168,76 @@ source-air, and interpolation rules, and retries it deterministically as one
 unit. It does not clip individual time samples. Schedule diagnostics, names, and
 units come from the schedule/profile contracts rather than a documentation
 column list.
+
+### Transient scalar handoff
+
+The Generation profile contract owns one ordered 12-field case-dependent
+runtime handoff. Each transient case writes exactly these values to
+`scalars.csv`, admits the file before process creation, and supplies the same
+ordered values to COMSOL through an argument vector without a shell.
+
+| Position | Field | Unit |
+| ---: | --- | --- |
+| 1 | `T_amb` | `K` |
+| 2 | `eps_bed_cal_ref` | `1` |
+| 3 | `rho_bu_dry_ref` | `kg/m^3` |
+| 4 | `k_gr` | `W/(m*K)` |
+| 5 | `cp_gr_dry` | `J/(kg*K)` |
+| 6 | `X_target_wb` | `1` |
+| 7 | `r_surf_0` | `1/s` |
+| 8 | `r_int_surf` | `1` |
+| 9 | `f_surf` | `1` |
+| 10 | `A_osw` | `1` |
+| 11 | `B_osw` | `1/K` |
+| 12 | `C_osw` | `1` |
+
+`T_init` is not an independent runtime value. Python supplies `T_amb`, and the
+canonical COMSOL template derives `T_init = T_amb`. The template/package-fixed
+values `T_flow_ref`, `p_ref`, `p_out`, and `f_wet_dm_max` remain with their
+existing canonical scientific-configuration/template owners; they are not
+duplicated into `scalars.csv`. Other fixed template parameters such as `cp_w`,
+`h_fg`, `d_wall`, `k_wall`, `h_ext`, and `U_wall` likewise do not belong in the
+case handoff.
+
+A representative subcommand has this structure:
+
+```text
+comsol batch -inputfile model.mph -outputfile solved.mph \
+  -pname T_amb,eps_bed_cal_ref,rho_bu_dry_ref,k_gr,cp_gr_dry,X_target_wb,r_surf_0,r_int_surf,f_surf,A_osw,B_osw,C_osw \
+  -plist 293.15[K],0.4,630[kg/m^3],0.364[W/(m*K)],2000[J/(kg*K)],0.2,1e-5[1/s],1,0.5,10,0.01[1/K],2 \
+  -pindex 1,2,3,4,5,6,7,8,9,10,11,12 -np 4
+```
+
+`generation.contracts.generation_contracts_scalar_handoff` is the sole reader
+and admission owner. It binds the source filename, hash, size, exact header and
+row order, canonical units, finite float64 values, case JSON representations,
+ownership, and workspace containment before solver evidence or process
+creation. Canonical HDF5 publication calls the same owner and writes an exact
+`(12,)` float64 runtime-scalar dataset with the same names, units, ownership,
+and values. Older scalar layouts fail exact admission and must be regenerated.
+The learned Dataset view remains a separately name-selected eight-field
+projection.
+
+The schedule is a separate four-column time-dependent adapter:
+`t,T_in_bc,omega_in_bc,phi_in_bc`. The corrected native interpolation feature
+uses column 1 as its `h` argument and columns 2--4 as
+`T_in_bc_file`, `omega_in_bc_file`, and `phi_in_bc_file`, with units `K`,
+`kg/kg`, and `1`. It uses linear interpolation and constant extrapolation. Each
+hourly interval is therefore determined by its adjacent endpoint values; no
+interval mean, integral, or additional scalar is needed.
+
+After a successful solver exit, runtime accepts exactly one new or replaced
+nonempty regular `solved*.mph` candidate. A sole suffixed candidate is
+atomically renamed to `solved.mph`; stale, empty, symbolic-link, missing, or
+ambiguous candidates fail closed. Execution provenance records both the
+produced and canonical names.
+
+The test-owned fake COMSOL executable proves the Python handoff and output
+contract. Static archive inspection proves the saved template descriptor and
+the SHA-256 sidecar binds its exact bytes. Neither is native execution evidence:
+a real transient technical smoke remains required to prove native parameter
+application, schedule-file reload, retained output, HDF5, packages, and both
+DataLoader worker modes.
 
 ## Material records and atomic selection
 

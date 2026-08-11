@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -13,6 +14,9 @@ import numpy as np
 import pytest
 
 from src import common, generation
+from src.generation.cli import cli_generation as cli_service
+from src.generation.contracts import generation_contracts_profiles as profile_contract
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_workspace as workspace
 
@@ -58,6 +62,168 @@ def test_resolved_science_and_execution_are_persisted_separately(
     execution = json.loads(execution_files[0].read_text(encoding="utf-8"))
     assert execution == config.execution_values
     assert common.serialization.canonical_json_sha256(scientific) == config.scientific_config_digest
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "-pname",
+        "-pname=T_amb",
+        "-plist",
+        "-plist=298.15[K]",
+        "-pindex",
+        "-pindex=1",
+        "-paramfile",
+        "-paramfile=parameters.txt",
+    ],
+)
+def test_extra_arguments_cannot_override_scalar_handoff_flags(
+    generation_config_factory: Any,
+    argument: str,
+) -> None:
+    """Keep every COMSOL parameter-injection flag runtime-owned."""
+    config_path, _template = generation_config_factory(extra_arguments=(argument,))
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="cannot override"):
+        generation.cases.config.load_generation_config(
+            config_path,
+            only_batch=_natural_batch_name("transient_drying"),
+        )
+
+
+def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Protect exact runtime injection, local/Slurm order, and CLI parity."""
+    config_path, _template = generation_config_factory(
+        executable=fake_comsol,
+        extra_arguments=("-recover",),
+    )
+    batch_name = _natural_batch_name("transient_drying")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=batch_name,
+    )
+    bundle = generation.cases.case.generate_case_input_bundle(
+        config,
+        1,
+        tmp_path / "command bundle",
+    )
+    admission = bundle.scalar_handoff
+    assert admission is not None
+    with pytest.raises(ValueError, match="require one admitted scalar handoff"):
+        runtime_service.build_comsol_command(config, cores_per_case=2)
+    entries = admission.entries
+    assert len(entries) == 12
+    assert tuple(entry.name for entry in entries) == profile_contract.TRANSIENT_SCALAR_INPUT_FIELDS
+    assert all(entry.owner == "case_dependent" for entry in entries)
+    assert {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}.isdisjoint(entry.name for entry in entries)
+
+    local = runtime_service.build_comsol_command(
+        config,
+        cores_per_case=2,
+        scalar_handoff=admission,
+    )
+    parameter_start = local.index("-pname")
+    assert local[parameter_start : parameter_start + 6 : 2] == ["-pname", "-plist", "-pindex"]
+    assert local[parameter_start + 1].split(",") == [entry.name for entry in entries]
+    expected_values = [scalar_handoff_contract.format_comsol_parameter(entry) for entry in entries]
+    assert local[parameter_start + 3].split(",") == expected_values
+    assert "[1]" not in local[parameter_start + 3]
+    assert local[parameter_start + 5] == ",".join(str(index) for index in range(1, 13))
+    assert local[parameter_start + 6 :] == ["-np", "2", "-recover"]
+
+    slurm = runtime_service.build_comsol_command(
+        config,
+        cores_per_case=2,
+        scalar_handoff=admission,
+        scheduler_kind="slurm",
+        node_hostname="node-a",
+    )
+    assert slurm[:7] == [
+        "srun",
+        "--exclusive",
+        "--nodes=1",
+        "--ntasks=1",
+        "--cpus-per-task=2",
+        "--cpu-bind=cores",
+        "--nodelist=node-a",
+    ]
+    assert slurm[7:] == local
+
+    status = cli_service.main(
+        [
+            "print-command",
+            str(config_path),
+            "--only-batch",
+            batch_name,
+            "1",
+            "--cores-per-case",
+            "2",
+        ]
+    )
+    assert status == 0
+    assert shlex.split(capsys.readouterr().out.strip()) == local
+
+
+def test_scalar_source_validation_precedes_evidence_and_process_start(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject changed scalar bytes before provenance or Popen can attest them."""
+    config_path, _template = generation_config_factory(executable=fake_comsol)
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    prepared = runtime_service.prepare_case_work_directory(
+        config,
+        1,
+        storage_root=tmp_path / "scalar validation storage",
+        work_root=tmp_path / "scalar validation work",
+    )
+    admission = prepared.bundle.scalar_handoff
+    assert admission is not None
+    admission.source_path.write_bytes(admission.source_path.read_bytes() + b"changed")
+    process_started = False
+
+    def reject_process_start(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal process_started
+        process_started = True
+        message = "Popen must not be reached"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(runtime_service.subprocess, "Popen", reject_process_start)
+    with pytest.raises(RuntimeError, match="bytes changed"):
+        runtime_service.execute_prepared_case(
+            config,
+            prepared,
+            cores_per_case=1,
+            worker_slot=0,
+        )
+    assert process_started is False
+    assert not (prepared.runtime_directory / "execution_provenance.json").exists()
+
+
+def test_steady_command_is_parameter_free(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+) -> None:
+    """Keep the steady template authoritative for its fixed conditioning."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    command = runtime_service.build_comsol_command(config, cores_per_case=1)
+    assert not {"-pname", "-plist", "-pindex"}.intersection(command)
 
 
 def test_terminal_case_identity_binds_persisted_input_configuration(
@@ -188,13 +354,33 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         batch_id=generation.cases.config.build_batch_id(batch_name, scientific_digest),
     )
     storage = tmp_path / "pilot terminal storage"
-    generation.runtime.run_case(
+    outcome = generation.runtime.run_case(
         batch,
         1,
         cores_per_case=1,
         storage_root=storage,
         work_root=tmp_path / "pilot terminal work",
     )
+    assert outcome.work_directory is not None
+    execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
+    case_payload = json.loads((outcome.processed_directory / "case.json").read_text(encoding="utf-8"))
+    scalar_binding = execution["scalar_handoff"]
+    runtime_entries = [entry for entry in case_payload["scalar_handoff"]["entries"] if entry["owner"] == "case_dependent"]
+    assert scalar_binding["state"] == "applied"
+    assert scalar_binding["mechanism"] == "comsol_cli_pname_plist"
+    assert scalar_binding["entries"] == case_payload["scalar_handoff"]["entries"]
+    assert scalar_binding["contract_sha256"] == scalar_handoff_contract.TRANSIENT_SCALAR_HANDOFF_CONTRACT_SHA256
+    assert scalar_binding["source"]["filename"] == "scalars.csv"
+    assert scalar_binding["source"]["sha256"] == case_payload["input_files"]["scalars.csv"]["sha256"]
+    assert scalar_binding["source"]["size_bytes"] == case_payload["input_files"]["scalars.csv"]["size_bytes"]
+    assert scalar_binding["source"]["path"] == str(outcome.work_directory / "scalars.csv")
+    assert scalar_binding["runtime_override_names"] == [entry["name"] for entry in runtime_entries]
+    assert scalar_binding["runtime_override_values"] == [entry["value"] for entry in runtime_entries]
+    arguments = execution["invocation"]["arguments"]
+    assert scalar_binding["formatted_plist_expressions"] == arguments[arguments.index("-plist") + 1].split(",")
+    assert scalar_binding["pindex_values"] == list(range(1, 13))
+    assert scalar_binding["original_comsol_output_filename"] == "solved.mph"
+    assert scalar_binding["canonical_solved_model_filename"] == "solved.mph"
     generation.runtime.finalize_batch(batch, storage_root=storage)
     admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
     assert admitted.batch_name == batch_name
@@ -307,16 +493,17 @@ def test_failure_timeout_missing_export_and_case_lock(
             future.result()
 
 
-def test_solver_receives_exact_isolated_cwd_and_relative_files(
+def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect explicit cwd, relative model arguments, and cleanup ordering."""
+    """Protect relative invocation plus atomic admission of one suffixed output."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
+        retain_solved_model=True,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
@@ -341,6 +528,7 @@ def test_solver_receives_exact_isolated_cwd_and_relative_files(
         "cleanup_case_workspace",
         cleanup_after_publication,
     )
+    monkeypatch.setenv("FAKE_COMSOL_SOLVED_MODEL_MODE", "suffixed")
     outcome = generation.runtime.run_case(
         config,
         1,
@@ -356,14 +544,125 @@ def test_solver_receives_exact_isolated_cwd_and_relative_files(
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
     assert timing["working_directory"] == str(outcome.work_directory)
     assert execution["invocation"]["working_directory"] == str(outcome.work_directory)
+    assert execution["schema_version"] == 2
     assert execution["result"]["state"] == "succeeded"
     assert execution["result"]["exit_code"] == 0
+    solved_model = outcome.processed_directory / "solved.mph"
+    assert execution["scalar_handoff"] == {
+        "state": "not_applicable",
+        "mechanism": "parameter_free",
+        "reason": "steady_flow_has_no_transient_scalar_runtime_overrides",
+        "original_comsol_output_filename": "solved_1.mph",
+        "canonical_solved_model_filename": "solved.mph",
+    }
+    solved_evidence = execution["result"]["solved_model"]
+    assert solved_evidence == {
+        "requested_relative_path": "solved.mph",
+        "observed_relative_path": "solved_1.mph",
+        "canonical_relative_path": "solved.mph",
+        "disposition": "new",
+        "canonicalized": True,
+        "size_bytes": solved_model.stat().st_size,
+        "sha256": common.serialization.file_sha256(solved_model),
+    }
+    publication = json.loads((outcome.processed_directory / "provenance.json").read_text(encoding="utf-8"))
+    assert publication["artifacts"]["solved.mph"] == {
+        "sha256": solved_evidence["sha256"],
+        "size_bytes": solved_evidence["size_bytes"],
+    }
     arguments = execution["invocation"]["arguments"]
     assert arguments[arguments.index("-inputfile") + 1] == "model.mph"
     assert arguments[arguments.index("-outputfile") + 1] == "solved.mph"
     case_payload = json.loads((outcome.processed_directory / "case.json").read_text(encoding="utf-8"))
     assert set(case_payload["input_files"]) == {"fields.csv"}
     assert "scalar_handoff" not in case_payload
+
+
+def test_solved_model_inventory_accepts_one_replaced_exact_candidate(tmp_path: Path) -> None:
+    """Distinguish a solver replacement from an unchanged stale exact output."""
+    work_directory = tmp_path / "replaced solved model"
+    work_directory.mkdir()
+    model = work_directory / "model.mph"
+    model.write_bytes(b"template model must never be selected\n")
+    solved_model = work_directory / "solved.mph"
+    solved_model.write_bytes(b"stale model\n")
+    before = runtime_service._solved_model_inventory(work_directory)  # noqa: SLF001
+    assert set(before) == {"solved.mph"}
+    solved_model.write_bytes(b"replacement model\n")
+
+    canonical, evidence = runtime_service._canonicalize_solved_model(  # noqa: SLF001
+        work_directory,
+        before,
+    )
+
+    assert canonical == solved_model
+    assert canonical.read_bytes() == b"replacement model\n"
+    assert model.read_bytes() == b"template model must never be selected\n"
+    assert evidence["observed_relative_path"] == "solved.mph"
+    assert evidence["disposition"] == "replaced"
+    assert evidence["canonicalized"] is False
+
+
+def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require exactly one valid solver-produced output after a zero exit."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    storage_root = tmp_path / "invalid solved storage"
+    work_root = tmp_path / "invalid solved work"
+    scenarios = (
+        ("missing", True, "observed none", ("solved*.mph",)),
+        ("multiple", False, "solved_1.mph, solved_2.mph", ("solved_1.mph", "solved_2.mph")),
+        ("empty", False, "unsafe or empty", ("solved.mph",)),
+        ("symlink", False, "unsafe or empty", ("solved.mph",)),
+    )
+    for worker_slot, (mode, create_stale, match, artifacts) in enumerate(scenarios):
+        case_index = config.case_indices[worker_slot % len(config.case_indices)]
+        prepared = runtime_service.prepare_case_work_directory(
+            config,
+            case_index,
+            storage_root=storage_root,
+            work_root=work_root,
+        )
+        stale_payload = b"stale solved model\n"
+        if create_stale:
+            (prepared.work_directory / "solved.mph").write_bytes(stale_payload)
+        monkeypatch.setenv("FAKE_COMSOL_SOLVED_MODEL_MODE", mode)
+        with pytest.raises(generation.runtime.CaseExecutionError, match=match) as caught:
+            runtime_service.execute_prepared_case(
+                config,
+                prepared,
+                cores_per_case=1,
+                worker_slot=worker_slot,
+            )
+        assert caught.value.exit_code == 0
+        assert caught.value.missing_or_invalid_artifacts == artifacts
+        if create_stale:
+            assert (prepared.work_directory / "solved.mph").read_bytes() == stale_payload
+        execution = json.loads((prepared.runtime_directory / "execution_provenance.json").read_text(encoding="utf-8"))
+        assert execution["result"]["state"] == "succeeded"
+        assert execution["result"]["solved_model"] is None
+        rejected_output = prepared.work_directory / "solved.mph"
+        if mode == "symlink":
+            assert rejected_output.is_symlink()
+            rejected_output.unlink()
+        workspace.cleanup_case_workspace(
+            prepared.work_directory,
+            allowed_root=prepared.work_root,
+            storage_root=storage_root.resolve(),
+            expected_run_id=prepared.workspace_run_id,
+            expected_case_id=prepared.bundle.case_id,
+        )
 
 
 def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(

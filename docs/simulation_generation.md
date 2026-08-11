@@ -190,9 +190,10 @@ keep ownership clear when a module is imported away from its directory.
 
 `src.generation` is the stable facade, and
 `python -m src.generation.cli.cli_generation` remains the supported command.
-Dependencies flow from contracts to cases to runtime, then into publication,
-validation, and top-level orchestration; lower packages never import workflow or
-CLI layers.
+Concrete dependencies flow from contracts to cases to publication, then to
+runtime and validation; top-level campaign, workflow, smoke, readiness, and CLI
+services orchestrate those owners. Lower packages never import workflow or CLI
+layers.
 
 After terminal publication, the workflow invokes `src.datasets.packages`. Dataset
 code mirrors the split through `dataset_contracts_*`, `dataset_packages_*`,
@@ -203,6 +204,46 @@ to one implementation. Training, EDA, and Evaluation import the public
 `datasets` alias with `from src import datasets`, not package directories or HDF5
 internals. The exact consumer aliases and Dataset responsibility table are in the
 [README](../README.md#-python-ownership-and-public-apis).
+
+## Transient scalar execution boundary
+
+Every transient case publishes an ordered 12-row `scalars.csv` file containing
+only values that vary by case and are actually supplied through COMSOL runtime
+parameter overrides. The exact order and units are in the
+[parameter reference](generation_parameter_reference.md#transient-scalar-handoff).
+One immutable admission in
+`generation.contracts.generation_contracts_scalar_handoff` validates the file
+and case provenance before execution, and runtime emits the same 12 entries
+through `-pname`, `-plist`, and `-pindex`. A steady command has none of these
+parameter flags.
+
+Python supplies `T_amb`; the corrected canonical template owns the derived alias
+`T_init = T_amb`. The fixed values `T_flow_ref`, `p_ref`, `p_out`, and
+`f_wet_dm_max` retain their existing scientific-configuration/template owners
+and are not duplicated into the case scalar handoff or its HDF5 vector. The
+canonical HDF5 runtime-scalar dataset therefore contains exactly the admitted
+12 case-dependent entries. The learned eight-scalar Dataset projection remains
+separate and unchanged.
+
+The schedule adapter has four total columns: one `t` argument column and three
+function-value columns `T_in_bc`, `omega_in_bc`, and `phi_in_bc`. The corrected
+saved template maps them to `T_in_bc_file`, `omega_in_bc_file`, and
+`phi_in_bc_file`, with linear interpolation and constant extrapolation. Adjacent
+hourly endpoints are sufficient to represent each interval; no interval
+aggregate is duplicated into the Dataset.
+
+COMSOL may add a suffix to a parameterized output. Runtime inventories only
+`solved*.mph` before launch, rejects unchanged or unsafe candidates after a zero
+exit, requires exactly one new or replaced nonempty regular file, and atomically
+canonicalizes it to `solved.mph`. Execution provenance preserves both filenames
+and the exact scalar CLI binding.
+
+The test-owned fake executable parses and uses the CLI values; static archive
+inspection verifies the saved descriptor; and the sidecar validates the exact
+canonical template bytes. These are contract and byte-identity evidence, not
+native solver evidence. A real transient technical smoke remains required to
+prove native parameter application, schedule-file reload, retained output, and
+the downstream HDF5/package/loader path.
 
 ## Transient Dataset time and sampling views
 
@@ -308,7 +349,7 @@ campaign with `validate-config` to review its exact cases, paired seed, package
 inventory, and retained-evidence policy. The gate requires:
 
 - every distinct case declared by both resolved technical campaigns;
-- case-local file reload and scalar handoff;
+- exact case-local scalar admission and twelve COMSOL CLI overrides;
 - validated raw exports and canonical HDF5;
 - paired shared inputs across the two profiles;
 - observed `p`, `u`, and `v` difference metrics without an invented tolerance;
@@ -319,9 +360,9 @@ inventory, and retained-evidence policy. The gate requires:
 
 Mapping probes inventory actual output files and headers. They never infer or
 write a mapping automatically. Fixed values reported as template-owned have no
-Python runtime setter; their configured record is bound to the canonical
-hashed template and model-report evidence, while case-adapter reload still
-requires native runtime evidence.
+Python runtime override; their configured record is bound to the canonical
+hashed template and model-report evidence. Case-dependent values use the
+admitted CLI vector and still require native runtime evidence.
 
 ## Configured transient pilot check
 

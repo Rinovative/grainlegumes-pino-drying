@@ -10,7 +10,7 @@ Responsibilities:
 Design principles:
   - Schedule class is metadata and never selects a production implementation path
   - All event details and activation decisions are label-derived provenance
-  - The configured complete schedule owns the reference temperature
+  - The configured complete schedule owns only time-dependent inlet forcing
 This module does NOT:
   - Define material ranges, COMSOL interpolation tags, or alternate class generators
   - Infer values from an early solver stop
@@ -57,7 +57,6 @@ class Schedule:
 
     values: np.ndarray
     metadata: dict[str, Any]
-    derived_scalars: dict[str, float]
 
     @property
     def diagnostics(self) -> dict[str, float | int]:
@@ -387,7 +386,6 @@ def generate_schedule(
         )
         raise ValueError(message)
     values_array = np.column_stack((time, temperature, humidity_ratio, relative_humidity)).astype(np.float64, copy=False)
-    reference_temperature = float(np.trapezoid(temperature, time) / (time[-1] - time[0]))
     component_amplitudes = {
         "temperature": {name: temperature_amplitude * weights[name] if active[name] else 0.0 for name in weights},
         "humidity_ratio": {name: humidity_amplitude * weights[name] if active[name] else 0.0 for name in weights},
@@ -463,5 +461,4 @@ def generate_schedule(
                 },
             },
         },
-        derived_scalars={"T_in_ref": reference_temperature},
     )

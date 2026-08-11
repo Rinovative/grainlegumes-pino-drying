@@ -9,6 +9,7 @@ Provides:
 - profiles: canonical simulation-profile schemas
 - provenance: scientific-source provenance admission
 - registry: typed scientific parameter registry
+- scalar_handoff: exact transient scalar-source admission and immutable entries
 - source: source-repository provenance validation
 - vocabulary: campaign, evaluation, and membership vocabulary
 - EvaluationRegime: canonical package evaluation-regime type
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from . import generation_contracts_profiles as profiles
     from . import generation_contracts_provenance as provenance
     from . import generation_contracts_registry as registry
+    from . import generation_contracts_scalar_handoff as scalar_handoff
     from . import generation_contracts_source as source
     from . import generation_contracts_vocabulary as vocabulary
     from .generation_contracts_descriptors import (
@@ -61,6 +63,7 @@ _MODULES = {
     "profiles": "generation_contracts_profiles",
     "provenance": "generation_contracts_provenance",
     "registry": "generation_contracts_registry",
+    "scalar_handoff": "generation_contracts_scalar_handoff",
     "source": "generation_contracts_source",
     "vocabulary": "generation_contracts_vocabulary",
 }
@@ -97,6 +100,7 @@ __all__ = [
     "profiles",
     "provenance",
     "registry",
+    "scalar_handoff",
     "source",
     "validate_git_commit",
     "vocabulary",

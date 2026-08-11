@@ -30,6 +30,7 @@ from src import common
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_paths as path_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
 from . import generation_cases_config as config_contract
@@ -92,14 +93,12 @@ class CaseBundle:
     simulation_case_id: str
     case_payload: dict[str, Any]
     input_paths: tuple[Path, ...]
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None
 
 
 def _format_number(value: float) -> str:
-    """Format one finite number with locale-independent round-trip precision."""
-    if not math.isfinite(value):
-        msg = f"Cannot serialize non-finite numeric value {value!r}."
-        raise ValueError(msg)
-    return format(float(value), ".17g")
+    """Format one finite number with the shared scalar round-trip contract."""
+    return scalar_handoff_contract.format_scalar_number(value)
 
 
 def _table_text(rows: list[list[str]], *, delimiter: str) -> str:
@@ -128,37 +127,13 @@ def _write_spatial_file(destination: Path, fields: fields_service.SpatialFields,
 def _write_scalar_file(
     destination: Path,
     spec: dict[str, Any],
-    profile_id: str,
     values: dict[str, Any],
     units: dict[str, str],
-) -> tuple[Path, list[dict[str, Any]]]:
-    """Write and validate the sole profile-owned long-form scalar handoff."""
-    field_names = profiles.scalar_input_fields(profile_id)
-    expected_units = profiles.scalar_input_units(profile_id)
-    package_fixed = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
-    entries: list[dict[str, Any]] = []
-    for name, expected_unit in zip(field_names, expected_units, strict=True):
-        if name not in values:
-            msg = f"Required scalar adapter value {name!r} is unresolved."
-            raise ValueError(msg)
-        number = float(values[name])
-        if not math.isfinite(number):
-            msg = f"Required scalar adapter value {name!r} is non-finite."
-            raise ValueError(msg)
-        unit = units.get(name)
-        if unit != expected_unit:
-            msg = f"Scalar adapter unit for {name!r} must be {expected_unit!r}, got {unit!r}."
-            raise ValueError(msg)
-        entries.append(
-            {
-                "name": name,
-                "value": number,
-                "unit": unit,
-                "owner": "package_fixed" if name in package_fixed else "case_dependent",
-            }
-        )
+) -> tuple[Path, tuple[scalar_handoff_contract.ScalarHandoffEntry, ...]]:
+    """Write the sole profile-owned long-form scalar handoff."""
+    entries = scalar_handoff_contract.build_transient_scalar_entries(values, units)
     rows = [["name", "value", "unit"]]
-    rows.extend([[entry["name"], _format_number(entry["value"]), entry["unit"]] for entry in entries])
+    rows.extend([[entry.name, scalar_handoff_contract.format_scalar_number(entry.value), entry.unit] for entry in entries])
     path = destination / spec["filename"]
     common.serialization.atomic_write_text(path, _table_text(rows, delimiter=spec["delimiter"]))
     return path, entries
@@ -268,8 +243,9 @@ def generate_case_input_bundle(
             msg = f"Package-fixed stationary scalar {name!r} is unresolved."
             raise ValueError(msg)
         number = float(value)
-        values[name] = number
-        units[name] = unit
+        if config.profile.id == profiles.STEADY_FLOW_PROFILE:
+            values[name] = number
+            units[name] = unit
         stationary_fixed_entries.append(
             {
                 "name": name,
@@ -279,9 +255,6 @@ def generate_case_input_bundle(
                 "runtime_source": "canonical_template",
             }
         )
-    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-        values["f_wet_dm_max"] = fixed["f_wet_dm_max"]
-        units["f_wet_dm_max"] = "1"
     subseeds = _subseeds(config, case_index)
 
     schedule: schedule_service.Schedule | None = None
@@ -292,8 +265,6 @@ def generate_case_input_bundle(
             fixed,
             seeds={name: subseeds[name] for name in ("schedule_shared", "schedule_independent")},
         )
-        values.update(schedule.derived_scalars)
-        units["T_in_ref"] = "K"
 
     family_contract = config.scientific_values["material"]
     spatial_seed_names: tuple[str, ...] = ("bed", "pressure_bc")
@@ -334,17 +305,15 @@ def generate_case_input_bundle(
                 for name in schedule_seed_names
             },
         )
-        values.update(schedule.derived_scalars)
     input_contract = config.scientific_values["input_contract"]
     spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
     input_paths_list = [spatial_path]
     scalar_path: Path | None = None
-    scalar_entries: list[dict[str, Any]] | None = None
+    scalar_entries: tuple[scalar_handoff_contract.ScalarHandoffEntry, ...] | None = None
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         scalar_path, scalar_entries = _write_scalar_file(
             bundle_dir,
             input_contract["scalar"],
-            config.profile.id,
             values,
             units,
         )
@@ -432,16 +401,25 @@ def generate_case_input_bundle(
             "dataset_membership": "none",
         }
     if scalar_path is not None and scalar_entries is not None:
+        scalar_entries_payload = [entry.as_dict() for entry in scalar_entries]
         case_payload["scalar_handoff"] = {
             "mechanism": "case_local_long_form_csv",
             "filename": scalar_path.name,
             "fresh_per_case": True,
             "runtime_validation": "required",
-            "entries": scalar_entries,
+            "entries": scalar_entries_payload,
         }
-        case_payload["scalars"] = scalar_entries
+        case_payload["scalars"] = scalar_entries_payload
     if schedule is not None:
         case_payload["schedule_diagnostics"] = schedule.metadata
+    scalar_admission = (
+        None
+        if scalar_path is None
+        else scalar_handoff_contract.admit_case_scalar_handoff(
+            case_payload,
+            bundle_dir,
+        )
+    )
     case_payload["case_input_id"] = compute_case_input_id(case_payload)
     case_payload["simulation_case_id"] = compute_simulation_case_id(case_payload)
     common.serialization.atomic_write_json(bundle_dir / "case.json", case_payload)
@@ -452,4 +430,5 @@ def generate_case_input_bundle(
         simulation_case_id=case_payload["simulation_case_id"],
         case_payload=case_payload,
         input_paths=input_paths,
+        scalar_handoff=scalar_admission,
     )

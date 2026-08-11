@@ -58,12 +58,8 @@ SCHEDULE_FIELDS: Final = ("t", "T_in_bc", "omega_in_bc", "phi_in_bc")
 SCHEDULE_UNITS: Final = ("h", "K", "kg/kg", "1")
 STATIONARY_FIXED_FIELDS: Final = ("T_flow_ref", "p_ref", "p_out")
 STATIONARY_FIXED_UNITS: Final = ("K", "Pa", "Pa")
-TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS: Final = (*STATIONARY_FIXED_FIELDS, "f_wet_dm_max")
 TRANSIENT_SCALAR_INPUT_FIELDS: Final = (
-    *STATIONARY_FIXED_FIELDS,
-    "T_init",
     "T_amb",
-    "T_in_ref",
     "eps_bed_cal_ref",
     "rho_bu_dry_ref",
     "k_gr",
@@ -75,12 +71,8 @@ TRANSIENT_SCALAR_INPUT_FIELDS: Final = (
     "A_osw",
     "B_osw",
     "C_osw",
-    "f_wet_dm_max",
 )
 TRANSIENT_SCALAR_INPUT_UNITS: Final = (
-    *STATIONARY_FIXED_UNITS,
-    "K",
-    "K",
     "K",
     "1",
     "kg/m^3",
@@ -93,8 +85,15 @@ TRANSIENT_SCALAR_INPUT_UNITS: Final = (
     "1",
     "1/K",
     "1",
-    "1",
 )
+_TRANSIENT_SCALAR_COUNT: Final = 12
+if (
+    len(TRANSIENT_SCALAR_INPUT_FIELDS) != _TRANSIENT_SCALAR_COUNT
+    or len(TRANSIENT_SCALAR_INPUT_FIELDS) != len(set(TRANSIENT_SCALAR_INPUT_FIELDS))
+    or len(TRANSIENT_SCALAR_INPUT_UNITS) != len(TRANSIENT_SCALAR_INPUT_FIELDS)
+):
+    message = "Transient runtime scalar names and units are inconsistent."
+    raise RuntimeError(message)
 STEADY_STATIC_FIELD_NAMES: Final = (
     "Kxx",
     "Kxy",

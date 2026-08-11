@@ -82,7 +82,18 @@ _FINAL_PHYSICAL_FORMULAS = {
 }
 _SEEN_SPLITS = frozenset((*ID_MEMBERSHIPS, "parameter_ood"))
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-_COMSOL_OWNED_ARGUMENTS = ("-inputfile", "-outputfile", "-np", "-nn", "-nnhost", "-mpihosts")
+_COMSOL_OWNED_ARGUMENTS = (
+    "-inputfile",
+    "-outputfile",
+    "-np",
+    "-nn",
+    "-nnhost",
+    "-mpihosts",
+    "-pname",
+    "-plist",
+    "-pindex",
+    "-paramfile",
+)
 _SCHEDULER_OWNED_OPTIONS = (
     "--parsable",
     "--nodes",
@@ -1701,7 +1712,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         msg = "execution.runtime.extra_arguments must be an ordered list of safe arguments."
         raise GenerationConfigError(msg)
     if any(item == owned or item.startswith(f"{owned}=") for item in arguments for owned in _COMSOL_OWNED_ARGUMENTS):
-        msg = "execution.runtime.extra_arguments cannot override case-owned files or one-node execution."
+        msg = "execution.runtime.extra_arguments cannot override runtime-owned COMSOL arguments."
         raise GenerationConfigError(msg)
     runtime["executable"] = site["comsol_executable"]
     runtime["module_initialization"] = [

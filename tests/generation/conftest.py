@@ -154,6 +154,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         retain_solved_model: bool = False,
         retain_raw_csv: bool = False,
         repeated_airflow_times: bool = False,
+        extra_arguments: tuple[str, ...] = (),
         natural_count: int = _SMOKE_CASE_COUNT,
         parameter_ood_count: int = 0,
     ) -> tuple[Path, Path]:
@@ -170,6 +171,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         )
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
         execution["runtime"]["timeout_seconds"] = timeout
+        execution["runtime"]["extra_arguments"] = list(extra_arguments)
         execution["retention"]["technical_runtime_smoke"] = {
             "retain_raw_csv": retain_raw_csv,
             "retain_solved_model": retain_solved_model,
@@ -256,6 +258,7 @@ def fake_comsol(tmp_path: Path) -> Path:
 import csv
 import fcntl
 import json
+import math
 import os
 import pathlib
 import sys
@@ -305,9 +308,43 @@ def wait_for_expected_starts():
     raise RuntimeError(f"timed out waiting for {expected} fake COMSOL starts")
 
 
-def scalar_values():
-    with pathlib.Path("scalars.csv").open(encoding="utf-8", newline="") as stream:
-        return {row["name"]: float(row["value"]) for row in csv.DictReader(stream, delimiter=";")}
+def runtime_scalar_values(arguments, case):
+    handoff = case.get("scalar_handoff")
+    entries = None if not isinstance(handoff, dict) else handoff.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("transient fake COMSOL requires recorded scalar handoff entries")
+    runtime_entries = [entry for entry in entries if entry.get("owner") == "case_dependent"]
+    if len(entries) != 12 or runtime_entries != entries:
+        raise RuntimeError("fake COMSOL scalar handoff is not the canonical 12-field runtime vector")
+    flags = ("-pname", "-plist", "-pindex")
+    if any(arguments.count(flag) != 1 for flag in flags):
+        raise RuntimeError("fake COMSOL requires exactly one pname/plist/pindex vector")
+    names = arguments[arguments.index("-pname") + 1].split(",")
+    values = arguments[arguments.index("-plist") + 1].split(",")
+    indices = arguments[arguments.index("-pindex") + 1].split(",")
+    expected_names = [entry["name"] for entry in runtime_entries]
+    expected_indices = [str(index) for index in range(1, 13)]
+    if names != expected_names or indices != expected_indices or len(values) != 12:
+        raise RuntimeError("fake COMSOL received a misordered or incomplete runtime scalar vector")
+    parsed = {}
+    for encoded, entry in zip(values, runtime_entries):
+        unit = entry["unit"]
+        if unit == "1":
+            if "[" in encoded or "]" in encoded:
+                raise RuntimeError("dimensionless fake COMSOL parameters cannot carry [1]")
+            number_text = encoded
+        else:
+            suffix = f"[{unit}]"
+            if not encoded.endswith(suffix):
+                raise RuntimeError(f"fake COMSOL parameter {entry['name']} lacks unit {unit}")
+            number_text = encoded[: -len(suffix)]
+        number = float(number_text)
+        if not math.isfinite(number) or format(number, ".17g") != number_text:
+            raise RuntimeError(f"fake COMSOL parameter {entry['name']} is not canonical finite text")
+        if number != float(entry["value"]):
+            raise RuntimeError(f"fake COMSOL parameter {entry['name']} disagrees with case provenance")
+        parsed[entry["name"]] = number
+    return parsed
 
 
 mode = os.environ.get("FAKE_COMSOL_MODE", "success")
@@ -322,12 +359,30 @@ try:
     else:
         time.sleep(float(os.environ.get("FAKE_COMSOL_DELAY", "0")))
         arguments = sys.argv[1:]
-        pathlib.Path(arguments[arguments.index("-outputfile") + 1]).write_bytes(b"synthetic solved model\n")
         case = json.loads(pathlib.Path("case.json").read_text(encoding="utf-8"))
+        transient_profile = case["simulation_profile"] == "transient_drying"
+        scalars = runtime_scalar_values(arguments, case) if transient_profile else {}
+        requested_output = arguments[arguments.index("-outputfile") + 1]
+        solved_model_mode = os.environ.get("FAKE_COMSOL_SOLVED_MODEL_MODE", "canonical")
+        solved_model_outputs = {
+            "canonical": (requested_output,),
+            "suffixed": ("solved_1.mph",),
+            "multiple": ("solved_1.mph", "solved_2.mph"),
+            "missing": (),
+            "empty": (requested_output,),
+            "symlink": (requested_output,),
+        }
+        if solved_model_mode not in solved_model_outputs:
+            raise RuntimeError(f"unsupported fake solved-model mode: {solved_model_mode}")
+        for solved_model_output in solved_model_outputs[solved_model_mode]:
+            solved_model_path = pathlib.Path(solved_model_output)
+            if solved_model_mode == "symlink":
+                solved_model_path.symlink_to("model.mph")
+            else:
+                payload = b"" if solved_model_mode == "empty" else b"synthetic solved model\n"
+                solved_model_path.write_bytes(payload)
         with pathlib.Path("fields.csv").open(encoding="utf-8", newline="") as stream:
             inputs = list(csv.DictReader(stream, delimiter=";"))
-        transient_profile = case["simulation_profile"] == "transient_drying"
-        scalars = scalar_values() if transient_profile else {}
         x_values = [float(source["x"]) for source in inputs]
         y_values = [float(source["y"]) for source in inputs]
         x_min, x_max = min(x_values), max(x_values)

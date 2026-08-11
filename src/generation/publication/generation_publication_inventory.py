@@ -48,9 +48,7 @@ _MATERIAL_VALUE_PARAMETERS: Final = frozenset(
 )
 _TRANSIENT_SCALAR_PARAMETERS: Final = frozenset(
     {
-        "T_init",
         "T_amb",
-        "T_in_ref",
         "eps_bed_cal_ref",
         "rho_bu_dry_ref",
         "k_gr",
@@ -67,7 +65,7 @@ _TRANSIENT_ONLY_CONSUMERS: Final = frozenset(
         "generation.cases.generation_cases_fields._initial_moisture",
         "generation.cases.generation_cases_schedule.generate_schedule",
         "generation.cases.generation_cases_fields derived dry-density fields",
-        "generation.cases.generation_cases_case transient scalar COMSOL adapter",
+        "generation.runtime.generation_runtime_batch admitted COMSOL CLI scalar override",
         "common.physical_formulas COMSOL expression contract",
     }
 )
@@ -82,14 +80,10 @@ COMSOL_INPUT_SOURCES: Final = MappingProxyType(
         "eps_bed": "generation.cases.generation_cases_fields porosity map",
         "p_in_bc": "generation.cases.generation_cases_fields inlet-pressure boundary",
         "X_0_db_field": "generation.cases.generation_cases_fields initial-moisture field",
-        **{
-            name: (
-                "common.scientific_fixed_values"
-                if name in profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS
-                else "typed parameter registry or deterministic derivation"
-            )
-            for name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS
-        },
+        **dict.fromkeys(
+            profiles.TRANSIENT_SCALAR_INPUT_FIELDS,
+            "typed parameter registry or deterministic derivation",
+        ),
         **dict.fromkeys(profiles.SCHEDULE_FIELDS, "generation.cases.generation_cases_schedule regular hourly nodes"),
     }
 )
@@ -174,12 +168,14 @@ def parameter_consumers(
         consumers.append("generation.cases.generation_cases_fields._pressure_boundary")
     if name.startswith("initial_moisture."):
         consumers.append("generation.cases.generation_cases_fields._initial_moisture")
-    if entry.get("block") == "operation":
+    if entry.get("block") == "operation" and name != "T_init":
         consumers.append("generation.cases.generation_cases_schedule.generate_schedule")
+    if name == "T_init":
+        consumers.append("canonical COMSOL template derived alias and generation.validation.generation_validation_sentinels")
     if name in {"rho_bu_dry_ref", "eps_bed_cal_ref"}:
         consumers.append("generation.cases.generation_cases_fields derived dry-density fields")
     if name in _TRANSIENT_SCALAR_PARAMETERS:
-        consumers.append("generation.cases.generation_cases_case transient scalar COMSOL adapter")
+        consumers.append("generation.runtime.generation_runtime_batch admitted COMSOL CLI scalar override")
     if name in {"r_surf", "r_int"}:
         consumers.append("common.physical_formulas COMSOL expression contract")
     return tuple(consumer for consumer in consumers if not (profile_id == profiles.STEADY_FLOW_PROFILE and consumer in _TRANSIENT_ONLY_CONSUMERS))
@@ -397,7 +393,8 @@ _SCHEDULE_FIXED_CONSUMERS: Final = frozenset(
 )
 _TEMPLATE_FIXED_NAMES: Final = frozenset(
     {
-        *profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS,
+        *profiles.STATIONARY_FIXED_FIELDS,
+        "f_wet_dm_max",
         "phi_clip_min",
         "phi_clip_max",
         "cp_w",
@@ -428,16 +425,16 @@ def _inspect_fixed_value(
     schedule_consumer = profile_id == profiles.TRANSIENT_DRYING_PROFILE and name in _SCHEDULE_FIXED_CONSUMERS
     if schedule_consumer:
         consumers.append("generation.cases.generation_cases_schedule feasibility or psychrometric conversion")
-    scalar_adapter = profile_id == profiles.TRANSIENT_DRYING_PROFILE and name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS
-    if scalar_adapter:
-        consumers.append("generation.cases.generation_cases_case transient scalar COMSOL adapter")
+    scalar_provenance = profile_id == profiles.TRANSIENT_DRYING_PROFILE and name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    if scalar_provenance:
+        consumers.append(
+            "generation.contracts.generation_contracts_scalar_handoff case provenance and generation.publication.generation_publication_storage HDF5"
+        )
     steady_template_consumer = profile_id == profiles.STEADY_FLOW_PROFILE and name in profiles.STATIONARY_FIXED_FIELDS
     if steady_template_consumer:
         consumers.append("canonical steady COMSOL template fixed conditioning")
-    template_consumer = (
-        name in _TEMPLATE_FIXED_NAMES
-        and not scalar_adapter
-        and not (profile_id == profiles.STEADY_FLOW_PROFILE and name in profiles.STATIONARY_FIXED_FIELDS)
+    template_consumer = name in _TEMPLATE_FIXED_NAMES and not (
+        profile_id == profiles.STEADY_FLOW_PROFILE and name in profiles.STATIONARY_FIXED_FIELDS
     )
     if template_consumer:
         consumers.append("canonical COMSOL template fixed physics; Python has no runtime setter")
@@ -445,9 +442,7 @@ def _inspect_fixed_value(
         consumers.append("generation.publication.generation_publication_storage and pilot exact-stop validation")
     provenance = copy.deepcopy(record["provenance"])
     runtime_state = (
-        "case_adapter_requires_native_reload_evidence"
-        if scalar_adapter
-        else "generator_consumed_and_template_fixed_requires_native_verification"
+        "generator_consumed_and_template_fixed_requires_native_verification"
         if schedule_consumer and template_consumer
         else "generator_consumed"
         if schedule_consumer
@@ -479,11 +474,11 @@ def _inspect_fixed_value(
             "sampler": "not_sampled",
             "effective_downstream_consumers": consumers,
             "runtime_mapping_state": runtime_state,
-            "case_provenance": ("case.json.sampled_values and scalar_handoff" if scalar_adapter else "resolved scientific config only"),
+            "case_provenance": ("case.json.sampled_values and scalar_handoff" if scalar_provenance else "resolved scientific config only"),
             "hdf5_config_provenance": "provenance/scientific_config_json.scientific_fixed_records",
             "hdf5_realized_provenance": (
                 "scalar values and provenance/case_scientific_provenance_json.sampled_values"
-                if scalar_adapter
+                if scalar_provenance
                 else "no separate realized value; fixed contract remains in scientific_config_json"
             ),
         },

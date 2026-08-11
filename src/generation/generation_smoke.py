@@ -579,13 +579,10 @@ def _variation_report(
             raise RuntimeError(message)
         schedule_difference = max(float(np.max(np.abs(reference.schedule - case.schedule))) for case in contrasts if case.schedule is not None)
         moisture_difference = max(float(np.max(np.abs(reference.static["X_0_db_field"] - case.static["X_0_db_field"]))) for case in contrasts)
-        fixed = frozenset(profiles.TRANSIENT_PACKAGE_FIXED_SCALAR_FIELDS)
         common_scalar_names = set(reference.scalars)
         for case in contrasts:
             common_scalar_names.intersection_update(case.scalars)
-        changed_scalars = sorted(
-            name for name in common_scalar_names if name not in fixed and any(reference.scalars[name] != case.scalars[name] for case in contrasts)
-        )
+        changed_scalars = sorted(name for name in common_scalar_names if any(reference.scalars[name] != case.scalars[name] for case in contrasts))
         if schedule_difference == 0.0 or moisture_difference == 0.0 or not changed_scalars:
             message = "Configured transient smoke did not vary schedule, initial moisture, and a case-dependent scalar."
             raise RuntimeError(message)
