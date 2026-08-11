@@ -431,7 +431,16 @@ creation. Canonical HDF5 publication calls the same owner and writes an exact
 `(12,)` float64 runtime-scalar dataset with the same names, units, ownership,
 and values. Older scalar layouts fail exact admission and must be regenerated.
 The learned Dataset view remains a separately name-selected eight-field
-projection.
+projection owned by
+`src/datasets/contracts/dataset_contracts_transient.py`:
+`r_surf_0`, `r_int_surf`, `f_surf`, `A_osw`, `B_osw`, `C_osw`, `k_gr`, and
+`cp_gr_dry`. The three transfer terms and three Oswin coefficients preserve the
+case-specific moisture kinetics and equilibrium relation; the two thermal
+properties preserve granular heat transport and storage. The four remaining
+runtime values have other model-facing owners: `T_amb` is step-boundary
+conditioning, while `eps_bed_cal_ref` and `rho_bu_dry_ref` are represented by
+the realized `eps_bed` and `rho_bu_dry` static fields. `X_target_wb` controls
+termination diagnostics and is not a training transition or rollout input.
 
 The schedule is a separate four-column time-dependent adapter:
 `t,T_in_bc,omega_in_bc,phi_in_bc`. The corrected native interpolation feature

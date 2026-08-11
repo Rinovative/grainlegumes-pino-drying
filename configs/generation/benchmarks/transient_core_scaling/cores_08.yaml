@@ -1,0 +1,5 @@
+schema_kind: generation_core_scaling_benchmark_variant
+schema_version: 1
+suite_config: configs/generation/benchmarks/transient_core_scaling/suite.yaml
+variant_id: cores_08
+cores_per_case: 8

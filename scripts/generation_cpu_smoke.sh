@@ -1,8 +1,9 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 15 )); then
-  printf 'Usage: %s VENV CAMPAIGN STORAGE ONLY_BATCH MAX_NODES CASES_PER_NODE CORES_PER_CASE MAX_PARALLEL CORES_PER_NODE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER\n' "$0" >&2
+if (( $# != 11 )); then
+  printf '%s\n' \
+    "Usage: $0 VENV CAMPAIGN STORAGE ONLY_BATCH CORES_PER_CASE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -16,17 +17,13 @@ GENERATION_CPU_VENV="$1"
 CAMPAIGN_CONFIG="$2"
 STORAGE_ROOT="$3"
 ONLY_BATCH="$4"
-MAX_NODES="$5"
-CASES_PER_NODE="$6"
-CORES_PER_CASE="$7"
-MAX_PARALLEL_CASES="$8"
-CORES_PER_NODE="$9"
-PREFLIGHT_MODE="${10}"
-PYTHON_MODULE="${11}"
-COMSOL_MODULE="${12}"
-PYTHON_EXECUTABLE="${13}"
-COMSOL_EXECUTABLE="${14}"
-SCHEDULER_KIND="${15}"
+CORES_PER_CASE="$5"
+PREFLIGHT_MODE="$6"
+PYTHON_MODULE="$7"
+COMSOL_MODULE="$8"
+PYTHON_EXECUTABLE="$9"
+COMSOL_EXECUTABLE="${10}"
+SCHEDULER_KIND="${11}"
 
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_CONFIG}" != /* ]]; then
   printf 'Venv, campaign, and storage paths must be absolute.\n' >&2
@@ -40,7 +37,6 @@ if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != producti
   printf 'Mode must be environment-only, production-ready, or mapping-probe.\n' >&2
   exit 2
 fi
-
 for value in "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
   "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}"; do
   [[ -n "${value}" && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || {
@@ -52,13 +48,13 @@ done
   printf 'CPU preflight requires configured scheduler=slurm.\n' >&2
   exit 2
 }
+
 module load "${PYTHON_MODULE}"
 module load "${COMSOL_MODULE}"
 command -v "${PYTHON_EXECUTABLE}"
 "${PYTHON_EXECUTABLE}" --version
 command -v "${COMSOL_EXECUTABLE}"
-COMSOL_VERSION_OUTPUT="$("${COMSOL_EXECUTABLE}" -version 2>&1)"
-printf '%s\n' "${COMSOL_VERSION_OUTPUT}"
+"${COMSOL_EXECUTABLE}" -version
 command -v sbatch
 sbatch --version
 command -v squeue
@@ -98,11 +94,6 @@ if [[ "${PREFLIGHT_MODE}" == mapping-probe ]]; then
     --work-root "${PROBE_ROOT}"
     --cores-per-case "${CORES_PER_CASE}"
   )
-  if [[ "${ONLY_BATCH}" != - ]]; then
-    COMMAND+=(--only-batch "${ONLY_BATCH}")
-  fi
-  "${COMMAND[@]}"
-  printf 'Native COMSOL mapping probe completed on %s.\n' "$(hostname)"
 else
   COMMAND=(
     "${GENERATION_CPU_VENV}/bin/python"
@@ -111,18 +102,13 @@ else
     --storage-root "${STORAGE_ROOT}"
     --work-root "${PROBE_ROOT}"
     --venv-path "${GENERATION_CPU_VENV}"
-    --max-nodes "${MAX_NODES}"
-    --cases-per-node "${CASES_PER_NODE}"
-    --cores-per-case "${CORES_PER_CASE}"
-    --max-parallel-cases "${MAX_PARALLEL_CASES}"
-    --cores-per-node "${CORES_PER_NODE}"
   )
-  if [[ "${ONLY_BATCH}" != - ]]; then
-    COMMAND+=(--only-batch "${ONLY_BATCH}")
-  fi
   if [[ "${PREFLIGHT_MODE}" == environment-only ]]; then
     COMMAND+=(--environment-only)
   fi
-  "${COMMAND[@]}"
-  printf 'Native CPU preflight completed on %s.\n' "$(hostname)"
 fi
+if [[ "${ONLY_BATCH}" != - ]]; then
+  COMMAND+=(--only-batch "${ONLY_BATCH}")
+fi
+"${COMMAND[@]}"
+printf 'Native CPU %s completed on %s.\n' "${PREFLIGHT_MODE}" "$(hostname)"

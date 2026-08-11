@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from src import common
+from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_readiness as readiness_service
 from src.generation import generation_smoke as smoke_service
@@ -67,13 +68,10 @@ def _add_batch_selection(parser: argparse.ArgumentParser, *, required: bool = Tr
     parser.add_argument("--only-batch", required=required)
 
 
-def _add_resources(parser: argparse.ArgumentParser) -> None:
-    """Add the four mandatory production resource controls and one capacity override."""
-    parser.add_argument("--max-nodes", type=int, required=True)
-    parser.add_argument("--cases-per-node", type=int, required=True)
+def _add_local_resources(parser: argparse.ArgumentParser) -> None:
+    """Add genuine local-development core and concurrency controls."""
     parser.add_argument("--cores-per-case", type=int, required=True)
     parser.add_argument("--max-parallel-cases", type=int, required=True)
-    parser.add_argument("--cores-per-node", type=int)
 
 
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centralized thin CLI parser
@@ -148,6 +146,110 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     validate_smoke.add_argument("receipt", type=Path, nargs="?")
     validate_smoke.add_argument("--storage-root", type=Path, required=True)
 
+    inspect_benchmark = subparsers.add_parser(
+        "inspect-core-benchmark",
+        help="resolve the same-case core-scaling suite without materializing inputs",
+    )
+    inspect_benchmark.add_argument("suite", type=Path)
+    inspect_benchmark.add_argument("--variant")
+    inspect_benchmark.add_argument("--require-executable", action="store_true")
+
+    plan_benchmark = subparsers.add_parser(
+        "plan-core-benchmark",
+        help="validate native evidence and print isolated Slurm submissions",
+    )
+    plan_benchmark.add_argument("suite", type=Path)
+    plan_benchmark.add_argument("--git-commit", required=True)
+    plan_benchmark.add_argument("--variant")
+    plan_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    submit_benchmark = subparsers.add_parser(
+        "submit-core-benchmark",
+        help="submit the shared-case four-variant core-scaling benchmark",
+    )
+    submit_benchmark.add_argument("suite", type=Path)
+    submit_benchmark.add_argument("--git-commit", required=True)
+    submit_benchmark.add_argument("--variant")
+    submit_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    prepare_benchmark = subparsers.add_parser(
+        "prepare-core-benchmark-case",
+        help="materialize and prove the canonical benchmark case on a CPU node",
+    )
+    prepare_benchmark.add_argument("benchmark_run_id")
+    prepare_benchmark.add_argument("--storage-root", type=Path, required=True)
+    prepare_benchmark.add_argument("--work-root", type=Path, required=True)
+
+    run_benchmark = subparsers.add_parser(
+        "run-core-benchmark-repetition",
+        help="run one isolated, identity-checked benchmark repetition",
+    )
+    run_benchmark.add_argument("benchmark_run_id")
+    run_benchmark.add_argument("variant_id")
+    run_benchmark.add_argument("repetition", type=int)
+    run_benchmark.add_argument("--storage-root", type=Path, required=True)
+    run_benchmark.add_argument("--work-root", type=Path, required=True)
+
+    benchmark_status = subparsers.add_parser(
+        "core-benchmark-status",
+        help="reconstruct benchmark repetition and scheduler state",
+    )
+    benchmark_status.add_argument("benchmark_run_id")
+    benchmark_status.add_argument("--no-scheduler", action="store_true")
+    benchmark_status.add_argument("--format", choices=("json", "state"), default="json")
+    benchmark_status.add_argument("--storage-root", type=Path, required=True)
+
+    resume_benchmark = subparsers.add_parser(
+        "resume-core-benchmark",
+        help="submit only benchmark repetitions without successful evidence",
+    )
+    resume_benchmark.add_argument("benchmark_run_id")
+    resume_benchmark.add_argument("--variant")
+    resume_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    finalize_benchmark = subparsers.add_parser(
+        "finalize-core-benchmark",
+        help="publish per-run and aggregate core-scaling evidence",
+    )
+    finalize_benchmark.add_argument("benchmark_run_id")
+    finalize_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    benchmark_transfer = subparsers.add_parser(
+        "core-benchmark-transfer-plan",
+        help="print the terminal benchmark evidence directory",
+    )
+    benchmark_transfer.add_argument("benchmark_run_id")
+    benchmark_transfer.add_argument("--format", choices=("json", "tsv"), default="json")
+    benchmark_transfer.add_argument("--storage-root", type=Path, required=True)
+
+    publish_benchmark = subparsers.add_parser(
+        "publish-transferred-core-benchmark",
+        help="validate and atomically publish staged benchmark evidence",
+    )
+    publish_benchmark.add_argument("benchmark_run_id")
+    publish_benchmark.add_argument("--staging-root", type=Path, required=True)
+    publish_benchmark.add_argument("--destination-root", type=Path, required=True)
+    publish_benchmark.add_argument("--source-host", required=True)
+    publish_benchmark.add_argument("--source-storage-root", required=True)
+    publish_benchmark.add_argument("--expected-inventory-sha256", required=True)
+    publish_benchmark.add_argument("--expected-file-count", type=int, required=True)
+    publish_benchmark.add_argument("--expected-size-bytes", type=int, required=True)
+
+    validate_benchmark = subparsers.add_parser(
+        "validate-core-benchmark",
+        help="validate terminal benchmark evidence and dataset isolation",
+    )
+    validate_benchmark.add_argument("benchmark_run_id")
+    validate_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    summarize_benchmark = subparsers.add_parser(
+        "core-benchmark-summary",
+        help="display the terminal benchmark summary",
+    )
+    summarize_benchmark.add_argument("benchmark_run_id")
+    summarize_benchmark.add_argument("--format", choices=("json", "markdown"), default="json")
+    summarize_benchmark.add_argument("--storage-root", type=Path, required=True)
+
     preflight = subparsers.add_parser(
         "preflight",
         help="audit the native CPU environment without a production solve",
@@ -158,7 +260,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     preflight.add_argument("--work-root", type=Path, required=True)
     preflight.add_argument("--venv-path", type=Path, required=True)
     preflight.add_argument("--environment-only", action="store_true")
-    _add_resources(preflight)
 
     worker_init = subparsers.add_parser(
         "initialize-worker-workspace",
@@ -228,9 +329,8 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     batch = subparsers.add_parser("run-batch", help="run a local multi-worker development batch")
     batch.add_argument("config", type=Path)
     _add_batch_selection(batch, required=True)
-    _add_resources(batch)
+    _add_local_resources(batch)
     _add_case_range(batch)
-    batch.add_argument("--assignment-mode", choices=("shared", "deterministic"), default="shared")
     _add_storage_arguments(batch, include_work=True)
 
     finalize = subparsers.add_parser("finalize-batch", help="validate and terminally publish one batch")
@@ -243,21 +343,14 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     _add_batch_selection(transfer, required=True)
     _add_storage_arguments(transfer)
 
-    campaign_worker = subparsers.add_parser("run-campaign-worker", help="run one node from the shared campaign worker pool")
-    campaign_worker.add_argument("config", type=Path)
-    _add_batch_selection(campaign_worker, required=False)
-    campaign_worker.add_argument(
-        "--skip-extreme-family-ood",
-        action="store_true",
-        help="skip the canonical extreme-family batches for this execution only",
+    campaign_case = subparsers.add_parser(
+        "run-campaign-case",
+        help="run one exact campaign case in its persisted Slurm job",
     )
-    campaign_worker.add_argument("--pilot-cases-per-material", type=int)
-    _add_resources(campaign_worker)
-    campaign_worker.add_argument("--worker-index", type=int, required=True)
-    campaign_worker.add_argument("--worker-count", type=int, required=True)
-    campaign_worker.add_argument("--remaining-cases", type=int, required=True)
-    campaign_worker.add_argument("--scheduler-kind", choices=("local", "slurm"), required=True)
-    _add_storage_arguments(campaign_worker, include_work=True)
+    campaign_case.add_argument("campaign_run_id")
+    campaign_case.add_argument("batch_name")
+    campaign_case.add_argument("case_index", type=int)
+    _add_storage_arguments(campaign_case, include_work=True)
 
     campaign_plan = subparsers.add_parser(
         "plan-campaign",
@@ -271,9 +364,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="skip the canonical extreme-family batches for this execution only",
     )
     campaign_plan.add_argument("--pilot-cases-per-material", type=int)
-    campaign_plan.add_argument("--wall-time")
     campaign_plan.add_argument("--git-commit", required=True)
-    _add_resources(campaign_plan)
     _add_storage_arguments(campaign_plan)
 
     submit_campaign = subparsers.add_parser("submit-campaign", help="submit and persist one exact-commit campaign run")
@@ -285,9 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="skip the canonical extreme-family batches for this execution only",
     )
     submit_campaign.add_argument("--pilot-cases-per-material", type=int)
-    submit_campaign.add_argument("--wall-time")
     submit_campaign.add_argument("--git-commit", required=True)
-    _add_resources(submit_campaign)
     _add_storage_arguments(submit_campaign)
 
     campaign_status = subparsers.add_parser("campaign-status", help="reconstruct persistent campaign and scheduler status")
@@ -310,9 +399,16 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     cancel.add_argument("campaign_run_id")
     _add_storage_arguments(cancel)
 
+    feed = subparsers.add_parser(
+        "feed-campaign",
+        help="reconcile exact jobs and restore at most one pending case job",
+    )
+    feed.add_argument("campaign_run_id")
+    _add_storage_arguments(feed)
+
     resume = subparsers.add_parser(
         "resume-campaign",
-        help="submit a fresh pool for incomplete validated membership",
+        help="explicitly retry at most one failed campaign case",
     )
     resume.add_argument("campaign_run_id")
     _add_storage_arguments(resume)
@@ -531,20 +627,12 @@ def _plan(
     config: config_service.GenerationConfig,
     args: argparse.Namespace,
     selected: tuple[int, ...],
-) -> cluster_service.ResourcePlan:
-    """Build one validated plan from mandatory parsed resource controls."""
-    cores_per_node = config.execution_values["cluster"]["cores_per_node"] if args.cores_per_node is None else args.cores_per_node
-    return cluster_service.build_resource_plan(
-        max_nodes=args.max_nodes,
-        cases_per_node=args.cases_per_node,
+) -> cluster_service.LocalResourcePlan:
+    """Build one local-development plan from explicit local controls."""
+    return cluster_service.build_local_resource_plan(
         cores_per_case=args.cores_per_case,
         max_parallel_cases=args.max_parallel_cases,
-        cores_per_node=cores_per_node,
-        remaining_cases=(
-            args.remaining_cases
-            if getattr(args, "remaining_cases", None) is not None
-            else _remaining(config, selected, storage_root=args.storage_root)
-        ),
+        remaining_cases=_remaining(config, selected, storage_root=args.storage_root),
     )
 
 
@@ -698,6 +786,7 @@ def _campaign_summary(
         "execution_resources": {
             "site": campaign.execution_values["site"],
             "runtime": campaign.execution_values["runtime"],
+            "submission": campaign.execution_values["submission"],
             "cluster": campaign.execution_values["cluster"],
             "retention_profile": campaign.execution_values["retention_profile"],
             "retention": campaign.execution_values["retention"],
@@ -846,23 +935,135 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(report, sort_keys=True))
         return 0
-    if args.command == "preflight":
-        unresolved = config_service.load_campaign_config(
-            args.config,
-            require_executable=False,
+    if args.command == "inspect-core-benchmark":
+        inspection = benchmark_service.inspect_core_benchmark(
+            args.suite,
+            variant_id=args.variant,
+            require_executable=args.require_executable,
         )
-        cores_per_node = unresolved.execution_values["cluster"]["cores_per_node"] if args.cores_per_node is None else args.cores_per_node
+        print(json.dumps(inspection, sort_keys=True))
+        return 0
+    if args.command == "plan-core-benchmark":
+        plan = benchmark_service.plan_core_benchmark(
+            args.suite,
+            git_commit=args.git_commit,
+            storage_root=args.storage_root,
+            variant_id=args.variant,
+        )
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+    if args.command == "submit-core-benchmark":
+        manifest = benchmark_service.submit_core_benchmark(
+            args.suite,
+            git_commit=args.git_commit,
+            storage_root=args.storage_root,
+            variant_id=args.variant,
+        )
+        print(json.dumps(manifest, sort_keys=True))
+        return 0
+    if args.command == "prepare-core-benchmark-case":
+        path = benchmark_service.prepare_core_benchmark_case(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            work_root=args.work_root,
+        )
+        print(path)
+        return 0
+    if args.command == "run-core-benchmark-repetition":
+        result = benchmark_service.run_core_benchmark_repetition(
+            args.benchmark_run_id,
+            args.variant_id,
+            args.repetition,
+            storage_root=args.storage_root,
+            work_root=args.work_root,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "core-benchmark-status":
+        status = benchmark_service.core_benchmark_status(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            query_scheduler=not args.no_scheduler,
+        )
+        if args.format == "state":
+            print(status["state"])
+        else:
+            print(json.dumps(status, sort_keys=True))
+        return 0
+    if args.command == "resume-core-benchmark":
+        manifest = benchmark_service.resume_core_benchmark(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            variant_id=args.variant,
+        )
+        print(json.dumps(manifest, sort_keys=True))
+        return 0
+    if args.command == "finalize-core-benchmark":
+        summary = benchmark_service.finalize_core_benchmark(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(summary, sort_keys=True))
+        return 0
+    if args.command == "core-benchmark-transfer-plan":
+        plan = benchmark_service.core_benchmark_transfer_plan(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+        )
+        if args.format == "json":
+            print(json.dumps(plan, sort_keys=True))
+        else:
+            print(
+                "\t".join(
+                    (
+                        "benchmark",
+                        str(plan["benchmark_run_id"]),
+                        str(plan["git_commit"]),
+                        str(plan["relative_directory"]),
+                        str(plan["inventory"]["inventory_sha256"]),
+                        str(plan["inventory"]["file_count"]),
+                        str(plan["inventory"]["size_bytes"]),
+                    )
+                )
+            )
+        return 0
+    if args.command == "publish-transferred-core-benchmark":
+        receipt = benchmark_service.publish_transferred_core_benchmark(
+            args.benchmark_run_id,
+            staging_root=args.staging_root,
+            destination_root=args.destination_root,
+            source_host=args.source_host,
+            source_storage_root=args.source_storage_root,
+            expected_inventory_sha256=args.expected_inventory_sha256,
+            expected_file_count=args.expected_file_count,
+            expected_size_bytes=args.expected_size_bytes,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "validate-core-benchmark":
+        result = benchmark_service.validate_core_benchmark(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "core-benchmark-summary":
+        summary = benchmark_service.load_core_benchmark_summary(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+        )
+        if args.format == "json":
+            print(json.dumps(summary, sort_keys=True))
+        else:
+            print(benchmark_service.core_benchmark_markdown(summary), end="")
+        return 0
+    if args.command == "preflight":
         report = preflight_service.run_cpu_preflight(
             args.config,
             only_batch=args.only_batch,
             storage_root=args.storage_root,
             work_root=args.work_root,
             venv_path=args.venv_path,
-            max_nodes=args.max_nodes,
-            cases_per_node=args.cases_per_node,
-            cores_per_case=args.cores_per_case,
-            max_parallel_cases=args.max_parallel_cases,
-            cores_per_node=cores_per_node,
         )
         print(json.dumps(report, sort_keys=True))
         if report["production_configuration_ready"] or args.environment_only:
@@ -958,6 +1159,13 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
         )
         print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "feed-campaign":
+        manifest = campaign_runtime.feed_campaign(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(manifest, sort_keys=True))
         return 0
     if args.command == "resume-campaign":
         manifest = campaign_runtime.resume_campaign(
@@ -1273,7 +1481,26 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(path)
         return 0
-    if args.command in {"run-campaign-worker", "plan-campaign", "submit-campaign"}:
+    if args.command == "run-campaign-case":
+        outcome = campaign_runtime.run_campaign_case_job(
+            args.campaign_run_id,
+            args.batch_name,
+            args.case_index,
+            storage_root=args.storage_root,
+            work_root=args.work_root,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": outcome.status,
+                    "case_id": outcome.case_id,
+                    "directory": str(outcome.processed_directory),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command in {"plan-campaign", "submit-campaign"}:
         if args.skip_extreme_family_ood and args.only_batch is not None:
             message = "--skip-extreme-family-ood cannot be combined with --only-batch."
             raise ValueError(message)
@@ -1292,63 +1519,20 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             if args.skip_extreme_family_ood:
                 campaign = campaign.without_extreme_family_ood()
             campaign = campaign.select_batches(None if args.only_batch is None else (args.only_batch,))
-        if args.command != "run-campaign-worker":
-            campaign = campaign.with_wall_time(args.wall_time)
-        remaining = (
-            args.remaining_cases
-            if args.command == "run-campaign-worker"
-            else sum(
-                not runtime_service.completed_case_is_valid(batch, case_index, storage_root=args.storage_root)
-                for batch in campaign.batches
-                for case_index in batch.case_indices
-            )
-        )
-        cores_per_node = campaign.execution_values["cluster"]["cores_per_node"] if args.cores_per_node is None else args.cores_per_node
-        campaign_plan = cluster_service.build_resource_plan(
-            max_nodes=args.max_nodes,
-            cases_per_node=args.cases_per_node,
-            cores_per_case=args.cores_per_case,
-            max_parallel_cases=args.max_parallel_cases,
-            cores_per_node=cores_per_node,
-            remaining_cases=remaining,
-        )
         if args.command == "plan-campaign":
             plan = campaign_runtime.plan_campaign(
                 campaign,
-                resource_plan=campaign_plan,
                 git_commit=args.git_commit,
                 storage_root=args.storage_root,
             )
             print(json.dumps(plan, sort_keys=True))
             return 0
-        if args.command == "submit-campaign":
-            manifest = campaign_runtime.submit_campaign(
-                campaign,
-                resource_plan=campaign_plan,
-                git_commit=args.git_commit,
-                storage_root=args.storage_root,
-            )
-            print(json.dumps(manifest, sort_keys=True))
-            return 0
-        campaign_result = cluster_service.run_campaign_worker(
+        manifest = campaign_runtime.submit_campaign(
             campaign,
-            plan=campaign_plan,
-            worker_index=args.worker_index,
-            worker_count=args.worker_count,
-            scheduler_kind=args.scheduler_kind,
+            git_commit=args.git_commit,
             storage_root=args.storage_root,
-            work_root=args.work_root,
         )
-        print(
-            json.dumps(
-                {
-                    "worker_index": campaign_result.worker_index,
-                    "completed_or_skipped": len(campaign_result.completed_tasks),
-                    "claimed_elsewhere": len(campaign_result.claimed_elsewhere),
-                },
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(manifest, sort_keys=True))
         return 0
     config = _load(args)
     if args.command == "validate-config":
@@ -1426,15 +1610,14 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             config,
             selected,
             plan=node_plan,
-            assignment_mode=args.assignment_mode,
             storage_root=args.storage_root,
             work_root=args.work_root,
         )
         print(
             json.dumps(
                 {
-                    "node_workers": len(results),
-                    "effective_parallel_cases": (node_plan.effective_parallel_cases),
+                    "case_outcomes": len(results),
+                    "effective_parallel_cases": node_plan.effective_parallel_cases,
                 },
                 sort_keys=True,
             )
@@ -1455,7 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
     previous_term: Any = None
-    if args.command == "run-campaign-worker":
+    if args.command in {"run-campaign-case", "run-core-benchmark-repetition"}:
         previous_term = signal.getsignal(signal.SIGTERM)
         signal.signal(
             signal.SIGTERM,

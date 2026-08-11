@@ -33,7 +33,6 @@ from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 
-from . import generation_runtime_cluster as cluster_service
 from . import generation_runtime_workspace as workspace_service
 
 _REQUIRED_IMPORTS = ("numpy", "scipy", "yaml", "h5py")
@@ -221,11 +220,6 @@ def run_cpu_preflight(
     storage_root: Path | str,
     work_root: Path | str,
     venv_path: Path | str,
-    max_nodes: int,
-    cases_per_node: int,
-    cores_per_case: int,
-    max_parallel_cases: int,
-    cores_per_node: int,
 ) -> dict[str, Any]:
     """Run one safe native CPU environment and path preflight."""
     repository = common.paths.get_project_root().resolve()
@@ -302,18 +296,6 @@ def run_cpu_preflight(
         timeout_seconds=timeout_seconds,
     )
 
-    remaining = max(
-        sum(len(batch.case_indices) for batch in campaign.batches),
-        1,
-    )
-    resource_plan = cluster_service.build_resource_plan(
-        max_nodes=max_nodes,
-        cases_per_node=cases_per_node,
-        cores_per_case=cores_per_case,
-        max_parallel_cases=max_parallel_cases,
-        cores_per_node=cores_per_node,
-        remaining_cases=remaining,
-    )
     production_blocker: str | None = None
     try:
         executable_campaign = config_service.load_campaign_config(
@@ -350,14 +332,13 @@ def run_cpu_preflight(
         "loaded_modules": os.environ.get("LOADEDMODULES"),
         "templates": _template_evidence(),
         "execution_config": campaign.execution_values,
-        "resource_plan": {
-            "max_nodes": resource_plan.max_nodes,
-            "cases_per_node": resource_plan.cases_per_node,
-            "cores_per_case": resource_plan.cores_per_case,
-            "max_parallel_cases": resource_plan.max_parallel_cases,
-            "cores_per_node": resource_plan.cores_per_node,
-            "effective_parallel_cases": resource_plan.effective_parallel_cases,
-            "effective_nodes": resource_plan.effective_nodes,
+        "submission_plan": {
+            "cases_per_job": 1,
+            "cores_per_case": campaign.execution_values["cluster"]["cores_per_case"],
+            "cores_per_node": campaign.execution_values["cluster"]["cores_per_node"],
+            "pending_buffer": campaign.execution_values["submission"]["pending_buffer"],
+            "poll_interval_seconds": campaign.execution_values["submission"]["poll_interval_seconds"],
+            "max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
         },
         "path_cleanup_probe": _path_guard_probe(
             storage_root=storage,

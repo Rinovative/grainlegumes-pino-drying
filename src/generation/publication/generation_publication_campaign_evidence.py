@@ -34,6 +34,13 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
+_FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
+    "--array",
+    "--exclusive",
+    "--nodelist",
+    "--reservation",
+)
+_RUN_MANIFEST_SCHEMA_VERSION: Final = 2
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -46,13 +53,13 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "simulation_profile",
         "selected_batch_names",
         "git_commit",
+        "execution_config_digest",
         "slurm_job_ids",
         "scheduler_job_name",
         "scheduler_log_directory",
-        "submission_command",
-        "submission_history",
-        "resource_plan",
-        "wall_time",
+        "submission_config",
+        "submissions",
+        "submission_intent",
         "remote_storage_root",
         "campaign_meta_directory",
         "batches",
@@ -124,25 +131,26 @@ def resolve_campaign_config_path(value: Any) -> Path:
     return resolved
 
 
-def load_campaign_run(
-    run_id: str,
+def _validate_campaign_run_header(
+    manifest: Mapping[str, Any],
     *,
-    storage_root: Path | str | None = None,
-) -> dict[str, Any]:
-    """Load and validate one persisted campaign run."""
-    manifest = load_json_object(
-        campaign_run_manifest_path(run_id, storage_root=storage_root),
-        label="campaign-run manifest",
-    )
+    run_id: str,
+) -> list[str]:
+    """Validate top-level campaign, source, and scheduler identity."""
     if (
         set(manifest) != _RUN_MANIFEST_KEYS
         or manifest.get("schema_kind") != "generation_campaign_run"
-        or manifest.get("schema_version") != 1
+        or manifest.get("schema_version") != _RUN_MANIFEST_SCHEMA_VERSION
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
         raise ValueError(message)
     source_service.validate_git_commit(manifest.get("git_commit"))
+    for key in ("campaign_digest", "execution_config_digest"):
+        value = manifest.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            message = f"Campaign-run {key} is malformed: {run_id}."
+            raise ValueError(message)
     batch_names = manifest.get("selected_batch_names")
     if (
         not isinstance(batch_names, list)
@@ -152,18 +160,25 @@ def load_campaign_run(
     ):
         message = f"Campaign-run batch selection is malformed: {run_id}."
         raise ValueError(message)
-    state = manifest.get("state")
+    states = {
+        "ready",
+        "submitting",
+        "active",
+        "submission_failed",
+        "submission_unknown",
+        "scheduler_unknown",
+        "failure_threshold_reached",
+        "complete",
+        "cancel_requested",
+    }
     job_ids = manifest.get("slurm_job_ids")
     if (
-        state not in {"submitting", "submitted", "resubmitting", "cancel_requested"}
+        manifest.get("state") not in states
         or not isinstance(job_ids, list)
         or len(job_ids) != len(set(job_ids))
         or not all(isinstance(job_id, str) and _JOB_ID_PATTERN.fullmatch(job_id) is not None for job_id in job_ids)
     ):
         message = f"Campaign-run submission state is malformed: {run_id}."
-        raise ValueError(message)
-    if (state == "submitting" and job_ids) or (state in {"submitted", "resubmitting", "cancel_requested"} and not job_ids):
-        message = f"Campaign-run scheduler identity disagrees with state {state!r}: {run_id}."
         raise ValueError(message)
     common.paths.validate_logical_name(
         manifest.get("scheduler_job_name"),
@@ -173,33 +188,167 @@ def load_campaign_run(
     if not isinstance(log_directory, str) or not Path(log_directory).is_absolute():
         message = f"Campaign-run scheduler log directory is malformed: {run_id}."
         raise ValueError(message)
-    command = manifest.get("submission_command")
-    history = manifest.get("submission_history")
-    if (
-        not isinstance(command, list)
-        or not command
-        or not all(isinstance(argument, str) for argument in command)
-        or not isinstance(history, list)
-        or not history
-    ):
-        message = f"Campaign-run submission command is malformed: {run_id}."
+    return job_ids
+
+
+def _validate_submission_configuration(
+    manifest: Mapping[str, Any],
+    *,
+    run_id: str,
+) -> None:
+    """Validate the persisted feeder and one-case allocation contract."""
+    submission = manifest.get("submission_config")
+    if not isinstance(submission, dict):
+        message = f"Campaign-run submission configuration is malformed: {run_id}."
+        raise TypeError(message)
+    if set(submission) != {
+        "pending_buffer",
+        "poll_interval_seconds",
+        "max_running_cases",
+        "cores_per_case",
+        "maximum_failures",
+        "partition",
+        "wall_time",
+        "scheduler_options",
+    }:
+        message = f"Campaign-run submission configuration is malformed: {run_id}."
         raise ValueError(message)
-    for attempt_index, attempt in enumerate(history, start=1):
-        if (
-            not isinstance(attempt, dict)
-            or set(attempt) != {"attempt", "kind", "recorded_at", "command", "job_id"}
-            or attempt.get("attempt") != attempt_index
-            or attempt.get("kind") not in {"initial", "resume"}
-            or not isinstance(attempt.get("recorded_at"), str)
-            or not isinstance(attempt.get("command"), list)
-            or not attempt["command"]
-            or not all(isinstance(argument, str) for argument in attempt["command"])
-            or (
-                attempt.get("job_id") is not None and (not isinstance(attempt["job_id"], str) or _JOB_ID_PATTERN.fullmatch(attempt["job_id"]) is None)
-            )
-        ):
-            message = f"Campaign-run submission history is malformed: {run_id}."
+    for key in (
+        "pending_buffer",
+        "poll_interval_seconds",
+        "cores_per_case",
+        "maximum_failures",
+    ):
+        value = submission[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."
             raise ValueError(message)
+    max_running = submission["max_running_cases"]
+    if max_running is not None and (isinstance(max_running, bool) or not isinstance(max_running, int) or max_running < 1):
+        message = f"Campaign-run max_running_cases is malformed: {run_id}."
+        raise ValueError(message)
+    options = submission["scheduler_options"]
+    if not isinstance(options, list) or not all(isinstance(option, str) and option.startswith("--") for option in options):
+        message = f"Campaign-run scheduler options are malformed: {run_id}."
+        raise ValueError(message)
+
+
+def _validate_submission_record(
+    record: object,
+    *,
+    index: int,
+    run_id: str,
+) -> tuple[str | None, bool]:
+    """Validate one atomic submission attempt and return its state summary."""
+    if (
+        not isinstance(record, dict)
+        or set(record)
+        != {
+            "submission_index",
+            "mode",
+            "recorded_at",
+            "case",
+            "job_name",
+            "command",
+            "job_id",
+            "status",
+            "error",
+        }
+        or record.get("submission_index") != index
+        or record.get("mode") not in {"initial", "resume"}
+        or not isinstance(record.get("recorded_at"), str)
+        or not isinstance(record.get("case"), dict)
+        or set(record["case"]) != {"batch_name", "batch_id", "case_index", "case_id"}
+        or isinstance(record["case"].get("case_index"), bool)
+        or not isinstance(record["case"].get("case_index"), int)
+        or not isinstance(record.get("command"), list)
+        or not record["command"]
+        or not all(isinstance(argument, str) for argument in record["command"])
+        or record.get("status") not in {"submitting", "submitted", "submission_failed"}
+    ):
+        message = f"Campaign-run submission record {index} is malformed: {run_id}."
+        raise ValueError(message)
+    for key in ("batch_name", "batch_id", "case_id"):
+        common.paths.validate_logical_name(
+            record["case"].get(key),
+            label=f"submission case {key}",
+        )
+    common.paths.validate_logical_name(
+        record.get("job_name"),
+        label="submission job_name",
+    )
+    if any(
+        argument == forbidden or argument.startswith(f"{forbidden}=")
+        for argument in record["command"]
+        for forbidden in _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS
+    ):
+        message = f"Campaign-run submission {index} uses forbidden packing, exclusivity, or reservation: {run_id}."
+        raise ValueError(message)
+    job_id = record.get("job_id")
+    if record["status"] == "submitted":
+        if not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None or record["error"] is not None:
+            message = f"Campaign-run submitted record {index} is malformed: {run_id}."
+            raise ValueError(message)
+        return job_id, False
+    if job_id is not None:
+        message = f"Campaign-run unresolved record {index} has a job ID: {run_id}."
+        raise ValueError(message)
+    if record["status"] == "submitting":
+        return None, True
+    if not isinstance(record["error"], str) or not record["error"]:
+        message = f"Campaign-run failed submission {index} has no error: {run_id}."
+        raise ValueError(message)
+    return None, False
+
+
+def _validate_submission_records(
+    manifest: Mapping[str, Any],
+    *,
+    run_id: str,
+) -> tuple[list[str], list[int]]:
+    """Validate every submission record and summarize persisted intent."""
+    submissions = manifest.get("submissions")
+    if not isinstance(submissions, list):
+        message = f"Campaign-run submissions are malformed: {run_id}."
+        raise TypeError(message)
+    persisted_ids: list[str] = []
+    unresolved: list[int] = []
+    for index, record in enumerate(submissions, start=1):
+        job_id, is_unresolved = _validate_submission_record(
+            record,
+            index=index,
+            run_id=run_id,
+        )
+        if job_id is not None:
+            persisted_ids.append(job_id)
+        if is_unresolved:
+            unresolved.append(index)
+    return persisted_ids, unresolved
+
+
+def load_campaign_run(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load and validate one persisted dynamic-feeder campaign run."""
+    manifest = load_json_object(
+        campaign_run_manifest_path(run_id, storage_root=storage_root),
+        label="campaign-run manifest",
+    )
+    job_ids = _validate_campaign_run_header(manifest, run_id=run_id)
+    _validate_submission_configuration(manifest, run_id=run_id)
+    persisted_ids, unresolved = _validate_submission_records(
+        manifest,
+        run_id=run_id,
+    )
+    if persisted_ids != job_ids:
+        message = f"Campaign-run job IDs disagree with submission records: {run_id}."
+        raise ValueError(message)
+    intent = manifest.get("submission_intent")
+    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
+        message = f"Campaign-run durable submission intent is inconsistent: {run_id}."
+        raise ValueError(message)
     resolve_campaign_config_path(manifest.get("campaign_config"))
     return manifest
 
@@ -236,6 +385,7 @@ def campaign_from_manifest(
     if (
         campaign.campaign_id != manifest["campaign_id"]
         or campaign.campaign_digest != manifest["campaign_digest"]
+        or common.serialization.canonical_json_sha256(campaign.execution_values) != manifest["execution_config_digest"]
         or [batch.batch_name for batch in campaign.batches] != manifest["selected_batch_names"]
     ):
         message = "Campaign configuration or execution-view identity changed after launch."

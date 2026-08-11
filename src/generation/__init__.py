@@ -2,6 +2,7 @@
 Reference-simulation responsibility packages and orchestration services.
 
 Provides:
+- benchmark: isolated transient COMSOL resource-scaling evidence
 - campaign: campaign planning, execution evidence, and finalization
 - cases: deterministic case planning and construction services
 - contracts: immutable scientific vocabularies and registries
@@ -20,12 +21,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import cases, contracts, publication, runtime, validation
+    from . import generation_benchmark as benchmark
     from . import generation_campaign as campaign
     from . import generation_readiness as readiness
     from . import generation_smoke as smoke
     from . import generation_workflow as workflow
 
 _MODULES = {
+    "benchmark": "generation_benchmark",
     "campaign": "generation_campaign",
     "cases": "cases",
     "contracts": "contracts",
@@ -37,6 +40,7 @@ _MODULES = {
     "workflow": "generation_workflow",
 }
 __all__ = [
+    "benchmark",
     "campaign",
     "cases",
     "contracts",

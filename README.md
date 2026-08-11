@@ -98,7 +98,7 @@ the stable `src.generation` and `src.datasets` facades.
 
 | Area | Visible module family | Owns |
 | --- | --- | --- |
-| Public orchestration | `src.generation`, `generation_campaign.py`, `generation_readiness.py`, `generation_smoke.py`, `generation_workflow.py` | Stable facade aliases and cross-responsibility campaign lifecycles |
+| Public orchestration | `src.generation`, `generation_benchmark.py`, `generation_campaign.py`, `generation_readiness.py`, `generation_smoke.py`, `generation_workflow.py` | Stable facade aliases and cross-responsibility campaign lifecycles |
 | `contracts/` | `generation_contracts_*` | Vocabularies, profiles, materials, paths, provenance, source identity, and scientific registry contracts |
 | `cases/` | `generation_cases_*` | Campaign/config resolution, deterministic seeding and sampling, fields, schedules, and case inputs |
 | `runtime/` | `generation_runtime_*` | Native execution, cluster planning, preflight, mapping probes, preparation, workspaces, and terminal batch evidence |
@@ -128,9 +128,11 @@ responsibility packages do not import workflow or CLI layers.
 
 Supported public boundaries are:
 
-- `from src import generation`: `campaign`, `cases`, `contracts`, `publication`,
-  `readiness`, `runtime`, `smoke`, `validation`, and `workflow`. The stable CLI
-  remains `python -m src.generation.cli.cli_generation`.
+- `from src import generation`: `benchmark`, `campaign`, `cases`, `contracts`,
+  `publication`, `readiness`, `runtime`, `smoke`, `validation`, and `workflow`.
+  On the bare control host, invoke the stable CLI through
+  `./scripts/docker_python.sh -m src.generation.cli.cli_generation`; direct
+  `python -m ...` remains valid inside the canonical container or CPU venv.
 - `from src import datasets`: `contracts`, `dataset_packages`, `packages`,
   `preprocessing`, and `runtime`. The canonical Dataset package facade and CLI
   remain `datasets.dataset_packages` and
@@ -161,8 +163,18 @@ is in the [generation workflow](docs/simulation_generation.md).
 
 Generation resolves scientific inputs, campaign membership, native COMSOL
 execution, atomic publication, and requested Dataset packages from validated
-YAML. Run the host-side workflow from `hpc115`; it owns remote work on the
-configured `sricehpc01` COMSOL/Slurm host.
+YAML. Run the host-side workflow from bare `hpc115`; Bash/Git/SSH/rsync/Docker
+form its control plane, while all local Generation Python runs in the canonical
+Docker image. The wrapper owns native Python, Slurm, case materialization, and
+COMSOL work on the configured `sricehpc01` CPU side. It also exposes the isolated
+four-variant transient core benchmark described in the operational guide.
+
+Production uses one ordinary non-exclusive Slurm job per scientific case. A
+durable feeder keeps the configuration-owned pending buffer small—currently one
+campaign job—while Slurm decides placement and how many jobs run; all remaining
+cases stay unsubmitted. The transient core benchmark runs the same case at the
+four configured core counts, globally serially, and reports an explicit
+COMSOL-core-hour recommendation without editing production configuration.
 
 - [Scientific and technical parameter reference](docs/generation_parameter_reference.md): parameter meanings, ranges, equations, provenance, caveats, and sources.
 - [Generation operational guide](docs/simulation_generation.md): configuration ownership, hosts, commands, gates, smoke, pilot, production, transfer, resume, retention, and cleanup.

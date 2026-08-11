@@ -95,7 +95,8 @@ def test_transient_contract_derives_source_fields_and_owns_persisted_serializer(
     ):
         source_field = source.field(field.name)
         assert (field.name, field.unit) == (source_field.name, source_field.unit)
-    assert tuple(field.name for field in contract.scalar_conditioning) == (
+    learned_scalar_names = tuple(field.name for field in contract.scalar_conditioning)
+    assert learned_scalar_names == (
         "r_surf_0",
         "r_int_surf",
         "f_surf",
@@ -105,6 +106,15 @@ def test_transient_contract_derives_source_fields_and_owns_persisted_serializer(
         "k_gr",
         "cp_gr_dry",
     )
+    assert tuple(name for name in generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS if name not in learned_scalar_names) == (
+        "T_amb",
+        "eps_bed_cal_ref",
+        "rho_bu_dry_ref",
+        "X_target_wb",
+    )
+    assert {field.name for field in contract.static_spatial_conditioning}.issuperset({"eps_bed", "rho_bu_dry"})
+    assert "T_amb" in {field.name for field in contract.step_boundary_conditioning}
+    assert contract.temporal.exact_stop_usage == "diagnostic_only_no_training_transition_or_rollout"
     payload = transient_contract.transient_contract_payload()
     assert payload["time"]["fields"] == [
         {"name": "t_n", "unit": "h"},

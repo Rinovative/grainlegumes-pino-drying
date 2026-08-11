@@ -107,7 +107,10 @@ _SCHEDULER_OWNED_OPTIONS = (
     "--time",
     "--output",
     "--error",
+    "--exclusive",
     "--export",
+    "--nodelist",
+    "--reservation",
     "--wrap",
 )
 
@@ -320,15 +323,6 @@ class CampaignConfig:
             message = "Campaign has no extreme-family OOD batch to skip."
             raise ValueError(message)
         return self.select_batches(selected)
-
-    def with_wall_time(self, wall_time: str | None) -> CampaignConfig:
-        """Return an execution-only campaign view with one scheduler time limit."""
-        if wall_time is None:
-            return self
-        validated = _safe_text_or_none(wall_time, label="execution.cluster.wall_time")
-        execution = copy.deepcopy(self.execution_values)
-        execution["cluster"]["wall_time"] = validated
-        return replace(self, execution_values=execution)
 
 
 class GenerationConfigError(ValueError):
@@ -1646,7 +1640,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     execution = _mapping(value, label="generation execution configuration")
     _exact_keys(
         execution,
-        required={"schema_kind", "schema_version", "runtime", "retention", "cluster", "site"},
+        required={"schema_kind", "schema_version", "runtime", "retention", "submission", "cluster", "site"},
         optional=set(),
         label="generation execution configuration",
     )
@@ -1722,18 +1716,43 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
             raise TypeError(msg)
         normalized_retention[purpose] = retention
 
+    submission = _mapping(execution["submission"], label="execution.submission")
+    _exact_keys(
+        submission,
+        required={"pending_buffer", "poll_interval_seconds", "max_running_cases"},
+        optional=set(),
+        label="execution.submission",
+    )
+    submission["pending_buffer"] = _integer(
+        submission["pending_buffer"],
+        label="execution.submission.pending_buffer",
+        minimum=1,
+    )
+    submission["poll_interval_seconds"] = _integer(
+        submission["poll_interval_seconds"],
+        label="execution.submission.poll_interval_seconds",
+        minimum=1,
+    )
+    max_running_cases = submission["max_running_cases"]
+    if max_running_cases is not None:
+        submission["max_running_cases"] = _integer(
+            max_running_cases,
+            label="execution.submission.max_running_cases",
+            minimum=1,
+        )
+
     cluster = _mapping(execution["cluster"], label="execution.cluster")
     cluster_keys = {
-        "max_nodes",
-        "cases_per_node",
         "cores_per_case",
-        "max_parallel_cases",
         "wall_time",
         "scheduler_options",
     }
     _exact_keys(cluster, required=cluster_keys, optional=set(), label="execution.cluster")
-    for key in ("max_nodes", "cases_per_node", "cores_per_case", "max_parallel_cases"):
-        cluster[key] = _integer(cluster[key], label=f"execution.cluster.{key}", minimum=1)
+    cluster["cores_per_case"] = _integer(
+        cluster["cores_per_case"],
+        label="execution.cluster.cores_per_case",
+        minimum=1,
+    )
     cluster["wall_time"] = _safe_text_or_none(cluster["wall_time"], label="execution.cluster.wall_time")
     options = cluster["scheduler_options"]
     if not isinstance(options, list) or not all(isinstance(item, str) and item.startswith("--") for item in options):
@@ -1745,11 +1764,8 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     cluster["cores_per_node"] = site["cores_per_node"]
     cluster["scheduler_kind"] = site["scheduler"]
     cluster["partition"] = site["partition"]
-    if cluster["cases_per_node"] * cluster["cores_per_case"] > cluster["cores_per_node"]:
-        msg = "cases_per_node * cores_per_case must not exceed site.cores_per_node."
-        raise GenerationConfigError(msg)
-    if cluster["max_parallel_cases"] > cluster["max_nodes"] * cluster["cases_per_node"]:
-        msg = "max_parallel_cases must not exceed max_nodes * cases_per_node."
+    if cluster["cores_per_case"] > cluster["cores_per_node"]:
+        msg = "execution.cluster.cores_per_case must not exceed site.cores_per_node."
         raise GenerationConfigError(msg)
 
     execution["site"] = site
@@ -1757,6 +1773,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     execution["retention_profile"] = campaign_purpose
     execution["retention"] = normalized_retention[campaign_purpose]
     execution["retention_profiles"] = normalized_retention
+    execution["submission"] = submission
     execution["cluster"] = cluster
     return execution
 

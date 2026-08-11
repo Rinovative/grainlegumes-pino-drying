@@ -2,14 +2,20 @@
 
 ## Quick start
 
-Run public workflow commands from the `hpc115` GPU/development host, outside
-Docker, in the repository checkout. The wrapper uses the local native Python
-environment for orchestration and Dataset packaging, then owns non-interactive
-SSH and rsync to the configured native CPU/COMSOL host `sricehpc01`. COMSOL 6.4
-and Slurm run only on `sricehpc01`; users do not manually SSH for normal
-workflow stages. Validated Generation publications return to the canonical
-`STORAGE_ROOT` on `hpc115`. Docker remains the development and learning
-environment, not a CPU COMSOL requirement.
+Run public workflow commands from the bare `hpc115` GPU/development host in
+the repository checkout. The bare host is a shell control plane: it needs Bash,
+Git, SSH, rsync, Docker, and ordinary core utilities, but no Generation Python
+venv or scientific Python packages. `scripts/generation_workflow.sh` sends every
+local Python operation through `scripts/docker_python.sh`, which starts the
+canonical `grainlegumes-pino-drying` image with `/workspace/repo` mounted
+read-only and `STORAGE_ROOT` mounted at `/workspace/storage`.
+
+The wrapper owns non-interactive SSH and rsync to `sricehpc01`. Its native
+`.[generation-cpu]` venv plans Slurm work, while CPU compute nodes materialize
+case inputs, run `Comsol/v6.4`, convert and validate results, and publish durable
+CPU evidence. Validated publications return to canonical storage on `hpc115`,
+where Docker validates Generation evidence and builds Dataset packages. Docker
+is not required on the CPU cluster.
 
 > Configured scientific values are modelling and sampling decisions. A citation
 > does not imply that every final number appears verbatim in its source. The
@@ -37,8 +43,10 @@ environment, not a CPU COMSOL requirement.
 | Campaign and membership seeds | Selected campaign YAML | `sampling.seed_base`, `membership.seed`, paired seed | Batch, block, permutation, and case seeds |
 | Technical-smoke cases | Both profile `technical_smoke.yaml` files | Natural counts and paired seed | Paired two-profile plan and retained packages |
 | Pilot cases | `configs/generation/campaigns/transient_drying/pilot_check.yaml` | `sampling.cases_per_material` and seed | Default 18; fast override is 6 |
+| Transient core benchmark | `configs/generation/benchmarks/transient_core_scaling/` | Shared case, repetitions, four resource variants | Same-case execution IDs and isolated scaling evidence |
 | Dataset package requests | Campaign `dataset_packages` | Source role and evaluation regime | Package names, materials, views, counts |
-| Slurm resources | `configs/generation/execution/cluster_cpu.yaml` (`cluster`) | Nodes, packing, cores, parallelism, wall time | Validated `sbatch` arguments and worker pool |
+| Per-case Slurm allocation | `configs/generation/execution/cluster_cpu.yaml` (`cluster`) | `cores_per_case`, wall time, scheduler options | One ordinary non-exclusive case-job request |
+| Submission feeder | `configs/generation/execution/cluster_cpu.yaml` (`submission`) | Pending buffer, poll interval, optional running safety cap | Durable one-at-a-time queue feeding |
 | CPU site, modules, partition | `configs/generation/execution/cluster_cpu.yaml` (`site`) | Site values only when infrastructure changes | Remote setup, module loads, executables |
 | Timeout and failure policy | `configs/generation/execution/cluster_cpu.yaml` (`runtime`) | Timeout, maximum failures, extra arguments | Runtime and campaign stop behavior |
 | Solved-model and raw-CSV retention | `configs/generation/execution/cluster_cpu.yaml` (`retention`) | Purpose-specific booleans | Per-case retained evidence |
@@ -54,8 +62,10 @@ source references are documented only in
 
 | Host | Responsibility | User interaction |
 | --- | --- | --- |
-| `hpc115` | Repository/config review, wrapper invocation, canonical `01_generation`, Dataset packages in `02_datasets`, Docker-backed development and training | Type every `generation_workflow.sh` command here; provide native Generation Python dependencies |
-| `sricehpc01` | Native Python 3.10, `Comsol/v6.4`, COMSOL, Slurm, isolated workspaces, CPU source | Wrapper-owned batch SSH and rsync; manual SSH only for requested inspection of retained evidence |
+| `hpc115` bare host | Shell control plane, exact Git state, Docker invocation, SSH, rsync, and canonical storage path | Type every `generation_workflow.sh` command here; do not maintain a native Generation venv |
+| `hpc115` Docker | Config resolution, local readiness/reporting, transferred HDF5/evidence admission, Dataset package building, and loader smokes | Wrapper-owned ephemeral `docker run`; no container ID or running-container name is required |
+| `sricehpc01` login | Exact checkout, native `.[generation-cpu]` venv, compact plans/manifests, Slurm submission/status, and durable CPU storage | Wrapper-owned batch SSH and rsync; manual SSH only for requested evidence inspection |
+| CPU Slurm compute node | Per-case `$TMPDIR` materialization, native COMSOL, export collection, HDF5 conversion/admission, and durable result publication | Scheduler-owned; no Docker and no manual login in the normal workflow |
 
 The default remote layout is `$HOME/grainlegumes-generation/{repo,storage,venv}`
 on `sricehpc01`. Override it only with `--remote-root`. The local storage root
@@ -70,18 +80,19 @@ export STORAGE_ROOT="$(realpath ../storage)"
 STEADY_CAMPAIGN=configs/generation/campaigns/steady_flow/family_generalization.yaml
 TRANSIENT_CAMPAIGN=configs/generation/campaigns/transient_drying/family_generalization.yaml
 PILOT_CAMPAIGN=configs/generation/campaigns/transient_drying/pilot_check.yaml
-CPU_HOST="$(
-  python -m src.generation.cli.cli_generation validate-config \
-    "$STEADY_CAMPAIGN" --allow-incomplete | \
-    python -c 'import json,sys; print(json.load(sys.stdin)["execution_resources"]["site"]["cpu_host"])'
-)"
+CPU_HOST=sricehpc01
 ```
+
+The execution YAML remains authoritative for `CPU_HOST`; the explicit shell
+value makes the initial bootstrap target visible before the remote checkout
+exists. Local inspection can be run explicitly through
+`scripts/docker_python.sh`; never replace it with bare-host `python`.
 
 1. Preview CPU setup, then perform it explicitly:
 
 ```bash
-./scripts/generation_workflow.sh setup-cpu --cpu-host "$CPU_HOST"
-./scripts/generation_workflow.sh setup-cpu --cpu-host "$CPU_HOST" --execute
+./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01
+./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01 --execute
 ```
 
 The first command is read-only. The second creates the remote checkout,
@@ -90,9 +101,9 @@ storage root, and Python environment for the exact local commit.
 2. Validate both primary configs without promoting unresolved values:
 
 ```bash
-python -m src.generation.cli.cli_generation validate-config \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
   "$STEADY_CAMPAIGN" --allow-incomplete
-python -m src.generation.cli.cli_generation validate-config \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
   "$TRANSIENT_CAMPAIGN" --allow-incomplete
 ```
 
@@ -138,7 +149,7 @@ same command. A complete smoke always retains its CPU source for review.
 
 ```bash
 SMOKE_RECEIPT=/absolute/path/printed/by/the/smoke/command.json
-python -m src.generation.cli.cli_generation validate-real-smoke \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-real-smoke \
   "$SMOKE_RECEIPT" --storage-root "$STORAGE_ROOT"
 ```
 
@@ -146,53 +157,63 @@ The all-in-one workflow already validates every HDF5 file, inspects every
 dataset package, and runs DataLoader smokes with `num_workers=0` and
 `num_workers=2`.
 
-6. Preview CPU-source cleanup for a reviewed run:
+6. Run the globally serial transient core benchmark:
 
-```bash
-GENERATION_RUN_ID='<campaign_run_id>'
-./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID"
-```
+~~~bash
+./scripts/generation_workflow.sh benchmark-cores --cpu-host sricehpc01
+~~~
 
-7. Execute only the authorized cleanup:
+Review recommended_production_cores_per_case in the transferred summary. Compare
+it with fastest_single_case_cores_per_case and
+best_parallel_efficiency_cores_per_case, then manually edit only
+cluster.cores_per_case in
+configs/generation/execution/cluster_cpu.yaml. The benchmark never changes that
+file. Commit the reviewed setting before continuing.
 
-```bash
-./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
-```
+7. Run the configured transient pilot after the core decision:
 
-8. After readiness is complete, run one complete resolved production campaign:
+~~~bash
+./scripts/generation_workflow.sh pilot-check "$PILOT_CAMPAIGN"
+~~~
 
-```bash
+8. After readiness and pilot acceptance, run each resolved production campaign:
+
+~~~bash
 ./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN"
-
 ./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"
-```
+~~~
 
-Execution config owns the default resources. Optional resource flags are explicit
-one-run overrides; review any override in the resolved plan. The generic
-`--only-batch <resolved-batch-name>` selector can run a predeclared subset.
-`all` otherwise uses exactly the batches displayed by
-`validate-config`. When the resolved campaign declares an extreme-family group,
-`--skip-extreme-family-ood` can omit that group for one execution without
-changing the campaign configuration; it cannot be combined with
-`--only-batch`.
+Execution config owns per-case allocation, pending-buffer, polling, optional
+running cap, timeout, and failure policy. The generic
+--only-batch <resolved-batch-name> selector can run a declared subset. When the
+campaign declares an extreme-family group, --skip-extreme-family-ood may omit it
+for one execution and cannot be combined with --only-batch.
 
-9. Inspect local and remote status:
+9. Inspect or safely resume one persisted campaign:
 
-```bash
+~~~bash
+GENERATION_RUN_ID="<campaign_run_id>"
 ./scripts/generation_workflow.sh status "$GENERATION_RUN_ID"
-```
-
-10. Resume an interrupted all-in-one workflow:
-
-```bash
 ./scripts/generation_workflow.sh resume "$GENERATION_RUN_ID"
-```
+~~~
 
-11. Cancel every persisted active Slurm attempt for a campaign:
+The foreground all or resume command owns polling and feeding. For a long
+campaign, keep it in a site-approved persistent terminal session. Disconnecting
+does not terminate submitted scientific jobs; rerunning resume reconciles exact
+job IDs and durable case evidence before feeding again.
 
-```bash
+10. Cancel every persisted campaign attempt only when cancellation is intended:
+
+~~~bash
 ./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID"
-```
+~~~
+
+11. Preview and then explicitly confirm CPU-source cleanup for a reviewed run:
+
+~~~bash
+./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID"
+./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
+~~~
 
 All setup, plan, launch, smoke, resume, and cleanup operations bind an exact
 Git commit. Launching operations require a clean worktree.
@@ -212,13 +233,14 @@ The owners are:
 | `configs/generation/materials/<family>.yaml` | Role-neutral material scope, natural supports, coupled records, targets, evidence | Campaign role, membership, count, profile, execution |
 | `configs/generation/profiles/<profile>.yaml` | Template identity, adapters, exports, explicit native mappings, profile conditioning | Material values, counts, roles, cluster plans |
 | `configs/generation/campaigns/<profile>/<campaign>.yaml` | Purpose, layer references, material roles, sampling counts and seeds, memberships, package requests | Parameter ranges, derived package materials, execution defaults |
+| `configs/generation/benchmarks/transient_core_scaling/` | One canonical pilot-case reference, repetitions, resource constraints, and four editable core counts | New scientific samples, package membership, production resource mutation |
 | `configs/generation/execution/<site>.yaml` | Site, modules, executables, runtime limits, scheduler resources, purpose-specific retention | Scientific ranges, material roles, learning parameters |
 | `configs/learning/<task>/<kind>/<config>.yaml` | Dataset IDs, model, optimization, training, evaluation, artifacts | Generation paths, material ranges, campaign membership |
 
 Inspect the effective campaign rather than maintaining a parallel summary:
 
 ```bash
-python -m src.generation.cli.cli_generation validate-config \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
   "$TRANSIENT_CAMPAIGN" --allow-incomplete
 ```
 
@@ -248,10 +270,11 @@ configuration persist with generated artifacts.
 | 3 | `setup-cpu` then `preflight` | Bootstraps exact commit/venv; audits modules, executables, storage and Slurm | Successful setup and preflight reports |
 | 4 | `smoke` when mappings need confirmation | Runs retained one-case native mapping probes and inventories real output names/headers | Human-reviewed profile mapping YAML; rerun from a clean committed state |
 | 5 | `smoke` | Paired steady/transient native technical campaign, transfer, publication, packages and loader smokes | Source-current immutable real-smoke receipt; CPU source retained |
-| 6 | `pilot-check .../pilot_check.yaml` | Six-material transient diagnostics and storage measurement | Accepted pilot receipt and reviewed diagnostics |
-| 7 | `all <production campaign>` | Preflight, plan, Slurm run, monitor, terminal validation, collection, package build, loader smokes and gated cleanup | Terminal all-workflow, transfer, Dataset, and cleanup receipts |
-| 8 | `validate`, `status`, or direct receipt validators | Revalidates publication and lifecycle evidence | Exact successful receipt/digest state |
-| 9 | `cleanup RUN_ID` then `--confirm` when needed | Preview then execute digest-authorized CPU cleanup | No active job; all transfer, Dataset, workflow and inventory digests agree |
+| 6 | `benchmark-cores`, review, then edit `cluster.cores_per_case` | Four globally serial core settings with three round-robin solves each | Reviewed core-hour recommendation and a separate committed production-core decision |
+| 7 | `pilot-check .../pilot_check.yaml` | Six-material transient diagnostics and storage measurement | Accepted pilot receipt and reviewed diagnostics |
+| 8 | `all <production campaign>` | Preflight, plan, Slurm run, monitor, terminal validation, collection, package build, loader smokes and gated cleanup | Terminal all-workflow, transfer, Dataset, and cleanup receipts |
+| 9 | `validate`, `status`, or direct receipt validators | Revalidates publication and lifecycle evidence | Exact successful receipt/digest state |
+| 10 | `cleanup RUN_ID` then `--confirm` when needed | Preview then execute digest-authorized CPU cleanup | No active job; all transfer, Dataset, workflow and inventory digests agree |
 
 No native COMSOL, Slurm, pilot, or production step is implied by a static test.
 
@@ -286,6 +309,7 @@ submit are shown for syntax and must run only after their gates are accepted.
 | `... preflight CAMPAIGN` | Audits resolved config, native environment and resources | No solve or Slurm submission |
 | `... plan CAMPAIGN` | Prints exact paths and Slurm arguments | Read-only, fails closed on unresolved gates |
 | `... smoke` | Owns mapping probes when required, then paired native technical gate | Native/Slurm; always retains CPU source |
+| `... benchmark-cores [--variant ID]` | Runs isolated repeated same-case core scaling or retries one variant | Native/Slurm; benchmark metadata only, CPU evidence retained |
 | `... pilot-check configs/generation/campaigns/transient_drying/pilot_check.yaml` | Runs transient diagnostic lifecycle | Native/Slurm; cleans CPU/staging after validated analysis by default |
 | `... launch CAMPAIGN` | Submits one campaign and prints run ID | Native/Slurm primitive; does not perform full local lifecycle |
 | `... all CAMPAIGN` | Full synchronous production through Dataset receipts and cleanup | Native/Slurm; cleans verified CPU source unless `--keep-cpu-source` |
@@ -298,54 +322,72 @@ submit are shown for syntax and must run only after their gates are accepted.
 | `... cleanup RUN_ID` | Prints exact authorized CPU deletion plan | Dry-run |
 | `... cleanup RUN_ID --confirm` | Deletes only digest-authorized inactive CPU source and records receipt | Destructive and gated; GPU publication remains |
 
-Resource overrides are `--wall-time`, `--only-batch`, and the validated node,
-case, core, and parallelism flags shown by `--help`. `--skip-extreme-family-ood`
-is a one-run omission and cannot be combined with `--only-batch`. `--detach`
-applies to `all`; `--keep-cpu-source` is the sole source-retention override.
+Production allocation and feeder settings have no command-line overrides; edit the
+execution YAML and review the resolved plan. `--only-batch` selects one declared
+batch, while `--skip-extreme-family-ood` is a one-run omission and cannot be
+combined with it. `--detach` applies to `all`; `--keep-cpu-source` is the sole
+source-retention override.
+
+The low-level `run-batch --max-parallel-cases` option is retained only for
+bounded local development execution. It limits local worker threads, is never
+forwarded to Slurm, and does not control production running or pending jobs.
 
 ## CPU/GPU path and lifecycle
 
+The maintained execution path is:
+
 ```text
-configured native CPU / COMSOL host
-  exact commit + configured COMSOL module + scheduler
-  -> isolated case workspaces
-  -> validated terminal campaign
-  -> retained source evidence
-                 |
-                 | validated rsync staging and atomic publication
-                 v
-hpc115 canonical storage
-  01_generation
-  -> immutable packages in 02_datasets
-  -> learning runs and artifacts in 03_experiments
+hpc115 bare shell
+  -> hpc115 Docker: local config/evidence/Dataset Python
+  -> sricehpc01 login: exact checkout + native Generation venv + Slurm control
+  -> CPU compute node $TMPDIR: case inputs + COMSOL + conversion
+  -> sricehpc01 durable Generation source
+  -> hpc115 marked transfer staging
+  -> hpc115 canonical Generation publication + Dataset packages
 ```
 
+Data sent from `hpc115` to the CPU side is compact: the exact source commit and
+its configuration/template content, orchestration identity, and small readiness
+or smoke receipts. The CPU checkout normally obtains source through Git; the
+wrapper does not pre-generate campaign-wide `fields.csv`, `schedule.csv`, or
+`scalars.csv` collections on `hpc115`. Completed validated results, HDF5,
+provenance, manifests, logs, and receipts travel from CPU storage back to
+`hpc115`. Bulk case-input CSV transfer is not part of normal production.
+
+A representative transient case has the following ownership:
+
+| Artifact | Created on and by | Filesystem/lifetime | Transfer |
+| --- | --- | --- | --- |
+| Compact campaign/case plan | `sricehpc01` login, native Generation venv | Durable CPU metadata bound to commit, config, indices, and seeds | Only compact control identity is needed before execution |
+| `case.json` | CPU compute node, deterministic case service | Per-case `$TMPDIR` workspace; required identity is persisted with CPU evidence | Not generated or bulk-transferred by bare `hpc115` |
+| `fields.csv` | CPU compute node | Per-case `$TMPDIR`; removed after safe publication | No hpc115-to-CPU bulk transfer |
+| `schedule.csv` | CPU compute node for transient cases | Per-case `$TMPDIR`; removed after safe publication | No hpc115-to-CPU bulk transfer |
+| `scalars.csv` | CPU compute node for transient cases | Per-case `$TMPDIR`; admitted before COMSOL and removed after safe publication | No hpc115-to-CPU bulk transfer |
+| `model.mph` work copy | CPU compute node from the exact checkout template | Per-case `$TMPDIR`; source template remains immutable | Template bytes arrive with the exact checkout |
+| COMSOL exports and optional solved model | CPU compute node, native `Comsol/v6.4` | Per-case `$TMPDIR`; retention follows campaign purpose | Required retained evidence publishes to CPU storage |
+| Canonical HDF5 | CPU compute node conversion/admission | Published atomically into durable CPU `01_generation` source | Validated CPU-to-hpc115 transfer |
+| CPU evidence | Compute worker and campaign services | Durable remote `01_generation/{meta,raw,processed}` | Source for validated collection; retained until cleanup gates pass |
+| Transfer staging | `hpc115` wrapper and Docker admission | Marked `01_generation/.state/transfer-staging`; temporary and retryable | Receives CPU-to-hpc115 rsync only |
+| GPU-side publication | `hpc115` Docker publication service | Canonical immutable `01_generation` | Atomic promotion from validated staging |
+| Dataset package | `hpc115` Docker Dataset service | Immutable `02_datasets` package referencing canonical Generation files | No return transfer to CPU |
+
 `01_generation` is the canonical simulation archive. `02_datasets` contains
-immutable package views addressed by `dataset_id`; it does not duplicate
-campaign configuration. `03_experiments` contains training, tuning, and
-evaluation artifacts.
+immutable package views addressed by `dataset_id`; `03_experiments` contains
+training, tuning, and evaluation artifacts. The `all` command performs terminal
+validation, transfer, publication, package inspection, both DataLoader smokes,
+and digest-authorized CPU cleanup. Failed or incomplete transfers retain CPU
+source and marked staging; successful cases and publications are reused rather
+than overwritten.
 
-The `all` command performs generation, terminal validation, transfer,
-publication, package building, package inspection, both DataLoader smokes, and
-authorized CPU cleanup. On failure it records the exact stage and a copyable
-resume command. Transfer staging is marked and removable; an incomplete
-transfer never becomes a published campaign.
-
-Cleanup is dry-run by default. Confirmation is accepted only after source
-inventory, transfer, dataset, and workflow digests agree and no active job owns
-the source. The technical smoke overrides cleanup to retain source evidence for
-manual review.
-
-On `sricehpc01`, the wrapper owns campaign source below the remote
-`$HOME/grainlegumes-generation/storage/01_generation` root and creates isolated
-worker directories with guarded markers. On `hpc115`, collection creates marked
-`01_generation/.state/transfer-staging` content, validates every declared byte,
-and atomically publishes the immutable campaign under canonical `01_generation`
-paths. Existing successful cases and valid publications are reused rather than
-overwritten. `collect` never deletes CPU source. Dataset packages are built on
-`hpc115` under `02_datasets`; transient indexes continue to reference canonical
-`01_generation` case files. `resume` reconstructs persisted stage evidence and
-submits only incomplete validated membership.
+The remote layout is `$HOME/grainlegumes-generation/{repo,storage,venv}`. The
+compute launcher loads the configured Python and COMSOL modules, activates the
+native venv, checks the exact commit and Slurm allocation, creates a guarded
+worker root under `$TMPDIR`, and removes only that owned temporary tree after
+success or recorded failure. `$TMPDIR` is never durable evidence. CPU source is
+deleted only through the existing inactive-job, source-inventory, transfer,
+HDF5, Dataset, workflow-receipt, and digest authorization gates. `collect` and
+the core benchmark always retain their CPU source; `--keep-cpu-source` remains
+the production/pilot retention override.
 
 ## Smoke versus production
 
@@ -378,12 +420,95 @@ Python runtime override; their configured record is bound to the canonical
 hashed template and model-report evidence. Case-dependent values use the
 admitted CLI vector and still require native runtime evidence.
 
+## Shared-cluster transient core benchmark
+
+The transient_core_scaling suite determines the production cores_per_case for
+one ordinary independent COMSOL case. It does not determine campaign
+concurrency, pending_buffer, scheduler priority, or node packing. Its owners are
+configs/generation/benchmarks/transient_core_scaling/suite.yaml and the four
+variant files:
+
+| Variant | Current configured cores | Measured repetitions |
+| --- | ---: | ---: |
+| cores_04.yaml | 4 | Suite-owned, currently 3 |
+| cores_08.yaml | 8 | Suite-owned, currently 3 |
+| cores_16.yaml | 16 | Suite-owned, currently 3 |
+| cores_32.yaml | 32 | Suite-owned, currently 3 |
+
+The values and repetition count are editable YAML decisions. Every variant uses
+the same nominal transient pilot case and proves the same case_input_id,
+simulation_case_id, fields, schedule, scalar handoff, scientific configuration,
+and template hash. Core count changes execution evidence only.
+
+After CPU setup and a source-current native technical-smoke receipt, run:
+
+~~~bash
+./scripts/generation_workflow.sh benchmark-cores \
+  --cpu-host sricehpc01
+~~~
+
+The measured sequence is round-robin:
+
+~~~text
+4, 8, 16, 32, 4, 8, 16, 32, 4, 8, 16, 32
+~~~
+
+Each entry is one ordinary non-exclusive Slurm job for one case. The workflow
+submits no array, dependency chain, full-node reservation, or later measured
+job. It submits the next entry only after the previous job is no longer active
+and its immutable success or failure evidence has been reconciled. Thus at most
+one benchmark solve is submitted, running, or pending at a time. A failed
+setting can be retried explicitly without rerunning successful repetitions:
+
+~~~bash
+./scripts/generation_workflow.sh benchmark-cores \
+  --variant cores_16 \
+  --cpu-host sricehpc01
+~~~
+
+Every attempt records submit, scheduler start, and completion timestamps;
+derived queue wait and turnaround; COMSOL and complete-case wall times; node,
+partition, requested and allocated CPUs, COMSOL process count, Slurm job ID, and
+accounting evidence. Queue wait describes observed scheduler conditions only
+and never selects the production core count.
+
+For each core setting, summary.json, summary.md, and runs.csv report median,
+mean, minimum, maximum, and sample standard deviation of COMSOL time; median
+complete-case, queue-wait, and turnaround time; speedup; parallel efficiency;
+median COMSOL core-hours per case; cases per 100 core-hours; and the estimated
+compute core-hours for the currently configured transient production case
+count. The estimate does not claim an exact campaign wall time because Slurm
+decides concurrent availability. Finalization re-resolves that current count;
+when the measured evidence remains applicable, finalizing the same terminal run
+again archives and regenerates its derived summaries without another COMSOL
+solve.
+
+The deterministic recommendation is the successful variant with the lowest
+median COMSOL core-hours per case, with fewer cores breaking a tie. The summary
+also reports fastest_single_case_cores_per_case and
+best_parallel_efficiency_cores_per_case separately, plus the recommended
+runtime, complete-case time, speedup, efficiency, current-setting difference,
+and comparison with the fastest setting. No result is hard-coded and queue wait
+is excluded.
+
+The workflow never edits production resources. After reviewing the benchmark
+summary, manually edit:
+
+~~~text
+configs/generation/execution/cluster_cpu.yaml
+cluster.cores_per_case
+~~~
+
+Then commit that reviewed configuration decision before the transient pilot and
+production workflow. pending_buffer remains a separate submission-policy
+setting and is never changed by the benchmark.
+
 ## Configured transient pilot check
 
 Inspect the pilot owner before launch:
 
 ```bash
-python -m src.generation.cli.cli_generation validate-config \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
   configs/generation/campaigns/transient_drying/pilot_check.yaml \
   --allow-incomplete
 ```
@@ -444,33 +569,103 @@ after validation. There is no storage-budget pass/fail guard. The command stops
 before native execution whenever the current readiness report has an unresolved
 gate.
 
-## Production generation
+## Scheduler-fed production generation
 
-Production prerequisites are both accepted gates: the source-current paired
-native COMSOL technical smoke and the transient pilot receipt. Do not infer
-acceptance from static tests or checksums, and do not claim that production has
-already run.
+Production prerequisites are accepted source-current native COMSOL smoke and
+transient pilot gates. Static tests and template checksums do not imply that
+production has run.
 
-```bash
+The execution owner is configs/generation/execution/cluster_cpu.yaml. Its
+current relevant structure is:
+
+~~~yaml
+runtime:
+  timeout_seconds: 3600
+  maximum_failures: 1
+submission:
+  pending_buffer: 1
+  poll_interval_seconds: 15
+  max_running_cases: null
+cluster:
+  cores_per_case: 16
+  wall_time: null
+  scheduler_options: []
+~~~
+
+cores_per_case is the independently requested CPU count for one COMSOL case.
+pending_buffer is the number of jobs from this exact campaign that may wait in
+Slurm; changing it from 1 to 2 is a configuration-only operational decision.
+poll_interval_seconds owns the foreground reconciliation cadence.
+max_running_cases is an optional safety cap, where null means that the workflow
+imposes no running target or cap. timeout_seconds and maximum_failures retain
+their existing runtime and stop-policy meanings. These settings affect
+execution provenance, not scientific case_input_id or Dataset identity.
+
+Fixed campaign-node packing and array-concurrency controls have no production
+owner. Each scientific case is one
+ordinary non-exclusive Slurm job requesting cores_per_case. There is no
+campaign node reservation, manual node packing, or whole-campaign array. Slurm
+chooses placement, may colocate compatible jobs, and decides how many run.
+The project makes no claim about scheduler priority for work submitted by other users.
+
+With the maintained pending_buffer of 1, the reconciliation loop is:
+
+~~~text
+lock the exact campaign run
+load atomic manifest and recover any unresolved submission intent
+query squeue and sacct for persisted job IDs only
+for every declared case:
+    trust validated immutable case evidence as success
+    otherwise classify exact submitted attempts as active, pending,
+    terminal failure, accounting-unknown, or absent
+count pending and running jobs for this campaign only
+stop on unknown accounting or the configured failure threshold
+if optional running cap is set and reached:
+    submit nothing
+elif pending count is at least pending_buffer:
+    submit nothing
+elif an eligible unsent case remains:
+    atomically persist its exact case/job submission intent
+    submit exactly that one ordinary job
+    atomically persist the returned job ID
+reconcile again before any later submission
+~~~
+
+This ramp-up allows every newly submitted job that Slurm admits to become
+running, then restores one waiting job. Once one campaign job remains pending,
+all remaining cases stay unsubmitted. When the pending slot clears, the next
+poll submits exactly one new case. Healthy running or pending jobs are neither
+cancelled nor suspended to make room.
+
+Resume uses the same manifest, lock, exact persisted job IDs, squeue, sacct,
+case-failure evidence, and validated HDF5 publication. It never reruns a valid
+successful case or duplicates an active or pending case. A disappeared job is
+not considered successful without authoritative case evidence. Accounting lag
+fails closed, and failed cases require the existing explicit resume/retry path
+once the failure threshold stops normal feeding. Unique persisted submission
+intent and campaign-scoped job identity recover an accepted sbatch after an SSH
+or wrapper interruption.
+
+Run:
+
+~~~bash
 ./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN"
 ./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"
-```
+~~~
 
-The wrapper uses campaign-owned counts, roles, seeds, package requests and
-execution defaults. It fails closed on a dirty checkout, commit/config/template
-mismatch, unresolved mapping, native or HDF5 admission failure, incomplete
-Slurm membership, transfer mismatch, package failure, or loader-smoke failure.
-The resulting canonical evidence is an immutable `01_generation` publication,
-transfer receipt, requested `02_datasets` packages, loader-smoke receipt, and
-all-workflow receipt. Use `--keep-cpu-source` only when native source must remain
-for review; otherwise CPU cleanup occurs only after every local gate passes.
+The foreground workflow polls and feeds, then continues through terminal
+validation, transfer, immutable Generation publication, requested Dataset
+packages, loader smokes, receipts, and gated CPU cleanup. If the controlling
+shell exits, already submitted Slurm jobs continue. Rerun
+generation_workflow.sh resume with the printed run ID to reconstruct state and
+continue safely; do not submit cases manually.
 
 ## Readiness gates
 
 Run:
 
 ```bash
-python -m src.generation.cli.cli_generation readiness-report \
+./scripts/docker_python.sh -m src.generation.cli.cli_generation readiness-report \
   "$STEADY_CAMPAIGN" "$TRANSIENT_CAMPAIGN" \
   --run-static-sentinels
 ```
@@ -499,6 +694,9 @@ model-tree behavior.
 - Failed collection retains marked staging and CPU source. Use `status` and
   `resume`; do not manually move partial data into `01_generation`.
 - Smoke packages cannot be selected by normal training configuration.
+- A benchmark refusal normally means the source-current real-smoke gate is
+  absent, one repetition failed, or a successful result conflicts. Use the
+  printed `--variant` recovery command; do not delete successful evidence.
 - Never delete CPU source manually. Use cleanup dry-run and confirmation so the
   digest authorization is preserved.
 

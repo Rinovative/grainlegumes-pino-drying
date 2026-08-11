@@ -14,11 +14,12 @@ retention:
   pilot_check:
     retain_raw_csv: true
     retain_solved_model: true
+submission:
+  pending_buffer: 1
+  poll_interval_seconds: 15
+  max_running_cases: null
 cluster:
-  max_nodes: 1
-  cases_per_node: 2
   cores_per_case: 16
-  max_parallel_cases: 2
   wall_time: null
   scheduler_options: []
 site:

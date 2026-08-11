@@ -65,11 +65,6 @@ def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         storage_root=storage,
         work_root=work,
         venv_path=venv,
-        max_nodes=1,
-        cases_per_node=2,
-        cores_per_case=16,
-        max_parallel_cases=2,
-        cores_per_node=32,
     )
 
 
@@ -84,14 +79,13 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert report["production_configuration_ready"] is False
     assert "unconfirmed required export mappings" in report["production_configuration_blocker"]
     assert report["production_solve_started"] is False
-    assert report["resource_plan"] == {
-        "max_nodes": 1,
-        "cases_per_node": 2,
+    assert report["submission_plan"] == {
+        "cases_per_job": 1,
         "cores_per_case": 16,
-        "max_parallel_cases": 2,
         "cores_per_node": 32,
-        "effective_parallel_cases": 2,
-        "effective_nodes": 1,
+        "pending_buffer": 1,
+        "poll_interval_seconds": 15,
+        "max_running_cases": None,
     }
     assert report["path_cleanup_probe"]["probe_removed"] is True
     assert not Path(report["path_cleanup_probe"]["probe_path"]).exists()
@@ -125,11 +119,6 @@ def test_preflight_fails_clearly_when_native_command_is_missing(
             storage_root=storage,
             work_root=work,
             venv_path=venv,
-            max_nodes=1,
-            cases_per_node=1,
-            cores_per_case=1,
-            max_parallel_cases=1,
-            cores_per_node=32,
         )
     assert not tuple(work.iterdir())
 
@@ -152,11 +141,6 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
             storage_root=storage,
             work_root=work,
             venv_path=venv,
-            max_nodes=1,
-            cases_per_node=1,
-            cores_per_case=1,
-            max_parallel_cases=1,
-            cores_per_node=32,
         )
     monkeypatch.undo()
     storage, work, venv = _paths(tmp_path / "wrong modules", monkeypatch)
@@ -180,11 +164,6 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
             storage_root=storage,
             work_root=work,
             venv_path=venv,
-            max_nodes=1,
-            cases_per_node=1,
-            cores_per_case=1,
-            max_parallel_cases=1,
-            cores_per_node=32,
         )
     assert not tuple(work.iterdir())
 
@@ -218,33 +197,5 @@ def test_preflight_rejects_wrong_binding_runtime_version(
             storage_root=storage,
             work_root=work,
             venv_path=venv,
-            max_nodes=1,
-            cases_per_node=1,
-            cores_per_case=1,
-            max_parallel_cases=1,
-            cores_per_node=32,
-        )
-    assert not tuple(work.iterdir())
-
-
-def test_preflight_rejects_resource_oversubscription_before_probe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Protect the physical cores-per-node cap before scratch mutation."""
-    storage, work, venv = _paths(tmp_path, monkeypatch)
-    _fake_capabilities(monkeypatch)
-    with pytest.raises(ValueError, match="cores_per_node"):
-        preflight.run_cpu_preflight(
-            _CAMPAIGN,
-            only_batch=None,
-            storage_root=storage,
-            work_root=work,
-            venv_path=venv,
-            max_nodes=1,
-            cases_per_node=5,
-            cores_per_case=8,
-            max_parallel_cases=1,
-            cores_per_node=32,
         )
     assert not tuple(work.iterdir())

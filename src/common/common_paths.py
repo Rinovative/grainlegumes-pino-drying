@@ -140,6 +140,14 @@ def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path
     return get_generation_root(storage_root=storage_root) / ".state"
 
 
+def get_generation_performance_benchmark_root(
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Return the Generation metadata namespace for performance evidence."""
+    return get_generation_meta_root(storage_root=storage_root) / "performance_benchmarks"
+
+
 def get_dataset_metadata_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the validated dataset-metadata stage."""
     return get_datasets_root(storage_root=storage_root) / "meta"

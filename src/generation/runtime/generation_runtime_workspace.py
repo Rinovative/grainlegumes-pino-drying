@@ -146,8 +146,11 @@ def resolve_work_root(
 
 
 def workspace_run_id(config: GenerationConfig) -> str:
-    """Return the campaign run identity or the batch identity for local work."""
-    run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID", config.batch_id)
+    """Return the campaign, benchmark, or local batch identity for work."""
+    run_id = os.environ.get(
+        "GENERATION_BENCHMARK_RUN_ID",
+        os.environ.get("GENERATION_CAMPAIGN_RUN_ID", config.batch_id),
+    )
     return common.paths.validate_logical_name(run_id, label="workspace run_id")
 
 

@@ -140,18 +140,10 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
         cores_per_case=2,
         scalar_handoff=admission,
         scheduler_kind="slurm",
-        node_hostname="node-a",
     )
-    assert slurm[:7] == [
-        "srun",
-        "--exclusive",
-        "--nodes=1",
-        "--ntasks=1",
-        "--cpus-per-task=2",
-        "--cpu-bind=cores",
-        "--nodelist=node-a",
-    ]
-    assert slurm[7:] == local
+    assert slurm == local
+    assert "srun" not in slurm
+    assert "--exclusive" not in slurm
 
     status = cli_service.main(
         [
@@ -543,6 +535,8 @@ def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
     timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
     assert timing["working_directory"] == str(outcome.work_directory)
+    assert timing["export_conversion_s"] >= 0.0
+    assert timing["complete_execution_s"] >= timing["runtime_s"]
     assert execution["invocation"]["working_directory"] == str(outcome.work_directory)
     assert execution["schema_version"] == 1
     assert execution["result"]["state"] == "succeeded"

@@ -1,0 +1,22 @@
+schema_kind: generation_core_scaling_benchmark_suite
+schema_version: 1
+suite_name: transient_core_scaling
+case:
+  campaign_config: configs/generation/campaigns/transient_drying/pilot_check.yaml
+  material_family: lentil
+  sampling_regime: natural
+  case_index: 1
+repetitions: 3
+resources:
+  partition: null
+  wall_time: null
+  scheduler_options: []
+production_interpretation:
+  campaign_config: configs/generation/campaigns/transient_drying/family_generalization.yaml
+  cores_config: configs/generation/execution/cluster_cpu.yaml
+  cores_key: cluster.cores_per_case
+variants:
+- configs/generation/benchmarks/transient_core_scaling/cores_04.yaml
+- configs/generation/benchmarks/transient_core_scaling/cores_08.yaml
+- configs/generation/benchmarks/transient_core_scaling/cores_16.yaml
+- configs/generation/benchmarks/transient_core_scaling/cores_32.yaml

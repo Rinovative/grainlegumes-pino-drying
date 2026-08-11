@@ -85,6 +85,7 @@ def test_generation_provenance_is_compact_controlled_and_source_resolved() -> No
 def test_generation_public_facade_is_explicit_and_narrow() -> None:
     """Protect the lazy same-level package and orchestration surface."""
     expected = {
+        "benchmark",
         "campaign",
         "cases",
         "contracts",
@@ -132,6 +133,22 @@ def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
             match="unconfirmed required export mappings",
         ):
             generation.cases.config.load_campaign_config(path)
+
+
+@pytest.mark.parametrize("option", ["--exclusive", "--reservation=reserved", "--nodelist=node-a"])
+def test_execution_rejects_nonordinary_scheduler_options(
+    generation_config_factory: Any,
+    option: str,
+) -> None:
+    """Prevent execution YAML from reintroducing exclusivity or reservations."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["cluster"]["scheduler_options"] = [option]
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="allocation directives"):
+        generation.cases.config.load_campaign_config(config_path)
 
 
 def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None:
@@ -273,14 +290,14 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
             "maximum_failures": 3,
         }
     )
-    execution["cluster"].update(
+    execution["submission"].update(
         {
-            "max_nodes": 2,
-            "cases_per_node": 1,
-            "cores_per_case": 8,
-            "max_parallel_cases": 2,
+            "pending_buffer": 2,
+            "poll_interval_seconds": 7,
+            "max_running_cases": 3,
         }
     )
+    execution["cluster"]["cores_per_case"] = 8
     execution["site"].update(
         {
             "cpu_host": "synthetic-host",
@@ -327,7 +344,12 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert scientific["storage"]["compression_level"] == 6
     assert resolved.execution_values["runtime"]["timeout_seconds"] == 4200.0
     assert resolved.execution_values["runtime"]["maximum_failures"] == 3
-    assert resolved.execution_values["cluster"]["max_parallel_cases"] == 2
+    assert resolved.execution_values["cluster"]["cores_per_case"] == 8
+    assert resolved.execution_values["submission"] == {
+        "pending_buffer": 2,
+        "poll_interval_seconds": 7,
+        "max_running_cases": 3,
+    }
     assert resolved.execution_values["site"]["cpu_host"] == "synthetic-host"
 
 

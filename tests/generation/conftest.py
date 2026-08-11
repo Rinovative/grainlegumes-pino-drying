@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -129,7 +130,10 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         destination = project_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
-            destination.symlink_to(source)
+            if relative == "scripts/generation_campaign_node.sh":
+                shutil.copy2(source, destination)
+            else:
+                destination.symlink_to(source)
     monkeypatch.setenv("PROJECT_ROOT", str(project_root))
 
     registry = yaml.safe_load((repository_root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))
@@ -157,6 +161,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         extra_arguments: tuple[str, ...] = (),
         natural_count: int = _SMOKE_CASE_COUNT,
         parameter_ood_count: int = 0,
+        max_running_cases: int | None = None,
     ) -> tuple[Path, Path]:
         tests_root = project_root / "configs/generation/campaigns/test_support"
         campaign_number = len(list(tests_root.glob("campaign_*"))) if tests_root.exists() else 0
@@ -176,12 +181,16 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             "retain_raw_csv": retain_raw_csv,
             "retain_solved_model": retain_solved_model,
         }
+        execution["submission"].update(
+            {
+                "pending_buffer": 1,
+                "poll_interval_seconds": 1,
+                "max_running_cases": max_running_cases,
+            }
+        )
         execution["cluster"].update(
             {
-                "max_nodes": 2,
-                "cases_per_node": 2,
                 "cores_per_case": 1,
-                "max_parallel_cases": 3,
                 "wall_time": None,
                 "scheduler_options": [],
             }
@@ -212,8 +221,11 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         if material_families != (_TEST_MATERIAL_FAMILY,):
             message = "Synthetic runtime fixtures use one explicit test-owned material."
             raise ValueError(message)
-        if natural_count != _SMOKE_CASE_COUNT or parameter_ood_count != 0:
-            message = "Synthetic runtime fixtures use exactly two natural cases and no parameter OOD."
+        if isinstance(natural_count, bool) or not isinstance(natural_count, int) or natural_count < 1:
+            message = "Synthetic runtime fixtures require at least one natural case."
+            raise ValueError(message)
+        if parameter_ood_count != 0:
+            message = "Synthetic runtime fixtures do not support parameter OOD."
             raise ValueError(message)
         campaign_seed = _TEST_STEADY_SEED if simulation_profile == "steady_flow" else _TEST_TRANSIENT_SEED
         campaign = {
@@ -236,7 +248,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             "sampling": {
                 "method": "lhs",
                 "seed_base": campaign_seed,
-                "counts": {"natural": {_TEST_MATERIAL_FAMILY: _SMOKE_CASE_COUNT}},
+                "counts": {"natural": {_TEST_MATERIAL_FAMILY: natural_count}},
             },
             "dataset_packages": [
                 {"evaluation_regime": "id", "source_role": "seen"},

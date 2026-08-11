@@ -1,5 +1,5 @@
 # ruff: noqa: S101, S603, PLR2004
-"""Host workflow lifecycle tests using fake remote, Slurm, COMSOL, and Python."""
+"""Host workflow lifecycle tests using fake Docker, remote, Slurm, and COMSOL."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from src import generation
 
 _COMMIT = "a" * 40
 _RUN_ID = "steady_flow_family_generalization__0123456789abcdef"
+_BENCHMARK_RUN_ID = "core_scaling_transient__fedcba9876543210"
+_SMOKE_SHA = "7" * 64
 _BATCH_NAME = generation.cases.config.build_batch_name(
     "steady_flow",
     "synthetic_material",
@@ -24,6 +26,9 @@ _DATASET_SHA = "3" * 64
 _WORKFLOW_SHA = "4" * 64
 _INVENTORY_SHA = "5" * 64
 _CLEANUP_RECEIPT_SHA = "6" * 64
+_BENCHMARK_INVENTORY_SHA = "8" * 64
+_BENCHMARK_FILE_COUNT = 1
+_BENCHMARK_SIZE_BYTES = 3
 _AUTHORIZED_BYTES = 24
 
 
@@ -47,6 +52,9 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     workflow = scripts / "generation_workflow.sh"
     shutil.copyfile(repository / "scripts/generation_workflow.sh", workflow)
     workflow.chmod(workflow.stat().st_mode | 0o111)
+    docker_python = scripts / "docker_python.sh"
+    shutil.copyfile(repository / "scripts/docker_python.sh", docker_python)
+    docker_python.chmod(docker_python.stat().st_mode | 0o111)
     shutil.copyfile(
         repository / "configs/generation/campaigns/steady_flow/family_generalization.yaml",
         campaigns / "family_generalization.yaml",
@@ -55,9 +63,61 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
         repository / "configs/generation/campaigns/transient_drying/pilot_check.yaml",
         pilot_campaigns / "pilot_check.yaml",
     )
+    shutil.copytree(
+        repository / "configs/generation/benchmarks/transient_core_scaling",
+        project / "configs/generation/benchmarks/transient_core_scaling",
+    )
     log = tmp_path / "commands.log"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    _executable(
+        fake_bin / "docker",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker-start\n' >> "${FAKE_COMMAND_LOG}"
+for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
+if [[ "${FAKE_DOCKER_FAIL:-false}" == true ]]; then
+  printf 'Synthetic Docker daemon failure.\n' >&2
+  exit 88
+fi
+case "${1:-}" in
+  info) exit 0 ;;
+  image) [[ "${2:-}" == inspect && "${3:-}" == grainlegumes-pino-drying ]]; exit ;;
+  run)
+    arguments=("$@")
+    python_index=-1
+    for ((index=0; index<${#arguments[@]}; index++)); do
+      if [[ "${arguments[index]}" == python ]]; then
+        python_index="${index}"
+      fi
+    done
+    (( python_index >= 0 )) || { printf 'Docker invocation omitted Python.\n' >&2; exit 91; }
+    translated=()
+    for argument in "${arguments[@]:python_index+1}"; do
+      case "${argument}" in
+        /workspace/repo) argument="${FAKE_PROJECT_ROOT}" ;;
+        /workspace/repo/*) argument="${FAKE_PROJECT_ROOT}/${argument#/workspace/repo/}" ;;
+        /workspace/storage) argument="${STORAGE_ROOT}" ;;
+        /workspace/storage/*) argument="${STORAGE_ROOT}/${argument#/workspace/storage/}" ;;
+      esac
+      translated+=("${argument}")
+    done
+    exec "${FAKE_LOCAL_PYTHON}" "${translated[@]}"
+    ;;
+  *) printf 'Unsupported fake Docker invocation.\n' >&2; exit 92 ;;
+esac
+""",
+    )
+    for forbidden_name in ("python", "python3"):
+        _executable(
+            fake_bin / forbidden_name,
+            r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'forbidden-host-python <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
+printf 'Bare-host Python is forbidden.\n' >&2
+exit 93
+""",
+        )
     _executable(
         fake_bin / "git",
         r"""#!/usr/bin/env bash
@@ -81,6 +141,25 @@ for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}";
 printf 'ssh-stdin-start\n%s\nssh-stdin-end\n' "${payload}" >> "${FAKE_COMMAND_LOG}"
 if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
   printf '%s\n' '/remote/home'
+elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
+  printf '%s\n' "${FAKE_BENCHMARK_STATE}"
+elif [[ " $* " == *' core-benchmark-status '* ]]; then
+  printf '%s\n' '{"state":"retry_required","retry_repetitions":[{"variant_id":"cores_16","repetition":2,"evidence_status":"failed"}]}'
+elif [[ " $* " == *' core-benchmark-transfer-plan '* ]]; then
+  printf 'benchmark\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_GIT_COMMIT}" "${FAKE_BENCHMARK_RELATIVE}" \
+    "${FAKE_BENCHMARK_INVENTORY_SHA}" "${FAKE_BENCHMARK_FILE_COUNT}" \
+    "${FAKE_BENCHMARK_SIZE_BYTES}"
+elif [[ " $* " == *' submit-core-benchmark '* ]]; then
+  printf '{"benchmark_run_id":"%s","state":"submitted"}\n' "${FAKE_BENCHMARK_RUN_ID}"
+elif [[ " $* " == *' plan-core-benchmark '* ]]; then
+  printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
+elif [[ " $* " == *' finalize-core-benchmark '* ]]; then
+  printf '%s\n' '{"state":"complete"}'
+elif [[ " $* " == *' core-benchmark-summary '* ]]; then
+  printf '%s\n' '# Synthetic remote core benchmark summary'
+elif [[ " $* " == *' validate-real-smoke '* ]]; then
+  printf '%s\n' '{"status":"valid"}'
 elif [[ " $* " == *' campaign-transfer-plan '* ]]; then
   printf '%b' "${FAKE_TRANSFER_PLAN}"
 elif [[ " $* " == *' campaign-source-status '* ]]; then
@@ -92,7 +171,7 @@ elif [[ " $* " == *' campaign-source-status '* ]]; then
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format state '* ]]; then
   printf '%s\n' "${FAKE_CAMPAIGN_STATE}"
 elif [[ " $* " == *' campaign-status '* ]]; then
-  printf '%s\n' '{"campaign_purpose":"family_generalization","cases_per_material":null}'
+  printf '%s\n' '{"campaign_purpose":"family_generalization","cases_per_material":null,"submission_config":{"poll_interval_seconds":1}}'
 elif [[ " $* " == *' storage-status '* && " $* " == *' --role cpu '* ]]; then
   printf '%s\n' '{"role":"cpu","generation_total_bytes":24,"datasets_total_bytes":0,"runs":[]}'
 elif [[ " $* " == *' cleanup-campaign-source '* ]]; then
@@ -130,6 +209,9 @@ printf 'rsync-start\n' >> "${FAKE_COMMAND_LOG}"
 for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
 source_argument="${@: -2:1}"
 destination="${@: -1}"
+if [[ "${destination}" == *:* ]]; then
+  exit 0
+fi
 remote_path="${source_argument#*:}"
 relative="${remote_path#*/./}"
 source="${FAKE_REMOTE_MIRROR}/${relative}"
@@ -147,9 +229,27 @@ if [[ " $* " == *' list-campaigns '* ]]; then
   printf '%s\n' '{}'
   exit 0
 fi
+if [[ " $* " == *' inspect-core-benchmark '* ]]; then
+  printf '%s\n' \
+    '{"suite_name":"transient_core_scaling",'\
+'"suite_digest":"8888888888888888888888888888888888888888888888888888888888888888",'\
+'"repetitions":3,"resource_contract":{"cpu_host":"fixture.cluster","scheduler":"slurm",'\
+'"partition":"standard","cores_per_node":32,"python_module":"Python/3.10",'\
+'"comsol_module":"Comsol/v6.4","python_executable":"python","comsol_executable":"comsol","poll_interval_seconds":1},'\
+'"variants":[{"variant_id":"cores_04","cores_per_case":4},'\
+'{"variant_id":"cores_08","cores_per_case":8},{"variant_id":"cores_16","cores_per_case":16},'\
+'{"variant_id":"cores_32","cores_per_case":32}]}'
+  exit 0
+fi
 if [[ " $* " == *' -c '* ]]; then
   cat >/dev/null
-  if [[ " $* " == *'workflow = value'* ]]; then
+  if [[ " $* " == *'resource = value'* ]]; then
+    printf 'benchmark\ttransient_core_scaling\t%s\t3\t4,8,16,32\tfixture.cluster\t'\
+'slurm\tstandard\t32\tPython/3.10\tComsol/v6.4\tpython\tcomsol\t1\n' \
+      '8888888888888888888888888888888888888888888888888888888888888888'
+  elif [[ " $* " == *'valid = value'* ]]; then
+    printf 'smoke\t/workspace/storage/01_generation/meta/smoke_receipts/current.json\t%s\n' "${FAKE_SMOKE_SHA}"
+  elif [[ " $* " == *'workflow = value'* ]]; then
     printf 'workflow\t%s\t%s\t%s\t%s\tfixture.cluster\tslurm\tfixture\t48\t'\
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' \
       "${FAKE_PROJECT_ROOT}/configs/generation/campaigns/steady_flow/technical_smoke.yaml" \
@@ -159,10 +259,10 @@ if [[ " $* " == *' -c '* ]]; then
   elif [[ " $* " == *'counts = tuple'* ]]; then
     printf 'pilot\tpilot_check\t4\t20\n'
   elif [[ " $* " == *'execution_resources'* ]]; then
-    printf 'execution\tfamily_generalization\t3\t4\t6\t7\t-\t48\tfixture.cluster\tslurm\tfixture\t'\
+    printf 'execution\tfamily_generalization\t8\t01:00:00\t48\t1\t1\t-\tfixture.cluster\tslurm\tfixture\t'\
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n'
   elif [[ " $* " == *'campaign_purpose'* ]]; then
-    printf 'campaign\tfamily_generalization\t\n'
+    printf 'campaign\tfamily_generalization\t-\t1\n'
   fi
   exit 0
 fi
@@ -175,12 +275,26 @@ for ((index=0; index<${#arguments[@]}; index++)); do
     --directory) directory="${arguments[index+1]}" ;;
   esac
 done
-if [[ " $* " == *' validate-published-campaign '* ]]; then
+if [[ " $* " == *' validate-real-smoke '* ]]; then
+  receipt="${storage}/01_generation/meta/smoke_receipts/current.json"
+  mkdir -p "$(dirname "${receipt}")"
+  printf '%s\n' '{}' > "${receipt}"
+  printf '{"status":"valid","valid_receipts":[{'\
+'"path":"/workspace/storage/01_generation/meta/smoke_receipts/current.json",'\
+'"receipt_digest":"%s"}]}\n' "${FAKE_SMOKE_SHA}"
+elif [[ " $* " == *' validate-core-benchmark '* ]]; then
+  [[ -f "${FAKE_BENCHMARK_PUBLISHED_FILE}" ]]
+elif [[ " $* " == *' validate-published-campaign '* ]]; then
   [[ -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' create-transfer-staging '* ]]; then
   staging="${storage}/01_generation/.state/transfer-staging/${FAKE_RUN_ID}.synthetic"
   mkdir -p "${staging}"
   printf '%s\n' "${staging}"
+elif [[ " $* " == *' publish-transferred-core-benchmark '* ]]; then
+  : > "${FAKE_BENCHMARK_PUBLISHED_FILE}"
+  printf '%s\n' '{"status":"transfer_complete","dataset_membership":"none"}'
+elif [[ " $* " == *' core-benchmark-summary '* ]]; then
+  printf '%s\n' '# Synthetic local core benchmark summary'
 elif [[ " $* " == *' publish-transferred-campaign '* ]]; then
   if [[ "${FAKE_PUBLISH_FAIL:-false}" == true ]]; then
     printf '%s\n' 'synthetic destination hash validation failed' >&2
@@ -238,6 +352,13 @@ fi
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
             "FAKE_RUN_ID": _RUN_ID,
+            "FAKE_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
+            "FAKE_BENCHMARK_STATE": "complete",
+            "FAKE_BENCHMARK_RELATIVE": (f"01_generation/meta/performance_benchmarks/core_scaling/{_BENCHMARK_RUN_ID}"),
+            "FAKE_BENCHMARK_INVENTORY_SHA": _BENCHMARK_INVENTORY_SHA,
+            "FAKE_BENCHMARK_FILE_COUNT": str(_BENCHMARK_FILE_COUNT),
+            "FAKE_BENCHMARK_SIZE_BYTES": str(_BENCHMARK_SIZE_BYTES),
+            "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
             "FAKE_CAMPAIGN_STATE": "publication_complete",
             "FAKE_SOURCE_STATE": "publication_complete",
@@ -249,12 +370,13 @@ fi
             "FAKE_INVENTORY_SHA": _INVENTORY_SHA,
             "FAKE_CLEANUP_RECEIPT_SHA": _CLEANUP_RECEIPT_SHA,
             "FAKE_GPU_PUBLISHED_FILE": str(state_root / "gpu-published"),
+            "FAKE_BENCHMARK_PUBLISHED_FILE": str(state_root / "benchmark-published"),
             "FAKE_DATASETS_COMPLETE_FILE": str(state_root / "datasets-complete"),
             "FAKE_WORKFLOW_READY_FILE": str(state_root / "workflow-ready"),
             "FAKE_WORKFLOW_COMPLETE_FILE": str(state_root / "workflow-complete"),
             "FAKE_REMOTE_CLEANED_FILE": str(state_root / "remote-cleaned"),
             "FAKE_SOURCE_DIRECTORIES_FILE": str(source_directories_file),
-            "GENERATION_LOCAL_PYTHON": str(local_python),
+            "FAKE_LOCAL_PYTHON": str(local_python),
             "GENERATION_STATUS_POLL_SECONDS": "0",
             "STORAGE_ROOT": str(storage),
         }
@@ -289,22 +411,9 @@ def _remote_options() -> list[str]:
     ]
 
 
-def _resource_options() -> list[str]:
-    """Return one valid explicit Slurm resource request."""
-    return [
-        "--max-nodes",
-        "2",
-        "--cases-per-node",
-        "2",
-        "--cores-per-case",
-        "8",
-        "--max-parallel-cases",
-        "3",
-        "--only-batch",
-        _BATCH_NAME,
-        "--wall-time",
-        "01:00:00",
-    ]
+def _selection_options() -> list[str]:
+    """Return one valid configured-campaign batch selection."""
+    return ["--only-batch", _BATCH_NAME]
 
 
 def _campaign(workflow: Path) -> Path:
@@ -358,7 +467,16 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert "Dry run: no remote files or jobs were created." in dry_run.stdout
     assert "Python/fixture-3.12" in dry_run.stdout
     assert "Comsol/fixture-9.9" in dry_run.stdout
-    assert not storage.exists()
+    assert storage.is_dir()
+    assert not any(storage.iterdir())
+    dry_log = log.read_text(encoding="utf-8")
+    assert "forbidden-host-python" not in dry_log
+    assert "<--rm>" in dry_log
+    assert "<--network>\n<none>" in dry_log
+    assert "<--name>" not in dry_log
+    assert "<type=bind,source=" in dry_log
+    assert ",target=/workspace/repo,readonly>" in dry_log
+    assert ",target=/workspace/storage>" in dry_log
 
     execute = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
     assert execute.returncode == 0, execute.stderr
@@ -368,16 +486,40 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert " Python/fixture-3.12 Comsol/fixture-9.9 " in log_text
     assert 'module load "${python_module}"' in log_text
     assert 'module load "${comsol_module}"' in log_text
+    assert "[generation-cpu]" in log_text
+    assert "forbidden-host-python" not in log_text
+
+    home_based = _run(
+        workflow,
+        ["setup-cpu", "--cpu-host", "cpu.example", "--git-commit", _COMMIT],
+        environment,
+    )
+    assert home_based.returncode == 0, home_based.stderr
+    assert "Repository: /remote/home/grainlegumes-generation/repo" in home_based.stdout
+    assert "Persistent storage: /remote/home/grainlegumes-generation/storage" in home_based.stdout
+    assert "Venv: /remote/home/grainlegumes-generation/venv" in home_based.stdout
 
     unsafe = _run(workflow, ["setup-cpu", "--cpu-host", "bad;host"], environment)
     assert unsafe.returncode == 2
     assert "Unsafe CPU host" in unsafe.stderr
 
 
+def test_local_docker_failure_is_clear_and_stops_before_remote_mutation(tmp_path: Path) -> None:
+    """Surface canonical Docker failures without falling back to native Python."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_DOCKER_FAIL"] = "true"
+    result = _run(workflow, ["setup-cpu", *_remote_options()], environment)
+    assert result.returncode == 1
+    assert "Local project Python requires the Docker daemon" in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "forbidden-host-python" not in log_text
+    assert "ssh-start" not in log_text
+
+
 def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path) -> None:
     """Protect planning, launch, unified storage status, and resource caps."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
-    plan = _run(workflow, ["plan", str(_campaign(workflow)), *_remote_options(), *_resource_options()], environment)
+    plan = _run(workflow, ["plan", str(_campaign(workflow)), *_remote_options(), *_selection_options()], environment)
     assert plan.returncode == 0, plan.stderr
     assert '"filesystem_mutated":false' in plan.stdout
 
@@ -394,17 +536,17 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     )
     assert configured.returncode == 0, configured.stderr
     configured_log = log.read_text(encoding="utf-8")
-    assert " 3 4 6 7 future.profile::batch " in configured_log
+    assert " future.profile::batch plan-campaign " in configured_log
+    assert "--max-nodes" not in configured_log
+    assert "--cases-per-node" not in configured_log
+    assert "--max-parallel-cases" not in configured_log
 
-    whole_campaign_resources = _resource_options()
-    del whole_campaign_resources[-4:-2]
     skipped = _run(
         workflow,
         [
             "plan",
             str(_campaign(workflow)),
             *_remote_options(),
-            *whole_campaign_resources,
             "--skip-extreme-family-ood",
         ],
         environment,
@@ -417,7 +559,7 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
             "plan",
             str(_campaign(workflow)),
             *_remote_options(),
-            *_resource_options(),
+            *_selection_options(),
             "--skip-extreme-family-ood",
         ],
         environment,
@@ -425,7 +567,7 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     assert incompatible.returncode == 2
     assert "cannot be combined with --only-batch" in incompatible.stderr
 
-    launch = _run(workflow, ["launch", str(_campaign(workflow)), *_remote_options(), *_resource_options()], environment)
+    launch = _run(workflow, ["launch", str(_campaign(workflow)), *_remote_options(), *_selection_options()], environment)
     assert launch.returncode == 0, launch.stderr
     assert f"Campaign run ID: {_RUN_ID}" in launch.stdout
     assert "submit-campaign" in log.read_text(encoding="utf-8")
@@ -441,25 +583,20 @@ def test_plan_launch_status_and_resource_rejection_are_canonical(tmp_path: Path)
     assert "CPU storage status:" in status.stdout
     assert '"role":"cpu"' in status.stdout
 
-    rejected = _run(
-        workflow,
-        [
-            "plan",
-            str(_campaign(workflow)),
-            *_remote_options(),
-            "--max-nodes",
-            "1",
-            "--cases-per-node",
-            "7",
-            "--cores-per-case",
-            "8",
-            "--max-parallel-cases",
-            "1",
-        ],
-        environment,
-    )
-    assert rejected.returncode == 2
-    assert "exceeds 48" in rejected.stderr
+    for obsolete in (
+        "--max-nodes",
+        "--cases-per-node",
+        "--cores-per-case",
+        "--max-parallel-cases",
+        "--wall-time",
+    ):
+        rejected = _run(
+            workflow,
+            ["plan", str(_campaign(workflow)), *_remote_options(), obsolete, "1"],
+            environment,
+        )
+        assert rejected.returncode == 2
+        assert f"Unsupported option: {obsolete}" in rejected.stderr
 
 
 def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: Path) -> None:
@@ -492,6 +629,63 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
     help_result = _run(workflow, ["--help"], environment)
     assert "pilot-check CAMPAIGN [--cases-per-material N]" in help_result.stderr
     assert "duration-check" not in help_result.stderr
+
+
+def test_high_level_core_benchmark_routes_through_docker_cpu_and_dedicated_transfer(tmp_path: Path) -> None:
+    """Exercise all-four submission, serial collection, and one-variant recovery routing."""
+    workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    relative = environment["FAKE_BENCHMARK_RELATIVE"]
+    remote_directory = mirror / relative
+    remote_directory.mkdir(parents=True)
+    (remote_directory / "summary.json").write_text("{}\n", encoding="utf-8")
+
+    result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
+    assert result.returncode == 0, result.stderr
+    assert f"Core benchmark run ID: {_BENCHMARK_RUN_ID}" in result.stdout
+    assert "Synthetic local core benchmark summary" in result.stdout
+    assert "CPU benchmark evidence retained" in result.stdout
+    assert remote_directory.is_dir()
+    assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()
+    log_text = log.read_text(encoding="utf-8")
+    for command in (
+        "inspect-core-benchmark",
+        "validate-real-smoke",
+        "plan-core-benchmark",
+        "submit-core-benchmark",
+        "core-benchmark-status",
+        "finalize-core-benchmark",
+        "core-benchmark-transfer-plan",
+        "publish-transferred-core-benchmark",
+    ):
+        assert command in log_text
+    assert "<build-campaign-datasets>" not in log_text
+    assert f"<--expected-inventory-sha256>\n<{_BENCHMARK_INVENTORY_SHA}>" in log_text
+    assert f"<--expected-file-count>\n<{_BENCHMARK_FILE_COUNT}>" in log_text
+    assert f"<--expected-size-bytes>\n<{_BENCHMARK_SIZE_BYTES}>" in log_text
+    assert "forbidden-host-python" not in log_text
+
+    recovered = _run(
+        workflow,
+        ["benchmark-cores", "--variant", "cores_08", *_remote_options()],
+        environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    recovered_log = log.read_text(encoding="utf-8")
+    assert "<--variant>\n<cores_08>" in recovered_log
+    assert "GPU benchmark publication validated and reused" in recovered.stdout
+
+
+def test_core_benchmark_failure_reports_retry_without_premature_finalization(tmp_path: Path) -> None:
+    """Stop on one failed repetition and preserve the remaining serial sequence."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_BENCHMARK_STATE"] = "retry_required"
+
+    result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
+
+    assert result.returncode != 0
+    assert '"variant_id":"cores_16"' in result.stdout
+    assert "requires retry" in result.stderr
+    assert "<finalize-core-benchmark>" not in log.read_text(encoding="utf-8")
 
 
 def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_path: Path) -> None:
@@ -536,7 +730,7 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
     source_directories = _seed_transfer(mirror, environment)
     complete = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_resource_options()],
+        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
         environment,
     )
     assert complete.returncode == 0, complete.stderr
@@ -564,7 +758,7 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
             "all",
             str(_campaign(retained_workflow)),
             *_remote_options(),
-            *_resource_options(),
+            *_selection_options(),
             "--keep-cpu-source",
         ],
         retained_environment,
@@ -584,7 +778,7 @@ def test_failure_preserves_cpu_and_gpu_then_resume_reuses_publication_idempotent
     environment["FAKE_BUILD_FAIL"] = "true"
     failed = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_resource_options()],
+        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
         environment,
     )
     assert failed.returncode != 0
@@ -630,7 +824,7 @@ def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None
     environment["FAKE_SOURCE_STATE"] = "partially_failed"
     partial = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_resource_options()],
+        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
         environment,
     )
     assert partial.returncode != 0
@@ -645,7 +839,7 @@ def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None
     detached_directories = _seed_transfer(detached_mirror, detached_environment)
     detached = _run(
         detached_workflow,
-        ["all", str(_campaign(detached_workflow)), *_remote_options(), *_resource_options(), "--detach"],
+        ["all", str(_campaign(detached_workflow)), *_remote_options(), *_selection_options(), "--detach"],
         detached_environment,
     )
     assert detached.returncode == 0, detached.stderr

@@ -286,7 +286,6 @@ def run_mapping_probe(
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
         scheduler_kind="slurm",
-        node_hostname=socket.gethostname(),
     )
     stdout_path = prepared.runtime_directory / "mapping_probe.stdout.log"
     stderr_path = prepared.runtime_directory / "mapping_probe.stderr.log"

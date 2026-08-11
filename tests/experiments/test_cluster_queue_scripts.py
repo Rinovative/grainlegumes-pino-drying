@@ -90,7 +90,12 @@ def _harness(
     repository = tmp_path / "repository with spaces"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("docker_job.sh", "_docker_run.sh", "config_preflight_runtime.py"):
+    for name in (
+        "docker_job.sh",
+        "docker_python.sh",
+        "_docker_run.sh",
+        "config_preflight_runtime.py",
+    ):
         shutil.copy2(_REPOSITORY_ROOT / "scripts" / name, scripts / name)
 
     shutil.copytree(_REPOSITORY_ROOT / "src", repository / "src")
@@ -402,7 +407,10 @@ def _assert_preflight_container(
     assert "WANDB_API_KEY" not in arguments
     assert not any(argument.startswith("WANDB_") for argument in arguments)
     assert f"type=bind,source={harness.repository},target=/workspace/repo,readonly" in arguments
+    assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in arguments
+    assert arguments[arguments.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert "STORAGE_ROOT=/workspace/storage" in arguments
+    assert not harness.host_python_capture.exists()
     assert arguments[-4:] == [
         "python",
         "/workspace/repo/scripts/config_preflight_runtime.py",
@@ -421,7 +429,10 @@ def _assert_queue_path_container(harness: _Harness, *, scope: str) -> None:
     assert arguments[arguments.index("--workdir") + 1] == "/workspace/repo"
     assert "--gpus" not in arguments
     assert f"type=bind,source={harness.repository},target=/workspace/repo,readonly" in arguments
+    assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in arguments
+    assert arguments[arguments.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert "STORAGE_ROOT=/workspace/storage" in arguments
+    assert not harness.host_python_capture.exists()
     assert arguments[-4:] == [
         "python",
         "-m",
@@ -552,8 +563,8 @@ def test_dataset_builder_runs_synchronously_without_gpu_queue(
     assert docker[docker.index("--user") + 1] == (f"{os.getuid()}:{os.getgid()}")
     assert docker[docker.index("--workdir") + 1] == "/workspace/repo"
     assert "--gpus" not in docker
-    assert f"{harness.repository}:/workspace/repo:ro" in docker
-    assert f"{harness.environment['STORAGE_ROOT']}:/workspace/storage:rw" in docker
+    assert f"type=bind,source={harness.repository},target=/workspace/repo,readonly" in docker
+    assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in docker
     assert docker[-7:] == [
         "python",
         "-m",

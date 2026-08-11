@@ -5,11 +5,8 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
-IMAGE_NAME="grainlegumes-pino-drying"
+DOCKER_PYTHON="${PROJECT_DIR}/scripts/docker_python.sh"
 PREFLIGHT_RUNTIME="/workspace/repo/scripts/config_preflight_runtime.py"
-PROJECT_PYTHON_MINIMUM="3.10"
-DETECTED_HOST_PYTHON_EXECUTABLE="not found"
-DETECTED_HOST_PYTHON_VERSION="unavailable"
 
 usage() {
   cat >&2 <<EOF
@@ -51,35 +48,6 @@ fail() {
   shift
   printf '%s\n' "$*" >&2
   exit "${status}"
-}
-
-detect_host_python() {
-  local executable=""
-  local version=""
-
-  if executable="$(command -v python 2>/dev/null)" && [[ -n "${executable}" ]]; then
-    DETECTED_HOST_PYTHON_EXECUTABLE="${executable}"
-    if version="$("${executable}" -c 'import sys; print("{}.{}.{}".format(*sys.version_info[:3]))' 2>/dev/null)" \
-        && [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      DETECTED_HOST_PYTHON_VERSION="${version}"
-    fi
-  fi
-}
-
-host_python_is_below_project_minimum() {
-  if [[ ! "${DETECTED_HOST_PYTHON_VERSION}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-    return 1
-  fi
-  (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 10) ))
-}
-
-preflight_runtime_failure() {
-  local detail="$1"
-  printf 'Configuration preflight could not start.\n' >&2
-  printf 'Host Python: %s (%s)\n' "${DETECTED_HOST_PYTHON_VERSION}" "${DETECTED_HOST_PYTHON_EXECUTABLE}" >&2
-  printf 'Required Python: >=%s\n' "${PROJECT_PYTHON_MINIMUM}" >&2
-  printf 'Maintained preflight container: %s\n' "${detail}" >&2
-  exit 1
 }
 
 trim_whitespace() {
@@ -175,51 +143,9 @@ run_config_preflight() {
   local container_config="$2"
   local output=""
   local status=0
-  local mount_args=(
-    --mount "type=bind,source=${PROJECT_DIR},target=/workspace/repo,readonly"
-  )
-  local command=()
 
-  case "${container_config}" in
-    /workspace/storage/*)
-      mount_args+=(
-        --mount "type=bind,source=${STORAGE_DIR},target=/workspace/storage,readonly"
-      )
-      ;;
-  esac
-
-  detect_host_python
-  if host_python_is_below_project_minimum; then
-    printf '%s\n' \
-      "Host Python ${DETECTED_HOST_PYTHON_VERSION} at ${DETECTED_HOST_PYTHON_EXECUTABLE} is below the project minimum >=${PROJECT_PYTHON_MINIMUM}. Running configuration preflight in the maintained CPU-only project container." \
-      >&2
-  fi
-
-  if ! command -v docker >/dev/null 2>&1; then
-    preflight_runtime_failure "Docker was not found on PATH."
-  fi
-  if ! docker info >/dev/null 2>&1; then
-    preflight_runtime_failure "the Docker daemon is unavailable."
-  fi
-  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
-    preflight_runtime_failure "image '${IMAGE_NAME}' is missing. Build it with ./scripts/docker_build.sh."
-  fi
-
-  command=(
-    docker run --rm
-    --network none
-    --workdir /workspace/repo
-    --tmpfs /tmp:rw,nosuid,nodev,size=64m
-    -e HOME=/tmp
-    -e PYTHONDONTWRITEBYTECODE=1
-    -e PYTHONNOUSERSITE=1
-    -e PROJECT_ROOT=/workspace/repo
-    -e STORAGE_ROOT=/workspace/storage
-    "${mount_args[@]}"
-    "${IMAGE_NAME}"
-    python "${PREFLIGHT_RUNTIME}" "${workflow}" "${container_config}"
-  )
-  if output="$("${command[@]}")"; then
+  if output="$(env STORAGE_ROOT="${STORAGE_DIR}" "${DOCKER_PYTHON}" \
+    "${PREFLIGHT_RUNTIME}" "${workflow}" "${container_config}")"; then
     printf '%s' "${output}"
     return 0
   else
@@ -236,31 +162,9 @@ resolve_host_queue_log_dir() {
   local output=""
   local status=0
   local container_root="/workspace/storage"
-  local command=(
-    docker run --rm
-    --network none
-    --workdir /workspace/repo
-    --tmpfs /tmp:rw,nosuid,nodev,size=64m
-    -e HOME=/tmp
-    -e PYTHONDONTWRITEBYTECODE=1
-    -e PYTHONNOUSERSITE=1
-    -e PROJECT_ROOT=/workspace/repo
-    -e STORAGE_ROOT="${container_root}"
-    --mount "type=bind,source=${PROJECT_DIR},target=/workspace/repo,readonly"
-    "${IMAGE_NAME}"
-    python -m src.common.common_queue_log_cli "${scope}"
-  )
 
-  if ! command -v docker >/dev/null 2>&1; then
-    fail 1 "Queue-log path resolution requires Docker, but Docker was not found on PATH."
-  fi
-  if ! docker info >/dev/null 2>&1; then
-    fail 1 "Queue-log path resolution requires the Docker daemon."
-  fi
-  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
-    fail 1 "Queue-log path resolution requires image '${IMAGE_NAME}'. Build it with ./scripts/docker_build.sh."
-  fi
-  if output="$("${command[@]}")"; then
+  if output="$(env STORAGE_ROOT="${STORAGE_DIR}" "${DOCKER_PYTHON}" \
+    -m src.common.common_queue_log_cli "${scope}")"; then
     :
   else
     status=$?
@@ -570,27 +474,8 @@ case "${JOB_TYPE}" in
 esac
 
 if [[ "${JOB_TYPE}" == build-datasets ]]; then
-  if ! command -v docker >/dev/null 2>&1; then
-    fail 1 "Dataset construction requires Docker on the GPU host."
-  fi
-  if ! docker info >/dev/null 2>&1; then
-    fail 1 "Dataset construction requires the Docker daemon."
-  fi
-  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
-    fail 1 "Dataset construction requires image '${IMAGE_NAME}'. Build it with ./scripts/docker_build.sh."
-  fi
-  exec docker run --rm \
-    --network none \
-    --user "$(id -u):$(id -g)" \
-    --workdir /workspace/repo \
-    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
-    -e HOME=/tmp \
-    -e PROJECT_ROOT=/workspace/repo \
-    -e STORAGE_ROOT=/workspace/storage \
-    -v "${PROJECT_DIR}:/workspace/repo:ro" \
-    -v "${STORAGE_DIR}:/workspace/storage:rw" \
-    "${IMAGE_NAME}" \
-    python -m src.datasets.dataset_packages build \
+  exec env STORAGE_ROOT="${STORAGE_DIR}" "${DOCKER_PYTHON}" \
+    -m src.datasets.dataset_packages build \
     "${SEMANTIC_ARGS[0]}" --storage-root /workspace/storage
 fi
 

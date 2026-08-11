@@ -677,7 +677,6 @@ def build_comsol_command(
     cores_per_case: int,
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
     scheduler_kind: str = "local",
-    node_hostname: str | None = None,
 ) -> list[str]:
     """Build one safe single-node COMSOL batch argument vector."""
     if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
@@ -696,25 +695,10 @@ def build_comsol_command(
         str(cores_per_case),
         *config.execution_values["runtime"]["extra_arguments"],
     ]
-    if scheduler_kind == "local":
-        return command
-    if scheduler_kind != "slurm":
+    if scheduler_kind not in {"local", "slurm"}:
         msg = f"Unsupported scheduler kind for case execution: {scheduler_kind!r}."
         raise ValueError(msg)
-    hostname = node_hostname or socket.gethostname()
-    if not hostname or any(character.isspace() for character in hostname):
-        msg = f"Cannot create a node-confined Slurm substep for hostname {hostname!r}."
-        raise ValueError(msg)
-    return [
-        "srun",
-        "--exclusive",
-        "--nodes=1",
-        "--ntasks=1",
-        f"--cpus-per-task={cores_per_case}",
-        "--cpu-bind=cores",
-        f"--nodelist={hostname}",
-        *command,
-    ]
+    return command
 
 
 def _require_executable(command: list[str], *, comsol_executable: str) -> None:
@@ -1088,7 +1072,6 @@ def execute_prepared_case(
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
         scheduler_kind=scheduler_kind,
-        node_hostname=allocated_node,
     )
     try:
         _require_executable(command, comsol_executable=resolve_comsol_executable(config))
@@ -1246,6 +1229,7 @@ def execute_prepared_case(
             command=tuple(command),
             exit_code=exit_code,
         )
+    export_conversion_start = time.monotonic()
     try:
         solved_model, solved_model_evidence = _canonicalize_solved_model(
             prepared.work_directory,
@@ -1291,6 +1275,12 @@ def execute_prepared_case(
             missing_or_invalid_artifacts=(str(error),),
             failure_stage="conversion",
         ) from error
+    timing["export_conversion_s"] = time.monotonic() - export_conversion_start
+    timing["complete_execution_s"] = time.monotonic() - monotonic_start
+    common.serialization.atomic_write_json(
+        prepared.runtime_directory / "timing.json",
+        timing,
+    )
     return ExecutionResult(
         prepared=prepared,
         command=tuple(command),
