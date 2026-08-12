@@ -93,8 +93,8 @@ SEED_GENERATED_VALUES: Final = (
     "permeability orientation jitter",
     "inlet-pressure Gaussian details",
     "initial-moisture multiscale realization",
-    "schedule harmonic phases and coefficients",
-    "schedule event details and activation mask",
+    "schedule low-pass excitation and filter details",
+    "schedule event placements, types, signs, durations, and widths",
 )
 GLOBAL_FIXED_VALUES: Final = (
     "grid",

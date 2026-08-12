@@ -2,17 +2,17 @@
 ===============================================================================
 generation_cases_schedule.py
 ===============================================================================
-Generate one deterministic compositional inlet schedule.
+Generate one deterministic grid-resolved temporal inlet schedule.
 Responsibilities:
-  - Combine smooth, event, and trend components through one sparse simplex model
-  - Generate temperature and humidity-ratio schedules from independent substreams
-  - Derive relative humidity thermodynamically and classify only after generation
+  - Compose dedicated smooth, event, and trend processes on the regular time grid
+  - Realize exact temperature and humidity-ratio amplitude and correlation contracts
+  - Derive relative humidity thermodynamically and report schedule-quality evidence
 Design principles:
-  - Schedule class is metadata and never selects a production implementation path
-  - All event details and activation decisions are label-derived provenance
-  - The configured complete schedule owns only time-dependent inlet forcing
+  - One temporal process family serves natural, parameter-OOD, and stress supports
+  - Simplex weights mean relative component contribution exactly once
+  - Temporal generation remains independent of every spatial-field implementation
 This module does NOT:
-  - Define material ranges, COMSOL interpolation tags, or alternate class generators
+  - Generate pressure or other spatial fields, define supports, or add learned channels
   - Infer values from an early solver stop
 ===============================================================================
 """
@@ -31,17 +31,62 @@ from src.generation.contracts import generation_contracts_profiles as profiles
 
 from . import generation_cases_seeding as seeding
 
-_EVENT_SELECTION_THRESHOLD = 0.5
 _MAX_SCHEDULE_ATTEMPTS = 32
 _MINIMUM_SCHEDULE_NODES = 2
+_GAUSSIAN_KERNEL_STANDARD_DEVIATIONS = 4.0
+_RANDOM_BINARY_THRESHOLD = 0.5
+_MINIMUM_LAG1_NODES = 3
+SCHEDULE_GENERATOR_VERSION: Final = 2
+CORRELATION_TOLERANCE: Final = 2.0e-12
+MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
+MINIMUM_EVENT_WIDTH_INTERVALS: Final = 2.0
+MINIMUM_EVENT_DURATION_INTERVALS: Final = 4.0
 SCHEDULE_DIAGNOSTIC_UNITS: Final = MappingProxyType(
     {
+        "mean_T_in_bc": "K",
         "min_T_in_bc": "K",
         "max_T_in_bc": "K",
+        "peak_to_peak_T_in_bc": "K",
+        "max_abs_deviation_T_in_base": "K",
+        "configured_T_in_amp": "K",
+        "realized_T_in_amp": "K",
+        "T_in_amp_realization_ratio": "1",
+        "rms_rate_T_in_bc": "K/h",
+        "max_abs_rate_T_in_bc": "K/h",
+        "lag1_autocorrelation_T_in_bc": "1",
+        "total_variation_per_horizon_T_in_bc": "K/h",
+        "mean_omega_in_bc": "kg/kg",
         "min_omega_in_bc": "kg/kg",
         "max_omega_in_bc": "kg/kg",
+        "peak_to_peak_omega_in_bc": "kg/kg",
+        "max_abs_deviation_omega_in_base": "kg/kg",
+        "configured_omega_in_amp": "kg/kg",
+        "realized_omega_in_amp": "kg/kg",
+        "omega_in_amp_realization_ratio": "1",
+        "rms_rate_omega_in_bc": "kg/(kg*h)",
+        "max_abs_rate_omega_in_bc": "kg/(kg*h)",
+        "lag1_autocorrelation_omega_in_bc": "1",
+        "total_variation_per_horizon_omega_in_bc": "kg/(kg*h)",
+        "mean_phi_in_bc": "1",
         "min_phi_in_bc": "1",
         "max_phi_in_bc": "1",
+        "peak_to_peak_phi_in_bc": "1",
+        "rms_rate_phi_in_bc": "1/h",
+        "max_abs_rate_phi_in_bc": "1/h",
+        "lag1_autocorrelation_phi_in_bc": "1",
+        "total_variation_per_horizon_phi_in_bc": "1/h",
+        "configured_T_omega_correlation": "1",
+        "realized_T_omega_correlation": "1",
+        "absolute_T_omega_correlation_error": "1",
+        "schedule_interval": "h",
+        "smooth_scale_hours": "h",
+        "smooth_scale_intervals": "1",
+        "minimum_event_width_hours": "h",
+        "minimum_event_width_intervals": "1",
+        "event_duration_hours": "h",
+        "event_duration_intervals": "1",
+        "constant_T_in_bc": "1",
+        "constant_omega_in_bc": "1",
         "min_phi_source_air": "1",
         "max_phi_source_air": "1",
         "min_heater_temperature_rise": "K",
@@ -49,6 +94,10 @@ SCHEDULE_DIAGNOSTIC_UNITS: Final = MappingProxyType(
         "schedule_acceptance_attempt": "1",
     }
 )
+
+
+class _DegenerateScheduleError(ValueError):
+    """Report one retryable zero-variance temporal realization."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +108,7 @@ class Schedule:
     metadata: dict[str, Any]
 
     @property
-    def diagnostics(self) -> dict[str, float | int]:
+    def diagnostics(self) -> dict[str, float | int | bool | None]:
         """Return the canonical generated-schedule diagnostic values."""
         return {name: self.metadata[name] for name in SCHEDULE_DIAGNOSTIC_UNITS}
 
@@ -101,36 +150,238 @@ def humidity_ratio_to_relative_humidity(
     return relative_humidity
 
 
-def _normalized(value: np.ndarray) -> np.ndarray:
+def relative_humidity_to_humidity_ratio(
+    relative_humidity: np.ndarray,
+    temperature: np.ndarray,
+    *,
+    pressure: float,
+) -> np.ndarray:
+    """Convert relative humidity to humidity ratio at one reference pressure."""
+    phi = np.asarray(relative_humidity, dtype=np.float64)
+    temperature = np.asarray(temperature, dtype=np.float64)
+    if phi.shape != temperature.shape or not np.isfinite(phi).all() or np.any((phi < 0.0) | (phi > 1.0)):
+        msg = "Relative humidity and temperature must be aligned finite arrays with phi in [0, 1]."
+        raise ValueError(msg)
+    if not math.isfinite(pressure) or pressure <= 0:
+        msg = "Reference pressure must be finite and positive."
+        raise ValueError(msg)
+    vapor_pressure = phi * saturation_vapor_pressure(temperature)
+    if np.any(vapor_pressure >= pressure):
+        msg = "Relative-humidity conversion requires vapor pressure below reference pressure."
+        raise ValueError(msg)
+    humidity_ratio = 0.621945 * vapor_pressure / (pressure - vapor_pressure)
+    if not np.isfinite(humidity_ratio).all() or np.any(humidity_ratio < 0.0):
+        msg = "Thermodynamic humidity-ratio conversion produced invalid values."
+        raise ValueError(msg)
+    return humidity_ratio
+
+
+def humidity_ratio_dew_point_temperature(
+    humidity_ratio: np.ndarray,
+    *,
+    pressure: float,
+) -> np.ndarray:
+    """Return the Magnus dew-point temperature for one humidity ratio."""
+    omega = np.asarray(humidity_ratio, dtype=np.float64)
+    if not np.isfinite(omega).all() or np.any(omega <= 0.0):
+        msg = "Dew-point conversion requires finite strictly positive humidity ratio."
+        raise ValueError(msg)
+    if not math.isfinite(pressure) or pressure <= 0.0:
+        msg = "Reference pressure must be finite and positive."
+        raise ValueError(msg)
+    vapor_pressure = pressure * omega / (0.621945 + omega)
+    logarithm = np.log(vapor_pressure / 610.94)
+    denominator = 17.625 - logarithm
+    if np.any(denominator <= 0.0):
+        msg = "Humidity ratio lies outside the maintained Magnus inverse domain."
+        raise ValueError(msg)
+    return 273.15 + 243.04 * logarithm / denominator
+
+
+def _regular_time(
+    time_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, float]:
+    """Return and validate the configured regular schedule grid."""
+    time = np.asarray(time_contract["regular_times"], dtype=np.float64)
+    interval = float(time_contract["interval"])
+    tolerance = np.finfo(np.float64).eps * max(1.0, abs(interval)) * 16
+    if (
+        time.ndim != 1
+        or time.size < _MINIMUM_SCHEDULE_NODES
+        or not math.isfinite(interval)
+        or interval <= 0.0
+        or not np.isfinite(time).all()
+        or not np.allclose(np.diff(time), interval, rtol=0.0, atol=tolerance)
+    ):
+        msg = "Schedule time contract must contain at least two finite, regularly spaced configured nodes."
+        raise ValueError(msg)
+    return time, interval
+
+
+def temporal_resolution(
+    values: Mapping[str, Any],
+    time_contract: Mapping[str, Any],
+) -> dict[str, float]:
+    """Return characteristic schedule scales in hours and regular intervals."""
+    time, interval = _regular_time(time_contract)
+    horizon = float(time[-1] - time[0])
+    smooth_scale = float(values["schedule.timescale_rel"]) * horizon
+    event_width = float(values["schedule.event_width_rel"]) * horizon
+    event_duration = float(values["schedule.event_duration_rel"]) * horizon
+    return {
+        "schedule_interval": interval,
+        "smooth_scale_hours": smooth_scale,
+        "smooth_scale_intervals": smooth_scale / interval,
+        "minimum_event_width_hours": event_width,
+        "minimum_event_width_intervals": event_width / interval,
+        "event_duration_hours": event_duration,
+        "event_duration_intervals": event_duration / interval,
+    }
+
+
+def validate_temporal_resolution(
+    values: Mapping[str, Any],
+    time_contract: Mapping[str, Any],
+) -> dict[str, float]:
+    """Validate every characteristic scale against the configured time grid."""
+    resolution = temporal_resolution(values, time_contract)
+    if resolution["smooth_scale_intervals"] < MINIMUM_SMOOTH_SCALE_INTERVALS:
+        message = f"schedule.timescale_rel resolves below the minimum {MINIMUM_SMOOTH_SCALE_INTERVALS:g} regular intervals."
+        raise ValueError(message)
+    if resolution["minimum_event_width_intervals"] < MINIMUM_EVENT_WIDTH_INTERVALS:
+        message = f"schedule.event_width_rel resolves below the minimum {MINIMUM_EVENT_WIDTH_INTERVALS:g} regular intervals."
+        raise ValueError(message)
+    if resolution["event_duration_intervals"] < MINIMUM_EVENT_DURATION_INTERVALS:
+        message = f"schedule.event_duration_rel resolves below the minimum {MINIMUM_EVENT_DURATION_INTERVALS:g} regular intervals."
+        raise ValueError(message)
+    if resolution["event_duration_hours"] < 2.0 * resolution["minimum_event_width_hours"]:
+        msg = "Schedule event duration must be at least twice the transition width."
+        raise ValueError(msg)
+    horizon = float(np.asarray(time_contract["regular_times"], dtype=np.float64)[-1]) - float(
+        np.asarray(time_contract["regular_times"], dtype=np.float64)[0]
+    )
+    if resolution["event_duration_hours"] + 2.0 * resolution["minimum_event_width_hours"] >= horizon:
+        msg = "Schedule event duration and edge widths must fit within the planned horizon."
+        raise ValueError(msg)
+    return resolution
+
+
+def validate_temporal_support_resolution(
+    parameter_values: Mapping[str, Mapping[str, Any]],
+    time_contract: Mapping[str, Any],
+) -> None:
+    """Validate every authored temporal support against the regular grid."""
+    time, interval = _regular_time(time_contract)
+    horizon = float(time[-1] - time[0])
+    requirements = {
+        "schedule.timescale_rel": MINIMUM_SMOOTH_SCALE_INTERVALS,
+        "schedule.event_width_rel": MINIMUM_EVENT_WIDTH_INTERVALS,
+        "schedule.event_duration_rel": MINIMUM_EVENT_DURATION_INTERVALS,
+    }
+    all_bounds: dict[str, list[Mapping[str, Any]]] = {}
+    for name, minimum_intervals in requirements.items():
+        entry = parameter_values[name]
+        bounds = [entry, *entry.get("ood", [])]
+        all_bounds[name] = bounds
+        for index, support in enumerate(bounds):
+            lower_intervals = float(support["lower"]) * horizon / interval
+            if lower_intervals < minimum_intervals:
+                support_kind = "natural" if index == 0 else f"ood[{index - 1}]"
+                message = f"{name} {support_kind} lower bound resolves to {lower_intervals:g} intervals; minimum is {minimum_intervals:g}."
+                raise ValueError(message)
+    maximum_duration = max(float(bounds["upper"]) for bounds in all_bounds["schedule.event_duration_rel"])
+    maximum_width = max(float(bounds["upper"]) for bounds in all_bounds["schedule.event_width_rel"])
+    if maximum_duration + 2.0 * maximum_width >= 1.0:
+        msg = "Authored event duration and edge-width supports do not fit within the planned horizon."
+        raise ValueError(msg)
+
+
+def _zero_centered(value: np.ndarray) -> np.ndarray:
+    """Return one float64 vector centered on the actual schedule nodes."""
+    centered = np.asarray(value, dtype=np.float64) - float(np.mean(value))
+    return centered - float(np.mean(centered))
+
+
+def _normalized_component(value: np.ndarray) -> np.ndarray:
     """Return one zero-mean component with maximum absolute value one."""
-    centered = np.asarray(value, dtype=np.float64) - np.mean(value)
+    centered = _zero_centered(value)
     maximum = float(np.max(np.abs(centered)))
     if maximum <= np.finfo(np.float64).eps:
         return np.zeros_like(centered)
-    return centered / maximum
+    normalized = centered / maximum
+    return _zero_centered(normalized)
+
+
+def _unit_vector(value: np.ndarray, *, label: str) -> np.ndarray:
+    """Return one zero-mean unit-norm vector or reject a degenerate draw."""
+    centered = _zero_centered(value)
+    norm = float(np.linalg.norm(centered))
+    if not math.isfinite(norm) or norm <= np.finfo(np.float64).eps * math.sqrt(centered.size):
+        message = f"{label} temporal realization is degenerate."
+        raise _DegenerateScheduleError(message)
+    return centered / norm
+
+
+def _amplitude_shape(value: np.ndarray, *, label: str) -> np.ndarray:
+    """Return one zero-mean shape with exact unit maximum absolute deviation."""
+    centered = _zero_centered(value)
+    maximum = float(np.max(np.abs(centered)))
+    if not math.isfinite(maximum) or maximum <= np.finfo(np.float64).eps:
+        message = f"{label} temporal realization cannot realize a positive amplitude."
+        raise _DegenerateScheduleError(message)
+    shape = _zero_centered(centered / maximum)
+    renormalization = float(np.max(np.abs(shape)))
+    if not math.isfinite(renormalization) or renormalization <= np.finfo(np.float64).eps:
+        message = f"{label} temporal realization became degenerate during normalization."
+        raise _DegenerateScheduleError(message)
+    return shape / renormalization
+
+
+def _gaussian_low_pass(
+    excitation: np.ndarray,
+    *,
+    correlation_intervals: float,
+) -> tuple[np.ndarray, dict[str, float | int | str]]:
+    """Apply a reflected Gaussian filter with one e-folding correlation scale."""
+    kernel_sigma = correlation_intervals / 2.0
+    radius = max(1, math.ceil(_GAUSSIAN_KERNEL_STANDARD_DEVIATIONS * kernel_sigma))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / kernel_sigma) ** 2)
+    kernel /= float(np.sum(kernel))
+    padded = np.pad(np.asarray(excitation, dtype=np.float64), radius, mode="reflect")
+    filtered = np.convolve(padded, kernel, mode="valid")
+    if filtered.shape != excitation.shape:
+        msg = "Temporal low-pass filtering changed the regular schedule shape."
+        raise RuntimeError(msg)
+    return filtered, {
+        "filter": "reflected_gaussian_convolution",
+        "correlation_definition": "e_folding_lag_of_the_ideal_filtered_white_noise_autocorrelation",
+        "kernel_sigma_intervals": kernel_sigma,
+        "kernel_radius_intervals": radius,
+    }
 
 
 def _smooth_component(
     time: np.ndarray,
     *,
+    interval: float,
     timescale_rel: float,
     random: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Generate one smooth harmonic realization and its phases."""
+    """Generate one dedicated low-pass temporal stochastic realization."""
     horizon = float(time[-1] - time[0])
-    scale = max(timescale_rel * horizon, 1.0)
-    harmonic_count = 3
-    phases = random.uniform(0.0, 2.0 * math.pi, size=harmonic_count)
-    coefficients = random.standard_normal(harmonic_count) / np.arange(1, harmonic_count + 1, dtype=np.float64)
-    component = np.zeros_like(time)
-    for index in range(harmonic_count):
-        period = scale / (index + 1)
-        component += coefficients[index] * np.sin(2.0 * math.pi * time / period + phases[index])
-    return _normalized(component), {
-        "harmonic_count": harmonic_count,
-        "phases": phases.tolist(),
-        "coefficients": coefficients.tolist(),
-        "timescale": scale,
+    scale = timescale_rel * horizon
+    correlation_intervals = scale / interval
+    excitation = random.standard_normal(time.size)
+    filtered, filter_details = _gaussian_low_pass(
+        excitation,
+        correlation_intervals=correlation_intervals,
+    )
+    return _normalized_component(filtered), {
+        "process": "seeded_white_excitation_then_gaussian_low_pass",
+        "correlation_time_hours": scale,
+        "correlation_time_intervals": correlation_intervals,
+        **filter_details,
     }
 
 
@@ -138,95 +389,159 @@ def _event_component(
     time: np.ndarray,
     *,
     count: int,
-    duration_rel: float,
-    width_rel: float,
+    duration: float,
+    width: float,
     random: np.random.Generator,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Generate deterministic step-or-pulse events within the planned horizon."""
+    """Generate deterministic finite-duration step-like or pulse events."""
     if count <= 0:
         return np.zeros_like(time), []
-    horizon = float(time[-1] - time[0])
-    duration = max(duration_rel * horizon, 1.0)
-    width = max(width_rel * horizon, 0.25)
-    positions = np.sort(random.uniform(time[0] + 1.0, time[-1] - 1.0, size=count))
+    start_minimum = float(time[0] + width)
+    start_maximum = float(time[-1] - duration - width)
+    if start_maximum <= start_minimum:
+        msg = "Resolved event duration and widths leave no valid event placement."
+        raise ValueError(msg)
+    starts = np.sort(random.uniform(start_minimum, start_maximum, size=count))
     component = np.zeros_like(time)
     details: list[dict[str, Any]] = []
-    for position in positions:
-        sign = 1.0 if float(random.random()) < _EVENT_SELECTION_THRESHOLD else -1.0
-        event_type = "step" if float(random.random()) < _EVENT_SELECTION_THRESHOLD else "pulse"
-        jitter = float(random.uniform(-0.5, 0.5))
-        center = float(np.clip(position + jitter, time[0], time[-1]))
+    for start in starts:
+        end = float(start + duration)
+        center = 0.5 * (float(start) + end)
+        sign = 1.0 if float(random.random()) < _RANDOM_BINARY_THRESHOLD else -1.0
+        event_type = "step" if float(random.random()) < _RANDOM_BINARY_THRESHOLD else "pulse"
+        window = 0.5 * (np.tanh((time - float(start)) / width) - np.tanh((time - end) / width))
+        contribution = window
         if event_type == "pulse":
-            contribution = np.exp(-0.5 * ((time - center) / width) ** 2)
-        else:
-            end = min(center + duration, float(time[-1]))
-            contribution = 0.5 * (np.tanh((time - center) / width) - np.tanh((time - end) / width))
+            contribution = window * np.exp(-0.5 * ((time - center) / (0.25 * duration)) ** 2)
         component += sign * contribution
         details.append(
             {
-                "position": center,
+                "start": float(start),
+                "center": center,
+                "end": end,
                 "sign": int(sign),
                 "type": event_type,
                 "duration": duration,
                 "width": width,
-                "local_jitter": jitter,
             }
         )
-    return _normalized(component), details
+    normalized = _normalized_component(component)
+    if not np.any(normalized):
+        msg = "Positive event_count produced a degenerate event realization."
+        raise _DegenerateScheduleError(msg)
+    return normalized, details
+
+
+def _trend_component(
+    time: np.ndarray,
+    *,
+    random: np.random.Generator,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Generate one slow horizon-scale drift without high-frequency structure."""
+    coordinate = np.linspace(-1.0, 1.0, time.size, dtype=np.float64)
+    direction = 1 if float(random.random()) < _RANDOM_BINARY_THRESHOLD else -1
+    curvature = float(random.uniform(-0.25, 0.25))
+    component = direction * (coordinate + curvature * (coordinate**2 - float(np.mean(coordinate**2))))
+    return _normalized_component(component), {
+        "direction": direction,
+        "curvature": curvature,
+        "scale_fraction_of_horizon": 1.0,
+    }
 
 
 def _components(
     time: np.ndarray,
     values: Mapping[str, Any],
     *,
+    interval: float,
     random: np.random.Generator,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Generate all three potential schedule components in one implementation."""
+    """Generate all dedicated temporal components in one implementation."""
+    horizon = float(time[-1] - time[0])
     smooth, smooth_details = _smooth_component(
         time,
+        interval=interval,
         timescale_rel=float(values["schedule.timescale_rel"]),
         random=random,
     )
     events, event_details = _event_component(
         time,
         count=int(values["schedule.event_count"]),
-        duration_rel=float(values["schedule.event_duration_rel"]),
-        width_rel=float(values["schedule.event_width_rel"]),
+        duration=float(values["schedule.event_duration_rel"]) * horizon,
+        width=float(values["schedule.event_width_rel"]) * horizon,
         random=random,
     )
-    trend = _normalized(np.linspace(-1.0, 1.0, time.size, dtype=np.float64))
+    trend, trend_details = _trend_component(time, random=random)
     return {"smooth": smooth, "event": events, "trend": trend}, {
         "smooth": smooth_details,
         "events": event_details,
+        "trend": trend_details,
     }
 
 
-def _activation(weights: Mapping[str, float], *, random: np.random.Generator, event_count: int) -> dict[str, bool]:
-    """Draw one deterministic sparse activation mask from simplex weights."""
-    active = {name: bool(weight > 0 and float(random.random()) < weight) for name, weight in weights.items()}
-    if event_count <= 0:
-        active["event"] = False
-    return active
+def _component_availability(
+    weights: Mapping[str, float],
+    *,
+    event_count: int,
+) -> dict[str, bool]:
+    """Return deterministic component availability without stochastic activation."""
+    return {
+        "smooth": weights["smooth"] > 0.0,
+        "event": weights["event"] > 0.0 and event_count > 0,
+        "trend": weights["trend"] > 0.0,
+    }
 
 
 def _compose(
     components: Mapping[str, np.ndarray],
     weights: Mapping[str, float],
-    active: Mapping[str, bool],
 ) -> np.ndarray:
-    """Combine active weighted components and bound the latent magnitude."""
+    """Combine each available normalized component using its simplex weight once."""
     result = np.zeros_like(next(iter(components.values())))
     for name in ("smooth", "event", "trend"):
-        if active[name]:
-            result += float(weights[name]) * components[name]
-    maximum = float(np.max(np.abs(result)))
-    return result if maximum <= 1.0 else result / maximum
+        result += float(weights[name]) * components[name]
+    return _zero_centered(result)
 
 
-def _schedule_class(active: Mapping[str, bool], *, temperature_amplitude: float, humidity_amplitude: float) -> str:
-    """Derive the realized schedule class only after component generation."""
-    names = [name for name in ("smooth", "event", "trend") if active[name]]
-    if (temperature_amplitude == 0 and humidity_amplitude == 0) or not names:
+def _correlated_latents(
+    shared: np.ndarray,
+    independent: np.ndarray,
+    *,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | str | None]]:
+    """Construct exact discrete-node Pearson-correlated temporal latents."""
+    shared_unit = _unit_vector(shared, label="shared")
+    independent_centered = _zero_centered(independent)
+    projection = float(np.dot(independent_centered, shared_unit))
+    orthogonal = independent_centered - projection * shared_unit
+    remainder = max(0.0, 1.0 - correlation**2)
+    if remainder <= np.finfo(np.float64).eps:
+        humidity_unit = math.copysign(1.0, correlation) * shared_unit
+        orthogonal_norm: float | None = None
+    else:
+        orthogonal_unit = _unit_vector(orthogonal, label="independent orthogonal")
+        orthogonal_norm = float(np.linalg.norm(orthogonal))
+        humidity_unit = correlation * shared_unit + math.sqrt(remainder) * orthogonal_unit
+    return (
+        shared_unit,
+        _unit_vector(humidity_unit, label="humidity"),
+        {
+            "method": "discrete_zero_center_standardize_orthogonalize",
+            "independent_projection_on_shared": projection,
+            "independent_orthogonal_norm": orthogonal_norm,
+        },
+    )
+
+
+def _schedule_class(
+    available: Mapping[str, bool],
+    *,
+    temperature_amplitude: float,
+    humidity_amplitude: float,
+) -> str:
+    """Derive a descriptive schedule class after deterministic composition."""
+    names = [name for name in ("smooth", "event", "trend") if available[name]]
+    if temperature_amplitude == 0.0 and humidity_amplitude == 0.0:
         return "constant"
     if len(names) > 1:
         return "mixed"
@@ -234,10 +549,16 @@ def _schedule_class(active: Mapping[str, bool], *, temperature_amplitude: float,
 
 
 def _attempt_seed(seed: int, *, attempt: int) -> int:
-    """Return the original seed first, then label-derived retry streams."""
+    """Return the original seed first, then schedule-version-bound retry streams."""
     if attempt == 1:
         return seed
-    return seeding.derive_seed(seed, "schedule_retry", str(attempt))
+    return seeding.derive_seed(
+        seed,
+        "schedule_algorithm",
+        str(SCHEDULE_GENERATOR_VERSION),
+        "retry",
+        str(attempt),
+    )
 
 
 def _candidate_schedule(
@@ -252,21 +573,125 @@ def _candidate_schedule(
     attempt: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, bool], dict[str, Any], dict[str, Any], dict[str, int]]:
     """Realize one complete unclipped schedule candidate from deterministic streams."""
+    interval = float(time[1] - time[0])
     attempt_seeds = {name: _attempt_seed(seed, attempt=attempt) for name, seed in seeds.items()}
     shared_random = np.random.default_rng(attempt_seeds["schedule_shared"])
     independent_random = np.random.default_rng(attempt_seeds["schedule_independent"])
-    active = _activation(weights, random=shared_random, event_count=int(values["schedule.event_count"]))
-    shared_components, shared_details = _components(time, values, random=shared_random)
-    independent_components, independent_details = _components(time, values, random=independent_random)
-    shared_latent = _compose(shared_components, weights, active)
-    independent_latent = _compose(independent_components, weights, active)
-    humidity_latent = correlation * shared_latent + math.sqrt(max(0.0, 1.0 - correlation**2)) * independent_latent
-    humidity_maximum = float(np.max(np.abs(humidity_latent)))
-    if humidity_maximum > 1.0:
-        humidity_latent /= humidity_maximum
-    temperature = float(values["T_in_base"]) + temperature_amplitude * shared_latent
-    humidity_ratio = float(values["omega_in_base"]) + humidity_amplitude * humidity_latent
-    return temperature, humidity_ratio, active, shared_details, independent_details, attempt_seeds
+    shared_components, shared_details = _components(
+        time,
+        values,
+        interval=interval,
+        random=shared_random,
+    )
+    independent_components, independent_details = _components(
+        time,
+        values,
+        interval=interval,
+        random=independent_random,
+    )
+    shared_latent, humidity_latent, correlation_details = _correlated_latents(
+        _compose(shared_components, weights),
+        _compose(independent_components, weights),
+        correlation=correlation,
+    )
+    temperature_base = float(values["T_in_base"])
+    humidity_base = float(values["omega_in_base"])
+    temperature = (
+        np.full(time.shape, temperature_base, dtype=np.float64)
+        if temperature_amplitude == 0.0
+        else temperature_base + temperature_amplitude * _amplitude_shape(shared_latent, label="temperature")
+    )
+    humidity_ratio = (
+        np.full(time.shape, humidity_base, dtype=np.float64)
+        if humidity_amplitude == 0.0
+        else humidity_base + humidity_amplitude * _amplitude_shape(humidity_latent, label="humidity-ratio")
+    )
+    available = _component_availability(
+        weights,
+        event_count=int(values["schedule.event_count"]),
+    )
+    shared_details["correlation_construction"] = correlation_details
+    return (
+        temperature,
+        humidity_ratio,
+        available,
+        shared_details,
+        independent_details,
+        attempt_seeds,
+    )
+
+
+def _discrete_pearson(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> float | None:
+    """Return discrete-node Pearson correlation or explicit not-applicable."""
+    left_centered = _zero_centered(left)
+    right_centered = _zero_centered(right)
+    denominator = float(np.linalg.norm(left_centered) * np.linalg.norm(right_centered))
+    if denominator <= np.finfo(np.float64).eps:
+        return None
+    return float(np.dot(left_centered, right_centered) / denominator)
+
+
+def _numeric_tolerance(*values: float) -> float:
+    """Return a strict scale-aware float64 tolerance."""
+    return np.finfo(np.float64).eps * max(1.0, *(abs(value) for value in values)) * 512.0
+
+
+def _amplitude_contract_reason(
+    signal: np.ndarray,
+    *,
+    base: float,
+    amplitude: float,
+    label: str,
+) -> str | None:
+    """Return one exact mean/amplitude contract violation."""
+    if amplitude == 0.0:
+        if not np.array_equal(signal, np.full(signal.shape, base, dtype=np.float64)):
+            return f"zero {label} amplitude did not produce an exact constant schedule"
+        return None
+    tolerance = _numeric_tolerance(base, amplitude)
+    realized = float(np.max(np.abs(signal - base)))
+    if np.array_equal(signal, np.full(signal.shape, signal[0], dtype=np.float64)):
+        return f"positive {label} amplitude produced a constant schedule"
+    if not math.isclose(float(np.mean(signal)), base, rel_tol=0.0, abs_tol=tolerance):
+        return f"{label} temporal mean does not equal its configured base"
+    if not math.isclose(realized, amplitude, rel_tol=0.0, abs_tol=tolerance):
+        return f"{label} realized amplitude does not equal its configured amplitude"
+    return None
+
+
+def _numerical_contract_reason(
+    temperature: np.ndarray,
+    humidity_ratio: np.ndarray,
+    *,
+    temperature_base: float,
+    humidity_base: float,
+    temperature_amplitude: float,
+    humidity_amplitude: float,
+    configured_correlation: float,
+) -> str | None:
+    """Return the first amplitude or correlation invariant violation."""
+    for signal, base, amplitude, label in (
+        (temperature, temperature_base, temperature_amplitude, "temperature"),
+        (humidity_ratio, humidity_base, humidity_amplitude, "humidity-ratio"),
+    ):
+        reason = _amplitude_contract_reason(
+            signal,
+            base=base,
+            amplitude=amplitude,
+            label=label,
+        )
+        if reason is not None:
+            return reason
+    realized = _discrete_pearson(temperature, humidity_ratio)
+    if temperature_amplitude == 0.0 or humidity_amplitude == 0.0:
+        if realized is not None:
+            return "zero-variance schedule correlation must be not applicable"
+    elif realized is None or abs(realized - configured_correlation) > CORRELATION_TOLERANCE:
+        return "realized T-omega correlation does not equal schedule.corr"
+    return None
 
 
 def _feasibility_reason(
@@ -299,6 +724,50 @@ def _feasibility_reason(
     return None
 
 
+def _lag1_autocorrelation(value: np.ndarray) -> float | None:
+    """Return lag-one correlation or explicit not-applicable for constants."""
+    if value.size < _MINIMUM_LAG1_NODES:
+        return None
+    return _discrete_pearson(value[:-1], value[1:])
+
+
+def _series_diagnostics(
+    value: np.ndarray,
+    *,
+    name: str,
+    interval: float,
+    base_name: str | None = None,
+    base: float | None = None,
+    amplitude_name: str | None = None,
+    configured_amplitude: float | None = None,
+) -> dict[str, float | bool | None]:
+    """Return the canonical scalar diagnostics for one temporal series."""
+    differences = np.diff(value)
+    rates = differences / interval
+    result: dict[str, float | bool | None] = {
+        f"mean_{name}": float(np.mean(value)),
+        f"min_{name}": float(np.min(value)),
+        f"max_{name}": float(np.max(value)),
+        f"peak_to_peak_{name}": float(np.ptp(value)),
+        f"rms_rate_{name}": float(np.sqrt(np.mean(rates * rates))),
+        f"max_abs_rate_{name}": float(np.max(np.abs(rates))),
+        f"lag1_autocorrelation_{name}": _lag1_autocorrelation(value),
+        f"total_variation_per_horizon_{name}": float(np.sum(np.abs(differences)) / ((value.size - 1) * interval)),
+    }
+    if base_name is not None and base is not None and amplitude_name is not None and configured_amplitude is not None:
+        realized = float(np.max(np.abs(value - base)))
+        result.update(
+            {
+                f"max_abs_deviation_{base_name}": realized,
+                f"configured_{amplitude_name}": configured_amplitude,
+                f"realized_{amplitude_name}": realized,
+                f"{amplitude_name}_realization_ratio": (None if configured_amplitude == 0.0 else realized / configured_amplitude),
+                f"constant_{name}": bool(np.array_equal(value, np.full(value.shape, value[0], dtype=np.float64))),
+            }
+        )
+    return result
+
+
 def generate_schedule(
     values: Mapping[str, Any],
     time_contract: Mapping[str, Any],
@@ -306,55 +775,76 @@ def generate_schedule(
     *,
     seeds: Mapping[str, int],
 ) -> Schedule:
-    """Generate the single finalized mixed schedule on configured regular nodes."""
+    """Generate the single finalized temporal schedule on configured regular nodes."""
     if set(seeds) != {"schedule_shared", "schedule_independent"}:
         msg = "Schedule generation requires exact shared and independent seeds."
         raise ValueError(msg)
-    time = np.asarray(time_contract["regular_times"], dtype=np.float64)
-    interval = float(time_contract["interval"])
-    tolerance = np.finfo(np.float64).eps * max(1.0, abs(interval)) * 16
-    if (
-        time.ndim != 1
-        or time.size < _MINIMUM_SCHEDULE_NODES
-        or not np.isfinite(time).all()
-        or not np.allclose(np.diff(time), interval, rtol=0.0, atol=tolerance)
-    ):
-        msg = "Schedule time contract must contain at least two finite, regularly spaced configured nodes."
-        raise ValueError(msg)
+    time, interval = _regular_time(time_contract)
+    resolution = validate_temporal_resolution(values, time_contract)
     weights_raw = values["schedule.component_weights"]
     if not isinstance(weights_raw, Mapping) or tuple(weights_raw) != ("smooth", "event", "trend"):
         msg = "Schedule component weights must be the ordered smooth/event/trend simplex."
         raise ValueError(msg)
     weights = {name: float(weights_raw[name]) for name in weights_raw}
-    if any(not math.isfinite(weight) or weight < 0 for weight in weights.values()) or not math.isclose(
-        sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-12
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in weights.values()) or not math.isclose(
+        sum(weights.values()),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
     ):
         msg = "Schedule component weights must be finite, non-negative, and sum to one."
         raise ValueError(msg)
     temperature_amplitude = float(values["T_in_amp"])
     humidity_amplitude = float(values["omega_in_amp"])
     correlation = float(values["schedule.corr"])
-    duration_relative = float(values["schedule.event_duration_rel"])
-    width_relative = float(values["schedule.event_width_rel"])
-    if temperature_amplitude < 0 or humidity_amplitude < 0 or not -1 <= correlation <= 1:
-        msg = "Schedule amplitudes must be non-negative and schedule.corr must lie in [-1, 1]."
-        raise ValueError(msg)
-    if duration_relative < 2.0 * width_relative:
-        msg = "Schedule event duration must be at least twice the transition width."
+    event_count_number = float(values["schedule.event_count"])
+    if (
+        temperature_amplitude < 0.0
+        or humidity_amplitude < 0.0
+        or not -1.0 <= correlation <= 1.0
+        or not event_count_number.is_integer()
+        or event_count_number < 0.0
+    ):
+        msg = "Schedule amplitudes and event count must be non-negative, and schedule.corr must lie in [-1, 1]."
         raise ValueError(msg)
     ambient_temperature = float(values["T_amb"])
+    temperature_base = float(values["T_in_base"])
+    humidity_base = float(values["omega_in_base"])
     rejection_reasons: list[str] = []
     for acceptance_attempt in range(1, _MAX_SCHEDULE_ATTEMPTS + 1):
-        temperature, humidity_ratio, active, shared_details, independent_details, attempt_seeds = _candidate_schedule(
-            time,
-            values,
-            weights,
+        try:
+            (
+                temperature,
+                humidity_ratio,
+                available,
+                shared_details,
+                independent_details,
+                attempt_seeds,
+            ) = _candidate_schedule(
+                time,
+                values,
+                weights,
+                temperature_amplitude=temperature_amplitude,
+                humidity_amplitude=humidity_amplitude,
+                correlation=correlation,
+                seeds=seeds,
+                attempt=acceptance_attempt,
+            )
+        except _DegenerateScheduleError as error:
+            rejection_reasons.append(str(error))
+            continue
+        numerical_reason = _numerical_contract_reason(
+            temperature,
+            humidity_ratio,
+            temperature_base=temperature_base,
+            humidity_base=humidity_base,
             temperature_amplitude=temperature_amplitude,
             humidity_amplitude=humidity_amplitude,
-            correlation=correlation,
-            seeds=seeds,
-            attempt=acceptance_attempt,
+            configured_correlation=correlation,
         )
+        if numerical_reason is not None:
+            message = f"Temporal schedule numerical contract failed: {numerical_reason}."
+            raise RuntimeError(message)
         try:
             relative_humidity = humidity_ratio_to_relative_humidity(
                 humidity_ratio,
@@ -385,39 +875,69 @@ def generate_schedule(
             f"No feasible complete heater-only schedule after {_MAX_SCHEDULE_ATTEMPTS} deterministic attempts; last_reason={rejection_reasons[-1]!r}."
         )
         raise ValueError(message)
-    values_array = np.column_stack((time, temperature, humidity_ratio, relative_humidity)).astype(np.float64, copy=False)
-    component_amplitudes = {
-        "temperature": {name: temperature_amplitude * weights[name] if active[name] else 0.0 for name in weights},
-        "humidity_ratio": {name: humidity_amplitude * weights[name] if active[name] else 0.0 for name in weights},
-    }
-    diagnostics = {
-        "min_T_in_bc": float(np.min(temperature)),
-        "max_T_in_bc": float(np.max(temperature)),
-        "min_omega_in_bc": float(np.min(humidity_ratio)),
-        "max_omega_in_bc": float(np.max(humidity_ratio)),
-        "min_phi_in_bc": float(np.min(relative_humidity)),
-        "max_phi_in_bc": float(np.max(relative_humidity)),
+
+    values_array = np.column_stack((time, temperature, humidity_ratio, relative_humidity)).astype(
+        np.float64,
+        copy=False,
+    )
+    realized_correlation = _discrete_pearson(temperature, humidity_ratio)
+    correlation_error = None if realized_correlation is None else abs(realized_correlation - correlation)
+    diagnostics: dict[str, float | int | bool | None] = {
+        **_series_diagnostics(
+            temperature,
+            name="T_in_bc",
+            interval=interval,
+            base_name="T_in_base",
+            base=temperature_base,
+            amplitude_name="T_in_amp",
+            configured_amplitude=temperature_amplitude,
+        ),
+        **_series_diagnostics(
+            humidity_ratio,
+            name="omega_in_bc",
+            interval=interval,
+            base_name="omega_in_base",
+            base=humidity_base,
+            amplitude_name="omega_in_amp",
+            configured_amplitude=humidity_amplitude,
+        ),
+        **_series_diagnostics(
+            relative_humidity,
+            name="phi_in_bc",
+            interval=interval,
+        ),
+        "configured_T_omega_correlation": correlation,
+        "realized_T_omega_correlation": realized_correlation,
+        "absolute_T_omega_correlation_error": correlation_error,
+        **resolution,
         "min_phi_source_air": float(np.min(source_relative_humidity)),
         "max_phi_source_air": float(np.max(source_relative_humidity)),
         "min_heater_temperature_rise": float(np.min(temperature - ambient_temperature)),
         "schedule_rejection_count": len(rejection_reasons),
         "schedule_acceptance_attempt": acceptance_attempt,
     }
+    if set(diagnostics) != set(SCHEDULE_DIAGNOSTIC_UNITS):
+        missing = sorted(set(SCHEDULE_DIAGNOSTIC_UNITS).difference(diagnostics))
+        extra = sorted(set(diagnostics).difference(SCHEDULE_DIAGNOSTIC_UNITS))
+        message = f"Schedule diagnostic ownership mismatch: missing={missing}, extra={extra}."
+        raise RuntimeError(message)
     return Schedule(
         values=values_array,
         metadata={
-            "generator_kind": "compositional_mixed",
-            "generator_version": seeding.GENERATOR_VERSION,
+            "generator_kind": "grid_resolved_correlated_temporal_composition",
+            "generator_version": SCHEDULE_GENERATOR_VERSION,
             "interpolation": "linear",
             "schedule_class": _schedule_class(
-                active,
+                available,
                 temperature_amplitude=temperature_amplitude,
                 humidity_amplitude=humidity_amplitude,
             ),
             "component_weights": weights,
-            "component_active": active,
-            "realized_component_amplitudes": component_amplitudes,
-            "schedule.corr": correlation,
+            "component_weight_semantics": "relative_contribution_used_once_before_complete_shape_normalization",
+            "component_availability": available,
+            "event_presence_semantics": "schedule.event_count_without_hidden_activation_probability",
+            "correlation_semantics": "realized_discrete_time_Pearson_on_regular_schedule_nodes",
+            "amplitude_semantics": "maximum_absolute_deviation_from_exact_temporal_mean_base",
             "seeds": dict(seeds),
             "accepted_attempt_seeds": attempt_seeds,
             "schedule_rejection_reasons": rejection_reasons,
@@ -448,14 +968,22 @@ def generate_schedule(
             ],
             "planned_interval": [float(time[0]), float(time[-1])],
             "units": {
-                "values": {"t": "h", "T_in_bc": "K", "omega_in_bc": "kg/kg", "phi_in_bc": "1"},
+                "values": {
+                    "t": "h",
+                    "T_in_bc": "K",
+                    "omega_in_bc": "kg/kg",
+                    "phi_in_bc": "1",
+                },
                 "diagnostics": {
-                    "smooth.phases": "rad",
-                    "smooth.timescale": "h",
-                    "events.position": "h",
+                    "smooth.correlation_time_hours": "h",
+                    "smooth.correlation_time_intervals": "1",
+                    "smooth.kernel_sigma_intervals": "1",
+                    "smooth.kernel_radius_intervals": "1",
+                    "events.start": "h",
+                    "events.center": "h",
+                    "events.end": "h",
                     "events.duration": "h",
                     "events.width": "h",
-                    "events.local_jitter": "h",
                     "planned_interval": "h",
                     **SCHEDULE_DIAGNOSTIC_UNITS,
                 },

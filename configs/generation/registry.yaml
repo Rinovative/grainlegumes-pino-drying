@@ -479,7 +479,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: T_{\mathrm{in},0}
-    description: Baseline inlet-air temperature.
+    description: Exact temporal mean of the planned inlet-air temperature schedule.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -491,7 +491,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \Delta T_{\mathrm{in}}
-    description: Inlet-temperature schedule amplitude.
+    description: Maximum absolute inlet-temperature deviation from its exact temporal mean.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -503,7 +503,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \omega_{\mathrm{in},0}
-    description: Baseline inlet humidity ratio.
+    description: Exact temporal mean of the planned inlet humidity-ratio schedule.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -515,7 +515,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \Delta\omega_{\mathrm{in}}
-    description: Inlet humidity-ratio schedule amplitude.
+    description: Maximum absolute inlet humidity-ratio deviation from its exact temporal mean.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -527,7 +527,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \rho_{T,\omega}
-    description: Cross-correlation of temperature and humidity schedule latent processes.
+    description: Exact discrete-node Pearson correlation of nonconstant inlet temperature and humidity-ratio schedules.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -539,7 +539,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \tau_{\mathrm{sched}}/t_{\max}
-    description: Schedule correlation timescale divided by total duration.
+    description: Gaussian low-pass e-folding correlation time divided by the planned duration.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -554,7 +554,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: \boldsymbol{\lambda}_{\mathrm{sched}}
-    description: Smooth, event, and trend schedule simplex.
+    description: Relative contributions of available smooth, event, and trend components, each used once.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -566,7 +566,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: n_{\mathrm{event}}
-    description: Number of generated schedule events.
+    description: Deterministic number of finite-duration schedule events; zero disables only the event contribution.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -578,7 +578,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: d_{\mathrm{event}}/t_{\max}
-    description: Event duration divided by total schedule duration.
+    description: Finite event duration divided by the planned schedule duration.
     classification: sampled
     profile_applicability:
     - transient_drying
@@ -590,7 +590,7 @@ parameters:
     block: operation
     ood_group: operation
     report_symbol: w_{\mathrm{event}}/t_{\max}
-    description: Event-edge width divided by total schedule duration.
+    description: Smooth event-edge transition width divided by the planned schedule duration.
     classification: sampled
     profile_applicability:
     - transient_drying

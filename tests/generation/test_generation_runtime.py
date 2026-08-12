@@ -196,7 +196,7 @@ def test_comsol_builder_owns_fixed_job_models_and_save_mode(
         "-inputfile",
         "model.mph",
         "-job",
-        "s1",
+        "b1",
         *save_arguments,
         "-np",
         "16",
@@ -259,7 +259,7 @@ def test_maintained_smoke_pilot_and_production_use_canonical_save_semantics(
         scheduler_kind="slurm",
     )
 
-    assert command[command.index("-job") + 1] == "s1"
+    assert command[command.index("-job") + 1] == "b1"
     assert command[command.index("-inputfile") + 1] == "model.mph"
     assert command[command.index("-np") + 1] == "16"
     assert ("-outputfile" in command) is retained
@@ -634,7 +634,7 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
         "-inputfile",
         "model.mph",
         "-job",
-        "s1",
+        "b1",
         "-nosave",
         "-np",
     ]

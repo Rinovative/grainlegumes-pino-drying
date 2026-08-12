@@ -190,16 +190,16 @@ The registry declares 63 canonical entries. Sampling coordinates contribute 28 d
 | `initial_moisture.structure.fine_ani_x` | `a_{X,x}` | `1` | sampled | `transient_drying` | `log` | `initial_moisture` | `initial_moisture` | Fine initial-moisture correlation-length multiplier along x. |
 | `initial_moisture.structure.fine_ani_y` | `a_{X,y}` | `1` | sampled | `transient_drying` | `log` | `initial_moisture` | `initial_moisture` | Fine initial-moisture correlation-length multiplier along y. |
 | `initial_moisture.structure.cross_scale_corr` | `\rho_X` | `1` | sampled | `transient_drying` | `linear` | `initial_moisture` | `initial_moisture` | Correlation between coarse and fine initial-moisture latent seeds. |
-| `T_in_base` | `T_{\mathrm{in},0}` | `K` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Baseline inlet-air temperature. |
-| `T_in_amp` | `\Delta T_{\mathrm{in}}` | `K` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Inlet-temperature schedule amplitude. |
-| `omega_in_base` | `\omega_{\mathrm{in},0}` | `kg/kg` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Baseline inlet humidity ratio. |
-| `omega_in_amp` | `\Delta\omega_{\mathrm{in}}` | `kg/kg` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Inlet humidity-ratio schedule amplitude. |
-| `schedule.corr` | `\rho_{T,\omega}` | `1` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Cross-correlation of temperature and humidity schedule latent processes. |
-| `schedule.timescale_rel` | `\tau_{\mathrm{sched}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Schedule correlation timescale divided by total duration. |
-| `schedule.component_weights` | `\boldsymbol{\lambda}_{\mathrm{sched}}` | `1` | sampled | `transient_drying` | `none` | `operation` | `operation` | Smooth, event, and trend schedule simplex. |
-| `schedule.event_count` | `n_{\mathrm{event}}` | `1` | sampled | `transient_drying` | `none` | `operation` | `operation` | Number of generated schedule events. |
-| `schedule.event_duration_rel` | `d_{\mathrm{event}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Event duration divided by total schedule duration. |
-| `schedule.event_width_rel` | `w_{\mathrm{event}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Event-edge width divided by total schedule duration. |
+| `T_in_base` | `T_{\mathrm{in},0}` | `K` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Exact temporal mean of the planned inlet-air temperature schedule. |
+| `T_in_amp` | `\Delta T_{\mathrm{in}}` | `K` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Maximum absolute inlet-temperature deviation from its exact temporal mean. |
+| `omega_in_base` | `\omega_{\mathrm{in},0}` | `kg/kg` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Exact temporal mean of the planned inlet humidity-ratio schedule. |
+| `omega_in_amp` | `\Delta\omega_{\mathrm{in}}` | `kg/kg` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Maximum absolute inlet humidity-ratio deviation from its exact temporal mean. |
+| `schedule.corr` | `\rho_{T,\omega}` | `1` | sampled | `transient_drying` | `linear` | `operation` | `operation` | Exact discrete-node Pearson correlation when both inlet schedules vary. |
+| `schedule.timescale_rel` | `\tau_{\mathrm{sched}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Gaussian low-pass e-folding correlation time divided by planned duration. |
+| `schedule.component_weights` | `\boldsymbol{\lambda}_{\mathrm{sched}}` | `1` | sampled | `transient_drying` | `none` | `operation` | `operation` | Relative smooth, event, and trend contributions, each applied once. |
+| `schedule.event_count` | `n_{\mathrm{event}}` | `1` | sampled | `transient_drying` | `none` | `operation` | `operation` | Deterministic count of finite-duration events; zero disables only the event contribution. |
+| `schedule.event_duration_rel` | `d_{\mathrm{event}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Finite event duration divided by planned schedule duration. |
+| `schedule.event_width_rel` | `w_{\mathrm{event}}/t_{\max}` | `1` | sampled | `transient_drying` | `log` | `operation` | `operation` | Smooth event-edge transition width divided by planned schedule duration. |
 | `rho_bu_dry_ref` | `\rho_{\mathrm{bu,dry,ref}}` | `kg/m^3` | sampled | `transient_drying` | `log` | `material_properties` | `material_properties` | Reference dry bulk density at calibration porosity. |
 | `k_gr` | `k_{\mathrm{gr}}` | `W/(m*K)` | sampled | `transient_drying` | `log` | `material_properties` | `material_properties` | Dry granular-phase thermal conductivity. |
 | `cp_gr_dry` | `c_{p,\mathrm{gr,dry}}` | `J/(kg*K)` | sampled | `transient_drying` | `log` | `material_properties` | `material_properties` | Dry granular-phase specific heat capacity. |
@@ -266,11 +266,11 @@ These are natural or ID supports from `fixed_bed.yaml`; transforms and OOD group
 | `omega_in_base` | 0.0045-0.0115 | 0.0075 | `kg/kg` | `engineering_estimate` |
 | `omega_in_amp` | 0-0.003 | 0.0015 | `kg/kg` | `synthetic_design` |
 | `schedule.corr` | -0.75-0.25 | -0.35 | `1` | `synthetic_design` |
-| `schedule.timescale_rel` | 0.03-0.18 | 0.08 | `1` | `synthetic_design` |
+| `schedule.timescale_rel` | 0.05-0.18 | 0.08 | `1` | `synthetic_design` |
 | `schedule.component_weights` | {'smooth': 0.55, 'event': 0.3, 'trend': 0.15} | {'smooth': 0.55, 'event': 0.3, 'trend': 0.15} | `1` | `synthetic_design` |
 | `schedule.event_count` | 0-4 | 2 | `1` | `synthetic_design` |
-| `schedule.event_duration_rel` | 0.015-0.08 | 0.04 | `1` | `synthetic_design` |
-| `schedule.event_width_rel` | 0.003-0.02 | 0.008 | `1` | `synthetic_design` |
+| `schedule.event_duration_rel` | 0.08-0.16 | 0.1 | `1` | `synthetic_design` |
+| `schedule.event_width_rel` | 0.02-0.04 | 0.03 | `1` | `synthetic_design` |
 | `T_amb` | 288.15-298.15 | 293.15 | `K` | `project_baseline` |
 | `kappa_cv` | 0.25-0.65 | 0.45 | `1` | `synthetic_design` |
 | `bed.structure.coarse_len_rel` | 0.06-0.16 | 0.1 | `1` | `project_baseline` |
@@ -386,12 +386,41 @@ HDF5, and maintained dataset views.
 
 ### Inlet schedule
 
-The schedule contract and constraints come from the common and operation owners.
-The generator validates the complete schedule, including temperature, humidity,
-source-air, and interpolation rules, and retries it deterministically as one
-unit. It does not clip individual time samples. Schedule diagnostics, names, and
-units come from the schedule/profile contracts rather than a documentation
-column list.
+`generation_cases_schedule.py` is the one canonical temporal generator for
+natural, parameter-OOD, and stress views. It is deliberately separate from the
+spatial pressure and field generator. The smooth component filters seeded
+one-dimensional white excitation with a reflected Gaussian kernel;
+`schedule.timescale_rel` is the ideal filtered process's e-folding correlation
+time divided by the planned horizon. Finite-duration step-like and pulse events
+use `schedule.event_count`, duration, and smooth edge width, while the trend is a
+horizon-scale drift without high-frequency structure.
+
+The smooth, event, and trend simplex values are relative contributions applied
+once. Event count, rather than a hidden Bernoulli draw, determines event
+presence. After complete composition, each latent is centered and normalized
+once. `T_in_base` and `omega_in_base` are therefore exact temporal means, and
+their amplitudes are exact maximum absolute deviations. The independent
+humidity latent is orthogonalized against the shared temperature latent on the
+actual schedule nodes, so `schedule.corr` is the realized discrete-time Pearson
+correlation whenever both schedules vary; correlation is not applicable for an
+intentional constant signal.
+
+All characteristic scales are validated against `common.time.interval`.
+Natural supports resolve the low-pass correlation time to at least 8.4 intervals,
+event edges to at least 3.36 intervals, and event durations to at least 13.44
+intervals on the maintained 168-hour, one-hour grid. Faster parameter-OOD tails
+remain resolved at minima of 4.032, 2.016, and 6.72 intervals respectively.
+Event duration is also at least twice its edge width. These schedule supports
+remain `synthetic_design`; they are not presented as literature measurements.
+
+The generator creates `T_in_bc(t)` and `omega_in_bc(t)` and derives
+`phi_in_bc(t)` thermodynamically from those values and `p_ref`; relative humidity
+is never sampled or smoothed independently. The complete schedule is checked
+against temperature, humidity-ratio, inlet-RH, source-air saturation, and
+heater-only constraints and is deterministically retried as one unit without
+clipping individual nodes. Natural and parameter-OOD behavior differ only by
+supports within this same process family. Diagnostics remain provenance and
+evaluation metadata, not learned fields or scalar inputs.
 
 ### Transient scalar handoff
 

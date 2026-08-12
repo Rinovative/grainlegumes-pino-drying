@@ -35,6 +35,7 @@ from src import common
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_registry as registry_service
 
+from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 if TYPE_CHECKING:
@@ -301,39 +302,120 @@ def _condition_operation_values(
     bounds: Mapping[str, Mapping[str, Any]],
     fixed: Mapping[str, Any],
 ) -> None:
-    """Enforce joint schedule support without clipping generated schedules."""
-    for base_name, amplitude_name, minimum_name, maximum_name in (
-        ("T_in_base", "T_in_amp", "T_in_min", "T_in_max"),
-        ("omega_in_base", "omega_in_amp", "omega_min", "omega_max"),
-    ):
-        base_bounds = bounds[base_name]
-        amplitude_bounds = bounds[amplitude_name]
-        amplitude_lower = float(amplitude_bounds["lower"])
-        operational_lower = float(fixed[minimum_name])
-        operational_upper = float(fixed[maximum_name])
-        base_lower = max(float(base_bounds["lower"]), operational_lower + amplitude_lower)
-        base_upper = min(float(base_bounds["upper"]), operational_upper - amplitude_lower)
-        base = _remap_interval(
-            registry[base_name],
-            coordinates[base_name],
-            lower=base_lower,
-            upper=base_upper,
-            label=base_name,
-        )
-        amplitude_upper = min(
-            float(amplitude_bounds["upper"]),
-            base - operational_lower,
-            operational_upper - base,
-        )
-        amplitude = _remap_interval(
-            registry[amplitude_name],
-            coordinates[amplitude_name],
-            lower=amplitude_lower,
-            upper=amplitude_upper,
-            label=amplitude_name,
-        )
-        values[base_name] = base
-        values[amplitude_name] = amplitude
+    """Condition the complete exact-amplitude schedule inside physical support."""
+    temperature_base_bounds = bounds["T_in_base"]
+    temperature_amplitude_bounds = bounds["T_in_amp"]
+    humidity_base_bounds = bounds["omega_in_base"]
+    humidity_amplitude_bounds = bounds["omega_in_amp"]
+    ambient_bounds = bounds["T_amb"]
+    temperature_amplitude_lower = float(temperature_amplitude_bounds["lower"])
+    humidity_amplitude_lower = float(humidity_amplitude_bounds["lower"])
+    pressure = float(fixed["p_ref"])
+
+    minimum_source_humidity = float(humidity_base_bounds["lower"]) + humidity_amplitude_lower
+    minimum_source_temperature = float(
+        schedule_service.humidity_ratio_dew_point_temperature(
+            np.asarray([minimum_source_humidity], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    maximum_feasible_temperature_base = min(
+        float(temperature_base_bounds["upper"]),
+        float(fixed["T_in_max"]) - temperature_amplitude_lower,
+    )
+    ambient = _remap_interval(
+        registry["T_amb"],
+        coordinates["T_amb"],
+        lower=max(float(ambient_bounds["lower"]), minimum_source_temperature),
+        upper=min(
+            float(ambient_bounds["upper"]),
+            maximum_feasible_temperature_base - temperature_amplitude_lower,
+        ),
+        label="T_amb",
+    )
+    values["T_amb"] = ambient
+
+    temperature_base = _remap_interval(
+        registry["T_in_base"],
+        coordinates["T_in_base"],
+        lower=max(
+            float(temperature_base_bounds["lower"]),
+            float(fixed["T_in_min"]) + temperature_amplitude_lower,
+            ambient + temperature_amplitude_lower,
+        ),
+        upper=maximum_feasible_temperature_base,
+        label="T_in_base",
+    )
+    temperature_amplitude = _remap_interval(
+        registry["T_in_amp"],
+        coordinates["T_in_amp"],
+        lower=temperature_amplitude_lower,
+        upper=min(
+            float(temperature_amplitude_bounds["upper"]),
+            temperature_base - float(fixed["T_in_min"]),
+            float(fixed["T_in_max"]) - temperature_base,
+            temperature_base - ambient,
+        ),
+        label="T_in_amp",
+    )
+    values["T_in_base"] = temperature_base
+    values["T_in_amp"] = temperature_amplitude
+
+    temperature_minimum = temperature_base - temperature_amplitude
+    temperature_maximum = temperature_base + temperature_amplitude
+    inlet_humidity_minimum = float(
+        schedule_service.relative_humidity_to_humidity_ratio(
+            np.asarray([float(fixed["phi_operational_min"])], dtype=np.float64),
+            np.asarray([temperature_maximum], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    inlet_humidity_maximum = float(
+        schedule_service.relative_humidity_to_humidity_ratio(
+            np.asarray([float(fixed["phi_operational_max"])], dtype=np.float64),
+            np.asarray([temperature_minimum], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    source_humidity_maximum = float(
+        schedule_service.relative_humidity_to_humidity_ratio(
+            np.ones(1, dtype=np.float64),
+            np.asarray([ambient], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    humidity_operational_lower = max(float(fixed["omega_min"]), inlet_humidity_minimum)
+    humidity_operational_upper = min(
+        float(fixed["omega_max"]),
+        inlet_humidity_maximum,
+        source_humidity_maximum,
+    )
+    humidity_base = _remap_interval(
+        registry["omega_in_base"],
+        coordinates["omega_in_base"],
+        lower=max(
+            float(humidity_base_bounds["lower"]),
+            humidity_operational_lower + humidity_amplitude_lower,
+        ),
+        upper=min(
+            float(humidity_base_bounds["upper"]),
+            humidity_operational_upper - humidity_amplitude_lower,
+        ),
+        label="omega_in_base",
+    )
+    humidity_amplitude = _remap_interval(
+        registry["omega_in_amp"],
+        coordinates["omega_in_amp"],
+        lower=humidity_amplitude_lower,
+        upper=min(
+            float(humidity_amplitude_bounds["upper"]),
+            humidity_base - humidity_operational_lower,
+            humidity_operational_upper - humidity_base,
+        ),
+        label="omega_in_amp",
+    )
+    values["omega_in_base"] = humidity_base
+    values["omega_in_amp"] = humidity_amplitude
 
     duration_name = "schedule.event_duration_rel"
     width_name = "schedule.event_width_rel"

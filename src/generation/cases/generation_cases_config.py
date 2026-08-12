@@ -44,6 +44,7 @@ from src.generation.contracts.generation_contracts_vocabulary import (
 )
 
 from . import generation_cases_sampling as sampling_service
+from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 CONFIG_SCHEMA_VERSION = 1
@@ -1217,6 +1218,7 @@ def _validate_operations(
     *,
     sources: Mapping[str, Mapping[str, Any]],
     definitions: Mapping[str, Mapping[str, Any]],
+    time_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate material-independent operating-distribution ownership."""
     operations = _mapping(value, label="generation operations configuration")
@@ -1282,6 +1284,14 @@ def _validate_operations(
             sources=sources,
             label=f"operations.parameter_values.{name}",
         )
+    try:
+        schedule_service.validate_temporal_support_resolution(
+            parameter_values,
+            time_contract,
+        )
+    except ValueError as error:
+        message = f"Temporal schedule support is incompatible with common.time: {error}"
+        raise GenerationConfigError(message) from error
     operations["parameter_values"] = parameter_values
     return operations
 
@@ -2054,6 +2064,7 @@ def _build_batch(
     if profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         scientific.update(
             {
+                "schedule_generator_version": schedule_service.SCHEDULE_GENERATOR_VERSION,
                 "physical_formulas": copy.deepcopy(dict(common_config["physical_formulas"])),
                 "physical_formulas_provenance": copy.deepcopy(dict(common_config["physical_formulas_provenance"])),
                 "time": copy.deepcopy(dict(common_config["time"])),
@@ -2145,6 +2156,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         ),
         sources=sources,
         definitions=definitions,
+        time_contract=common_config["time"],
     )
     profile_raw = _load_yaml(
         campaign["profile_config"],

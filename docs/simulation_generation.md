@@ -425,7 +425,7 @@ A representative transient case has the following ownership:
 | Dataset package | `hpc115` Docker Dataset service | Immutable `02_datasets` package referencing canonical Generation files | No return transfer to CPU |
 
 Both canonical COMSOL templates expose one Job Configuration whose internal
-Sequence tag is `s1`. Their descriptive labels are not runtime identifiers.
+Sequence tag is `b1`. Their descriptive labels are not runtime identifiers.
 Generation selects that job automatically; users do not provide a job tag,
 input model name, output model name, or save mode. Each case uses the
 fixed `model.mph` work copy and always passes `-np` from `cores_per_case`.

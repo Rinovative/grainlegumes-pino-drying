@@ -238,7 +238,7 @@ def test_fake_mapping_probe_uses_canonical_retained_command(
     command = report["command"]
 
     assert command[command.index("-inputfile") + 1] == "model.mph"
-    assert command[command.index("-job") + 1] == "s1"
+    assert command[command.index("-job") + 1] == "b1"
     assert command[command.index("-outputfile") + 1] == "solved.mph"
     assert command[command.index("-np") + 1] == "16"
     assert "-nosave" not in command

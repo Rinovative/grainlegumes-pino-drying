@@ -23,7 +23,7 @@ import copy
 import hashlib
 import math
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 
@@ -271,12 +271,22 @@ def _realization_evidence(
         return result
     fixed = batch.scientific_values["scientific_fixed_values"]
     seeds = _subseeds(batch, case_index)
+    schedule_seeds = {name: seeds[name] for name in ("schedule_shared", "schedule_independent")}
     schedule = schedule_service.generate_schedule(
         sample.values,
         batch.scientific_values["time"],
         fixed,
-        seeds={name: seeds[name] for name in ("schedule_shared", "schedule_independent")},
+        seeds=schedule_seeds,
     )
+    replay = schedule_service.generate_schedule(
+        sample.values,
+        batch.scientific_values["time"],
+        fixed,
+        seeds=schedule_seeds,
+    )
+    if not np.array_equal(schedule.values, replay.values) or schedule.metadata != replay.metadata:
+        message = "Static schedule sentinel failed deterministic replay."
+        raise ValueError(message)
     temperature = schedule.values[:, 1]
     humidity_ratio = schedule.values[:, 2]
     relative_humidity = schedule.values[:, 3]
@@ -288,17 +298,58 @@ def _realization_evidence(
         message = "Static schedule sentinel escaped its temperature, humidity-ratio, or RH envelope."
         raise ValueError(message)
     schedule_diagnostics = schedule.diagnostics
+    minimum_source_phi = float(cast("float", schedule_diagnostics["min_phi_source_air"]))
+    maximum_source_phi = float(cast("float", schedule_diagnostics["max_phi_source_air"]))
+    minimum_heater_rise = float(cast("float", schedule_diagnostics["min_heater_temperature_rise"]))
+    rejection_count = int(cast("int", schedule_diagnostics["schedule_rejection_count"]))
+    acceptance_attempt = int(cast("int", schedule_diagnostics["schedule_acceptance_attempt"]))
     if (
         schedule.metadata["column_order"] != list(profiles.SCHEDULE_FIELDS)
-        or schedule_diagnostics["min_phi_source_air"] <= 0.0
-        or schedule_diagnostics["max_phi_source_air"] > 1.0
-        or schedule_diagnostics["min_heater_temperature_rise"] < 0.0
-        or schedule_diagnostics["schedule_rejection_count"] != schedule_diagnostics["schedule_acceptance_attempt"] - 1
+        or minimum_source_phi <= 0.0
+        or maximum_source_phi > 1.0
+        or minimum_heater_rise < 0.0
+        or rejection_count != acceptance_attempt - 1
     ):
         message = "Static schedule sentinel violated heater-only diagnostics or the four-column contract."
         raise ValueError(message)
     if float(sample.values["schedule.event_duration_rel"]) < 2.0 * float(sample.values["schedule.event_width_rel"]):
         message = "Static schedule sentinel violated duration >= 2*width."
+        raise ValueError(message)
+    if (
+        float(cast("float", schedule_diagnostics["smooth_scale_intervals"])) < schedule_service.MINIMUM_SMOOTH_SCALE_INTERVALS
+        or float(cast("float", schedule_diagnostics["minimum_event_width_intervals"])) < schedule_service.MINIMUM_EVENT_WIDTH_INTERVALS
+        or float(cast("float", schedule_diagnostics["event_duration_intervals"])) < schedule_service.MINIMUM_EVENT_DURATION_INTERVALS
+    ):
+        message = "Static schedule sentinel violated the regular-grid temporal-resolution contract."
+        raise ValueError(message)
+    for amplitude_name, ratio_name, constant_name in (
+        ("T_in_amp", "T_in_amp_realization_ratio", "constant_T_in_bc"),
+        ("omega_in_amp", "omega_in_amp_realization_ratio", "constant_omega_in_bc"),
+    ):
+        amplitude = float(sample.values[amplitude_name])
+        ratio = schedule_diagnostics[ratio_name]
+        constant = bool(schedule_diagnostics[constant_name])
+        if amplitude == 0.0:
+            valid = ratio is None and constant
+        else:
+            valid = ratio is not None and math.isclose(float(ratio), 1.0, rel_tol=0.0, abs_tol=2.0e-12) and not constant
+        if not valid:
+            message = f"Static schedule sentinel violated exact {amplitude_name} semantics."
+            raise ValueError(message)
+    correlation_error = schedule_diagnostics["absolute_T_omega_correlation_error"]
+    both_vary = float(sample.values["T_in_amp"]) > 0.0 and float(sample.values["omega_in_amp"]) > 0.0
+    if (both_vary and (correlation_error is None or float(correlation_error) > schedule_service.CORRELATION_TOLERANCE)) or (
+        not both_vary and correlation_error is not None
+    ):
+        message = "Static schedule sentinel violated exact discrete-node correlation semantics."
+        raise ValueError(message)
+    recomputed_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        humidity_ratio,
+        temperature,
+        pressure=float(fixed["p_ref"]),
+    )
+    if not np.array_equal(relative_humidity, recomputed_phi):
+        message = "Static schedule sentinel found phi_in_bc not derived exactly from T_in_bc and omega_in_bc."
         raise ValueError(message)
     moisture_metadata = fields.metadata["initial_moisture"]
     target_constraint = batch.scientific_values["material"]["initial_moisture_field_constraint"]

@@ -200,11 +200,11 @@ parameter_values:
       source_refs:
       - vm2_project
   schedule.timescale_rel:
-    lower: 0.03
+    lower: 0.05
     upper: 0.18
     ood:
-    - lower: 0.01
-      upper: 0.02
+    - lower: 0.024
+      upper: 0.036
     - lower: 0.25
       upper: 0.4
     nominal: 0.08
@@ -244,28 +244,28 @@ parameter_values:
       source_refs:
       - vm2_project
   schedule.event_duration_rel:
-    lower: 0.015
-    upper: 0.08
+    lower: 0.08
+    upper: 0.16
     ood:
-    - lower: 0.004
-      upper: 0.01
-    - lower: 0.12
-      upper: 0.2
-    nominal: 0.04
+    - lower: 0.04
+      upper: 0.06
+    - lower: 0.22
+      upper: 0.32
+    nominal: 0.1
     distribution: uniform_in_log_transform_space
     provenance:
       evidence: synthetic_design
       source_refs:
       - vm2_project
   schedule.event_width_rel:
-    lower: 0.003
-    upper: 0.02
+    lower: 0.02
+    upper: 0.04
     ood:
-    - lower: 0.0008
-      upper: 0.002
-    - lower: 0.03
-      upper: 0.05
-    nominal: 0.008
+    - lower: 0.012
+      upper: 0.016
+    - lower: 0.06
+      upper: 0.09
+    nominal: 0.03
     distribution: uniform_in_log_transform_space
     provenance:
       evidence: synthetic_design

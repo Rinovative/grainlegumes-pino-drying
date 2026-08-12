@@ -272,7 +272,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     campaign["dataset_packages"] = [package for package in campaign["dataset_packages"] if package["evaluation_regime"] != "extreme_family_ood"]
 
     common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0, "Lz": 0.4})
-    common["time"].update({"start": 0.0, "stop": 4.0, "interval": 0.5})
+    common["time"].update({"start": 0.0, "stop": 84.0, "interval": 0.5})
     common["scientific_fixed_values"]["T_flow_ref"]["value"] = 301.15
     common["scientific_fixed_values"]["p_ref"]["value"] = 100000.0
     common["storage"].update(
@@ -338,7 +338,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     scientific = resolved.batches[0].scientific_values
     assert scientific["grid"]["dx"] == pytest.approx(0.1)
     assert scientific["grid"]["dy"] == pytest.approx(0.1)
-    assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(9)]
+    assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(169)]
     assert scientific["scientific_fixed_values"]["T_flow_ref"] == 301.15
     assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
     assert scientific["storage"]["compression_level"] == 6
@@ -919,17 +919,17 @@ def test_heater_schedule_retries_complete_realization_deterministically(
     sample = sampling.sample_case(batch, 1)
     assert batch.seed_base is not None
     seeds = {name: seeding.derive_seed(batch.seed_base, "case", "1", name) for name in ("schedule_shared", "schedule_independent")}
-    original = schedule_service._candidate_schedule
+    original = schedule_service._feasibility_reason
+    call_count = 0
 
-    def force_first_rejection(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
-        result = original(*args, **kwargs)
-        if kwargs["attempt"] != 1:
-            return result
-        temperature, *remaining = result
-        rejected = np.full_like(temperature, float(sample.values["T_amb"]) - 1.0)
-        return (rejected, *remaining)
+    def force_first_rejection(*args: Any, **kwargs: Any) -> str | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count % 2 == 1:
+            return "forced deterministic whole-schedule rejection"
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(schedule_service, "_candidate_schedule", force_first_rejection)
+    monkeypatch.setattr(schedule_service, "_feasibility_reason", force_first_rejection)
     first = schedule_service.generate_schedule(
         sample.values,
         batch.scientific_values["time"],
