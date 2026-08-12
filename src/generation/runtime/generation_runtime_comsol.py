@@ -29,7 +29,7 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 if TYPE_CHECKING:
     from src.generation.cases import generation_cases_config as config_contract
 
-COMSOL_JOB_TAG: Final = "generation"
+COMSOL_JOB_TAG: Final = "s1"
 WORK_MODEL_FILENAME: Final = "model.mph"
 RETAINED_MODEL_FILENAME: Final = "solved.mph"
 

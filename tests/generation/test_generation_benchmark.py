@@ -117,7 +117,7 @@ def test_maintained_suite_is_config_owned_same_case_and_serially_isolated(tmp_pa
         scalar_handoff=bundle.scalar_handoff,
         scheduler_kind="slurm",
     )
-    assert command[command.index("-job") + 1] == "generation"
+    assert command[command.index("-job") + 1] == "s1"
     assert command[command.index("-inputfile") + 1] == "model.mph"
     assert command[command.index("-np") + 1] == "16"
     assert "-nosave" in command

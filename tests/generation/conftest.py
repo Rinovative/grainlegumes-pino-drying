@@ -371,8 +371,8 @@ try:
     else:
         time.sleep(float(os.environ.get("FAKE_COMSOL_DELAY", "0")))
         arguments = sys.argv[1:]
-        if arguments.count("-job") != 1 or arguments[arguments.index("-job") + 1] != "generation":
-            raise RuntimeError("fake COMSOL requires the canonical generation job")
+        if arguments.count("-job") != 1 or arguments[arguments.index("-job") + 1] != "s1":
+            raise RuntimeError("fake COMSOL requires the canonical s1 job configuration")
         if arguments.count("-inputfile") != 1 or arguments[arguments.index("-inputfile") + 1] != "model.mph":
             raise RuntimeError("fake COMSOL requires the canonical work model")
         retained = arguments.count("-outputfile") == 1
