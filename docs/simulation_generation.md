@@ -481,13 +481,21 @@ inventory, and retained-evidence policy. The gate requires:
 
 Mapping probes inventory actual output files and headers. COMSOL Spreadsheet
 exports carry a variable-length leading block of percent-prefixed metadata whose
-final compatible record is the column header. Generation parses that structure
-directly, preserves the raw unit-decorated header, and removes only exact
-declared unit suffixes before exact source-header comparison. It never infers or
-writes a mapping automatically. Fixed values reported as template-owned have no
-Python runtime override; their configured record is bound to the canonical
-hashed template and model-report evidence. Case-dependent values use the
-admitted CLI vector and still require native runtime evidence.
+final compatible record is the column header. Native transient Data exports are
+wide tables: Generation parses each exact ``@ t=...`` descriptor, removes its
+exact declared trailing unit, validates one complete logical field group per
+state, and streams those groups directly into canonical regular and diagnostic
+state arrays. Numeric ``t`` columns and repeated coordinates must agree with the
+header-owned state and authoritative grid. Global Time Series and Final Status
+tables may include runtime parameter columns and COMSOL ``Time``; Generation
+ignores those extras and maps only explicitly configured headers, including the
+distinct Generation-owned ``t`` field. The runtime-confirmed mappings remain
+explicit profile configuration, and canonical HDF5/Dataset consumers are
+independent of COMSOL's raw layout. Generation never infers or writes a mapping
+automatically. Fixed values reported as template-owned have no Python runtime
+override; their configured record is bound to the canonical hashed template and
+model-report evidence. Case-dependent values use the admitted CLI vector and
+still require native runtime evidence.
 
 ## Shared-cluster transient core benchmark
 

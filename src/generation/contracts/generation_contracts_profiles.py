@@ -37,7 +37,6 @@ STEADY_FLOW_EXPORT_ROLE = "steady_flow_fields"
 TRANSIENT_RAW_EXPORT_ROLE = "transient_fields"
 GLOBAL_EXPORT_ROLE = "global_time_series"
 FINAL_STATUS_EXPORT_ROLE = "final_status"
-EXACT_STOP_EXPORT_ROLE = "exact_stop_diagnostics"
 STEADY_FLOW_LEARNING_VIEW = "steady_flow"
 TRANSIENT_DRYING_LEARNING_VIEW = "transient_drying"
 STATIONARITY_TOLERANCE = 1e-10
@@ -254,7 +253,7 @@ _PROFILES: Final = MappingProxyType(
                 ExportRoleSpec(
                     role=TRANSIENT_RAW_EXPORT_ROLE,
                     required=True,
-                    allow_multiple=True,
+                    allow_multiple=False,
                     logical_fields=("t", "x", "y", *TRANSIENT_FIELD_NAMES),
                     units=("h", "m", "m", *TRANSIENT_FIELD_UNITS),
                     learning_view=TRANSIENT_DRYING_LEARNING_VIEW,
@@ -273,14 +272,6 @@ _PROFILES: Final = MappingProxyType(
                     allow_multiple=False,
                     logical_fields=FINAL_STATUS_FIELDS,
                     units=FINAL_STATUS_UNITS,
-                    learning_view=None,
-                ),
-                ExportRoleSpec(
-                    role=EXACT_STOP_EXPORT_ROLE,
-                    required=False,
-                    allow_multiple=False,
-                    logical_fields=(),
-                    units=(),
                     learning_view=None,
                 ),
             ),

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -241,8 +243,8 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
                 "delimiter": ",",
                 "columns": {
                     "t": {"state": "runtime_confirmed", "source_header": "t"},
-                    "X_wb_bulk": {"state": "runtime_confirmed", "source_header": "comp1.X_wb_bulk"},
-                    "T_out_mean": {"state": "runtime_confirmed", "source_header": "comp1.T_out_mean"},
+                    "X_wb_bulk": {"state": "runtime_confirmed", "source_header": "X_wb_bulk"},
+                    "T_out_mean": {"state": "runtime_confirmed", "source_header": "T_out_mean"},
                 },
             },
             {
@@ -251,14 +253,14 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
                 "source": {"state": "runtime_confirmed", "pattern": "final.csv"},
                 "delimiter": ",",
                 "columns": {
-                    "t_final": {"state": "runtime_confirmed", "source_header": "t"},
+                    "t_final": {"state": "runtime_confirmed", "source_header": "t_final"},
                     "T_max_final": {
                         "state": "runtime_confirmed",
-                        "source_header": "comp1.maxop_bed(comp1.T)",
+                        "source_header": "T_max_final",
                     },
                     "phi_min_final": {
                         "state": "runtime_confirmed",
-                        "source_header": "comp1.minop_bed(comp1.mt.phi)",
+                        "source_header": "phi_min_final",
                     },
                 },
             },
@@ -279,17 +281,17 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
 % Dimension,2
 % Nodes,1
 % Expressions,3
-% t (h),T (K),mt.phi
+% t (h) @ t=0,T (K) @ t=0,mt.phi (1) @ t=0
 0,296,0.5
 """,
         "globals.csv": """% Model,model.mph
-% Expressions,3
-% t (h),comp1.X_wb_bulk,comp1.T_out_mean (K)
-0,0.2,296
+% Expressions,4
+% Time,t (h),X_wb_bulk (1),T_out_mean (K)
+0,0,0.2,296
 """,
         "final.csv": """% Model,model.mph
-% t (h),comp1.maxop_bed(comp1.T) (K),comp1.minop_bed(comp1.mt.phi)
-1,295,0.4
+% Time,t_final (h),T_max_final (K),phi_min_final (1)
+0,1,295,0.4
 """,
     }
     inventory = []
@@ -325,3 +327,192 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
         assert observation["raw_header"]
         assert observation["canonical_header"] == observation["observed_header"]
         assert observation["parsed_shape"][0] == 1
+
+
+_TEMPORAL_UNITS = {
+    "t": "h",
+    "x": "m",
+    "y": "m",
+    "T": "K",
+    "mt.phi": "1",
+    "w_surf": "kg/m^3",
+    "w_int": "kg/m^3",
+}
+
+
+def _wide_header(times: tuple[float, ...]) -> list[str]:
+    """Return compact native COMSOL temporal descriptors."""
+    return [f"{source} ({unit}) @ t={state_time:g}" for state_time in times for source, unit in _TEMPORAL_UNITS.items()]
+
+
+def _write_wide_fixture(
+    path: Path,
+    *,
+    numeric_times: tuple[float, ...] = (0.0, 1.0, 1.5),
+    shifted_state: int | None = None,
+) -> None:
+    """Write a three-node native-wide table with one exact-stop state."""
+    times = (0.0, 1.0, 1.5)
+    header = _wide_header(times)
+    records = [
+        "% Model,model.mph",
+        "% Dimension,2",
+        "% Nodes,3",
+        f"% Expressions,{len(header)}",
+        "% " + ",".join(header),
+    ]
+    for x_value in (0.0, 1.0, 2.0):
+        row: list[float] = []
+        for state_index, (header_time, numeric_time) in enumerate(zip(times, numeric_times, strict=True)):
+            state_x = x_value + (0.01 if state_index == shifted_state else 0.0)
+            row.extend(
+                (
+                    numeric_time,
+                    state_x,
+                    0.0,
+                    300.0 + header_time + x_value,
+                    0.4 + 0.01 * header_time,
+                    10.0 - header_time - x_value,
+                    20.0 - header_time - x_value,
+                )
+            )
+        records.append(",".join(format(value, ".17g") for value in row))
+    path.write_text("\n".join(records) + "\n", encoding="utf-8")
+
+
+def _wide_storage_config() -> Any:
+    """Return the minimal resolved contract consumed by wide admission."""
+    return SimpleNamespace(
+        scientific_values={
+            "time": {
+                "start": 0.0,
+                "interval": 1.0,
+                "stop": 2.0,
+                "regular_times": [0.0, 1.0, 2.0],
+            },
+            "output_contract": {
+                "exports": [
+                    {
+                        "role": "transient_fields",
+                        "delimiter": ",",
+                        "columns": {
+                            "t": "t",
+                            "x": "x",
+                            "y": "y",
+                            "T": "T",
+                            "phi": "mt.phi",
+                            "w_surf": "w_surf",
+                            "w_int": "w_int",
+                        },
+                        "units": {
+                            "t": "h",
+                            "x": "m",
+                            "y": "m",
+                            "T": "K",
+                            "phi": "1",
+                            "w_surf": "kg/m^3",
+                            "w_int": "kg/m^3",
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+
+def test_temporal_descriptor_preserves_expression_and_header_precision() -> None:
+    """Parse only the trailing declared unit and temporal suffix."""
+    descriptor = spreadsheet.parse_temporal_column_descriptor(
+        "comp1.some_expression(a(b)) (kg/s) @ t=50.601",
+        expected_units={"comp1.some_expression(a(b))": "kg/s"},
+    )
+    assert descriptor.source == "comp1.some_expression(a(b))"
+    assert descriptor.unit == "kg/s"
+    assert descriptor.state_time == 50.601
+    assert descriptor.state_time_text_atol == pytest.approx(0.0005)
+
+
+@pytest.mark.parametrize(
+    ("header", "match"),
+    [
+        (_wide_header((0.0,))[:-1], "incomplete"),
+        ([*_wide_header((0.0,)), "T (K) @ t=0"], "repeats logical"),
+        (_wide_header((1.0, 0.0)), "strictly increasing"),
+        (["T (degC) @ t=0"], "exact declared unit"),
+        (["T (K) @ t=broken"], "Malformed"),
+        (
+            [name.replace("w_int (kg/m^3) @ t=1", "w_int (kg/m^3) @ t=1.5") for name in _wide_header((1.0,))],
+            "incomplete",
+        ),
+    ],
+)
+def test_temporal_grouping_rejects_malformed_or_incomplete_states(
+    header: list[str],
+    match: str,
+) -> None:
+    """Fail closed for every malformed temporal grouping branch."""
+    with pytest.raises(ValueError, match=match):
+        spreadsheet.group_temporal_columns(header, expected_units=_TEMPORAL_UNITS)
+
+
+def test_wide_transient_conversion_preserves_regular_and_exact_stop_states(tmp_path: Path) -> None:
+    """Stream native wide rows directly into canonical ordered state arrays."""
+    path = tmp_path / "transient.csv"
+    _write_wide_fixture(path, numeric_times=(0.0, 1.0, 1.5004))
+    regular_time, regular, exact_time, exact = storage._transient_fields(
+        _wide_storage_config(),
+        [SimpleNamespace(role="transient_fields", source_path=path)],
+        x_axis=np.asarray([0.0, 1.0, 2.0]),
+        y_axis=np.asarray([0.0]),
+    )
+    np.testing.assert_array_equal(regular_time, np.asarray([0.0, 1.0]))
+    assert regular.shape == (2, 4, 1, 3)
+    np.testing.assert_array_equal(regular[0, 0, 0], np.asarray([300.0, 301.0, 302.0]))
+    np.testing.assert_array_equal(regular[1, 1, 0], np.full(3, 0.4 + 0.01))
+    assert exact_time == 1.5004
+    assert exact is not None
+    np.testing.assert_array_equal(exact[2, 0], np.asarray([8.5, 7.5, 6.5]))
+
+
+@pytest.mark.parametrize(
+    ("numeric_times", "shifted_state", "match"),
+    [((0.0, 1.0, 1.4), None, "numeric t disagrees"), ((0.0, 1.0, 1.5), 1, "coordinates disagree")],
+)
+def test_wide_transient_conversion_rejects_numeric_time_or_grid_disagreement(
+    tmp_path: Path,
+    numeric_times: tuple[float, ...],
+    shifted_state: int | None,
+    match: str,
+) -> None:
+    """Require independent numeric-time and repeated-grid evidence."""
+    path = tmp_path / "invalid.csv"
+    _write_wide_fixture(path, numeric_times=numeric_times, shifted_state=shifted_state)
+    with pytest.raises(ValueError, match=match):
+        storage._transient_fields(
+            _wide_storage_config(),
+            [SimpleNamespace(role="transient_fields", source_path=path)],
+            x_axis=np.asarray([0.0, 1.0, 2.0]),
+            y_axis=np.asarray([0.0]),
+        )
+
+
+@pytest.mark.parametrize(
+    "times",
+    [np.asarray([0.0, 0.5, 1.0]), np.asarray([0.0, 0.5, 1.0, 1.5])],
+)
+def test_time_classification_rejects_nonfinal_or_multiple_irregular_states(times: np.ndarray) -> None:
+    """Keep irregular solver stops final, singular, and diagnostic-only."""
+    with pytest.raises(ValueError, match="irregular"):
+        storage._classify_transient_times(
+            times,
+            {"start": 0.0, "interval": 1.0, "stop": 2.0, "regular_times": [0.0, 1.0, 2.0]},
+        )
+
+
+def test_unit_interval_admission_allows_only_binary64_roundoff() -> None:
+    """Admit COMSOL unit-fraction residue without hiding real violations."""
+    values = np.asarray([np.nextafter(0.0, -1.0), 0.0, 1.0, np.nextafter(1.0, 2.0), -1e-6, 1.0 + 1e-6])
+    np.testing.assert_array_equal(
+        storage._outside_unit_interval(values),
+        np.asarray([False, False, False, False, True, True]),
+    )

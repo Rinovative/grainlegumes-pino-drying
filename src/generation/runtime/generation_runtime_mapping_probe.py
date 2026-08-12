@@ -43,7 +43,7 @@ from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 
 MAPPING_PROBE_SCHEMA_KIND: Final = "generation_mapping_probe"
-MAPPING_PROBE_SCHEMA_VERSION: Final = 2
+MAPPING_PROBE_SCHEMA_VERSION: Final = 3
 _TECHNICAL_SMOKE_PURPOSE: Final = "technical_runtime_smoke"
 _TEXT_SUFFIXES: Final = frozenset({".csv", ".dat", ".txt"})
 
@@ -159,18 +159,15 @@ def _mapping_comparison(
     for record in inventory:
         by_basename.setdefault(Path(record["relative_path"]).name, []).append(record)
     required_corrections: list[str] = []
-    optional_corrections: list[str] = []
     required_missing_exports: list[dict[str, str]] = []
-    optional_missing_exports: list[dict[str, str]] = []
     observations: list[dict[str, Any]] = []
     profile_spec = profiles.resolve_profile(str(profile["simulation_profile"]))
     for index, export in enumerate(profile["exports"]):
         role = str(export["role"])
         role_spec = profile_spec.export_role(role)
         units_by_logical = dict(zip(role_spec.logical_fields, role_spec.units, strict=True))
-        optional = role == "exact_stop_diagnostics"
-        corrections = optional_corrections if optional else required_corrections
-        missing_exports = optional_missing_exports if optional else required_missing_exports
+        corrections = required_corrections
+        missing_exports = required_missing_exports
         source = export["source"]
         source_key = f"{prefix}:exports[{index}].source"
         pattern = source.get("pattern")
@@ -189,12 +186,26 @@ def _mapping_comparison(
             for logical, mapping in export["columns"].items()
             if isinstance(mapping.get("source_header"), str)
         }
-        canonical_header = list(
-            spreadsheet_contract.canonicalize_header(
-                raw_header,
-                expected_units=expected_units,
+        temporal_groups: tuple[spreadsheet_contract.ComsolTemporalGroup, ...] = ()
+        temporal_error: str | None = None
+        if role == profiles.TRANSIENT_RAW_EXPORT_ROLE and raw_header:
+            try:
+                temporal_groups = spreadsheet_contract.group_temporal_columns(
+                    raw_header,
+                    expected_units=expected_units,
+                )
+            except ValueError as error:
+                temporal_error = str(error)
+                canonical_header = []
+            else:
+                canonical_header = [column.source for column in temporal_groups[0].columns]
+        else:
+            canonical_header = list(
+                spreadsheet_contract.canonicalize_header(
+                    raw_header,
+                    expected_units=expected_units,
+                )
             )
-        )
         observed_header = canonical_header
         delimiter_matches = bool(isinstance(table, dict) and table.get("delimiter") == export["delimiter"])
         if len(matches) == 1 and not delimiter_matches:
@@ -214,7 +225,6 @@ def _mapping_comparison(
         observations.append(
             {
                 "role": role,
-                "optional": optional,
                 "source_state": source["state"],
                 "declared_pattern": pattern,
                 "matched_relative_paths": [record["relative_path"] for record in matches],
@@ -224,15 +234,16 @@ def _mapping_comparison(
                 "observed_header": observed_header,
                 "parsed_shape": table.get("shape") if isinstance(table, dict) else None,
                 "comsol_metadata": table.get("comsol_metadata", {}) if isinstance(table, dict) else {},
+                "temporal_state_times": [group.state_time for group in temporal_groups],
+                "temporal_group_count": len(temporal_groups),
+                "temporal_structure_error": temporal_error,
                 "delimiter_matches": delimiter_matches,
                 "columns": column_results,
             }
         )
     return {
         "required_corrections": sorted(set(required_corrections)),
-        "optional_corrections": sorted(set(optional_corrections)),
         "required_missing_exports": required_missing_exports,
-        "optional_missing_exports": optional_missing_exports,
         "observations": observations,
         "aliases_used": False,
     }
@@ -410,9 +421,7 @@ def run_mapping_probe(
                 "resolved_output_contract": config.scientific_values["output_contract"],
             },
             "fields_requiring_correction": mapping_comparison["required_corrections"],
-            "optional_fields_requiring_correction": mapping_comparison["optional_corrections"],
             "required_exports_missing": mapping_comparison["required_missing_exports"],
-            "optional_exports_missing": mapping_comparison["optional_missing_exports"],
             "mapping_comparison": mapping_comparison,
             "actual_file_inventory": inventory,
             "command": command,

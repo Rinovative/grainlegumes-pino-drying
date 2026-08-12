@@ -25,6 +25,7 @@ import os
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +55,8 @@ _COORDINATE_ATOL = 1e-12
 _STATIONARITY_RTOL = profiles.STATIONARITY_TOLERANCE
 _TIME_CLASSIFICATION_FACTOR = 16.0
 _THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
+_UNIT_INTERVAL_ROUNDOFF_ATOL = 64.0 * np.finfo(np.float64).eps
+_FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 STATUS_SCHEMA_VERSION = 1
@@ -192,33 +195,22 @@ def _static_fields(
     x_axis, y_axis = _expected_axes(config)
     x_values = mapped["x"]
     y_values = mapped["y"]
-    actual_x = np.unique(x_values)
-    actual_y = np.unique(y_values)
-    if (
-        actual_x.size != x_axis.size
-        or actual_y.size != y_axis.size
-        or not np.allclose(actual_x, x_axis, rtol=0.0, atol=_COORDINATE_ATOL)
-        or not np.allclose(actual_y, y_axis, rtol=0.0, atol=_COORDINATE_ATOL)
-    ):
-        msg = "Static export coordinates do not match the configured boundary-inclusive grid."
-        raise ValueError(msg)
-    coordinate_rows: dict[tuple[float, float], list[int]] = {}
-    for row, coordinate in enumerate(zip(x_values, y_values, strict=True)):
-        coordinate_rows.setdefault((float(coordinate[0]), float(coordinate[1])), []).append(row)
+    coordinate_rows: dict[tuple[int, int], list[int]] = {}
+    for row, (x_value, y_value) in enumerate(zip(x_values, y_values, strict=True)):
+        x_index = _axis_index(float(x_value), x_axis, label="static x")
+        y_index = _axis_index(float(y_value), y_axis, label="static y")
+        coordinate_rows.setdefault((y_index, x_index), []).append(row)
     if len(coordinate_rows) != x_axis.size * y_axis.size:
-        msg = "Static export does not contain one complete Cartesian grid."
+        msg = "Static export does not contain one complete Cartesian grid within coordinate tolerance."
         raise ValueError(msg)
     repeated_allowed = False
     field_names = profiles.static_field_names(config.profile.id)
     arrays: np.ndarray = np.empty((len(field_names), y_axis.size, x_axis.size), dtype=np.float64)
-    x_lookup = {float(value): index for index, value in enumerate(actual_x)}
-    y_lookup = {float(value): index for index, value in enumerate(actual_y)}
     for coordinate, rows in coordinate_rows.items():
         if len(rows) != 1 and not repeated_allowed:
-            msg = f"Static export repeats coordinate {coordinate} without configured time ownership."
+            msg = f"Static export repeats coordinate index {coordinate} without configured time ownership."
             raise ValueError(msg)
-        y_index = y_lookup[coordinate[1]]
-        x_index = x_lookup[coordinate[0]]
+        y_index, x_index = coordinate
         for field_index, name in enumerate(field_names):
             candidates = mapped[name][rows]
             if not np.allclose(candidates, candidates[0], rtol=_STATIONARITY_RTOL, atol=_STATIONARITY_RTOL):
@@ -290,6 +282,20 @@ def _classify_transient_times(
     return regular_times, regular_positions, irregular_position
 
 
+def _axis_index(value: float, axis: np.ndarray, *, label: str) -> int:
+    """Return one authoritative coordinate index within canonical tolerance."""
+    insertion = int(np.searchsorted(axis, value))
+    candidates = [index for index in (insertion - 1, insertion) if 0 <= index < axis.size]
+    if not candidates:
+        message = f"Export {label} coordinate {value!r} lies outside the authoritative grid."
+        raise ValueError(message)
+    index = min(candidates, key=lambda candidate: abs(float(axis[candidate]) - value))
+    if abs(float(axis[index]) - value) > _COORDINATE_ATOL:
+        message = f"Export {label} coordinate {value!r} lies outside the authoritative grid."
+        raise ValueError(message)
+    return index
+
+
 def _transient_fields(
     config: GenerationConfig,
     exports: Sequence[Any],
@@ -297,54 +303,123 @@ def _transient_fields(
     x_axis: np.ndarray,
     y_axis: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray | None]:
-    """Canonicalize regular states and one optional diagnostic exact-stop state."""
+    """Stream one native wide export into regular and diagnostic state arrays."""
     contract = _contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)
-    mapped = _mapped_table(_role_paths(exports, profiles.TRANSIENT_RAW_EXPORT_ROLE), contract)
-    raw_times = np.unique(mapped["t"])
+    paths = _role_paths(exports, profiles.TRANSIENT_RAW_EXPORT_ROLE)
+    if len(paths) != 1:
+        message = "Native wide transient admission requires exactly one configured Spreadsheet export."
+        raise ValueError(message)
+    expected_logical = tuple(contract["units"])
+    if tuple(contract["columns"]) != expected_logical:
+        unresolved = [logical for logical in expected_logical if logical not in contract["columns"]]
+        message = f"Export role {profiles.TRANSIENT_RAW_EXPORT_ROLE!r} cannot be ingested until mappings are confirmed for {unresolved}."
+        raise RuntimeError(message)
+    source_by_logical = {logical: str(source) for logical, source in contract["columns"].items()}
+    expected_units = {source_by_logical[logical]: str(contract["units"][logical]) for logical in expected_logical}
+    path = paths[0]
+    table = spreadsheet_contract.read_comsol_spreadsheet(
+        path,
+        delimiter=str(contract["delimiter"]),
+        include_values=False,
+    )
+    groups = spreadsheet_contract.group_temporal_columns(
+        table.raw_header,
+        expected_units=expected_units,
+    )
+    numeric_rows = spreadsheet_contract.iter_comsol_spreadsheet_numeric_rows(
+        path,
+        delimiter=str(contract["delimiter"]),
+        width=table.column_count,
+    )
+    try:
+        first_row = next(numeric_rows)
+    except StopIteration as error:
+        message = "Native wide transient export contains no numeric state-time evidence."
+        raise ValueError(message) from error
+    source_t = source_by_logical["t"]
+    observed_numeric_times = np.asarray(
+        [float(first_row[group.column_index(source_t)]) for group in groups],
+        dtype=np.float64,
+    )
     regular_times, regular_positions, irregular_position = _classify_transient_times(
-        raw_times,
+        observed_numeric_times,
         config.scientific_values["time"],
     )
-    actual_x = np.unique(mapped["x"])
-    actual_y = np.unique(mapped["y"])
-    expected_rows = raw_times.size * x_axis.size * y_axis.size
-    if (
-        mapped["x"].size != expected_rows
-        or actual_x.size != x_axis.size
-        or actual_y.size != y_axis.size
-        or not np.allclose(actual_x, x_axis, rtol=0.0, atol=_COORDINATE_ATOL)
-        or not np.allclose(actual_y, y_axis, rtol=0.0, atol=_COORDINATE_ATOL)
-    ):
-        msg = "Transient export must contain one complete authoritative Cartesian grid per state time."
-        raise ValueError(msg)
-    all_fields = np.full(
-        (raw_times.size, len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
+    expected_rows = x_axis.size * y_axis.size
+    if table.row_count != expected_rows:
+        message = (
+            "Native wide transient export must contain exactly one row per authoritative "
+            f"grid node; expected={expected_rows}, observed={table.row_count}."
+        )
+        raise ValueError(message)
+    regular_fields = np.full(
+        (regular_times.size, len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
         np.nan,
         dtype=np.float64,
     )
-    time_lookup = {float(value): index for index, value in enumerate(raw_times)}
-    x_lookup = {float(value): index for index, value in enumerate(actual_x)}
-    y_lookup = {float(value): index for index, value in enumerate(actual_y)}
-    occupied: set[tuple[int, int, int]] = set()
-    for row, (time_value, x_value, y_value) in enumerate(zip(mapped["t"], mapped["x"], mapped["y"], strict=True)):
-        try:
-            coordinate = time_lookup[float(time_value)], y_lookup[float(y_value)], x_lookup[float(x_value)]
-        except KeyError as error:
-            msg = "Transient export contains a coordinate outside the authoritative grid."
-            raise ValueError(msg) from error
-        if coordinate in occupied:
-            msg = f"Transient export repeats state coordinate {coordinate}."
-            raise ValueError(msg)
-        occupied.add(coordinate)
-        for field_index, name in enumerate(profiles.TRANSIENT_FIELD_NAMES):
-            all_fields[coordinate[0], field_index, coordinate[1], coordinate[2]] = mapped[name][row]
-    if not np.isfinite(all_fields).all():
-        msg = "Transient export contains missing or non-finite canonical fields."
-        raise ValueError(msg)
-    regular_fields = all_fields[regular_positions]
-    if irregular_position is None:
-        return regular_times, regular_fields, None, None
-    return regular_times, regular_fields, float(raw_times[irregular_position]), all_fields[irregular_position]
+    exact_stop_fields = (
+        None
+        if irregular_position is None
+        else np.full(
+            (len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
+            np.nan,
+            dtype=np.float64,
+        )
+    )
+    regular_target = {int(position): index for index, position in enumerate(regular_positions)}
+    occupied = np.zeros((y_axis.size, x_axis.size), dtype=bool)
+    time_tolerance = time_classification_tolerance(config.scientific_values["time"])
+    row_count = 0
+    for row in chain((first_row,), numeric_rows):
+        row_count += 1
+        first = groups[0]
+        reference_x = float(row[first.column_index(source_by_logical["x"])])
+        reference_y = float(row[first.column_index(source_by_logical["y"])])
+        x_index = _axis_index(reference_x, x_axis, label="x")
+        y_index = _axis_index(reference_y, y_axis, label="y")
+        if occupied[y_index, x_index]:
+            message = f"Native wide transient export repeats grid coordinate {(reference_x, reference_y)}."
+            raise ValueError(message)
+        occupied[y_index, x_index] = True
+        row_numeric_times = np.asarray(
+            [float(row[group.column_index(source_by_logical["t"])]) for group in groups],
+            dtype=np.float64,
+        )
+        if not np.allclose(row_numeric_times, observed_numeric_times, rtol=0.0, atol=time_tolerance):
+            message = "Native wide transient numeric t columns must be spatially constant within canonical tolerance."
+            raise ValueError(message)
+        for state_index, group in enumerate(groups):
+            numeric_time = float(row_numeric_times[state_index])
+            header_tolerance = max(column.state_time_text_atol for column in group.columns)
+            if abs(numeric_time - group.state_time) > max(time_tolerance, header_tolerance):
+                message = f"Native wide transient numeric t disagrees with header-owned time {group.state_time:g}: observed={numeric_time!r}."
+                raise ValueError(message)
+            state_x = float(row[group.column_index(source_by_logical["x"])])
+            state_y = float(row[group.column_index(source_by_logical["y"])])
+            if abs(state_x - reference_x) > _COORDINATE_ATOL or abs(state_y - reference_y) > _COORDINATE_ATOL:
+                message = f"Native wide transient x/y coordinates disagree across state {group.state_time:g}."
+                raise ValueError(message)
+            if state_index in regular_target:
+                target = regular_fields[regular_target[state_index]]
+            else:
+                if state_index != irregular_position or exact_stop_fields is None:
+                    message = "Transient state ownership is inconsistent with regular/exact-stop classification."
+                    raise RuntimeError(message)
+                target = exact_stop_fields
+            for field_index, logical in enumerate(profiles.TRANSIENT_FIELD_NAMES):
+                target[field_index, y_index, x_index] = row[group.column_index(source_by_logical[logical])]
+    if row_count != table.row_count:
+        message = f"Native wide transient streaming lost numeric rows: inspected={table.row_count}, converted={row_count}."
+        raise RuntimeError(message)
+    if not occupied.all() or not np.isfinite(regular_fields).all() or (exact_stop_fields is not None and not np.isfinite(exact_stop_fields).all()):
+        message = "Native wide transient export contains an incomplete grid or non-finite canonical fields."
+        raise ValueError(message)
+    numeric_regular = observed_numeric_times[regular_positions]
+    if not np.allclose(numeric_regular, regular_times, rtol=0.0, atol=time_tolerance):
+        message = "Native wide transient regular numeric times disagree with the configured schedule prefix."
+        raise ValueError(message)
+    exact_stop_time = None if irregular_position is None else float(observed_numeric_times[irregular_position])
+    return regular_times, regular_fields, exact_stop_time, exact_stop_fields
 
 
 def _ordered_values(config: GenerationConfig, exports: Sequence[Any], role: str, names: tuple[str, ...]) -> np.ndarray:
@@ -362,45 +437,51 @@ def _ordered_values(config: GenerationConfig, exports: Sequence[Any], role: str,
     return values
 
 
-def _combined_state_axis(
+def _combined_state_time(
     regular_time: np.ndarray,
-    regular_fields: np.ndarray,
     exact_stop_time: float | None,
     exact_stop_fields: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the complete state axis without blurring regular/exact ownership."""
+) -> np.ndarray:
+    """Return the complete state-time axis without copying full state fields."""
     if (exact_stop_time is None) != (exact_stop_fields is None):
-        msg = "Exact-stop time and fields must either both be present or both be absent."
-        raise ValueError(msg)
-    if exact_stop_time is None or exact_stop_fields is None:
-        return regular_time, regular_fields
-    return (
-        np.concatenate((regular_time, np.asarray([exact_stop_time], dtype=np.float64))),
-        np.concatenate((regular_fields, exact_stop_fields[np.newaxis, ...]), axis=0),
-    )
+        message = "Exact-stop time and fields must either both be present or both be absent."
+        raise ValueError(message)
+    if exact_stop_time is None:
+        return regular_time
+    return np.concatenate((regular_time, np.asarray([exact_stop_time], dtype=np.float64)))
 
 
 def _validate_global_bulk_moisture(
     static_fields: np.ndarray,
     state_time: np.ndarray,
-    state_fields: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_fields: np.ndarray | None,
     global_values: np.ndarray,
     *,
     f_surf: float,
     time_tolerance: float,
 ) -> None:
-    """Validate exported bulk moisture against the weighted two-state contract."""
+    """Validate exported bulk moisture without a second full state tensor."""
     rho_bu_dry = static_fields[profiles.TRANSIENT_STATIC_FIELD_NAMES.index("rho_bu_dry")]
-    water = domain.moisture.granular_water_content(
-        state_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_surf")],
-        state_fields[:, profiles.TRANSIENT_FIELD_NAMES.index("w_int")],
-        f_surf,
-    )
+    surface_index = profiles.TRANSIENT_FIELD_NAMES.index("w_surf")
+    interior_index = profiles.TRANSIENT_FIELD_NAMES.index("w_int")
+    states = iter(regular_fields) if exact_stop_fields is None else chain(iter(regular_fields), (exact_stop_fields,))
     weights = np.ones_like(rho_bu_dry, dtype=np.float64)
     weights[[0, -1], :] *= 0.5
     weights[:, [0, -1]] *= 0.5
     expected = np.asarray(
-        [domain.moisture.bulk_wet_basis_moisture(state, rho_bu_dry, cell_weights=weights) for state in water],
+        [
+            domain.moisture.bulk_wet_basis_moisture(
+                domain.moisture.granular_water_content(
+                    state[surface_index],
+                    state[interior_index],
+                    f_surf,
+                ),
+                rho_bu_dry,
+                cell_weights=weights,
+            )
+            for state in states
+        ],
         dtype=np.float64,
     )
     global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
@@ -522,11 +603,18 @@ def _schedule_values(
     return values
 
 
+def _outside_unit_interval(values: np.ndarray) -> np.ndarray:
+    """Return values outside [0, 1] beyond binary64 roundoff residue."""
+    return (values < -_UNIT_INTERVAL_ROUNDOFF_ATOL) | (values > 1.0 + _UNIT_INTERVAL_ROUNDOFF_ATOL)
+
+
 def _validate_transient_outputs(
     config: GenerationConfig,
     static_fields: np.ndarray,
-    state_time: np.ndarray,
-    state_fields: np.ndarray,
+    regular_time: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_time: float | None,
+    exact_stop_fields: np.ndarray | None,
     global_values: np.ndarray,
     final_status: np.ndarray,
     *,
@@ -534,41 +622,42 @@ def _validate_transient_outputs(
 ) -> None:
     """Validate final weighted moisture, diagnostic signs, and exact-stop alignment."""
     time_tolerance = time_classification_tolerance(config.scientific_values["time"])
+    state_time = _combined_state_time(regular_time, exact_stop_time, exact_stop_fields)
     if global_values.shape != (state_time.size, len(profiles.GLOBAL_FIELD_NAMES)):
-        msg = "Global diagnostics must contain one complete row per exported solution state."
-        raise ValueError(msg)
+        message = "Global diagnostics must contain one complete row per exported solution state."
+        raise ValueError(message)
     global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
     if not np.allclose(global_time, state_time, rtol=0.0, atol=time_tolerance):
-        msg = "Global diagnostic times do not align with the complete exported state axis."
-        raise ValueError(msg)
+        message = "Global diagnostic times do not align with the complete exported state axis."
+        raise ValueError(message)
     f_wet = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]
     evaporation = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_evap")]
     vapor_in = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_in")]
     vapor_out = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_out")]
-    if np.any((f_wet < 0.0) | (f_wet > 1.0)):
-        msg = "Global f_wet_dm must lie in [0, 1]."
-        raise ValueError(msg)
+    if np.any(_outside_unit_interval(f_wet)):
+        message = "Global f_wet_dm must lie in [0, 1] within binary64 roundoff."
+        raise ValueError(message)
     if np.any(evaporation < 0.0) or np.any(vapor_in < 0.0) or np.any(vapor_out < 0.0):
-        msg = "Canonical evaporation, inlet, and outlet mass-flow signs must be externally non-negative."
-        raise ValueError(msg)
+        message = "Canonical evaporation, inlet, and outlet mass-flow signs must be externally non-negative."
+        raise ValueError(message)
     if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
-        msg = "Final status export must contain exactly one complete row."
-        raise ValueError(msg)
+        message = "Final status export must contain exactly one complete row."
+        raise ValueError(message)
     final = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
     if abs(float(final["t_final"]) - float(state_time[-1])) > time_tolerance:
-        msg = "Final Status t_final must identify the actual last exported solution state."
-        raise ValueError(msg)
+        message = "Final Status t_final must identify the actual last exported solution state."
+        raise ValueError(message)
     if not np.isclose(float(final["f_wet_dm_final"]), float(f_wet[-1]), rtol=1e-6, atol=1e-9):
-        msg = "Final Status f_wet_dm_final disagrees with the complete global series."
-        raise ValueError(msg)
+        message = "Final Status f_wet_dm_final disagrees with the complete global series."
+        raise ValueError(message)
     if not np.isclose(
         float(final["X_wb_bulk_final"]),
         float(global_values[-1, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]),
         rtol=1e-6,
         atol=1e-9,
     ):
-        msg = "Final Status X_wb_bulk_final disagrees with the complete global series."
-        raise ValueError(msg)
+        message = "Final Status X_wb_bulk_final disagrees with the complete global series."
+        raise ValueError(message)
     static_names = profiles.TRANSIENT_STATIC_FIELD_NAMES
     rho_bu_dry = static_fields[static_names.index("rho_bu_dry")]
     x_initial = static_fields[static_names.index("X_0_db_field")]
@@ -577,20 +666,21 @@ def _validate_transient_outputs(
     rtol = float(config.scientific_values["storage"]["float32_rtol"])
     atol = float(config.scientific_values["storage"]["float32_atol"])
     for name in ("w_surf", "w_int"):
-        if not np.allclose(state_fields[0, state_names.index(name)], initial_water, rtol=rtol, atol=atol):
-            msg = f"Initial {name} must equal rho_bu_dry*X_0_db_field without compartment splitting."
-            raise ValueError(msg)
+        if not np.allclose(regular_fields[0, state_names.index(name)], initial_water, rtol=rtol, atol=atol):
+            message = f"Initial {name} must equal rho_bu_dry*X_0_db_field without compartment splitting."
+            raise ValueError(message)
+    final_state = regular_fields[-1] if exact_stop_fields is None else exact_stop_fields
     final_water = domain.moisture.granular_water_content(
-        state_fields[-1, state_names.index("w_surf")],
-        state_fields[-1, state_names.index("w_int")],
+        final_state[state_names.index("w_surf")],
+        final_state[state_names.index("w_int")],
         f_surf,
     )
     final_x_wb = domain.moisture.wet_basis_moisture(final_water, rho_bu_dry)
     if not np.isclose(float(final["X_wb_max_final"]), float(np.max(final_x_wb)), rtol=1e-6, atol=1e-9):
-        msg = "Final Status X_wb_max_final disagrees with the weighted Python-derived field."
-        raise ValueError(msg)
-    final_temperature = state_fields[-1, state_names.index("T")]
-    final_phi = state_fields[-1, state_names.index("phi")]
+        message = "Final Status X_wb_max_final disagrees with the weighted Python-derived field."
+        raise ValueError(message)
+    final_temperature = final_state[state_names.index("T")]
+    final_phi = final_state[state_names.index("phi")]
     extrema = {
         "T_min_final": float(np.min(final_temperature)),
         "T_max_final": float(np.max(final_temperature)),
@@ -603,12 +693,13 @@ def _validate_transient_outputs(
         or not np.isclose(float(final["phi_min_final"]), extrema["phi_min_final"], rtol=1e-6, atol=1e-9)
         or not np.isclose(float(final["phi_max_final"]), extrema["phi_max_final"], rtol=1e-6, atol=1e-9)
     ):
-        msg = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
-        raise ValueError(msg)
+        message = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
+        raise ValueError(message)
     _validate_global_bulk_moisture(
         static_fields,
         state_time,
-        state_fields,
+        regular_fields,
+        exact_stop_fields,
         global_values,
         f_surf=f_surf,
         time_tolerance=time_tolerance,
@@ -622,9 +713,16 @@ def validate_float32_conversion(values: np.ndarray, *, rtol: float, atol: float,
         msg = f"{label} contains non-finite values before float32 conversion."
         raise ValueError(msg)
     converted = source.astype(np.float32)
-    restored = converted.astype(np.float64)
-    if not np.allclose(source, restored, rtol=rtol, atol=atol):
-        maximum_error = float(np.max(np.abs(source - restored)))
+    source_flat = source.reshape(-1)
+    converted_flat = converted.reshape(-1)
+    maximum_error = 0.0
+    for start in range(0, source_flat.size, _FLOAT32_VALIDATION_CHUNK_VALUES):
+        stop = min(start + _FLOAT32_VALIDATION_CHUNK_VALUES, source_flat.size)
+        restored = converted_flat[start:stop].astype(np.float64)
+        source_chunk = source_flat[start:stop]
+        if not np.allclose(source_chunk, restored, rtol=rtol, atol=atol):
+            maximum_error = max(maximum_error, float(np.max(np.abs(source_chunk - restored))))
+    if maximum_error > 0.0:
         msg = f"{label} float32 conversion exceeds configured tolerance; maximum absolute error={maximum_error}."
         raise ValueError(msg)
     return converted
@@ -1789,17 +1887,13 @@ def convert_exports_to_hdf5(
             msg = "Global diagnostic time must be strictly increasing."
             raise ValueError(msg)
         final_status = _ordered_values(config, exports, profiles.FINAL_STATUS_EXPORT_ROLE, profiles.FINAL_STATUS_FIELDS)
-        state_time, state_fields = _combined_state_axis(
+        _validate_transient_outputs(
+            config,
+            static_fields,
             transient_time,
             transient_fields,
             exact_stop_time,
             exact_stop_fields,
-        )
-        _validate_transient_outputs(
-            config,
-            static_fields,
-            state_time,
-            state_fields,
             global_values,
             final_status,
             f_surf=f_surf,

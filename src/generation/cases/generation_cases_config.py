@@ -1118,7 +1118,6 @@ def _validate_profile_config(
         profiles.TRANSIENT_RAW_EXPORT_ROLE: "regular_time_series",
         profiles.GLOBAL_EXPORT_ROLE: "regular_time_series",
         profiles.FINAL_STATUS_EXPORT_ROLE: "final_status",
-        profiles.EXACT_STOP_EXPORT_ROLE: "irregular_stop_diagnostic",
     }
     validated: list[dict[str, Any]] = []
     for index, raw in enumerate(exports):

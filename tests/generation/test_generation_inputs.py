@@ -127,12 +127,21 @@ def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
     )
     assert fast.total_case_count == 6
 
-    for path in tuple(expected)[:4]:
+    for path in (
+        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
+        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"),
+    ):
         with pytest.raises(
             generation.cases.config.GenerationConfigError,
             match="unconfirmed required export mappings",
         ):
             generation.cases.config.load_campaign_config(path)
+    for path in (
+        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"),
+    ):
+        campaign = generation.cases.config.load_campaign_config(path)
+        assert all(export["mapping_state"] == "runtime_confirmed" for export in campaign.batches[0].scientific_values["output_contract"]["exports"])
 
 
 @pytest.mark.parametrize("option", ["--exclusive", "--reservation=reserved", "--nodelist=node-a"])

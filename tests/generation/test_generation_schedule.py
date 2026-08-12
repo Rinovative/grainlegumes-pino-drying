@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+import yaml
 
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_fields as field_service
@@ -59,15 +58,6 @@ def _schedule(**overrides: Any) -> schedule_service.Schedule:
         _FIXED,
         seeds=_SEEDS,
     )
-
-
-def _field_digest(value: np.ndarray) -> str:
-    array = np.ascontiguousarray(value, dtype=np.float64)
-    digest = hashlib.sha256()
-    digest.update(str(array.shape).encode("ascii"))
-    digest.update(b"|float64|")
-    digest.update(array.tobytes(order="C"))
-    return digest.hexdigest()
 
 
 def test_schedule_replays_byte_identically_and_uses_weights_once() -> None:
@@ -210,20 +200,67 @@ def test_temporal_generator_never_calls_spatial_generation(monkeypatch: pytest.M
     _schedule()
 
 
-def test_prechange_spatial_fields_remain_byte_identical() -> None:
-    """Protect fixed-seed spatial fields from temporal-generator changes."""
-    campaign = config_service.load_campaign_config(
-        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"),
-        require_executable=False,
-    )
-    batch = campaign.batch("transient_drying__lentil__natural")
-    sample = sampling_service.sample_case(batch, 1)
-    family = batch.scientific_values["material"]
-    moisture_bounds = materials.initial_moisture_generation_bounds(
-        family,
-        sample.values,
-        active_ood_unit=sample.ood_provenance["active_unit_id"],
-    )
+def test_prechange_spatial_fields_remain_byte_identical(
+    generation_config_factory: Any,
+) -> None:
+    """Keep schedule-only support changes outside spatial sampling and fields."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    before_campaign = config_service.load_campaign_config(config_path, require_executable=False)
+    before_batch = before_campaign.batch("transient_drying__lentil__natural")
+    before = sampling_service.sample_case(before_batch, 1)
+
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    schedule_supports = {
+        "schedule.timescale_rel": (0.06, 0.16),
+        "schedule.event_duration_rel": (0.09, 0.15),
+        "schedule.event_width_rel": (0.025, 0.035),
+    }
+    for name, (lower, upper) in schedule_supports.items():
+        operations["parameter_values"][name]["lower"] = lower
+        operations["parameter_values"][name]["upper"] = upper
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+
+    after_campaign = config_service.load_campaign_config(config_path, require_executable=False)
+    after_batch = after_campaign.batch("transient_drying__lentil__natural")
+    after = sampling_service.sample_case(after_batch, 1)
+    schedule_names = frozenset(schedule_supports)
+    spatial_and_other_names = set(before.values).difference(schedule_names)
+    assert {name: before.values[name] for name in spatial_and_other_names} == {name: after.values[name] for name in spatial_and_other_names}
+    assert any(before.values[name] != after.values[name] for name in schedule_names)
+    assert before.units == after.units
+    assert before.coupled_selections == after.coupled_selections
+    assert before.block_provenance == after.block_provenance
+    assert before.conditional_supports == after.conditional_supports
+    assert before.ood_provenance == after.ood_provenance
+    before_sampling = before_batch.scientific_values["sampling"]
+    after_sampling = after_batch.scientific_values["sampling"]
+    assert before_sampling["blocks"] == after_sampling["blocks"]
+    before_position = before_batch.case_indices.index(1)
+    after_position = after_batch.case_indices.index(1)
+    for block, before_plan in before_sampling["blocks"].items():
+        after_plan = after_sampling["blocks"][block]
+        before_design = sampling_service.unit_design(
+            before_sampling["method"],
+            count=len(before_batch.case_indices),
+            dimensions=int(before_plan["effective_dimension"]),
+            seed=int(before_plan["design_seed"]),
+        )
+        after_design = sampling_service.unit_design(
+            after_sampling["method"],
+            count=len(after_batch.case_indices),
+            dimensions=int(after_plan["effective_dimension"]),
+            seed=int(after_plan["design_seed"]),
+        )
+        before_row = int(before_plan["permutation"][before_position])
+        after_row = int(after_plan["permutation"][after_position])
+        np.testing.assert_array_equal(before_design[before_row], after_design[after_row])
+
+    seeds = {
+        "bed": 1936762462,
+        "pressure_bc": 990883689,
+        "initial_moisture": 2503402048,
+    }
     grid = {
         "Lx": 1.2,
         "Ly": 0.75,
@@ -234,26 +271,26 @@ def test_prechange_spatial_fields_remain_byte_identical() -> None:
         "dy": 0.75 / 15.0,
         "boundaries_included": True,
     }
-    generated = field_service.generate_spatial_fields(
-        "transient_drying",
-        grid,
-        sample.values,
-        seeds={
-            "bed": 1936762462,
-            "pressure_bc": 990883689,
-            "initial_moisture": 2503402048,
-        },
-        family_bounds=moisture_bounds,
-        packing_porosity_mean_support=family["packing_porosity_mean_support"],
-        material_kappa_nominal=float(family["parameter_registry"]["kappa_mean"]["nominal"]),
-        active_ood_unit=sample.ood_provenance["active_unit_id"],
-    )
-    expected = {
-        "Kxx": "92a237f14e2af494c08094bc83e087be8b30aa25d64139a69be0db3a51380f18",
-        "Kxy": "b24698dc407f44544ccae799db9e945989962b9ea03fe973e863c0d6608caeb8",
-        "Kyy": "ba93eea791b52e1c6efb7954e10323bae4d28cf724144c6f79f6969bb183327e",
-        "X_0_db_field": "e7238642f77236ed26bec19dba8f63e92e832e8ddb0fafb477e6bd03800305e0",
-        "eps_bed": "ef0639f99f519e34d43d74a6973bcf720b2796563ed19f03147bceaca4aea872",
-        "p_in_bc": "01d6b20d24653d24ce737124151910c7e1a6501a8bac618bbe56165ea764ef1d",
-    }
-    assert {name: _field_digest(generated.columns[name]) for name in expected} == expected
+
+    def generate(batch: Any, sample: Any) -> field_service.SpatialFields:
+        family = batch.scientific_values["material"]
+        moisture_bounds = materials.initial_moisture_generation_bounds(
+            family,
+            sample.values,
+            active_ood_unit=sample.ood_provenance["active_unit_id"],
+        )
+        return field_service.generate_spatial_fields(
+            "transient_drying",
+            grid,
+            sample.values,
+            seeds=seeds,
+            family_bounds=moisture_bounds,
+            packing_porosity_mean_support=family["packing_porosity_mean_support"],
+            material_kappa_nominal=float(family["parameter_registry"]["kappa_mean"]["nominal"]),
+            active_ood_unit=sample.ood_provenance["active_unit_id"],
+        )
+
+    before_fields = generate(before_batch, before)
+    after_fields = generate(after_batch, after)
+    for name in ("Kxx", "Kxy", "Kyy", "eps_bed", "X_0_db_field", "p_in_bc"):
+        np.testing.assert_array_equal(before_fields.columns[name], after_fields.columns[name])

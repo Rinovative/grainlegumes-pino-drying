@@ -44,144 +44,142 @@ exports:
 - role: steady_flow_fields
   temporal_kind: stationary
   source:
-    state: declared_unverified
+    state: runtime_confirmed
     pattern: stationary_fields.csv
   delimiter: ','
   columns:
     x:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: x
     y:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: y
     Kxx:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: Kxx
     Kxy:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: Kxy
     Kyy:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: Kyy
     eps_bed:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: eps_bed
     p_in_bc:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: p_in_bc
     X_0_db_field:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: X_0_db_field
     u:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: u
     v:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: v
     p:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: p
     rho_bu_dry:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: rho_bu_dry
 - role: transient_fields
   temporal_kind: regular_time_series
   source:
-    state: declared_unverified
+    state: runtime_confirmed
     pattern: transient_states.csv
   delimiter: ','
   columns:
     t:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: t
     x:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: x
     y:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: y
     T:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: T
     phi:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: mt.phi
     w_surf:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: w_surf
     w_int:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: w_int
 - role: global_time_series
   temporal_kind: regular_time_series
   source:
-    state: declared_unverified
+    state: runtime_confirmed
     pattern: global_timeseries.csv
   delimiter: ','
   columns:
     t:
-      state: declared_unverified
+      state: runtime_confirmed
       source_header: t
     X_wb_bulk:
-      state: declared_unverified
-      source_header: comp1.X_wb_bulk
+      state: runtime_confirmed
+      source_header: X_wb_bulk
     f_wet_dm:
-      state: declared_unverified
-      source_header: comp1.f_wet_dm
+      state: runtime_confirmed
+      source_header: f_wet_dm
     m_w_gr:
-      state: declared_unverified
-      source_header: comp1.m_w_gr
+      state: runtime_confirmed
+      source_header: m_w_gr
     m_v_gas:
-      state: mapping_probe_required
+      state: runtime_confirmed
+      source_header: m_v_gas
     m_dot_evap:
-      state: declared_unverified
-      source_header: comp1.m_dot_evap
+      state: runtime_confirmed
+      source_header: m_dot_evap
     m_dot_v_in:
-      state: mapping_probe_required
+      state: runtime_confirmed
+      source_header: m_dot_v_in
     m_dot_v_out:
-      state: mapping_probe_required
+      state: runtime_confirmed
+      source_header: m_dot_v_out
     mt_mass_balance:
-      state: mapping_probe_required
+      state: runtime_confirmed
+      source_header: mt_mass_balance
     T_out_mean:
-      state: declared_unverified
-      source_header: comp1.T_out_mean
+      state: runtime_confirmed
+      source_header: T_out_mean
     phi_out_mean:
-      state: declared_unverified
-      source_header: comp1.phi_out_mean
+      state: runtime_confirmed
+      source_header: phi_out_mean
 - role: final_status
   temporal_kind: final_status
   source:
-    state: declared_unverified
+    state: runtime_confirmed
     pattern: final_status.csv
   delimiter: ','
   columns:
     t_final:
-      state: declared_unverified
-      source_header: t
+      state: runtime_confirmed
+      source_header: t_final
     f_wet_dm_final:
-      state: declared_unverified
-      source_header: comp1.f_wet_dm
+      state: runtime_confirmed
+      source_header: f_wet_dm_final
     X_wb_bulk_final:
-      state: declared_unverified
-      source_header: comp1.X_wb_bulk
+      state: runtime_confirmed
+      source_header: X_wb_bulk_final
     X_wb_max_final:
-      state: declared_unverified
-      source_header: comp1.maxop_bed(comp1.X_wb)
+      state: runtime_confirmed
+      source_header: X_wb_max_final
     T_min_final:
-      state: declared_unverified
-      source_header: comp1.minop_bed(comp1.T)
+      state: runtime_confirmed
+      source_header: T_min_final
     T_max_final:
-      state: declared_unverified
-      source_header: comp1.maxop_bed(comp1.T)
+      state: runtime_confirmed
+      source_header: T_max_final
     phi_min_final:
-      state: declared_unverified
-      source_header: comp1.minop_bed(comp1.mt.phi)
+      state: runtime_confirmed
+      source_header: phi_min_final
     phi_max_final:
-      state: declared_unverified
-      source_header: comp1.maxop_bed(comp1.mt.phi)
-- role: exact_stop_diagnostics
-  temporal_kind: irregular_stop_diagnostic
-  source:
-    state: mapping_probe_required
-  delimiter: ','
-  columns: {}
+      state: runtime_confirmed
+      source_header: phi_max_final

@@ -90,8 +90,8 @@ def _primary_missing(path: Path) -> list[str]:
 
 def _profile_mapping_states(
     campaign_path: Path,
-) -> tuple[list[str], list[str], list[str]]:
-    """Return required and optional typed mapping states separately."""
+) -> tuple[list[str], list[str]]:
+    """Return unresolved required typed mapping states."""
     campaign = _yaml(campaign_path)
     configured = Path(campaign["profile_config"])
     profile_path = configured if configured.is_absolute() else common.paths.get_project_root() / configured
@@ -99,23 +99,20 @@ def _profile_mapping_states(
     prefix = _relative(profile_path)
     probe_required: list[str] = []
     declared_unverified: list[str] = []
-    optional_probe_required: list[str] = []
     for index, export in enumerate(profile["exports"]):
-        optional = export["role"] == "exact_stop_diagnostics"
-        probe_destination = optional_probe_required if optional else probe_required
         source = export["source"]
         source_key = f"{prefix}:exports[{index}].source"
         if source["state"] == "mapping_probe_required":
-            probe_destination.append(source_key)
-        elif source["state"] == "declared_unverified" and not optional:
+            probe_required.append(source_key)
+        elif source["state"] == "declared_unverified":
             declared_unverified.append(source_key)
         for logical, mapping in export["columns"].items():
             key = f"{prefix}:exports[{index}].columns.{logical}"
             if mapping["state"] == "mapping_probe_required":
-                probe_destination.append(key)
-            elif mapping["state"] == "declared_unverified" and not optional:
+                probe_required.append(key)
+            elif mapping["state"] == "declared_unverified":
                 declared_unverified.append(key)
-    return probe_required, declared_unverified, optional_probe_required
+    return probe_required, declared_unverified
 
 
 def campaign_unresolved_gates(path: Path | str) -> dict[str, list[str]]:
@@ -123,12 +120,11 @@ def campaign_unresolved_gates(path: Path | str) -> dict[str, list[str]]:
     campaign_path = Path(path).expanduser().resolve()
     raw = _yaml(campaign_path)
     primary_missing = _primary_missing(campaign_path) if raw.get("campaign_purpose") == "family_generalization" else []
-    probe_required, declared_unverified, optional_probe_required = _profile_mapping_states(campaign_path)
+    probe_required, declared_unverified = _profile_mapping_states(campaign_path)
     return {
         "missing_production_keys": sorted(primary_missing),
         "missing_profile_mapping_keys": sorted(probe_required),
         "declared_unverified_profile_mapping_keys": sorted(declared_unverified),
-        "optional_profile_mapping_keys": sorted(optional_probe_required),
     }
 
 
@@ -195,7 +191,6 @@ def build_readiness_report(
     mapping_declared_unverified = sorted(
         set(steady_gates["declared_unverified_profile_mapping_keys"] + transient_gates["declared_unverified_profile_mapping_keys"])
     )
-    optional_mapping_missing = sorted(set(steady_gates["optional_profile_mapping_keys"] + transient_gates["optional_profile_mapping_keys"]))
 
     static_report = None
     if run_static_sentinels:
@@ -238,7 +233,6 @@ def build_readiness_report(
         "missing_primary_keys": primary_missing,
         "missing_profile_mapping_keys": mapping_missing,
         "declared_unverified_profile_mapping_keys": mapping_declared_unverified,
-        "optional_profile_mapping_keys": optional_mapping_missing,
         "real_runtime_receipt": (None if receipt_path is None else str(receipt_path)),
         "static_sentinel_report": static_report,
         "status_lines": [

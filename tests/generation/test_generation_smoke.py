@@ -121,9 +121,7 @@ exports:
         profile_path=profile,
     )
     assert comparison["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
-    assert comparison["optional_corrections"] == []
     assert comparison["required_missing_exports"] == []
-    assert comparison["optional_missing_exports"] == []
     assert comparison["aliases_used"] is False
 
 

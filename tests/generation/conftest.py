@@ -80,22 +80,23 @@ def _profile_configuration(
         "transient_fields": "regular_time_series",
         "global_time_series": "regular_time_series",
         "final_status": "final_status",
-        "exact_stop_diagnostics": "irregular_stop_diagnostic",
     }
     exports = []
     for role in profile.export_roles:
-        source = (
-            {"state": "mapping_probe_required"}
-            if role.role == "exact_stop_diagnostics"
-            else {"state": "runtime_confirmed", "pattern": patterns[role.role]}
-        )
+        source = {"state": "runtime_confirmed", "pattern": patterns[role.role]}
         exports.append(
             {
                 "role": role.role,
                 "temporal_kind": temporal_kinds[role.role],
                 "source": source,
                 "delimiter": ";",
-                "columns": {name: {"state": "runtime_confirmed", "source_header": name} for name in role.logical_fields},
+                "columns": {
+                    name: {
+                        "state": "runtime_confirmed",
+                        "source_header": "mt.phi" if role.role == "transient_fields" and name == "phi" else name,
+                    }
+                    for name in role.logical_fields
+                },
             }
         )
     return {
@@ -483,11 +484,24 @@ try:
         if mapping_export_mode == "missing":
             airflow_path.unlink()
         if transient_profile:
-            state_times = (0.0, 1.0)
-            water_by_time = {}
+            state_times = (0.0, 1.0, 1.5)
+            water_by_time = {state_time: [] for state_time in state_times}
             with (exports / "transient.csv").open("w", encoding="utf-8", newline="") as stream:
-                names = ["x", "y", "t", "T", "phi", "w_surf", "w_int"]
-                writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
+                logical_units = (
+                    ("t", "h"),
+                    ("x", "m"),
+                    ("y", "m"),
+                    ("T", "K"),
+                    ("mt.phi", "1"),
+                    ("w_surf", "kg/m^3"),
+                    ("w_int", "kg/m^3"),
+                )
+                names = [
+                    f"{name} ({unit}) @ t={state_time:g}"
+                    for state_time in state_times
+                    for name, unit in logical_units
+                ]
+                writer = csv.writer(stream, delimiter=";", lineterminator="\n")
                 write_spreadsheet_header(
                     stream,
                     names,
@@ -498,40 +512,43 @@ try:
                         ("Expressions", len(names)),
                     ],
                 )
-                for state_time in state_times:
-                    water_by_time[state_time] = []
-                    for source, rho in zip(inputs, rho_values):
+                for source, rho in zip(inputs, rho_values):
+                    row = []
+                    for state_time in state_times:
                         initial_water = rho * float(source["X_0_db_field"])
                         w_surf = initial_water - 0.2 * state_time
                         w_int = initial_water - 0.1 * state_time
                         water = scalars["f_surf"] * w_surf + (1.0 - scalars["f_surf"]) * w_int
                         water_by_time[state_time].append(water)
-                        writer.writerow(
-                            {
-                                "x": float(source["x"]) + 1e-13,
-                                "y": float(source["y"]) + 1e-13,
-                                "t": state_time,
-                                "T": 296.0 - 0.1 * state_time,
-                                "phi": 0.5 - 0.01 * state_time,
-                                "w_surf": w_surf,
-                                "w_int": w_int,
-                            }
+                        row.extend(
+                            (
+                                state_time,
+                                float(source["x"]) + 1e-13,
+                                float(source["y"]) + 1e-13,
+                                296.0 - 0.1 * state_time,
+                                0.5 - 0.01 * state_time,
+                                w_surf,
+                                w_int,
+                            )
                         )
+                    writer.writerow(row)
             with (exports / "globals.csv").open("w", encoding="utf-8", newline="") as stream:
                 names = [
-                    "t",
-                    "X_wb_bulk",
-                    "f_wet_dm",
-                    "m_w_gr",
-                    "m_v_gas",
-                    "m_dot_evap",
-                    "m_dot_v_in",
-                    "m_dot_v_out",
-                    "mt_mass_balance",
-                    "T_out_mean",
-                    "phi_out_mean",
+                    "T_amb (K)",
+                    "Time",
+                    "t (h)",
+                    "X_wb_bulk (1)",
+                    "f_wet_dm (1)",
+                    "m_w_gr (kg)",
+                    "m_v_gas (kg)",
+                    "m_dot_evap (kg/s)",
+                    "m_dot_v_in (kg/s)",
+                    "m_dot_v_out (kg/s)",
+                    "mt_mass_balance (kg/s)",
+                    "T_out_mean (K)",
+                    "phi_out_mean (1)",
                 ]
-                writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
+                writer = csv.writer(stream, delimiter=";", lineterminator="\n")
                 write_spreadsheet_header(
                     stream,
                     names,
@@ -542,49 +559,55 @@ try:
                     weighted_water = sum(water * weight for water, weight in zip(water_values, cell_weights))
                     bulk = weighted_water / (weighted_dry + weighted_water)
                     writer.writerow(
-                        dict(
-                            zip(
-                                names,
-                                [
-                                    state_time,
-                                    bulk,
-                                    1.0 if state_time == 0.0 else 0.04,
-                                    0.8 * 9e-6 * weighted_water,
-                                    1.0 + 0.1 * state_time,
-                                    0.1 - 0.01 * state_time,
-                                    0.02,
-                                    0.01 + 0.005 * state_time,
-                                    0.0,
-                                    296.0 - 0.1 * state_time,
-                                    0.5 - 0.01 * state_time,
-                                ],
-                            )
-                        )
+                        [
+                            scalars["T_amb"],
+                            state_time,
+                            state_time,
+                            bulk,
+                            1.0 if state_time == 0.0 else 0.04,
+                            0.8 * 9e-6 * weighted_water,
+                            1.0 + 0.1 * state_time,
+                            0.1 - 0.01 * state_time,
+                            0.02,
+                            0.01 + 0.005 * state_time,
+                            0.0,
+                            296.0 - 0.1 * state_time,
+                            0.5 - 0.01 * state_time,
+                        ]
                     )
             with (exports / "status.csv").open("w", encoding="utf-8", newline="") as stream:
                 names = [
-                    "t_final",
-                    "f_wet_dm_final",
-                    "X_wb_bulk_final",
-                    "X_wb_max_final",
-                    "T_min_final",
-                    "T_max_final",
-                    "phi_min_final",
-                    "phi_max_final",
+                    "T_amb (K)",
+                    "Time",
+                    "t_final (h)",
+                    "f_wet_dm_final (1)",
+                    "X_wb_bulk_final (1)",
+                    "X_wb_max_final (1)",
+                    "T_min_final (K)",
+                    "T_max_final (K)",
+                    "phi_min_final (1)",
+                    "phi_max_final (1)",
                 ]
-                writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
-                write_spreadsheet_header(stream, names, [("Model", "model.mph")])
-                final_water = water_by_time[1.0]
+                writer = csv.writer(stream, delimiter=";", lineterminator="\n")
+                write_spreadsheet_header(stream, names, [("Model", "model.mph"), ("Expressions", len(names))])
+                final_time = state_times[-1]
+                final_water = water_by_time[final_time]
                 weighted_water = sum(water * weight for water, weight in zip(final_water, cell_weights))
                 bulk = weighted_water / (weighted_dry + weighted_water)
                 maximum = max(water / (rho + water) for water, rho in zip(final_water, rho_values))
                 writer.writerow(
-                    dict(
-                        zip(
-                            names,
-                            [1.0, 0.04, bulk, maximum, 295.9, 295.9, 0.49, 0.49],
-                        )
-                    )
+                    [
+                        scalars["T_amb"],
+                        0.0,
+                        final_time,
+                        0.04,
+                        bulk,
+                        maximum,
+                        296.0 - 0.1 * final_time,
+                        296.0 - 0.1 * final_time,
+                        0.5 - 0.01 * final_time,
+                        0.5 - 0.01 * final_time,
+                    ]
                 )
         print("synthetic success")
 finally:
