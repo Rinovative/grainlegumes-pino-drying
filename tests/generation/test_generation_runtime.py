@@ -18,6 +18,7 @@ from src.generation.cli import cli_generation as cli_service
 from src.generation.contracts import generation_contracts_profiles as profile_contract
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_comsol as comsol_service
 from src.generation.runtime import generation_runtime_workspace as workspace
 
 if TYPE_CHECKING:
@@ -67,6 +68,9 @@ def test_resolved_science_and_execution_are_persisted_separately(
 @pytest.mark.parametrize(
     "argument",
     [
+        "-job",
+        "-job=other",
+        "-nosave",
         "-pname",
         "-pname=T_amb",
         "-plist",
@@ -114,14 +118,14 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     admission = bundle.scalar_handoff
     assert admission is not None
     with pytest.raises(ValueError, match="require one admitted scalar handoff"):
-        runtime_service.build_comsol_command(config, cores_per_case=2)
+        comsol_service.build_comsol_command(config, cores_per_case=2)
     entries = admission.entries
     assert len(entries) == 12
     assert tuple(entry.name for entry in entries) == profile_contract.TRANSIENT_SCALAR_INPUT_FIELDS
     assert all(entry.owner == "case_dependent" for entry in entries)
     assert {"T_init", "T_flow_ref", "p_ref", "p_out", "f_wet_dm_max"}.isdisjoint(entry.name for entry in entries)
 
-    local = runtime_service.build_comsol_command(
+    local = comsol_service.build_comsol_command(
         config,
         cores_per_case=2,
         scalar_handoff=admission,
@@ -135,7 +139,7 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     assert local[parameter_start + 5] == ",".join(str(index) for index in range(1, 13))
     assert local[parameter_start + 6 :] == ["-np", "2", "-recover"]
 
-    slurm = runtime_service.build_comsol_command(
+    slurm = comsol_service.build_comsol_command(
         config,
         cores_per_case=2,
         scalar_handoff=admission,
@@ -158,6 +162,110 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     )
     assert status == 0
     assert shlex.split(capsys.readouterr().out.strip()) == local
+
+
+@pytest.mark.parametrize(
+    ("retain_solved_model", "save_arguments"),
+    [
+        (True, ["-outputfile", "solved.mph"]),
+        (False, ["-nosave"]),
+    ],
+)
+def test_comsol_builder_owns_fixed_job_models_and_save_mode(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    retain_solved_model: bool,
+    save_arguments: list[str],
+) -> None:
+    """Protect the fixed job, workspace names, explicit cores, and exclusive save modes."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        retain_solved_model=retain_solved_model,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+
+    command = comsol_service.build_comsol_command(config, cores_per_case=16)
+
+    assert command == [
+        str(fake_comsol),
+        "batch",
+        "-inputfile",
+        "model.mph",
+        "-job",
+        "generation",
+        *save_arguments,
+        "-np",
+        "16",
+    ]
+    assert command.count("-job") == 1
+    assert command.count("-np") == 1
+    assert ("-nosave" in command) != ("-outputfile" in command)
+
+
+def test_comsol_builder_rejects_invalid_retention_state(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+) -> None:
+    """Fail closed instead of constructing a command without one save mode."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    execution = {**config.execution_values, "retention": {"retain_raw_csv": False, "retain_solved_model": None}}
+    invalid = replace(config, execution_values=execution)
+
+    with pytest.raises(TypeError, match="retain_solved_model must be boolean"):
+        comsol_service.build_comsol_command(invalid, cores_per_case=16)
+
+
+@pytest.mark.parametrize(
+    ("campaign_path", "retained"),
+    [
+        ("configs/generation/campaigns/steady_flow/technical_smoke.yaml", True),
+        ("configs/generation/campaigns/transient_drying/technical_smoke.yaml", True),
+        ("configs/generation/campaigns/transient_drying/pilot_check.yaml", True),
+        ("configs/generation/campaigns/steady_flow/family_generalization.yaml", False),
+        ("configs/generation/campaigns/transient_drying/family_generalization.yaml", False),
+    ],
+)
+def test_maintained_smoke_pilot_and_production_use_canonical_save_semantics(
+    tmp_path: Path,
+    campaign_path: str,
+    retained: bool,
+) -> None:
+    """Bind each maintained campaign purpose to the shared command contract."""
+    campaign = generation.cases.config.load_campaign_config(
+        campaign_path,
+        require_executable=False,
+    )
+    config = campaign.batches[0]
+    bundle = generation.cases.case.generate_case_input_bundle(
+        config,
+        config.case_indices[0],
+        tmp_path / config.batch_name,
+    )
+    command = comsol_service.build_comsol_command(
+        config,
+        cores_per_case=16,
+        scalar_handoff=bundle.scalar_handoff,
+        scheduler_kind="slurm",
+    )
+
+    assert command[command.index("-job") + 1] == "generation"
+    assert command[command.index("-inputfile") + 1] == "model.mph"
+    assert command[command.index("-np") + 1] == "16"
+    assert ("-outputfile" in command) is retained
+    assert ("-nosave" in command) is not retained
+    if retained:
+        assert command[command.index("-outputfile") + 1] == "solved.mph"
 
 
 def test_scalar_source_validation_precedes_evidence_and_process_start(
@@ -214,7 +322,7 @@ def test_steady_command_is_parameter_free(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
-    command = runtime_service.build_comsol_command(config, cores_per_case=1)
+    command = comsol_service.build_comsol_command(config, cores_per_case=1)
     assert not {"-pname", "-plist", "-pindex"}.intersection(command)
 
 
@@ -328,6 +436,8 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
     scientific.pop("paired_equivalence_seed", None)
     scientific_digest = common.serialization.canonical_json_sha256(scientific)
     case_input_digest = generation.cases.config.compute_case_input_config_digest(scientific)
+    execution = json.loads(json.dumps(original.execution_values))
+    execution["retention"]["retain_solved_model"] = True
     batch_name = generation.cases.config.build_batch_name(
         original.profile.id,
         original.material_family,
@@ -338,6 +448,7 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         evaluation_regime=generation.cases.config.NO_EVALUATION_REGIME,
         batch_name=batch_name,
         scientific_values=scientific,
+        execution_values=execution,
         case_indices=(1,),
         assignments={1: assignment},
         scientific_config_digest=scientific_digest,
@@ -485,6 +596,54 @@ def test_failure_timeout_missing_export_and_case_lock(
             future.result()
 
 
+def test_no_save_case_converts_and_publishes_without_solved_model(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """Prove production-like success depends on exports and HDF5, not solved.mph."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        retain_solved_model=False,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    outcome = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=16,
+        storage_root=tmp_path / "no-save storage",
+        work_root=tmp_path / "no-save work",
+    )
+
+    assert outcome.status == "completed"
+    assert generation.runtime.completed_case_is_valid(
+        config,
+        1,
+        storage_root=tmp_path / "no-save storage",
+    )
+    assert not (outcome.processed_directory / "solved.mph").exists()
+    execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
+    arguments = execution["invocation"]["arguments"]
+    assert arguments[:8] == [
+        str(fake_comsol),
+        "batch",
+        "-inputfile",
+        "model.mph",
+        "-job",
+        "generation",
+        "-nosave",
+        "-np",
+    ]
+    assert arguments[8] == "16"
+    assert "-outputfile" not in arguments
+    assert execution["result"]["solved_model"] is None
+    assert (outcome.processed_directory / "case.h5").is_file()
+
+
 def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -607,6 +766,7 @@ def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
+        retain_solved_model=True,
     )
     config = generation.cases.config.load_generation_config(
         config_path,

@@ -102,9 +102,26 @@ def test_maintained_suite_is_config_owned_same_case_and_serially_isolated(tmp_pa
         yaml.safe_load(variant.source_path.read_text(encoding="utf-8"))["cores_per_case"] for variant in suite.variants
     ]
     assert suite.case_campaign.dataset_packages == ()
+    assert suite.case_config.execution_values["retention"]["retain_solved_model"] is False
     case = suite.case_selection()
     assert case["assignment"]["pilot_case_kind"] == "nominal_reference"
     assert case["simulation_profile"] == "transient_drying"
+    bundle = generation.cases.case.generate_case_input_bundle(
+        suite.case_config,
+        suite.case_index,
+        tmp_path / "benchmark command case",
+    )
+    command = generation.runtime.comsol.build_comsol_command(
+        suite.case_config,
+        cores_per_case=16,
+        scalar_handoff=bundle.scalar_handoff,
+        scheduler_kind="slurm",
+    )
+    assert command[command.index("-job") + 1] == "generation"
+    assert command[command.index("-inputfile") + 1] == "model.mph"
+    assert command[command.index("-np") + 1] == "16"
+    assert "-nosave" in command
+    assert "-outputfile" not in command
     first = suite.variants[0]
     changed_cores = replace(first, cores_per_case=first.cores_per_case + 1)
     assert suite.execution_id(changed_cores) != suite.execution_id(first)

@@ -84,7 +84,9 @@ _SEEN_SPLITS = frozenset((*ID_MEMBERSHIPS, "parameter_ood"))
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _COMSOL_OWNED_ARGUMENTS = (
     "-inputfile",
+    "-job",
     "-outputfile",
+    "-nosave",
     "-np",
     "-nn",
     "-nnhost",

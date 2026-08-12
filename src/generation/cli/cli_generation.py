@@ -43,6 +43,7 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 from src.generation.publication import generation_publication_inventory as inventory_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
+from src.generation.runtime import generation_runtime_comsol as comsol_service
 from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe_service
 from src.generation.runtime import generation_runtime_preflight as preflight_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
@@ -1564,7 +1565,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                     message = "Transient print-command generation produced no scalar handoff."
                     raise RuntimeError(message)
                 scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
-                command = runtime_service.build_comsol_command(
+                command = comsol_service.build_comsol_command(
                     config,
                     cores_per_case=args.cores_per_case,
                     scalar_handoff=scalar_handoff,
@@ -1572,7 +1573,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 )
         else:
             config.case_id(args.case_index)
-            command = runtime_service.build_comsol_command(
+            command = comsol_service.build_comsol_command(
                 config,
                 cores_per_case=args.cores_per_case,
                 scheduler_kind=args.scheduler_kind,

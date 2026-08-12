@@ -19,6 +19,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import math
@@ -30,7 +31,7 @@ import socket
 import statistics
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -367,6 +368,15 @@ def _scheduler_options(value: object) -> tuple[str, ...]:
     return options
 
 
+def _production_like_benchmark_config(
+    config: config_service.GenerationConfig,
+) -> config_service.GenerationConfig:
+    """Return the benchmark execution view with production-equivalent no-save semantics."""
+    execution = copy.deepcopy(config.execution_values)
+    execution["retention"]["retain_solved_model"] = False
+    return replace(config, execution_values=execution)
+
+
 def load_core_benchmark_suite(
     path: Path | str,
     *,
@@ -500,6 +510,9 @@ def load_core_benchmark_suite(
     if production_campaign.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
         message = "Core benchmark production interpretation requires a transient campaign."
         raise ValueError(message)
+    if production_campaign.execution_values["retention"]["retain_solved_model"] is not False:
+        message = "Core benchmark production interpretation requires no-save production execution."
+        raise ValueError(message)
 
     if site["scheduler"] != "slurm":
         message = "Core benchmarking requires the configured Slurm CPU site."
@@ -609,7 +622,7 @@ def load_core_benchmark_suite(
         suite_digest=common.serialization.canonical_json_sha256(digest_payload),
         case_campaign_path=campaign_path,
         case_campaign=campaign,
-        case_config=case_config,
+        case_config=_production_like_benchmark_config(case_config),
         case_index=case_index,
         repetitions=repetitions,
         variants=tuple(variants),

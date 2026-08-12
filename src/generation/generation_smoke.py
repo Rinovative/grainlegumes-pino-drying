@@ -41,6 +41,7 @@ from .contracts import generation_contracts_profiles as profiles
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .publication import generation_publication_storage as storage_service
 from .runtime import generation_runtime_batch as runtime_service
+from .runtime import generation_runtime_comsol as comsol_service
 from .runtime import generation_runtime_preflight as preflight_service
 from .runtime import generation_runtime_workspace as workspace_service
 
@@ -376,7 +377,7 @@ def _case_evidence(
     if not config.execution_values["retention"]["retain_raw_csv"] or not config.execution_values["retention"]["retain_solved_model"]:
         message = "Technical smoke execution must retain raw CSV and solved model evidence."
         raise RuntimeError(message)
-    solved = processed / "solved.mph"
+    solved = processed / comsol_service.RETAINED_MODEL_FILENAME
     if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
         message = f"Technical smoke solved model was not retained: {solved}"
         raise FileNotFoundError(message)

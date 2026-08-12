@@ -371,22 +371,34 @@ try:
     else:
         time.sleep(float(os.environ.get("FAKE_COMSOL_DELAY", "0")))
         arguments = sys.argv[1:]
+        if arguments.count("-job") != 1 or arguments[arguments.index("-job") + 1] != "generation":
+            raise RuntimeError("fake COMSOL requires the canonical generation job")
+        if arguments.count("-inputfile") != 1 or arguments[arguments.index("-inputfile") + 1] != "model.mph":
+            raise RuntimeError("fake COMSOL requires the canonical work model")
+        retained = arguments.count("-outputfile") == 1
+        no_save = arguments.count("-nosave") == 1
+        if retained == no_save:
+            raise RuntimeError("fake COMSOL requires exactly one canonical save mode")
         case = json.loads(pathlib.Path("case.json").read_text(encoding="utf-8"))
         transient_profile = case["simulation_profile"] == "transient_drying"
         scalars = runtime_scalar_values(arguments, case) if transient_profile else {}
-        requested_output = arguments[arguments.index("-outputfile") + 1]
         solved_model_mode = os.environ.get("FAKE_COMSOL_SOLVED_MODEL_MODE", "canonical")
-        solved_model_outputs = {
-            "canonical": (requested_output,),
-            "suffixed": ("solved_1.mph",),
-            "multiple": ("solved_1.mph", "solved_2.mph"),
-            "missing": (),
-            "empty": (requested_output,),
-            "symlink": (requested_output,),
-        }
-        if solved_model_mode not in solved_model_outputs:
-            raise RuntimeError(f"unsupported fake solved-model mode: {solved_model_mode}")
-        for solved_model_output in solved_model_outputs[solved_model_mode]:
+        if retained:
+            requested_output = arguments[arguments.index("-outputfile") + 1]
+            solved_model_outputs = {
+                "canonical": (requested_output,),
+                "suffixed": ("solved_1.mph",),
+                "multiple": ("solved_1.mph", "solved_2.mph"),
+                "missing": (),
+                "empty": (requested_output,),
+                "symlink": (requested_output,),
+            }
+            if solved_model_mode not in solved_model_outputs:
+                raise RuntimeError(f"unsupported fake solved-model mode: {solved_model_mode}")
+            selected_solved_model_outputs = solved_model_outputs[solved_model_mode]
+        else:
+            selected_solved_model_outputs = ()
+        for solved_model_output in selected_solved_model_outputs:
             solved_model_path = pathlib.Path(solved_model_output)
             if solved_model_mode == "symlink":
                 solved_model_path.symlink_to("model.mph")

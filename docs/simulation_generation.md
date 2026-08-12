@@ -424,6 +424,16 @@ A representative transient case has the following ownership:
 | GPU-side publication | `hpc115` Docker publication service | Canonical immutable `01_generation` | Atomic promotion from validated staging |
 | Dataset package | `hpc115` Docker Dataset service | Immutable `02_datasets` package referencing canonical Generation files | No return transfer to CPU |
 
+Both canonical COMSOL templates expose one Job Configuration tagged
+`generation`. Generation selects that job automatically; users do not provide a
+job tag, input model name, output model name, or save mode. Each case uses the
+fixed `model.mph` work copy and always passes `-np` from `cores_per_case`.
+Retained technical smoke and pilot diagnostics write `solved.mph`; normal
+production and the production-like core benchmark use `-nosave`. Scientific
+success is based on Job Configuration exports, conversion/admission, and the
+canonical HDF5 publication. A solved model is required and published only when
+`retain_solved_model` is true.
+
 `01_generation` is the canonical simulation archive. `02_datasets` contains
 immutable package views addressed by `dataset_id`; `03_experiments` contains
 training, tuning, and evaluation artifacts. The `all` command performs terminal

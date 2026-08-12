@@ -25,6 +25,7 @@ from src import common
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_contract
 
+from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 
 if TYPE_CHECKING:
@@ -91,7 +92,7 @@ def prepare_case_work_directory(
         work_root=work_root,
     )
     run_id = workspace_service.workspace_run_id(config)
-    model_path = work_directory / "model.mph"
+    model_path = work_directory / comsol_service.WORK_MODEL_FILENAME
     try:
         bundle = case_service.generate_case_input_bundle(
             config,

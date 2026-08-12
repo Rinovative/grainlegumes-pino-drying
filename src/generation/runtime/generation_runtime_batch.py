@@ -47,6 +47,7 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_storage as storage_service
 
+from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
@@ -347,7 +348,7 @@ class ExecutionResult:
     exports: tuple[CollectedExport, ...]
     canonical_case: storage_service.CanonicalCase
     solver_log: Path
-    solved_model: Path
+    solved_model: Path | None
     execution_provenance: Path
 
 
@@ -626,81 +627,6 @@ def initialize_batch_metadata(
     return scientific_path
 
 
-def resolve_comsol_executable(config: config_contract.GenerationConfig) -> str:
-    """Return the configured COMSOL executable without shell parsing."""
-    executable = config.execution_values["runtime"].get("executable") or os.environ.get("COMSOL_EXECUTABLE")
-    if not executable:
-        msg = "COMSOL executable is unresolved; configure runtime.executable or COMSOL_EXECUTABLE."
-        raise FileNotFoundError(msg)
-    return str(executable)
-
-
-def _comsol_parameter_arguments(
-    config: config_contract.GenerationConfig,
-    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None,
-) -> list[str]:
-    """Return the exact admitted transient runtime vector or no steady flags."""
-    if config.profile.id == profiles.STEADY_FLOW_PROFILE:
-        if scalar_handoff is not None:
-            message = "Steady-flow COMSOL commands cannot receive a transient scalar handoff."
-            raise ValueError(message)
-        return []
-    if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
-        message = f"Unsupported simulation profile for COMSOL execution: {config.profile.id!r}."
-        raise ValueError(message)
-    if scalar_handoff is None:
-        message = "Transient COMSOL commands require one admitted scalar handoff."
-        raise ValueError(message)
-    if scalar_handoff.profile_id != config.profile.id:
-        message = "Scalar-handoff profile identity disagrees with the generation configuration."
-        raise ValueError(message)
-    entries = scalar_handoff.entries
-    names = tuple(entry.name for entry in entries)
-    if names != profiles.TRANSIENT_SCALAR_INPUT_FIELDS:
-        message = "Transient COMSOL runtime overrides do not match the canonical case-dependent contract."
-        raise ValueError(message)
-    values = tuple(scalar_handoff_contract.format_comsol_parameter(entry) for entry in entries)
-    indices = tuple(str(index) for index in range(1, len(entries) + 1))
-    return [
-        "-pname",
-        ",".join(names),
-        "-plist",
-        ",".join(values),
-        "-pindex",
-        ",".join(indices),
-    ]
-
-
-def build_comsol_command(
-    config: config_contract.GenerationConfig,
-    *,
-    cores_per_case: int,
-    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
-    scheduler_kind: str = "local",
-) -> list[str]:
-    """Build one safe single-node COMSOL batch argument vector."""
-    if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
-        msg = f"cores_per_case must be a positive integer, got {cores_per_case!r}."
-        raise ValueError(msg)
-    parameter_arguments = _comsol_parameter_arguments(config, scalar_handoff)
-    command = [
-        resolve_comsol_executable(config),
-        "batch",
-        "-inputfile",
-        "model.mph",
-        "-outputfile",
-        "solved.mph",
-        *parameter_arguments,
-        "-np",
-        str(cores_per_case),
-        *config.execution_values["runtime"]["extra_arguments"],
-    ]
-    if scheduler_kind not in {"local", "slurm"}:
-        msg = f"Unsupported scheduler kind for case execution: {scheduler_kind!r}."
-        raise ValueError(msg)
-    return command
-
-
 def _require_executable(command: list[str], *, comsol_executable: str) -> None:
     """Require the launcher and COMSOL executable before process creation."""
     for name in dict.fromkeys((command[0], comsol_executable)):
@@ -782,7 +708,7 @@ def _canonicalize_solved_model(
 
     admitted = changed[0]
     observed_path = work_directory / admitted.relative_path
-    canonical_path = work_directory / "solved.mph"
+    canonical_path = work_directory / comsol_service.RETAINED_MODEL_FILENAME
     canonicalized = admitted.relative_path != canonical_path.name
     if canonicalized:
         try:
@@ -823,7 +749,7 @@ def _canonicalize_solved_model(
         raise _SolvedModelOutputError(message, artifacts=(canonical_path.name,))
     disposition = "new" if admitted.relative_path not in before else "replaced"
     evidence = {
-        "requested_relative_path": "solved.mph",
+        "requested_relative_path": comsol_service.RETAINED_MODEL_FILENAME,
         "observed_relative_path": admitted.relative_path,
         "canonical_relative_path": canonical_path.name,
         "disposition": disposition,
@@ -985,7 +911,7 @@ def _execution_provenance(
         "invocation": {
             "arguments": command,
             "working_directory": str(prepared.work_directory),
-            "executable_path": shutil.which(resolve_comsol_executable(config)),
+            "executable_path": shutil.which(comsol_service.resolve_comsol_executable(config)),
             "requested_cores": cores_per_case,
             "worker_slot": worker_slot,
             "scheduler_kind": scheduler_kind,
@@ -1067,14 +993,14 @@ def execute_prepared_case(
     scalar_handoff = prepared.bundle.scalar_handoff
     if scalar_handoff is not None:
         scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
-    command = build_comsol_command(
+    command = comsol_service.build_comsol_command(
         config,
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
         scheduler_kind=scheduler_kind,
     )
     try:
-        _require_executable(command, comsol_executable=resolve_comsol_executable(config))
+        _require_executable(command, comsol_executable=comsol_service.resolve_comsol_executable(config))
     except FileNotFoundError as error:
         raise CaseExecutionError(
             str(error),
@@ -1089,15 +1015,18 @@ def execute_prepared_case(
             command=tuple(command),
             exit_code=None,
         )
-    try:
-        solved_models_before = _solved_model_inventory(prepared.work_directory)
-    except _SolvedModelOutputError as error:
-        raise CaseExecutionError(
-            str(error),
-            work_directory=prepared.work_directory,
-            command=tuple(command),
-            missing_or_invalid_artifacts=error.artifacts,
-        ) from error
+    retain_solved_model = config.execution_values["retention"]["retain_solved_model"]
+    solved_models_before: dict[str, _SolvedModelInventoryEntry] = {}
+    if retain_solved_model:
+        try:
+            solved_models_before = _solved_model_inventory(prepared.work_directory)
+        except _SolvedModelOutputError as error:
+            raise CaseExecutionError(
+                str(error),
+                work_directory=prepared.work_directory,
+                command=tuple(command),
+                missing_or_invalid_artifacts=error.artifacts,
+            ) from error
     execution_provenance = _execution_provenance(
         config,
         prepared,
@@ -1169,7 +1098,7 @@ def execute_prepared_case(
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "simulation_profile": config.profile.id,
         "git_commit": prepared.bundle.case_payload["git_commit"],
-        "executable": resolve_comsol_executable(config),
+        "executable": comsol_service.resolve_comsol_executable(config),
         "arguments": command,
         "working_directory": str(prepared.work_directory),
         "hostname": hostname,
@@ -1230,21 +1159,23 @@ def execute_prepared_case(
             exit_code=exit_code,
         )
     export_conversion_start = time.monotonic()
-    try:
-        solved_model, solved_model_evidence = _canonicalize_solved_model(
-            prepared.work_directory,
-            solved_models_before,
-        )
-        _record_solved_model_provenance(execution_provenance, solved_model_evidence)
-    except (_SolvedModelOutputError, OSError, TypeError, ValueError) as error:
-        artifacts = error.artifacts if isinstance(error, _SolvedModelOutputError) else ("solved.mph",)
-        raise CaseExecutionError(
-            str(error),
-            work_directory=prepared.work_directory,
-            command=tuple(command),
-            exit_code=exit_code,
-            missing_or_invalid_artifacts=artifacts,
-        ) from error
+    solved_model: Path | None = None
+    if retain_solved_model:
+        try:
+            solved_model, solved_model_evidence = _canonicalize_solved_model(
+                prepared.work_directory,
+                solved_models_before,
+            )
+            _record_solved_model_provenance(execution_provenance, solved_model_evidence)
+        except (_SolvedModelOutputError, OSError, TypeError, ValueError) as error:
+            artifacts = error.artifacts if isinstance(error, _SolvedModelOutputError) else (comsol_service.RETAINED_MODEL_FILENAME,)
+            raise CaseExecutionError(
+                str(error),
+                work_directory=prepared.work_directory,
+                command=tuple(command),
+                exit_code=exit_code,
+                missing_or_invalid_artifacts=artifacts,
+            ) from error
     try:
         exports = collect_exports(config, prepared)
     except Exception as error:
@@ -1387,7 +1318,16 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
     shutil.copy2(result.canonical_case.status_path, destination / "status.json")
     shutil.copy2(result.execution_provenance, destination / "execution_provenance.json")
     if config.execution_values["retention"]["retain_solved_model"]:
-        shutil.copy2(result.solved_model, destination / "solved.mph")
+        if result.solved_model is None:
+            message = "Retained execution completed without an admitted solved model."
+            raise FileNotFoundError(message)
+        shutil.copy2(
+            result.solved_model,
+            destination / comsol_service.RETAINED_MODEL_FILENAME,
+        )
+    elif result.solved_model is not None:
+        message = "No-save execution unexpectedly returned a solved model for publication."
+        raise RuntimeError(message)
     _complete_stage(destination, config=config, case_payload=result.prepared.bundle.case_payload, stage="processed")
 
 
@@ -1476,16 +1416,17 @@ def _failure_missing_artifacts(
     if work_directory is None:
         missing.add("case_workspace")
         return sorted(missing)
-    required = {"model.mph", "case.json", "fields.csv"}
+    required = {comsol_service.WORK_MODEL_FILENAME, "case.json", "fields.csv"}
     if config.profile.id == "transient_drying":
         required.update({"scalars.csv", "schedule.csv"})
     for name in required:
         path = work_directory / name
         if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
             missing.add(name)
-    solved = work_directory / "solved.mph"
-    if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
-        missing.add("solved.mph")
+    if config.execution_values["retention"]["retain_solved_model"]:
+        solved = work_directory / comsol_service.RETAINED_MODEL_FILENAME
+        if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
+            missing.add(comsol_service.RETAINED_MODEL_FILENAME)
     exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
     for contract in config.scientific_values["output_contract"]["exports"]:
         role = str(contract["role"])

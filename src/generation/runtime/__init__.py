@@ -4,6 +4,7 @@ Native solver, workspace, cluster, and single-batch execution services.
 Provides:
 - batch: single-case execution and terminal batch admission
 - cluster: scheduler planning and submission
+- comsol: fixed COMSOL command and workspace-name conventions
 - mapping_probe: native template-mapping probes
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
@@ -58,6 +59,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import generation_runtime_batch as batch
     from . import generation_runtime_cluster as cluster
+    from . import generation_runtime_comsol as comsol
     from . import generation_runtime_mapping_probe as mapping_probe
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
@@ -78,7 +80,6 @@ if TYPE_CHECKING:
         TerminalCaseEvidence,
         admit_terminal_batch,
         batch_meta_directory,
-        build_comsol_command,
         case_failure_artifacts_directory,
         case_failure_is_recorded,
         case_failure_path,
@@ -95,12 +96,12 @@ if TYPE_CHECKING:
         record_case_failure,
         request_runtime_cancellation,
         reset_runtime_cancellation,
-        resolve_comsol_executable,
         run_case,
         runtime_cancellation_requested,
         validate_completed_case,
         validate_terminal_batch,
     )
+    from .generation_runtime_comsol import build_comsol_command, resolve_comsol_executable
     from .generation_runtime_preparation import (
         CasePreparationError,
         PreparedCase,
@@ -110,6 +111,7 @@ if TYPE_CHECKING:
 _MODULES = {
     "batch": "generation_runtime_batch",
     "cluster": "generation_runtime_cluster",
+    "comsol": "generation_runtime_comsol",
     "mapping_probe": "generation_runtime_mapping_probe",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
@@ -132,7 +134,6 @@ _BATCH_EXPORTS = frozenset(
         "TerminalCaseEvidence",
         "admit_terminal_batch",
         "batch_meta_directory",
-        "build_comsol_command",
         "case_failure_artifacts_directory",
         "case_failure_is_recorded",
         "case_failure_path",
@@ -149,13 +150,13 @@ _BATCH_EXPORTS = frozenset(
         "record_case_failure",
         "request_runtime_cancellation",
         "reset_runtime_cancellation",
-        "resolve_comsol_executable",
         "run_case",
         "runtime_cancellation_requested",
         "validate_completed_case",
         "validate_terminal_batch",
     }
 )
+_COMSOL_EXPORTS = frozenset({"build_comsol_command", "resolve_comsol_executable"})
 _PREPARATION_EXPORTS = frozenset(
     {
         "CasePreparationError",
@@ -191,6 +192,7 @@ __all__ = [
     "cluster",
     "collect_exports",
     "completed_case_is_valid",
+    "comsol",
     "execute_prepared_case",
     "finalize_batch",
     "initialize_batch_metadata",
@@ -220,6 +222,8 @@ def __getattr__(name: str) -> object:
         value = import_module(f"{__name__}.{module_name}")
     elif name in _BATCH_EXPORTS:
         value = getattr(import_module(f"{__name__}.generation_runtime_batch"), name)
+    elif name in _COMSOL_EXPORTS:
+        value = getattr(import_module(f"{__name__}.generation_runtime_comsol"), name)
     elif name in _PREPARATION_EXPORTS:
         value = getattr(import_module(f"{__name__}.generation_runtime_preparation"), name)
     else:

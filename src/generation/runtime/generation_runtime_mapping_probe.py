@@ -38,6 +38,7 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 from src.generation.contracts import generation_contracts_source as source_service
 
 from . import generation_runtime_batch as runtime_service
+from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 
 MAPPING_PROBE_SCHEMA_KIND: Final = "generation_mapping_probe"
@@ -160,24 +161,32 @@ def _mapping_comparison(
     *,
     profile_path: Path,
 ) -> dict[str, Any]:
-    """Compare observed filenames and headers with the explicit typed contract."""
+    """Compare existing observed exports with the explicit typed contract."""
     prefix = profile_path.relative_to(common.paths.get_project_root().resolve()).as_posix()
     by_basename: dict[str, list[dict[str, Any]]] = {}
     for record in inventory:
         by_basename.setdefault(Path(record["relative_path"]).name, []).append(record)
     required_corrections: list[str] = []
     optional_corrections: list[str] = []
+    required_missing_exports: list[dict[str, str]] = []
+    optional_missing_exports: list[dict[str, str]] = []
     observations: list[dict[str, Any]] = []
     for index, export in enumerate(profile["exports"]):
         role = str(export["role"])
         optional = role == "exact_stop_diagnostics"
         corrections = optional_corrections if optional else required_corrections
+        missing_exports = optional_missing_exports if optional else required_missing_exports
         source = export["source"]
         source_key = f"{prefix}:exports[{index}].source"
         pattern = source.get("pattern")
         matches = [] if not isinstance(pattern, str) else by_basename.get(pattern, [])
-        if source["state"] == "mapping_probe_required" or not isinstance(pattern, str) or len(matches) != 1:
+        if not isinstance(pattern, str):
             corrections.append(source_key)
+        elif not matches:
+            missing_exports.append({"role": role, "declared_pattern": pattern})
+        elif len(matches) > 1 or source["state"] == "mapping_probe_required":
+            corrections.append(source_key)
+
         table = matches[0].get("table") if len(matches) == 1 else None
         observed_header = table.get("header", []) if isinstance(table, dict) else []
         delimiter_matches = bool(isinstance(table, dict) and table.get("delimiter") == export["delimiter"])
@@ -188,7 +197,7 @@ def _mapping_comparison(
             key = f"{prefix}:exports[{index}].columns.{logical}"
             header = mapping.get("source_header")
             matches_header = isinstance(header, str) and header in observed_header
-            if mapping["state"] == "mapping_probe_required" or not matches_header:
+            if len(matches) == 1 and (mapping["state"] == "mapping_probe_required" or not matches_header):
                 corrections.append(key)
             column_results[logical] = {
                 "state": mapping["state"],
@@ -210,9 +219,28 @@ def _mapping_comparison(
     return {
         "required_corrections": sorted(set(required_corrections)),
         "optional_corrections": sorted(set(optional_corrections)),
+        "required_missing_exports": required_missing_exports,
+        "optional_missing_exports": optional_missing_exports,
         "observations": observations,
         "aliases_used": False,
     }
+
+
+def _mapping_probe_status(
+    comparison: dict[str, Any],
+    *,
+    exit_code: int | None,
+    timed_out: bool,
+    start_error: str | None,
+) -> str:
+    """Classify process, export-execution, and mapping outcomes distinctly."""
+    if start_error is not None or timed_out or exit_code != 0:
+        return "comsol_execution_failed"
+    if comparison["required_missing_exports"]:
+        return "required_export_missing"
+    if comparison["required_corrections"]:
+        return "mapping_update_required"
+    return "mapping_observation_complete"
 
 
 def _copy_probe_artifacts(
@@ -281,7 +309,7 @@ def run_mapping_probe(
     if scalar_handoff is not None:
         scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
     before = _snapshot(prepared.work_directory)
-    command = runtime_service.build_comsol_command(
+    command = comsol_service.build_comsol_command(
         config,
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
@@ -322,7 +350,12 @@ def run_mapping_probe(
         inventory,
         profile_path=profile_path,
     )
-    missing = mapping_comparison["required_corrections"]
+    status = _mapping_probe_status(
+        mapping_comparison,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        start_error=start_error,
+    )
     probe_id = _probe_id(config.profile.id, git_commit, slurm_job_id)
     root = common.paths.get_generation_meta_root(storage_root=storage) / "mapping_probes"
     destination = root / probe_id
@@ -342,7 +375,7 @@ def run_mapping_probe(
         report = {
             "schema_kind": MAPPING_PROBE_SCHEMA_KIND,
             "schema_version": MAPPING_PROBE_SCHEMA_VERSION,
-            "status": "mapping_update_required" if missing else "mapping_observation_complete",
+            "status": status,
             "probe_id": probe_id,
             "campaign_id": campaign.campaign_id,
             "campaign_config": source_path.relative_to(common.paths.get_project_root().resolve()).as_posix(),
@@ -364,8 +397,10 @@ def run_mapping_probe(
                 "profile_yaml": raw_profile,
                 "resolved_output_contract": config.scientific_values["output_contract"],
             },
-            "fields_requiring_correction": missing,
+            "fields_requiring_correction": mapping_comparison["required_corrections"],
             "optional_fields_requiring_correction": mapping_comparison["optional_corrections"],
+            "required_exports_missing": mapping_comparison["required_missing_exports"],
+            "optional_exports_missing": mapping_comparison["optional_missing_exports"],
             "mapping_comparison": mapping_comparison,
             "actual_file_inventory": inventory,
             "command": command,

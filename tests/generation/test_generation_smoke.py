@@ -6,9 +6,11 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
+import yaml
 
 from src import generation
 from src.generation.contracts import generation_contracts_profiles as profiles
@@ -119,7 +121,127 @@ exports:
     )
     assert comparison["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
     assert comparison["optional_corrections"] == []
+    assert comparison["required_missing_exports"] == []
+    assert comparison["optional_missing_exports"] == []
     assert comparison["aliases_used"] is False
+
+
+def test_mapping_probe_distinguishes_missing_mismatched_and_confirmed_exports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report export execution failure before making any per-column claim."""
+    monkeypatch.setattr(mapping_probe.common.paths, "get_project_root", lambda: tmp_path)
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        """simulation_profile: steady_flow
+steady_flow_conditioning: null
+exports:
+- role: steady_flow_fields
+  temporal_kind: stationary
+  source:
+    state: runtime_confirmed
+    pattern: observed.csv
+  delimiter: ','
+  columns:
+    x:
+      state: runtime_confirmed
+      source_header: x
+""",
+        encoding="utf-8",
+    )
+    raw = mapping_probe._profile_mapping(profile)
+
+    missing = mapping_probe._mapping_comparison(raw, [], profile_path=profile)
+    assert missing["required_missing_exports"] == [{"role": "steady_flow_fields", "declared_pattern": "observed.csv"}]
+    assert missing["required_corrections"] == []
+    assert (
+        mapping_probe._mapping_probe_status(
+            missing,
+            exit_code=0,
+            timed_out=False,
+            start_error=None,
+        )
+        == "required_export_missing"
+    )
+
+    mismatched = mapping_probe._mapping_comparison(
+        raw,
+        [
+            {
+                "relative_path": "exports/observed.csv",
+                "table": {"delimiter": ",", "header": ["wrong"]},
+            }
+        ],
+        profile_path=profile,
+    )
+    assert mismatched["required_missing_exports"] == []
+    assert mismatched["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
+    assert (
+        mapping_probe._mapping_probe_status(
+            mismatched,
+            exit_code=0,
+            timed_out=False,
+            start_error=None,
+        )
+        == "mapping_update_required"
+    )
+
+    confirmed = mapping_probe._mapping_comparison(
+        raw,
+        [
+            {
+                "relative_path": "exports/observed.csv",
+                "table": {"delimiter": ",", "header": ["x"]},
+            }
+        ],
+        profile_path=profile,
+    )
+    assert confirmed["required_missing_exports"] == []
+    assert confirmed["required_corrections"] == []
+    assert (
+        mapping_probe._mapping_probe_status(
+            confirmed,
+            exit_code=0,
+            timed_out=False,
+            start_error=None,
+        )
+        == "mapping_observation_complete"
+    )
+
+
+def test_fake_mapping_probe_uses_canonical_retained_command(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove mapping probes consume the shared retained-diagnostic builder path."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        retain_solved_model=True,
+    )
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    project_root = mapping_probe.common.paths.get_project_root().resolve()
+    authored["profile_config"] = (config_path.parent / "profile.yaml").relative_to(project_root).as_posix()
+    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+
+    report_path = mapping_probe.run_mapping_probe(
+        config_path,
+        storage_root=tmp_path / "mapping storage",
+        work_root=tmp_path / "mapping work",
+        cores_per_case=16,
+    )
+    report = mapping_probe.load_mapping_probe(report_path)
+    command = report["command"]
+
+    assert command[command.index("-inputfile") + 1] == "model.mph"
+    assert command[command.index("-job") + 1] == "generation"
+    assert command[command.index("-outputfile") + 1] == "solved.mph"
+    assert command[command.index("-np") + 1] == "16"
+    assert "-nosave" not in command
 
 
 def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None:
