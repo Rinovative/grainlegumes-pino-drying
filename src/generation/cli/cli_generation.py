@@ -120,6 +120,16 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     readiness.add_argument("transient_primary", type=Path)
     readiness.add_argument("--run-static-sentinels", action="store_true")
     readiness.add_argument("--real-runtime-receipt", type=Path)
+    readiness.add_argument("--storage-root", type=Path)
+    readiness.add_argument("--comsol-version-output")
+
+    mapping_evidence = subparsers.add_parser(
+        "mapping-evidence-status",
+        help="query durable mapping-probe evidence for one complete campaign",
+    )
+    mapping_evidence.add_argument("config", type=Path)
+    mapping_evidence.add_argument("--storage-root", type=Path, required=True)
+    mapping_evidence.add_argument("--comsol-version-output", required=True)
 
     mapping_probe = subparsers.add_parser(
         "mapping-probe",
@@ -900,9 +910,19 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             args.transient_primary,
             run_static_sentinels=args.run_static_sentinels,
             real_runtime_receipt=args.real_runtime_receipt,
+            storage_root=args.storage_root,
+            comsol_version_output=args.comsol_version_output,
         )
         print(json.dumps(report, sort_keys=True))
         return 0 if report["production_ready_for_user_launch"] else 2
+    if args.command == "mapping-evidence-status":
+        report = mapping_probe_service.mapping_evidence_status(
+            args.config,
+            storage_root=args.storage_root,
+            comsol_version_output=args.comsol_version_output,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["status"] == "mapping_evidence_valid" else 2
     if args.command == "mapping-probe":
         path = mapping_probe_service.run_mapping_probe(
             args.config,

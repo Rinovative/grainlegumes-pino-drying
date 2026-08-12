@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from src import generation
+from src.generation.contracts import generation_contracts_mapping as mapping_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe
 
@@ -72,7 +73,7 @@ def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance
     assert balance["acceptance_tolerance"] is None
 
 
-def test_mapping_probe_reports_exact_unconfirmed_keys_and_actual_table(
+def test_mapping_probe_reports_exact_incomplete_keys_and_actual_table(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -84,21 +85,18 @@ def test_mapping_probe_reports_exact_unconfirmed_keys_and_actual_table(
     )
     profile = tmp_path / "profile.yaml"
     profile.write_text(
-        """simulation_profile: steady_flow
+        """schema_kind: generation_profile
+schema_version: 2
+simulation_profile: steady_flow
 steady_flow_conditioning: null
 exports:
 - role: steady_flow_fields
   temporal_kind: stationary
-  source:
-    state: runtime_confirmed
-    pattern: observed.csv
+  source: observed.csv
   delimiter: ','
   columns:
-    x:
-      state: mapping_probe_required
-    y:
-      state: declared_unverified
-      source_header: y
+    x: null
+    y: y
 """,
         encoding="utf-8",
     )
@@ -133,19 +131,17 @@ def test_mapping_probe_distinguishes_missing_mismatched_and_confirmed_exports(
     monkeypatch.setattr(mapping_probe.common.paths, "get_project_root", lambda: tmp_path)
     profile = tmp_path / "profile.yaml"
     profile.write_text(
-        """simulation_profile: steady_flow
+        """schema_kind: generation_profile
+schema_version: 2
+simulation_profile: steady_flow
 steady_flow_conditioning: null
 exports:
 - role: steady_flow_fields
   temporal_kind: stationary
-  source:
-    state: runtime_confirmed
-    pattern: observed.csv
+  source: observed.csv
   delimiter: ','
   columns:
-    x:
-      state: runtime_confirmed
-      source_header: x
+    x: x
 """,
         encoding="utf-8",
     )
@@ -313,3 +309,203 @@ def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None
     changed = replace(transient, execution_values=changed_execution)
     with pytest.raises(RuntimeError, match="must agree"):
         generation.smoke._paired_comsol_contract((steady, changed))
+
+
+def _successful_mapping_report(expected: dict[str, Any]) -> dict[str, Any]:
+    """Return one compact successful report for pure evidence-validity tests."""
+    return {
+        "schema_kind": mapping_probe.MAPPING_PROBE_SCHEMA_KIND,
+        "schema_version": mapping_probe.MAPPING_PROBE_SCHEMA_VERSION,
+        "status": "mapping_observation_complete",
+        "simulation_profile": expected["simulation_profile"],
+        "mapping_contract_sha256": expected["mapping_contract_sha256"],
+        "git_commit": "a" * 40,
+        "template": {"sha256": expected["template_sha256"]},
+        "comsol": {
+            "exact_version": expected["comsol_version"],
+            "version_output": f"COMSOL Multiphysics {expected['comsol_version']}",
+        },
+        "fields_requiring_correction": [],
+        "required_exports_missing": [],
+        "exit_code": 0,
+        "timed_out": False,
+        "start_error": None,
+        "mapping_auto_detection_used": False,
+        "production_solve_started": False,
+        "mapping_comparison": {
+            "required_corrections": [],
+            "required_missing_exports": [],
+            "observations": [
+                {
+                    "role": "steady_flow_fields",
+                    "matched_relative_paths": ["observed.csv"],
+                    "delimiter_matches": True,
+                    "temporal_structure_error": None,
+                    "columns": {
+                        "x": {
+                            "declared_source_header": "x",
+                            "observed_exact_header_match": True,
+                        }
+                    },
+                }
+            ],
+        },
+        "actual_file_inventory": [
+            {
+                "relative_path": "observed.csv",
+                "sha256": "e" * 64,
+                "size_bytes": 1,
+            }
+        ],
+    }
+
+
+def test_readiness_accepts_complete_profiles_with_matching_probe_evidence(
+    tmp_path: Path,
+) -> None:
+    """Protect the real-run regression where successful evidence must unblock mappings."""
+    storage = tmp_path / "readiness storage"
+    storage.mkdir()
+    version_output = "COMSOL Multiphysics 6.4.0.293"
+    campaigns = {
+        "steady_flow": Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
+        "transient_drying": Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+    }
+    for profile_id, campaign_path in campaigns.items():
+        expected = mapping_probe.build_mapping_evidence_context(
+            campaign_path,
+            comsol_version_output=version_output,
+        )
+        root = storage / "01_generation/meta/mapping_probes" / f"{profile_id}-probe"
+        produced = root / "produced_files"
+        produced.mkdir(parents=True)
+        observed = produced / "observed.csv"
+        observed.write_bytes(profile_id.encode("utf-8"))
+        report = _successful_mapping_report(expected)
+        report["actual_file_inventory"][0].update(
+            {
+                "sha256": mapping_probe.common.serialization.file_sha256(observed),
+                "size_bytes": observed.stat().st_size,
+            }
+        )
+        (root / "mapping_probe.json").write_text(
+            __import__("json").dumps(report),
+            encoding="utf-8",
+        )
+
+    report = generation.readiness.build_readiness_report(
+        campaigns["steady_flow"],
+        campaigns["transient_drying"],
+        storage_root=storage,
+        comsol_version_output=version_output,
+    )
+    assert report["profile_mapping_configuration_complete"] is True
+    assert report["mapping_evidence_complete"] is True
+    assert report["profile_mapping_complete"] is True
+    assert all(evidence["status"] == "mapping_evidence_valid" for evidence in report["mapping_evidence"].values())
+
+
+def test_mapping_contract_fingerprint_tracks_only_mapping_semantics(
+    generation_config_factory: Any,
+) -> None:
+    """Invalidate every mapping-relevant change while ignoring unrelated metadata."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    output = campaign.batches[0].scientific_values["output_contract"]
+    original = mapping_contract.mapping_contract_sha256("transient_drying", output)
+
+    mutations = []
+    for key, value in (
+        ("pattern", "changed.csv"),
+        ("delimiter", ","),
+        ("temporal_kind", "changed_time_semantics"),
+    ):
+        changed = copy.deepcopy(output)
+        changed["exports"][0][key] = value
+        mutations.append(changed)
+    changed = copy.deepcopy(output)
+    first_logical = next(iter(changed["exports"][0]["columns"]))
+    changed["exports"][0]["columns"][first_logical] = "changed_header"
+    mutations.append(changed)
+    changed = copy.deepcopy(output)
+    changed["exports"][0]["units"][first_logical] = "changed_unit"
+    mutations.append(changed)
+    changed = copy.deepcopy(output)
+    changed["exports"][0]["columns"].pop(first_logical)
+    changed["exports"][0]["units"].pop(first_logical)
+    mutations.append(changed)
+
+    assert all(mapping_contract.mapping_contract_sha256("transient_drying", changed) != original for changed in mutations)
+    unrelated = copy.deepcopy(output)
+    unrelated["display_metadata"] = {"title": "ignored"}
+    assert mapping_contract.mapping_contract_sha256("transient_drying", unrelated) == original
+
+
+def test_mapping_evidence_validity_tuple_excludes_git_commit(
+    generation_config_factory: Any,
+) -> None:
+    """Bind evidence to semantics, template, COMSOL, and verifier but not commit."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    expected = mapping_probe.build_mapping_evidence_context(
+        config_path,
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+    )
+    report = _successful_mapping_report(expected)
+    assert mapping_probe.evaluate_mapping_probe_report(report, expected)["valid"] is True
+
+    report["git_commit"] = "b" * 40
+    assert mapping_probe.evaluate_mapping_probe_report(report, expected)["valid"] is True
+
+    variants = (
+        ("template", {"sha256": "c" * 64}, "template SHA-256 changed"),
+        ("mapping_contract_sha256", "d" * 64, "output mapping contract changed"),
+        ("comsol", {"exact_version": "6.5.0.1", "version_output": "COMSOL 6.5.0.1"}, "COMSOL version changed"),
+        ("schema_version", mapping_probe.MAPPING_PROBE_SCHEMA_VERSION - 1, "verifier version differs"),
+    )
+    for key, value, reason in variants:
+        changed = copy.deepcopy(report)
+        changed[key] = value
+        result = mapping_probe.evaluate_mapping_probe_report(changed, expected)
+        assert result["valid"] is False
+        assert reason in result["reasons"]
+
+
+def test_mapping_evidence_requires_matching_successful_probe(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reproduce complete declarations becoming ready only from matching evidence."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    storage = tmp_path / "evidence storage"
+    storage.mkdir()
+    expected = mapping_probe.build_mapping_evidence_context(
+        config_path,
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+    )
+    missing = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
+    assert missing["status"] == "mapping_evidence_missing"
+
+    root = storage / "01_generation/meta/mapping_probes/probe-1"
+    produced = root / "produced_files"
+    produced.mkdir(parents=True)
+    observed = produced / "observed.csv"
+    observed.write_bytes(b"x")
+    report = _successful_mapping_report(expected)
+    report["actual_file_inventory"][0]["sha256"] = mapping_probe.common.serialization.file_sha256(observed)
+    (root / "mapping_probe.json").write_text(
+        __import__("json").dumps(report),
+        encoding="utf-8",
+    )
+    valid = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
+    assert valid["status"] == "mapping_evidence_valid"
+
+    report["status"] = "mapping_update_required"
+    report["fields_requiring_correction"] = ["profile.yaml:exports[0].columns.x"]
+    report["mapping_comparison"]["required_corrections"] = report["fields_requiring_correction"]
+    (root / "mapping_probe.json").write_text(
+        __import__("json").dumps(report),
+        encoding="utf-8",
+    )
+    failed = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
+    assert failed["status"] == "mapping_evidence_invalid"
+    assert "probe status is 'mapping_update_required'" in failed["reason"]

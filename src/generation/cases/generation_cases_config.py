@@ -48,6 +48,7 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 CONFIG_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 CANONICAL_HDF5_SCHEMA_VERSION = 1
 CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
@@ -1017,60 +1018,38 @@ def _validate_steady_flow_conditioning(
     return conditioning
 
 
-_MAPPING_STATES = (
-    "declared_unverified",
-    "runtime_confirmed",
-    "mapping_probe_required",
-)
-
-
-def _validate_mapping_node(
+def _validate_mapping_value(
     value: Any,
     *,
     label: str,
-    value_key: str,
-) -> dict[str, str]:
-    """Validate one typed source or header mapping without a null sentinel."""
-    node = _mapping(value, label=label)
-    state = node.get("state")
-    if state not in _MAPPING_STATES:
-        message = f"{label}.state must be one of {list(_MAPPING_STATES)}."
+    allow_missing: bool,
+    source_pattern: bool,
+) -> str | None:
+    """Validate one explicit source filename or source-header declaration."""
+    if value is None:
+        if allow_missing:
+            return None
+        message = f"{label} is incomplete; an explicit executable mapping declaration is required."
         raise GenerationConfigError(message)
-    required = {"state"} if state == "mapping_probe_required" else {"state", value_key}
-    _exact_keys(node, required=required, optional=set(), label=label)
-    if state == "mapping_probe_required":
-        return {"state": state}
-    mapped = node[value_key]
-    if not isinstance(mapped, str) or not mapped or mapped.strip() != mapped or any(character in mapped for character in ("\x00", "\n", "\r")):
-        message = f"{label}.{value_key} must be safe non-empty text."
+    if isinstance(value, Mapping) and "state" in value:
+        message = (
+            f"{label} uses obsolete persistent export-mapping verification state; generation profile schema_version 2 requires a scalar declaration."
+        )
         raise GenerationConfigError(message)
-    if value_key == "pattern":
-        candidate = Path(mapped)
+    if not isinstance(value, str) or not value or value.strip() != value or any(character in value for character in ("\x00", "\n", "\r")):
+        message = f"{label} must be safe non-empty text."
+        raise GenerationConfigError(message)
+    if source_pattern:
+        candidate = Path(value)
         if (
-            candidate.name != mapped
+            candidate.name != value
             or candidate.is_absolute()
-            or mapped in {".", ".."}
-            or any(character in mapped for character in ("*", "?", "[", "]"))
+            or value in {".", ".."}
+            or any(character in value for character in ("*", "?", "[", "]"))
         ):
-            message = f"{label}.pattern must be one exact case-local filename."
+            message = f"{label} must be one exact case-local filename."
             raise GenerationConfigError(message)
-    return {"state": state, value_key: mapped}
-
-
-def _mapping_rollup(
-    source_mapping: Mapping[str, str],
-    column_mappings: Mapping[str, Mapping[str, str]],
-) -> str:
-    """Return the least-confirmed state across one export role."""
-    states = [
-        str(source_mapping["state"]),
-        *(str(mapping["state"]) for mapping in column_mappings.values()),
-    ]
-    if "mapping_probe_required" in states:
-        return "mapping_probe_required"
-    if "declared_unverified" in states:
-        return "declared_unverified"
-    return "runtime_confirmed"
+    return value
 
 
 def _validate_profile_config(
@@ -1080,7 +1059,7 @@ def _validate_profile_config(
     fixed_values: Mapping[str, Any],
     require_executable: bool,
 ) -> dict[str, Any]:
-    """Validate typed export mappings without inventing missing headers."""
+    """Validate expected export mappings without inventing missing declarations."""
     if not isinstance(require_executable, bool):
         message = "require_executable must be boolean."
         raise TypeError(message)
@@ -1098,7 +1077,11 @@ def _validate_profile_config(
         optional=set(),
         label="generation profile configuration",
     )
-    if config["schema_kind"] != "generation_profile" or config["schema_version"] != 1 or config["simulation_profile"] != profile.id:
+    if (
+        config["schema_kind"] != "generation_profile"
+        or config["schema_version"] != PROFILE_SCHEMA_VERSION
+        or config["simulation_profile"] != profile.id
+    ):
         message = "Generation profile configuration schema or profile identity is invalid."
         raise GenerationConfigError(message)
     config["steady_flow_conditioning"] = _validate_steady_flow_conditioning(
@@ -1141,46 +1124,37 @@ def _validate_profile_config(
         if temporal_kind != temporal_kinds[role]:
             message = f"{label}.temporal_kind must be {temporal_kinds[role]!r}."
             raise GenerationConfigError(message)
-        source_mapping = _validate_mapping_node(
+        source_pattern = _validate_mapping_value(
             export["source"],
             label=f"{label}.source",
-            value_key="pattern",
+            allow_missing=not require_executable,
+            source_pattern=True,
         )
         columns = _mapping(export["columns"], label=f"{label}.columns")
         if tuple(columns) != role_spec.logical_fields:
             message = f"{label}.columns must map exact logical fields {list(role_spec.logical_fields)} in order."
             raise GenerationConfigError(message)
         column_mappings = {
-            logical: _validate_mapping_node(
+            logical: _validate_mapping_value(
                 mapping,
                 label=f"{label}.columns.{logical}",
-                value_key="source_header",
+                allow_missing=not require_executable,
+                source_pattern=False,
             )
             for logical, mapping in columns.items()
         }
-        configured_sources = [mapping["source_header"] for mapping in column_mappings.values() if "source_header" in mapping]
+        configured_sources = [mapping for mapping in column_mappings.values() if mapping is not None]
         if len(configured_sources) != len(set(configured_sources)):
             message = f"{label}.columns must map known fields to distinct source headers."
             raise GenerationConfigError(message)
-        probe_columns = [logical for logical, mapping in column_mappings.items() if mapping["state"] == "mapping_probe_required"]
         normalized: dict[str, Any] = {
             "role": role,
             "temporal_kind": temporal_kind,
-            "source_mapping": source_mapping,
             "delimiter": _delimiter(
                 export["delimiter"],
                 label=f"{label}.delimiter",
             ),
-            "column_mappings": column_mappings,
-            "columns": {logical: mapping["source_header"] for logical, mapping in column_mappings.items() if "source_header" in mapping},
-            "mapping_state": _mapping_rollup(
-                source_mapping,
-                column_mappings,
-            ),
-            "mapping_probe_required": {
-                "source": source_mapping["state"] == "mapping_probe_required",
-                "columns": probe_columns,
-            },
+            "columns": {logical: mapping for logical, mapping in column_mappings.items() if mapping is not None},
             "required": role_spec.required,
             "allow_multiple": role_spec.allow_multiple,
             "units": dict(
@@ -1191,22 +1165,25 @@ def _validate_profile_config(
                 )
             ),
         }
-        if "pattern" in source_mapping:
-            normalized["pattern"] = source_mapping["pattern"]
+        if source_pattern is not None:
+            normalized["pattern"] = source_pattern
         validated.append(normalized)
     if require_executable:
-        unresolved = [
-            {
-                "role": export["role"],
-                "mapping_state": export["mapping_state"],
-                "source_probe_required": export["mapping_probe_required"]["source"],
-                "column_probe_required": export["mapping_probe_required"]["columns"],
-            }
-            for export in validated
-            if export["required"] and export["mapping_state"] != "runtime_confirmed"
-        ]
+        unresolved = []
+        for export in validated:
+            if not export["required"]:
+                continue
+            missing_columns = [logical for logical in profile.export_role(str(export["role"])).logical_fields if logical not in export["columns"]]
+            if "pattern" not in export or missing_columns:
+                unresolved.append(
+                    {
+                        "role": export["role"],
+                        "source_missing": "pattern" not in export,
+                        "missing_source_headers": missing_columns,
+                    }
+                )
         if unresolved:
-            message = f"Executable generation profile has unconfirmed required export mappings: {unresolved}."
+            message = f"Executable generation profile has incomplete required export declarations: {unresolved}."
             raise GenerationConfigError(message)
     config["exports"] = validated
     return config

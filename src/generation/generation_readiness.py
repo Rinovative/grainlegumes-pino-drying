@@ -29,6 +29,7 @@ from src import common
 from . import generation_smoke as smoke_service
 from .cases import generation_cases_config as config_service
 from .contracts import generation_contracts_profiles as profiles
+from .runtime import generation_runtime_mapping_probe as mapping_probe_service
 from .validation import generation_validation_sentinels as sentinel_service
 
 _STATUS_COMPLETE: Final = "COMPLETE"
@@ -88,31 +89,29 @@ def _primary_missing(path: Path) -> list[str]:
     return missing
 
 
-def _profile_mapping_states(
-    campaign_path: Path,
-) -> tuple[list[str], list[str]]:
-    """Return unresolved required typed mapping states."""
+def _profile_mapping_missing(campaign_path: Path) -> list[str]:
+    """Return structurally incomplete required export declarations."""
     campaign = _yaml(campaign_path)
     configured = Path(campaign["profile_config"])
     profile_path = configured if configured.is_absolute() else common.paths.get_project_root() / configured
     profile = _yaml(profile_path)
     prefix = _relative(profile_path)
-    probe_required: list[str] = []
-    declared_unverified: list[str] = []
+    profile_spec = profiles.get_profile(str(profile["simulation_profile"]))
+    missing: list[str] = []
     for index, export in enumerate(profile["exports"]):
-        source = export["source"]
-        source_key = f"{prefix}:exports[{index}].source"
-        if source["state"] == "mapping_probe_required":
-            probe_required.append(source_key)
-        elif source["state"] == "declared_unverified":
-            declared_unverified.append(source_key)
-        for logical, mapping in export["columns"].items():
-            key = f"{prefix}:exports[{index}].columns.{logical}"
-            if mapping["state"] == "mapping_probe_required":
-                probe_required.append(key)
-            elif mapping["state"] == "declared_unverified":
-                declared_unverified.append(key)
-    return probe_required, declared_unverified
+        role_spec = profile_spec.export_role(str(export["role"]))
+        if not role_spec.required:
+            continue
+        if not isinstance(export.get("source"), str):
+            missing.append(f"{prefix}:exports[{index}].source")
+        columns = export.get("columns")
+        if not isinstance(columns, dict):
+            missing.append(f"{prefix}:exports[{index}].columns")
+            continue
+        missing.extend(
+            f"{prefix}:exports[{index}].columns.{logical}" for logical in role_spec.logical_fields if not isinstance(columns.get(logical), str)
+        )
+    return missing
 
 
 def campaign_unresolved_gates(path: Path | str) -> dict[str, list[str]]:
@@ -120,11 +119,10 @@ def campaign_unresolved_gates(path: Path | str) -> dict[str, list[str]]:
     campaign_path = Path(path).expanduser().resolve()
     raw = _yaml(campaign_path)
     primary_missing = _primary_missing(campaign_path) if raw.get("campaign_purpose") == "family_generalization" else []
-    probe_required, declared_unverified = _profile_mapping_states(campaign_path)
+    mapping_missing = _profile_mapping_missing(campaign_path)
     return {
         "missing_production_keys": sorted(primary_missing),
-        "missing_profile_mapping_keys": sorted(probe_required),
-        "declared_unverified_profile_mapping_keys": sorted(declared_unverified),
+        "missing_profile_mapping_keys": sorted(mapping_missing),
     }
 
 
@@ -163,8 +161,10 @@ def build_readiness_report(
     *,
     run_static_sentinels: bool = False,
     real_runtime_receipt: Path | str | None = None,
+    storage_root: Path | str | None = None,
+    comsol_version_output: str | None = None,
 ) -> dict[str, Any]:
-    """Build one read-only, exact-key production-readiness report."""
+    """Build one read-only production-readiness report from declarations and evidence."""
     steady_path = Path(steady_primary_path).expanduser().resolve()
     transient_path = Path(transient_primary_path).expanduser().resolve()
     campaigns = tuple(config_service.load_campaign_config(path, require_executable=False) for path in (steady_path, transient_path))
@@ -184,13 +184,35 @@ def build_readiness_report(
     campaign_resolution_complete = len(campaign_contracts) == len(campaigns)
     resolved_ownership_complete = campaign_resolution_complete
 
-    steady_gates = campaign_unresolved_gates(steady_path)
-    transient_gates = campaign_unresolved_gates(transient_path)
-    primary_missing = sorted(set(steady_gates["missing_production_keys"] + transient_gates["missing_production_keys"]))
-    mapping_missing = sorted(set(steady_gates["missing_profile_mapping_keys"] + transient_gates["missing_profile_mapping_keys"]))
-    mapping_declared_unverified = sorted(
-        set(steady_gates["declared_unverified_profile_mapping_keys"] + transient_gates["declared_unverified_profile_mapping_keys"])
-    )
+    paths = (steady_path, transient_path)
+    gates = tuple(campaign_unresolved_gates(path) for path in paths)
+    primary_missing = sorted({key for gate in gates for key in gate["missing_production_keys"]})
+    mapping_missing = sorted({key for gate in gates for key in gate["missing_profile_mapping_keys"]})
+    configuration_complete = not mapping_missing
+
+    mapping_evidence: dict[str, dict[str, Any]] = {}
+    for path_value, profile_id in zip(paths, expected_profiles, strict=True):
+        if not configuration_complete:
+            mapping_evidence[profile_id] = {
+                "status": "configuration_incomplete",
+                "reason": "required source patterns or source headers are missing",
+                "valid_report": None,
+                "inspected_reports": [],
+            }
+        elif storage_root is None or comsol_version_output is None:
+            mapping_evidence[profile_id] = {
+                "status": "mapping_evidence_missing",
+                "reason": "storage root and exact COMSOL version evidence were not provided",
+                "valid_report": None,
+                "inspected_reports": [],
+            }
+        else:
+            mapping_evidence[profile_id] = mapping_probe_service.mapping_evidence_status(
+                path_value,
+                storage_root=storage_root,
+                comsol_version_output=comsol_version_output,
+            )
+    mapping_evidence_complete = all(evidence["status"] == "mapping_evidence_valid" for evidence in mapping_evidence.values())
 
     static_report = None
     if run_static_sentinels:
@@ -205,7 +227,6 @@ def build_readiness_report(
         real_complete = True
 
     primary_complete = not primary_missing
-    mapping_complete = not mapping_missing and (not mapping_declared_unverified or real_complete)
     static_complete = static_report is not None and static_report["status"] == "pass"
     static_status = _STATUS_COMPLETE if static_complete else _STATUS_BLOCKED if static_report is not None else _STATUS_PENDING
     production_ready = all(
@@ -213,14 +234,15 @@ def build_readiness_report(
             campaign_resolution_complete,
             resolved_ownership_complete,
             primary_complete,
-            mapping_complete,
+            configuration_complete,
+            mapping_evidence_complete,
             static_complete,
             real_complete,
         )
     )
     return {
         "schema_kind": "vp2_production_readiness",
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_contracts": campaign_contracts,
         "campaign_ids": [campaign.campaign_id for campaign in campaigns],
         "campaign_config_resolution_complete": campaign_resolution_complete,
@@ -228,11 +250,13 @@ def build_readiness_report(
         "static_generator_sentinels_complete": static_complete,
         "real_runtime_validation_complete": real_complete,
         "primary_production_config_complete": primary_complete,
-        "profile_mapping_complete": mapping_complete,
+        "profile_mapping_configuration_complete": configuration_complete,
+        "mapping_evidence_complete": mapping_evidence_complete,
+        "profile_mapping_complete": configuration_complete and mapping_evidence_complete,
         "production_ready_for_user_launch": production_ready,
         "missing_primary_keys": primary_missing,
         "missing_profile_mapping_keys": mapping_missing,
-        "declared_unverified_profile_mapping_keys": mapping_declared_unverified,
+        "mapping_evidence": mapping_evidence,
         "real_runtime_receipt": (None if receipt_path is None else str(receipt_path)),
         "static_sentinel_report": static_report,
         "status_lines": [
@@ -240,7 +264,8 @@ def build_readiness_report(
             ("RESOLVED_CONFIG_OWNERSHIP_VALIDATION_COMPLETE" if resolved_ownership_complete else "RESOLVED_CONFIG_OWNERSHIP_VALIDATION_INCOMPLETE"),
             f"STATIC_GENERATOR_SENTINELS_{static_status}",
             (f"PRIMARY_PRODUCTION_CONFIG_{_STATUS_COMPLETE if primary_complete else _STATUS_INCOMPLETE}"),
-            (f"PROFILE_MAPPING_{_STATUS_COMPLETE if mapping_complete else _STATUS_INCOMPLETE}"),
+            (f"PROFILE_MAPPING_CONFIGURATION_{_STATUS_COMPLETE if configuration_complete else _STATUS_INCOMPLETE}"),
+            (f"MAPPING_EVIDENCE_{_STATUS_COMPLETE if mapping_evidence_complete else _STATUS_PENDING}"),
             (f"REAL_RUNTIME_VALIDATION_{_STATUS_COMPLETE if real_complete else _STATUS_PENDING}"),
             (f"PRODUCTION_READY_FOR_USER_LAUNCH_{_STATUS_COMPLETE if production_ready else _STATUS_BLOCKED}"),
         ],

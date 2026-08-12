@@ -178,9 +178,9 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     """Protect non-solving readiness evidence and the self-cleaning probe."""
     report = _run(tmp_path, monkeypatch)
     work = tmp_path / "node work"
-    assert report["status"] == "environment_ready_production_blocked"
-    assert report["production_configuration_ready"] is False
-    assert "unconfirmed required export mappings" in report["production_configuration_blocker"]
+    assert report["status"] == "environment_ready"
+    assert report["production_configuration_ready"] is True
+    assert report["production_configuration_blocker"] is None
     assert report["production_solve_started"] is False
     assert report["domain"] == "CPU compute-node"
     assert set(report["commands"]) == {"python", "comsol"}

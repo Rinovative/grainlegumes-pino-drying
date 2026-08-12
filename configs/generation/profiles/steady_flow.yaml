@@ -1,5 +1,5 @@
 schema_kind: generation_profile
-schema_version: 1
+schema_version: 2
 simulation_profile: steady_flow
 steady_flow_conditioning:
   schema_kind: steady_flow_conditioning
@@ -43,38 +43,16 @@ steady_flow_conditioning:
 exports:
 - role: steady_flow_fields
   temporal_kind: stationary
-  source:
-    state: declared_unverified
-    pattern: stationary_fields.csv
+  source: stationary_fields.csv
   delimiter: ','
   columns:
-    x:
-      state: declared_unverified
-      source_header: x
-    y:
-      state: declared_unverified
-      source_header: y
-    Kxx:
-      state: declared_unverified
-      source_header: Kxx
-    Kxy:
-      state: declared_unverified
-      source_header: Kxy
-    Kyy:
-      state: declared_unverified
-      source_header: Kyy
-    eps_bed:
-      state: declared_unverified
-      source_header: eps_bed
-    p_in_bc:
-      state: declared_unverified
-      source_header: p_in_bc
-    u:
-      state: declared_unverified
-      source_header: u
-    v:
-      state: declared_unverified
-      source_header: v
-    p:
-      state: declared_unverified
-      source_header: p
+    x: x
+    y: y
+    Kxx: Kxx
+    Kxy: Kxy
+    Kyy: Kyy
+    eps_bed: eps_bed
+    p_in_bc: p_in_bc
+    u: u
+    v: v
+    p: p

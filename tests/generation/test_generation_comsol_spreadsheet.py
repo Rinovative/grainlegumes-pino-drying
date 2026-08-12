@@ -212,56 +212,41 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
     """Cover long Data metadata and shorter Table metadata for every role."""
     monkeypatch.setattr(mapping_probe.common.paths, "get_project_root", lambda: tmp_path)
     profile = {
+        "schema_kind": "generation_profile",
+        "schema_version": 2,
         "simulation_profile": "transient_drying",
         "steady_flow_conditioning": None,
         "exports": [
             {
                 "role": "steady_flow_fields",
                 "temporal_kind": "stationary",
-                "source": {"state": "runtime_confirmed", "pattern": "steady.csv"},
+                "source": "steady.csv",
                 "delimiter": ",",
-                "columns": {
-                    "x": {"state": "runtime_confirmed", "source_header": "x"},
-                    "p": {"state": "runtime_confirmed", "source_header": "p"},
-                },
+                "columns": {"x": "x", "p": "p"},
             },
             {
                 "role": "transient_fields",
                 "temporal_kind": "regular_time_series",
-                "source": {"state": "runtime_confirmed", "pattern": "transient.csv"},
+                "source": "transient.csv",
                 "delimiter": ",",
-                "columns": {
-                    "t": {"state": "runtime_confirmed", "source_header": "t"},
-                    "T": {"state": "runtime_confirmed", "source_header": "T"},
-                    "phi": {"state": "runtime_confirmed", "source_header": "mt.phi"},
-                },
+                "columns": {"t": "t", "T": "T", "phi": "mt.phi"},
             },
             {
                 "role": "global_time_series",
                 "temporal_kind": "regular_time_series",
-                "source": {"state": "runtime_confirmed", "pattern": "globals.csv"},
+                "source": "globals.csv",
                 "delimiter": ",",
-                "columns": {
-                    "t": {"state": "runtime_confirmed", "source_header": "t"},
-                    "X_wb_bulk": {"state": "runtime_confirmed", "source_header": "X_wb_bulk"},
-                    "T_out_mean": {"state": "runtime_confirmed", "source_header": "T_out_mean"},
-                },
+                "columns": {"t": "t", "X_wb_bulk": "X_wb_bulk", "T_out_mean": "T_out_mean"},
             },
             {
                 "role": "final_status",
                 "temporal_kind": "final_status",
-                "source": {"state": "runtime_confirmed", "pattern": "final.csv"},
+                "source": "final.csv",
                 "delimiter": ",",
                 "columns": {
-                    "t_final": {"state": "runtime_confirmed", "source_header": "t_final"},
-                    "T_max_final": {
-                        "state": "runtime_confirmed",
-                        "source_header": "T_max_final",
-                    },
-                    "phi_min_final": {
-                        "state": "runtime_confirmed",
-                        "source_header": "phi_min_final",
-                    },
+                    "t_final": "t_final",
+                    "T_max_final": "T_max_final",
+                    "phi_min_final": "phi_min_final",
                 },
             },
         ],

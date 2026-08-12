@@ -1,5 +1,5 @@
 schema_kind: generation_profile
-schema_version: 1
+schema_version: 2
 simulation_profile: transient_drying
 steady_flow_conditioning:
   schema_kind: steady_flow_conditioning
@@ -43,143 +43,59 @@ steady_flow_conditioning:
 exports:
 - role: steady_flow_fields
   temporal_kind: stationary
-  source:
-    state: runtime_confirmed
-    pattern: stationary_fields.csv
+  source: stationary_fields.csv
   delimiter: ','
   columns:
-    x:
-      state: runtime_confirmed
-      source_header: x
-    y:
-      state: runtime_confirmed
-      source_header: y
-    Kxx:
-      state: runtime_confirmed
-      source_header: Kxx
-    Kxy:
-      state: runtime_confirmed
-      source_header: Kxy
-    Kyy:
-      state: runtime_confirmed
-      source_header: Kyy
-    eps_bed:
-      state: runtime_confirmed
-      source_header: eps_bed
-    p_in_bc:
-      state: runtime_confirmed
-      source_header: p_in_bc
-    X_0_db_field:
-      state: runtime_confirmed
-      source_header: X_0_db_field
-    u:
-      state: runtime_confirmed
-      source_header: u
-    v:
-      state: runtime_confirmed
-      source_header: v
-    p:
-      state: runtime_confirmed
-      source_header: p
-    rho_bu_dry:
-      state: runtime_confirmed
-      source_header: rho_bu_dry
+    x: x
+    y: y
+    Kxx: Kxx
+    Kxy: Kxy
+    Kyy: Kyy
+    eps_bed: eps_bed
+    p_in_bc: p_in_bc
+    X_0_db_field: X_0_db_field
+    u: u
+    v: v
+    p: p
+    rho_bu_dry: rho_bu_dry
 - role: transient_fields
   temporal_kind: regular_time_series
-  source:
-    state: runtime_confirmed
-    pattern: transient_states.csv
+  source: transient_states.csv
   delimiter: ','
   columns:
-    t:
-      state: runtime_confirmed
-      source_header: t
-    x:
-      state: runtime_confirmed
-      source_header: x
-    y:
-      state: runtime_confirmed
-      source_header: y
-    T:
-      state: runtime_confirmed
-      source_header: T
-    phi:
-      state: runtime_confirmed
-      source_header: mt.phi
-    w_surf:
-      state: runtime_confirmed
-      source_header: w_surf
-    w_int:
-      state: runtime_confirmed
-      source_header: w_int
+    t: t
+    x: x
+    y: y
+    T: T
+    phi: mt.phi
+    w_surf: w_surf
+    w_int: w_int
 - role: global_time_series
   temporal_kind: regular_time_series
-  source:
-    state: runtime_confirmed
-    pattern: global_timeseries.csv
+  source: global_timeseries.csv
   delimiter: ','
   columns:
-    t:
-      state: runtime_confirmed
-      source_header: t
-    X_wb_bulk:
-      state: runtime_confirmed
-      source_header: X_wb_bulk
-    f_wet_dm:
-      state: runtime_confirmed
-      source_header: f_wet_dm
-    m_w_gr:
-      state: runtime_confirmed
-      source_header: m_w_gr
-    m_v_gas:
-      state: runtime_confirmed
-      source_header: m_v_gas
-    m_dot_evap:
-      state: runtime_confirmed
-      source_header: m_dot_evap
-    m_dot_v_in:
-      state: runtime_confirmed
-      source_header: m_dot_v_in
-    m_dot_v_out:
-      state: runtime_confirmed
-      source_header: m_dot_v_out
-    mt_mass_balance:
-      state: runtime_confirmed
-      source_header: mt_mass_balance
-    T_out_mean:
-      state: runtime_confirmed
-      source_header: T_out_mean
-    phi_out_mean:
-      state: runtime_confirmed
-      source_header: phi_out_mean
+    t: t
+    X_wb_bulk: X_wb_bulk
+    f_wet_dm: f_wet_dm
+    m_w_gr: m_w_gr
+    m_v_gas: m_v_gas
+    m_dot_evap: m_dot_evap
+    m_dot_v_in: m_dot_v_in
+    m_dot_v_out: m_dot_v_out
+    mt_mass_balance: mt_mass_balance
+    T_out_mean: T_out_mean
+    phi_out_mean: phi_out_mean
 - role: final_status
   temporal_kind: final_status
-  source:
-    state: runtime_confirmed
-    pattern: final_status.csv
+  source: final_status.csv
   delimiter: ','
   columns:
-    t_final:
-      state: runtime_confirmed
-      source_header: t_final
-    f_wet_dm_final:
-      state: runtime_confirmed
-      source_header: f_wet_dm_final
-    X_wb_bulk_final:
-      state: runtime_confirmed
-      source_header: X_wb_bulk_final
-    X_wb_max_final:
-      state: runtime_confirmed
-      source_header: X_wb_max_final
-    T_min_final:
-      state: runtime_confirmed
-      source_header: T_min_final
-    T_max_final:
-      state: runtime_confirmed
-      source_header: T_max_final
-    phi_min_final:
-      state: runtime_confirmed
-      source_header: phi_min_final
-    phi_max_final:
-      state: runtime_confirmed
-      source_header: phi_max_final
+    t_final: t_final
+    f_wet_dm_final: f_wet_dm_final
+    X_wb_bulk_final: X_wb_bulk_final
+    X_wb_max_final: X_wb_max_final
+    T_min_final: T_min_final
+    T_max_final: T_max_final
+    phi_min_final: phi_min_final
+    phi_max_final: phi_max_final

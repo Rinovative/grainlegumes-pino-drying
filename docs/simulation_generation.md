@@ -46,7 +46,7 @@ is not required on the CPU cluster.
 | Parameter definitions, transforms, sampling order, and OOD policy | `configs/generation/registry.yaml` | Typed parameter and OOD declarations | Profile projections, active blocks, dimensions, eligible OOD units |
 | Material values, supports, evidence, targets, complete records | `configs/generation/materials/<family>.yaml` | One role-neutral family record | Effective registry, material digest, atomic OOD admission |
 | Operation and boundary-condition ranges | `configs/generation/operations/fixed_bed.yaml` | Natural/OOD supports, nominals, schedules, constraints | Case schedules and operation digest |
-| Profile I/O, mappings, exports, template identity | `configs/generation/profiles/steady_flow.yaml` or `transient_drying.yaml` | Explicit mapping state and profile contract | Runtime adapter and export admission plan |
+| Profile I/O, mappings, exports, template identity | `configs/generation/profiles/steady_flow.yaml` or `transient_drying.yaml` | Expected filenames, delimiters, temporal kinds, and exact source headers | Runtime adapter, semantic mapping fingerprint, and export admission plan |
 | Material roles and family OOD | Selected `configs/generation/campaigns/<profile>/<campaign>.yaml` | `material_roles` | Evaluation regimes and package materials |
 | Source-case counts | Production campaign `sampling.counts` | Counts by regime and family | Total, batches, indices, OOD allocation |
 | Train, validation, ID membership | Production campaign `membership.per_seen_material` | Split counts | Split membership and package eligibility |
@@ -193,10 +193,12 @@ resolved JSON is the review surface for the exact work that `plan` will use.
 ./scripts/generation_workflow.sh smoke --keep-cpu-source
 ```
 
-If mappings are unconfirmed, this command first runs retained mapping probes
-for both profiles and stops. Review the probe artifacts, update only the
-explicit profile mapping keys, commit those reviewed changes, and rerun the
-same command. A complete smoke always retains its CPU source for review.
+The command queries durable mapping-probe evidence first. It runs only the
+profiles whose evidence is missing or stale, publishes successful probe reports,
+refreshes readiness immediately, and continues the same invocation. A mismatch,
+missing export, or COMSOL failure remains fail closed with exact observations;
+profile YAML is never changed automatically. A complete smoke always retains its
+CPU source for review.
 
 5. Inspect the immutable real-smoke receipt printed by the smoke command:
 
@@ -321,7 +323,7 @@ configuration persist with generated artifacts.
 | 1 | Edit the authoritative YAML | User decisions only | Reviewed diff and clean commit before remote execution |
 | 2 | `validate-config ... --allow-incomplete` | Resolves all owners without solving | Counts, dimensions, roles, seeds, packages, OOD plan, template and exact gates |
 | 3 | `setup-cpu` then `preflight` | Bootstraps exact commit/venv; audits modules, executables, storage and Slurm | Successful setup and preflight reports |
-| 4 | `smoke` when mappings need confirmation | Runs retained one-case native mapping probes and inventories real output names/headers | Human-reviewed profile mapping YAML; rerun from a clean committed state |
+| 4 | `smoke` when mapping evidence is missing or stale | Runs only required retained one-case probes, persists evidence, and refreshes readiness | Successful evidence matching mapping contract, template, exact COMSOL version, and verifier version; same invocation continues |
 | 5 | `smoke` | Paired steady/transient native technical campaign, transfer, publication, packages and loader smokes | Source-current immutable real-smoke receipt; CPU source retained |
 | 6 | `benchmark-cores`, review, then edit `cluster.cores_per_case` | Four globally serial core settings with three round-robin solves each | Reviewed core-hour recommendation and a separate committed production-core decision |
 | 7 | `pilot-check .../pilot_check.yaml` | Six-material transient diagnostics and storage measurement | Accepted pilot receipt and reviewed diagnostics |
@@ -479,6 +481,29 @@ inventory, and retained-evidence policy. The gate requires:
 - retained CPU inputs, exports, solved evidence, logs, Slurm IDs, and version;
 - one source-bound real-smoke receipt.
 
+Generation profile schema version 2 contains declarations only. A required
+export is executable when its role, exact source filename, delimiter, temporal
+kind, complete ordered logical-field mapping, exact source headers, and
+canonical units are resolved. Discovery mode may leave a source or header null;
+production execution may not. There is no configured verification enum or
+boolean.
+
+One canonical ``mapping_contract_sha256`` covers the simulation profile,
+exports root, and each export's role, required flag, exact source pattern,
+``allow_multiple`` policy, delimiter, temporal kind, ordered logical fields,
+exact source headers, and units. Wide transient identity contains only the base
+``t``, ``x``, ``y``, ``T``, ``mt.phi``, ``w_surf``, and ``w_int`` semantics,
+never observed ``@ t=...`` values. Unrelated profile metadata and Git commits do
+not change this fingerprint.
+
+A successful report is current only when simulation profile,
+``mapping_contract_sha256``, template SHA-256, exact COMSOL runtime version, and
+mapping-probe schema/version all match. It must also record
+``mapping_observation_complete``, successful COMSOL execution, and empty
+required-correction and missing-export lists. Git commit and full profile-file
+SHA remain provenance, not validity gates. Template, mapping, COMSOL-version, or
+verifier-version changes require a new probe; unrelated commits do not.
+
 Mapping probes inventory actual output files and headers. COMSOL Spreadsheet
 exports carry a variable-length leading block of percent-prefixed metadata whose
 final compatible record is the column header. Native transient Data exports are
@@ -489,10 +514,11 @@ state arrays. Numeric ``t`` columns and repeated coordinates must agree with the
 header-owned state and authoritative grid. Global Time Series and Final Status
 tables may include runtime parameter columns and COMSOL ``Time``; Generation
 ignores those extras and maps only explicitly configured headers, including the
-distinct Generation-owned ``t`` field. The runtime-confirmed mappings remain
-explicit profile configuration, and canonical HDF5/Dataset consumers are
-independent of COMSOL's raw layout. Generation never infers or writes a mapping
-automatically. Fixed values reported as template-owned have no Python runtime
+distinct Generation-owned ``t`` field. Expected mappings remain explicit profile configuration, while verification
+comes only from immutable ``mapping_probe.json`` reports under
+``<STORAGE_ROOT>/01_generation/meta/mapping_probes/``. Generation never infers
+or writes a mapping automatically. Canonical HDF5/Dataset consumers remain
+independent of COMSOL's raw layout. Fixed values reported as template-owned have no Python runtime
 override; their configured record is bound to the canonical hashed template and
 model-report evidence. Case-dependent values use the admitted CLI vector and
 still require native runtime evidence.
@@ -751,8 +777,8 @@ The report owns its status vocabulary and includes one structured record for
 each configuration, static-science, mapping, native-runtime, and launch gate.
 Treat its current JSON as authoritative; do not infer readiness from a template
 hash, a cached receipt, or documentation text. Launch is ready only when
-the resolved production configuration, static scientific checks, reviewed
-mappings, native profile reloads, scalar handoff, paired-equivalence
+the resolved production configuration, static scientific checks, current
+mapping-probe evidence, native profile reloads, scalar handoff, paired-equivalence
 observations, HDF5/package/loader validation, and a source-current real-smoke
 receipt all pass. A template hash proves byte identity only; it does not prove
 model-tree behavior.
@@ -762,10 +788,11 @@ model-tree behavior.
 - Exit status 2 from `validate-config` without `--allow-incomplete`, `plan`, or
   readiness means a fail-closed gate remains. Read the reported file and key;
   do not fill scientific values with CLI defaults.
-- If `smoke` stops after mapping probes, review
+- If `smoke` stops after a mapping probe, review
   `01_generation/meta/mapping_probes/<probe_id>/mapping_probe.json` and its
-  retained files on the CPU storage. Update profile YAML only after COMSOL
-  inspection.
+  retained files on CPU storage. Correct explicit YAML declarations only when
+  the observed filenames or headers differ; a successful matching probe needs
+  no YAML edit, commit, setup rerun, or second smoke command.
 - A dirty worktree or commit mismatch blocks remote planning and launch. Commit
   reviewed work outside this workflow, then rerun the same command.
 - Failed collection retains marked staging and CPU source. Use `status` and

@@ -647,19 +647,41 @@ REMOTE
 validate_local_launch_gates() {
   local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null
   [[ "${CAMPAIGN_PURPOSE}" == technical_runtime_smoke ]] && return
+  local selected_campaign="${CAMPAIGN_CONFIG_PATH}"
   resolve_workflow_campaigns
   local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
     "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" >/dev/null ||
     fail 2 "Static scientific sentinels block production planning or launch."
   local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
+  local comsol_version
+  comsol_version="$(remote_comsol_version)"
+  mapping_evidence_status_cpu "${selected_campaign}" "${comsol_version}" >/dev/null ||
+    fail 2 "Current mapping evidence for the selected campaign profile is required before production planning or launch."
+  resolve_campaign "${selected_campaign}"
+  resolve_configured_resources
 }
 
-technical_profiles_ready() {
-  resolve_local_python
-  resolve_workflow_campaigns
-  local_cli validate-config "${STATIONARY_SMOKE_CAMPAIGN_HOST_PATH}" >/dev/null 2>&1 &&
-    local_cli validate-config "${TRANSIENT_SMOKE_CAMPAIGN_HOST_PATH}" >/dev/null 2>&1
+mapping_evidence_status_cpu() {
+  local campaign_argument="$1"
+  local comsol_version_output="$2"
+  resolve_campaign "${campaign_argument}"
+  resolve_configured_resources
+  resolve_remote_layout
+  local remote_campaign
+  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
+  remote_bash "${CPU_HOST}" \
+    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
+    "${remote_campaign}" "${comsol_version_output}" "${PYTHON_MODULE}" <<'REMOTE'
+set -euo pipefail
+repository="$1"; storage="$2"; venv="$3"; campaign="$4"
+comsol_version_output="$5"; python_module="$6"
+module load "${python_module}"
+cd "${repository}"
+"${venv}/bin/python" -m src.generation.cli.cli_generation \
+  mapping-evidence-status "${campaign}" --storage-root "${storage}" \
+  --comsol-version-output "${comsol_version_output}"
+REMOTE
 }
 
 remote_comsol_version() {
@@ -692,15 +714,34 @@ run_smoke() {
   KEEP_CPU_SOURCE=true
   CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
   preflight_cpu
-  if ! technical_profiles_ready; then
-    printf 'Profile mappings remain unconfirmed; running isolated retained probes.\n' >&2
+  local comsol_version
+  comsol_version="$(remote_comsol_version)"
+  local steady_evidence_valid=true transient_evidence_valid=true
+  mapping_evidence_status_cpu \
+    "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null 2>&1 ||
+    steady_evidence_valid=false
+  mapping_evidence_status_cpu \
+    "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null 2>&1 ||
+    transient_evidence_valid=false
+  if [[ "${steady_evidence_valid}" != true || "${transient_evidence_valid}" != true ]]; then
+    printf 'Current mapping evidence is missing or stale; running only required isolated probes.\n' >&2
     local probe_failed=false
-    mapping_probe_cpu "${STATIONARY_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
-    mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
-    if [[ "${probe_failed}" == true ]]; then
-      printf 'One or more mapping probes reported an execution or mapping failure.\n' >&2
+    if [[ "${steady_evidence_valid}" != true ]]; then
+      mapping_probe_cpu "${STATIONARY_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
     fi
-    fail 2 "Mapping confirmation is required. Review mapping_probe.json artifacts, update only explicit profile mappings, commit, and rerun this smoke command."
+    if [[ "${transient_evidence_valid}" != true ]]; then
+      mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
+    fi
+    if [[ "${probe_failed}" == true ]]; then
+      fail 2 "One or more mapping probes reported an execution failure, missing export, or exact mapping mismatch."
+    fi
+    mapping_evidence_status_cpu \
+      "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null ||
+      fail 2 "Steady-flow mapping evidence is not valid after its successful probe command."
+    mapping_evidence_status_cpu \
+      "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null ||
+      fail 2 "Transient-drying mapping evidence is not valid after its successful probe command."
+    printf 'Mapping probes completed and readiness refreshed; continuing this smoke invocation.\n'
   fi
   CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
   run_all
@@ -708,8 +749,7 @@ run_smoke() {
   CAMPAIGN_ARGUMENT="${TRANSIENT_SMOKE_CAMPAIGN_PATH}"
   run_all
   local transient_run_id="${RUN_ID}"
-  local comsol_version receipt
-  comsol_version="$(remote_comsol_version)"
+  local receipt
   receipt="$(local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
     --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
   receipt="$(container_path_to_host "${receipt}")"
@@ -730,6 +770,18 @@ plan_campaign() {
   validate_local_launch_gates
   print_layout
   remote_plan_submit plan-campaign
+}
+
+launch_requested_campaign() {
+  resolve_local_commit true
+  resolve_campaign "${CAMPAIGN_ARGUMENT}"
+  resolve_configured_resources
+  validate_resources
+  resolve_remote_layout
+  resolve_local_storage
+  resolve_local_python
+  validate_local_launch_gates
+  launch_campaign
 }
 
 launch_campaign() {
@@ -1279,14 +1331,22 @@ run_pilot_check() {
   EXECUTE_SETUP=true
   setup_cpu
   preflight_cpu
-  ALL_STAGE="profile mapping validation"
-  if ! local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null 2>&1; then
-    printf 'Transient profile mappings remain unconfirmed; running one retained probe.\n' >&2
-    mapping_probe_cpu "${CAMPAIGN_CONFIG_PATH}" || true
-    fail 2 "Mapping confirmation is required. Review mapping_probe.json, update only explicit profile mappings, commit, and rerun pilot-check."
-  fi
-  ALL_STAGE="configured-material static scientific sentinels"
+  ALL_STAGE="profile mapping evidence"
+  local comsol_version pilot_campaign_path
+  comsol_version="$(remote_comsol_version)"
+  pilot_campaign_path="${CAMPAIGN_CONFIG_PATH}"
   resolve_workflow_campaigns
+  if ! mapping_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null 2>&1; then
+    printf 'Current transient mapping evidence is missing or stale; running one retained technical-smoke probe.\n' >&2
+    mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" ||
+      fail 2 "Transient mapping probe reported an execution failure, missing export, or exact mapping mismatch."
+    mapping_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null ||
+      fail 2 "Transient mapping evidence is not valid after its successful probe command."
+    printf 'Transient mapping probe completed and readiness refreshed; continuing this pilot invocation.\n'
+  fi
+  resolve_campaign "${pilot_campaign_path}"
+  resolve_configured_resources
+  ALL_STAGE="configured-material static scientific sentinels"
   local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
     "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" ||
     fail 2 "Static scientific sentinels block pilot launch; inspect the sentinel report before rerunning."
@@ -1713,7 +1773,7 @@ case "${SUBCOMMAND}" in
         ;;
       launch)
         [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "launch already submits and returns."
-        launch_campaign
+        launch_requested_campaign
         ;;
       all) run_all ;;
     esac

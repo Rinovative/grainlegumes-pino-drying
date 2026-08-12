@@ -127,21 +127,49 @@ def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
     )
     assert fast.total_case_count == 6
 
-    for path in (
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"),
-    ):
-        with pytest.raises(
-            generation.cases.config.GenerationConfigError,
-            match="unconfirmed required export mappings",
-        ):
-            generation.cases.config.load_campaign_config(path)
-    for path in (
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
-        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"),
-    ):
+    for path in expected:
         campaign = generation.cases.config.load_campaign_config(path)
-        assert all(export["mapping_state"] == "runtime_confirmed" for export in campaign.batches[0].scientific_values["output_contract"]["exports"])
+        exports = campaign.batches[0].scientific_values["output_contract"]["exports"]
+        assert all(export.get("pattern") and set(export["columns"]) == set(export["units"]) for export in exports)
+        assert all({"state", "verified"}.isdisjoint(export) for export in exports)
+
+
+def test_profile_schema_rejects_obsolete_verification_field(
+    generation_config_factory: Any,
+) -> None:
+    """Reject the old persistent verification model instead of migrating it."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    profile_path = config_path.parent / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["exports"][0]["source"] = {
+        "state": "obsolete",
+        "pattern": profile["exports"][0]["source"],
+    }
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    with pytest.raises(
+        generation.cases.config.GenerationConfigError,
+        match="obsolete persistent export-mapping verification state",
+    ):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_incomplete_mapping_declaration_is_discovery_only(
+    generation_config_factory: Any,
+) -> None:
+    """Permit structural discovery only when executable mappings are not required."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    profile_path = config_path.parent / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["exports"][0]["columns"]["x"] = None
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+
+    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
+    assert "x" not in campaign.batches[0].scientific_values["output_contract"]["exports"][0]["columns"]
+    with pytest.raises(
+        generation.cases.config.GenerationConfigError,
+        match="incomplete; an explicit executable mapping declaration is required",
+    ):
+        generation.cases.config.load_campaign_config(config_path)
 
 
 @pytest.mark.parametrize("option", ["--exclusive", "--reservation=reserved", "--nodelist=node-a"])

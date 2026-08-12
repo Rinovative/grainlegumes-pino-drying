@@ -83,25 +83,19 @@ def _profile_configuration(
     }
     exports = []
     for role in profile.export_roles:
-        source = {"state": "runtime_confirmed", "pattern": patterns[role.role]}
+        source = patterns[role.role]
         exports.append(
             {
                 "role": role.role,
                 "temporal_kind": temporal_kinds[role.role],
                 "source": source,
                 "delimiter": ";",
-                "columns": {
-                    name: {
-                        "state": "runtime_confirmed",
-                        "source_header": "mt.phi" if role.role == "transient_fields" and name == "phi" else name,
-                    }
-                    for name in role.logical_fields
-                },
+                "columns": {name: "mt.phi" if role.role == "transient_fields" and name == "phi" else name for name in role.logical_fields},
             }
         )
     return {
         "schema_kind": "generation_profile",
-        "schema_version": 1,
+        "schema_version": 2,
         "simulation_profile": simulation_profile,
         "steady_flow_conditioning": _steady_flow_conditioning(fixed_values),
         "exports": exports,
@@ -366,6 +360,10 @@ def runtime_scalar_values(arguments, case):
         parsed[entry["name"]] = number
     return parsed
 
+
+if sys.argv[1:] == ["-version"]:
+    print("COMSOL Multiphysics 6.4.0.293")
+    raise SystemExit(0)
 
 mode = os.environ.get("FAKE_COMSOL_MODE", "success")
 if mode == "failure":

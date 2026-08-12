@@ -782,11 +782,6 @@ def collect_exports(
     collected: dict[Path, CollectedExport] = {}
     for contract in config.scientific_values["output_contract"]["exports"]:
         role = str(contract["role"])
-        if contract["mapping_state"] == "mapping_probe_required":
-            if contract["required"]:
-                message = f"Required profile mapping for {role!r} still requires a mapping probe."
-                raise RuntimeError(message)
-            continue
         pattern = contract.get("pattern")
         if not isinstance(pattern, str):
             message = f"Profile mapping for {role!r} has no declared source filename."
@@ -1431,10 +1426,6 @@ def _failure_missing_artifacts(
     for contract in config.scientific_values["output_contract"]["exports"]:
         role = str(contract["role"])
         pattern = contract.get("pattern")
-        if contract["mapping_state"] == "mapping_probe_required":
-            if contract["required"]:
-                missing.add(f"export:{role}:mapping_probe_required")
-            continue
         if not isinstance(pattern, str) or not pattern:
             missing.add(f"export:{role}:unresolved_mapping")
             continue

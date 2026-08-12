@@ -183,6 +183,25 @@ elif [[ " $* " == *' plan-core-benchmark '* ]]; then
   printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
 elif [[ " $* " == *' finalize-core-benchmark '* ]]; then
   printf '%s\n' '{"state":"complete"}'
+elif [[ "${payload}" == *'mapping-evidence-status'* ]]; then
+  count=0
+  [[ ! -f "${FAKE_MAPPING_EVIDENCE_COUNTER}" ]] || count="$(cat "${FAKE_MAPPING_EVIDENCE_COUNTER}")"
+  count="$((count + 1))"
+  printf '%s\n' "${count}" > "${FAKE_MAPPING_EVIDENCE_COUNTER}"
+  requested_profile=steady_flow
+  [[ " $* " != *'/transient_drying/'* ]] || requested_profile=transient_drying
+  printf 'mapping-evidence-profile <%s>\n' "${requested_profile}" >> "${FAKE_COMMAND_LOG}"
+  if [[ "${FAKE_MAPPING_EVIDENCE_REJECT_PROFILE:-}" == "${requested_profile}" ]]; then
+    printf '%s\n' '{"status":"mapping_evidence_missing"}'
+    exit 2
+  fi
+  if [[ "${FAKE_MAPPING_EVIDENCE_INITIAL_MISSING:-false}" == true && "${count}" -le 2 ]]; then
+    printf '%s\n' '{"status":"mapping_evidence_missing"}'
+    exit 2
+  fi
+  printf '%s\n' '{"status":"mapping_evidence_valid"}'
+elif [[ "${payload}" == *'COMSOL version query'* ]]; then
+  printf '%s\n' 'COMSOL Multiphysics 6.4.0.293'
 elif [[ " $* " == *' core-benchmark-summary '* ]]; then
   printf '%s\n' '# Synthetic remote core benchmark summary'
 elif [[ " $* " == *' validate-real-smoke '* ]]; then
@@ -223,6 +242,9 @@ elif [[ " $* " == *' submit-campaign'* ]]; then
   printf '%s\n' '{"campaign_run_id":"steady_flow_family_generalization__0123456789abcdef","state":"submitted"}'
 elif [[ " $* " == *' plan-campaign'* ]]; then
   printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
+elif [[ "${payload}" == *'vp2-mapping-probe'* && "${FAKE_MAPPING_PROBE_FAIL:-false}" == true ]]; then
+  printf '%s\n' 'synthetic mapping mismatch' >&2
+  exit 9
 elif [[ "${payload}" == *'sbatch --wait --parsable'* ]]; then
   printf '%s\n' '12345'
 fi
@@ -395,6 +417,7 @@ fi
             "FAKE_BENCHMARK_FILE_COUNT": str(_BENCHMARK_FILE_COUNT),
             "FAKE_BENCHMARK_SIZE_BYTES": str(_BENCHMARK_SIZE_BYTES),
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
+            "FAKE_MAPPING_EVIDENCE_COUNTER": str(state_root / "mapping-evidence-counter"),
             "FAKE_TRANSFER_PLAN": "",
             "FAKE_CAMPAIGN_STATE": "publication_complete",
             "FAKE_SOURCE_STATE": "publication_complete",
@@ -462,6 +485,11 @@ def _pilot_campaign(workflow: Path) -> Path:
     return workflow.parent.parent / "configs/generation/campaigns/transient_drying/pilot_check.yaml"
 
 
+def _transient_campaign(workflow: Path) -> Path:
+    """Return the copied transient production campaign configuration."""
+    return workflow.parent.parent / "configs/generation/campaigns/transient_drying/family_generalization.yaml"
+
+
 def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
     """Create one complete fake terminal transfer tree and TSV plan."""
     campaign_directory = f"01_generation/meta/campaigns/{_RUN_ID}"
@@ -516,6 +544,79 @@ def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Pa
     assert "Bare-host realpath received a Docker-only path" not in result.stderr
     assert "forbidden-host-python" not in log_text
     assert "submit-campaign" in log_text
+
+
+def test_production_plan_and_launch_require_only_selected_profile_evidence(tmp_path: Path) -> None:
+    """Prevent cross-profile mapping-evidence coupling for production operations."""
+    profiles = ("steady_flow", "transient_drying")
+    cases = tuple(
+        (operation, selected_profile, rejected_profile, selected_profile != rejected_profile)
+        for operation in ("plan", "launch")
+        for selected_profile in profiles
+        for rejected_profile in profiles
+    )
+    for index, (operation, selected_profile, rejected_profile, expected_success) in enumerate(cases):
+        root = tmp_path / f"case-{index}"
+        root.mkdir()
+        workflow, log, environment, _storage, _mirror = _harness(root)
+        environment["FAKE_MAPPING_EVIDENCE_REJECT_PROFILE"] = rejected_profile
+        campaign = _campaign(workflow) if selected_profile == "steady_flow" else _transient_campaign(workflow)
+
+        result = _run(workflow, [operation, str(campaign), *_remote_options()], environment)
+
+        assert (result.returncode == 0) is expected_success, result.stderr
+        evidence_lines = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("mapping-evidence-profile")]
+        assert evidence_lines == [f"mapping-evidence-profile <{selected_profile}>"]
+        if not expected_success:
+            assert "selected campaign profile is required" in result.stderr
+
+
+def test_combined_smoke_checks_both_profile_evidence(tmp_path: Path) -> None:
+    """Keep paired technical smoke explicitly responsible for both profiles."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+
+    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+
+    assert result.returncode == 0, result.stderr
+    evidence_lines = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("mapping-evidence-profile")]
+    assert evidence_lines[:2] == [
+        "mapping-evidence-profile <steady_flow>",
+        "mapping-evidence-profile <transient_drying>",
+    ]
+
+
+def test_smoke_continues_after_successful_required_mapping_probes(tmp_path: Path) -> None:
+    """Refresh evidence and continue technical smoke without a second invocation."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_MAPPING_EVIDENCE_INITIAL_MISSING"] = "true"
+
+    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count("--job-name=vp2-mapping-probe") == 2
+    assert "Mapping probes completed and readiness refreshed; continuing this smoke invocation." in result.stdout
+    assert "Current mapping evidence is missing or stale" in result.stderr
+    assert "submit-campaign" in log_text
+    assert "Mapping confirmation is required" not in result.stderr
+    assert "update only explicit profile mappings" not in result.stderr
+
+
+def test_smoke_stops_after_failed_required_mapping_probe(tmp_path: Path) -> None:
+    """Keep failed probes fail closed before technical campaign submission."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_MAPPING_EVIDENCE_INITIAL_MISSING"] = "true"
+    environment["FAKE_MAPPING_PROBE_FAIL"] = "true"
+
+    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+
+    assert result.returncode != 0
+    assert "execution failure, missing export, or exact mapping mismatch" in result.stderr
+    assert "submit-campaign" not in log.read_text(encoding="utf-8")
+    assert "update only explicit profile mappings" not in result.stderr
 
 
 def test_repository_admission_rejects_escape_ambiguous_and_container_paths(tmp_path: Path) -> None:

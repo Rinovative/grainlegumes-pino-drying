@@ -284,9 +284,6 @@ def _export_inventory(
             include_values=False,
         )
         header = list(table.canonical_header)
-        if contract["mapping_state"] == "mapping_probe_required":
-            message = f"Real smoke cannot bind unresolved required mapping role {role!r}."
-            raise RuntimeError(message)
         expected_sources = list(contract["columns"].values())
         missing = sorted(set(expected_sources).difference(header))
         if missing:
@@ -301,7 +298,6 @@ def _export_inventory(
                 "raw_header": list(table.raw_header),
                 "actual_header": header,
                 "configured_columns": dict(contract["columns"]),
-                "mapping_state_before_runtime_receipt": contract["mapping_state"],
             }
         )
     return records
