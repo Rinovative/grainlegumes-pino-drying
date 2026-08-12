@@ -101,10 +101,15 @@ the stable `src.generation` and `src.datasets` facades.
 | Public orchestration | `src.generation`, `generation_benchmark.py`, `generation_campaign.py`, `generation_readiness.py`, `generation_smoke.py`, `generation_workflow.py` | Stable facade aliases and cross-responsibility campaign lifecycles |
 | `contracts/` | `generation_contracts_*` | Vocabularies, profiles, materials, paths, provenance, source identity, and scientific registry contracts |
 | `cases/` | `generation_cases_*` | Campaign/config resolution, deterministic seeding and sampling, fields, schedules, and case inputs |
-| `runtime/` | `generation_runtime_*` | Native execution, cluster planning, preflight, mapping probes, preparation, workspaces, and terminal batch evidence |
+| `runtime/` | `generation_runtime_*` | Native execution, cluster planning, preflight, export collection, preparation, workspaces, and terminal batch evidence |
 | `publication/` | `generation_publication_*` | Canonical HDF5 admission, inventories, campaign manifests, and transfer evidence |
 | `validation/` | `generation_validation_*` | Static sentinels and transient pilot validation/analysis |
 | `cli/` | `cli_generation.py` | Thin argument parsing for the supported Generation command |
+
+Generation profiles declare the expected export contract. Technical smoke runs
+COMSOL, validates export mappings, converts and admits canonical HDF5, publishes
+the cases, and records durable profile-scoped technical-smoke evidence. Production
+readiness requires matching successful evidence for the selected profile.
 
 ### Dataset responsibilities
 

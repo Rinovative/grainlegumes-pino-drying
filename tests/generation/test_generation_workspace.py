@@ -1,9 +1,10 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, SLF001
 """Disposable workspace ownership, containment, and cleanup contracts."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,30 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
         expected_case_id=prepared.bundle.case_id,
         allow_active_job_id="12345",
     )
+
+
+def test_workspace_squeue_query_attaches_validated_job_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attach the optional live-job filter after validating numeric identity."""
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        arguments = list(command)
+        commands.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, stdout="12345\n", stderr="")
+
+    monkeypatch.setattr(workspace.shutil, "which", lambda _name: "/usr/bin/squeue")
+    monkeypatch.setattr(workspace.subprocess, "run", fake_run)
+
+    assert workspace._slurm_job_is_active("12345")
+    assert commands == [
+        ["/usr/bin/squeue", "--noheader", "--jobs=12345", "--format=%A"],
+    ]
+    for invalid_job_id in ("12345 --all", "\uff11\uff12\uff13\uff14\uff15"):
+        with pytest.raises(ValueError, match="malformed"):
+            workspace._slurm_job_is_active(invalid_job_id)
+    assert len(commands) == 1
 
 
 def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(

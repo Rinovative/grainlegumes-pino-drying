@@ -1,21 +1,20 @@
 # ruff: noqa: S101, SLF001
-"""Bounded mapping-probe and real-smoke diagnostic contracts."""
+"""Profile smoke-evidence and paired runtime diagnostic contracts."""
 
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
-import yaml
 
 from src import generation
 from src.generation.contracts import generation_contracts_mapping as mapping_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
-from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe
 
 
 def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance() -> None:
@@ -73,221 +72,6 @@ def test_observed_difference_and_mass_balance_metrics_have_no_invented_tolerance
     assert balance["acceptance_tolerance"] is None
 
 
-def test_mapping_probe_reports_exact_incomplete_keys_and_actual_table(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep mapping observation explicit and prohibit silent mapping inference."""
-    monkeypatch.setattr(
-        mapping_probe.common.paths,
-        "get_project_root",
-        lambda: tmp_path,
-    )
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        """schema_kind: generation_profile
-schema_version: 2
-simulation_profile: steady_flow
-steady_flow_conditioning: null
-exports:
-- role: steady_flow_fields
-  temporal_kind: stationary
-  source: observed.csv
-  delimiter: ','
-  columns:
-    x: null
-    y: y
-""",
-        encoding="utf-8",
-    )
-    raw = mapping_probe._profile_mapping(profile)
-
-    table = tmp_path / "observed.csv"
-    table.write_text("x,y,p\n0,1,2\n3,4,5\n", encoding="utf-8")
-    observation = mapping_probe._table_observation(table)
-    assert observation == {
-        "delimiter": ",",
-        "raw_header": ["x", "y", "p"],
-        "shape": [2, 3],
-        "rectangular": True,
-        "comsol_metadata": {},
-        "time_header_candidates": [],
-    }
-    comparison = mapping_probe._mapping_comparison(
-        raw,
-        [{"relative_path": "observed.csv", "table": observation}],
-        profile_path=profile,
-    )
-    assert comparison["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
-    assert comparison["required_missing_exports"] == []
-    assert comparison["aliases_used"] is False
-
-
-def test_mapping_probe_distinguishes_missing_mismatched_and_confirmed_exports(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Report export execution failure before making any per-column claim."""
-    monkeypatch.setattr(mapping_probe.common.paths, "get_project_root", lambda: tmp_path)
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        """schema_kind: generation_profile
-schema_version: 2
-simulation_profile: steady_flow
-steady_flow_conditioning: null
-exports:
-- role: steady_flow_fields
-  temporal_kind: stationary
-  source: observed.csv
-  delimiter: ','
-  columns:
-    x: x
-""",
-        encoding="utf-8",
-    )
-    raw = mapping_probe._profile_mapping(profile)
-
-    missing = mapping_probe._mapping_comparison(raw, [], profile_path=profile)
-    assert missing["required_missing_exports"] == [{"role": "steady_flow_fields", "declared_pattern": "observed.csv"}]
-    assert missing["required_corrections"] == []
-    assert (
-        mapping_probe._mapping_probe_status(
-            missing,
-            exit_code=0,
-            timed_out=False,
-            start_error=None,
-        )
-        == "required_export_missing"
-    )
-
-    mismatched = mapping_probe._mapping_comparison(
-        raw,
-        [
-            {
-                "relative_path": "exports/observed.csv",
-                "table": {"delimiter": ",", "raw_header": ["wrong"]},
-            }
-        ],
-        profile_path=profile,
-    )
-    assert mismatched["required_missing_exports"] == []
-    assert mismatched["required_corrections"] == ["profile.yaml:exports[0].columns.x"]
-    assert (
-        mapping_probe._mapping_probe_status(
-            mismatched,
-            exit_code=0,
-            timed_out=False,
-            start_error=None,
-        )
-        == "mapping_update_required"
-    )
-
-    confirmed = mapping_probe._mapping_comparison(
-        raw,
-        [
-            {
-                "relative_path": "exports/observed.csv",
-                "table": {"delimiter": ",", "raw_header": ["x"]},
-            }
-        ],
-        profile_path=profile,
-    )
-    assert confirmed["required_missing_exports"] == []
-    assert confirmed["required_corrections"] == []
-    assert (
-        mapping_probe._mapping_probe_status(
-            confirmed,
-            exit_code=0,
-            timed_out=False,
-            start_error=None,
-        )
-        == "mapping_observation_complete"
-    )
-
-
-def test_fake_mapping_probe_uses_canonical_retained_command(
-    generation_config_factory: Any,
-    fake_comsol: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prove mapping probes consume the shared retained-diagnostic builder path."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow",
-        executable=fake_comsol,
-        retain_solved_model=True,
-    )
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    project_root = mapping_probe.common.paths.get_project_root().resolve()
-    authored["profile_config"] = (config_path.parent / "profile.yaml").relative_to(project_root).as_posix()
-    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
-    monkeypatch.setenv("SLURM_JOB_ID", "12345")
-
-    report_path = mapping_probe.run_mapping_probe(
-        config_path,
-        storage_root=tmp_path / "mapping storage",
-        work_root=tmp_path / "mapping work",
-        cores_per_case=16,
-    )
-    report = mapping_probe.load_mapping_probe(report_path)
-    command = report["command"]
-    steady_observation = report["mapping_comparison"]["observations"][0]
-
-    assert report["status"] == "mapping_observation_complete"
-    assert steady_observation["raw_header"] == steady_observation["canonical_header"]
-    assert steady_observation["parsed_shape"][0] > 0
-    assert command[command.index("-inputfile") + 1] == "model.mph"
-    assert command[command.index("-job") + 1] == "b1"
-    assert command[command.index("-outputfile") + 1] == "solved.mph"
-    assert command[command.index("-np") + 1] == "16"
-    assert "-nosave" not in command
-
-
-@pytest.mark.parametrize(
-    ("export_mode", "expected_status"),
-    [
-        ("mismatch", "mapping_update_required"),
-        ("missing", "required_export_missing"),
-    ],
-)
-def test_fake_mapping_probe_preserves_negative_status_semantics(
-    generation_config_factory: Any,
-    fake_comsol: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    export_mode: str,
-    expected_status: str,
-) -> None:
-    """Keep genuine header mismatches distinct from absent required exports."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow",
-        executable=fake_comsol,
-        retain_solved_model=True,
-    )
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    project_root = mapping_probe.common.paths.get_project_root().resolve()
-    authored["profile_config"] = (config_path.parent / "profile.yaml").relative_to(project_root).as_posix()
-    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
-    monkeypatch.setenv("SLURM_JOB_ID", "12345")
-    monkeypatch.setenv("FAKE_COMSOL_MAPPING_EXPORT_MODE", export_mode)
-
-    report_path = mapping_probe.run_mapping_probe(
-        config_path,
-        storage_root=tmp_path / f"{export_mode} storage",
-        work_root=tmp_path / f"{export_mode} work",
-        cores_per_case=16,
-    )
-    report = mapping_probe.load_mapping_probe(report_path)
-
-    assert report["status"] == expected_status
-    if export_mode == "mismatch":
-        assert report["required_exports_missing"] == []
-        assert any(key.endswith(".columns.x") for key in report["fields_requiring_correction"])
-    else:
-        assert report["required_exports_missing"] == [{"role": "steady_flow_fields", "declared_pattern": "airflow.csv"}]
-        assert report["fields_requiring_correction"] == []
-
-
 def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None:
     """Bind receipt version evidence to configured paired execution contracts."""
     root = Path("configs/generation/campaigns")
@@ -311,59 +95,295 @@ def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None
         generation.smoke._paired_comsol_contract((steady, changed))
 
 
-def _successful_mapping_report(expected: dict[str, Any]) -> dict[str, Any]:
-    """Return one compact successful report for pure evidence-validity tests."""
-    return {
-        "schema_kind": mapping_probe.MAPPING_PROBE_SCHEMA_KIND,
-        "schema_version": mapping_probe.MAPPING_PROBE_SCHEMA_VERSION,
-        "status": "mapping_observation_complete",
+def _successful_smoke_report(
+    expected: dict[str, Any],
+    *,
+    run_id: str,
+    git_commit: str = "a" * 40,
+) -> dict[str, Any]:
+    """Return compact complete profile evidence for pure validity tests."""
+    cases = [
+        {
+            "case_id": f"case_{index:04d}",
+            "case_input_id": f"input-{index}",
+            "simulation_case_id": f"{index + 1:064x}",
+            "hdf5_sha256": f"{index + 2:064x}",
+            "publication_provenance_sha256": f"{index + 3:064x}",
+        }
+        for index in range(expected["required_case_count"])
+    ]
+    report: dict[str, Any] = {
+        "schema_kind": generation.smoke.TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND,
+        "schema_version": generation.smoke.TECHNICAL_SMOKE_EVIDENCE_SCHEMA_VERSION,
+        "status": "technical_smoke_complete",
+        "recorded_at": "2026-08-12T00:00:00+00:00",
         "simulation_profile": expected["simulation_profile"],
         "mapping_contract_sha256": expected["mapping_contract_sha256"],
-        "git_commit": "a" * 40,
-        "template": {"sha256": expected["template_sha256"]},
+        "template": {"relative_path": "simulation/template.mph", "sha256": expected["template_sha256"]},
         "comsol": {
             "exact_version": expected["comsol_version"],
             "version_output": f"COMSOL Multiphysics {expected['comsol_version']}",
         },
-        "fields_requiring_correction": [],
-        "required_exports_missing": [],
-        "exit_code": 0,
-        "timed_out": False,
-        "start_error": None,
-        "mapping_auto_detection_used": False,
-        "production_solve_started": False,
-        "mapping_comparison": {
-            "required_corrections": [],
-            "required_missing_exports": [],
-            "observations": [
-                {
-                    "role": "steady_flow_fields",
-                    "matched_relative_paths": ["observed.csv"],
-                    "delimiter_matches": True,
-                    "temporal_structure_error": None,
-                    "columns": {
-                        "x": {
-                            "declared_source_header": "x",
-                            "observed_exact_header_match": True,
-                        }
-                    },
-                }
-            ],
-        },
-        "actual_file_inventory": [
-            {
-                "relative_path": "observed.csv",
-                "sha256": "e" * 64,
-                "size_bytes": 1,
-            }
-        ],
+        "technical_smoke_contract_sha256": expected["technical_smoke_contract_sha256"],
+        "technical_smoke_campaign_id": expected["technical_smoke_campaign_id"],
+        "campaign_run_id": run_id,
+        "git_commit": git_commit,
+        "required_case_count": expected["required_case_count"],
+        "cases": cases,
+        "workflow_gate_sha256": "f" * 64,
     }
+    report["evidence_digest"] = generation.smoke.common.serialization.canonical_json_sha256(report)
+    return report
 
 
-def test_readiness_accepts_complete_profiles_with_matching_probe_evidence(
+def _write_smoke_evidence(storage: Path, report: dict[str, Any]) -> Path:
+    """Write one compact test evidence record under its canonical campaign path."""
+    path = storage / "01_generation/meta/campaigns" / report["campaign_run_id"] / "technical_smoke_evidence.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return path
+
+
+def _validated_case_summary(batch: Any, case_index: int) -> generation.smoke._CaseEvidence:
+    """Return one compact summary at the validated publication boundary."""
+    identity = case_index + 1
+    return generation.smoke._CaseEvidence(
+        record={
+            "case_id": batch.case_id(case_index),
+            "case_input_id": f"case-input-{identity}",
+            "simulation_case_id": f"{identity:064x}",
+            "hdf5": {"sha256": f"{identity + 10:064x}"},
+            "publication": {"provenance_sha256": f"{identity + 20:064x}"},
+        },
+        static={},
+        stationary_fixed={},
+        scalars={},
+        schedule=None,
+        global_values=None,
+        initial_state={},
+    )
+
+
+def _patch_finalizer_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    campaign: Any,
+    cases: dict[int, generation.smoke._CaseEvidence],
+) -> None:
+    """Provide compact successful lifecycle evidence to the real finalizer."""
+
+    def campaign_for_run(
+        _run_id: str,
+        *,
+        storage_root: Path | str | None = None,
+    ) -> Any:
+        assert storage_root is not None
+        return campaign
+
+    def validate_workflow(
+        _run_id: str,
+        *,
+        storage_root: Path | str | None = None,
+    ) -> dict[str, Any]:
+        assert storage_root is not None
+        return {
+            "cleanup_requested": False,
+            "cpu_cleanup_complete": {
+                "status": "skipped_by_request",
+                "evidence": None,
+            },
+            "workflow_gate_sha256": "f" * 64,
+        }
+
+    def validate_terminal(
+        _run_id: str,
+        *,
+        storage_root: Path | str | None = None,
+    ) -> dict[str, Any]:
+        assert storage_root is not None
+        return {"git_commit": "a" * 40}
+
+    def case_evidence(
+        _batch: Any,
+        case_index: int,
+        *,
+        storage: Path,
+    ) -> generation.smoke._CaseEvidence:
+        assert storage.is_dir()
+        try:
+            return cases[case_index]
+        except KeyError as error:
+            message = f"Required technical-smoke case {case_index} is not admissible."
+            raise FileNotFoundError(message) from error
+
+    monkeypatch.setattr(
+        generation.smoke.campaign_evidence,
+        "campaign_for_run",
+        campaign_for_run,
+    )
+    monkeypatch.setattr(
+        generation.smoke.workflow_service,
+        "validate_completed_workflow",
+        validate_workflow,
+    )
+    monkeypatch.setattr(
+        generation.smoke.campaign_runtime,
+        "validate_terminal_campaign",
+        validate_terminal,
+    )
+    monkeypatch.setattr(generation.smoke, "_case_evidence", case_evidence)
+
+
+def test_finalizer_atomically_publishes_and_reuses_complete_smoke_evidence(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise real finalization, immutable reuse, and stale-identity rejection."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        natural_count=2,
+        retain_raw_csv=True,
+        retain_solved_model=True,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    cases = {case_index: _validated_case_summary(batch, case_index) for case_index in batch.case_indices}
+    storage = tmp_path / "complete smoke storage"
+    storage.mkdir()
+    run_id = "synthetic-complete-smoke"
+    version_output = "COMSOL Multiphysics 6.4.0.293"
+    _patch_finalizer_dependencies(monkeypatch, campaign, cases)
+
+    atomic_paths: list[Path] = []
+    atomic_write_json = generation.smoke.common.serialization.atomic_write_json
+
+    def record_atomic_write(
+        destination: Path | str,
+        payload: Any,
+        *,
+        indent: int = 2,
+    ) -> Path:
+        atomic_paths.append(Path(destination).resolve())
+        return atomic_write_json(destination, payload, indent=indent)
+
+    monkeypatch.setattr(
+        generation.smoke.common.serialization,
+        "atomic_write_json",
+        record_atomic_write,
+    )
+    expected = generation.smoke.build_technical_smoke_evidence_context(
+        campaign.source_path,
+        comsol_version_output=version_output,
+    )
+
+    path = generation.smoke.finalize_technical_smoke_evidence(
+        run_id,
+        comsol_version_output=version_output,
+        storage_root=storage,
+    )
+    report = generation.smoke.load_technical_smoke_evidence(
+        path,
+        storage_root=storage,
+    )
+
+    assert atomic_paths == [path]
+    assert report["simulation_profile"] == campaign.profile.id
+    assert report["mapping_contract_sha256"] == expected["mapping_contract_sha256"]
+    assert report["template"]["sha256"] == expected["template_sha256"]
+    assert report["comsol"]["exact_version"] == expected["comsol_version"]
+    assert report["schema_kind"] == expected["verifier_schema_kind"]
+    assert report["schema_version"] == expected["verifier_schema_version"]
+    assert report["technical_smoke_campaign_id"] == campaign.campaign_id
+    assert report["technical_smoke_contract_sha256"] == campaign.campaign_digest
+    assert report["required_case_count"] == len(batch.case_indices)
+    assert [case["case_id"] for case in report["cases"]] == [cases[case_index].record["case_id"] for case_index in batch.case_indices]
+    assert [case["hdf5_sha256"] for case in report["cases"]] == [cases[case_index].record["hdf5"]["sha256"] for case_index in batch.case_indices]
+    assert [case["publication_provenance_sha256"] for case in report["cases"]] == [
+        cases[case_index].record["publication"]["provenance_sha256"] for case_index in batch.case_indices
+    ]
+    assert (
+        generation.smoke.evaluate_technical_smoke_evidence(
+            report,
+            expected,
+        )["valid"]
+        is True
+    )
+
+    original_bytes = path.read_bytes()
+    reused = generation.smoke.finalize_technical_smoke_evidence(
+        run_id,
+        comsol_version_output=version_output,
+        storage_root=storage,
+    )
+    assert reused == path
+    assert atomic_paths == [path]
+    assert path.read_bytes() == original_bytes
+
+    with pytest.raises(ValueError, match="COMSOL version changed"):
+        generation.smoke.finalize_technical_smoke_evidence(
+            run_id,
+            comsol_version_output="COMSOL Multiphysics 6.5.0.1",
+            storage_root=storage,
+        )
+    assert atomic_paths == [path]
+    assert path.read_bytes() == original_bytes
+
+
+def test_finalizer_publishes_nothing_for_an_incomplete_required_smoke(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed before evidence publication when one required case is absent."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        natural_count=2,
+        retain_raw_csv=True,
+        retain_solved_model=True,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    first_case = batch.case_indices[0]
+    cases = {first_case: _validated_case_summary(batch, first_case)}
+    storage = tmp_path / "partial smoke storage"
+    storage.mkdir()
+    run_id = "synthetic-partial-smoke"
+    version_output = "COMSOL Multiphysics 6.4.0.293"
+    _patch_finalizer_dependencies(monkeypatch, campaign, cases)
+
+    def reject_publication(*_args: Any, **_kwargs: Any) -> Path:
+        pytest.fail("Incomplete technical smoke reached evidence publication.")
+
+    monkeypatch.setattr(
+        generation.smoke.common.serialization,
+        "atomic_write_json",
+        reject_publication,
+    )
+    evidence_path = generation.smoke.technical_smoke_evidence_path(
+        run_id,
+        storage_root=storage,
+    )
+
+    with pytest.raises(FileNotFoundError, match="is not admissible"):
+        generation.smoke.finalize_technical_smoke_evidence(
+            run_id,
+            comsol_version_output=version_output,
+            storage_root=storage,
+        )
+
+    assert not evidence_path.exists()
+    status = generation.smoke.technical_smoke_evidence_status(
+        campaign.source_path,
+        storage_root=storage,
+        comsol_version_output=version_output,
+    )
+    assert status["status"] == "technical_smoke_evidence_missing"
+
+
+def test_readiness_accepts_complete_profiles_with_matching_smoke_evidence(
     tmp_path: Path,
 ) -> None:
-    """Protect the real-run regression where successful evidence must unblock mappings."""
+    """Require completed technical-smoke evidence without static verification state."""
     storage = tmp_path / "readiness storage"
     storage.mkdir()
     version_output = "COMSOL Multiphysics 6.4.0.293"
@@ -371,26 +391,14 @@ def test_readiness_accepts_complete_profiles_with_matching_probe_evidence(
         "steady_flow": Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
         "transient_drying": Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
     }
-    for profile_id, campaign_path in campaigns.items():
-        expected = mapping_probe.build_mapping_evidence_context(
+    for index, campaign_path in enumerate(campaigns.values()):
+        expected = generation.smoke.build_technical_smoke_evidence_context(
             campaign_path,
             comsol_version_output=version_output,
         )
-        root = storage / "01_generation/meta/mapping_probes" / f"{profile_id}-probe"
-        produced = root / "produced_files"
-        produced.mkdir(parents=True)
-        observed = produced / "observed.csv"
-        observed.write_bytes(profile_id.encode("utf-8"))
-        report = _successful_mapping_report(expected)
-        report["actual_file_inventory"][0].update(
-            {
-                "sha256": mapping_probe.common.serialization.file_sha256(observed),
-                "size_bytes": observed.stat().st_size,
-            }
-        )
-        (root / "mapping_probe.json").write_text(
-            __import__("json").dumps(report),
-            encoding="utf-8",
+        _write_smoke_evidence(
+            storage,
+            _successful_smoke_report(expected, run_id=f"technical-smoke-{index}"),
         )
 
     report = generation.readiness.build_readiness_report(
@@ -400,9 +408,9 @@ def test_readiness_accepts_complete_profiles_with_matching_probe_evidence(
         comsol_version_output=version_output,
     )
     assert report["profile_mapping_configuration_complete"] is True
-    assert report["mapping_evidence_complete"] is True
+    assert report["technical_smoke_evidence_complete"] is True
     assert report["profile_mapping_complete"] is True
-    assert all(evidence["status"] == "mapping_evidence_valid" for evidence in report["mapping_evidence"].values())
+    assert all(evidence["status"] == "technical_smoke_evidence_valid" for evidence in report["technical_smoke_evidence"].values())
 
 
 def test_mapping_contract_fingerprint_tracks_only_mapping_semantics(
@@ -441,71 +449,102 @@ def test_mapping_contract_fingerprint_tracks_only_mapping_semantics(
     assert mapping_contract.mapping_contract_sha256("transient_drying", unrelated) == original
 
 
-def test_mapping_evidence_validity_tuple_excludes_git_commit(
-    generation_config_factory: Any,
-) -> None:
-    """Bind evidence to semantics, template, COMSOL, and verifier but not commit."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    expected = mapping_probe.build_mapping_evidence_context(
-        config_path,
+def test_smoke_evidence_validity_tuple_excludes_git_commit() -> None:
+    """Bind evidence to semantics, template, COMSOL, verifier, and smoke contract."""
+    campaign = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
+    expected = generation.smoke.build_technical_smoke_evidence_context(
+        campaign,
         comsol_version_output="COMSOL Multiphysics 6.4.0.293",
     )
-    report = _successful_mapping_report(expected)
-    assert mapping_probe.evaluate_mapping_probe_report(report, expected)["valid"] is True
+    report = _successful_smoke_report(expected, run_id="steady-smoke")
+    assert generation.smoke.evaluate_technical_smoke_evidence(report, expected)["valid"] is True
 
     report["git_commit"] = "b" * 40
-    assert mapping_probe.evaluate_mapping_probe_report(report, expected)["valid"] is True
+    assert generation.smoke.evaluate_technical_smoke_evidence(report, expected)["valid"] is True
 
     variants = (
-        ("template", {"sha256": "c" * 64}, "template SHA-256 changed"),
+        ("template", {"relative_path": "template.mph", "sha256": "c" * 64}, "template SHA-256 changed"),
         ("mapping_contract_sha256", "d" * 64, "output mapping contract changed"),
         ("comsol", {"exact_version": "6.5.0.1", "version_output": "COMSOL 6.5.0.1"}, "COMSOL version changed"),
-        ("schema_version", mapping_probe.MAPPING_PROBE_SCHEMA_VERSION - 1, "verifier version differs"),
+        (
+            "schema_version",
+            generation.smoke.TECHNICAL_SMOKE_EVIDENCE_SCHEMA_VERSION + 1,
+            "technical-smoke verifier version differs",
+        ),
     )
     for key, value, reason in variants:
         changed = copy.deepcopy(report)
         changed[key] = value
-        result = mapping_probe.evaluate_mapping_probe_report(changed, expected)
+        result = generation.smoke.evaluate_technical_smoke_evidence(changed, expected)
         assert result["valid"] is False
         assert reason in result["reasons"]
 
 
-def test_mapping_evidence_requires_matching_successful_probe(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """Reproduce complete declarations becoming ready only from matching evidence."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+def test_smoke_evidence_requires_complete_success_and_is_profile_scoped(tmp_path: Path) -> None:
+    """Reject missing, failed, and partial evidence without coupling profiles."""
     storage = tmp_path / "evidence storage"
     storage.mkdir()
-    expected = mapping_probe.build_mapping_evidence_context(
-        config_path,
-        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+    version_output = "COMSOL Multiphysics 6.4.0.293"
+    steady_campaign = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
+    transient_campaign = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
+    expected = generation.smoke.build_technical_smoke_evidence_context(
+        steady_campaign,
+        comsol_version_output=version_output,
     )
-    missing = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
-    assert missing["status"] == "mapping_evidence_missing"
 
-    root = storage / "01_generation/meta/mapping_probes/probe-1"
-    produced = root / "produced_files"
-    produced.mkdir(parents=True)
-    observed = produced / "observed.csv"
-    observed.write_bytes(b"x")
-    report = _successful_mapping_report(expected)
-    report["actual_file_inventory"][0]["sha256"] = mapping_probe.common.serialization.file_sha256(observed)
-    (root / "mapping_probe.json").write_text(
-        __import__("json").dumps(report),
-        encoding="utf-8",
+    missing = generation.smoke.discover_technical_smoke_evidence(
+        storage_root=storage,
+        expected=expected,
     )
-    valid = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
-    assert valid["status"] == "mapping_evidence_valid"
+    assert missing["status"] == "technical_smoke_evidence_missing"
 
-    report["status"] = "mapping_update_required"
-    report["fields_requiring_correction"] = ["profile.yaml:exports[0].columns.x"]
-    report["mapping_comparison"]["required_corrections"] = report["fields_requiring_correction"]
-    (root / "mapping_probe.json").write_text(
-        __import__("json").dumps(report),
-        encoding="utf-8",
+    report = _successful_smoke_report(expected, run_id="steady-smoke")
+    path = _write_smoke_evidence(storage, report)
+    valid = generation.smoke.technical_smoke_evidence_status(
+        steady_campaign,
+        storage_root=storage,
+        comsol_version_output=version_output,
     )
-    failed = mapping_probe.discover_mapping_evidence(storage_root=storage, expected=expected)
-    assert failed["status"] == "mapping_evidence_invalid"
-    assert "probe status is 'mapping_update_required'" in failed["reason"]
+    assert valid["status"] == "technical_smoke_evidence_valid"
+    transient = generation.smoke.technical_smoke_evidence_status(
+        transient_campaign,
+        storage_root=storage,
+        comsol_version_output=version_output,
+    )
+    assert transient["status"] == "technical_smoke_evidence_missing"
+
+    report["status"] = "technical_smoke_failed"
+    report["evidence_digest"] = generation.smoke.common.serialization.canonical_json_sha256(
+        {key: value for key, value in report.items() if key != "evidence_digest"}
+    )
+    path.write_text(json.dumps(report), encoding="utf-8")
+    failed = generation.smoke.discover_technical_smoke_evidence(
+        storage_root=storage,
+        expected=expected,
+    )
+    assert failed["status"] == "technical_smoke_evidence_invalid"
+
+    report = _successful_smoke_report(expected, run_id="steady-smoke")
+    report["cases"].pop()
+    report["evidence_digest"] = generation.smoke.common.serialization.canonical_json_sha256(
+        {key: value for key, value in report.items() if key != "evidence_digest"}
+    )
+    path.write_text(json.dumps(report), encoding="utf-8")
+    partial = generation.smoke.discover_technical_smoke_evidence(
+        storage_root=storage,
+        expected=expected,
+    )
+    assert partial["status"] == "technical_smoke_evidence_invalid"
+    assert "every required case" in partial["reason"]
+
+
+@pytest.mark.parametrize(
+    ("version_output", "expected"),
+    [
+        ("COMSOL Multiphysics 6.4.0.293", "6.4.0.293"),
+        ("COMSOL 6.4.0", "6.4.0"),
+    ],
+)
+def test_exact_comsol_version_parser(version_output: str, expected: str) -> None:
+    """Keep exact runtime version identity independent of module naming."""
+    assert generation.smoke.parse_comsol_exact_version(version_output) == expected

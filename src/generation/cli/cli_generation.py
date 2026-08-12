@@ -44,7 +44,6 @@ from src.generation.publication import generation_publication_inventory as inven
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
 from src.generation.runtime import generation_runtime_comsol as comsol_service
-from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe_service
 from src.generation.runtime import generation_runtime_preflight as preflight_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
 from src.generation.validation import generation_validation_pilot as pilot_service
@@ -123,23 +122,21 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     readiness.add_argument("--storage-root", type=Path)
     readiness.add_argument("--comsol-version-output")
 
-    mapping_evidence = subparsers.add_parser(
-        "mapping-evidence-status",
-        help="query durable mapping-probe evidence for one complete campaign",
+    smoke_evidence = subparsers.add_parser(
+        "technical-smoke-evidence-status",
+        help="query successful technical-smoke evidence for one selected profile",
     )
-    mapping_evidence.add_argument("config", type=Path)
-    mapping_evidence.add_argument("--storage-root", type=Path, required=True)
-    mapping_evidence.add_argument("--comsol-version-output", required=True)
+    smoke_evidence.add_argument("config", type=Path)
+    smoke_evidence.add_argument("--storage-root", type=Path, required=True)
+    smoke_evidence.add_argument("--comsol-version-output", required=True)
 
-    mapping_probe = subparsers.add_parser(
-        "mapping-probe",
-        help="run one retained technical case and inventory actual COMSOL outputs",
+    finalize_profile_smoke = subparsers.add_parser(
+        "finalize-technical-smoke-evidence",
+        help="publish profile-scoped evidence after a complete technical smoke",
     )
-    mapping_probe.add_argument("config", type=Path)
-    _add_batch_selection(mapping_probe, required=False)
-    mapping_probe.add_argument("--storage-root", type=Path, required=True)
-    mapping_probe.add_argument("--work-root", type=Path, required=True)
-    mapping_probe.add_argument("--cores-per-case", type=int, required=True)
+    finalize_profile_smoke.add_argument("campaign_run_id")
+    finalize_profile_smoke.add_argument("--comsol-version-output", required=True)
+    finalize_profile_smoke.add_argument("--storage-root", type=Path, required=True)
 
     finalize_smoke = subparsers.add_parser(
         "finalize-real-smoke",
@@ -915,25 +912,22 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(report, sort_keys=True))
         return 0 if report["production_ready_for_user_launch"] else 2
-    if args.command == "mapping-evidence-status":
-        report = mapping_probe_service.mapping_evidence_status(
+    if args.command == "technical-smoke-evidence-status":
+        report = smoke_service.technical_smoke_evidence_status(
             args.config,
             storage_root=args.storage_root,
             comsol_version_output=args.comsol_version_output,
         )
         print(json.dumps(report, sort_keys=True))
-        return 0 if report["status"] == "mapping_evidence_valid" else 2
-    if args.command == "mapping-probe":
-        path = mapping_probe_service.run_mapping_probe(
-            args.config,
-            only_batch=args.only_batch,
+        return 0 if report["status"] == "technical_smoke_evidence_valid" else 2
+    if args.command == "finalize-technical-smoke-evidence":
+        path = smoke_service.finalize_technical_smoke_evidence(
+            args.campaign_run_id,
             storage_root=args.storage_root,
-            work_root=args.work_root,
-            cores_per_case=args.cores_per_case,
+            comsol_version_output=args.comsol_version_output,
         )
-        report = mapping_probe_service.load_mapping_probe(path)
-        print(json.dumps({"path": str(path), "report": report}, sort_keys=True))
-        return 0 if report["status"] == "mapping_observation_complete" and report["exit_code"] == 0 else 2
+        print(path)
+        return 0
     if args.command == "finalize-real-smoke":
         path = smoke_service.finalize_real_smoke(
             args.steady_campaign_run_id,

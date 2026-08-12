@@ -193,12 +193,13 @@ resolved JSON is the review surface for the exact work that `plan` will use.
 ./scripts/generation_workflow.sh smoke --keep-cpu-source
 ```
 
-The command queries durable mapping-probe evidence first. It runs only the
-profiles whose evidence is missing or stale, publishes successful probe reports,
-refreshes readiness immediately, and continues the same invocation. A mismatch,
-missing export, or COMSOL failure remains fail closed with exact observations;
-profile YAML is never changed automatically. A complete smoke always retains its
-CPU source for review.
+The command directly runs both maintained technical campaigns. Each case performs
+one real COMSOL solve, validates exact export files, delimiters, source headers,
+units and temporal structure, converts and admits canonical HDF5, and publishes
+the durable case result. Only after every required case for a profile and its
+complete workflow succeed does Generation atomically publish profile-scoped
+technical-smoke evidence. There is no preliminary duplicate verification solve. A complete
+smoke always retains its CPU source for review.
 
 5. Inspect the immutable real-smoke receipt printed by the smoke command:
 
@@ -323,8 +324,8 @@ configuration persist with generated artifacts.
 | 1 | Edit the authoritative YAML | User decisions only | Reviewed diff and clean commit before remote execution |
 | 2 | `validate-config ... --allow-incomplete` | Resolves all owners without solving | Counts, dimensions, roles, seeds, packages, OOD plan, template and exact gates |
 | 3 | `setup-cpu` then `preflight` | Bootstraps exact commit/venv; audits modules, executables, storage and Slurm | Successful setup and preflight reports |
-| 4 | `smoke` when mapping evidence is missing or stale | Runs only required retained one-case probes, persists evidence, and refreshes readiness | Successful evidence matching mapping contract, template, exact COMSOL version, and verifier version; same invocation continues |
-| 5 | `smoke` | Paired steady/transient native technical campaign, transfer, publication, packages and loader smokes | Source-current immutable real-smoke receipt; CPU source retained |
+| 4 | `smoke` | Runs both profile technical campaigns directly; validates exports, HDF5, admission, publication, packages, and loaders | Profile-scoped evidence matching smoke contract, mapping contract, template, exact COMSOL version, and verifier version; CPU source retained |
+| 5 | Inspect the paired diagnostic receipt | Revalidates paired airflow and mass-balance observations | Immutable cross-profile diagnostic receipt; not a production profile-coupling gate |
 | 6 | `benchmark-cores`, review, then edit `cluster.cores_per_case` | Four globally serial core settings with three round-robin solves each | Reviewed core-hour recommendation and a separate committed production-core decision |
 | 7 | `pilot-check .../pilot_check.yaml` | Six-material transient diagnostics and storage measurement | Accepted pilot receipt and reviewed diagnostics |
 | 8 | `all <production campaign>` | Preflight, plan, Slurm run, monitor, terminal validation, collection, package build, loader smokes and gated cleanup | Terminal all-workflow, transfer, Dataset, and cleanup receipts |
@@ -363,7 +364,7 @@ submit are shown for syntax and must run only after their gates are accepted.
 | `... setup-cpu --execute` | Creates/updates exact remote checkout, storage and venv | Mutates configured remote layout, no solve |
 | `... preflight CAMPAIGN` | Audits resolved config, native environment and resources | No solve or Slurm submission |
 | `... plan CAMPAIGN` | Prints exact paths and Slurm arguments | Read-only, fails closed on unresolved gates |
-| `... smoke` | Owns mapping probes when required, then paired native technical gate | Native/Slurm; always retains CPU source |
+| `... smoke` | Runs paired profile technical campaigns and publishes profile evidence plus paired diagnostics | Native/Slurm; always retains CPU source |
 | `... benchmark-cores [--variant ID]` | Runs isolated repeated same-case core scaling or retries one variant | Native/Slurm; benchmark metadata only, CPU evidence retained |
 | `... pilot-check configs/generation/campaigns/transient_drying/pilot_check.yaml` | Runs transient diagnostic lifecycle | Native/Slurm; cleans CPU/staging after validated analysis by default |
 | `... launch CAMPAIGN` | Submits one campaign and prints run ID | Native/Slurm primitive; does not perform full local lifecycle |
@@ -496,15 +497,16 @@ exact source headers, and units. Wide transient identity contains only the base
 never observed ``@ t=...`` values. Unrelated profile metadata and Git commits do
 not change this fingerprint.
 
-A successful report is current only when simulation profile,
-``mapping_contract_sha256``, template SHA-256, exact COMSOL runtime version, and
-mapping-probe schema/version all match. It must also record
-``mapping_observation_complete``, successful COMSOL execution, and empty
-required-correction and missing-export lists. Git commit and full profile-file
-SHA remain provenance, not validity gates. Template, mapping, COMSOL-version, or
-verifier-version changes require a new probe; unrelated commits do not.
+Successful profile evidence is current only when the simulation profile,
+``mapping_contract_sha256``, template SHA-256, exact COMSOL runtime version,
+technical-smoke verifier version, and canonical technical-smoke campaign digest
+all match. It records every required successful case only after export validation,
+HDF5 conversion and admission, publication, package construction, and loader
+smokes complete. Git commit remains provenance, not a validity gate. Template,
+mapping, COMSOL-version, verifier-version, or required smoke-contract changes
+require a new smoke; unrelated commits do not.
 
-Mapping probes inventory actual output files and headers. COMSOL Spreadsheet
+Technical smoke inventories actual output files and headers. COMSOL Spreadsheet
 exports carry a variable-length leading block of percent-prefixed metadata whose
 final compatible record is the column header. Native transient Data exports are
 wide tables: Generation parses each exact ``@ t=...`` descriptor, removes its
@@ -514,11 +516,15 @@ state arrays. Numeric ``t`` columns and repeated coordinates must agree with the
 header-owned state and authoritative grid. Global Time Series and Final Status
 tables may include runtime parameter columns and COMSOL ``Time``; Generation
 ignores those extras and maps only explicitly configured headers, including the
-distinct Generation-owned ``t`` field. Expected mappings remain explicit profile configuration, while verification
-comes only from immutable ``mapping_probe.json`` reports under
-``<STORAGE_ROOT>/01_generation/meta/mapping_probes/``. Generation never infers
-or writes a mapping automatically. Canonical HDF5/Dataset consumers remain
-independent of COMSOL's raw layout. Fixed values reported as template-owned have no Python runtime
+distinct Generation-owned ``t`` field. Expected mappings remain explicit profile
+configuration, while verification comes from immutable
+``technical_smoke_evidence.json`` records alongside their authoritative campaign
+metadata under ``<STORAGE_ROOT>/01_generation/meta/campaigns/<run_id>/``. A
+steady production operation queries only steady evidence; transient production
+queries only transient evidence, whose own contract includes its stationary
+airflow export. Generation never infers or writes a mapping automatically.
+Canonical HDF5/Dataset consumers remain independent of COMSOL's raw layout.
+Fixed values reported as template-owned have no Python runtime
 override; their configured record is bound to the canonical hashed template and
 model-report evidence. Case-dependent values use the admitted CLI vector and
 still require native runtime evidence.
@@ -543,7 +549,7 @@ the same nominal transient pilot case and proves the same case_input_id,
 simulation_case_id, fields, schedule, scalar handoff, scientific configuration,
 and template hash. Core count changes execution evidence only.
 
-After CPU setup and a source-current native technical-smoke receipt, run:
+After CPU setup and a current paired technical-smoke diagnostic receipt, run:
 
 ~~~bash
 ./scripts/generation_workflow.sh benchmark-cores \
@@ -653,9 +659,10 @@ Retained-source debugging form:
   --keep-cpu-source
 ```
 
-The lifecycle performs host preflight, exact commit/config/template binding, CPU
-readiness, a mapping probe when required, deterministic planning, scheduler
-execution and monitoring, terminal collection, hash validation, HDF5 conversion,
+The lifecycle performs host preflight, exact commit/config/template binding,
+requires current successful transient-profile technical-smoke evidence, then
+performs deterministic planning, scheduler execution and monitoring, terminal
+collection, hash validation, HDF5 conversion,
 runtime/physical/mass-balance/extrema/trend analysis, pre-cleanup CPU and staging
 measurement, permanent GPU measurement, and a storage projection against the
 separately resolved production campaign. It labels that projection
@@ -674,8 +681,8 @@ gate.
 
 ## Scheduler-fed production generation
 
-Production prerequisites are accepted source-current native COMSOL smoke and
-transient pilot gates. Static tests and template checksums do not imply that
+Production prerequisites are semantically current native COMSOL technical-smoke
+evidence for the selected profile and the applicable pilot gates. Static tests and template checksums do not imply that
 production has run.
 
 The execution owner is configs/generation/execution/cluster_cpu.yaml. Its
@@ -777,22 +784,25 @@ The report owns its status vocabulary and includes one structured record for
 each configuration, static-science, mapping, native-runtime, and launch gate.
 Treat its current JSON as authoritative; do not infer readiness from a template
 hash, a cached receipt, or documentation text. Launch is ready only when
-the resolved production configuration, static scientific checks, current
-mapping-probe evidence, native profile reloads, scalar handoff, paired-equivalence
-observations, HDF5/package/loader validation, and a source-current real-smoke
-receipt all pass. A template hash proves byte identity only; it does not prove
-model-tree behavior.
+the resolved production configuration, static scientific checks, and current
+successful technical-smoke evidence for the selected profile pass. That evidence
+is created only after native profile reloads, scalar handoff, export mapping,
+HDF5/package/loader validation, and publication all succeed. The combined smoke
+may additionally produce paired-equivalence observations, but steady production
+does not depend on transient evidence and transient production does not depend
+on an independent steady-profile record. A template hash proves byte identity
+only; it does not prove model-tree behavior.
 
 ## Troubleshooting
 
 - Exit status 2 from `validate-config` without `--allow-incomplete`, `plan`, or
   readiness means a fail-closed gate remains. Read the reported file and key;
   do not fill scientific values with CLI defaults.
-- If `smoke` stops after a mapping probe, review
-  `01_generation/meta/mapping_probes/<probe_id>/mapping_probe.json` and its
-  retained files on CPU storage. Correct explicit YAML declarations only when
-  the observed filenames or headers differ; a successful matching probe needs
-  no YAML edit, commit, setup rerun, or second smoke command.
+- If `smoke` fails, inspect the retained case failure and raw-export diagnostics.
+  They report the role, matched file, delimiter, raw and canonical headers, exact
+  per-field matches, parsed shape, and wide temporal groups where applicable.
+  Correct explicit YAML only when actual filenames or headers differ; failed or
+  partial smoke never publishes production evidence.
 - A dirty worktree or commit mismatch blocks remote planning and launch. Commit
   reviewed work outside this workflow, then rerun the same command.
 - Failed collection retains marked staging and CPU source. Use `status` and

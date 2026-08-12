@@ -2331,8 +2331,7 @@ def _scheduler_evidence(job_ids: Sequence[str]) -> dict[str, Any]:
         "squeue": [
             "squeue",
             "--noheader",
-            "--jobs",
-            selection,
+            f"--jobs={selection}",
             "--format=%i|%T|%R",
         ],
         "sacct": [

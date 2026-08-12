@@ -41,6 +41,7 @@ from typing import Any, Final
 from src import common
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_contract
+from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
@@ -135,7 +136,7 @@ _CASE_SUCCESS_KEYS: Final = frozenset(
     }
 )
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
-CASE_FAILURE_SCHEMA_VERSION = 1
+CASE_FAILURE_SCHEMA_VERSION = 2
 _CASE_FAILURE_KEYS = frozenset(
     {
         "schema_kind",
@@ -156,6 +157,7 @@ _CASE_FAILURE_KEYS = frozenset(
         "input_files",
         "template_sha256",
         "missing_or_invalid_artifacts",
+        "export_diagnostics",
         "log_tail",
         "retained_artifacts",
         "scratch_cleanup",
@@ -1484,6 +1486,80 @@ def _failure_execution_evidence(
     }
 
 
+def _failure_export_diagnostics(
+    config: config_contract.GenerationConfig,
+    work_directory: Path | None,
+) -> list[dict[str, Any]]:
+    """Return compact exact mapping observations before failed scratch cleanup."""
+    if work_directory is None:
+        return []
+    output_contract = config.scientific_values["output_contract"]
+    exports_root = work_directory / output_contract["exports_root"]
+    if not exports_root.is_dir() or exports_root.is_symlink():
+        return []
+    available = [path for path in sorted(exports_root.rglob("*")) if path.is_file() and not path.is_symlink()]
+    available_relative = [path.relative_to(exports_root).as_posix() for path in available]
+    diagnostics: list[dict[str, Any]] = []
+    for contract in output_contract["exports"]:
+        role = str(contract["role"])
+        pattern = contract.get("pattern")
+        matches = (
+            [] if not isinstance(pattern, str) else [path for path in sorted(exports_root.glob(pattern)) if path.is_file() and not path.is_symlink()]
+        )
+        observations: list[dict[str, Any]] = []
+        for candidate in matches:
+            try:
+                observation = spreadsheet_contract.validate_export_mapping_observation(
+                    candidate,
+                    delimiter=str(contract["delimiter"]),
+                    columns=contract["columns"],
+                    units=contract["units"],
+                    wide_temporal=role == profiles.TRANSIENT_RAW_EXPORT_ROLE,
+                )
+            except (OSError, TypeError, ValueError) as error:
+                fallback: dict[str, Any] = {
+                    "validation_error": str(error),
+                    "declared_delimiter": str(contract["delimiter"]),
+                    "expected_source_headers": list(contract["columns"].values()),
+                }
+                try:
+                    detected = spreadsheet_contract.detect_comsol_spreadsheet_delimiter(candidate)
+                    table = spreadsheet_contract.read_comsol_spreadsheet(
+                        candidate,
+                        delimiter=detected,
+                        include_values=False,
+                    )
+                except (OSError, ValueError) as fallback_error:
+                    fallback["observation_error"] = str(fallback_error)
+                else:
+                    fallback.update(
+                        {
+                            "detected_delimiter": detected,
+                            "raw_header": list(table.raw_header),
+                            "canonical_header": list(table.canonical_header),
+                            "parsed_shape": list(table.shape),
+                            "comsol_metadata": dict(table.metadata),
+                        }
+                    )
+                observation = fallback
+            observations.append(
+                {
+                    "relative_path": candidate.relative_to(exports_root).as_posix(),
+                    **observation,
+                }
+            )
+        diagnostics.append(
+            {
+                "role": role,
+                "declared_pattern": pattern,
+                "matched_relative_paths": [path.relative_to(exports_root).as_posix() for path in matches],
+                "available_relative_paths": available_relative,
+                "observations": observations,
+            }
+        )
+    return diagnostics
+
+
 def _failure_export_inventory(
     config: config_contract.GenerationConfig,
     work_directory: Path,
@@ -1632,6 +1708,7 @@ def record_case_failure(
             error,
             work_directory,
         ),
+        "export_diagnostics": _failure_export_diagnostics(config, work_directory),
         "log_tail": _failure_log_tail(work_directory),
         "retained_artifacts": _retain_failure_artifacts(
             config,
@@ -1811,6 +1888,25 @@ def case_failure_is_recorded(
     missing = payload.get("missing_or_invalid_artifacts")
     if not isinstance(missing, list) or not all(isinstance(item, str) and item for item in missing):
         msg = f"Case failure artifact evidence is invalid: {path}"
+        raise ValueError(msg)
+    export_diagnostics = payload.get("export_diagnostics")
+    if not isinstance(export_diagnostics, list) or any(
+        not isinstance(record, dict)
+        or set(record)
+        != {
+            "role",
+            "declared_pattern",
+            "matched_relative_paths",
+            "available_relative_paths",
+            "observations",
+        }
+        or not isinstance(record["role"], str)
+        or not isinstance(record["matched_relative_paths"], list)
+        or not isinstance(record["available_relative_paths"], list)
+        or not isinstance(record["observations"], list)
+        for record in export_diagnostics
+    ):
+        msg = f"Case failure export diagnostics are invalid: {path}"
         raise ValueError(msg)
     log_tail = payload.get("log_tail")
     if log_tail is not None and (

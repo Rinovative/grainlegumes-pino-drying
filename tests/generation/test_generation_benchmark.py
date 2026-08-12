@@ -89,6 +89,32 @@ def _success_record(suite: Any, variant: Any, repetition: int) -> dict[str, Any]
     }
 
 
+def test_benchmark_scheduler_query_attaches_optional_squeue_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use Slurm-compatible live selection while retaining sacct semantics."""
+    commands: list[list[str]] = []
+
+    def capture(command: list[str]) -> dict[str, str | None]:
+        commands.append(command)
+        return {"output": "", "error": None}
+
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_scheduler_command_evidence",
+        capture,
+    )
+    generation.benchmark._scheduler_evidence(["1002", "1003"])
+
+    assert commands[0] == [
+        "squeue",
+        "--noheader",
+        "--jobs=1002,1003",
+        "--format=%i|%T|%R",
+    ]
+    assert commands[1][3:5] == ["--jobs", "1002,1003"]
+
+
 def test_maintained_suite_is_config_owned_same_case_and_serially_isolated(tmp_path: Path) -> None:
     """Protect four YAML-owned variants, one shared case, and one measured solve at a time."""
     suite = _suite()

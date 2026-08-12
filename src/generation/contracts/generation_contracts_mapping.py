@@ -4,15 +4,15 @@ generation_contracts_mapping.py
 ===============================================================================
 Define the semantic identity of one resolved Generation export-mapping contract.
 Responsibilities:
-  - Select every resolved semantic input that runtime mapping evidence verifies
+  - Select every resolved semantic input that technical smoke verifies
   - Canonicalize ordered export roles, source declarations, fields, and units
-  - Derive the sole SHA-256 identity used to match mapping-probe evidence
+  - Derive the sole SHA-256 identity used to match runtime smoke evidence
 Design principles:
   - Mapping identity excludes unrelated profile metadata and source commits
   - Wide transient identity includes base fields, never observed time suffixes
   - Incomplete executable contracts fail before an identity is produced
 This module does NOT:
-  - Load YAML, inspect runtime files, execute COMSOL, or discover probe reports
+  - Load YAML, inspect runtime files, execute COMSOL, or discover smoke evidence
   - Decide whether runtime evidence is current
 ===============================================================================
 """

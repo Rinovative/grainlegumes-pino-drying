@@ -41,6 +41,7 @@ _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
     "--reservation",
 )
 _RUN_MANIFEST_SCHEMA_VERSION: Final = 2
+TECHNICAL_SMOKE_EVIDENCE_FILENAME: Final = "technical_smoke_evidence.json"
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -73,6 +74,7 @@ TRANSFER_OPERATIONAL_RECEIPTS: Final = frozenset(
         "cpu_source_cleanup.json",
         "dataset_packages_complete.json",
         "transfer_complete.json",
+        TECHNICAL_SMOKE_EVIDENCE_FILENAME,
     }
 )
 

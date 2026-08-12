@@ -127,7 +127,6 @@ def _compute_command(
         str(tmp_path / "campaign.yaml"),
         str(storage),
         "-",
-        "16",
         mode,
         "Python/3.10",
         "Comsol/v6.4",
@@ -216,43 +215,6 @@ def test_compute_preflight_is_independent_of_slurm_spool_location(tmp_path: Path
     for login_only in ("rsync", "sbatch", "squeue", "sacct", "scancel"):
         assert login_only not in evidence
     assert not tuple(scratch.iterdir())
-
-
-def test_mapping_probe_uses_canonical_venv_validation(tmp_path: Path) -> None:
-    """Validate the venv before the relocated mapping-probe path starts."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
-    scratch = tmp_path / "scratch"
-    storage = tmp_path / "storage"
-    scratch.mkdir()
-    storage.mkdir()
-    environment.update(
-        {
-            "SLURM_JOB_ID": "123",
-            "TMPDIR": str(scratch),
-            "GENERATION_GIT_COMMIT": _COMMIT,
-        }
-    )
-
-    result = subprocess.run(
-        _compute_command(
-            runtime_script,
-            repository,
-            venv,
-            tmp_path,
-            storage,
-            mode="mapping-probe",
-        ),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "Native CPU mapping-probe completed" in result.stdout
-    _assert_canonical_venv_validation(log)
 
 
 def test_login_preflight_requires_rsync_with_explicit_diagnostic(tmp_path: Path) -> None:

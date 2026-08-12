@@ -115,6 +115,30 @@ def _mock_local_gates(
     return storage, transfer, terminal, datasets_receipt
 
 
+def test_technical_smoke_receipt_does_not_change_campaign_transfer_identity(tmp_path: Path) -> None:
+    """Keep post-workflow profile evidence outside immutable transfer payload identity."""
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    (campaign / "campaign_terminal.json").write_text("{}\n", encoding="utf-8")
+    before = campaign_evidence.directory_identity(
+        campaign,
+        ignored_names=campaign_evidence.TRANSFER_OPERATIONAL_RECEIPTS,
+    )
+    (campaign / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        campaign_evidence.directory_identity(
+            campaign,
+            ignored_names=campaign_evidence.TRANSFER_OPERATIONAL_RECEIPTS,
+        )
+        == before
+    )
+    assert campaign_evidence.directory_identity(campaign) != before
+
+
 def test_all_receipt_records_distinct_gates_and_cleanup_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

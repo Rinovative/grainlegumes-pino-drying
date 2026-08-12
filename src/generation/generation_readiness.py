@@ -2,7 +2,7 @@
 ===============================================================================
 generation_readiness.py
 ===============================================================================
-Report fail-closed VP2 scientific, mapping, runtime, and launch readiness.
+Report fail-closed VP2 scientific, technical-smoke, and launch readiness.
 Responsibilities:
   - Resolve both configured primary campaigns without requiring launch values
   - Enumerate missing configured counts, seeds, memberships, and mappings
@@ -29,7 +29,6 @@ from src import common
 from . import generation_smoke as smoke_service
 from .cases import generation_cases_config as config_service
 from .contracts import generation_contracts_profiles as profiles
-from .runtime import generation_runtime_mapping_probe as mapping_probe_service
 from .validation import generation_validation_sentinels as sentinel_service
 
 _STATUS_COMPLETE: Final = "COMPLETE"
@@ -190,29 +189,29 @@ def build_readiness_report(
     mapping_missing = sorted({key for gate in gates for key in gate["missing_profile_mapping_keys"]})
     configuration_complete = not mapping_missing
 
-    mapping_evidence: dict[str, dict[str, Any]] = {}
+    technical_smoke_evidence: dict[str, dict[str, Any]] = {}
     for path_value, profile_id in zip(paths, expected_profiles, strict=True):
         if not configuration_complete:
-            mapping_evidence[profile_id] = {
+            technical_smoke_evidence[profile_id] = {
                 "status": "configuration_incomplete",
                 "reason": "required source patterns or source headers are missing",
                 "valid_report": None,
                 "inspected_reports": [],
             }
         elif storage_root is None or comsol_version_output is None:
-            mapping_evidence[profile_id] = {
-                "status": "mapping_evidence_missing",
+            technical_smoke_evidence[profile_id] = {
+                "status": "technical_smoke_evidence_missing",
                 "reason": "storage root and exact COMSOL version evidence were not provided",
                 "valid_report": None,
                 "inspected_reports": [],
             }
         else:
-            mapping_evidence[profile_id] = mapping_probe_service.mapping_evidence_status(
+            technical_smoke_evidence[profile_id] = smoke_service.technical_smoke_evidence_status(
                 path_value,
                 storage_root=storage_root,
                 comsol_version_output=comsol_version_output,
             )
-    mapping_evidence_complete = all(evidence["status"] == "mapping_evidence_valid" for evidence in mapping_evidence.values())
+    technical_smoke_evidence_complete = all(evidence["status"] == "technical_smoke_evidence_valid" for evidence in technical_smoke_evidence.values())
 
     static_report = None
     if run_static_sentinels:
@@ -235,14 +234,14 @@ def build_readiness_report(
             resolved_ownership_complete,
             primary_complete,
             configuration_complete,
-            mapping_evidence_complete,
+            technical_smoke_evidence_complete,
             static_complete,
             real_complete,
         )
     )
     return {
         "schema_kind": "vp2_production_readiness",
-        "schema_version": 2,
+        "schema_version": 3,
         "campaign_contracts": campaign_contracts,
         "campaign_ids": [campaign.campaign_id for campaign in campaigns],
         "campaign_config_resolution_complete": campaign_resolution_complete,
@@ -251,12 +250,12 @@ def build_readiness_report(
         "real_runtime_validation_complete": real_complete,
         "primary_production_config_complete": primary_complete,
         "profile_mapping_configuration_complete": configuration_complete,
-        "mapping_evidence_complete": mapping_evidence_complete,
-        "profile_mapping_complete": configuration_complete and mapping_evidence_complete,
+        "technical_smoke_evidence_complete": technical_smoke_evidence_complete,
+        "profile_mapping_complete": configuration_complete and technical_smoke_evidence_complete,
         "production_ready_for_user_launch": production_ready,
         "missing_primary_keys": primary_missing,
         "missing_profile_mapping_keys": mapping_missing,
-        "mapping_evidence": mapping_evidence,
+        "technical_smoke_evidence": technical_smoke_evidence,
         "real_runtime_receipt": (None if receipt_path is None else str(receipt_path)),
         "static_sentinel_report": static_report,
         "status_lines": [
@@ -265,7 +264,7 @@ def build_readiness_report(
             f"STATIC_GENERATOR_SENTINELS_{static_status}",
             (f"PRIMARY_PRODUCTION_CONFIG_{_STATUS_COMPLETE if primary_complete else _STATUS_INCOMPLETE}"),
             (f"PROFILE_MAPPING_CONFIGURATION_{_STATUS_COMPLETE if configuration_complete else _STATUS_INCOMPLETE}"),
-            (f"MAPPING_EVIDENCE_{_STATUS_COMPLETE if mapping_evidence_complete else _STATUS_PENDING}"),
+            (f"TECHNICAL_SMOKE_EVIDENCE_{_STATUS_COMPLETE if technical_smoke_evidence_complete else _STATUS_PENDING}"),
             (f"REAL_RUNTIME_VALIDATION_{_STATUS_COMPLETE if real_complete else _STATUS_PENDING}"),
             (f"PRODUCTION_READY_FOR_USER_LAUNCH_{_STATUS_COMPLETE if production_ready else _STATUS_BLOCKED}"),
         ],

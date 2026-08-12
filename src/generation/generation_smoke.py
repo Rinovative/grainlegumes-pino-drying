@@ -2,8 +2,10 @@
 ===============================================================================
 generation_smoke.py
 ===============================================================================
-Validate and bind one two-profile native technical runtime smoke.
+Validate, evidence, and compare native technical runtime smoke campaigns.
 Responsibilities:
+  - Publish profile-scoped evidence only after a complete technical workflow
+  - Match production readiness to semantic mapping, template, and runtime identity
   - Require contrasting terminal steady and transient Slurm cases
   - Bind retained inputs, exports, HDF5, packages, loaders, and source identities
   - Report paired airflow differences and transient mass-balance observations
@@ -11,7 +13,7 @@ Responsibilities:
 Design principles:
   - Existing campaign and all-workflow receipts remain the lifecycle authorities
   - Equivalence and mass balance are reported without invented pass tolerances
-  - Current source, template, mapping, material, and decision identities are bound
+  - Profile evidence excludes Git commit from its validity identity
 This module does NOT:
   - Run COMSOL, submit Slurm jobs, infer export mappings, or launch production
   - Treat a technical smoke as experimental validation of scientific priors
@@ -23,6 +25,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,7 +40,9 @@ from src import common, domain
 
 from . import generation_campaign as campaign_runtime
 from . import generation_workflow as workflow_service
+from .cases import generation_cases_config as config_service
 from .contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
+from .contracts import generation_contracts_mapping as mapping_contract
 from .contracts import generation_contracts_profiles as profiles
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .publication import generation_publication_storage as storage_service
@@ -49,10 +54,10 @@ from .runtime import generation_runtime_workspace as workspace_service
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .cases import generation_cases_config as config_service
-
 REAL_SMOKE_SCHEMA_KIND: Final = "vp2_real_runtime_smoke"
 REAL_SMOKE_SCHEMA_VERSION: Final = 1
+TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND: Final = "generation_technical_smoke_evidence"
+TECHNICAL_SMOKE_EVIDENCE_SCHEMA_VERSION: Final = 1
 TECHNICAL_SMOKE_PURPOSE: Final = "technical_runtime_smoke"
 _SHARED_FIELD_NAMES: Final = (
     *domain.fields.PERMEABILITY_FIELDS,
@@ -64,6 +69,27 @@ _MINIMUM_CONTRASTING_CASES: Final = 2
 _EXPECTED_PROFILE_COUNT: Final = 2
 _GIT_SHA_LENGTH: Final = 40
 _SHA256_LENGTH: Final = 64
+_COMSOL_EXACT_VERSION_PATTERN: Final = re.compile(r"(?<![0-9.])([0-9]+(?:[.][0-9]+){2,3})(?![0-9.])")
+_TECHNICAL_SMOKE_EVIDENCE_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "recorded_at",
+        "simulation_profile",
+        "mapping_contract_sha256",
+        "template",
+        "comsol",
+        "technical_smoke_contract_sha256",
+        "technical_smoke_campaign_id",
+        "campaign_run_id",
+        "git_commit",
+        "required_case_count",
+        "cases",
+        "workflow_gate_sha256",
+        "evidence_digest",
+    }
+)
 _RECEIPT_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -252,7 +278,7 @@ def _export_inventory(
     source_exports: Mapping[str, Mapping[str, Any]],
     output_contract: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Validate retained export bytes and report actual versus mapped headers."""
+    """Validate retained export bytes and report exact mapping observations."""
     contracts = {str(contract["role"]): contract for contract in output_contract["exports"]}
     actual = (
         {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file() and not path.is_symlink()}
@@ -276,28 +302,20 @@ def _export_inventory(
         if sha256 != identity.get("sha256") or size_bytes != identity.get("size_bytes"):
             message = f"Retained raw-export identity changed: {path}"
             raise RuntimeError(message)
-        expected_units = {source: str(contract["units"][logical]) for logical, source in contract["columns"].items()}
-        table = spreadsheet_contract.read_comsol_spreadsheet(
+        observation = spreadsheet_contract.validate_export_mapping_observation(
             path,
             delimiter=str(contract["delimiter"]),
-            expected_units=expected_units,
-            include_values=False,
+            columns=contract["columns"],
+            units=contract["units"],
+            wide_temporal=role == profiles.TRANSIENT_RAW_EXPORT_ROLE,
         )
-        header = list(table.canonical_header)
-        expected_sources = list(contract["columns"].values())
-        missing = sorted(set(expected_sources).difference(header))
-        if missing:
-            message = f"Export mapping for {role!r} is missing actual headers {missing}: {path}"
-            raise ValueError(message)
         records.append(
             {
                 "relative_path": relative_path,
                 "role": role,
                 "sha256": sha256,
                 "size_bytes": size_bytes,
-                "raw_header": list(table.raw_header),
-                "actual_header": header,
-                "configured_columns": dict(contract["columns"]),
+                **observation,
             }
         )
     return records
@@ -509,6 +527,391 @@ def _validate_campaign(
         message = f"Technical smoke {expected_profile!r} reused a simulation identity."
         raise RuntimeError(message)
     return campaign, terminal, workflow, cases
+
+
+def parse_comsol_exact_version(version_output: str) -> str:
+    """Return the exact COMSOL runtime version from bounded command output."""
+    if not isinstance(version_output, str) or not version_output.strip():
+        message = "COMSOL version output must be non-empty text."
+        raise ValueError(message)
+    versions = tuple(dict.fromkeys(_COMSOL_EXACT_VERSION_PATTERN.findall(version_output)))
+    if len(versions) != 1:
+        message = f"COMSOL version output must contain exactly one full runtime version; found {list(versions)}."
+        raise ValueError(message)
+    return versions[0]
+
+
+def _output_identity(campaign: config_service.CampaignConfig) -> tuple[str, str, str]:
+    """Return one profile, mapping, and template identity for a campaign."""
+    identities = {
+        (
+            batch.profile.id,
+            mapping_contract.mapping_contract_sha256(
+                batch.profile.id,
+                batch.scientific_values["output_contract"],
+            ),
+            batch.template_sha256,
+        )
+        for batch in campaign.batches
+    }
+    if len(identities) != 1:
+        message = "One campaign must resolve exactly one output mapping and template identity."
+        raise RuntimeError(message)
+    return next(iter(identities))
+
+
+def _technical_smoke_campaign_for(
+    campaign: config_service.CampaignConfig,
+) -> config_service.CampaignConfig:
+    """Resolve the unique maintained technical-smoke contract for one profile."""
+    if campaign.campaign_purpose == TECHNICAL_SMOKE_PURPOSE:
+        smoke = campaign
+    else:
+        candidates = [
+            candidate
+            for candidate in config_service.discover_campaign_configs(
+                common.paths.get_project_root(),
+                require_executable=True,
+            )
+            if candidate.campaign_purpose == TECHNICAL_SMOKE_PURPOSE and candidate.profile.id == campaign.profile.id
+        ]
+        if len(candidates) != 1:
+            message = (
+                "Production readiness requires exactly one maintained technical-smoke "
+                f"campaign for profile {campaign.profile.id!r}; discovered {len(candidates)}."
+            )
+            raise ValueError(message)
+        smoke = candidates[0]
+    valid_batch = len(smoke.batches) == 1 and smoke.batches[0].sampling_regime == "natural"
+    if not valid_batch or smoke.total_case_count < _MINIMUM_CONTRASTING_CASES:
+        message = f"Technical-smoke contract for profile {campaign.profile.id!r} must contain one natural batch with at least two required cases."
+        raise ValueError(message)
+    return smoke
+
+
+def build_technical_smoke_evidence_context(
+    campaign_path: Path | str,
+    *,
+    comsol_version_output: str,
+) -> dict[str, Any]:
+    """Resolve the profile-scoped identity required from technical-smoke evidence."""
+    campaign = config_service.load_campaign_config(campaign_path, require_executable=True)
+    smoke = _technical_smoke_campaign_for(campaign)
+    requested_identity = _output_identity(campaign)
+    smoke_identity = _output_identity(smoke)
+    if requested_identity != smoke_identity:
+        message = (
+            f"Current {campaign.profile.id!r} operation and its maintained technical smoke do not resolve the same mapping and template contract."
+        )
+        raise RuntimeError(message)
+    simulation_profile, contract_sha256, template_sha256 = requested_identity
+    return {
+        "simulation_profile": simulation_profile,
+        "mapping_contract_sha256": contract_sha256,
+        "template_sha256": template_sha256,
+        "comsol_version": parse_comsol_exact_version(comsol_version_output),
+        "verifier_schema_kind": TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND,
+        "verifier_schema_version": TECHNICAL_SMOKE_EVIDENCE_SCHEMA_VERSION,
+        "technical_smoke_contract_sha256": smoke.campaign_digest,
+        "technical_smoke_campaign_id": smoke.campaign_id,
+        "required_case_count": smoke.total_case_count,
+    }
+
+
+def evaluate_technical_smoke_evidence(
+    report: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Classify one technical-smoke evidence record against current semantics."""
+    if report.get("schema_kind") != TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND:
+        return {"valid": False, "classification": "malformed", "reasons": ["schema kind is invalid"]}
+    stale_reasons: list[str] = []
+    if report.get("schema_version") != expected.get("verifier_schema_version"):
+        stale_reasons.append("technical-smoke verifier version differs")
+    if report.get("simulation_profile") != expected.get("simulation_profile"):
+        stale_reasons.append("simulation profile differs")
+    if report.get("mapping_contract_sha256") != expected.get("mapping_contract_sha256"):
+        stale_reasons.append("output mapping contract changed")
+    template = report.get("template")
+    if not isinstance(template, Mapping) or template.get("sha256") != expected.get("template_sha256"):
+        stale_reasons.append("template SHA-256 changed")
+    comsol = report.get("comsol")
+    if not isinstance(comsol, Mapping) or comsol.get("exact_version") != expected.get("comsol_version"):
+        stale_reasons.append("COMSOL version changed")
+    if report.get("technical_smoke_contract_sha256") != expected.get("technical_smoke_contract_sha256"):
+        stale_reasons.append("technical-smoke campaign contract changed")
+    if report.get("technical_smoke_campaign_id") != expected.get("technical_smoke_campaign_id"):
+        stale_reasons.append("technical-smoke campaign identity changed")
+    if report.get("required_case_count") != expected.get("required_case_count"):
+        stale_reasons.append("technical-smoke required case count changed")
+    if stale_reasons:
+        return {"valid": False, "classification": "stale", "reasons": stale_reasons}
+    cases = report.get("cases")
+    failure_reasons: list[str] = []
+    if report.get("status") != "technical_smoke_complete":
+        failure_reasons.append(f"technical-smoke status is {report.get('status')!r}")
+    if not isinstance(cases, list) or len(cases) != expected.get("required_case_count"):
+        failure_reasons.append("technical-smoke evidence does not contain every required case")
+    elif any(
+        not isinstance(case, Mapping)
+        or set(case)
+        != {
+            "case_id",
+            "case_input_id",
+            "simulation_case_id",
+            "hdf5_sha256",
+            "publication_provenance_sha256",
+        }
+        or not isinstance(case.get("case_id"), str)
+        or not case.get("case_id")
+        or not isinstance(case.get("case_input_id"), str)
+        or not case.get("case_input_id")
+        or not isinstance(case.get("simulation_case_id"), str)
+        or not case.get("simulation_case_id")
+        or re.fullmatch(r"[0-9a-f]{64}", str(case.get("hdf5_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(case.get("publication_provenance_sha256"))) is None
+        for case in cases
+    ):
+        failure_reasons.append("technical-smoke case success evidence is malformed")
+    elif (
+        len({str(case["case_id"]) for case in cases}) != len(cases)
+        or len({str(case["case_input_id"]) for case in cases}) != len(cases)
+        or len({str(case["simulation_case_id"]) for case in cases}) != len(cases)
+    ):
+        failure_reasons.append("technical-smoke case success identities are not unique")
+    if failure_reasons:
+        return {"valid": False, "classification": "failed", "reasons": failure_reasons}
+    return {"valid": True, "classification": "valid", "reasons": []}
+
+
+def technical_smoke_evidence_path(
+    campaign_run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Return the canonical profile evidence path alongside campaign metadata."""
+    return (
+        campaign_evidence.campaign_run_directory(
+            campaign_run_id,
+            storage_root=storage_root,
+        )
+        / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME
+    )
+
+
+def load_technical_smoke_evidence(
+    path: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load one self-digested immutable technical-smoke evidence record."""
+    evidence_path = Path(path).expanduser().resolve()
+    report = _json_object(evidence_path, label="technical-smoke evidence")
+    if set(report) != _TECHNICAL_SMOKE_EVIDENCE_KEYS:
+        message = f"Technical-smoke evidence schema is invalid: {evidence_path}"
+        raise ValueError(message)
+    run_id = report.get("campaign_run_id")
+    if not isinstance(run_id, str):
+        message = f"Technical-smoke evidence campaign-run identity is malformed: {evidence_path}"
+        raise TypeError(message)
+    if storage_root is not None and evidence_path != technical_smoke_evidence_path(run_id, storage_root=storage_root):
+        message = f"Technical-smoke evidence is outside its canonical campaign path: {evidence_path}"
+        raise ValueError(message)
+    template = report.get("template")
+    comsol = report.get("comsol")
+    cases = report.get("cases")
+    if (
+        report.get("schema_kind") != TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND
+        or not isinstance(report.get("schema_version"), int)
+        or isinstance(report.get("schema_version"), bool)
+        or not isinstance(report.get("status"), str)
+        or not isinstance(report.get("recorded_at"), str)
+        or not report.get("recorded_at")
+        or not isinstance(report.get("simulation_profile"), str)
+        or not report.get("simulation_profile")
+        or re.fullmatch(r"[0-9a-f]{64}", str(report.get("mapping_contract_sha256"))) is None
+        or not isinstance(template, dict)
+        or not isinstance(template.get("relative_path"), str)
+        or not template.get("relative_path")
+        or re.fullmatch(r"[0-9a-f]{64}", str(template.get("sha256"))) is None
+        or not isinstance(comsol, dict)
+        or set(comsol) != {"exact_version", "version_output"}
+        or not isinstance(comsol.get("exact_version"), str)
+        or not isinstance(comsol.get("version_output"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(report.get("technical_smoke_contract_sha256"))) is None
+        or not isinstance(report.get("technical_smoke_campaign_id"), str)
+        or not report.get("technical_smoke_campaign_id")
+        or re.fullmatch(r"[0-9a-f]{40}", str(report.get("git_commit"))) is None
+        or not isinstance(report.get("required_case_count"), int)
+        or isinstance(report.get("required_case_count"), bool)
+        or report.get("required_case_count", 0) < _MINIMUM_CONTRASTING_CASES
+        or not isinstance(cases, list)
+        or re.fullmatch(r"[0-9a-f]{64}", str(report.get("workflow_gate_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(report.get("evidence_digest"))) is None
+    ):
+        message = f"Technical-smoke evidence fields are malformed: {evidence_path}"
+        raise ValueError(message)
+    try:
+        reported_version = parse_comsol_exact_version(comsol["version_output"])
+    except ValueError as error:
+        message = f"Technical-smoke COMSOL version evidence is malformed: {evidence_path}"
+        raise ValueError(message) from error
+    if reported_version != comsol["exact_version"]:
+        message = f"Technical-smoke COMSOL version evidence disagrees internally: {evidence_path}"
+        raise ValueError(message)
+    payload = dict(report)
+    observed_digest = payload.pop("evidence_digest")
+    if common.serialization.canonical_json_sha256(payload) != observed_digest:
+        message = f"Technical-smoke evidence self-digest is invalid: {evidence_path}"
+        raise RuntimeError(message)
+    return report
+
+
+def discover_technical_smoke_evidence(
+    *,
+    storage_root: Path | str,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Find current evidence for one profile using a bounded campaign scan."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
+    if not root.is_dir() or root.is_symlink():
+        return {
+            "status": "technical_smoke_evidence_missing",
+            "reason": "no safe Generation campaign-evidence directory exists",
+            "valid_report": None,
+            "inspected_reports": [],
+        }
+    candidates = tuple(
+        sorted(
+            (
+                directory / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME
+                for directory in root.iterdir()
+                if directory.is_dir() and not directory.is_symlink() and (directory / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME).is_file()
+            ),
+            reverse=True,
+        )
+    )
+    inspected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            report = load_technical_smoke_evidence(candidate, storage_root=storage)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            inspected.append({"path": str(candidate), "classification": "malformed", "reasons": [str(error)]})
+            continue
+        if report.get("simulation_profile") != expected.get("simulation_profile"):
+            continue
+        evaluation = evaluate_technical_smoke_evidence(report, expected)
+        inspected.append({"path": str(candidate), **evaluation})
+        if evaluation["valid"]:
+            return {
+                "status": "technical_smoke_evidence_valid",
+                "reason": None,
+                "valid_report": str(candidate),
+                "inspected_reports": inspected,
+            }
+    relevant = [record for record in inspected if record.get("classification") != "malformed"]
+    if not relevant:
+        status = "technical_smoke_evidence_missing"
+        reason = "no completed technical-smoke evidence exists for the current simulation profile"
+    else:
+        status = (
+            "technical_smoke_evidence_invalid"
+            if any(record["classification"] == "failed" for record in relevant)
+            else "technical_smoke_evidence_stale"
+        )
+        reason = "; ".join(dict.fromkeys(reason for record in relevant for reason in record["reasons"]))
+    return {
+        "status": status,
+        "reason": reason,
+        "valid_report": None,
+        "inspected_reports": inspected,
+    }
+
+
+def technical_smoke_evidence_status(
+    campaign_path: Path | str,
+    *,
+    storage_root: Path | str,
+    comsol_version_output: str,
+) -> dict[str, Any]:
+    """Return current technical-smoke evidence status for one selected profile."""
+    expected = build_technical_smoke_evidence_context(
+        campaign_path,
+        comsol_version_output=comsol_version_output,
+    )
+    return {
+        "expected_identity": expected,
+        **discover_technical_smoke_evidence(storage_root=storage_root, expected=expected),
+    }
+
+
+def finalize_technical_smoke_evidence(
+    campaign_run_id: str,
+    *,
+    comsol_version_output: str,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Publish evidence only after every required technical-smoke case succeeds."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    declared = campaign_evidence.campaign_for_run(campaign_run_id, storage_root=storage)
+    campaign, terminal, workflow, cases = _validate_campaign(
+        campaign_run_id,
+        expected_profile=declared.profile.id,
+        storage=storage,
+    )
+    expected = build_technical_smoke_evidence_context(
+        campaign.source_path,
+        comsol_version_output=comsol_version_output,
+    )
+    if len(cases) != expected["required_case_count"]:
+        message = "Completed technical-smoke evidence does not cover every required campaign case."
+        raise RuntimeError(message)
+    path = technical_smoke_evidence_path(campaign_run_id, storage_root=storage)
+    if path.exists():
+        report = load_technical_smoke_evidence(path, storage_root=storage)
+        evaluation = evaluate_technical_smoke_evidence(report, expected)
+        if not evaluation["valid"]:
+            message = f"Existing immutable technical-smoke evidence is not current: {evaluation['reasons']}"
+            raise ValueError(message)
+        return path
+    payload: dict[str, Any] = {
+        "schema_kind": TECHNICAL_SMOKE_EVIDENCE_SCHEMA_KIND,
+        "schema_version": TECHNICAL_SMOKE_EVIDENCE_SCHEMA_VERSION,
+        "status": "technical_smoke_complete",
+        "recorded_at": _utc_now(),
+        "simulation_profile": expected["simulation_profile"],
+        "mapping_contract_sha256": expected["mapping_contract_sha256"],
+        "template": {
+            "relative_path": campaign.profile.template_relative_path,
+            "sha256": expected["template_sha256"],
+        },
+        "comsol": {
+            "exact_version": expected["comsol_version"],
+            "version_output": comsol_version_output[:4096],
+        },
+        "technical_smoke_contract_sha256": expected["technical_smoke_contract_sha256"],
+        "technical_smoke_campaign_id": expected["technical_smoke_campaign_id"],
+        "campaign_run_id": campaign_run_id,
+        "git_commit": terminal["git_commit"],
+        "required_case_count": expected["required_case_count"],
+        "cases": [
+            {
+                "case_id": case.record["case_id"],
+                "case_input_id": case.record["case_input_id"],
+                "simulation_case_id": case.record["simulation_case_id"],
+                "hdf5_sha256": case.record["hdf5"]["sha256"],
+                "publication_provenance_sha256": case.record["publication"]["provenance_sha256"],
+            }
+            for case in cases
+        ],
+        "workflow_gate_sha256": workflow["workflow_gate_sha256"],
+    }
+    payload["evidence_digest"] = common.serialization.canonical_json_sha256(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    common.serialization.atomic_write_json(path, payload)
+    load_technical_smoke_evidence(path, storage_root=storage)
+    return path
 
 
 def _array_identity(value: np.ndarray) -> dict[str, Any]:

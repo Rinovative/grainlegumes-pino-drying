@@ -3,6 +3,7 @@
 # ================================
 /mlenv/
 /.claude/
+/.codex/
 /_llm_workflow/
 /AGENTS.md
 /DEVELOPMENT_STYLE.md
@@ -25,7 +26,6 @@ __pycache__/
 .coverage
 .coverage.*
 htmlcov/
-
 # ================================
 # Jupyter notebook checkpoints
 # ================================
@@ -53,7 +53,6 @@ dist/
 # ================================
 *.tar.gz
 *.pid
-
 # ================================
 # Generated data
 # ================================

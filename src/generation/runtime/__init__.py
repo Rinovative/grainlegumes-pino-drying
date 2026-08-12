@@ -5,7 +5,6 @@ Provides:
 - batch: single-case execution and terminal batch admission
 - cluster: scheduler planning and submission
 - comsol: fixed COMSOL command and workspace-name conventions
-- mapping_probe: native template-mapping probes
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
 - workspace: bounded scratch and publication staging
@@ -60,7 +59,6 @@ if TYPE_CHECKING:
     from . import generation_runtime_batch as batch
     from . import generation_runtime_cluster as cluster
     from . import generation_runtime_comsol as comsol
-    from . import generation_runtime_mapping_probe as mapping_probe
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
     from . import generation_runtime_workspace as workspace
@@ -112,7 +110,6 @@ _MODULES = {
     "batch": "generation_runtime_batch",
     "cluster": "generation_runtime_cluster",
     "comsol": "generation_runtime_comsol",
-    "mapping_probe": "generation_runtime_mapping_probe",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
     "workspace": "generation_runtime_workspace",
@@ -196,7 +193,6 @@ __all__ = [
     "execute_prepared_case",
     "finalize_batch",
     "initialize_batch_metadata",
-    "mapping_probe",
     "preflight",
     "preparation",
     "prepare_case_work_directory",

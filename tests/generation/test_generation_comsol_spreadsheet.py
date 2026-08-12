@@ -9,11 +9,12 @@ from typing import Any
 
 import numpy as np
 import pytest
-import yaml
 
+from src import common
+from src.generation import generation_smoke as smoke
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet
 from src.generation.publication import generation_publication_storage as storage
-from src.generation.runtime import generation_runtime_mapping_probe as mapping_probe
+from src.generation.runtime import generation_runtime_batch as runtime_batch
 
 _STEADY_RAW_HEADER = (
     "x (m)",
@@ -205,54 +206,62 @@ def test_comment_after_numeric_data_fails_clearly(tmp_path: Path) -> None:
         )
 
 
-def test_all_export_roles_use_unit_aware_exact_mapping(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cover long Data metadata and shorter Table metadata for every role."""
-    monkeypatch.setattr(mapping_probe.common.paths, "get_project_root", lambda: tmp_path)
-    profile = {
-        "schema_kind": "generation_profile",
-        "schema_version": 2,
-        "simulation_profile": "transient_drying",
-        "steady_flow_conditioning": None,
-        "exports": [
-            {
-                "role": "steady_flow_fields",
-                "temporal_kind": "stationary",
-                "source": "steady.csv",
-                "delimiter": ",",
-                "columns": {"x": "x", "p": "p"},
+def test_all_export_roles_use_unit_aware_exact_mapping(tmp_path: Path) -> None:
+    """Retain exact technical-smoke observations for every export role."""
+    contracts = [
+        {
+            "role": "steady_flow_fields",
+            "temporal_kind": "stationary",
+            "pattern": "steady.csv",
+            "delimiter": ",",
+            "columns": {"x": "x", "p": "p"},
+            "units": {"x": "m", "p": "Pa"},
+        },
+        {
+            "role": "transient_fields",
+            "temporal_kind": "regular_time_series",
+            "pattern": "transient.csv",
+            "delimiter": ",",
+            "columns": {
+                "t": "t",
+                "x": "x",
+                "y": "y",
+                "T": "T",
+                "phi": "mt.phi",
+                "w_surf": "w_surf",
+                "w_int": "w_int",
             },
-            {
-                "role": "transient_fields",
-                "temporal_kind": "regular_time_series",
-                "source": "transient.csv",
-                "delimiter": ",",
-                "columns": {"t": "t", "T": "T", "phi": "mt.phi"},
+            "units": {
+                "t": "h",
+                "x": "m",
+                "y": "m",
+                "T": "K",
+                "phi": "1",
+                "w_surf": "kg/m^3",
+                "w_int": "kg/m^3",
             },
-            {
-                "role": "global_time_series",
-                "temporal_kind": "regular_time_series",
-                "source": "globals.csv",
-                "delimiter": ",",
-                "columns": {"t": "t", "X_wb_bulk": "X_wb_bulk", "T_out_mean": "T_out_mean"},
+        },
+        {
+            "role": "global_time_series",
+            "temporal_kind": "regular_time_series",
+            "pattern": "globals.csv",
+            "delimiter": ",",
+            "columns": {"t": "t", "X_wb_bulk": "X_wb_bulk", "T_out_mean": "T_out_mean"},
+            "units": {"t": "h", "X_wb_bulk": "1", "T_out_mean": "K"},
+        },
+        {
+            "role": "final_status",
+            "temporal_kind": "final_status",
+            "pattern": "final.csv",
+            "delimiter": ",",
+            "columns": {
+                "t_final": "t_final",
+                "T_max_final": "T_max_final",
+                "phi_min_final": "phi_min_final",
             },
-            {
-                "role": "final_status",
-                "temporal_kind": "final_status",
-                "source": "final.csv",
-                "delimiter": ",",
-                "columns": {
-                    "t_final": "t_final",
-                    "T_max_final": "T_max_final",
-                    "phi_min_final": "phi_min_final",
-                },
-            },
-        ],
-    }
-    profile_path = tmp_path / "profile.yaml"
-    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+            "units": {"t_final": "h", "T_max_final": "K", "phi_min_final": "1"},
+        },
+    ]
     exports = {
         "steady.csv": """% Model,model.mph
 % Dimension,2
@@ -265,9 +274,9 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
         "transient.csv": """% Model,model.mph
 % Dimension,2
 % Nodes,1
-% Expressions,3
-% t (h) @ t=0,T (K) @ t=0,mt.phi (1) @ t=0
-0,296,0.5
+% Expressions,7
+% t (h) @ t=0,x (m) @ t=0,y (m) @ t=0,T (K) @ t=0,mt.phi (1) @ t=0,w_surf (kg/m^3) @ t=0,w_int (kg/m^3) @ t=0
+0,0,0,296,0.5,1,2
 """,
         "globals.csv": """% Model,model.mph
 % Expressions,4
@@ -279,39 +288,70 @@ def test_all_export_roles_use_unit_aware_exact_mapping(
 0,1,295,0.4
 """,
     }
-    inventory = []
+    source_exports = {}
+    roles = {contract["pattern"]: contract["role"] for contract in contracts}
     for name, content in exports.items():
         path = tmp_path / name
         path.write_text(content, encoding="utf-8")
-        inventory.append({"relative_path": name, "table": mapping_probe._table_observation(path)})
+        source_exports[name] = {
+            "role": roles[name],
+            "sha256": common.serialization.file_sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
 
-    comparison = mapping_probe._mapping_comparison(
-        mapping_probe._profile_mapping(profile_path),
-        inventory,
-        profile_path=profile_path,
+    observations = smoke._export_inventory(
+        tmp_path,
+        source_exports,
+        {"exports": contracts},
     )
 
-    assert comparison["required_corrections"] == []
-    assert comparison["required_missing_exports"] == []
-    assert (
-        mapping_probe._mapping_probe_status(
-            comparison,
-            exit_code=0,
-            timed_out=False,
-            start_error=None,
-        )
-        == "mapping_observation_complete"
-    )
-    assert [observation["role"] for observation in comparison["observations"]] == [
+    assert [observation["role"] for observation in observations] == [
+        "final_status",
+        "global_time_series",
         "steady_flow_fields",
         "transient_fields",
-        "global_time_series",
-        "final_status",
     ]
-    for observation in comparison["observations"]:
+    for observation in observations:
         assert observation["raw_header"]
-        assert observation["canonical_header"] == observation["observed_header"]
         assert observation["parsed_shape"][0] == 1
+        assert all(column["observed_exact_header_match"] for column in observation["columns"].values())
+    transient = next(observation for observation in observations if observation["role"] == "transient_fields")
+    assert transient["canonical_header"] == ["t", "x", "y", "T", "mt.phi", "w_surf", "w_int"]
+    assert transient["temporal_group_count"] == 1
+    assert transient["temporal_state_times"] == [0.0]
+
+
+def test_failed_case_diagnostics_retain_actual_header_and_exact_error(tmp_path: Path) -> None:
+    """Explain mapping failures without retaining or manually opening a large export."""
+    exports_root = tmp_path / "exports"
+    exports_root.mkdir()
+    path = exports_root / "steady.csv"
+    path.write_text("wrong (m),p (Pa)\n0,1\n", encoding="utf-8")
+    config: Any = SimpleNamespace(
+        profile=SimpleNamespace(id="steady_flow"),
+        scientific_values={
+            "output_contract": {
+                "exports_root": "exports",
+                "exports": [
+                    {
+                        "role": "steady_flow_fields",
+                        "pattern": "steady.csv",
+                        "delimiter": ",",
+                        "columns": {"x": "x", "p": "p"},
+                        "units": {"x": "m", "p": "Pa"},
+                    }
+                ],
+            }
+        },
+    )
+
+    diagnostics = runtime_batch._failure_export_diagnostics(config, tmp_path)
+
+    observation = diagnostics[0]["observations"][0]
+    assert diagnostics[0]["matched_relative_paths"] == ["steady.csv"]
+    assert observation["raw_header"] == ["wrong (m)", "p (Pa)"]
+    assert observation["parsed_shape"] == [1, 2]
+    assert "missing explicitly configured headers ['x']" in observation["validation_error"]
 
 
 _TEMPORAL_UNITS = {

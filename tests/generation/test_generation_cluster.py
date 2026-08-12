@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,181 @@ def test_one_case_submission_and_local_only_concurrency(
     assert plan.effective_parallel_cases == 2
     assert not hasattr(plan, "max_nodes")
     assert not hasattr(plan, "cases_per_node")
+
+
+def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise first submission and exact persisted-job reconciliation."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=3,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    commit = "8" * 40
+    storage = tmp_path / "storage"
+    calls: list[list[str]] = []
+    submitted_ids = iter(("12345", "12346"))
+    scheduler_mode = {"value": "active"}
+
+    def fake_scheduler(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        arguments = list(command)
+        calls.append(arguments)
+        if arguments[0] == "sbatch":
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=f"{next(submitted_ids)}\n",
+                stderr="",
+            )
+        if arguments[0] == "squeue":
+            assert arguments == [
+                "squeue",
+                "--noheader",
+                "--jobs=12345",
+                "--format=%i|%T|%R|%N",
+            ]
+            output = "12345|PENDING|Resources|\n" if scheduler_mode["value"] == "active" else ""
+            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+        if arguments[0] == "sacct":
+            assert arguments == [
+                "sacct",
+                "--noheader",
+                "--parsable2",
+                "--jobs",
+                "12345",
+                "--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,NodeList,AllocCPUS,Partition",
+            ]
+            output = "" if scheduler_mode["value"] == "active" else "12345|COMPLETED|0:0\n"
+            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_scheduler)
+
+    first = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    assert first["slurm_job_ids"] == ["12345"]
+    assert [command[0] for command in calls] == ["sbatch"]
+    persisted = campaign_evidence.load_campaign_run(
+        first["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert persisted["submissions"][0]["job_id"] == "12345"
+
+    active = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    assert active["slurm_job_ids"] == ["12345"]
+    assert [command[0] for command in calls].count("sbatch") == 1
+
+    scheduler_mode["value"] = "completed"
+    first_case = tasks[0]
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) == (first_case.batch_name, first_case.case_index),
+    )
+    advanced = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    assert advanced["slurm_job_ids"] == ["12345", "12346"]
+    assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
+
+
+def test_scheduler_queries_support_multiple_ids_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attach optional squeue selections and preserve genuine query failures."""
+    commands: list[list[str]] = []
+
+    def capture(command: list[str]) -> tuple[str, str | None]:
+        commands.append(command)
+        return "", None
+
+    monkeypatch.setattr(generation.campaign, "_scheduler_output", capture)
+    empty = generation.campaign._scheduler_evidence([])
+    assert empty["squeue"]["command"] == []
+    assert commands == []
+
+    evidence = generation.campaign._scheduler_evidence(["123", "124"])
+    assert commands == [
+        ["squeue", "--noheader", "--jobs=123,124", "--format=%i|%T|%R|%N"],
+        [
+            "sacct",
+            "--noheader",
+            "--parsable2",
+            "--jobs",
+            "123,124",
+            "--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,NodeList,AllocCPUS,Partition",
+        ],
+    ]
+    generation.campaign._require_scheduler_evidence(evidence)
+
+    for failed_owner in ("squeue", "sacct"):
+
+        def fail_query(
+            command: list[str],
+            *,
+            owner: str = failed_owner,
+        ) -> tuple[str, str | None]:
+            return ("", "synthetic scheduler failure") if command[0] == owner else ("", None)
+
+        monkeypatch.setattr(generation.campaign, "_scheduler_output", fail_query)
+        failed = generation.campaign._scheduler_evidence(["123"])
+        with pytest.raises(RuntimeError, match=rf"{failed_owner} failed: synthetic scheduler failure"):
+            generation.campaign._require_scheduler_evidence(failed)
+
+
+def test_malformed_persisted_job_id_fails_before_scheduler_query(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject non-numeric durable job identity without querying Slurm."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    commit = "7" * 40
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: "123")
+    manifest = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    path = campaign_evidence.campaign_run_manifest_path(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["slurm_job_ids"] = ["123 --all"]
+    payload["submissions"][0]["job_id"] = "123 --all"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_output",
+        lambda _command: pytest.fail("malformed persisted identity reached scheduler query"),
+    )
+
+    with pytest.raises(ValueError, match="submission state is malformed"):
+        generation.campaign.feed_campaign(
+            manifest["campaign_run_id"],
+            storage_root=storage,
+        )
 
 
 def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
@@ -314,8 +490,10 @@ def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
         if any(argument == f"--name={job_name}" for argument in command):
             return "98765|PENDING|Resources", None
         if command[0] == "squeue":
+            assert "--jobs=98765" in command
             return "98765|PENDING|Resources|", None
         if command[0] == "sacct":
+            assert command[3:5] == ["--jobs", "98765"]
             return "", None
         raise AssertionError(command)
 

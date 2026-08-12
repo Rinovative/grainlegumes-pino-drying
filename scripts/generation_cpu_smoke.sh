@@ -1,9 +1,9 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 12 )); then
+if (( $# != 11 )); then
   printf '%s\n' \
-    "Usage: $0 REPOSITORY VENV CAMPAIGN STORAGE ONLY_BATCH CORES_PER_CASE MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER" >&2
+    "Usage: $0 REPOSITORY VENV CAMPAIGN STORAGE ONLY_BATCH MODE PYTHON_MODULE COMSOL_MODULE PYTHON_EXECUTABLE COMSOL_EXECUTABLE SCHEDULER" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -31,20 +31,19 @@ GENERATION_CPU_VENV="$2"
 CAMPAIGN_CONFIG="$3"
 STORAGE_ROOT="$4"
 ONLY_BATCH="$5"
-CORES_PER_CASE="$6"
-PREFLIGHT_MODE="$7"
-PYTHON_MODULE="$8"
-COMSOL_MODULE="$9"
-PYTHON_EXECUTABLE="${10}"
-COMSOL_EXECUTABLE="${11}"
-SCHEDULER_KIND="${12}"
+PREFLIGHT_MODE="$6"
+PYTHON_MODULE="$7"
+COMSOL_MODULE="$8"
+PYTHON_EXECUTABLE="$9"
+COMSOL_EXECUTABLE="${10}"
+SCHEDULER_KIND="${11}"
 
 if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* || "${CAMPAIGN_CONFIG}" != /* ]]; then
   printf 'Venv, campaign, and storage paths must be absolute.\n' >&2
   exit 2
 fi
-if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready && "${PREFLIGHT_MODE}" != mapping-probe ]]; then
-  printf 'Mode must be environment-only, production-ready, or mapping-probe.\n' >&2
+if [[ "${PREFLIGHT_MODE}" != environment-only && "${PREFLIGHT_MODE}" != production-ready ]]; then
+  printf 'Mode must be environment-only or production-ready.\n' >&2
   exit 2
 fi
 for value in "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
@@ -109,28 +108,18 @@ cleanup_probe_root() {
 }
 trap cleanup_probe_root EXIT
 
-if [[ "${PREFLIGHT_MODE}" == mapping-probe ]]; then
-  COMMAND=(
-    "${GENERATION_CPU_VENV}/bin/python"
-    -m src.generation.cli.cli_generation
-    mapping-probe "${CAMPAIGN_CONFIG}"
-    --storage-root "${STORAGE_ROOT}"
-    --work-root "${PROBE_ROOT}"
-    --cores-per-case "${CORES_PER_CASE}"
-  )
-else
-  COMMAND=(
-    "${GENERATION_CPU_VENV}/bin/python"
-    -m src.generation.cli.cli_generation
-    preflight "${CAMPAIGN_CONFIG}"
-    --storage-root "${STORAGE_ROOT}"
-    --work-root "${PROBE_ROOT}"
-    --venv-path "${GENERATION_CPU_VENV}"
-  )
-  if [[ "${PREFLIGHT_MODE}" == environment-only ]]; then
-    COMMAND+=(--environment-only)
-  fi
+COMMAND=(
+  "${GENERATION_CPU_VENV}/bin/python"
+  -m src.generation.cli.cli_generation
+  preflight "${CAMPAIGN_CONFIG}"
+  --storage-root "${STORAGE_ROOT}"
+  --work-root "${PROBE_ROOT}"
+  --venv-path "${GENERATION_CPU_VENV}"
+)
+if [[ "${PREFLIGHT_MODE}" == environment-only ]]; then
+  COMMAND+=(--environment-only)
 fi
+
 if [[ "${ONLY_BATCH}" != - ]]; then
   COMMAND+=(--only-batch "${ONLY_BATCH}")
 fi

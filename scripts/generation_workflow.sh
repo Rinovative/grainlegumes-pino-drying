@@ -548,15 +548,15 @@ preflight_cpu() {
   remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${remote_campaign}" "${ONLY_BATCH}" "${CORES_PER_CASE}" \
+    "${remote_campaign}" "${ONLY_BATCH}" \
     "${PARTITION}" "${WALL_TIME}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
     "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" \
     "${REQUESTED_COMMIT}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; campaign="$4"; only_batch="$5"
-cores_per_case="$6"; partition="$7"; wall_time="$8"; python_module="$9"
-comsol_module="${10}"; python_executable="${11}"; comsol_executable="${12}"
-scheduler="${13}"; commit="${14}"
+partition="$6"; wall_time="$7"; python_module="$8"; comsol_module="$9"
+python_executable="${10}"; comsol_executable="${11}"; scheduler="${12}"
+commit="${13}"
 preflight_id="$(date -u +%Y%m%dT%H%M%SZ)"
 cd "${repository}"
 meta_root="$("${venv}/bin/python" -c 'import sys; from src import common; print(common.paths.get_generation_meta_root(storage_root=sys.argv[1]))' "${storage}")"
@@ -573,7 +573,7 @@ submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntas
 set +e
 job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
   "${repository}" "${venv}" "${campaign}" "${storage}" "${only_batch}" \
-  "${cores_per_case}" environment-only "${python_module}" "${comsol_module}" \
+  environment-only "${python_module}" "${comsol_module}" \
   "${python_executable}" "${comsol_executable}" "${scheduler}")"
 status="$?"
 set -e
@@ -595,54 +595,6 @@ REMOTE
 }
 
 
-mapping_probe_cpu() {
-  local campaign_argument="$1"
-  resolve_campaign "${campaign_argument}"
-  resolve_configured_resources
-  validate_resources
-  resolve_remote_layout
-  local remote_campaign
-  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
-  remote_bash "${CPU_HOST}" \
-    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${remote_campaign}" "${CORES_PER_CASE}" \
-    "${WALL_TIME}" "${PARTITION}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
-    "${PYTHON_EXECUTABLE}" "${COMSOL_EXECUTABLE}" "${SCHEDULER_KIND}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
-cores_per_case="$6"; wall_time="$7"; partition="$8"; python_module="$9"
-comsol_module="${10}"; python_executable="${11}"; comsol_executable="${12}"
-scheduler="${13}"
-probe_id="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
-cd "${repository}"
-meta_root="$("${venv}/bin/python" -c 'import sys; from src import common; print(common.paths.get_generation_meta_root(storage_root=sys.argv[1]))' "${storage}")"
-logs="${meta_root}/mapping_probe_jobs/${probe_id}"
-mkdir -p "${logs}"
-submission=(sbatch --wait --parsable --partition="${partition}" --nodes=1 --ntasks=1
-  --cpus-per-task="${cores_per_case}" --job-name=vp2-mapping-probe
-  --export="ALL,GENERATION_GIT_COMMIT=${commit}"
-  --output="${logs}/slurm-%j.out" --error="${logs}/slurm-%j.err"
-  --chdir="${repository}")
-[[ -z "${wall_time}" ]] || submission+=(--time="${wall_time}")
-set +e
-job_id="$("${submission[@]}" "${repository}/scripts/generation_cpu_smoke.sh" \
-  "${repository}" "${venv}" "${campaign}" "${storage}" - \
-  "${cores_per_case}" mapping-probe "${python_module}" "${comsol_module}" \
-  "${python_executable}" "${comsol_executable}" "${scheduler}")"
-status="$?"
-set -e
-job_id="${job_id%%;*}"
-[[ "${job_id}" =~ ^[0-9]+$ ]] || {
-  printf 'Mapping-probe submission returned malformed job ID: %s\n' "${job_id}" >&2
-  exit 1
-}
-printf 'Mapping-probe Slurm job: %s\n' "${job_id}"
-[[ ! -f "${logs}/slurm-${job_id}.out" ]] || cat "${logs}/slurm-${job_id}.out"
-[[ ! -f "${logs}/slurm-${job_id}.err" ]] || cat "${logs}/slurm-${job_id}.err" >&2
-exit "${status}"
-REMOTE
-}
-
 
 validate_local_launch_gates() {
   local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" >/dev/null
@@ -652,17 +604,15 @@ validate_local_launch_gates() {
   local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
     "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" >/dev/null ||
     fail 2 "Static scientific sentinels block production planning or launch."
-  local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-    fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
   local comsol_version
   comsol_version="$(remote_comsol_version)"
-  mapping_evidence_status_cpu "${selected_campaign}" "${comsol_version}" >/dev/null ||
-    fail 2 "Current mapping evidence for the selected campaign profile is required before production planning or launch."
+  technical_smoke_evidence_status_cpu "${selected_campaign}" "${comsol_version}" >/dev/null ||
+    fail 2 "Current successful technical-smoke evidence for the selected campaign profile is required; run the technical smoke first."
   resolve_campaign "${selected_campaign}"
   resolve_configured_resources
 }
 
-mapping_evidence_status_cpu() {
+technical_smoke_evidence_status_cpu() {
   local campaign_argument="$1"
   local comsol_version_output="$2"
   resolve_campaign "${campaign_argument}"
@@ -679,10 +629,11 @@ comsol_version_output="$5"; python_module="$6"
 module load "${python_module}"
 cd "${repository}"
 "${venv}/bin/python" -m src.generation.cli.cli_generation \
-  mapping-evidence-status "${campaign}" --storage-root "${storage}" \
+  technical-smoke-evidence-status "${campaign}" --storage-root "${storage}" \
   --comsol-version-output "${comsol_version_output}"
 REMOTE
 }
+
 
 remote_comsol_version() {
   remote_bash "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
@@ -706,6 +657,43 @@ REMOTE
 }
 
 
+sync_technical_smoke_evidence() {
+  local evidence="$1" campaign_argument="$2" comsol_version_output="$3"
+  require_command rsync "technical-smoke evidence transfer"
+  [[ "${evidence}" == "${LOCAL_STORAGE_ROOT}/"* && -f "${evidence}" && ! -L "${evidence}" ]] ||
+    fail 1 "Technical-smoke evidence is outside canonical local storage."
+  local relative="${evidence#"${LOCAL_STORAGE_ROOT}/"}"
+  validate_transfer_path "${relative}"
+  local destination="${REMOTE_STORAGE_ROOT}/${relative}"
+  local temporary="${destination}.incoming.$$"
+  remote_bash "${CPU_HOST}" "$(dirname "${destination}")" <<'REMOTE'
+set -euo pipefail
+directory="$1"
+mkdir -p "${directory}"
+REMOTE
+  rsync -a --protect-args "${evidence}" "${CPU_HOST}:${temporary}" ||
+    fail 1 "Could not transfer compact technical-smoke evidence to the CPU host."
+  remote_bash "${CPU_HOST}" "${destination}" "${temporary}" <<'REMOTE'
+set -euo pipefail
+destination="$1"; temporary="$2"
+[[ -f "${temporary}" && ! -L "${temporary}" ]]
+if [[ -e "${destination}" ]]; then
+  [[ -f "${destination}" && ! -L "${destination}" ]]
+  if ! cmp -s "${temporary}" "${destination}"; then
+    rm -f -- "${temporary}"
+    printf 'Existing CPU technical-smoke evidence conflicts: %s\n' "${destination}" >&2
+    exit 1
+  fi
+  rm -f -- "${temporary}"
+else
+  mv -- "${temporary}" "${destination}"
+fi
+REMOTE
+  technical_smoke_evidence_status_cpu \
+    "${campaign_argument}" "${comsol_version_output}" >/dev/null ||
+    fail 2 "CPU-side technical-smoke evidence is missing, stale, or incomplete after transfer."
+}
+
 run_smoke() {
   [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
     fail 2 "smoke does not support --detach, --confirm, or --only-batch."
@@ -716,44 +704,29 @@ run_smoke() {
   preflight_cpu
   local comsol_version
   comsol_version="$(remote_comsol_version)"
-  local steady_evidence_valid=true transient_evidence_valid=true
-  mapping_evidence_status_cpu \
-    "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null 2>&1 ||
-    steady_evidence_valid=false
-  mapping_evidence_status_cpu \
-    "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null 2>&1 ||
-    transient_evidence_valid=false
-  if [[ "${steady_evidence_valid}" != true || "${transient_evidence_valid}" != true ]]; then
-    printf 'Current mapping evidence is missing or stale; running only required isolated probes.\n' >&2
-    local probe_failed=false
-    if [[ "${steady_evidence_valid}" != true ]]; then
-      mapping_probe_cpu "${STATIONARY_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
-    fi
-    if [[ "${transient_evidence_valid}" != true ]]; then
-      mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" || probe_failed=true
-    fi
-    if [[ "${probe_failed}" == true ]]; then
-      fail 2 "One or more mapping probes reported an execution failure, missing export, or exact mapping mismatch."
-    fi
-    mapping_evidence_status_cpu \
-      "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null ||
-      fail 2 "Steady-flow mapping evidence is not valid after its successful probe command."
-    mapping_evidence_status_cpu \
-      "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}" >/dev/null ||
-      fail 2 "Transient-drying mapping evidence is not valid after its successful probe command."
-    printf 'Mapping probes completed and readiness refreshed; continuing this smoke invocation.\n'
-  fi
   CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
   run_all
-  local stationary_run_id="${RUN_ID}"
+  local stationary_run_id="${RUN_ID}" steady_evidence
+  steady_evidence="$(local_cli finalize-technical-smoke-evidence "${stationary_run_id}" \
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+  steady_evidence="$(container_path_to_host "${steady_evidence}")"
+  sync_technical_smoke_evidence \
+    "${steady_evidence}" "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
   CAMPAIGN_ARGUMENT="${TRANSIENT_SMOKE_CAMPAIGN_PATH}"
   run_all
-  local transient_run_id="${RUN_ID}"
+  local transient_run_id="${RUN_ID}" transient_evidence
+  transient_evidence="$(local_cli finalize-technical-smoke-evidence "${transient_run_id}" \
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+  transient_evidence="$(container_path_to_host "${transient_evidence}")"
+  sync_technical_smoke_evidence \
+    "${transient_evidence}" "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
   local receipt
   receipt="$(local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
     --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
   receipt="$(container_path_to_host "${receipt}")"
-  printf 'Real technical runtime-smoke receipt: %s\n' "${receipt}"
+  printf 'Profile technical-smoke evidence: %s and %s\n' \
+    "${steady_evidence}" "${transient_evidence}"
+  printf 'Paired technical runtime diagnostic receipt: %s\n' "${receipt}"
   printf 'CPU sources retained for review for runs %s and %s.\n' \
     "${stationary_run_id}" "${transient_run_id}"
 }
@@ -1331,19 +1304,12 @@ run_pilot_check() {
   EXECUTE_SETUP=true
   setup_cpu
   preflight_cpu
-  ALL_STAGE="profile mapping evidence"
+  ALL_STAGE="profile technical-smoke evidence"
   local comsol_version pilot_campaign_path
   comsol_version="$(remote_comsol_version)"
   pilot_campaign_path="${CAMPAIGN_CONFIG_PATH}"
-  resolve_workflow_campaigns
-  if ! mapping_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null 2>&1; then
-    printf 'Current transient mapping evidence is missing or stale; running one retained technical-smoke probe.\n' >&2
-    mapping_probe_cpu "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" ||
-      fail 2 "Transient mapping probe reported an execution failure, missing export, or exact mapping mismatch."
-    mapping_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null ||
-      fail 2 "Transient mapping evidence is not valid after its successful probe command."
-    printf 'Transient mapping probe completed and readiness refreshed; continuing this pilot invocation.\n'
-  fi
+  technical_smoke_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null ||
+    fail 2 "Current successful transient technical-smoke evidence is required before pilot launch; run the technical smoke first."
   resolve_campaign "${pilot_campaign_path}"
   resolve_configured_resources
   ALL_STAGE="configured-material static scientific sentinels"

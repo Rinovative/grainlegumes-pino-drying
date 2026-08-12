@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -42,6 +43,7 @@ WORKER_WORKSPACE_MARKER: Final = ".generation-worker-workspace.json"
 TRANSFER_STAGING_MARKER: Final = ".generation-transfer-staging.json"
 PUBLICATION_STAGING_MARKER: Final = ".generation-publication-staging.json"
 WORKSPACE_SCHEMA_VERSION: Final = 1
+_SLURM_JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _CASE_MARKER_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -227,7 +229,7 @@ def _directory_size(path: Path) -> int:
 
 def _slurm_job_is_active(job_id: str) -> bool:
     """Return whether Slurm still reports one exact root job identifier."""
-    if not job_id.isdigit():
+    if _SLURM_JOB_ID_PATTERN.fullmatch(job_id) is None:
         message = f"Workspace Slurm job ID is malformed: {job_id!r}"
         raise ValueError(message)
     executable = shutil.which("squeue")
@@ -235,7 +237,7 @@ def _slurm_job_is_active(job_id: str) -> bool:
         message = f"Cannot prove Slurm job {job_id} is inactive because squeue is unavailable."
         raise RuntimeError(message)
     result = subprocess.run(  # noqa: S603 -- executable and numeric job ID are validated above
-        [executable, "--noheader", "--jobs", job_id, "--format=%A"],
+        [executable, "--noheader", f"--jobs={job_id}", "--format=%A"],
         check=False,
         capture_output=True,
         text=True,

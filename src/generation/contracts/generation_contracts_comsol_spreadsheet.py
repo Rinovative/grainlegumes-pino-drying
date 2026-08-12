@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass
 from itertools import chain, pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
 
@@ -445,6 +445,66 @@ def read_comsol_spreadsheet(
         row_count=row_count,
         column_count=len(raw_header),
     )
+
+
+def validate_export_mapping_observation(
+    path: Path | str,
+    *,
+    delimiter: str,
+    columns: Mapping[str, str],
+    units: Mapping[str, str],
+    wide_temporal: bool,
+) -> dict[str, Any]:
+    """Validate and report exact configured headers for one COMSOL export."""
+    if tuple(columns) != tuple(units):
+        message = "Export observation columns and units disagree."
+        raise ValueError(message)
+    expected_units = {source: str(units[logical]) for logical, source in columns.items()}
+    if wide_temporal:
+        table = read_comsol_spreadsheet(
+            path,
+            delimiter=delimiter,
+            include_values=False,
+        )
+        temporal_groups = group_temporal_columns(
+            table.raw_header,
+            expected_units=expected_units,
+        )
+        canonical_header = [column.source for column in temporal_groups[0].columns]
+        temporal_times = [group.state_time for group in temporal_groups]
+    else:
+        table = read_comsol_spreadsheet(
+            path,
+            delimiter=delimiter,
+            expected_units=expected_units,
+            include_values=False,
+        )
+        temporal_groups = ()
+        temporal_times = []
+        canonical_header = list(table.canonical_header)
+    expected_sources = list(columns.values())
+    missing = sorted(set(expected_sources).difference(canonical_header))
+    if missing:
+        message = f"COMSOL export is missing explicitly configured headers {missing}: {Path(path)}"
+        raise ValueError(message)
+    return {
+        "delimiter": delimiter,
+        "raw_header": list(table.raw_header),
+        "canonical_header": canonical_header,
+        "parsed_shape": list(table.shape),
+        "comsol_metadata": dict(table.metadata),
+        "expected_source_headers": expected_sources,
+        "columns": {
+            logical: {
+                "declared_source_header": source,
+                "observed_exact_header_match": source in canonical_header,
+            }
+            for logical, source in columns.items()
+        },
+        "temporal_group_count": len(temporal_groups),
+        "temporal_state_times": temporal_times,
+        "temporal_structure_error": None,
+    }
 
 
 def iter_comsol_spreadsheet_numeric_rows(
