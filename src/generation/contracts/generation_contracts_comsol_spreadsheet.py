@@ -1,0 +1,337 @@
+"""
+===============================================================================
+generation_contracts_comsol_spreadsheet.py
+===============================================================================
+Parse COMSOL Spreadsheet-format exports for observation and numeric admission.
+Responsibilities:
+  - Identify percent-prefixed COMSOL metadata and column-header records
+  - Preserve raw headers while applying declared-unit-aware canonicalization
+  - Admit finite rectangular numeric rows without consuming the first data row
+  - Validate COMSOL Nodes and Expressions metadata when semantically applicable
+Design principles:
+  - Header identification follows table structure rather than fixed line numbers
+  - Unit normalization removes only exact declared trailing unit decorations
+  - Malformed or ambiguous tables fail closed without ordinary header inference
+This module does NOT:
+  - Infer source aliases, delimiters, scientific mappings, or export roles
+  - Rewrite COMSOL output text or make metadata part of scientific identity
+===============================================================================
+"""
+
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
+
+import numpy as np
+
+_SUPPORTED_DELIMITERS: Final = (",", ";")
+_USEFUL_METADATA_KEYS: Final = frozenset(
+    {
+        "Model",
+        "Version",
+        "Date",
+        "Dimension",
+        "Nodes",
+        "Expressions",
+        "Description",
+        "Length unit",
+    }
+)
+_INTEGER_METADATA_KEYS: Final = frozenset({"Dimension", "Nodes", "Expressions"})
+_METADATA_FIELD_COUNT: Final = 2
+_MINIMUM_PLAIN_RECORDS: Final = 2
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+
+@dataclass(frozen=True, slots=True)
+class ComsolSpreadsheetTable:
+    """One parsed COMSOL Spreadsheet table with raw and canonical headers."""
+
+    delimiter: str
+    raw_header: tuple[str, ...]
+    canonical_header: tuple[str, ...]
+    values: np.ndarray | None
+    metadata: dict[str, str | int]
+    row_count: int
+    column_count: int
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Return the numeric row and column count."""
+        return self.row_count, self.column_count
+
+
+def _parse_record(record: str, *, delimiter: str, label: str) -> tuple[str, ...]:
+    """Parse and trim one delimited logical record."""
+    try:
+        parsed = next(csv.reader([record], delimiter=delimiter, strict=True))
+    except csv.Error as error:
+        message = f"{label} is not valid delimiter-separated text."
+        raise ValueError(message) from error
+    return tuple(value.strip() for value in parsed)
+
+
+def _numeric_row(record: str, *, delimiter: str, width: int, label: str) -> list[float]:
+    """Parse one finite fixed-width numeric data record."""
+    fields = _parse_record(record, delimiter=delimiter, label=label)
+    if len(fields) != width:
+        message = f"{label} has {len(fields)} fields; expected {width}."
+        raise ValueError(message)
+    try:
+        values = [float(value) for value in fields]
+    except ValueError as error:
+        message = f"{label} contains a malformed numeric value."
+        raise ValueError(message) from error
+    if not np.isfinite(np.asarray(values, dtype=np.float64)).all():
+        message = f"{label} contains NaN or infinity."
+        raise ValueError(message)
+    return values
+
+
+def _all_numeric(fields: Sequence[str]) -> bool:
+    """Return whether every field is finite numeric text."""
+    if not fields:
+        return False
+    try:
+        values = np.asarray([float(value) for value in fields], dtype=np.float64)
+    except ValueError:
+        return False
+    return bool(np.isfinite(values).all())
+
+
+def canonicalize_header(
+    raw_header: Sequence[str],
+    *,
+    expected_units: Mapping[str, str],
+) -> tuple[str, ...]:
+    """
+    Canonicalize raw COMSOL headers against exact declared source units.
+
+    Only the exact trailing declared unit decoration is removed from a header
+    that otherwise matches one configured source expression. Parentheses inside
+    the source expression remain untouched.
+    """
+    normalized: list[str] = []
+    for raw_name in raw_header:
+        canonical = raw_name
+        for source, unit in expected_units.items():
+            if raw_name == source:
+                canonical = source
+                break
+            if raw_name == f"{source} ({unit})":
+                canonical = source
+                break
+        normalized.append(canonical)
+    if len(normalized) != len(set(normalized)):
+        message = "COMSOL header canonicalization produced duplicate source fields."
+        raise ValueError(message)
+    return tuple(normalized)
+
+
+def _metadata(
+    records: Sequence[tuple[str, ...]],
+    *,
+    path: Path,
+) -> dict[str, str | int]:
+    """Return useful diagnostic metadata from records preceding the header."""
+    metadata: dict[str, str | int] = {}
+    for fields in records:
+        if len(fields) < _METADATA_FIELD_COUNT or fields[0] not in _USEFUL_METADATA_KEYS:
+            continue
+        key = fields[0]
+        if key in metadata:
+            message = f"COMSOL Spreadsheet metadata repeats {key!r}: {path}"
+            raise ValueError(message)
+        if len(fields) != _METADATA_FIELD_COUNT:
+            message = f"COMSOL Spreadsheet metadata {key!r} is malformed: {path}"
+            raise ValueError(message)
+        raw_value = fields[1]
+        if key in _INTEGER_METADATA_KEYS:
+            try:
+                value = int(raw_value)
+            except ValueError as error:
+                message = f"COMSOL Spreadsheet metadata {key!r} must be an integer: {path}"
+                raise ValueError(message) from error
+            if value < 1:
+                message = f"COMSOL Spreadsheet metadata {key!r} must be positive: {path}"
+                raise ValueError(message)
+            metadata[key] = value
+        else:
+            metadata[key] = raw_value
+    return metadata
+
+
+def _validate_metadata(
+    metadata: Mapping[str, str | int],
+    *,
+    header: Sequence[str],
+    row_count: int,
+    path: Path,
+) -> None:
+    """Validate available COMSOL width and row-count evidence."""
+    expressions = metadata.get("Expressions")
+    if isinstance(expressions, int) and expressions != len(header):
+        message = f"COMSOL Spreadsheet Expressions metadata disagrees with parsed width for {path}: metadata={expressions}, parsed={len(header)}."
+        raise ValueError(message)
+    nodes = metadata.get("Nodes")
+    if not isinstance(nodes, int):
+        return
+    temporal = "t" in header or any(name.startswith("t (") and name.endswith(")") for name in header)
+    matches = row_count % nodes == 0 if temporal else row_count == nodes
+    if not matches:
+        relation = "a positive multiple of" if temporal else "equal to"
+        message = f"COMSOL Spreadsheet Nodes metadata disagrees with parsed rows for {path}: parsed rows must be {relation} {nodes}, got {row_count}."
+        raise ValueError(message)
+
+
+def read_comsol_spreadsheet(
+    path: Path | str,
+    *,
+    delimiter: str,
+    expected_units: Mapping[str, str] | None = None,
+    include_values: bool = True,
+) -> ComsolSpreadsheetTable:
+    """
+    Read one COMSOL Spreadsheet export or explicit-header delimited test table.
+
+    Percent-prefixed files are interpreted structurally: the complete leading
+    percent block is read, the first non-percent record determines data width,
+    and the final compatible percent record immediately before data is the
+    column header. The first non-percent record is always retained as data.
+    """
+    source = Path(path)
+    if delimiter not in _SUPPORTED_DELIMITERS:
+        message = f"Unsupported COMSOL Spreadsheet delimiter {delimiter!r}: {source}"
+        raise ValueError(message)
+    try:
+        records = [line for line in source.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    except (OSError, UnicodeDecodeError) as error:
+        message = f"Configured COMSOL export is not readable text: {source}"
+        raise ValueError(message) from error
+    if not records:
+        message = f"COMSOL Spreadsheet export is empty: {source}"
+        raise ValueError(message)
+
+    leading_comments: list[str] = []
+    index = 0
+    while index < len(records) and records[index].lstrip().startswith("%"):
+        leading_comments.append(records[index].lstrip()[1:].strip())
+        index += 1
+
+    metadata: dict[str, str | int]
+    if leading_comments:
+        if index >= len(records):
+            message = f"COMSOL Spreadsheet export has metadata but no numeric data: {source}"
+            raise ValueError(message)
+        first_data_fields = _parse_record(
+            records[index],
+            delimiter=delimiter,
+            label=f"First COMSOL data record in {source}",
+        )
+        data_width = len(first_data_fields)
+        parsed_comments = [_parse_record(record, delimiter=delimiter, label=f"COMSOL percent record in {source}") for record in leading_comments]
+        compatible = [position for position, fields in enumerate(parsed_comments) if len(fields) == data_width]
+        candidate = parsed_comments[-1]
+        if (
+            not compatible
+            or compatible[-1] != len(parsed_comments) - 1
+            or not candidate
+            or candidate[0] in _USEFUL_METADATA_KEYS
+            or _all_numeric(candidate)
+        ):
+            message = f"Could not identify the final width-compatible percent-prefixed COMSOL header immediately before data: {source}"
+            raise ValueError(message)
+        raw_header = candidate
+        metadata = _metadata(parsed_comments[:-1], path=source)
+        data_records = records[index:]
+    else:
+        if len(records) < _MINIMUM_PLAIN_RECORDS:
+            message = f"Delimited table must contain an explicit header and numeric data: {source}"
+            raise ValueError(message)
+        raw_header = _parse_record(records[0], delimiter=delimiter, label=f"Delimited header in {source}")
+        if _all_numeric(raw_header):
+            message = f"Delimited table has no explicit nonnumeric header; refusing to consume its first numeric row: {source}"
+            raise ValueError(message)
+        metadata = {}
+        data_records = records[1:]
+        first_data_fields = _parse_record(
+            data_records[0],
+            delimiter=delimiter,
+            label=f"First numeric data record in {source}",
+        )
+        data_width = len(first_data_fields)
+        if len(raw_header) != data_width:
+            message = f"Delimited header width disagrees with numeric data width: {source}"
+            raise ValueError(message)
+
+    if not raw_header or len(raw_header) != len(set(raw_header)) or any(not name for name in raw_header):
+        message = f"COMSOL Spreadsheet header is empty or contains duplicate fields: {source}"
+        raise ValueError(message)
+    values: list[list[float]] = []
+    row_count = 0
+    for row_number, record in enumerate(data_records, start=1):
+        if record.lstrip().startswith(("%", "#")):
+            message = f"Unexpected comment record after COMSOL numeric data began at row {row_number}: {source}"
+            raise ValueError(message)
+        numeric = _numeric_row(
+            record,
+            delimiter=delimiter,
+            width=len(raw_header),
+            label=f"COMSOL numeric record {row_number} in {source}",
+        )
+        row_count += 1
+        if include_values:
+            values.append(numeric)
+    array = np.asarray(values, dtype=np.float64) if include_values else None
+    canonical_header = canonicalize_header(raw_header, expected_units={} if expected_units is None else expected_units)
+    _validate_metadata(
+        metadata,
+        header=canonical_header,
+        row_count=row_count,
+        path=source,
+    )
+    return ComsolSpreadsheetTable(
+        delimiter=delimiter,
+        raw_header=raw_header,
+        canonical_header=canonical_header,
+        values=array,
+        metadata=metadata,
+        row_count=row_count,
+        column_count=len(raw_header),
+    )
+
+
+def _delimiter_candidate(path: Path, delimiter: str) -> tuple[int | None, str | None]:
+    """Return parsed width or one delimiter-specific failure."""
+    try:
+        table = read_comsol_spreadsheet(path, delimiter=delimiter, include_values=False)
+    except ValueError as error:
+        return None, str(error)
+    return table.shape[1], None
+
+
+def detect_comsol_spreadsheet_delimiter(path: Path | str) -> str:
+    """Detect comma or semicolon from the uniquely parseable table structure."""
+    source = Path(path)
+    candidates: list[tuple[str, int]] = []
+    errors: list[str] = []
+    for delimiter in _SUPPORTED_DELIMITERS:
+        width, error = _delimiter_candidate(source, delimiter)
+        if width is None:
+            errors.append(f"{delimiter!r}: {error}")
+        else:
+            candidates.append((delimiter, width))
+    if not candidates:
+        message = f"Could not parse COMSOL Spreadsheet export with a supported delimiter: {source}. {'; '.join(errors)}"
+        raise ValueError(message)
+    maximum_width = max(width for _, width in candidates)
+    widest = [delimiter for delimiter, width in candidates if width == maximum_width]
+    if len(widest) != 1:
+        message = f"COMSOL Spreadsheet delimiter is ambiguous for {source}: {widest}."
+        raise ValueError(message)
+    return widest[0]

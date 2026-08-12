@@ -320,6 +320,13 @@ def wait_for_expected_starts():
     raise RuntimeError(f"timed out waiting for {expected} fake COMSOL starts")
 
 
+def write_spreadsheet_header(stream, names, metadata):
+    writer = csv.writer(stream, delimiter=";", lineterminator="\n")
+    for key, value in metadata:
+        writer.writerow([f"% {key}", value])
+    writer.writerow([f"% {names[0]}", *names[1:]])
+
+
 def runtime_scalar_values(arguments, case):
     handoff = case.get("scalar_handoff")
     entries = None if not isinstance(handoff, dict) else handoff.get("entries")
@@ -426,6 +433,9 @@ try:
             weighted_dry = sum(rho * weight for rho, weight in zip(rho_values, cell_weights))
         exports = pathlib.Path("exports")
         exports.mkdir(exist_ok=True)
+        mapping_export_mode = os.environ.get("FAKE_COMSOL_MAPPING_EXPORT_MODE", "canonical")
+        if mapping_export_mode not in {"canonical", "mismatch", "missing"}:
+            raise RuntimeError(f"unsupported fake mapping export mode: {mapping_export_mode}")
         repeated = os.environ.get("FAKE_COMSOL_REPEAT_AIRFLOW") == "1"
         varying = os.environ.get("FAKE_COMSOL_VARY_AIRFLOW") == "1"
         static_names = ["x", "y", "Kxx", "Kxy", "Kyy", "eps_bed", "p_in_bc"]
@@ -434,11 +444,25 @@ try:
         static_names.extend(("u", "v", "p"))
         if transient_profile:
             static_names.append("rho_bu_dry")
-        with (exports / "airflow.csv").open("w", encoding="utf-8", newline="") as stream:
+        airflow_path = exports / "airflow.csv"
+        with airflow_path.open("w", encoding="utf-8", newline="") as stream:
             names = (["stationary_time"] if repeated else []) + static_names
             writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
-            writer.writeheader()
-            for stationary_time in ([0.0, 1.0] if repeated else [None]):
+            stationary_times = [0.0, 1.0] if repeated else [None]
+            header_names = ["wrong_x" if name == "x" and mapping_export_mode == "mismatch" else name for name in names]
+            write_spreadsheet_header(
+                stream,
+                header_names,
+                [
+                    ("Model", "model.mph"),
+                    ("Version", "COMSOL 6.4.0.293"),
+                    ("Dimension", 2),
+                    ("Nodes", len(inputs) * len(stationary_times)),
+                    ("Expressions", len(names)),
+                    ("Length unit", "m"),
+                ],
+            )
+            for stationary_time in stationary_times:
                 for row_index, source in enumerate(inputs):
                     eps = float(source["eps_bed"])
                     values = {
@@ -456,13 +480,24 @@ try:
                     if stationary_time is not None:
                         values["stationary_time"] = stationary_time
                     writer.writerow(values)
+        if mapping_export_mode == "missing":
+            airflow_path.unlink()
         if transient_profile:
             state_times = (0.0, 1.0)
             water_by_time = {}
             with (exports / "transient.csv").open("w", encoding="utf-8", newline="") as stream:
                 names = ["x", "y", "t", "T", "phi", "w_surf", "w_int"]
                 writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
-                writer.writeheader()
+                write_spreadsheet_header(
+                    stream,
+                    names,
+                    [
+                        ("Model", "model.mph"),
+                        ("Dimension", 2),
+                        ("Nodes", len(inputs)),
+                        ("Expressions", len(names)),
+                    ],
+                )
                 for state_time in state_times:
                     water_by_time[state_time] = []
                     for source, rho in zip(inputs, rho_values):
@@ -497,7 +532,11 @@ try:
                     "phi_out_mean",
                 ]
                 writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
-                writer.writeheader()
+                write_spreadsheet_header(
+                    stream,
+                    names,
+                    [("Model", "model.mph"), ("Expressions", len(names))],
+                )
                 for state_time in state_times:
                     water_values = water_by_time[state_time]
                     weighted_water = sum(water * weight for water, weight in zip(water_values, cell_weights))
@@ -534,7 +573,7 @@ try:
                     "phi_max_final",
                 ]
                 writer = csv.DictWriter(stream, fieldnames=names, delimiter=";", lineterminator="\n")
-                writer.writeheader()
+                write_spreadsheet_header(stream, names, [("Model", "model.mph")])
                 final_water = water_by_time[1.0]
                 weighted_water = sum(water * weight for water, weight in zip(final_water, cell_weights))
                 bulk = weighted_water / (weighted_dry + weighted_water)

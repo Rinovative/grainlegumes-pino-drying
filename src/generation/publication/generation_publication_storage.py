@@ -34,6 +34,7 @@ import numpy as np
 from src import common, domain
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_schedule as schedule_service
+from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
 HDF5_SCHEMA_KIND = "vp2_canonical_case"
 HDF5_SCHEMA_VERSION = config_contract.CANONICAL_HDF5_SCHEMA_VERSION
 HDF5_CONVERTER_VERSION = config_contract.CANONICAL_HDF5_CONVERTER_VERSION
-_MINIMUM_TABLE_ROWS = 2
+_MINIMUM_ADAPTER_ROWS = 2
 _MINIMUM_AXIS_POINTS = 2
 _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
@@ -96,29 +97,29 @@ def _compression_matches(dataset: h5py.Dataset, storage: Mapping[str, Any]) -> b
     )
 
 
-def _read_table(path: Path, *, delimiter: str) -> tuple[list[str], np.ndarray]:
-    """Read one finite rectangular numeric table with a unique header."""
+def _read_input_adapter_table(path: Path, *, delimiter: str) -> tuple[list[str], np.ndarray]:
+    """Read one Generation-owned finite numeric input adapter."""
     try:
-        lines = [line for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip() and not line.lstrip().startswith(("%", "#"))]
+        lines = [line for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
     except (OSError, UnicodeDecodeError) as error:
-        msg = f"Configured COMSOL export is not readable text: {path}"
-        raise ValueError(msg) from error
+        message = f"Generation input adapter is not readable text: {path}"
+        raise ValueError(message) from error
     rows = list(csv.reader(lines, delimiter=delimiter))
-    if len(rows) < _MINIMUM_TABLE_ROWS:
-        msg = f"Numeric export must contain a header and data: {path}"
-        raise ValueError(msg)
+    if len(rows) < _MINIMUM_ADAPTER_ROWS:
+        message = f"Generation input adapter must contain a header and data: {path}"
+        raise ValueError(message)
     header = [item.strip() for item in rows[0]]
     if not header or len(header) != len(set(header)) or any(len(row) != len(header) for row in rows[1:]):
-        msg = f"Numeric export has duplicate headers or inconsistent row widths: {path}"
-        raise ValueError(msg)
+        message = f"Generation input adapter has duplicate headers or inconsistent row widths: {path}"
+        raise ValueError(message)
     try:
         values = np.asarray([[float(item.strip()) for item in row] for row in rows[1:]], dtype=np.float64)
     except ValueError as error:
-        msg = f"Numeric export contains malformed values: {path}"
-        raise ValueError(msg) from error
+        message = f"Generation input adapter contains malformed values: {path}"
+        raise ValueError(message) from error
     if not np.isfinite(values).all():
-        msg = f"Numeric export contains NaN or infinity: {path}"
-        raise ValueError(msg)
+        message = f"Generation input adapter contains NaN or infinity: {path}"
+        raise ValueError(message)
     return header, values
 
 
@@ -150,12 +151,19 @@ def _mapped_table(
     if not paths:
         message = f"Required export role {role!r} produced no files."
         raise FileNotFoundError(message)
+    expected_units = {source: str(contract["units"][logical]) for logical, source in contract["columns"].items()}
     collected: dict[str, list[np.ndarray]] = {name: [] for name in expected_logical}
     for path in paths:
-        header, values = _read_table(
+        table = spreadsheet_contract.read_comsol_spreadsheet(
             path,
-            delimiter=contract["delimiter"],
+            delimiter=str(contract["delimiter"]),
+            expected_units=expected_units,
         )
+        header = list(table.canonical_header)
+        values = table.values
+        if values is None:
+            message = f"COMSOL Spreadsheet admission did not load numeric values: {path}"
+            raise RuntimeError(message)
         missing = [source for source in contract["columns"].values() if source not in header]
         if missing:
             message = f"Export {path} is missing explicitly configured headers {missing}."
@@ -483,7 +491,7 @@ def _schedule_values(
     if common.serialization.file_sha256(path) != identity["sha256"] or path.stat().st_size != identity["size_bytes"]:
         msg = "Schedule adapter bytes changed after case-input identity was computed."
         raise RuntimeError(msg)
-    header, values = _read_table(path, delimiter=spec["delimiter"])
+    header, values = _read_input_adapter_table(path, delimiter=spec["delimiter"])
     expected_time = np.asarray(time_contract["regular_times"], dtype=np.float64)
     if header != list(profiles.SCHEDULE_FIELDS) or values.shape != (
         expected_time.size,

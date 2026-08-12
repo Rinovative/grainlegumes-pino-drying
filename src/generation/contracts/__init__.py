@@ -2,6 +2,7 @@
 Immutable Generation vocabularies, scientific registries, and source contracts.
 
 Provides:
+- comsol_spreadsheet: canonical COMSOL Spreadsheet export parsing
 - descriptors: stable cross-package profile and vocabulary descriptors
 - materials: resolved material-science contracts
 - paths: persistent storage-root safety contracts
@@ -31,6 +32,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from . import generation_contracts_comsol_spreadsheet as comsol_spreadsheet
     from . import generation_contracts_descriptors as descriptors
     from . import generation_contracts_materials as materials
     from . import generation_contracts_paths as paths
@@ -56,6 +58,7 @@ if TYPE_CHECKING:
     )
 
 _MODULES = {
+    "comsol_spreadsheet": "generation_contracts_comsol_spreadsheet",
     "descriptors": "generation_contracts_descriptors",
     "materials": "generation_contracts_materials",
     "paths": "generation_contracts_paths",
@@ -89,6 +92,7 @@ __all__ = [
     "ProfileContract",
     "available_material_families",
     "available_profile_ids",
+    "comsol_spreadsheet",
     "descriptors",
     "evaluation_regimes",
     "get_profile_contract",

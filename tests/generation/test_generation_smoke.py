@@ -109,9 +109,10 @@ exports:
     observation = mapping_probe._table_observation(table)
     assert observation == {
         "delimiter": ",",
-        "header": ["x", "y", "p"],
+        "raw_header": ["x", "y", "p"],
         "shape": [2, 3],
         "rectangular": True,
+        "comsol_metadata": {},
         "time_header_candidates": [],
     }
     comparison = mapping_probe._mapping_comparison(
@@ -170,7 +171,7 @@ exports:
         [
             {
                 "relative_path": "exports/observed.csv",
-                "table": {"delimiter": ",", "header": ["wrong"]},
+                "table": {"delimiter": ",", "raw_header": ["wrong"]},
             }
         ],
         profile_path=profile,
@@ -192,7 +193,7 @@ exports:
         [
             {
                 "relative_path": "exports/observed.csv",
-                "table": {"delimiter": ",", "header": ["x"]},
+                "table": {"delimiter": ",", "raw_header": ["x"]},
             }
         ],
         profile_path=profile,
@@ -236,12 +237,61 @@ def test_fake_mapping_probe_uses_canonical_retained_command(
     )
     report = mapping_probe.load_mapping_probe(report_path)
     command = report["command"]
+    steady_observation = report["mapping_comparison"]["observations"][0]
 
+    assert report["status"] == "mapping_observation_complete"
+    assert steady_observation["raw_header"] == steady_observation["canonical_header"]
+    assert steady_observation["parsed_shape"][0] > 0
     assert command[command.index("-inputfile") + 1] == "model.mph"
     assert command[command.index("-job") + 1] == "b1"
     assert command[command.index("-outputfile") + 1] == "solved.mph"
     assert command[command.index("-np") + 1] == "16"
     assert "-nosave" not in command
+
+
+@pytest.mark.parametrize(
+    ("export_mode", "expected_status"),
+    [
+        ("mismatch", "mapping_update_required"),
+        ("missing", "required_export_missing"),
+    ],
+)
+def test_fake_mapping_probe_preserves_negative_status_semantics(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export_mode: str,
+    expected_status: str,
+) -> None:
+    """Keep genuine header mismatches distinct from absent required exports."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        retain_solved_model=True,
+    )
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    project_root = mapping_probe.common.paths.get_project_root().resolve()
+    authored["profile_config"] = (config_path.parent / "profile.yaml").relative_to(project_root).as_posix()
+    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    monkeypatch.setenv("FAKE_COMSOL_MAPPING_EXPORT_MODE", export_mode)
+
+    report_path = mapping_probe.run_mapping_probe(
+        config_path,
+        storage_root=tmp_path / f"{export_mode} storage",
+        work_root=tmp_path / f"{export_mode} work",
+        cores_per_case=16,
+    )
+    report = mapping_probe.load_mapping_probe(report_path)
+
+    assert report["status"] == expected_status
+    if export_mode == "mismatch":
+        assert report["required_exports_missing"] == []
+        assert any(key.endswith(".columns.x") for key in report["fields_requiring_correction"])
+    else:
+        assert report["required_exports_missing"] == [{"role": "steady_flow_fields", "declared_pattern": "airflow.csv"}]
+        assert report["fields_requiring_correction"] == []
 
 
 def test_real_smoke_comsol_contract_comes_from_paired_execution_config() -> None:

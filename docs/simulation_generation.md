@@ -479,8 +479,12 @@ inventory, and retained-evidence policy. The gate requires:
 - retained CPU inputs, exports, solved evidence, logs, Slurm IDs, and version;
 - one source-bound real-smoke receipt.
 
-Mapping probes inventory actual output files and headers. They never infer or
-write a mapping automatically. Fixed values reported as template-owned have no
+Mapping probes inventory actual output files and headers. COMSOL Spreadsheet
+exports carry a variable-length leading block of percent-prefixed metadata whose
+final compatible record is the column header. Generation parses that structure
+directly, preserves the raw unit-decorated header, and removes only exact
+declared unit suffixes before exact source-header comparison. It never infers or
+writes a mapping automatically. Fixed values reported as template-owned have no
 Python runtime override; their configured record is bound to the canonical
 hashed template and model-report evidence. Case-dependent values use the
 admitted CLI vector and still require native runtime evidence.

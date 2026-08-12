@@ -19,7 +19,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import shutil
@@ -34,6 +33,8 @@ import yaml
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
+from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
@@ -42,7 +43,7 @@ from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
 
 MAPPING_PROBE_SCHEMA_KIND: Final = "generation_mapping_probe"
-MAPPING_PROBE_SCHEMA_VERSION: Final = 1
+MAPPING_PROBE_SCHEMA_VERSION: Final = 2
 _TECHNICAL_SMOKE_PURPOSE: Final = "technical_runtime_smoke"
 _TEXT_SUFFIXES: Final = frozenset({".csv", ".dat", ".txt"})
 
@@ -107,30 +108,21 @@ def _snapshot(directory: Path) -> set[str]:
 
 
 def _table_observation(path: Path) -> dict[str, Any] | None:
-    """Return header and rectangular shape for one likely text table."""
+    """Return structurally parsed COMSOL Spreadsheet evidence."""
     if path.suffix.lower() not in _TEXT_SUFFIXES:
         return None
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            lines = (line for line in stream if line.strip() and not line.lstrip().startswith(("%", "#")))
-            first = next(lines, None)
-            if first is None:
-                return {"header": [], "shape": [0, 0], "rectangular": True}
-            delimiter = ";" if first.count(";") >= first.count(",") else ","
-            header = [value.strip() for value in next(csv.reader([first], delimiter=delimiter))]
-            row_count = 0
-            rectangular = True
-            for line in lines:
-                row = next(csv.reader([line], delimiter=delimiter))
-                row_count += 1
-                rectangular = rectangular and len(row) == len(header)
-    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        delimiter = spreadsheet_contract.detect_comsol_spreadsheet_delimiter(path)
+        table = spreadsheet_contract.read_comsol_spreadsheet(path, delimiter=delimiter, include_values=False)
+    except ValueError as error:
         return {"read_error": str(error)}
+    header = list(table.canonical_header)
     return {
         "delimiter": delimiter,
-        "header": header,
-        "shape": [row_count, len(header)],
-        "rectangular": rectangular,
+        "raw_header": list(table.raw_header),
+        "shape": list(table.shape),
+        "rectangular": True,
+        "comsol_metadata": dict(table.metadata),
         "time_header_candidates": [name for name in header if name.casefold() in {"t", "time", "time_h", "time_s"}],
     }
 
@@ -171,8 +163,11 @@ def _mapping_comparison(
     required_missing_exports: list[dict[str, str]] = []
     optional_missing_exports: list[dict[str, str]] = []
     observations: list[dict[str, Any]] = []
+    profile_spec = profiles.resolve_profile(str(profile["simulation_profile"]))
     for index, export in enumerate(profile["exports"]):
         role = str(export["role"])
+        role_spec = profile_spec.export_role(role)
+        units_by_logical = dict(zip(role_spec.logical_fields, role_spec.units, strict=True))
         optional = role == "exact_stop_diagnostics"
         corrections = optional_corrections if optional else required_corrections
         missing_exports = optional_missing_exports if optional else required_missing_exports
@@ -188,7 +183,19 @@ def _mapping_comparison(
             corrections.append(source_key)
 
         table = matches[0].get("table") if len(matches) == 1 else None
-        observed_header = table.get("header", []) if isinstance(table, dict) else []
+        raw_header = table.get("raw_header", []) if isinstance(table, dict) else []
+        expected_units = {
+            str(mapping["source_header"]): units_by_logical[logical]
+            for logical, mapping in export["columns"].items()
+            if isinstance(mapping.get("source_header"), str)
+        }
+        canonical_header = list(
+            spreadsheet_contract.canonicalize_header(
+                raw_header,
+                expected_units=expected_units,
+            )
+        )
+        observed_header = canonical_header
         delimiter_matches = bool(isinstance(table, dict) and table.get("delimiter") == export["delimiter"])
         if len(matches) == 1 and not delimiter_matches:
             corrections.append(f"{prefix}:exports[{index}].delimiter")
@@ -211,7 +218,12 @@ def _mapping_comparison(
                 "source_state": source["state"],
                 "declared_pattern": pattern,
                 "matched_relative_paths": [record["relative_path"] for record in matches],
+                "delimiter": table.get("delimiter") if isinstance(table, dict) else None,
+                "raw_header": raw_header,
+                "canonical_header": canonical_header,
                 "observed_header": observed_header,
+                "parsed_shape": table.get("shape") if isinstance(table, dict) else None,
+                "comsol_metadata": table.get("comsol_metadata", {}) if isinstance(table, dict) else {},
                 "delimiter_matches": delimiter_matches,
                 "columns": column_results,
             }

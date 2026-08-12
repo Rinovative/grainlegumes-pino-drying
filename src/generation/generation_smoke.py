@@ -37,6 +37,7 @@ from src import common, domain
 
 from . import generation_campaign as campaign_runtime
 from . import generation_workflow as workflow_service
+from .contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from .contracts import generation_contracts_profiles as profiles
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .publication import generation_publication_storage as storage_service
@@ -165,7 +166,7 @@ def _relative(path: Path, *, storage: Path) -> str:
         raise ValueError(message) from error
 
 
-def _csv_header(path: Path, *, delimiter: str) -> list[str]:
+def _input_adapter_header(path: Path, *, delimiter: str) -> list[str]:
     """Read the first non-comment CSV header without loading its payload."""
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
@@ -209,7 +210,7 @@ def _input_inventory(
         if sha256 != identity.get("sha256") or size_bytes != identity.get("size_bytes"):
             message = f"Retained input identity differs from case.json: {path}"
             raise RuntimeError(message)
-        header = _csv_header(path, delimiter=str(contract["delimiter"]))
+        header = _input_adapter_header(path, delimiter=str(contract["delimiter"]))
         if header != list(contract["columns"]):
             message = f"Retained input header differs from its explicit contract: {path}"
             raise ValueError(message)
@@ -275,7 +276,14 @@ def _export_inventory(
         if sha256 != identity.get("sha256") or size_bytes != identity.get("size_bytes"):
             message = f"Retained raw-export identity changed: {path}"
             raise RuntimeError(message)
-        header = _csv_header(path, delimiter=str(contract["delimiter"]))
+        expected_units = {source: str(contract["units"][logical]) for logical, source in contract["columns"].items()}
+        table = spreadsheet_contract.read_comsol_spreadsheet(
+            path,
+            delimiter=str(contract["delimiter"]),
+            expected_units=expected_units,
+            include_values=False,
+        )
+        header = list(table.canonical_header)
         if contract["mapping_state"] == "mapping_probe_required":
             message = f"Real smoke cannot bind unresolved required mapping role {role!r}."
             raise RuntimeError(message)
@@ -290,6 +298,7 @@ def _export_inventory(
                 "role": role,
                 "sha256": sha256,
                 "size_bytes": size_bytes,
+                "raw_header": list(table.raw_header),
                 "actual_header": header,
                 "configured_columns": dict(contract["columns"]),
                 "mapping_state_before_runtime_receipt": contract["mapping_state"],
