@@ -38,6 +38,7 @@ SKIP_EXTREME_FAMILY_OOD=false
 PILOT_STAGING=""
 PILOT_STAGING_BYTES=0
 PILOT_STAGING_RECLAIMED=0
+REMOTE_SETUP_IDENTITY=""
 
 usage() {
   cat >&2 <<EOF
@@ -426,7 +427,12 @@ print_layout() {
 
 verify_remote_setup() {
   resolve_remote_layout
-  remote_bash "${CPU_HOST}" \
+  local setup_identity
+  printf -v setup_identity '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
+    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${PYTHON_MODULE}" "${PYTHON_EXECUTABLE}"
+  [[ "${REMOTE_SETUP_IDENTITY}" != "${setup_identity}" ]] || return 0
+  if remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${PYTHON_MODULE}" \
     "${PYTHON_EXECUTABLE}" <<'REMOTE'
@@ -437,6 +443,11 @@ python_module="$6"; python_executable="$7"
   "${repository}" "${storage}" "${venv}" "${commit}" "${repository_url}" \
   "${python_module}" "${python_executable}"
 REMOTE
+  then
+    REMOTE_SETUP_IDENTITY="${setup_identity}"
+  else
+    return $?
+  fi
 }
 
 
@@ -510,7 +521,7 @@ REMOTE
 
 remote_plan_submit() {
   local operation="$1"
-  verify_remote_setup
+  verify_remote_setup >&2 || return $?
   local remote_campaign
   remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
   remote_bash "${CPU_HOST}" \
@@ -764,6 +775,7 @@ launch_campaign() {
   validate_resources
   resolve_remote_layout
   print_layout
+  verify_remote_setup >&2
   local output
   output="$(remote_plan_submit submit-campaign)" || fail 1 "Remote launch failed."
   printf '%s\n' "${output}"
@@ -776,7 +788,7 @@ launch_campaign() {
 }
 
 remote_cli() {
-  verify_remote_setup
+  verify_remote_setup >&2 || return $?
   remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
     "${REMOTE_VENV}" "${PYTHON_MODULE}" "$@" <<'REMOTE'
 set -euo pipefail
@@ -857,6 +869,7 @@ collect_campaign() {
   resolve_local_python
   resolve_remote_layout
   resolve_local_storage
+  verify_remote_setup >&2
   if gpu_publication_is_valid; then
     printf 'GPU generation publication validated and reused for %s.\n' "${RUN_ID}"
     return
@@ -941,6 +954,7 @@ read_remote_source_status() {
 
 wait_for_terminal_publication() {
   validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
+  verify_remote_setup >&2
   while true; do
     read_remote_source_status
     if [[ "${REMOTE_SOURCE_STATE}" == source_cleanup_complete ]]; then
@@ -1053,6 +1067,7 @@ cleanup_cpu_source() {
   resolve_local_python
   resolve_remote_layout
   resolve_local_storage
+  verify_remote_setup >&2
   if [[ "${CONFIRM_CLEANUP}" == true ]]; then
     confirm_cpu_cleanup
     return
@@ -1164,6 +1179,7 @@ workflow_exit_handler() {
 
 read_remote_campaign_identity() {
   resolve_local_python
+  verify_remote_setup >&2
   local identity kind purpose cases extra
   identity="$(remote_cli campaign-status "${RUN_ID}" --no-scheduler \
     --storage-root "${REMOTE_STORAGE_ROOT}" |

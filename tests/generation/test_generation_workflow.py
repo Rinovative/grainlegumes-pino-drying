@@ -8,8 +8,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src import generation
+from src.generation.cli import cli_generation
+
+if TYPE_CHECKING:
+    import pytest
 
 _COMMIT = "a" * 40
 _RUN_ID = "steady_flow_family_generalization__0123456789abcdef"
@@ -166,6 +171,12 @@ if [[ "${FAKE_CPU_LOGIN_RSYNC_MISSING:-false}" == true \
   printf 'CPU login prerequisite missing: rsync (blocks transfer).\n' >&2
   exit 71
 fi
+if [[ "${FAKE_LOGIN_PREFLIGHT_STDOUT:-false}" == true \
+  && "${payload}" == *'generation_cpu_login_preflight.sh'* ]]; then
+  printf '%s\n' \
+    'Preflight domain=CPU login check=command:git status=pass detail=resolved' \
+    'Generation-venv-runtime status=pass'
+fi
 if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
   printf '%s\n' '/remote/home'
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
@@ -231,7 +242,16 @@ elif [[ " $* " == *' campaign-accounting '* ]]; then
 elif [[ " $* " == *' cancel-campaign '* ]]; then
   printf '%s\n' '{"status":"cancel_requested"}'
 elif [[ " $* " == *' submit-campaign'* ]]; then
-  printf '{"campaign_run_id":"%s","state":"submitted"}\n' "${FAKE_RUN_ID}"
+  if [[ "${FAKE_TRACK_SINGLE_SUBMISSION:-false}" == true ]]; then
+    [[ ! -e "${FAKE_SUBMISSION_FILE}" ]] || {
+      printf '%s\n' 'synthetic duplicate campaign submission' >&2
+      exit 72
+    }
+    printf '%s\n' '591776' > "${FAKE_SUBMISSION_FILE}"
+  fi
+  printf '{"campaign_run_id":"%s","state":"active","slurm_job_ids":["591776"],'\
+'"submissions":[{"case_id":"case_0001","case_index":1,"status":"submitted","error":null}]}\n' \
+    "${FAKE_RUN_ID}"
 elif [[ " $* " == *' plan-campaign'* ]]; then
   printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
 elif [[ "${payload}" == *'sbatch --wait --parsable'* ]]; then
@@ -430,6 +450,9 @@ fi
             "FAKE_WORKFLOW_SHA": _WORKFLOW_SHA,
             "FAKE_INVENTORY_SHA": _INVENTORY_SHA,
             "FAKE_CLEANUP_RECEIPT_SHA": _CLEANUP_RECEIPT_SHA,
+            "FAKE_LOGIN_PREFLIGHT_STDOUT": "false",
+            "FAKE_TRACK_SINGLE_SUBMISSION": "false",
+            "FAKE_SUBMISSION_FILE": str(state_root / "submission"),
             "FAKE_GPU_PUBLISHED_FILE": str(state_root / "gpu-published"),
             "FAKE_BENCHMARK_PUBLISHED_FILE": str(state_root / "benchmark-published"),
             "FAKE_DATASETS_COMPLETE_FILE": str(state_root / "datasets-complete"),
@@ -522,6 +545,78 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
         encoding="utf-8",
     )
     return source_directories
+
+
+def test_campaign_source_status_cli_emits_exact_tsv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep the source-status producer to one strict six-field TSV record."""
+    status = {
+        "campaign_run_id": _RUN_ID,
+        "campaign_state": "active",
+        "reclaimable_bytes": 1234,
+        "cleanup_eligibility": "ineligible",
+        "active_slurm": True,
+    }
+    monkeypatch.setattr(
+        cli_generation.workflow_service,
+        "campaign_source_status",
+        lambda *_args, **_kwargs: status,
+    )
+
+    result = cli_generation.main(
+        [
+            "campaign-source-status",
+            _RUN_ID,
+            "--query-scheduler",
+            "--format",
+            "tsv",
+            "--storage-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == f"source-status\t{_RUN_ID}\tactive\t1234\tineligible\tTrue\n"
+    fields = captured.out.rstrip("\n").split("\t")
+    assert len(fields) == 6
+    assert fields[1] == _RUN_ID
+    assert int(fields[3]) >= 0
+
+
+def test_fresh_campaign_monitoring_keeps_machine_stdout_clean(tmp_path: Path) -> None:
+    """Continue a first active submission despite visible login diagnostics."""
+    workflow, log, environment, storage, _mirror = _harness(tmp_path)
+    environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATE"] = "publication_complete"
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    campaign = workflow.parent.parent / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+    assert not storage.exists()
+
+    result = _run(
+        workflow,
+        ["all", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Malformed CPU source status." not in result.stderr
+    assert f"Campaign {_RUN_ID} state: publication_complete" in result.stdout
+    assert '"state":"active","slurm_job_ids":["591776"]' in result.stdout
+    assert "Preflight domain=CPU login" not in result.stdout
+    assert "Preflight domain=CPU login" in result.stderr
+    assert Path(environment["FAKE_SUBMISSION_FILE"]).read_text(encoding="utf-8") == "591776\n"
+    log_text = log.read_text(encoding="utf-8")
+    assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
+    assert "campaign-source-status" in log_text
+    assert "campaign-status" in log_text
+    assert log_text.count("generation_cpu_login_preflight.sh") == 1
 
 
 def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Path) -> None:
@@ -659,6 +754,24 @@ def test_preflight_stops_on_missing_login_rsync_before_slurm_submission(tmp_path
     log_text = log.read_text(encoding="utf-8")
     assert "generation_cpu_login_preflight.sh" in log_text
     assert "sbatch --wait --parsable" not in log_text
+
+
+def test_captured_launch_stops_when_login_preflight_fails(tmp_path: Path) -> None:
+    """Keep captured launch output fail-closed on a prerequisite error."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_CPU_LOGIN_RSYNC_MISSING"] = "true"
+
+    result = _run(
+        workflow,
+        ["launch", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "CPU login prerequisite missing: rsync (blocks transfer)." in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "generation_cpu_login_preflight.sh" in log_text
+    assert "submit-campaign" not in log_text
 
 
 def test_preflight_passes_exact_cpu_checkout_to_relocated_worker(tmp_path: Path) -> None:
@@ -873,6 +986,7 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
 def test_high_level_core_benchmark_routes_through_docker_cpu_and_dedicated_transfer(tmp_path: Path) -> None:
     """Exercise all-four submission, serial collection, and one-variant recovery routing."""
     workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     relative = environment["FAKE_BENCHMARK_RELATIVE"]
     remote_directory = mirror / relative
     remote_directory.mkdir(parents=True)
@@ -885,6 +999,7 @@ def test_high_level_core_benchmark_routes_through_docker_cpu_and_dedicated_trans
     assert "CPU benchmark evidence retained" in result.stdout
     assert remote_directory.is_dir()
     assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()
+    assert f"Core benchmark {_BENCHMARK_RUN_ID} state: complete" in result.stdout
     log_text = log.read_text(encoding="utf-8")
     for command in (
         "inspect-core-benchmark",
@@ -930,6 +1045,7 @@ def test_core_benchmark_failure_reports_retry_without_premature_finalization(tmp
 def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_path: Path) -> None:
     """Protect safe rsync, source retention, staging cleanup, and retry evidence."""
     workflow, log, environment, storage, mirror = _harness(tmp_path)
+    environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     source_directories = _seed_transfer(mirror, environment)
     collected = _run(
         workflow,
@@ -938,6 +1054,8 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     )
     assert collected.returncode == 0, collected.stderr
     assert "CPU source retained" in collected.stdout
+    assert "Preflight domain=CPU login" not in collected.stdout
+    assert "Preflight domain=CPU login" in collected.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("rsync-start") == 4
