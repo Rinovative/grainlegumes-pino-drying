@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -115,15 +116,16 @@ def _mock_local_gates(
     return storage, transfer, terminal, datasets_receipt
 
 
-def test_technical_smoke_receipt_does_not_change_campaign_transfer_identity(tmp_path: Path) -> None:
-    """Keep post-workflow profile evidence outside immutable transfer payload identity."""
+def test_post_transfer_operational_paths_do_not_change_campaign_transfer_identity(tmp_path: Path) -> None:
+    """Exclude only exact campaign-local post-transfer paths from transfer identity."""
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     (campaign / "campaign_terminal.json").write_text("{}\n", encoding="utf-8")
     before = campaign_evidence.directory_identity(
         campaign,
-        ignored_names=campaign_evidence.TRANSFER_OPERATIONAL_RECEIPTS,
+        ignored_relative_paths=campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS,
     )
+    (campaign / "dataset_packages_complete.lock").touch()
     (campaign / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME).write_text(
         "{}\n",
         encoding="utf-8",
@@ -132,11 +134,53 @@ def test_technical_smoke_receipt_does_not_change_campaign_transfer_identity(tmp_
     assert (
         campaign_evidence.directory_identity(
             campaign,
-            ignored_names=campaign_evidence.TRANSFER_OPERATIONAL_RECEIPTS,
+            ignored_relative_paths=campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS,
         )
         == before
     )
     assert campaign_evidence.directory_identity(campaign) != before
+    nested = campaign / "nested"
+    nested.mkdir()
+    (nested / "dataset_packages_complete.lock").touch()
+    assert (
+        campaign_evidence.directory_identity(
+            campaign,
+            ignored_relative_paths=campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS,
+        )
+        != before
+    )
+
+
+def test_dataset_finalization_lock_uses_generation_local_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep dataset-finalization synchronization outside campaign evidence."""
+    storage = tmp_path / "storage"
+    run_directory = campaign_evidence.campaign_run_directory(_RUN_ID, storage_root=storage)
+    run_directory.mkdir(parents=True)
+    (run_directory / generation.workflow.DATASET_RECEIPT_FILENAME).write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(generation.campaign, "validate_transferred_campaign", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        generation.campaign,
+        "validate_terminal_campaign",
+        lambda *_args, **_kwargs: {"dataset_packages": []},
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_for_run",
+        lambda *_args, **_kwargs: SimpleNamespace(dataset_packages=()),
+    )
+    monkeypatch.setattr(
+        generation.workflow,
+        "validate_dataset_packages_receipt",
+        lambda *_args, **_kwargs: {"packages": []},
+    )
+
+    assert generation.workflow.build_campaign_datasets(_RUN_ID, storage_root=storage) == {"packages": []}
+    expected_lock = common.paths.get_generation_state_root(storage_root=storage) / "dataset-package-locks" / f"{_RUN_ID}.lock"
+    assert expected_lock.is_file()
+    assert not (run_directory / "dataset_packages_complete.lock").exists()
 
 
 def test_all_receipt_records_distinct_gates_and_cleanup_policy(

@@ -127,6 +127,12 @@ def _dataset_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / DATASET_RECEIPT_FILENAME
 
 
+def _dataset_receipt_lock_path(run_id: str, *, storage_root: Path) -> Path:
+    """Return the GPU-local dataset-finalization lock path."""
+    safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
+    return common.paths.get_generation_state_root(storage_root=storage_root) / "dataset-package-locks" / f"{safe_id}.lock"
+
+
 def _all_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the all-workflow receipt path."""
     return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / ALL_WORKFLOW_RECEIPT_FILENAME
@@ -322,7 +328,7 @@ def build_campaign_datasets(
         message = "Terminal campaign dataset declarations differ from the repository campaign."
         raise RuntimeError(message)
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
-    lock_path = receipt_path.with_suffix(".lock")
+    lock_path = _dataset_receipt_lock_path(run_id, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         if receipt_path.exists():
             return validate_dataset_packages_receipt(run_id, storage_root=storage)

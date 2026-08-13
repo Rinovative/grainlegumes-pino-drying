@@ -873,6 +873,55 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     )
     assert repeated == receipt
     assert destination_checks["count"] == 4
+
+    receipt_path = destination / campaign_directory / "transfer_complete.json"
+    immutable_receipt = receipt_path.read_bytes()
+    (destination / campaign_directory / "dataset_packages_complete.lock").touch()
+    (destination / campaign_directory / "dataset_packages_complete.json").write_text("{}\n", encoding="utf-8")
+    (destination / campaign_directory / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    validated = campaign_evidence.validate_transfer_receipt(
+        run_id,
+        terminal=terminal,
+        plan=plan,
+        storage_root=destination,
+    )
+    current_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
+    assert validated == receipt
+    assert receipt_path.read_bytes() == immutable_receipt
+    assert current_inventory == {
+        "file_count": receipt["transferred_file_count"],
+        "size_bytes": receipt["transferred_bytes"],
+        "files": receipt["files"],
+        "inventory_sha256": receipt["transfer_inventory_sha256"],
+    }
+
+    nested = destination / campaign_directory / "nested"
+    nested.mkdir()
+    nested_lock = nested / "dataset_packages_complete.lock"
+    nested_lock.touch()
+    with pytest.raises(ValueError, match="Transfer completion receipt or GPU publication is invalid"):
+        campaign_evidence.validate_transfer_receipt(
+            run_id,
+            terminal=terminal,
+            plan=plan,
+            storage_root=destination,
+        )
+    nested_lock.unlink()
+    nested.rmdir()
+
+    transferred_path = destination / relative_directories[0] / "payload-0.txt"
+    transferred_path.write_text("mutated\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Transfer completion receipt or GPU publication is invalid"):
+        campaign_evidence.validate_transfer_receipt(
+            run_id,
+            terminal=terminal,
+            plan=plan,
+            storage_root=destination,
+        )
+
     unmarked = tmp_path / "unmarked staging"
     unmarked.mkdir()
     with pytest.raises(ValueError, match="marker"):

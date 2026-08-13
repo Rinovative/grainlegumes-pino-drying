@@ -1241,10 +1241,10 @@ def publish_transferred_campaign(
         if not source.is_relative_to(staging) or not target.is_relative_to(destination):
             message = f"Transfer directory escapes a storage root: {relative_value!r}"
             raise ValueError(message)
-        ignored = campaign_evidence.TRANSFER_OPERATIONAL_RECEIPTS if relative_value == plan["campaign_directory"] else frozenset()
-        source_identity = campaign_evidence.directory_identity(source, ignored_names=ignored)
+        ignored_relative_paths = campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
+        source_identity = campaign_evidence.directory_identity(source, ignored_relative_paths=ignored_relative_paths)
         if target.exists():
-            target_identity = campaign_evidence.directory_identity(target, ignored_names=ignored)
+            target_identity = campaign_evidence.directory_identity(target, ignored_relative_paths=ignored_relative_paths)
             if target_identity != source_identity:
                 message = f"Existing transfer destination conflicts with staged identity: {target}"
                 raise FileExistsError(message)
@@ -1265,12 +1265,12 @@ def publish_transferred_campaign(
         )
         payload = publication_stage / "payload"
         shutil.copytree(source, payload)
-        if campaign_evidence.directory_identity(payload, ignored_names=ignored) != source_identity:
+        if campaign_evidence.directory_identity(payload, ignored_relative_paths=ignored_relative_paths) != source_identity:
             message = f"Transfer copy changed staged identity: {relative_value!r}"
             raise RuntimeError(message)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload.replace(target)
-        if campaign_evidence.directory_identity(target, ignored_names=ignored) != source_identity:
+        if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored_relative_paths) != source_identity:
             message = f"Transferred directory identity changed during publication: {target}"
             raise RuntimeError(message)
         workspace_service.cleanup_publication_staging(

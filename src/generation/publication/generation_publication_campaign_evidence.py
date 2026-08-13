@@ -68,11 +68,12 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "state",
     }
 )
-TRANSFER_OPERATIONAL_RECEIPTS: Final = frozenset(
+POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
     {
         "all_workflow.json",
         "cpu_source_cleanup.json",
         "dataset_packages_complete.json",
+        "dataset_packages_complete.lock",
         "transfer_complete.json",
         TECHNICAL_SMOKE_EVIDENCE_FILENAME,
     }
@@ -409,7 +410,7 @@ def campaign_for_run(
 def directory_identity(
     directory: Path,
     *,
-    ignored_names: frozenset[str] = frozenset(),
+    ignored_relative_paths: frozenset[str] = frozenset(),
 ) -> str:
     """Return a symlink-free exact tree identity for transfer comparison."""
     if not directory.is_dir() or directory.is_symlink():
@@ -420,9 +421,9 @@ def directory_identity(
         if path.is_symlink():
             message = f"Transfer directory contains a symbolic link: {path}"
             raise ValueError(message)
-        if not path.is_file() or path.name in ignored_names:
-            continue
         relative = path.relative_to(directory).as_posix()
+        if not path.is_file() or relative in ignored_relative_paths:
+            continue
         records[relative] = {
             "sha256": common.serialization.file_sha256(path),
             "size_bytes": path.stat().st_size,
@@ -457,12 +458,13 @@ def transfer_inventory_from_plan(
         if not directory.is_relative_to(storage_root) or not directory.is_dir() or directory.is_symlink():
             message = f"Transfer source is missing or unsafe: {directory}"
             raise FileNotFoundError(message)
-        ignored_names = TRANSFER_OPERATIONAL_RECEIPTS if relative_value == plan["campaign_directory"] else frozenset()
+        ignored_relative_paths = POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
         for path in sorted(directory.rglob("*")):
             if path.is_symlink():
                 message = f"Transfer source contains a symbolic link: {path}"
                 raise ValueError(message)
-            if not path.is_file() or path.name in ignored_names:
+            relative_to_directory = path.relative_to(directory).as_posix()
+            if not path.is_file() or relative_to_directory in ignored_relative_paths:
                 continue
             relative_path = path.relative_to(storage_root).as_posix()
             if relative_path in seen:
