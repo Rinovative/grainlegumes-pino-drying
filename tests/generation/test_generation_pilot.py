@@ -579,6 +579,18 @@ def test_failed_pilot_retains_compact_artifacts_before_scratch_disappears(
     }.issubset(failure["retained_artifacts"])
     shutil.rmtree(work)
     assert runtime_service.case_failure_is_recorded(batch, 1, storage_root=storage)
+    retained = runtime_service.case_failure_artifacts_directory(
+        batch,
+        1,
+        storage_root=storage,
+    )
+    (retained / "fields.csv").write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="retained-artifact identity is invalid"):
+        runtime_service.case_failure_is_recorded(
+            batch,
+            1,
+            storage_root=storage,
+        )
 
 
 def test_staging_cleanup_writes_pending_transaction_before_deletion(

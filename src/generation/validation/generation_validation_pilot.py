@@ -532,6 +532,8 @@ def finalize_pilot_campaign(
                 batch,
                 case_index,
                 storage_root=storage,
+                execution_run_id=run_id,
+                git_commit=str(manifest["git_commit"]),
             ):
                 source = runtime_service.case_failure_path(
                     batch,

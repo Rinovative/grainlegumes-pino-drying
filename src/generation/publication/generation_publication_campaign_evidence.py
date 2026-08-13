@@ -40,7 +40,7 @@ _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
     "--nodelist",
     "--reservation",
 )
-_RUN_MANIFEST_SCHEMA_VERSION: Final = 2
+_RUN_MANIFEST_SCHEMA_VERSION: Final = 1
 TECHNICAL_SMOKE_EVIDENCE_FILENAME: Final = "technical_smoke_evidence.json"
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {

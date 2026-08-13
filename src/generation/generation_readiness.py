@@ -241,7 +241,7 @@ def build_readiness_report(
     )
     return {
         "schema_kind": "vp2_production_readiness",
-        "schema_version": 3,
+        "schema_version": 1,
         "campaign_contracts": campaign_contracts,
         "campaign_ids": [campaign.campaign_id for campaign in campaigns],
         "campaign_config_resolution_complete": campaign_resolution_complete,

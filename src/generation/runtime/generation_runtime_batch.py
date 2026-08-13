@@ -36,7 +36,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from src import common
 from src.generation.cases import generation_cases_case as case_service
@@ -136,7 +136,7 @@ _CASE_SUCCESS_KEYS: Final = frozenset(
     }
 )
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
-CASE_FAILURE_SCHEMA_VERSION = 2
+CASE_FAILURE_SCHEMA_VERSION = 1
 _CASE_FAILURE_KEYS = frozenset(
     {
         "schema_kind",
@@ -150,6 +150,7 @@ _CASE_FAILURE_KEYS = frozenset(
         "case_id",
         "case_index",
         "git_commit",
+        "execution_run_id",
         "recorded_at",
         "execution",
         "error",
@@ -182,6 +183,7 @@ _FAILURE_EXECUTION_KEYS = frozenset(
     }
 )
 _FAILURE_STAGES = frozenset({"input", "solver", "export", "conversion", "invalid_result"})
+_FailureEvidenceState = Literal["absent", "current", "stale"]
 
 
 class CaseExecutionError(RuntimeError):
@@ -1348,6 +1350,106 @@ def case_failure_artifacts_directory(
     return _state_batch_root(config, storage_root=storage_root) / "failure_artifacts" / config.case_id(case_index)
 
 
+def _case_failure_identity(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    execution_run_id: str | None = None,
+    git_commit: str | None = None,
+) -> dict[str, Any]:
+    """Return the exact scientific and execution identity of one failure receipt."""
+    run_id = (
+        workspace_service.workspace_run_id(config)
+        if execution_run_id is None
+        else common.paths.validate_logical_name(
+            execution_run_id,
+            label="failure execution_run_id",
+        )
+    )
+    commit = source_service.required_git_commit() if git_commit is None else source_service.validate_git_commit(git_commit)
+    return {
+        "simulation_profile": config.profile.id,
+        "batch_id": config.batch_id,
+        "batch_identity": config.batch_identity,
+        "scientific_config_digest": config.scientific_config_digest,
+        "case_id": config.case_id(case_index),
+        "case_index": case_index,
+        "git_commit": commit,
+        "execution_run_id": run_id,
+        "template_sha256": config.template_sha256,
+    }
+
+
+def _validate_case_failure_path_safety(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None,
+) -> tuple[Path, Path]:
+    """Return failure paths after rejecting non-ordinary or symlinked state."""
+    path = case_failure_path(config, case_index, storage_root=storage_root)
+    artifacts = case_failure_artifacts_directory(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        message = f"Case failure evidence is unsafe: {path}"
+        raise ValueError(message)
+    if artifacts.is_symlink() or (artifacts.exists() and not artifacts.is_dir()):
+        message = f"Case failure artifact path is unsafe: {artifacts}"
+        raise ValueError(message)
+    if artifacts.exists():
+        for artifact in artifacts.rglob("*"):
+            if artifact.is_symlink():
+                message = f"Case failure retained artifacts contain a symbolic link: {artifact}"
+                raise ValueError(message)
+    return path, artifacts
+
+
+def _validate_case_failure_identity_fields(
+    payload: Mapping[str, Any],
+    *,
+    path: Path,
+) -> None:
+    """Reject malformed identity fields in a current-schema failure receipt."""
+    try:
+        source_service.validate_git_commit(payload.get("git_commit"))
+        common.paths.validate_logical_name(
+            payload.get("simulation_profile"),
+            label="failure simulation_profile",
+        )
+        common.paths.validate_logical_name(
+            payload.get("batch_id"),
+            label="failure batch_id",
+        )
+        common.paths.validate_logical_name(
+            payload.get("execution_run_id"),
+            label="failure execution_run_id",
+        )
+    except (TypeError, ValueError) as error:
+        message = f"Case failure evidence identity is invalid: {path}"
+        raise ValueError(message) from error
+    case_index = payload.get("case_index")
+    if (
+        isinstance(case_index, bool)
+        or not isinstance(case_index, int)
+        or case_index < 1
+        or not isinstance(payload.get("case_id"), str)
+        or _CASE_ID_PATTERN.fullmatch(payload["case_id"]) is None
+        or any(
+            not isinstance(payload.get(key), str) or _SHA256_PATTERN.fullmatch(payload[key]) is None
+            for key in (
+                "batch_identity",
+                "scientific_config_digest",
+                "template_sha256",
+            )
+        )
+    ):
+        message = f"Case failure evidence identity is invalid: {path}"
+        raise ValueError(message)
+
+
 def _optional_json_object(path: Path) -> dict[str, Any] | None:
     """Load one optional non-symlink JSON object for failure evidence."""
     if not path.is_file() or path.is_symlink():
@@ -1672,6 +1774,11 @@ def record_case_failure(
         message = f"Initial scratch cleanup status is invalid: {scratch_cleanup_status!r}"
         raise ValueError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
+    _retire_stale_case_failure(
+        config,
+        case_index,
+        storage_root=storage,
+    )
     path = case_failure_path(config, case_index, storage_root=storage)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = "cancelled" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "failed"
@@ -1680,13 +1787,7 @@ def record_case_failure(
         "schema_version": CASE_FAILURE_SCHEMA_VERSION,
         "state": state,
         "failure_stage": failure_stage,
-        "simulation_profile": config.profile.id,
-        "batch_id": config.batch_id,
-        "batch_identity": config.batch_identity,
-        "scientific_config_digest": config.scientific_config_digest,
-        "case_id": config.case_id(case_index),
-        "case_index": case_index,
-        "git_commit": source_service.required_git_commit(),
+        **_case_failure_identity(config, case_index),
         "recorded_at": _utc_now(),
         "execution": _failure_execution_evidence(
             config,
@@ -1752,17 +1853,14 @@ def clear_case_failure(
     *,
     storage_root: Path | str | None = None,
 ) -> None:
-    """Clear stale failure evidence after exact completion or integrity reuse."""
-    case_failure_path(config, case_index, storage_root=storage_root).unlink(missing_ok=True)
-    artifacts = case_failure_artifacts_directory(
+    """Clear safe obsolete or superseded failure diagnostics."""
+    path, artifacts = _validate_case_failure_path_safety(
         config,
         case_index,
         storage_root=storage_root,
     )
+    path.unlink(missing_ok=True)
     if artifacts.exists():
-        if not artifacts.is_dir() or artifacts.is_symlink():
-            message = f"Case failure artifact path is unsafe: {artifacts}"
-            raise ValueError(message)
         shutil.rmtree(artifacts)
 
 
@@ -1817,37 +1915,53 @@ def _validate_failure_retained_artifacts(
             raise ValueError(message)
 
 
-def case_failure_is_recorded(
+def _case_failure_evidence_state(
     config: config_contract.GenerationConfig,
     case_index: int,
     *,
     storage_root: Path | str | None = None,
-) -> bool:
-    """Validate and report durable failure evidence for one incomplete case."""
-    path = case_failure_path(config, case_index, storage_root=storage_root)
+    execution_run_id: str | None = None,
+    git_commit: str | None = None,
+) -> _FailureEvidenceState:
+    """Classify absent, current, and stale failure evidence without legacy parsing."""
+    path, artifacts_root = _validate_case_failure_path_safety(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
     if not path.exists():
-        return False
-    if not path.is_file() or path.is_symlink():
-        msg = f"Case failure evidence is unsafe: {path}"
-        raise ValueError(msg)
+        return "stale" if artifacts_root.exists() else "absent"
     payload = _load_json_object(path, label="case failure evidence")
+    schema_kind = payload.get("schema_kind")
+    schema_version = payload.get("schema_version")
     if (
-        set(payload) != _CASE_FAILURE_KEYS
-        or payload.get("schema_kind") != CASE_FAILURE_SCHEMA_KIND
-        or payload.get("schema_version") != CASE_FAILURE_SCHEMA_VERSION
-        or payload.get("state") not in {"failed", "cancelled"}
-        or payload.get("failure_stage") not in _FAILURE_STAGES
-        or payload.get("simulation_profile") != config.profile.id
-        or payload.get("batch_id") != config.batch_id
-        or payload.get("batch_identity") != config.batch_identity
-        or payload.get("scientific_config_digest") != config.scientific_config_digest
-        or payload.get("case_id") != config.case_id(case_index)
-        or payload.get("case_index") != case_index
-        or payload.get("template_sha256") != config.template_sha256
+        not isinstance(schema_kind, str)
+        or not schema_kind
+        or isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 1
     ):
-        msg = f"Case failure evidence identity is invalid: {path}"
-        raise ValueError(msg)
-    source_service.validate_git_commit(payload.get("git_commit"))
+        message = f"Case failure evidence identity is invalid: {path}"
+        raise ValueError(message)
+    if schema_kind != CASE_FAILURE_SCHEMA_KIND or schema_version != CASE_FAILURE_SCHEMA_VERSION:
+        return "stale"
+    if "execution_run_id" not in payload:
+        return "stale"
+    if set(payload) != _CASE_FAILURE_KEYS:
+        message = f"Case failure evidence identity is invalid: {path}"
+        raise ValueError(message)
+    _validate_case_failure_identity_fields(payload, path=path)
+    expected_identity = _case_failure_identity(
+        config,
+        case_index,
+        execution_run_id=execution_run_id,
+        git_commit=git_commit,
+    )
+    if any(payload.get(key) != value for key, value in expected_identity.items()):
+        return "stale"
+    if payload.get("state") not in {"failed", "cancelled"} or payload.get("failure_stage") not in _FAILURE_STAGES:
+        message = f"Case failure evidence outcome is invalid: {path}"
+        raise ValueError(message)
     execution = payload.get("execution")
     error = payload.get("error")
     if (
@@ -1862,20 +1976,20 @@ def case_failure_is_recorded(
         or not isinstance(execution.get("timed_out"), bool)
         or not isinstance(execution.get("configured_modules"), list)
     ):
-        msg = f"Case failure execution evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure execution evidence is invalid: {path}"
+        raise ValueError(message)
     if (
         not isinstance(error, dict)
         or set(error) != {"type", "message"}
         or not isinstance(error["type"], str)
         or not isinstance(error["message"], str)
     ):
-        msg = f"Case failure error evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure error evidence is invalid: {path}"
+        raise ValueError(message)
     work_directory = payload.get("work_directory")
     if work_directory is not None and (not isinstance(work_directory, str) or not work_directory or not Path(work_directory).is_absolute()):
-        msg = f"Case failure work-directory evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure work-directory evidence is invalid: {path}"
+        raise ValueError(message)
     inputs = payload.get("input_files")
     if (
         not isinstance(inputs, dict)
@@ -1883,12 +1997,12 @@ def case_failure_is_recorded(
         or not isinstance(inputs["declared"], dict)
         or not isinstance(inputs["observed"], dict)
     ):
-        msg = f"Case failure input identity evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure input identity evidence is invalid: {path}"
+        raise ValueError(message)
     missing = payload.get("missing_or_invalid_artifacts")
     if not isinstance(missing, list) or not all(isinstance(item, str) and item for item in missing):
-        msg = f"Case failure artifact evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure artifact evidence is invalid: {path}"
+        raise ValueError(message)
     export_diagnostics = payload.get("export_diagnostics")
     if not isinstance(export_diagnostics, list) or any(
         not isinstance(record, dict)
@@ -1906,14 +2020,14 @@ def case_failure_is_recorded(
         or not isinstance(record["observations"], list)
         for record in export_diagnostics
     ):
-        msg = f"Case failure export diagnostics are invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure export diagnostics are invalid: {path}"
+        raise ValueError(message)
     log_tail = payload.get("log_tail")
     if log_tail is not None and (
         not isinstance(log_tail, dict) or set(log_tail) != {"source", "text"} or not all(isinstance(value, str) for value in log_tail.values())
     ):
-        msg = f"Case failure log-tail evidence is invalid: {path}"
-        raise ValueError(msg)
+        message = f"Case failure log-tail evidence is invalid: {path}"
+        raise ValueError(message)
     _validate_failure_retained_artifacts(
         config,
         case_index,
@@ -1931,9 +2045,54 @@ def case_failure_is_recorded(
         or cleanup.get("reclaimed_bytes", -1) < 0
         or (cleanup.get("error") is not None and not isinstance(cleanup.get("error"), str))
     ):
-        msg = f"Case failure scratch-cleanup evidence is invalid: {path}"
-        raise ValueError(msg)
-    return True
+        message = f"Case failure scratch-cleanup evidence is invalid: {path}"
+        raise ValueError(message)
+    return "current"
+
+
+def case_failure_is_recorded(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None = None,
+    execution_run_id: str | None = None,
+    git_commit: str | None = None,
+) -> bool:
+    """Validate and report current failure evidence for one incomplete case."""
+    return (
+        _case_failure_evidence_state(
+            config,
+            case_index,
+            storage_root=storage_root,
+            execution_run_id=execution_run_id,
+            git_commit=git_commit,
+        )
+        == "current"
+    )
+
+
+def _retire_stale_case_failure(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None = None,
+    execution_run_id: str | None = None,
+    git_commit: str | None = None,
+) -> None:
+    """Remove one safe obsolete diagnostic before a current case attempt."""
+    state = _case_failure_evidence_state(
+        config,
+        case_index,
+        storage_root=storage_root,
+        execution_run_id=execution_run_id,
+        git_commit=git_commit,
+    )
+    if state == "stale":
+        clear_case_failure(
+            config,
+            case_index,
+            storage_root=storage_root,
+        )
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -2499,6 +2658,11 @@ def run_case(
                 ),
                 work_directory=None,
             )
+        _retire_stale_case_failure(
+            config,
+            case_index,
+            storage_root=storage,
+        )
         prepared: PreparedCase | None = None
         failure_stage = "input"
         try:

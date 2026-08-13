@@ -196,7 +196,7 @@ def _new_campaign_manifest(
     scheduler_prefix = f"vp2-{run_id.rsplit('__', maxsplit=1)[-1]}"
     return {
         "schema_kind": "generation_campaign_run",
-        "schema_version": 2,
+        "schema_version": 1,
         "campaign_run_id": run_id,
         "campaign_name": campaign.campaign_name,
         "campaign_id": campaign.campaign_id,
@@ -273,7 +273,7 @@ def plan_campaign(
     )
     return {
         "schema_kind": "generation_campaign_plan",
-        "schema_version": 2,
+        "schema_version": 1,
         "state": "planned",
         "filesystem_mutated": False,
         "campaign_run_id": run_id,
@@ -506,7 +506,13 @@ def _task_state(
         elif unknown_records:
             state = "scheduler_unknown"
             reason = str(unknown_records[-1]["job_id"])
-        elif batch_runtime.case_failure_is_recorded(batch, task.case_index, storage_root=storage_root):
+        elif batch_runtime.case_failure_is_recorded(
+            batch,
+            task.case_index,
+            storage_root=storage_root,
+            execution_run_id=str(manifest["campaign_run_id"]),
+            git_commit=str(manifest["git_commit"]),
+        ):
             state = "failed"
             reason = "case_failure_evidence"
         elif latest_accounted is not None:
@@ -852,7 +858,7 @@ def record_worker_interruption(
     path = directory / f"{job_id}.json"
     payload = {
         "schema_kind": "generation_worker_interruption",
-        "schema_version": 2,
+        "schema_version": 1,
         "campaign_run_id": run_id,
         "git_commit": manifest["git_commit"],
         "recorded_at": _utc_now(),

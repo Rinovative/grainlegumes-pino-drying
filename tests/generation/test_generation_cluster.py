@@ -172,6 +172,130 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
 
 
+def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore a prior execution failure while preserving active-job priority."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=2,
+        max_running_cases=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    storage = tmp_path / "stale campaign storage"
+    old_commit = "7" * 40
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", old_commit)
+    monkeypatch.setenv(
+        "GENERATION_CAMPAIGN_RUN_ID",
+        "old-campaign__0123456789abcdef",
+    )
+    generation.runtime.record_case_failure(
+        batch,
+        task.case_index,
+        RuntimeError("old synthetic failure"),
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node-old",
+        work_directory=None,
+        storage_root=storage,
+        scratch_cleanup_status="not_created",
+        failure_stage="input",
+    )
+
+    current_commit = "8" * 40
+    current_run_id = generation.campaign.campaign_run_id(
+        campaign,
+        git_commit=current_commit,
+    )
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
+    scheduler = _scheduler()
+    submissions: list[list[str]] = []
+
+    def submit(command: list[str], **_kwargs: Any) -> str:
+        submissions.append(command)
+        return "321"
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: current_commit)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: scheduler)
+    monkeypatch.setattr(generation.campaign, "_submit_case", submit)
+
+    manifest = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=current_commit,
+        storage_root=storage,
+    )
+    assert manifest["slurm_job_ids"] == ["321"]
+    assert len(submissions) == 1
+
+    scheduler["active"] = {"321": ["321", "RUNNING", "node-new", "node-new"]}
+    active = generation.campaign.feed_campaign(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert active["slurm_job_ids"] == ["321"]
+    assert len(submissions) == 1
+
+
+def test_current_failure_still_requires_explicit_retry(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the configured failure threshold for the exact current execution."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    storage = tmp_path / "current failure storage"
+    commit = "9" * 40
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    generation.runtime.record_case_failure(
+        batch,
+        task.case_index,
+        RuntimeError("current synthetic failure"),
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node-current",
+        work_directory=None,
+        storage_root=storage,
+        scratch_cleanup_status="not_created",
+        failure_stage="input",
+    )
+    submitted: list[list[str]] = []
+
+    def submit(command: list[str], **_kwargs: Any) -> str:
+        submitted.append(command)
+        return "654"
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: _scheduler(),
+    )
+    monkeypatch.setattr(generation.campaign, "_submit_case", submit)
+
+    stopped = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    assert stopped["state"] == "failure_threshold_reached"
+    assert submitted == []
+
+    resumed = generation.campaign.resume_campaign(run_id, storage_root=storage)
+    assert resumed["slurm_job_ids"] == ["654"]
+    assert len(submitted) == 1
+    assert resumed["submissions"][0]["mode"] == "resume"
+
+
 def test_scheduler_queries_support_multiple_ids_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

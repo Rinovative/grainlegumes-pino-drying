@@ -1,5 +1,5 @@
 schema_kind: generation_profile
-schema_version: 2
+schema_version: 1
 simulation_profile: steady_flow
 steady_flow_conditioning:
   schema_kind: steady_flow_conditioning

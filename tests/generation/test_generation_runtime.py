@@ -34,6 +34,31 @@ def _natural_batch_name(simulation_profile: str) -> str:
     )
 
 
+def _record_synthetic_failure(
+    config: Any,
+    storage: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    git_commit: str,
+    execution_run_id: str,
+) -> Path:
+    """Record one compact test-owned execution failure."""
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", git_commit)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", execution_run_id)
+    return generation.runtime.record_case_failure(
+        config,
+        1,
+        RuntimeError("synthetic case failure"),
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node01",
+        work_directory=None,
+        storage_root=storage,
+        scratch_cleanup_status="not_created",
+        failure_stage="input",
+    )
+
+
 def test_float32_conversion_requires_explicit_tolerance() -> None:
     """Protect validated conversion rather than silent precision loss."""
     values = np.asarray([1.0, 1.0e-9, 123.456789], dtype=np.float64)
@@ -522,6 +547,253 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
     failure = json.loads(generation.runtime.case_failure_path(config, 1, storage_root=storage).read_text(encoding="utf-8"))
     assert failure["error"]["type"] == "OSError"
     assert failure["work_directory"] is None
+
+
+@pytest.mark.parametrize(
+    ("identity_key", "stale_value"),
+    [
+        ("git_commit", "b" * 40),
+        ("execution_run_id", "prior-campaign__0123456789abcdef"),
+        ("template_sha256", "d" * 64),
+        ("scientific_config_digest", "e" * 64),
+    ],
+)
+def test_failure_receipt_with_different_execution_identity_is_stale(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_key: str,
+    stale_value: str,
+) -> None:
+    """Treat a well-formed receipt from another execution as non-current."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    storage = tmp_path / "stale identity storage"
+    current_commit = "a" * 40
+    current_run_id = "current-campaign__0123456789abcdef"
+    path = _record_synthetic_failure(
+        config,
+        storage,
+        monkeypatch,
+        git_commit=current_commit,
+        execution_run_id=current_run_id,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[identity_key] = stale_value
+    common.serialization.atomic_write_json(path, payload)
+
+    assert not generation.runtime.case_failure_is_recorded(
+        config,
+        1,
+        storage_root=storage,
+        execution_run_id=current_run_id,
+        git_commit=current_commit,
+    )
+
+
+def test_obsolete_failure_shape_is_stale_but_current_corruption_fails_closed(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retire pre-production shapes without weakening current receipt validation."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    storage = tmp_path / "receipt shape storage"
+    commit = "a" * 40
+    run_id = "current-campaign__0123456789abcdef"
+    path = _record_synthetic_failure(
+        config,
+        storage,
+        monkeypatch,
+        git_commit=commit,
+        execution_run_id=run_id,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    common.serialization.atomic_write_json(path, payload)
+    assert not generation.runtime.case_failure_is_recorded(
+        config,
+        1,
+        storage_root=storage,
+        execution_run_id=run_id,
+        git_commit=commit,
+    )
+
+    _record_synthetic_failure(
+        config,
+        storage,
+        monkeypatch,
+        git_commit=commit,
+        execution_run_id=run_id,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("execution_run_id")
+    common.serialization.atomic_write_json(path, payload)
+    assert not generation.runtime.case_failure_is_recorded(
+        config,
+        1,
+        storage_root=storage,
+        execution_run_id=run_id,
+        git_commit=commit,
+    )
+
+    _record_synthetic_failure(
+        config,
+        storage,
+        monkeypatch,
+        git_commit=commit,
+        execution_run_id=run_id,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["error"] = {}
+    common.serialization.atomic_write_json(path, payload)
+    with pytest.raises(ValueError, match="error evidence is invalid"):
+        generation.runtime.case_failure_is_recorded(
+            config,
+            1,
+            storage_root=storage,
+            execution_run_id=run_id,
+            git_commit=commit,
+        )
+
+
+def test_malformed_or_symlinked_failure_receipt_fails_closed(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reject unreadable current-state objects and unsafe receipt paths."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    malformed_storage = tmp_path / "malformed storage"
+    malformed = generation.runtime.case_failure_path(
+        config,
+        1,
+        storage_root=malformed_storage,
+    )
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="Could not read case failure evidence"):
+        generation.runtime.case_failure_is_recorded(
+            config,
+            1,
+            storage_root=malformed_storage,
+        )
+
+    symlink_storage = tmp_path / "symlink storage"
+    symlink = generation.runtime.case_failure_path(
+        config,
+        1,
+        storage_root=symlink_storage,
+    )
+    symlink.parent.mkdir(parents=True)
+    target = tmp_path / "foreign failure.json"
+    target.write_text("{}\n", encoding="utf-8")
+    symlink.symlink_to(target)
+    with pytest.raises(ValueError, match="evidence is unsafe"):
+        generation.runtime.case_failure_is_recorded(
+            config,
+            1,
+            storage_root=symlink_storage,
+        )
+
+
+def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow a new attempt to replace or clear one obsolete diagnostic."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("steady_flow"),
+    )
+    old_commit = "b" * 40
+    old_run_id = "old-campaign__0123456789abcdef"
+    current_commit = "a" * 40
+    current_run_id = "current-campaign__0123456789abcdef"
+
+    failed_storage = tmp_path / "new failure storage"
+    path = _record_synthetic_failure(
+        config,
+        failed_storage,
+        monkeypatch,
+        git_commit=old_commit,
+        execution_run_id=old_run_id,
+    )
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
+    with monkeypatch.context() as scoped:
+
+        def reject_preparation(*_args: Any, **_kwargs: Any) -> None:
+            message = "new synthetic preparation failure"
+            raise OSError(message)
+
+        scoped.setattr(
+            runtime_service,
+            "prepare_case_work_directory",
+            reject_preparation,
+        )
+        with pytest.raises(OSError, match="new synthetic preparation failure"):
+            generation.runtime.run_case(
+                config,
+                1,
+                cores_per_case=1,
+                storage_root=failed_storage,
+                work_root=tmp_path / "new failure work",
+            )
+    replacement = json.loads(path.read_text(encoding="utf-8"))
+    assert replacement["git_commit"] == current_commit
+    assert replacement["execution_run_id"] == current_run_id
+    assert generation.runtime.case_failure_is_recorded(
+        config,
+        1,
+        storage_root=failed_storage,
+    )
+
+    success_storage = tmp_path / "recovery storage"
+    success_path = _record_synthetic_failure(
+        config,
+        success_storage,
+        monkeypatch,
+        git_commit=old_commit,
+        execution_run_id=old_run_id,
+    )
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
+    outcome = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=1,
+        storage_root=success_storage,
+        work_root=tmp_path / "recovery work",
+    )
+    assert outcome.status == "completed"
+    assert generation.runtime.completed_case_is_valid(
+        config,
+        1,
+        storage_root=success_storage,
+    )
+    assert not success_path.exists()
+    assert not generation.runtime.case_failure_is_recorded(
+        config,
+        1,
+        storage_root=success_storage,
+    )
 
 
 def test_failure_timeout_missing_export_and_case_lock(

@@ -95,7 +95,7 @@ def _profile_configuration(
         )
     return {
         "schema_kind": "generation_profile",
-        "schema_version": 2,
+        "schema_version": 1,
         "simulation_profile": simulation_profile,
         "steady_flow_conditioning": _steady_flow_conditioning(fixed_values),
         "exports": exports,

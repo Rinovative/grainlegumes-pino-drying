@@ -48,7 +48,7 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 CONFIG_SCHEMA_VERSION = 1
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 1
 CANONICAL_HDF5_SCHEMA_VERSION = 1
 CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
@@ -1033,7 +1033,7 @@ def _validate_mapping_value(
         raise GenerationConfigError(message)
     if isinstance(value, Mapping) and "state" in value:
         message = (
-            f"{label} uses obsolete persistent export-mapping verification state; generation profile schema_version 2 requires a scalar declaration."
+            f"{label} uses obsolete persistent export-mapping verification state; generation profile schema_version 1 requires a scalar declaration."
         )
         raise GenerationConfigError(message)
     if not isinstance(value, str) or not value or value.strip() != value or any(character in value for character in ("\x00", "\n", "\r")):

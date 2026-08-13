@@ -482,7 +482,7 @@ inventory, and retained-evidence policy. The gate requires:
 - retained CPU inputs, exports, solved evidence, logs, Slurm IDs, and version;
 - one source-bound real-smoke receipt.
 
-Generation profile schema version 2 contains declarations only. A required
+Generation profile schema version 1 contains declarations only. A required
 export is executable when its role, exact source filename, delimiter, temporal
 kind, complete ordered logical-field mapping, exact source headers, and
 canonical units are resolved. Discovery mode may leave a source or header null;
