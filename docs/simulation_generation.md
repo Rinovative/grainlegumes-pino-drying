@@ -201,6 +201,16 @@ complete workflow succeed does Generation atomically publish profile-scoped
 technical-smoke evidence. There is no preliminary duplicate verification solve. A complete
 smoke always retains its CPU source for review.
 
+A failed Technical-Smoke case durably stages the configured raw inputs, native
+exports, and solved model according to the resolved execution-retention policy
+before node-local scratch is cleaned. When a failed transient case already has
+valid stationary and transient exports, Generation also writes quantitative
+initial-state JSON and full-grid CSV diagnostics from those exact outputs; it
+never starts a second COMSOL solve. Successful smoke cases do not perform this
+extra pass. Pilot and Production do not run the transient quantitative
+diagnostic, and Production failure evidence remains compact when raw and solved
+retention are disabled.
+
 5. Inspect the immutable real-smoke receipt printed by the smoke command:
 
 ```bash

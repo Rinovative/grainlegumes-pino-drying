@@ -616,7 +616,7 @@ def test_obsolete_failure_shape_is_stale_but_current_corruption_fails_closed(
         execution_run_id=run_id,
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema_version"] = 2
+    payload["schema_version"] = generation.runtime.CASE_FAILURE_SCHEMA_VERSION + 1
     common.serialization.atomic_write_json(path, payload)
     assert not generation.runtime.case_failure_is_recorded(
         config,

@@ -1828,6 +1828,117 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _DiagnosticExport:
+    """Minimal raw-export descriptor accepted by production parsers."""
+
+    source_path: Path
+    role: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructedTransientInitialState:
+    """Production-parsed transient initial state and source-byte evidence."""
+
+    stationary_fields: np.ndarray
+    transient_states: np.ndarray
+    time: np.ndarray
+    x_axis: np.ndarray
+    y_axis: np.ndarray
+    scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission
+    source_artifacts: dict[str, dict[str, Any]]
+
+
+def reconstruct_transient_initial_state(
+    config: GenerationConfig,
+    case_payload: Mapping[str, Any],
+    *,
+    stationary_export: Path | str,
+    transient_export: Path | str,
+    work_directory: Path | str,
+) -> ReconstructedTransientInitialState:
+    """
+    Reconstruct the production canonical initial state from two raw transient exports.
+
+    Parameters
+    ----------
+    config : GenerationConfig
+        Resolved transient generation configuration.
+    case_payload : Mapping[str, Any]
+        Prepared case provenance and scalar-handoff contract.
+    stationary_export : Path | str
+        Configured stationary-fields Spreadsheet export.
+    transient_export : Path | str
+        Configured wide transient-states Spreadsheet export.
+    work_directory : Path | str
+        Case-local input workspace containing the admitted scalar handoff.
+
+    Returns
+    -------
+    ReconstructedTransientInitialState
+        Canonically ordered stationary fields, regular transient states, grid,
+        time axis, scalar handoff, and source identities.
+
+    Raises
+    ------
+    ValueError
+        If the supplied paths cannot satisfy the exact production parser contract.
+
+    Notes
+    -----
+    This bridge deliberately stops before output validation and HDF5 publication,
+    allowing conversion-failure diagnostics to inspect the exact arrays that the
+    production validator would otherwise reject.
+
+    """
+    if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
+        message = "Initial-state reconstruction requires the transient_drying profile."
+        raise ValueError(message)
+    stationary_path = Path(stationary_export)
+    transient_path = Path(transient_export)
+    for path, role in ((stationary_path, profiles.STEADY_FLOW_EXPORT_ROLE), (transient_path, profiles.TRANSIENT_RAW_EXPORT_ROLE)):
+        if not path.is_file() or path.is_symlink():
+            message = f"Initial-state reconstruction requires one safe {role!r} export: {path}"
+            raise FileNotFoundError(message)
+    exports = (
+        _DiagnosticExport(stationary_path, profiles.STEADY_FLOW_EXPORT_ROLE),
+        _DiagnosticExport(transient_path, profiles.TRANSIENT_RAW_EXPORT_ROLE),
+    )
+    x_axis, y_axis, stationary_fields = _static_fields(config, exports)
+    regular_time, transient_states, exact_stop_time, _exact_stop_fields = _transient_fields(
+        config,
+        exports,
+        x_axis=x_axis,
+        y_axis=y_axis,
+    )
+    exported_time = regular_time if exact_stop_time is None else np.concatenate((regular_time, np.asarray((exact_stop_time,), dtype=np.float64)))
+    work_root = Path(work_directory).resolve()
+    source_paths = {
+        "stationary_fields": stationary_path.resolve(),
+        "transient_states": transient_path.resolve(),
+    }
+    if any(not source.is_relative_to(work_root) for source in source_paths.values()):
+        message = "Initial-state diagnostic exports must remain inside the case work directory."
+        raise ValueError(message)
+    scalar_handoff = scalar_handoff_contract.admit_case_scalar_handoff(case_payload, work_directory)
+    return ReconstructedTransientInitialState(
+        stationary_fields=stationary_fields,
+        transient_states=transient_states,
+        time=exported_time,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        scalar_handoff=scalar_handoff,
+        source_artifacts={
+            name: {
+                "relative_path": source.relative_to(work_root).as_posix(),
+                "sha256": common.serialization.file_sha256(source),
+                "size_bytes": source.stat().st_size,
+            }
+            for name, source in source_paths.items()
+        },
+    )
+
+
 def convert_exports_to_hdf5(
     config: GenerationConfig,
     case_payload: Mapping[str, Any],

@@ -10,7 +10,7 @@ Responsibilities:
 Design principles:
   - Scientific configuration and execution provenance are physically separate
   - Successful CSV and solved-model retention is explicit and off by default
-  - Failed scratch is removed only after compact persistent evidence is complete
+  - Failed scratch is removed only after policy-bound durable evidence is complete
 This module does NOT:
   - Modify COMSOL templates or infer internal tags, expressions, or signs
   - Publish a parallel canonical CSV learning view
@@ -49,6 +49,7 @@ from src.generation.contracts import generation_contracts_source as source_servi
 from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol as comsol_service
+from . import generation_runtime_diagnostics as diagnostics_service
 from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
@@ -161,6 +162,8 @@ _CASE_FAILURE_KEYS = frozenset(
         "export_diagnostics",
         "log_tail",
         "retained_artifacts",
+        "retention_error",
+        "failure_diagnostics",
         "scratch_cleanup",
     }
 )
@@ -1686,71 +1689,286 @@ def _failure_export_inventory(
     return records
 
 
+def _configured_failure_exports(
+    config: config_contract.GenerationConfig,
+    work_directory: Path,
+) -> dict[str, tuple[Path, ...]]:
+    """Return exact available regular files selected by configured export roles."""
+    exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
+    if not exports_root.exists():
+        return {}
+    if not exports_root.is_dir() or exports_root.is_symlink():
+        message = f"Failure export root is unsafe: {exports_root}"
+        raise ValueError(message)
+    root = exports_root.resolve()
+    selected: dict[str, tuple[Path, ...]] = {}
+    claimed: set[Path] = set()
+    for contract in config.scientific_values["output_contract"]["exports"]:
+        role = str(contract["role"])
+        pattern = contract.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        admitted: list[Path] = []
+        for candidate in sorted(exports_root.glob(pattern)):
+            if candidate.is_symlink() or not candidate.is_file():
+                message = f"Configured failure export is unsafe: {candidate}"
+                raise ValueError(message)
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                message = f"Configured failure export escapes its case-owned root: {candidate}"
+                raise ValueError(message)
+            if resolved in claimed:
+                message = f"Configured failure export matches more than one role: {candidate}"
+                raise ValueError(message)
+            claimed.add(resolved)
+            admitted.append(resolved)
+        if not contract["allow_multiple"] and len(admitted) > 1:
+            message = f"Configured failure export role {role!r} matched more than one file."
+            raise ValueError(message)
+        selected[role] = tuple(admitted)
+    return selected
+
+
+def _copy_failure_file(source: Path, destination: Path) -> None:
+    """Copy one admitted regular failure artifact without following links."""
+    if source.is_symlink() or not source.is_file():
+        message = f"Failure artifact source is missing or unsafe: {source}"
+        raise ValueError(message)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def _diagnostic_artifact_relative_paths(
+    result: diagnostics_service.InitialStateDiagnostic,
+    *,
+    staging: Path,
+) -> tuple[str, str]:
+    """Return the two exact diagnostic paths or reject misplaced output."""
+    json_relative = result.json_path.relative_to(staging).as_posix()
+    csv_relative = result.csv_path.relative_to(staging).as_posix()
+    if json_relative != "diagnostics/initial_state_diagnostic.json" or csv_relative != "diagnostics/initial_state_diagnostic.csv":
+        message = "Initial-state diagnostic published outside its owned artifact paths."
+        raise ValueError(message)
+    return json_relative, csv_relative
+
+
+def _initial_state_failure_diagnostic(
+    config: config_contract.GenerationConfig,
+    *,
+    work_directory: Path | None,
+    configured_exports: Mapping[str, tuple[Path, ...]],
+    staging: Path | None,
+    enabled: bool,
+) -> dict[str, dict[str, Any]]:
+    """Run the maintained transient diagnostic only for failed Technical Smoke."""
+    if (
+        not enabled
+        or config.scientific_values.get("campaign_purpose") != "technical_runtime_smoke"
+        or config.profile.id != profiles.TRANSIENT_DRYING_PROFILE
+    ):
+        return {}
+    unavailable = {
+        "status": "inputs_unavailable",
+        "error": None,
+        "json_relative_path": None,
+        "csv_relative_path": None,
+    }
+    if work_directory is None or staging is None:
+        return {"transient_initial_state": unavailable}
+    stationary = configured_exports.get(profiles.STEADY_FLOW_EXPORT_ROLE, ())
+    transient = configured_exports.get(profiles.TRANSIENT_RAW_EXPORT_ROLE, ())
+    if len(stationary) != 1 or len(transient) != 1:
+        return {"transient_initial_state": unavailable}
+    case_payload = _optional_json_object(work_directory / "case.json")
+    if case_payload is None:
+        return {
+            "transient_initial_state": {
+                "status": "failed",
+                "error": "case.json is unavailable or malformed.",
+                "json_relative_path": None,
+                "csv_relative_path": None,
+            }
+        }
+    diagnostic_root = staging / "diagnostics"
+    try:
+        result = diagnostics_service.write_initial_state_diagnostic(
+            config,
+            case_payload,
+            stationary_export=stationary[0],
+            transient_export=transient[0],
+            work_directory=work_directory,
+            output_directory=diagnostic_root,
+            campaign_run_id=workspace_service.workspace_run_id(config),
+        )
+        json_relative, csv_relative = _diagnostic_artifact_relative_paths(
+            result,
+            staging=staging,
+        )
+    except Exception as error:  # noqa: BLE001 -- diagnostics remain secondary to the original failure
+        with suppress(OSError):
+            if diagnostic_root.exists():
+                shutil.rmtree(diagnostic_root)
+        return {
+            "transient_initial_state": {
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "json_relative_path": None,
+                "csv_relative_path": None,
+            }
+        }
+    return {
+        "transient_initial_state": {
+            "status": "complete",
+            "error": None,
+            "json_relative_path": json_relative,
+            "csv_relative_path": csv_relative,
+        }
+    }
+
+
+def _failure_artifact_records(root: Path) -> dict[str, dict[str, Any]]:
+    """Return exact file identities beneath one safe retained-artifact root."""
+    if not root.is_dir() or root.is_symlink():
+        message = f"Failure artifact root is missing or unsafe: {root}"
+        raise ValueError(message)
+    records: dict[str, dict[str, Any]] = {}
+    for artifact in sorted(root.rglob("*")):
+        if artifact.is_symlink():
+            message = f"Failure retained artifacts contain a symbolic link: {artifact}"
+            raise ValueError(message)
+        if artifact.is_file():
+            records[artifact.relative_to(root).as_posix()] = {
+                "sha256": common.serialization.file_sha256(artifact),
+                "size_bytes": artifact.stat().st_size,
+            }
+    return records
+
+
+def _publish_failure_artifact_directory(staging: Path, target: Path) -> None:
+    """Publish one staged directory while restoring prior evidence on failure."""
+    if not target.exists():
+        staging.replace(target)
+        return
+    if not target.is_dir() or target.is_symlink() or not target.resolve().is_relative_to(target.parent.resolve()):
+        message = f"Failure artifact target is unsafe: {target}"
+        raise ValueError(message)
+    backup = Path(
+        tempfile.mkdtemp(
+            prefix=f"{target.name}.previous.",
+            dir=target.parent,
+        )
+    )
+    backup.rmdir()
+    target.replace(backup)
+    try:
+        staging.replace(target)
+    except BaseException:
+        if target.exists():
+            shutil.rmtree(target)
+        backup.replace(target)
+        raise
+    else:
+        shutil.rmtree(backup)
+
+
 def _retain_failure_artifacts(
     config: config_contract.GenerationConfig,
     case_index: int,
     *,
     work_directory: Path | None,
     storage_root: Path,
-) -> dict[str, dict[str, Any]]:
-    """Retain compact pilot diagnostics before marked scratch is removed."""
-    if config.scientific_values.get("campaign_purpose") != config_contract.PILOT_CAMPAIGN_PURPOSE or work_directory is None:
-        return {}
+    run_diagnostics: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Stage configured failed-case artifacts and optional Technical-Smoke diagnostics."""
+    retention = config.execution_values["retention"]
+    retain_raw_csv = retention["retain_raw_csv"]
+    retain_solved_model = retention["retain_solved_model"]
+    diagnostic_applicable = (
+        run_diagnostics
+        and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
+        and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
+    )
+    if work_directory is None:
+        unavailable_diagnostics = _initial_state_failure_diagnostic(
+            config,
+            work_directory=None,
+            configured_exports={},
+            staging=None,
+            enabled=run_diagnostics,
+        )
+        return {}, unavailable_diagnostics
+    if not retain_raw_csv and not retain_solved_model and not diagnostic_applicable:
+        return {}, {}
+
     target = case_failure_artifacts_directory(
         config,
         case_index,
         storage_root=storage_root,
     )
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if not target.is_dir() or target.is_symlink() or not target.resolve().is_relative_to(target.parent.resolve()):
-            message = f"Pilot failure artifact target is unsafe: {target}"
-            raise ValueError(message)
-        shutil.rmtree(target)
     staging = Path(tempfile.mkdtemp(prefix=f"{config.case_id(case_index)}.", dir=target.parent))
-    retained_paths = (
-        Path("case.json"),
-        Path("fields.csv"),
-        Path("scalars.csv"),
-        Path("schedule.csv"),
-        Path("runtime/solver.log"),
-        Path("runtime/stdout.log"),
-        Path("runtime/stderr.log"),
-        Path("runtime/execution_provenance.json"),
-        Path("runtime/timing.json"),
-        Path("runtime/status.json"),
-    )
+    configured_exports: dict[str, tuple[Path, ...]] = {}
+    diagnostics: dict[str, dict[str, Any]] = {}
     try:
-        for relative in retained_paths:
-            source = work_directory / relative
-            if not source.is_file() or source.is_symlink():
-                continue
-            destination = staging / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-        export_inventory = _failure_export_inventory(config, work_directory)
-        common.serialization.atomic_write_json(
-            staging / "export_inventory.json",
-            {
-                "schema_kind": "simulation_case_failure_export_inventory",
-                "schema_version": 1,
-                "exports": export_inventory,
-            },
+        if retain_raw_csv or diagnostic_applicable:
+            configured_exports = _configured_failure_exports(config, work_directory)
+        if retain_raw_csv:
+            input_names = ["case.json", "fields.csv"]
+            if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+                input_names.extend(("scalars.csv", "schedule.csv"))
+            for name in input_names:
+                source = work_directory / name
+                if source.exists():
+                    _copy_failure_file(source, staging / name)
+            for paths in configured_exports.values():
+                for source in paths:
+                    relative = source.relative_to((work_directory / config.scientific_values["output_contract"]["exports_root"]).resolve())
+                    _copy_failure_file(source, staging / "exports" / relative)
+            for relative in (
+                Path("runtime/solver.log"),
+                Path("runtime/stdout.log"),
+                Path("runtime/stderr.log"),
+                Path("runtime/execution_provenance.json"),
+                Path("runtime/timing.json"),
+                Path("runtime/status.json"),
+            ):
+                source = work_directory / relative
+                if source.exists():
+                    _copy_failure_file(source, staging / relative)
+            export_inventory = _failure_export_inventory(config, work_directory)
+            common.serialization.atomic_write_json(
+                staging / "export_inventory.json",
+                {
+                    "schema_kind": "simulation_case_failure_export_inventory",
+                    "schema_version": 1,
+                    "exports": export_inventory,
+                },
+            )
+        if retain_solved_model:
+            solved_model = work_directory / comsol_service.RETAINED_MODEL_FILENAME
+            if (solved_model.is_symlink() or solved_model.exists()) and (not solved_model.is_file() or solved_model.stat().st_size > 0):
+                _copy_failure_file(
+                    solved_model,
+                    staging / comsol_service.RETAINED_MODEL_FILENAME,
+                )
+        diagnostics = _initial_state_failure_diagnostic(
+            config,
+            work_directory=work_directory,
+            configured_exports=configured_exports,
+            staging=staging,
+            enabled=run_diagnostics,
         )
-        records = {
-            path.relative_to(staging).as_posix(): {
-                "sha256": common.serialization.file_sha256(path),
-                "size_bytes": path.stat().st_size,
-            }
-            for path in sorted(staging.rglob("*"))
-            if path.is_file()
-        }
-        staging.replace(target)
+        records = _failure_artifact_records(staging)
+        if records:
+            _publish_failure_artifact_directory(staging, target)
+        else:
+            shutil.rmtree(staging)
     except BaseException:
         if staging.exists():
             shutil.rmtree(staging)
         raise
-    return records
+    else:
+        return records, diagnostics
 
 
 def record_case_failure(
@@ -1782,6 +2000,29 @@ def record_case_failure(
     path = case_failure_path(config, case_index, storage_root=storage)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = "cancelled" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "failed"
+    retention_error: dict[str, Any] | None = None
+    try:
+        retained_artifacts, failure_diagnostics = _retain_failure_artifacts(
+            config,
+            case_index,
+            work_directory=work_directory,
+            storage_root=storage,
+            run_diagnostics=state == "failed",
+        )
+    except Exception as artifact_error:  # noqa: BLE001 -- retention is secondary to the original failure
+        failure_diagnostics = {}
+        _path, artifacts = _validate_case_failure_path_safety(
+            config,
+            case_index,
+            storage_root=storage,
+        )
+        prior_artifacts_preserved = artifacts.exists()
+        retained_artifacts = _failure_artifact_records(artifacts) if prior_artifacts_preserved else {}
+        retention_error = {
+            "type": type(artifact_error).__name__,
+            "message": str(artifact_error),
+            "prior_artifacts_preserved": prior_artifacts_preserved,
+        }
     payload = {
         "schema_kind": CASE_FAILURE_SCHEMA_KIND,
         "schema_version": CASE_FAILURE_SCHEMA_VERSION,
@@ -1811,12 +2052,9 @@ def record_case_failure(
         ),
         "export_diagnostics": _failure_export_diagnostics(config, work_directory),
         "log_tail": _failure_log_tail(work_directory),
-        "retained_artifacts": _retain_failure_artifacts(
-            config,
-            case_index,
-            work_directory=work_directory,
-            storage_root=storage,
-        ),
+        "retained_artifacts": retained_artifacts,
+        "retention_error": retention_error,
+        "failure_diagnostics": failure_diagnostics,
         "scratch_cleanup": {
             "status": scratch_cleanup_status,
             "reclaimed_bytes": 0,
@@ -1824,7 +2062,55 @@ def record_case_failure(
         },
     }
     common.serialization.atomic_write_json(path, payload)
+    if (
+        _case_failure_evidence_state(
+            config,
+            case_index,
+            storage_root=storage,
+        )
+        != "current"
+    ):
+        message = f"Published case failure evidence is not current: {path}"
+        raise RuntimeError(message)
     return path
+
+
+def _report_technical_smoke_failure_artifacts(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    failure_path: Path,
+    storage_root: Path,
+) -> None:
+    """Print compact durable paths for one failed Technical-Smoke worker."""
+    if config.scientific_values.get("campaign_purpose") != "technical_runtime_smoke":
+        return
+    payload = _load_json_object(failure_path, label="case failure evidence")
+    retained = payload.get("retained_artifacts")
+    if isinstance(retained, dict) and retained:
+        print(
+            "Retained failure artifacts:",
+            case_failure_artifacts_directory(
+                config,
+                case_index,
+                storage_root=storage_root,
+            ),
+            file=sys.stderr,
+        )
+    diagnostics = payload.get("failure_diagnostics")
+    initial = diagnostics.get("transient_initial_state") if isinstance(diagnostics, dict) else None
+    if isinstance(initial, dict) and initial.get("status") == "complete":
+        relative = initial["json_relative_path"]
+        print(
+            "Initial-state diagnostic:",
+            case_failure_artifacts_directory(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            / relative,
+            file=sys.stderr,
+        )
 
 
 def _complete_failure_cleanup(
@@ -1864,6 +2150,72 @@ def clear_case_failure(
         shutil.rmtree(artifacts)
 
 
+def _forbidden_failure_artifact_paths(
+    config: config_contract.GenerationConfig,
+    retained: Mapping[str, Any],
+    *,
+    allow_diagnostics: bool,
+) -> set[str]:
+    """Return receipt-declared paths forbidden by resolved retention policy."""
+    retention = config.execution_values["retention"]
+    allowed_paths: set[str] = set()
+    if retention["retain_raw_csv"]:
+        allowed_paths.update(
+            {
+                "case.json",
+                "fields.csv",
+                "runtime/solver.log",
+                "runtime/stdout.log",
+                "runtime/stderr.log",
+                "runtime/execution_provenance.json",
+                "runtime/timing.json",
+                "runtime/status.json",
+                "export_inventory.json",
+            }
+        )
+        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+            allowed_paths.update({"scalars.csv", "schedule.csv"})
+    export_contracts = tuple(
+        contract
+        for contract in config.scientific_values["output_contract"]["exports"]
+        if isinstance(contract.get("pattern"), str) and contract["pattern"]
+    )
+    if retention["retain_solved_model"]:
+        allowed_paths.add(comsol_service.RETAINED_MODEL_FILENAME)
+    if allow_diagnostics:
+        allowed_paths.update(
+            {
+                "diagnostics/initial_state_diagnostic.json",
+                "diagnostics/initial_state_diagnostic.csv",
+            }
+        )
+    forbidden_paths: set[str] = set()
+    export_role_counts: dict[str, int] = {}
+    for relative_value in retained:
+        relative = Path(relative_value)
+        export_relative = Path(*relative.parts[1:]) if relative.parts and relative.parts[0] == "exports" else None
+        matching_contracts = (
+            [contract for contract in export_contracts if export_relative is not None and export_relative.match(str(contract["pattern"]))]
+            if retention["retain_raw_csv"]
+            else []
+        )
+        configured_export = len(matching_contracts) == 1
+        if configured_export:
+            role = str(matching_contracts[0]["role"])
+            export_role_counts[role] = export_role_counts.get(role, 0) + 1
+        if relative_value not in allowed_paths and not configured_export:
+            forbidden_paths.add(relative_value)
+    for contract in export_contracts:
+        role = str(contract["role"])
+        if not contract["allow_multiple"] and export_role_counts.get(role, 0) > 1:
+            forbidden_paths.update(
+                relative
+                for relative in retained
+                if Path(relative).parts and Path(relative).parts[0] == "exports" and Path(*Path(relative).parts[1:]).match(str(contract["pattern"]))
+            )
+    return forbidden_paths
+
+
 def _validate_failure_retained_artifacts(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -1871,6 +2223,9 @@ def _validate_failure_retained_artifacts(
     *,
     storage_root: Path | str | None,
     failure_path: Path,
+    diagnostic_complete: bool,
+    retention_failed: bool,
+    diagnostics_allowed: bool,
 ) -> None:
     """Validate exact compact artifact membership for one failed case."""
     artifacts_root = case_failure_artifacts_directory(
@@ -1888,6 +2243,14 @@ def _validate_failure_retained_artifacts(
         return
     if not artifacts_root.is_dir() or artifacts_root.is_symlink():
         message = f"Case failure retained artifacts are missing or unsafe: {artifacts_root}"
+        raise ValueError(message)
+    forbidden_paths = _forbidden_failure_artifact_paths(
+        config,
+        retained,
+        allow_diagnostics=(diagnostic_complete or (retention_failed and diagnostics_allowed)),
+    )
+    if forbidden_paths:
+        message = f"Case failure retained artifacts violate resolved retention policy: {failure_path}; forbidden={sorted(forbidden_paths)}"
         raise ValueError(message)
     actual_paths: set[str] = set()
     for artifact in artifacts_root.rglob("*"):
@@ -1913,6 +2276,83 @@ def _validate_failure_retained_artifacts(
         ):
             message = f"Case failure retained-artifact identity is invalid: {artifact}"
             raise ValueError(message)
+
+
+def _validate_failure_diagnostics(
+    config: config_contract.GenerationConfig,
+    *,
+    failure_state: Any,
+    diagnostics: Any,
+    retained: Any,
+    retention_failed: bool,
+    failure_path: Path,
+) -> None:
+    """Validate the closed set of secondary failed-case diagnostic evidence."""
+    if not isinstance(diagnostics, dict) or not isinstance(retained, dict):
+        message = f"Case failure diagnostic evidence is invalid: {failure_path}"
+        raise TypeError(message)
+    if set(diagnostics).difference({"transient_initial_state"}):
+        message = f"Case failure diagnostic evidence has unknown members: {failure_path}"
+        raise ValueError(message)
+    applicable = (
+        failure_state == "failed"
+        and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
+        and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
+    )
+    if (not applicable and diagnostics) or (applicable and not retention_failed and set(diagnostics) != {"transient_initial_state"}):
+        message = f"Case failure diagnostic evidence violates execution policy: {failure_path}"
+        raise ValueError(message)
+    record = diagnostics.get("transient_initial_state")
+    if record is None:
+        if any(str(relative).startswith("diagnostics/") for relative in retained) and (not retention_failed or not applicable):
+            message = f"Undeclared case failure diagnostic artifacts exist: {failure_path}"
+            raise ValueError(message)
+        return
+    expected_keys = {
+        "status",
+        "error",
+        "json_relative_path",
+        "csv_relative_path",
+    }
+    if not isinstance(record, dict) or set(record) != expected_keys:
+        message = f"Transient initial-state diagnostic evidence is invalid: {failure_path}"
+        raise ValueError(message)
+    status = record.get("status")
+    error = record.get("error")
+    json_relative = record.get("json_relative_path")
+    csv_relative = record.get("csv_relative_path")
+    if status == "complete":
+        if (
+            error is not None
+            or json_relative != "diagnostics/initial_state_diagnostic.json"
+            or csv_relative != "diagnostics/initial_state_diagnostic.csv"
+            or json_relative not in retained
+            or csv_relative not in retained
+        ):
+            message = f"Completed transient diagnostic evidence is invalid: {failure_path}"
+            raise ValueError(message)
+    elif status == "failed":
+        if (
+            not isinstance(error, str)
+            or not error
+            or json_relative is not None
+            or csv_relative is not None
+            or any(str(relative).startswith("diagnostics/") for relative in retained)
+        ):
+            message = f"Failed transient diagnostic evidence is invalid: {failure_path}"
+            raise ValueError(message)
+    elif status == "inputs_unavailable":
+        if (
+            error is not None
+            or json_relative is not None
+            or csv_relative is not None
+            or any(str(relative).startswith("diagnostics/") for relative in retained)
+        ):
+            message = f"Unavailable transient diagnostic evidence is invalid: {failure_path}"
+            raise ValueError(message)
+    else:
+        message = f"Transient diagnostic status is invalid: {failure_path}"
+        raise ValueError(message)
 
 
 def _case_failure_evidence_state(
@@ -2028,11 +2468,42 @@ def _case_failure_evidence_state(
     ):
         message = f"Case failure log-tail evidence is invalid: {path}"
         raise ValueError(message)
+    retained = payload.get("retained_artifacts")
+    diagnostics = payload.get("failure_diagnostics")
+    initial_diagnostic = diagnostics.get("transient_initial_state") if isinstance(diagnostics, dict) else None
+    diagnostic_complete = isinstance(initial_diagnostic, dict) and initial_diagnostic.get("status") == "complete"
+    diagnostics_allowed = (
+        payload.get("state") == "failed"
+        and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
+        and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
+    )
     _validate_failure_retained_artifacts(
         config,
         case_index,
-        payload.get("retained_artifacts"),
+        retained,
         storage_root=storage_root,
+        failure_path=path,
+        diagnostic_complete=diagnostic_complete,
+        retention_failed=payload.get("retention_error") is not None,
+        diagnostics_allowed=diagnostics_allowed,
+    )
+    retention_error = payload.get("retention_error")
+    if retention_error is not None and (
+        not isinstance(retention_error, dict)
+        or set(retention_error) != {"type", "message", "prior_artifacts_preserved"}
+        or not all(isinstance(retention_error.get(key), str) and retention_error[key] for key in ("type", "message"))
+        or not isinstance(retention_error.get("prior_artifacts_preserved"), bool)
+        or retention_error["prior_artifacts_preserved"] != bool(retained)
+        or diagnostics
+    ):
+        message = f"Case failure retention-error evidence is invalid: {path}"
+        raise ValueError(message)
+    _validate_failure_diagnostics(
+        config,
+        failure_state=payload.get("state"),
+        diagnostics=diagnostics,
+        retained=retained,
+        retention_failed=retention_error is not None,
         failure_path=path,
     )
     cleanup = payload.get("scratch_cleanup")
@@ -2718,6 +3189,12 @@ def run_case(
                     storage_root=storage,
                     scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
                     failure_stage=str(getattr(error, "failure_stage", failure_stage)),
+                )
+                _report_technical_smoke_failure_artifacts(
+                    config,
+                    case_index,
+                    failure_path=failure_path,
+                    storage_root=storage,
                 )
             if attempt_directory is not None and attempt_root is not None and attempt_run_id is not None:
                 try:
