@@ -1,5 +1,10 @@
 # Generation Operations and Campaign Workflow
 
+This guide owns setup, execution, validation, publication, resume, retention,
+and troubleshooting. Scientific definitions, equations, material tables,
+supports, classifications, and provenance semantics live only in the
+[scientific parameter reference](generation_parameter_reference.md).
+
 ## Quick start
 
 Run public workflow commands from the bare `hpc115` GPU/development host in
@@ -67,6 +72,15 @@ is not required on the CPU cluster.
 Scientific definitions, ranges, equations, provenance classifications, and
 source references are documented only in
 `docs/generation_parameter_reference.md`.
+
+### Scientific contract boundary
+
+The workflow resolves and persists the material, Kozeny--Carman,
+packing-scatter, support, seed, and exact identity evidence defined in the
+[scientific parameter reference](generation_parameter_reference.md#material-calibrated-kozeny--carman-trend-and-packing-scatter).
+All active numeric Generation/schema versions remain `1`; changed contract
+content changes digests and identities, and exact admission rejects stale
+artifacts.
 
 ## Host responsibilities
 
@@ -292,24 +306,7 @@ job IDs and durable case evidence before feeding again.
 All setup, plan, launch, smoke, resume, and cleanup operations bind an exact
 Git commit. Launching operations require a clean worktree.
 
-## Configuration ownership and inspection
-
-Configuration files author decisions; Python resolution validates and combines
-them. Do not copy resolved values into scripts, notebooks, or documentation.
-The owners are:
-
-| Owner | Controls | Excludes |
-| --- | --- | --- |
-| `configs/generation/sources.yaml` | Bibliographic records keyed once | Parameter values, inferred assignments, roles, execution |
-| `configs/generation/registry.yaml` | Parameter names, units, kinds, transforms, sampling order, OOD groups, components, derivations | Material supports, campaign counts, mappings, cluster resources |
-| `configs/generation/common.yaml` | Grid, time, shared fixed physics, formulas, adapter and storage contracts | Material values, roles, counts, learning choices |
-| `configs/generation/operations/<operation>.yaml` | Operation supports and constraints | Material values, template mappings, execution resources |
-| `configs/generation/materials/<family>.yaml` | Role-neutral material scope, natural supports, coupled records, targets, evidence | Campaign role, membership, count, profile, execution |
-| `configs/generation/profiles/<profile>.yaml` | Template identity, adapters, exports, explicit native mappings, profile conditioning | Material values, counts, roles, cluster plans |
-| `configs/generation/campaigns/<profile>/<campaign>.yaml` | Purpose, layer references, material roles, sampling counts and seeds, memberships, package requests | Parameter ranges, derived package materials, execution defaults |
-| `configs/generation/benchmarks/transient_core_scaling/` | One canonical pilot-case reference, repetitions, resource constraints, and four editable core counts | New scientific samples, package membership, production resource mutation |
-| `configs/generation/execution/<site>.yaml` | Site, modules, executables, runtime limits, scheduler resources, purpose-specific retention | Scientific ranges, material roles, learning parameters |
-| `configs/learning/<task>/<kind>/<config>.yaml` | Dataset IDs, model, optimization, training, evaluation, artifacts | Generation paths, material ranges, campaign membership |
+## Inspect resolved configuration
 
 Inspect the effective campaign rather than maintaining a parallel summary:
 
@@ -318,22 +315,11 @@ Inspect the effective campaign rather than maintaining a parallel summary:
   "$TRANSIENT_CAMPAIGN" --allow-incomplete
 ```
 
-The JSON has four useful layers:
-
-- `material_inventory`, `material_roles`, `case_counts`, `membership`, and
-  `material_memberships` show source-case scope and split eligibility.
-- `seed_plan` shows the campaign, membership, paired-equivalence, batch, and
-  sampling-block seeds; case seeds remain deterministically derived from batch
-  seed and case identity.
-- `dataset_package_requests` preserves the campaign intent, while
-  `dataset_package_inventory` shows every profile-expanded immutable package.
-- `parameter_ood`, `pilot_plan`, `technical_smoke_plan`,
-  `static_sentinel_workload`, and `execution_resources` show the applicable
-  derived workload and runtime plan.
-
-Validation errors identify the exact file, key, rule, actual value, and owner to
-edit. Resolved identities, allocation evidence, and the effective scientific
-configuration persist with generated artifacts.
+The JSON exposes material scope and roles, case counts and memberships, seed
+plans, package requests and resolved inventory, OOD allocation, pilot or smoke
+scope, static-sentinel workload, execution resources, identities, and the
+resolved scientific configuration. Validation errors identify the exact file,
+key, rule, actual value, and owner to edit.
 
 ## Supported progression and evidence
 

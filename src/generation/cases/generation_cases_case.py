@@ -24,11 +24,12 @@ import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from src import common
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_paths as path_contract
+from src.generation.contracts import generation_contracts_porosity as porosity_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
@@ -42,6 +43,93 @@ from . import generation_cases_seeding as seeding
 CASE_SCHEMA_KIND = "simulation_case"
 CASE_SCHEMA_VERSION = 1
 _TABLE_RANK = 2
+
+
+_CASE_PAYLOAD_REQUIRED_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "simulation_profile",
+        "batch_id",
+        "batch_identity",
+        "scientific_config_digest",
+        "case_input_config_digest",
+        "case_id",
+        "case_index",
+        "generator_version",
+        "git_commit",
+        "material_family",
+        "material_role",
+        "evaluation_regime",
+        "sampling_regime",
+        "natural_support_state",
+        "ood",
+        "available_learning_views",
+        "airflow_source",
+        "steady_flow_conditioning",
+        "steady_flow_conditioning_digest",
+        "stationary_fixed_ownership",
+        "stationary_fixed_values",
+        "seed_evidence",
+        "block_provenance",
+        "sampled_values",
+        "sampled_units",
+        "coupled_selections",
+        "spatial_diagnostics",
+        "input_contract",
+        "template",
+        "export_contract_sha256",
+        "input_files",
+        "case_input_id",
+        "simulation_case_id",
+    }
+)
+
+_CASE_PAYLOAD_OPTIONAL_KEYS: Final = frozenset({"schedule_diagnostics", "pilot_check", "scalar_handoff", "scalars"})
+CASE_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(
+    {
+        "schema_kind": CASE_SCHEMA_KIND,
+        "schema_version": CASE_SCHEMA_VERSION,
+        "generator_version": seeding.GENERATOR_VERSION,
+        "required_case_fields": sorted(_CASE_PAYLOAD_REQUIRED_KEYS),
+        "optional_case_fields": sorted(_CASE_PAYLOAD_OPTIONAL_KEYS),
+        "transient_only_case_fields": ["scalar_handoff", "scalars", "schedule_diagnostics"],
+        "porosity_diagnostic_fields": sorted(fields_service.POROSITY_DIAGNOSTIC_KEYS),
+        "packing_scatter_truncation": [
+            porosity_contract.PACKING_SCATTER_TRUNCATION_LOWER,
+            porosity_contract.PACKING_SCATTER_TRUNCATION_UPPER,
+        ],
+    }
+)
+
+
+def validate_case_payload_schema(payload: dict[str, Any]) -> None:
+    """Validate the exact active case.json schema and reject stale fields."""
+    if not isinstance(payload, dict):
+        msg = "case.json payload must be a mapping."
+        raise TypeError(msg)
+    missing, unknown = (
+        sorted(_CASE_PAYLOAD_REQUIRED_KEYS.difference(payload)),
+        sorted(set(payload).difference(_CASE_PAYLOAD_REQUIRED_KEYS | _CASE_PAYLOAD_OPTIONAL_KEYS)),
+    )
+    if missing or unknown:
+        msg = f"case.json schema is invalid: missing={missing}, unknown={unknown}."
+        raise ValueError(msg)
+    if payload["schema_kind"] != CASE_SCHEMA_KIND or payload["schema_version"] != CASE_SCHEMA_VERSION:
+        msg = "case.json schema kind or version is invalid."
+        raise ValueError(msg)
+    profile = payload["simulation_profile"]
+    profiles.resolve_profile(profile)
+    transient = profile == profiles.TRANSIENT_DRYING_PROFILE
+    scalar_keys = {"scalar_handoff", "scalars"}
+    scalar_fields_match = scalar_keys.issubset(payload) if transient else scalar_keys.isdisjoint(payload)
+    if not scalar_fields_match:
+        msg = "case.json scalar-handoff fields do not match its simulation profile."
+        raise ValueError(msg)
+    if transient != ("schedule_diagnostics" in payload):
+        msg = "case.json schedule diagnostics do not match its simulation profile."
+        raise ValueError(msg)
+    fields_service.validate_porosity_diagnostics(payload["spatial_diagnostics"]["porosity"])
 
 
 def compute_case_input_id(payload: dict[str, Any]) -> str:
@@ -175,7 +263,7 @@ def _subseeds(
 ) -> dict[str, int]:
     """Return profile substreams, sharing paired-smoke airflow only."""
     case_seed = config.case_seed(case_index)
-    labels = ["bed", "pressure_bc"]
+    labels = ["bed", "pressure_bc", "packing_scatter"]
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         labels.extend(
             (
@@ -203,7 +291,7 @@ def _subseeds(
             str(assignment["assignment_role"]),
             str(case_index),
         )
-        for label in ("bed", "pressure_bc"):
+        for label in ("bed", "pressure_bc", "packing_scatter"):
             result[label] = seeding.derive_seed(
                 paired_case_seed,
                 "paired_airflow_substream",
@@ -267,7 +355,7 @@ def generate_case_input_bundle(
         )
 
     family_contract = config.scientific_values["material"]
-    spatial_seed_names: tuple[str, ...] = ("bed", "pressure_bc")
+    spatial_seed_names: tuple[str, ...] = ("bed", "pressure_bc", "packing_scatter")
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         spatial_seed_names = (*spatial_seed_names, "initial_moisture")
     initial_moisture_bounds = None
@@ -283,8 +371,7 @@ def generate_case_input_bundle(
         values,
         seeds={name: subseeds[name] for name in spatial_seed_names},
         family_bounds=initial_moisture_bounds,
-        packing_porosity_mean_support=family_contract["packing_porosity_mean_support"],
-        material_kappa_nominal=float(family_contract["parameter_registry"]["kappa_mean"]["nominal"]),
+        porosity_coupling=family_contract["porosity_coupling"],
         active_ood_unit=sample.ood_provenance["active_unit_id"],
     )
     complete_case_retry = fields.metadata["complete_case_support_retry"]
@@ -345,7 +432,8 @@ def generate_case_input_bundle(
         },
         "paired_equivalence_seed": paired_seed,
         "subseed_origins": {
-            name: ("paired_equivalence" if paired_seed is not None and name in {"bed", "pressure_bc"} else "profile_case") for name in subseeds
+            name: ("paired_equivalence" if paired_seed is not None and name in {"bed", "pressure_bc", "packing_scatter"} else "profile_case")
+            for name in subseeds
         },
         "derivation": ("sha256(generator_version|seed_namespace|semantic_labels)"),
         "subseeds": subseeds,
@@ -376,7 +464,6 @@ def generate_case_input_bundle(
         "stationary_fixed_values": stationary_fixed_entries,
         "seed_evidence": seed_evidence,
         "block_provenance": sample.block_provenance,
-        "conditional_supports": sample.conditional_supports,
         "sampled_values": values,
         "sampled_units": units,
         "coupled_selections": sample.coupled_selections,
@@ -422,6 +509,7 @@ def generate_case_input_bundle(
     )
     case_payload["case_input_id"] = compute_case_input_id(case_payload)
     case_payload["simulation_case_id"] = compute_simulation_case_id(case_payload)
+    validate_case_payload_schema(case_payload)
     common.serialization.atomic_write_json(bundle_dir / "case.json", case_payload)
     return CaseBundle(
         directory=bundle_dir,

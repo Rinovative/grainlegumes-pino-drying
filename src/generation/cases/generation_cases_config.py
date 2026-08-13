@@ -1259,7 +1259,7 @@ def _validate_operations(
         "source_relative_humidity": "RH(T_amb,omega_in_bc(t),p_ref)",
         "inlet_relative_humidity": "RH(T_in_bc(t),omega_in_bc(t),p_ref)",
         "infeasible_schedule_policy": "reject_complete_schedule_and_deterministically_resample",
-        "porosity_natural_support_policy": ("realized_mean_must_match_material_support_except_active_kc_anchor_factor_ood"),
+        "porosity_natural_support_policy": ("realized_mean_must_retain_natural_or_kappa_mean_ood_state"),
     }
     _exact_keys(
         constraints,

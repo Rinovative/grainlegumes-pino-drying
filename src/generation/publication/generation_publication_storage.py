@@ -34,6 +34,7 @@ import numpy as np
 
 from src import common, domain
 from src.generation.cases import generation_cases_config as config_contract
+from src.generation.cases import generation_cases_fields as fields_service
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
@@ -846,7 +847,6 @@ def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, An
         "natural_support_state",
         "seed_evidence",
         "block_provenance",
-        "conditional_supports",
         "sampled_values",
         "sampled_units",
         "coupled_selections",
@@ -1278,7 +1278,6 @@ def _validate_hdf5_provenance(
         "natural_support_state",
         "seed_evidence",
         "block_provenance",
-        "conditional_supports",
         "sampled_values",
         "sampled_units",
         "coupled_selections",
@@ -1313,7 +1312,6 @@ def _validate_hdf5_provenance(
     sampled_values = case_scientific["sampled_values"]
     sampled_units = case_scientific["sampled_units"]
     block_provenance = case_scientific["block_provenance"]
-    conditional_supports = case_scientific["conditional_supports"]
     ood = case_scientific["ood"]
     if (
         not isinstance(sampled_values, dict)
@@ -1322,7 +1320,6 @@ def _validate_hdf5_provenance(
         or set(sampled_values) != set(sampled_units)
         or not isinstance(block_provenance, dict)
         or not block_provenance
-        or not isinstance(conditional_supports, dict)
         or not isinstance(case_scientific["seed_evidence"], dict)
         or not isinstance(case_scientific["coupled_selections"], dict)
         or not isinstance(case_scientific["spatial_diagnostics"], dict)
@@ -1331,23 +1328,23 @@ def _validate_hdf5_provenance(
     ):
         msg = "Canonical HDF5 realized values, units, seeds, blocks, diagnostics, or OOD provenance are invalid."
         raise ValueError(msg)
+    diagnostics = case_scientific["spatial_diagnostics"]
+    try:
+        fields_service.validate_porosity_diagnostics(diagnostics["porosity"])
+    except (KeyError, TypeError, ValueError) as error:
+        msg_0 = "Canonical HDF5 porosity diagnostics are invalid."
+        raise ValueError(msg_0) from error
     material_contract = scientific.get("material")
     if isinstance(material_contract, dict):
         active_names = material_contract.get("active_coordinate_names")
         active_blocks = material_contract.get("active_sampling_blocks")
         registry = material_contract.get("parameter_registry")
-        expected_conditional = (
-            {name for name, entry in registry.items() if isinstance(entry, dict) and entry.get("kind") == "conditional_interval"}
-            if isinstance(registry, dict)
-            else None
-        )
         if (
             not isinstance(active_names, list)
             or not set(active_names).issubset(sampled_values)
             or not isinstance(active_blocks, list)
             or set(active_blocks) != set(block_provenance)
-            or expected_conditional is None
-            or set(conditional_supports) != expected_conditional
+            or not isinstance(registry, dict)
         ):
             msg = "Canonical HDF5 realized provenance does not cover every profile-active coordinate and block."
             raise ValueError(msg)

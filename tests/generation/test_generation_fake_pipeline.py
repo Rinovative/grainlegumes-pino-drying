@@ -81,17 +81,21 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
             assert realized["evaluation_regime"] == "id"
             assert set(batch.scientific_values["material"]["active_coordinate_names"]).issubset(realized["sampled_values"])
             assert set(realized["sampled_values"]) == set(realized["sampled_units"])
-            anchor = porosity_service.ANCHOR_PARAMETER_NAME
-            anchor_support = realized["conditional_supports"][anchor]
             porosity = realized["spatial_diagnostics"]["porosity"]
-            assert anchor_support["support_kind"] == "natural"
-            assert anchor_support["support_resolver"] == "kozeny_carman_anchor_factor"
-            assert anchor_support["id_interval"][0] <= realized["sampled_values"][anchor] <= anchor_support["id_interval"][1]
-            assert porosity["A_KC_case"] == pytest.approx(realized["sampled_values"][anchor] * porosity["A_KC_reference"])
+            natural_support = porosity["natural_porosity_support"]
+            retry = realized["spatial_diagnostics"]["complete_case_support_retry"]
+            assert "packing_scatter_z" not in realized["sampled_values"]
+            assert porosity["packing_scatter_support_kind"] == "natural"
+            assert porosity["packing_scatter_truncation_lower"] < porosity["packing_scatter_z"] < porosity["packing_scatter_truncation_upper"]
+            assert porosity["packing_scatter_seed"] == realized["seed_evidence"]["subseeds"]["packing_scatter"]
+            assert retry["accepted_attempt_seeds"]["packing_scatter"] == porosity["packing_scatter_seed"]
+            assert porosity["packing_scatter_support_lower"] <= porosity["eps_reference"] <= porosity["packing_scatter_support_upper"]
+            assert natural_support["lower"] <= porosity["eps_bed_mean"] <= natural_support["upper"]
+            assert porosity["sampled_kappa_mean"] == realized["sampled_values"]["kappa_mean"]
+            assert porosity["sampled_kappa_mean"] == pytest.approx(
+                porosity["A_KC_reference"] * porosity_service.kozeny_carman_response(porosity["eps_kc_trend"])
+            )
             assert porosity["texture_source"] == "z_background"
-            assert porosity["active_anchor_support_kind"] == "natural"
-            assert porosity["eps_bed_within_material_natural_support"] is True
-            assert porosity["material_support_departure_cause"] is None
     generation.runtime.finalize_batch(batch, storage_root=storage)
     generation.runtime.validate_terminal_batch(batch, storage_root=storage)
     bounded = datasets.packages.generated_batch.load_generated_batch(

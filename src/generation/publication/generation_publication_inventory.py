@@ -88,6 +88,7 @@ COMSOL_INPUT_SOURCES: Final = MappingProxyType(
     }
 )
 SEED_GENERATED_VALUES: Final = (
+    "bounded case-level packing scatter",
     "bed multiscale realization",
     "bed local perturbation count, locations, widths, orientations, and signs",
     "permeability orientation jitter",
@@ -162,8 +163,10 @@ def parameter_consumers(
         consumers.append("generation.cases.generation_cases_fields._bed_structure")
     if name in {"kappa_mean", "kappa_cv"} or name.startswith("permeability."):
         consumers.append("generation.cases.generation_cases_fields._permeability_fields")
-    if name in {*materials.POROSITY_GENERATOR_PARAMETERS, "kappa_mean", "eps_bed_cal_ref", "eps_min_global", "eps_max_global"}:
+    if name in {*materials.POROSITY_GENERATOR_PARAMETERS, "kappa_mean"}:
         consumers.append("generation.cases.generation_cases_fields._porosity_field")
+    if name in {"kappa_mean", "eps_bed_cal_ref", "eps_min_global", "eps_max_global"}:
+        consumers.append("generation.contracts.generation_contracts_porosity.resolve_porosity_coupling")
     if name.startswith("pressure_bc."):
         consumers.append("generation.cases.generation_cases_fields._pressure_boundary")
     if name.startswith("initial_moisture."):
@@ -319,20 +322,6 @@ def _ood_inventory(material: Mapping[str, Any], name: str) -> list[Any]:
     entry = material["parameter_registry"].get(registry_name)
     if not isinstance(entry, Mapping):
         return []
-    if entry["kind"] == "conditional_interval":
-        registry = material["parameter_registry"]
-        values = {
-            "kappa_mean": registry["kappa_mean"]["nominal"],
-            "eps_bed_cal_ref": registry["eps_bed_cal_ref"]["value"],
-            "eps_min_global": registry["eps_min_global"]["value"],
-            "eps_max_global": registry["eps_max_global"]["value"],
-        }
-        support = registry_service.resolve_conditional_support(
-            entry,
-            values=values,
-            material_contract=material,
-        )
-        return copy.deepcopy(list(support["available_ood_tails"]))
     key = {
         "interval": "ood",
         "integer": "ood",
@@ -362,14 +351,7 @@ def _entry_inspection_contract(entry: Mapping[str, Any]) -> dict[str, Any]:
         "kind": entry["kind"],
         "classification": entry.get("classification"),
         "unit": entry.get("unit", entry.get("units")),
-        "transform": (
-            "conditional_log" if entry.get("kind") == "conditional_interval" and entry.get("transform") == "log" else entry.get("transform")
-        ),
-        "support_kind": entry.get("support_kind"),
-        "support_resolver": entry.get("support_resolver"),
-        "conditioning_coordinates": copy.deepcopy(entry.get("conditioning_coordinates")),
-        "material_inputs": copy.deepcopy(entry.get("material_inputs")),
-        "parameter_ood": entry.get("parameter_ood"),
+        "transform": entry.get("transform"),
         "block": entry.get("block"),
         "ood_group": entry.get("ood_group"),
         "profile_applicability": copy.deepcopy(entry.get("profile_applicability")),
@@ -762,15 +744,4 @@ def inspect_campaign_parameter(campaign: Any, canonical_name: str) -> dict[str, 
             if key in primary_entry:
                 output_key = "unit" if key == "units" else key
                 result[output_key] = copy.deepcopy(primary_entry[key])
-        if primary_entry["kind"] == "conditional_interval":
-            result.update(
-                {
-                    "transform": "conditional_log",
-                    "support_kind": primary_entry["support_kind"],
-                    "support_resolver": primary_entry["support_resolver"],
-                    "conditioning_coordinates": copy.deepcopy(primary_entry["conditioning_coordinates"]),
-                    "material_inputs": copy.deepcopy(primary_entry["material_inputs"]),
-                    "parameter_ood": primary_entry["parameter_ood"],
-                }
-            )
     return result

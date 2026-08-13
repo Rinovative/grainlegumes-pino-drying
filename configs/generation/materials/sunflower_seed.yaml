@@ -19,10 +19,23 @@ permeability:
     evidence: engineering_estimate
     source_refs:
     - sunflower_airflow_canada_1990
-    method: Kozeny-Carman-scale and airflow-envelope inversion for a loose bed of large elongated hull-intact achenes; exact
-      fill pressure-drop data were not available.
+    method: Kozeny-Carman-scale and airflow-envelope inversion for a loose bed of
+      large elongated hull-intact achenes; exact fill pressure-drop data were not
+      available.
     applicability:
-      packing: Only for packing bands in each complete density record; generated mean eps must pass the material band.
+      packing: Only for packing bands in each complete density record; generated mean
+        eps must pass the material band.
+  ood_supports:
+  - lower: 1.2e-08
+    upper: 2.6e-08
+  - lower: 2.4e-07
+    upper: 4.125e-07
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+      gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
+    verification: mathematically_reproduced
 packing_porosity_mean_support:
   lower: 0.5
   upper: 0.57
@@ -31,11 +44,13 @@ packing_porosity_mean_support:
     evidence: coupled_record
     source_refs:
     - sunflower_density_isik_izli_2007
-    method: Select the complete rho-eps pair atomically. Never combine density and porosity from different source states.
+    method: Select the complete rho-eps pair atomically. Never combine density and
+      porosity from different source states.
     verification: mathematically_reproduced
     applicability:
-      packing: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density divided by 1+X_db while porosity remains
-        unchanged under the paired bulk/true-density conversion.
+      packing: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density
+        divided by 1+X_db while porosity remains unchanged under the paired bulk/true-density
+        conversion.
 density_calibration:
   record_id: sunflower_seed_density_calibration_v1
   reference:
@@ -45,17 +60,35 @@ density_calibration:
     lower: 330.0
     upper: 410.0
     transform: log
-  ood_records: []
+  ood_records:
+  - record_id: loose_low_density
+    rho_bu_dry_ref: 270
+    eps_bed_cal_ref: 0.66418124
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  - record_id: dense_high_density
+    rho_bu_dry_ref: 610
+    eps_bed_cal_ref: 0.24129836
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
   selection_rule: complete_record_atomic
   provenance:
     evidence: coupled_record
     source_refs:
     - sunflower_density_isik_izli_2007
-    method: Select the complete rho-eps pair atomically. Never combine density and porosity from different source states.
+    method: Select the complete rho-eps pair atomically. Never combine density and
+      porosity from different source states.
     verification: mathematically_reproduced
     applicability:
-      packing: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density divided by 1+X_db while porosity remains
-        unchanged under the paired bulk/true-density conversion.
+      packing: Isik and Izli whole-seed record at 10.06% db; measured bulk mass density
+        divided by 1+X_db while porosity remains unchanged under the paired bulk/true-density
+        conversion.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete loose and dense packing records derived at the fixed reference
+      inferred dry particle density.
+    verification: mathematically_reproduced
 thermal_properties:
   k_gr:
     nominal: 0.2
@@ -68,8 +101,21 @@ thermal_properties:
       evidence: engineering_inversion
       source_refs:
       - sunflower_thermal_ince_2008
-      method: Dry granular-phase conductivity selected by inverting the binding Maxwell-Eucken relation so the packed effective
-        conductivity matches the low-moisture sunflower measurements near VP2 temperatures.
+      method: Dry granular-phase conductivity selected by inverting the binding Maxwell-Eucken
+        relation so the packed effective conductivity matches the low-moisture sunflower
+        measurements near VP2 temperatures.
+    ood_supports:
+    - lower: 0.1
+      upper: 0.13
+    - lower: 0.38
+      upper: 0.5
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   cp_gr_dry:
     nominal: 700.0
     support:
@@ -81,8 +127,21 @@ thermal_properties:
       evidence: engineering_conversion
       source_refs:
       - sunflower_thermal_ince_2008
-      method: The source reports wet-product heat capacity. The nominal was converted to the model dry-solid basis after removing
-        the explicit X_db*cp_w contribution at low moisture and 25-40 degC; this avoids double counting water heat capacity.
+      method: The source reports wet-product heat capacity. The nominal was converted
+        to the model dry-solid basis after removing the explicit X_db*cp_w contribution
+        at low moisture and 25-40 degC; this avoids double counting water heat capacity.
+    ood_supports:
+    - lower: 300
+      upper: 400
+    - lower: 1200
+      upper: 1500
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
 initial_moisture:
   mean_db:
     nominal: 0.14942528735632185
@@ -95,8 +154,19 @@ initial_moisture:
       evidence: engineering_estimate
       source_refs:
       - sunflower_sorption_drying_munder_2019
-      note: Natural whole-seed starting-moisture envelope chosen inside the product-compatible sorption/drying domain and
-        above the 6% wb target; no measurement of the future lot is claimed.
+      note: Natural whole-seed starting-moisture envelope chosen inside the product-compatible
+        sorption/drying domain and above the 6% wb target; no measurement of the future
+        lot is claimed.
+    ood_supports:
+    - lower: 0.27
+      upper: 0.36
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   amplitude_db:
     nominal: 0.015
     support:
@@ -108,6 +178,16 @@ initial_moisture:
       evidence: synthetic_design
       source_refs:
       - sunflower_sorption_drying_munder_2019
+    ood_supports:
+    - lower: 0.042
+      upper: 0.06
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   field_support:
     lower: 0.0989010989010989
     upper: 0.2195121951219512
@@ -138,16 +218,19 @@ oswin:
     B_osw: 1/K
     C_osw: '1'
   equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
-  temperature_variable: T_C=T_K-273.15 K; numerical B is per kelvin or per degree Celsius increment
+  temperature_variable: T_C=T_K-273.15 K; numerical B is per kelvin or per degree
+    Celsius increment
   provenance:
     evidence: literature_convention_conversion
     source_refs:
     - sunflower_sorption_drying_munder_2019
-    method: Exact equation-convention conversion into the binding A/B/C form; no new fit and no coefficient mixing are claimed.
+    method: Exact equation-convention conversion into the binding A/B/C form; no new
+      fit and no coefficient mixing are claimed.
     applicability:
-      moisture_basis: kg water/kg dry solids; source kg/kg dry-matter coefficient scale converted to the binding percent-db
-        prefactor
-      evidence_scope: Whole high-oleic hull-intact sunflower seed; 25-50 degC and aw 0.10-0.95.
+      moisture_basis: kg water/kg dry solids; source kg/kg dry-matter coefficient
+        scale converted to the binding percent-db prefactor
+      evidence_scope: Whole high-oleic hull-intact sunflower seed; 25-50 degC and
+        aw 0.10-0.95.
 two_compartment_kinetics:
   record_id: sunflower_seed_two_compartment_kinetics_v1
   components:
@@ -169,13 +252,28 @@ two_compartment_kinetics:
         lower: 0.25
         upper: 0.65
       transform: logit
-  ood_records: []
+  ood_records:
+  - record_id: slow_internal_limited
+    r_surf_0: 2.0e-06
+    r_int_surf: 0.075
+    f_surf: 0.3
+  - record_id: fast_surface_exposed
+    r_surf_0: 2.8e-05
+    r_int_surf: 0.225
+    f_surf: 0.6
   selection_rule: complete_record_atomic
   provenance:
     evidence: hierarchical_engineering_prior
     source_refs:
     - sunflower_sorption_drying_munder_2019
     applicability:
-      evidence_scope: A desired nominal drying duration, or preferably independent whole-seed X_db(t) curves at known T, RH/omega
-        and airflow.
-      limitation: use the pilot nominal unchanged; label all results engineering stress-test only
+      evidence_scope: A desired nominal drying duration, or preferably independent
+        whole-seed X_db(t) curves at known T, RH/omega and airflow.
+      limitation: use the pilot nominal unchanged; label all results engineering stress-test
+        only
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete slow and fast records follow the common nominal-multiplier kinetics
+      stress design equation.
+    verification: mathematically_reproduced

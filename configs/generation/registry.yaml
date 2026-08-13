@@ -210,29 +210,6 @@ parameters:
     - steady_flow
     - transient_drying
     sampling_order: 16
-  porosity.kc_anchor_factor:
-    kind: conditional_interval
-    unit: '1'
-    transform: log
-    support_kind: conditional
-    support_resolver: kozeny_carman_anchor_factor
-    conditioning_coordinates:
-    - kappa_mean
-    material_inputs:
-    - permeability.nominal
-    - packing_porosity_mean_support
-    - density_calibration.reference.eps_bed_cal_ref
-    parameter_ood: conditional_relative_tails
-    block: airflow
-    ood_group: bed
-    report_symbol: a_KC
-    description: Dimensionless factor scaling the material-calibrated Kozeny-Carman
-      reference coefficient.
-    classification: sampled
-    profile_applicability:
-    - steady_flow
-    - transient_drying
-    sampling_order: 17
   porosity.smooth_len_rel:
     kind: interval
     unit: '1'
@@ -245,7 +222,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 18
+    sampling_order: 17
   porosity.texture_amp:
     kind: interval
     unit: '1'
@@ -258,7 +235,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 19
+    sampling_order: 18
   pressure_bc.mean:
     kind: interval
     unit: Pa
@@ -271,7 +248,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 20
+    sampling_order: 19
   pressure_bc.sin_amp:
     kind: interval
     unit: '1'
@@ -284,7 +261,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 21
+    sampling_order: 20
   pressure_bc.sin_freq:
     kind: interval
     unit: '1'
@@ -297,7 +274,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 22
+    sampling_order: 21
   pressure_bc.sin_phase:
     kind: interval
     unit: rad
@@ -310,7 +287,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 23
+    sampling_order: 22
   pressure_bc.gauss_count:
     kind: integer
     unit: '1'
@@ -322,7 +299,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 24
+    sampling_order: 23
   pressure_bc.gauss_amp:
     kind: interval
     unit: '1'
@@ -335,7 +312,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 25
+    sampling_order: 24
   pressure_bc.gauss_width:
     kind: interval
     unit: '1'
@@ -348,7 +325,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 26
+    sampling_order: 25
   pressure_bc.gauss_jitter:
     kind: interval
     unit: '1'
@@ -361,7 +338,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 27
+    sampling_order: 26
   pressure_bc.linear_amp:
     kind: interval
     unit: '1'
@@ -374,7 +351,7 @@ parameters:
     profile_applicability:
     - steady_flow
     - transient_drying
-    sampling_order: 28
+    sampling_order: 27
   initial_moisture.mean_db:
     kind: interval
     unit: kg/kg

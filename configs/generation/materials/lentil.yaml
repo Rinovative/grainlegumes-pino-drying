@@ -25,7 +25,14 @@ permeability:
     source_refs:
     - ba
     applicability:
-      packing: Only for packing bands in each complete density record; generated mean eps must pass the material band.
+      packing: Only for packing bands in each complete density record; generated mean
+        eps must pass the material band.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+      gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
+    verification: mathematically_reproduced
 packing_porosity_mean_support:
   lower: 0.29
   upper: 0.36
@@ -34,11 +41,12 @@ packing_porosity_mean_support:
     evidence: coupled_record
     source_refs:
     - ba
-    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    method: Select a complete record atomically. Never combine rho from one source/record
+      with eps from another.
     verification: mathematically_reproduced
     applicability:
-      packing: Project real mixed-lentil bed; dry bulk density reconstructed consistently from particle density, porosity
-        and 20% wb moisture.
+      packing: Project real mixed-lentil bed; dry bulk density reconstructed consistently
+        from particle density, porosity and 20% wb moisture.
 density_calibration:
   record_id: lentil_density_calibration_v1
   reference:
@@ -52,17 +60,30 @@ density_calibration:
   - record_id: loose_low_density
     rho_bu_dry_ref: 475.0
     eps_bed_cal_ref: 0.48164683
-    basis: same inferred dry particle density as reference; alternate complete packing record
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  - record_id: dense_high_density
+    rho_bu_dry_ref: 720.0
+    eps_bed_cal_ref: 0.21428571
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
   selection_rule: complete_record_atomic
   provenance:
     evidence: coupled_record
     source_refs:
     - ba
-    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    method: Select a complete record atomically. Never combine rho from one source/record
+      with eps from another.
     verification: mathematically_reproduced
     applicability:
-      packing: Project real mixed-lentil bed; dry bulk density reconstructed consistently from particle density, porosity
-        and 20% wb moisture.
+      packing: Project real mixed-lentil bed; dry bulk density reconstructed consistently
+        from particle density, porosity and 20% wb moisture.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete loose and dense packing records derived at the fixed reference
+      inferred dry particle density.
+    verification: mathematically_reproduced
 thermal_properties:
   k_gr:
     nominal: 0.364
@@ -80,6 +101,13 @@ thermal_properties:
       evidence: literature_fit
       source_refs:
       - matouk_thermal
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   cp_gr_dry:
     nominal: 2100.0
     support:
@@ -96,6 +124,13 @@ thermal_properties:
       evidence: literature_fit
       source_refs:
       - matouk_thermal
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
 initial_moisture:
   mean_db:
     nominal: 0.25
@@ -111,8 +146,16 @@ initial_moisture:
       evidence: engineering_estimate
       source_refs:
       - ba
-      note: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope around project
-        or product-compatible drying evidence, not a market-target transfer.
+      note: Natural material-dependent starting moisture in dry basis; range is an
+        explicit engineering envelope around project or product-compatible drying
+        evidence, not a market-target transfer.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   amplitude_db:
     nominal: 0.02
     support:
@@ -127,6 +170,13 @@ initial_moisture:
       evidence: synthetic_design
       source_refs:
       - pino_airflow_project
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   field_support:
     lower: 0.1904761904761905
     upper: 0.3157894736842105
@@ -146,7 +196,8 @@ target_moisture:
     evidence: derived
     source_refs:
     - swiss_crops
-    note: Selected simulation stop target; market, safe-storage and selected values remain separate.
+    note: Selected simulation stop target; market, safe-storage and selected values
+      remain separate.
 oswin:
   record_id: lentil_production_oswin_v1
   components:
@@ -158,17 +209,20 @@ oswin:
     B_osw: 1/K
     C_osw: '1'
   equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
-  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or per degree Celsius increment
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or
+    per degree Celsius increment
   provenance:
     evidence: literature_fit
     source_refs:
     - lentil_oswin_source
-    method: 'Re-fit of 4637 reconstructed source-surface points: RMSE 0.6542 percentage points db, MRE 3.867%, R2 0.96619.
-      These statistics were calculated here, not reported by the source.'
+    method: 'Re-fit of 4637 reconstructed source-surface points: RMSE 0.6542 percentage
+      points db, MRE 3.867%, R2 0.96619. These statistics were calculated here, not
+      reported by the source.'
     applicability:
-      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted by 0.01
-      evidence_scope: 5-30 degC, RH 0.27-0.90, approximately 8-22% db; pooled equal-weight source-model surfaces of three
-        whole red-lentil cultivars
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted
+        by 0.01
+      evidence_scope: 5-30 degC, RH 0.27-0.90, approximately 8-22% db; pooled equal-weight
+        source-model surfaces of three whole red-lentil cultivars
 two_compartment_kinetics:
   record_id: lentil_two_compartment_kinetics_v1
   components:
@@ -205,7 +259,13 @@ two_compartment_kinetics:
     source_refs:
     - lentil_drying
     applicability:
-      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
-        state; T(t) if available
-      limitation: use pilot nominal, run only engineering preflight, treat as a calibration prior and do not claim experimental
-        validation
+      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
+        at known T, RH/omega, airflow and product state; T(t) if available
+      limitation: use pilot nominal, run only engineering preflight, treat as a calibration
+        prior and do not claim experimental validation
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete slow and fast records follow the common nominal-multiplier kinetics
+      stress design equation.
+    verification: mathematically_reproduced

@@ -7,7 +7,7 @@ constraints:
   source_relative_humidity: RH(T_amb,omega_in_bc(t),p_ref)
   inlet_relative_humidity: RH(T_in_bc(t),omega_in_bc(t),p_ref)
   infeasible_schedule_policy: reject_complete_schedule_and_deterministically_resample
-  porosity_natural_support_policy: realized_mean_must_match_material_support_except_active_kc_anchor_factor_ood
+  porosity_natural_support_policy: realized_mean_must_retain_natural_or_kappa_mean_ood_state
 parameter_values:
   pressure_bc.mean:
     lower: 250.0
@@ -500,17 +500,6 @@ parameter_values:
       source_refs:
       - pino_airflow_project
       note: Interacts with coarse/fine field scales.
-  porosity.kc_anchor_factor:
-    nominal: 1.0
-    distribution: uniform_in_conditional_log_transform_space
-    provenance:
-      evidence: synthetic_design
-      source_refs:
-      - pino_airflow_project
-      method: A_KC_case = kc_anchor_factor*A_KC_ref with conditional log-space ID support and relative OOD tails.
-      verification: mathematically_reproduced
-      note: OOD tails are synthetic generator design and are not experimentally observed packing ranges. Local porosity morphology
-        is generated only from the shared background field.
   porosity.smooth_len_rel:
     lower: 0.03
     upper: 0.09

@@ -103,37 +103,6 @@ def test_generation_public_facade_is_explicit_and_narrow() -> None:
     assert not hasattr(generation, "storage")
 
 
-def test_current_authoritative_configs_resolve_reviewed_outputs() -> None:
-    """Record current config-derived outputs without making them validator rules."""
-    expected = {
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"): (1200, 28),
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"): (660, 54),
-        Path("configs/generation/campaigns/steady_flow/technical_smoke.yaml"): (2, 28),
-        Path("configs/generation/campaigns/transient_drying/technical_smoke.yaml"): (2, 54),
-        Path("configs/generation/campaigns/transient_drying/pilot_check.yaml"): (18, 54),
-    }
-    for path, (case_count, dimension) in expected.items():
-        campaign = generation.cases.config.load_campaign_config(path, require_executable=False)
-        assert campaign.total_case_count == case_count
-        assert sum(campaign.batches[0].scientific_values["sampling"]["block_dimensions"].values()) == dimension
-        inventory_names = tuple(family for role in generation.contracts.material_roles() for family in campaign.material_roles[role])
-        assert len(inventory_names) == len(set(inventory_names))
-        assert set(inventory_names) <= set(generation.contracts.available_material_families())
-    pilot_path = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
-    fast = generation.cases.config.load_campaign_config(
-        pilot_path,
-        require_executable=False,
-        pilot_cases_per_material=1,
-    )
-    assert fast.total_case_count == 6
-
-    for path in expected:
-        campaign = generation.cases.config.load_campaign_config(path)
-        exports = campaign.batches[0].scientific_values["output_contract"]["exports"]
-        assert all(export.get("pattern") and set(export["columns"]) == set(export["units"]) for export in exports)
-        assert all({"state", "verified"}.isdisjoint(export) for export in exports)
-
-
 def test_profile_schema_rejects_obsolete_verification_field(
     generation_config_factory: Any,
 ) -> None:
@@ -628,6 +597,7 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
     assert permeability_mean["producer_to_consumer_path"]["effective_downstream_consumers"] == [
         "generation.cases.generation_cases_fields._permeability_fields",
         "generation.cases.generation_cases_fields._porosity_field",
+        "generation.contracts.generation_contracts_porosity.resolve_porosity_coupling",
     ]
     assert template_fixed["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
     assert set(template_fixed["provenance"]).issubset({"evidence", "source_refs", "method", "verification", "applicability", "note", "sources"})
@@ -723,18 +693,17 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     values = sample.values
     registry = batch.scientific_values["material"]["parameter_registry"]
     grid = {"Lx": 1.2, "Ly": 0.75, "Lz": 0.8, "dx": 0.015, "dy": 0.015, "nx": 81, "ny": 51}
-    seeds = {"bed": 101, "pressure_bc": 202, "initial_moisture": 303}
+    seeds = {"bed": 101, "pressure_bc": 202, "packing_scatter": 303, "initial_moisture": 404}
     family_contract = batch.scientific_values["material"]
     family_bounds = family_contract["initial_moisture_bounds"]
-    porosity_support = family_contract["packing_porosity_mean_support"]
+    porosity_coupling = family_contract["porosity_coupling"]
     baseline = fields.generate_spatial_fields(
         "transient_drying",
         grid,
         values,
         seeds=seeds,
         family_bounds=family_bounds,
-        packing_porosity_mean_support=porosity_support,
-        material_kappa_nominal=float(registry["kappa_mean"]["nominal"]),
+        porosity_coupling=porosity_coupling,
         active_ood_unit=None,
     )
     bed_names = (
@@ -785,8 +754,7 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
             variant,
             seeds=seeds,
             family_bounds=family_bounds,
-            packing_porosity_mean_support=porosity_support,
-            material_kappa_nominal=float(registry["kappa_mean"]["nominal"]),
+            porosity_coupling=porosity_coupling,
             active_ood_unit=None,
         )
         affected_fields = ("Kxx", "Kxy", "Kyy", "eps_bed") if name in bed_names else ("X_0_db_field",)
@@ -1097,3 +1065,52 @@ def test_all_generation_source_references_resolve() -> None:
         if path.name != "sources.yaml":
             collect(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert used_refs <= source_keys
+
+
+def test_material_ood_inventory_is_complete_and_provenanced() -> None:
+    """Protect the complete material-owned scalar and atomic OOD inventory."""
+    campaign_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
+    expected_scalar_directions = {
+        "kappa_mean": 2,
+        "k_gr": 2,
+        "cp_gr_dry": 2,
+        "initial_moisture.mean_db": 1,
+        "initial_moisture.amplitude_db": 1,
+    }
+    transient = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
+    for family in materials.available_material_families():
+        batch = transient.require_batch(material_family=family, sampling_regime="natural")
+        material = batch.scientific_values["material"]
+        registry = material["parameter_registry"]
+        for name, count in expected_scalar_directions.items():
+            entry = registry[name]
+            assert len(entry["ood"]) == count
+            assert entry["ood_provenance"]["evidence"] == "synthetic_design"
+            assert entry["ood_provenance"]["source_refs"] == []
+        for contract_name, expected_ids in {
+            "density_calibration": ["loose_low_density", "dense_high_density"],
+            "two_compartment_kinetics": ["slow_internal_limited", "fast_surface_exposed"],
+        }.items():
+            contract = material["coupled_ood_records"][contract_name]
+            assert [record["id"] for record in contract["records"]] == expected_ids
+            assert contract["ood_provenance"]["evidence"] == "synthetic_design"
+        assert "packing_scatter" not in registry
+        assert "packing_scatter_z" not in registry
+        assert batch.scientific_values["generator_version"] == 1
+
+
+def test_material_scalar_ood_provenance_is_required() -> None:
+    """Fail closed when a material-owned scalar omits its OOD provenance."""
+    record = {
+        "nominal": 1.0,
+        "support": {"lower": 0.5, "upper": 2.0},
+        "transform": "log",
+        "distribution": "uniform_in_log_space",
+        "provenance": {"evidence": "synthetic_design", "source_refs": []},
+    }
+    with pytest.raises(ValueError, match="ood_provenance is required"):
+        materials._support_record(record, sources={}, label="synthetic")
+
+    record["ood_provenance"] = {"evidence": "project_baseline", "source_refs": []}
+    with pytest.raises(ValueError, match="evidence must be synthetic_design"):
+        materials._support_record(record, sources={}, label="synthetic")

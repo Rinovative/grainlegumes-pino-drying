@@ -26,6 +26,54 @@ def _json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _porosity_diagnostics() -> dict[str, Any]:
+    """Return exact current porosity provenance for synthetic HDF5 fixtures."""
+    return {
+        "texture_source": "z_background",
+        "background_field_sha256": "d" * 64,
+        "material_family": "lentil",
+        "material_kappa_nominal": 7.88e-9,
+        "material_eps_bed_cal_ref": 0.3125,
+        "A_KC_reference": 1.2204544e-7,
+        "authored_permeability_support": {"lower": 5.0e-9, "upper": 1.3e-8},
+        "kc_compatible_permeability_support": {
+            "lower": 5.904713819004165e-9,
+            "upper": 1.39017384e-8,
+        },
+        "effective_joint_permeability_support": {
+            "lower": 5.904713819004165e-9,
+            "upper": 1.3e-8,
+        },
+        "active_kappa_mean_support": {
+            "lower": 5.904713819004165e-9,
+            "upper": 1.3e-8,
+        },
+        "natural_porosity_support": {"lower": 0.29, "upper": 0.36},
+        "sampled_kappa_mean": 7.88e-9,
+        "eps_kc_trend": 0.3125,
+        "packing_scatter_seed": 123,
+        "packing_scatter_z": 0.0,
+        "packing_scatter_truncation_lower": -3.0,
+        "packing_scatter_truncation_upper": 3.0,
+        "packing_scatter_margin": 0.0225,
+        "packing_scatter_sigma": 0.0075,
+        "packing_scatter_support_kind": "natural",
+        "packing_scatter_support_lower": 0.29,
+        "packing_scatter_support_upper": 0.36,
+        "eps_reference": 0.3125,
+        "pointwise_guard_lower": 0.2,
+        "pointwise_guard_upper": 0.8,
+        "eps_bed_min": 0.30,
+        "eps_bed_max": 0.325,
+        "eps_bed_mean": 0.3125,
+        "eps_bed_std": 0.005,
+        "eps_bed_q05": 0.304,
+        "eps_bed_q50": 0.3125,
+        "eps_bed_q95": 0.321,
+        "eps_bed_clipped_fraction": 0.0,
+    }
+
+
 def _synthetic_scientific_contract() -> dict[str, Any]:
     """Return the explicit config evidence owned by one synthetic case."""
     return {
@@ -254,12 +302,11 @@ def _write_transient_case(
         "natural_support_state": "natural",
         "seed_evidence": {},
         "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
-        "conditional_supports": {},
         "sampled_values": {name: scalar_values[name] for name in scalar_names},
         "sampled_units": dict(zip(scalar_names, profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
         "coupled_selections": {},
         "ood": {"natural_support_state": "natural"},
-        "spatial_diagnostics": {},
+        "spatial_diagnostics": {"porosity": _porosity_diagnostics()},
         "schedule_diagnostics": {},
     }
 

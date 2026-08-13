@@ -36,7 +36,6 @@ from src.generation.cases import generation_cases_seeding as seeding
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_porosity as porosity_service
 from src.generation.contracts import generation_contracts_profiles as profiles
-from src.generation.contracts import generation_contracts_registry as registry_service
 from src.generation.publication import generation_publication_inventory as inventory_service
 
 if TYPE_CHECKING:
@@ -155,7 +154,7 @@ def _subseeds(batch: config_service.GenerationConfig, case_index: int) -> dict[s
         raise RuntimeError(message)
     return {
         name: seeding.derive_seed(batch.seed_base, "static_sentinel_case", str(case_index), name)
-        for name in ("bed", "pressure_bc", "initial_moisture", "schedule_shared", "schedule_independent")
+        for name in ("bed", "pressure_bc", "initial_moisture", "packing_scatter", "schedule_shared", "schedule_independent")
     }
 
 
@@ -216,7 +215,7 @@ def _diagnostic_fields(
     seeds = _subseeds(batch, case_index)
     family = batch.scientific_values["material"]
     moisture_bounds = None
-    field_seed_names: tuple[str, ...] = ("bed", "pressure_bc")
+    field_seed_names: tuple[str, ...] = ("bed", "pressure_bc", "packing_scatter")
     if batch.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         field_seed_names = (*field_seed_names, "initial_moisture")
         moisture_bounds = materials.initial_moisture_generation_bounds(
@@ -230,8 +229,7 @@ def _diagnostic_fields(
         sample.values,
         seeds={name: seeds[name] for name in field_seed_names},
         family_bounds=moisture_bounds,
-        packing_porosity_mean_support=family["packing_porosity_mean_support"],
-        material_kappa_nominal=float(family["parameter_registry"]["kappa_mean"]["nominal"]),
+        porosity_coupling=family["porosity_coupling"],
         active_ood_unit=sample.ood_provenance["active_unit_id"],
     )
 
@@ -396,7 +394,7 @@ def _maximum_field_difference(left: field_service.SpatialFields, right: field_se
 def _field_coupling_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
-    """Prove scalar coupling effects and the shared-background local contract."""
+    """Prove global KC coupling effects and the shared-background local contract."""
     sentinel = _sentinel_view(
         batch,
         case_count=2,
@@ -410,32 +408,29 @@ def _field_coupling_evidence(
     baseline = _diagnostic_fields(sentinel, 1, sample)
     material = sentinel.scientific_values["material"]
     registry = material["parameter_registry"]
+    coupling = material["porosity_coupling"]
 
     def generated(changes: Mapping[str, float]) -> field_service.SpatialFields:
         values = copy.deepcopy(sample.values)
         values.update(changes)
         return _diagnostic_fields(sentinel, 1, replace(sample, values=values))
 
-    support = registry_service.resolve_conditional_support(
-        registry[porosity_service.ANCHOR_PARAMETER_NAME],
-        values=sample.values,
-        material_contract=material,
-    )
-    natural = support["id_interval"]
-    lower_log = math.log(float(natural["lower"]))
-    upper_log = math.log(float(natural["upper"]))
-    current_factor = float(sample.values[porosity_service.ANCHOR_PARAMETER_NAME])
-    candidate_factors = (
-        math.exp(lower_log + 0.25 * (upper_log - lower_log)),
-        math.exp(lower_log + 0.75 * (upper_log - lower_log)),
-    )
-    alternate_factor = max(candidate_factors, key=lambda value: abs(value - current_factor))
-    factor_fields = generated({porosity_service.ANCHOR_PARAMETER_NAME: alternate_factor})
-
+    effective = coupling["effective_joint_permeability_support"]
+    effective_lower = float(effective["lower"])
+    effective_upper = float(effective["upper"])
+    effective_width = effective_upper - effective_lower
     current_kappa = float(sample.values["kappa_mean"])
-    kappa_candidates = (0.995 * current_kappa, 1.005 * current_kappa)
+    kappa_candidates = (
+        effective_lower + 0.25 * effective_width,
+        effective_lower + 0.75 * effective_width,
+    )
     kappa_alternate = max(kappa_candidates, key=lambda value: abs(value - current_kappa))
     kappa_fields = generated({"kappa_mean": kappa_alternate})
+    baseline_porosity = baseline.metadata["porosity"]
+    kappa_porosity = kappa_fields.metadata["porosity"]
+    if baseline_porosity["packing_scatter_z"] != kappa_porosity["packing_scatter_z"]:
+        message = "Packing scatter changed while probing deterministic kappa_mean coupling."
+        raise ValueError(message)
 
     independent_names = (
         "kappa_cv",
@@ -485,7 +480,6 @@ def _field_coupling_evidence(
             )
         }
     )
-    factor_difference = _maximum_field_difference(baseline, factor_fields, domain.fields.POROSITY_FIELDS)
     kappa_difference = _maximum_field_difference(baseline, kappa_fields, domain.fields.POROSITY_FIELDS)
     smooth_difference = _maximum_field_difference(baseline, smooth_fields, domain.fields.POROSITY_FIELDS)
     amplitude_difference = _maximum_field_difference(baseline, amplitude_fields, domain.fields.POROSITY_FIELDS)
@@ -493,7 +487,6 @@ def _field_coupling_evidence(
         min(
             shared_porosity_difference,
             shared_permeability_difference,
-            factor_difference,
             kappa_difference,
             smooth_difference,
             amplitude_difference,
@@ -503,10 +496,13 @@ def _field_coupling_evidence(
         message = "One corrected porosity or shared-background control has no observable static field effect."
         raise ValueError(message)
     return {
-        "texture_source": baseline.metadata["porosity"]["texture_source"],
-        "background_field_sha256": baseline.metadata["porosity"]["background_field_sha256"],
+        "texture_source": baseline_porosity["texture_source"],
+        "background_field_sha256": baseline_porosity["background_field_sha256"],
+        "A_KC_reference": baseline_porosity["A_KC_reference"],
+        "packing_scatter_seed": baseline_porosity["packing_scatter_seed"],
+        "packing_scatter_z": baseline_porosity["packing_scatter_z"],
+        "packing_scatter_fixed_during_kappa_probe": True,
         "kappa_mean_eps_bed_max_abs_difference": kappa_difference,
-        "kc_anchor_factor_eps_bed_max_abs_difference": factor_difference,
         "shared_background_control": {
             "name": shared_name,
             "eps_bed_max_abs_difference": shared_porosity_difference,
@@ -520,59 +516,54 @@ def _field_coupling_evidence(
     }
 
 
-def _nominal_anchor_evidence(
+def _kc_coupling_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
-    """Prove the material nominal factor identity and conditional support contract."""
+    """Prove fixed material calibration and resolved joint-support identities."""
     material = batch.scientific_values["material"]
     registry = material["parameter_registry"]
-    entry = registry["porosity.kc_anchor_factor"]
-    values = {
-        "kappa_mean": float(registry["kappa_mean"]["nominal"]),
-        "eps_bed_cal_ref": float(registry["eps_bed_cal_ref"]["value"]),
-        "eps_min_global": float(registry["eps_min_global"]["value"]),
-        "eps_max_global": float(registry["eps_max_global"]["value"]),
-    }
-    support = registry_service.resolve_conditional_support(
-        entry,
-        values=values,
-        material_contract=material,
-    )
-    coefficient = float(support["A_KC_reference"])
+    coupling = material["porosity_coupling"]
+    nominal = float(coupling["material_kappa_nominal"])
+    calibration = float(coupling["material_eps_bed_cal_ref"])
+    coefficient = float(coupling["A_KC_reference"])
     reference = porosity_service.solve_reference_porosity(
-        values["kappa_mean"],
+        nominal,
         coefficient,
-        1.0,
-        eps_min_global=values["eps_min_global"],
-        eps_max_global=values["eps_max_global"],
+        eps_min_global=float(registry["eps_min_global"]["value"]),
+        eps_max_global=float(registry["eps_max_global"]["value"]),
     )
-    calibration = values["eps_bed_cal_ref"]
     if not math.isclose(reference, calibration, rel_tol=0.0, abs_tol=2e-15):
         message = f"Nominal Kozeny-Carman identity failed for {batch.material_family!r}."
         raise ValueError(message)
-    natural = support["id_interval"]
-    if not 0.0 < float(natural["lower"]) < 1.0 < float(natural["upper"]):
-        message = f"Nominal anchor factor is outside conditional natural support for {batch.material_family!r}."
+    derived = porosity_service.derive_reference_coefficient(nominal, calibration)
+    if not math.isclose(coefficient, derived, rel_tol=0.0, abs_tol=0.0):
+        message = f"Stored Kozeny-Carman coefficient is not canonical for {batch.material_family!r}."
+        raise ValueError(message)
+    effective = coupling["effective_joint_permeability_support"]
+    kappa_entry = registry["kappa_mean"]
+    if float(kappa_entry["lower"]) != float(effective["lower"]) or float(kappa_entry["upper"]) != float(effective["upper"]):
+        message = f"Registry permeability support is not the resolved joint support for {batch.material_family!r}."
         raise ValueError(message)
     return {
         "eps_bed_cal_ref": calibration,
-        "packing_porosity_mean_support": copy.deepcopy(material["packing_porosity_mean_support"]),
-        "material_kappa_nominal": values["kappa_mean"],
+        "material_kappa_nominal": nominal,
         "A_KC_reference": coefficient,
-        "nominal_anchor_factor": 1.0,
         "recovered_eps_reference": reference,
         "nominal_recovery_absolute_error": abs(reference - calibration),
-        "conditional_id_interval": [float(natural["lower"]), float(natural["upper"])],
-        "available_ood_directions": [str(tail["direction"]) for tail in support["available_ood_tails"]],
-        "unavailable_ood_directions": copy.deepcopy(support["unavailable_ood_directions"]),
+        "authored_permeability_support": copy.deepcopy(coupling["authored_permeability_support"]),
+        "kc_compatible_permeability_support": copy.deepcopy(coupling["kc_compatible_permeability_support"]),
+        "effective_joint_permeability_support": copy.deepcopy(effective),
+        "natural_porosity_support": copy.deepcopy(coupling["natural_porosity_support"]),
+        "authored_support_narrowed": bool(coupling["authored_support_narrowed"]),
+        "kappa_ood_directions": sorted(coupling["kappa_ood_porosity_supports"]),
         "status": "pass",
     }
 
 
-def _anchor_ood_evidence(
+def _kappa_ood_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
-    """Realize every feasible conditional anchor tail with one active OOD unit."""
+    """Realize every authored permeability tail with one active OOD unit."""
     sentinel = _sentinel_view(
         batch,
         case_count=2,
@@ -580,80 +571,81 @@ def _anchor_ood_evidence(
             _PRIMARY_SENTINEL_SEED,
             batch.profile.id,
             batch.material_family,
-            "anchor_ood",
+            "kappa_ood",
         ),
     )
     sample = sampling_service.sample_case(sentinel, 1)
-    material = sentinel.scientific_values["material"]
-    entry = material["parameter_registry"][porosity_service.ANCHOR_PARAMETER_NAME]
-    support = registry_service.resolve_conditional_support(
-        entry,
-        values=sample.values,
-        material_contract=material,
-    )
-    group = entry.get("ood_group")
-    if not isinstance(group, str) or not group:
-        message = f"Conditional anchor {porosity_service.ANCHOR_PARAMETER_NAME!r} has no registry OOD group."
-        raise RuntimeError(message)
-    packing = material["packing_porosity_mean_support"]
-    lower = float(packing["lower"])
-    upper = float(packing["upper"])
-    minimum_gap_fraction, minimum_width_fraction = registry_service.ood_separation_fractions()
+    coupling = sentinel.scientific_values["material"]["porosity_coupling"]
+    natural = coupling["natural_porosity_support"]
+    natural_lower = float(natural["lower"])
+    natural_upper = float(natural["upper"])
     directions: dict[str, Any] = {}
-    for tail in support["available_ood_tails"]:
-        direction = str(tail["direction"])
-        factor = math.exp(0.5 * (float(tail["transformed_lower"]) + float(tail["transformed_upper"])))
+    for direction, tail in sorted(coupling["kappa_ood_porosity_supports"].items()):
+        permeability = math.sqrt(float(tail["kappa_lower"]) * float(tail["kappa_upper"]))
         values = copy.deepcopy(sample.values)
-        values[porosity_service.ANCHOR_PARAMETER_NAME] = factor
+        values["kappa_mean"] = permeability
         ood = copy.deepcopy(sample.ood_provenance)
         ood.update(
             {
-                "group": group,
-                "active_ood_group": group,
-                "selected_units": [porosity_service.ANCHOR_PARAMETER_NAME],
-                "active_unit_id": porosity_service.ANCHOR_PARAMETER_NAME,
-                "active_record_id": f"{porosity_service.ANCHOR_PARAMETER_NAME}__ood_{direction}",
+                "group": "transport_structure",
+                "active_ood_group": "transport_structure",
+                "selected_units": ["kappa_mean"],
+                "active_unit_id": "kappa_mean",
+                "active_record_id": f"kappa_mean__ood_{direction}",
                 "units_per_case": 1,
                 "natural_support_state": "parameter_ood",
             }
         )
-        ood_sample = replace(sample, values=values, ood_provenance=ood)
-        fields = _diagnostic_fields(sentinel, 1, ood_sample)
+        fields = _diagnostic_fields(
+            sentinel,
+            1,
+            replace(sample, values=values, ood_provenance=ood),
+        )
         diagnostics = fields.metadata["porosity"]
         reference = float(diagnostics["eps_reference"])
         realized = float(diagnostics["eps_bed_mean"])
-        correct_direction = reference > upper and realized > upper if direction == "lower" else reference < lower and realized < lower
+        if direction == "lower":
+            correct_direction = reference < natural_lower and realized < natural_lower
+        else:
+            correct_direction = reference > natural_upper and realized > natural_upper
+        mapped_lower = porosity_service.solve_reference_porosity(
+            float(tail["kappa_lower"]),
+            float(coupling["A_KC_reference"]),
+            eps_min_global=float(sample.values["eps_min_global"]),
+            eps_max_global=float(sample.values["eps_max_global"]),
+        )
+        mapped_upper = porosity_service.solve_reference_porosity(
+            float(tail["kappa_upper"]),
+            float(coupling["A_KC_reference"]),
+            eps_min_global=float(sample.values["eps_min_global"]),
+            eps_max_global=float(sample.values["eps_max_global"]),
+        )
         if (
             not correct_direction
-            or diagnostics["active_anchor_support_kind"] != f"ood_{direction}"
-            or diagnostics["material_support_departure_cause"] != porosity_service.ANCHOR_PARAMETER_NAME
-            or float(tail["transformed_gap_fraction"]) < minimum_gap_fraction - 1e-12
-            or float(tail["transformed_width_fraction"]) < minimum_width_fraction - 1e-12
+            or diagnostics["packing_scatter_support_kind"] != f"kappa_mean_ood_{direction}"
+            or not math.isclose(mapped_lower, float(tail["porosity_lower"]), rel_tol=0.0, abs_tol=2e-15)
+            or not math.isclose(mapped_upper, float(tail["porosity_upper"]), rel_tol=0.0, abs_tol=2e-15)
             or float(diagnostics["eps_bed_min"]) < float(sample.values["eps_min_global"])
             or float(diagnostics["eps_bed_max"]) > float(sample.values["eps_max_global"])
         ):
-            message = f"Conditional anchor OOD sentinel failed for {batch.material_family!r} direction {direction!r}."
+            message = f"Permeability OOD sentinel failed for {batch.material_family!r} direction {direction!r}."
             raise ValueError(message)
         directions[direction] = {
-            "factor_interval": [float(tail["lower"]), float(tail["upper"])],
-            "sampled_factor": factor,
-            "reference_porosity_range": copy.deepcopy(tail["reference_porosity_range"]),
+            "kappa_interval": [float(tail["kappa_lower"]), float(tail["kappa_upper"])],
+            "sampled_kappa_mean": permeability,
+            "mapped_porosity_interval": [mapped_lower, mapped_upper],
+            "observed_eps_kc_trend": float(diagnostics["eps_kc_trend"]),
             "observed_eps_reference": reference,
             "observed_eps_bed_mean": realized,
-            "transformed_gap": float(tail["transformed_gap"]),
-            "transformed_width": float(tail["transformed_width"]),
-            "transformed_gap_fraction": float(tail["transformed_gap_fraction"]),
-            "transformed_width_fraction": float(tail["transformed_width_fraction"]),
-            "physical_interpretation": tail["physical_interpretation"],
-            "one_active_ood_unit": ood["selected_units"] == [porosity_service.ANCHOR_PARAMETER_NAME],
+            "packing_scatter_z": float(diagnostics["packing_scatter_z"]),
+            "one_active_ood_unit": ood["selected_units"] == ["kappa_mean"],
             "realized_mean_retained_ood_direction": True,
         }
     if not directions:
-        message = f"Seen material {batch.material_family!r} has no feasible conditional anchor OOD direction."
+        message = f"Seen material {batch.material_family!r} has no authored kappa_mean OOD direction."
         raise ValueError(message)
     return {
         "available_directions": list(directions),
-        "unavailable_directions": copy.deepcopy(support["unavailable_ood_directions"]),
         "directions": directions,
         "status": "pass",
     }
@@ -662,7 +654,7 @@ def _anchor_ood_evidence(
 def _downstream_ood_attribution_evidence(
     batch: config_service.GenerationConfig,
 ) -> dict[str, Any]:
-    """Prove non-anchor OOD responses do not create a second OOD unit."""
+    """Prove only kappa OOD changes the active porosity support."""
     candidates = _ood_candidates(batch)
     case_count = sum(len(names) for names in candidates.values())
     if case_count <= 0:
@@ -685,6 +677,10 @@ def _downstream_ood_attribution_evidence(
     ]
     if batch.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         requested.append("density_calibration")
+    coupling = sentinel.scientific_values["material"]["porosity_coupling"]
+    natural = coupling["natural_porosity_support"]
+    natural_lower = float(natural["lower"])
+    natural_upper = float(natural["upper"])
     results: dict[str, Any] = {}
     for unit in requested:
         matches = [case_index for case_index in sentinel.case_indices if sentinel.case_assignment(case_index)["ood_unit_id"] == unit]
@@ -697,24 +693,25 @@ def _downstream_ood_attribution_evidence(
             message = f"Static attribution sentinel {unit!r} is not the sole active OOD unit."
             raise ValueError(message)
         fields = _diagnostic_fields(sentinel, case_index, sample)
-        porosity = fields.metadata["porosity"]
-        conditional = sample.conditional_supports["porosity.kc_anchor_factor"]
-        if (
-            conditional["support_kind"] != "natural"
-            or porosity["active_anchor_support_kind"] != "natural"
-            or porosity["material_support_departure_cause"] is not None
-            or not porosity["eps_bed_within_material_natural_support"]
-        ):
-            message = f"Downstream porosity response to OOD unit {unit!r} was double-counted or escaped natural support."
+        diagnostics = fields.metadata["porosity"]
+        support_kind = str(diagnostics["packing_scatter_support_kind"])
+        realized = float(diagnostics["eps_bed_mean"])
+        if unit == "kappa_mean":
+            retained = (support_kind == "kappa_mean_ood_lower" and realized < natural_lower) or (
+                support_kind == "kappa_mean_ood_upper" and realized > natural_upper
+            )
+        else:
+            retained = support_kind == "natural" and natural_lower <= realized <= natural_upper
+        if not retained or float(diagnostics["A_KC_reference"]) != float(coupling["A_KC_reference"]):
+            message = f"Downstream porosity response to OOD unit {unit!r} has incorrect support attribution."
             raise ValueError(message)
         results[unit] = {
             "case_index": case_index,
             "selected_units": copy.deepcopy(sample.ood_provenance["selected_units"]),
-            "anchor_support_kind": conditional["support_kind"],
-            "eps_reference": porosity["eps_reference"],
-            "eps_bed_mean": porosity["eps_bed_mean"],
-            "eps_bed_within_material_natural_support": True,
-            "material_support_departure_cause": None,
+            "packing_scatter_support_kind": support_kind,
+            "eps_reference": diagnostics["eps_reference"],
+            "eps_bed_mean": realized,
+            "A_KC_reference": diagnostics["A_KC_reference"],
             "one_active_ood_unit": True,
         }
     return results
@@ -793,8 +790,8 @@ def _parameter_ood_source(
     natural_batch: config_service.GenerationConfig,
 ) -> config_service.GenerationConfig:
     """Return a sentinel-only parameter-OOD source independent of production counts."""
-    if natural_batch.material_role != "seen" or natural_batch.sampling_regime != "natural":
-        message = "Parameter-OOD sentinels require one Seen natural source batch."
+    if natural_batch.sampling_regime != "natural":
+        message = "Parameter-OOD sentinels require one natural source batch."
         raise ValueError(message)
     scientific = copy.deepcopy(natural_batch.scientific_values)
     scientific["sampling_regime"] = "parameter_ood"
@@ -844,7 +841,7 @@ def inspect_sentinel_workload(
     """Return the bounded config-derived static-sentinel workload plan."""
     inventory = _validate_campaign(campaign, campaign.profile.id)
     parameter_ood: dict[str, Any] = {}
-    for material_family in campaign.material_roles["seen"]:
+    for material_family in inventory:
         natural = campaign.require_batch(
             material_family=material_family,
             sampling_regime="natural",
@@ -928,14 +925,14 @@ def run_static_sentinels(
             family_evidence[material_family] = {
                 "inventory": asdict(report),
                 "design_change_evidence": change_evidence,
-                "nominal_anchor": _nominal_anchor_evidence(source),
+                "kc_coupling": _kc_coupling_evidence(source),
                 "realization": realization,
             }
 
-        seen_materials = campaign.material_roles["seen"]
-        anchor_ood = {material_family: _anchor_ood_evidence(natural_sources[material_family]) for material_family in seen_materials}
+        inventory_materials = inventory
+        kappa_ood = {material_family: _kappa_ood_evidence(natural_sources[material_family]) for material_family in inventory_materials}
         parameter_ood: dict[str, Any] = {}
-        for material_family in seen_materials:
+        for material_family in inventory_materials:
             configured_source = campaign.find_batch(
                 material_family=material_family,
                 sampling_regime="parameter_ood",
@@ -964,8 +961,8 @@ def run_static_sentinels(
         profile_evidence[profile_id] = {
             "family_evidence": family_evidence,
             "field_coupling_by_material": {material_family: _field_coupling_evidence(source) for material_family, source in natural_sources.items()},
-            "anchor_ood_by_seen_material": anchor_ood,
-            "parameter_ood_by_seen_material": parameter_ood,
+            "kappa_mean_ood_by_material": kappa_ood,
+            "parameter_ood_by_material": parameter_ood,
         }
 
     status = "pass" if not support_failures else "blocked_by_scientific_sanity_guard"

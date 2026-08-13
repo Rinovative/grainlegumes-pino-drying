@@ -101,8 +101,7 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_permeability.orientation.smooth_len_rel", "Orientation smoothing length", "Material and properties", 260),
     ParameterPresentation("parameters_permeability.orientation.jitter", "Orientation jitter", "Material and properties", 270),
     ParameterPresentation("parameters_porosity.smooth_len_rel", "Porosity smoothing length", "Material and properties", 280),
-    ParameterPresentation("parameters_porosity.kc_anchor_factor", "Kozeny-Carman anchor factor", "Material and properties", 290),
-    ParameterPresentation("parameters_porosity.texture_amp", "Porosity texture amplitude", "Material and properties", 300),
+    ParameterPresentation("parameters_porosity.texture_amp", "Porosity texture amplitude", "Material and properties", 290),
     # gen_pressure_bc builds shape terms in this order, then applies pressure_bc.mean.
     ParameterPresentation("parameters_pressure_bc.sin_amp", "Inlet sinusoid amplitude", "Boundary conditions", 410),
     ParameterPresentation("parameters_pressure_bc.sin_freq", "Inlet sinusoid frequency", "Boundary conditions", 420),

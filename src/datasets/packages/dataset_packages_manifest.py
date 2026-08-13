@@ -25,6 +25,10 @@ from typing import Any, Final
 
 from src import common
 from src.datasets.contracts import dataset_contracts_identity as identity
+from src.generation.cases import generation_cases_case as case_contract
+from src.generation.cases import generation_cases_config as config_contract
+
+from . import dataset_packages_trajectory as trajectory
 
 DATASET_PACKAGE_SCHEMA_KIND: Final = "vp2_dataset_package_manifest"
 DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
@@ -88,6 +92,26 @@ PACKAGE_MANIFEST_KEYS: Final = PACKAGE_PROVENANCE_KEYS | {
 }
 
 
+def _validate_schema_identity(value: Any, *, dataset_view: Any) -> None:
+    """Require the exact active package, case, HDF5, and view schema identity."""
+    if dataset_view == "transient_drying":
+        payload_schema_version = trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
+    elif dataset_view == "steady_flow":
+        payload_schema_version = identity.TRAINING_DATASET_SCHEMA_VERSION
+    else:
+        message = f"Dataset package declares unsupported view {dataset_view!r}."
+        raise ValueError(message)
+    expected = {
+        "package": DATASET_PACKAGE_SCHEMA_VERSION,
+        "case_hdf5": config_contract.CANONICAL_HDF5_SCHEMA_VERSION,
+        "generation_case": case_contract.CASE_CONTRACT_DIGEST,
+        "transient_index": payload_schema_version,
+    }
+    if value != expected:
+        message = "Dataset package does not carry the current exact generation case-contract identity."
+        raise ValueError(message)
+
+
 def validate_manifest_content(
     manifest: Any,
     *,
@@ -98,6 +122,10 @@ def validate_manifest_content(
     if not isinstance(manifest, dict) or set(manifest) != PACKAGE_MANIFEST_KEYS:
         message = f"Dataset package manifest keys do not match the current schema for {dataset_id!r}."
         raise ValueError(message)
+    _validate_schema_identity(
+        manifest["schema_identity"],
+        dataset_view=manifest["dataset_view"],
+    )
     provenance = {key: manifest[key] for key in PACKAGE_PROVENANCE_KEYS}
     expected_id, expected_digest = identity.package_identity_from_provenance(provenance)
     if (

@@ -25,13 +25,11 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final
 
-from . import generation_contracts_porosity as porosity_service
 from . import generation_contracts_profiles as profile_service
 
 PARAMETER_KINDS: Final = (
     "fixed",
     "interval",
-    "conditional_interval",
     "integer",
     "categorical",
     "simplex",
@@ -54,6 +52,7 @@ _SCIENTIFIC_METADATA_KEYS: Final = frozenset(
         "profile_applicability",
         "atomic_record",
         "provenance",
+        "ood_provenance",
     }
 )
 _CLASSIFICATIONS: Final = ("sampled", "fixed", "derived", "coupled_record")
@@ -67,21 +66,6 @@ _KIND_KEYS: Final = MappingProxyType(
         "interval": (
             frozenset({"kind", "unit", "lower", "upper", "transform"}),
             frozenset({"block", "ood_group", "ood"}),
-        ),
-        "conditional_interval": (
-            frozenset(
-                {
-                    "kind",
-                    "unit",
-                    "transform",
-                    "support_kind",
-                    "support_resolver",
-                    "conditioning_coordinates",
-                    "material_inputs",
-                    "parameter_ood",
-                }
-            ),
-            frozenset({"block", "ood_group"}),
         ),
         "integer": (
             frozenset({"kind", "unit", "lower", "upper"}),
@@ -431,41 +415,6 @@ def _validate_entry(name: str, value: Any, *, allow_unresolved: bool) -> dict[st
         if entry["lower"] is not None and entry["upper"] is not None:
             _validate_interval_domain(float(entry["lower"]), float(entry["upper"]), transform, label=label)
         _validate_interval_ood(entry, label=label, allow_unresolved=allow_unresolved)
-    elif kind == "conditional_interval":
-        if entry["transform"] != "log":
-            message = f"{label}.transform must be 'log' for the maintained conditional interval."
-            raise ValueError(message)
-        if entry["support_kind"] != "conditional":
-            message = f"{label}.support_kind must be 'conditional'."
-            raise ValueError(message)
-        if entry["support_resolver"] != "kozeny_carman_anchor_factor":
-            message = f"{label}.support_resolver is not a maintained conditional-support resolver."
-            raise ValueError(message)
-        conditioning = _name_sequence(
-            entry["conditioning_coordinates"],
-            label=f"{label}.conditioning_coordinates",
-        )
-        material_inputs = _name_sequence(
-            entry["material_inputs"],
-            label=f"{label}.material_inputs",
-        )
-        expected_conditioning = ("kappa_mean",)
-        expected_inputs = (
-            "permeability.nominal",
-            "packing_porosity_mean_support",
-            "density_calibration.reference.eps_bed_cal_ref",
-        )
-        if conditioning != expected_conditioning or material_inputs != expected_inputs:
-            message = f"{label} must declare conditioning {list(expected_conditioning)} and material inputs {list(expected_inputs)}."
-            raise ValueError(message)
-        if entry["parameter_ood"] != "conditional_relative_tails":
-            message = f"{label}.parameter_ood must be 'conditional_relative_tails'."
-            raise ValueError(message)
-        if entry.get("nominal") != 1.0:
-            message = f"{label}.nominal must be exactly 1.0."
-            raise ValueError(message)
-        entry["conditioning_coordinates"] = list(conditioning)
-        entry["material_inputs"] = list(material_inputs)
     elif kind == "integer":
         for bound in ("lower", "upper"):
             number = _finite(entry[bound], label=f"{label}.{bound}", allow_unresolved=allow_unresolved)
@@ -634,7 +583,7 @@ def validate_parameter_registry(value: Any, *, allow_unresolved: bool = False) -
 def effective_dimension(entry: Mapping[str, Any]) -> int:
     """Return the numerical design dimension owned by one registry entry."""
     kind = entry["kind"]
-    if kind in {"interval", "conditional_interval", "integer"}:
+    if kind in {"interval", "integer"}:
         return 1
     if kind == "simplex":
         return len(entry["components"]) - 1
@@ -645,40 +594,6 @@ def transformed_coordinate(value: float, entry: Mapping[str, Any]) -> float:
     """Return one registry-owned transformed coordinate for separation checks."""
     transform = str(entry.get("transform", "linear"))
     return _transform_coordinate(float(value), transform)
-
-
-def resolve_conditional_support(
-    entry: Mapping[str, Any],
-    *,
-    values: Mapping[str, Any],
-    material_contract: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Resolve one declared conditional scalar support from complete case context."""
-    if entry.get("kind") != "conditional_interval" or entry.get("support_kind") != "conditional":
-        message = "Conditional support resolution requires one validated conditional_interval entry."
-        raise ValueError(message)
-    resolver = entry.get("support_resolver")
-    if resolver != "kozeny_carman_anchor_factor":
-        message = f"Unsupported conditional-support resolver {resolver!r}."
-        raise ValueError(message)
-    registry = material_contract.get("parameter_registry")
-    if not isinstance(registry, Mapping) or "kappa_mean" not in registry:
-        message = "Conditional support requires the resolved material parameter registry."
-        raise ValueError(message)
-    kappa_entry = registry["kappa_mean"]
-    if not isinstance(kappa_entry, Mapping) or "nominal" not in kappa_entry:
-        message = "Conditional support requires the material permeability nominal."
-        raise ValueError(message)
-    return porosity_service.resolve_anchor_factor_support(
-        sampled_kappa_mean=float(values["kappa_mean"]),
-        material_kappa_nominal=float(kappa_entry["nominal"]),
-        eps_bed_cal_ref=float(values["eps_bed_cal_ref"]),
-        packing_porosity_mean_support=material_contract["packing_porosity_mean_support"],
-        eps_min_global=float(values["eps_min_global"]),
-        eps_max_global=float(values["eps_max_global"]),
-        ood_gap_fraction=_MINIMUM_OOD_GAP_FRACTION,
-        ood_width_fraction=_MINIMUM_OOD_WIDTH_FRACTION,
-    )
 
 
 def resolve_derived_values(

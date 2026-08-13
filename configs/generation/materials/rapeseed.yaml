@@ -20,7 +20,19 @@ permeability:
     source_refs:
     - canola_airflow
     applicability:
-      packing: Only for packing bands in each complete density record; generated mean eps must pass the material band.
+      packing: Only for packing bands in each complete density record; generated mean
+        eps must pass the material band.
+  ood_supports:
+  - lower: 6.0e-10
+    upper: 1.3e-09
+  - lower: 1.44e-08
+    upper: 2.475e-08
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+      gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
+    verification: mathematically_reproduced
 packing_porosity_mean_support:
   lower: 0.365
   upper: 0.422
@@ -29,10 +41,12 @@ packing_porosity_mean_support:
     evidence: coupled_record
     source_refs:
     - canola_thermal
-    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    method: Select a complete record atomically. Never combine rho from one source/record
+      with eps from another.
     verification: mathematically_reproduced
     applicability:
-      packing: Whole-seed bulk and particle density ranges from one compatible study; reference pair selected near 6-11% wb.
+      packing: Whole-seed bulk and particle density ranges from one compatible study;
+        reference pair selected near 6-11% wb.
 density_calibration:
   record_id: rapeseed_density_calibration_v1
   reference:
@@ -42,16 +56,34 @@ density_calibration:
     lower: 590.0
     upper: 640.0
     transform: log
-  ood_records: []
+  ood_records:
+  - record_id: loose_low_density
+    rho_bu_dry_ref: 500
+    eps_bed_cal_ref: 0.51612903
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
+  - record_id: dense_high_density
+    rho_bu_dry_ref: 800
+    eps_bed_cal_ref: 0.22580645
+    basis: same inferred dry particle density as reference; alternate complete packing
+      record
   selection_rule: complete_record_atomic
   provenance:
     evidence: coupled_record
     source_refs:
     - canola_thermal
-    method: Select a complete record atomically. Never combine rho from one source/record with eps from another.
+    method: Select a complete record atomically. Never combine rho from one source/record
+      with eps from another.
     verification: mathematically_reproduced
     applicability:
-      packing: Whole-seed bulk and particle density ranges from one compatible study; reference pair selected near 6-11% wb.
+      packing: Whole-seed bulk and particle density ranges from one compatible study;
+        reference pair selected near 6-11% wb.
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete loose and dense packing records derived at the fixed reference
+      inferred dry particle density.
+    verification: mathematically_reproduced
 thermal_properties:
   k_gr:
     nominal: 0.2
@@ -64,6 +96,18 @@ thermal_properties:
       evidence: literature_direct
       source_refs:
       - canola_thermal
+    ood_supports:
+    - lower: 0.09
+      upper: 0.12
+    - lower: 0.31
+      upper: 0.4
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   cp_gr_dry:
     nominal: 1850.0
     support:
@@ -75,6 +119,18 @@ thermal_properties:
       evidence: literature_direct
       source_refs:
       - canola_thermal
+    ood_supports:
+    - lower: 1200
+      upper: 1450
+    - lower: 2400
+      upper: 2800
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
 initial_moisture:
   mean_db:
     nominal: 0.13636363636363635
@@ -87,8 +143,19 @@ initial_moisture:
       evidence: engineering_estimate
       source_refs:
       - canola_drying
-      note: Natural material-dependent starting moisture in dry basis; range is an explicit engineering envelope around project
-        or product-compatible drying evidence, not a market-target transfer.
+      note: Natural material-dependent starting moisture in dry basis; range is an
+        explicit engineering envelope around project or product-compatible drying
+        evidence, not a market-target transfer.
+    ood_supports:
+    - lower: 0.23
+      upper: 0.3
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   amplitude_db:
     nominal: 0.012
     support:
@@ -100,6 +167,16 @@ initial_moisture:
       evidence: synthetic_design
       source_refs:
       - pino_airflow_project
+    ood_supports:
+    - lower: 0.035
+      upper: 0.05
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
+        guards.
+      verification: mathematically_reproduced
   field_support:
     lower: 0.0989010989010989
     upper: 0.1904761904761905
@@ -130,14 +207,17 @@ oswin:
     B_osw: 1/K
     C_osw: '1'
   equation: X_eq_db=0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
-  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or per degree Celsius increment
+  temperature_variable: T_C=T_K-273.15 K; numerical coefficient B is per kelvin or
+    per degree Celsius increment
   provenance:
     evidence: literature_direct
     source_refs:
     - canola_oswin
     applicability:
-      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted by 0.01
-      evidence_scope: Whole intact Option 500 canola, desorption, 30-60 degC, aw 0.11-0.81, % db
+      moisture_basis: kg water/kg dry solids; source percent-db prefactor converted
+        by 0.01
+      evidence_scope: Whole intact Option 500 canola, desorption, 30-60 degC, aw 0.11-0.81,
+        % db
 two_compartment_kinetics:
   record_id: rapeseed_two_compartment_kinetics_v1
   components:
@@ -159,14 +239,28 @@ two_compartment_kinetics:
         lower: 0.3
         upper: 0.68
       transform: logit
-  ood_records: []
+  ood_records:
+  - record_id: slow_internal_limited
+    r_surf_0: 3.0e-06
+    r_int_surf: 0.11
+    f_surf: 0.35
+  - record_id: fast_surface_exposed
+    r_surf_0: 4.2e-05
+    r_int_surf: 0.33
+    f_surf: 0.65
   selection_rule: complete_record_atomic
   provenance:
     evidence: calibration_prior
     source_refs:
     - canola_drying
     applicability:
-      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves at known T, RH/omega, airflow and product
-        state; T(t) if available
-      limitation: use pilot nominal, run only engineering preflight, treat as a calibration prior and do not claim experimental
-        validation
+      evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
+        at known T, RH/omega, airflow and product state; T(t) if available
+      limitation: use pilot nominal, run only engineering preflight, treat as a calibration
+        prior and do not claim experimental validation
+  ood_provenance:
+    evidence: synthetic_design
+    source_refs: []
+    method: Complete slow and fast records follow the common nominal-multiplier kinetics
+      stress design equation.
+    verification: mathematically_reproduced

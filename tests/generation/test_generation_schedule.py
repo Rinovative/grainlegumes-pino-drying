@@ -231,7 +231,6 @@ def test_prechange_spatial_fields_remain_byte_identical(
     assert before.units == after.units
     assert before.coupled_selections == after.coupled_selections
     assert before.block_provenance == after.block_provenance
-    assert before.conditional_supports == after.conditional_supports
     assert before.ood_provenance == after.ood_provenance
     before_sampling = before_batch.scientific_values["sampling"]
     after_sampling = after_batch.scientific_values["sampling"]
@@ -260,6 +259,7 @@ def test_prechange_spatial_fields_remain_byte_identical(
         "bed": 1936762462,
         "pressure_bc": 990883689,
         "initial_moisture": 2503402048,
+        "packing_scatter": 383704986,
     }
     grid = {
         "Lx": 1.2,
@@ -285,8 +285,7 @@ def test_prechange_spatial_fields_remain_byte_identical(
             sample.values,
             seeds=seeds,
             family_bounds=moisture_bounds,
-            packing_porosity_mean_support=family["packing_porosity_mean_support"],
-            material_kappa_nominal=float(family["parameter_registry"]["kappa_mean"]["nominal"]),
+            porosity_coupling=family["porosity_coupling"],
             active_ood_unit=sample.ood_provenance["active_unit_id"],
         )
 

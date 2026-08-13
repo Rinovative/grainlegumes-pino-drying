@@ -10,8 +10,10 @@ from src.datasets.contracts import dataset_contracts_identity as dataset_identit
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_builder as package_builder
+from src.datasets.packages import dataset_packages_manifest as package_manifest
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 from src.datasets.runtime import dataset_runtime_transient as transient_runtime
+from src.generation.cases import generation_cases_case as case_contract
 
 _STEADY_DIGEST = "d40dc74f5f8e70dc19a7e592e4d720ff27ca6131b70bd64d88556791566fac0a"
 _TRANSIENT_DIGEST = "40715d172f8bbda1a863e0f59f014e604c53f1c0bf4428ae0e2fc58ee82f1823"
@@ -23,9 +25,24 @@ def test_package_payload_schema_identity_is_view_specific() -> None:
     transient = package_builder._schema_identity("transient_drying")
     assert steady["transient_index"] == dataset_identity.TRAINING_DATASET_SCHEMA_VERSION
     assert transient["transient_index"] == trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
+    assert steady["generation_case"] == transient["generation_case"] == case_contract.CASE_CONTRACT_DIGEST
     assert {key: value for key, value in steady.items() if key != "transient_index"} == {
         key: value for key, value in transient.items() if key != "transient_index"
     }
+
+
+def test_package_schema_identity_rejects_legacy_version_one_case_contract() -> None:
+    """Reject self-consistent v1 package metadata that lacks the current case digest."""
+    legacy = {
+        "package": 1,
+        "case_hdf5": 1,
+        "transient_index": 1,
+    }
+    with pytest.raises(ValueError, match="current exact generation case-contract identity"):
+        package_manifest._validate_schema_identity(
+            legacy,
+            dataset_view="steady_flow",
+        )
 
 
 def test_contract_inspection_is_uniform_immutable_and_preserves_persisted_identity() -> None:

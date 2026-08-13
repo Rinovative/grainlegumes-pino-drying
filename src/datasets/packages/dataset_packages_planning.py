@@ -410,17 +410,9 @@ def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
             block = entry.get("block")
             detail = selection_details.get(name)
             transform: Any
-            if entry.get("kind") == "conditional_interval":
-                if not isinstance(detail, dict) or detail.get("selection_kind") != "conditional_scalar_interval":
-                    message = f"Conditional OOD unit {name!r} lacks realized support evidence."
-                    raise ValueError(message)
-                id_support = copy.deepcopy(detail["id_interval"])
-                ood_support = copy.deepcopy(detail["ood_interval"])
-                transform = "conditional_log"
-            else:
-                id_support = {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry}
-                ood_support = copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets"))))
-                transform = entry.get("transform")
+            id_support = {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry}
+            ood_support = copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets"))))
+            transform = entry.get("transform")
             parameters.append(
                 {
                     "name": name,
@@ -434,6 +426,7 @@ def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
                     "sampled_value": copy.deepcopy(sampled_values.get(name)),
                     "coupled_selection": coupled.get(name),
                     "transformed_coordinate_evidence": copy.deepcopy(detail),
+                    "ood_provenance": copy.deepcopy(entry.get("ood_provenance")),
                 }
             )
             continue
@@ -458,6 +451,7 @@ def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
                 "sampled_value": {component: copy.deepcopy(sampled_values[component]) for component in components},
                 "coupled_selection": coupled.get(name),
                 "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
+                "ood_provenance": copy.deepcopy(contract.get("ood_provenance")),
             }
         )
     return {

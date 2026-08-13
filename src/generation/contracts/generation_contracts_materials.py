@@ -30,13 +30,13 @@ import yaml
 
 from src import common
 
+from . import generation_contracts_porosity as porosity_service
 from . import generation_contracts_provenance as provenance_service
 from . import generation_contracts_registry as registry_service
 
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
 _PARAMETER_REGISTRY_SCHEMA_VERSION: Final = 1
 POROSITY_GENERATOR_PARAMETERS: Final = (
-    "porosity.kc_anchor_factor",
     "porosity.smooth_len_rel",
     "porosity.texture_amp",
 )
@@ -323,6 +323,20 @@ def resolve_value_record(
     return record
 
 
+def _resolve_synthetic_ood_provenance(
+    value: Any,
+    *,
+    sources: Mapping[str, Mapping[str, Any]],
+    label: str,
+) -> dict[str, Any]:
+    """Resolve one OOD provenance record and require synthetic-design evidence."""
+    resolved = provenance_service.resolve_provenance(value, sources=sources, label=label)
+    if resolved.get("evidence") != "synthetic_design":
+        message = f"{label}.evidence must be synthetic_design."
+        raise ValueError(message)
+    return resolved
+
+
 def _support_record(
     value: Any,
     *,
@@ -332,7 +346,11 @@ def _support_record(
 ) -> dict[str, Any]:
     """Flatten one compact nominal/support record for registry merging."""
     record = resolve_value_record(value, sources=sources, label=label)
-    required = {"nominal", "support", "transform", "distribution", "provenance"}
+    if "ood_provenance" not in record:
+        message = f"{label}.ood_provenance is required."
+        raise ValueError(message)
+    record["ood_provenance"] = _resolve_synthetic_ood_provenance(record["ood_provenance"], sources=sources, label=f"{label}.ood_provenance")
+    required = {"nominal", "support", "transform", "distribution", "provenance", "ood_provenance"}
     optional = {"ood_supports"} if allow_ood else set()
     _exact_keys(record, required, optional=optional, label=label)
     support = _mapping(record.pop("support"), label=f"{label}.support")
@@ -343,6 +361,7 @@ def _support_record(
         "nominal": record["nominal"],
         "distribution": record["distribution"],
         "provenance": record["provenance"],
+        "ood_provenance": record["ood_provenance"],
     }
     if "ood_supports" in record:
         result["ood"] = copy.deepcopy(record["ood_supports"])
@@ -417,9 +436,13 @@ def _validate_density_record(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Validate natural sampled density, fixed reference epsilon, and atomic OOD records."""
     density = resolve_value_record(value, sources=sources, label=label)
+    if "ood_provenance" not in density:
+        message = f"{label}.ood_provenance is required."
+        raise ValueError(message)
+    density["ood_provenance"] = _resolve_synthetic_ood_provenance(density["ood_provenance"], sources=sources, label=f"{label}.ood_provenance")
     _exact_keys(
         density,
-        {"record_id", "reference", "rho_bu_dry_ref_support", "ood_records", "selection_rule", "provenance"},
+        {"record_id", "reference", "rho_bu_dry_ref_support", "ood_records", "selection_rule", "provenance", "ood_provenance"},
         label=label,
     )
     if not isinstance(density["record_id"], str) or not density["record_id"]:
@@ -451,16 +474,18 @@ def _validate_density_record(
         message = f"{label}.ood_records must be a list."
         raise TypeError(message)
     ood_records: list[dict[str, Any]] = []
+    expected_ids = ("loose_low_density", "dense_high_density")
+    if len(raw_ood) != len(expected_ids):
+        message = f"{label}.ood_records must contain exactly {list(expected_ids)}."
+        raise ValueError(message)
     identities: set[str] = set()
     for index, raw in enumerate(raw_ood):
         item_label = f"{label}.ood_records[{index}]"
         item = _mapping(raw, label=item_label)
-        _exact_keys(
-            item,
-            {"record_id", "rho_bu_dry_ref", "eps_bed_cal_ref"},
-            optional={"basis"},
-            label=item_label,
-        )
+        _exact_keys(item, {"record_id", "rho_bu_dry_ref", "eps_bed_cal_ref"}, optional={"basis"}, label=item_label)
+        if item["record_id"] != expected_ids[index]:
+            message = f"{item_label}.record_id must be {expected_ids[index]!r}."
+            raise ValueError(message)
         identity = item["record_id"]
         if not isinstance(identity, str) or not identity or identity in identities:
             message = f"{item_label}.record_id must be unique non-empty text."
@@ -475,6 +500,19 @@ def _validate_density_record(
             raise ValueError(message)
         if lower <= values["rho_bu_dry_ref"] <= upper:
             message = f"{item_label}.rho_bu_dry_ref must be disjoint from natural support."
+            raise ValueError(message)
+        expected_loose = index == 0
+        directional = (
+            values["rho_bu_dry_ref"] < lower and values["eps_bed_cal_ref"] > float(packing_support["upper"])
+            if expected_loose
+            else values["rho_bu_dry_ref"] > upper and values["eps_bed_cal_ref"] < float(packing_support["lower"])
+        )
+        if not directional:
+            message = f"{item_label} does not retain its required density/porosity OOD direction."
+            raise ValueError(message)
+        inferred_particle = values["rho_bu_dry_ref"] / (1.0 - values["eps_bed_cal_ref"])
+        if not math.isclose(inferred_particle, particle, rel_tol=0.0, abs_tol=2e-5):
+            message = f"{item_label} must preserve the reference inferred dry particle density."
             raise ValueError(message)
         metadata = {"basis": copy.deepcopy(item["basis"])} if "basis" in item else {}
         ood_records.append({"id": identity, "values": values, "metadata": metadata})
@@ -503,6 +541,7 @@ def _validate_density_record(
         "records": ood_records,
         "selection_rule": "complete_record_atomic",
         "provenance": copy.deepcopy(density["provenance"]),
+        "ood_provenance": copy.deepcopy(density["ood_provenance"]),
         "natural_packing_support": {
             "lower": float(packing_support["lower"]),
             "upper": float(packing_support["upper"]),
@@ -550,7 +589,11 @@ def _validate_kinetics_record(
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
     """Validate natural component supports and complete kinetics OOD records."""
     kinetics = resolve_value_record(value, sources=sources, label=label)
-    _exact_keys(kinetics, {"record_id", "components", "ood_records", "selection_rule", "provenance"}, label=label)
+    if "ood_provenance" not in kinetics:
+        message = f"{label}.ood_provenance is required."
+        raise ValueError(message)
+    kinetics["ood_provenance"] = _resolve_synthetic_ood_provenance(kinetics["ood_provenance"], sources=sources, label=f"{label}.ood_provenance")
+    _exact_keys(kinetics, {"record_id", "components", "ood_records", "selection_rule", "provenance", "ood_provenance"}, label=label)
     if kinetics["selection_rule"] != "complete_record_atomic":
         message = f"{label}.selection_rule must be complete_record_atomic."
         raise ValueError(message)
@@ -585,12 +628,19 @@ def _validate_kinetics_record(
         message = f"{label}.ood_records must be a list."
         raise TypeError(message)
     records: list[dict[str, Any]] = []
+    expected_ids = ("slow_internal_limited", "fast_surface_exposed")
+    if len(raw_records) != len(expected_ids):
+        message = f"{label}.ood_records must contain exactly {list(expected_ids)}."
+        raise ValueError(message)
     identities: set[str] = set()
     for index, raw in enumerate(raw_records):
         item_label = f"{label}.ood_records[{index}]"
         item = _mapping(raw, label=item_label)
         _exact_keys(item, {"record_id", *expected}, label=item_label)
         identity = item.pop("record_id")
+        if identity != expected_ids[index]:
+            message = f"{item_label}.record_id must be {expected_ids[index]!r}."
+            raise ValueError(message)
         if not isinstance(identity, str) or not identity or identity in identities:
             message = f"{item_label}.record_id must be unique non-empty text."
             raise ValueError(message)
@@ -598,6 +648,15 @@ def _validate_kinetics_record(
         values = {name: _finite(item[name], label=f"{item_label}.{name}") for name in expected}
         if normalized_components["r_surf_0"]["support"]["lower"] <= values["r_surf_0"] <= normalized_components["r_surf_0"]["support"]["upper"]:
             message = f"{item_label}.r_surf_0 must be disjoint from its natural support."
+            raise ValueError(message)
+        multipliers = (0.25, 0.5, -0.15) if index == 0 else (3.5, 1.5, 0.15)
+        expected_values = {
+            "r_surf_0": multipliers[0] * normalized_components["r_surf_0"]["nominal"],
+            "r_int_surf": multipliers[1] * normalized_components["r_int_surf"]["nominal"],
+            "f_surf": normalized_components["f_surf"]["nominal"] + multipliers[2],
+        }
+        if any(not math.isclose(values[name], expected_values[name], rel_tol=0.0, abs_tol=1e-14) for name in expected):
+            message = f"{item_label} violates the required common kinetics OOD design equation."
             raise ValueError(message)
         records.append({"id": identity, "values": values, "metadata": {}})
     kinetics["components"] = normalized_components
@@ -615,8 +674,42 @@ def _validate_kinetics_record(
         "records": records,
         "selection_rule": "complete_record_atomic",
         "provenance": copy.deepcopy(kinetics["provenance"]),
+        "ood_provenance": copy.deepcopy(kinetics["ood_provenance"]),
     }
     return kinetics, owners, contract
+
+
+def _validate_material_ood_inventory(registry: Mapping[str, Mapping[str, Any]]) -> None:
+    """Require complete scalar OOD roles with their exact directional inventory."""
+    expected = {
+        "kappa_mean": (True, True),
+        "k_gr": (True, True),
+        "cp_gr_dry": (True, True),
+        "initial_moisture.mean_db": (False, True),
+        "initial_moisture.amplitude_db": (False, True),
+    }
+    for name, (requires_lower, requires_upper) in expected.items():
+        entry = registry.get(name)
+        if not isinstance(entry, Mapping):
+            message = f"Material scalar OOD role {name!r} is missing from the resolved registry."
+            raise TypeError(message)
+        tails = entry.get("ood")
+        if not isinstance(tails, list):
+            message = f"Material scalar OOD role {name!r} must declare interval tails."
+            raise TypeError(message)
+        lower, upper = float(entry["lower"]), float(entry["upper"])
+        directions = [
+            "lower" if float(tail["upper"]) < lower else "upper" if float(tail["lower"]) > upper else "overlap"
+            for tail in tails
+            if isinstance(tail, Mapping) and {"lower", "upper"}.issubset(tail)
+        ]
+        expected_directions = (["lower"] if requires_lower else []) + (["upper"] if requires_upper else [])
+        if directions != expected_directions:
+            message = f"Material scalar OOD role {name!r} must declare exact directions {expected_directions}."
+            raise ValueError(message)
+        if not isinstance(entry.get("ood_provenance"), Mapping):
+            message = f"Material scalar OOD role {name!r} requires OOD provenance."
+            raise TypeError(message)
 
 
 def _merge_registry(
@@ -791,6 +884,7 @@ def project_material_for_profile(
         "material_family": material["material_family"],
         "material_scope": copy.deepcopy(material["material_scope"]),
         "packing_porosity_mean_support": copy.deepcopy(material["packing_porosity_mean_support"]),
+        "porosity_coupling": copy.deepcopy(material["porosity_coupling"]),
         "parameter_registry": projected_registry,
         "effective_parameter_provenance": {
             name: copy.deepcopy(value)
@@ -1009,6 +1103,20 @@ def resolve_material_definition(
     }
     owners["X_target_wb"] = {"value": target_wb, "nominal": target_wb, "provenance": copy.deepcopy(target["provenance"])}
     registry = _merge_registry(definitions, owners)
+    _validate_material_ood_inventory(registry)
+    kappa_entry = registry["kappa_mean"]
+    coupling = porosity_service.resolve_porosity_coupling(
+        material_family=family,
+        material_kappa_nominal=float(kappa_entry["nominal"]),
+        eps_bed_cal_ref=float(registry["eps_bed_cal_ref"]["value"]),
+        authored_permeability_support=kappa_entry,
+        packing_porosity_mean_support=packing,
+        eps_min_global=float(registry["eps_min_global"]["value"]),
+        eps_max_global=float(registry["eps_max_global"]["value"]),
+        authored_kappa_ood=kappa_entry.get("ood"),
+    )
+    kappa_entry["lower"] = coupling["effective_joint_permeability_support"]["lower"]
+    kappa_entry["upper"] = coupling["effective_joint_permeability_support"]["upper"]
     effective: dict[str, Any] = {}
     for name, entry in registry.items():
         entry_provenance = entry.get("provenance")
@@ -1027,6 +1135,7 @@ def resolve_material_definition(
         "material_family": family,
         "material_scope": scope,
         "packing_porosity_mean_support": packing,
+        "porosity_coupling": coupling,
         "initial_moisture_bounds": initial_bounds,
         "initial_moisture_field_constraint": field_constraint,
         "parameter_registry": registry,

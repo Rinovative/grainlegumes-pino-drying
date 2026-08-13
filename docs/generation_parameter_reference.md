@@ -1,10 +1,11 @@
-# Generation Scientific and Technical Parameter Reference
+# Generation Scientific and Configuration Parameter Reference
 
 This is the single maintained human-readable reference for Generation
-parameters, ranges, equations, classifications, and scientific provenance. The
-validated YAML and Python resolver remain executable authority; this document
-explains their scientific meaning without becoming a second configuration. See
-`simulation_generation.md` for configuration ownership and execution workflows.
+parameters, units, ranges, equations, support roles, classifications, and
+scientific provenance. Validated configuration and its resolved form remain the
+executable authority; this document explains their scientific meaning without
+becoming a second configuration. The [operations guide](simulation_generation.md)
+owns setup, execution, publication, resume, and troubleshooting.
 
 ## Scientific parameter note
 
@@ -23,8 +24,11 @@ explains their scientific meaning without becoming a second configuration. See
 
 Every authored provenance record has two required concepts: `evidence` states
 what kind of support underlies the value, and `source_refs` points to the
-canonical bibliography below. An empty source list is valid only for an explicit
-project modelling or synthetic design decision.
+canonical bibliography in `configs/generation/sources.yaml`. An empty source
+list is valid only for an explicit project modelling or synthetic design
+decision. Material OOD supports additionally carry a separate
+`ood_provenance`, so a literature-backed ID value is never presented as evidence
+for a synthetic stress interval.
 
 The controlled evidence vocabulary preserves the distinctions that matter:
 direct literature or official targets; literature fits, transfers, and
@@ -45,26 +49,9 @@ Four optional concepts appear only when they add information:
 
 A separate confidence field is not used because uncalibrated compound judgements
 would overlap evidence class, method, source, and explicit applicability limits.
-Those canonical concepts communicate directness and uncertainty without a second
-vocabulary.
-
-## Owners at a glance
-
-| Owner | Scientific decision |
-| --- | --- |
-| `configs/generation/sources.yaml` | One bibliographic record per source key |
-| `configs/generation/registry.yaml` | Parameter name, symbol, unit, kind, transform, block, sampling order, OOD group, components, and derivation |
-| `configs/generation/common.yaml` | Grid, time, shared fixed physics, formulas, adapter and HDF5 contracts |
-| `configs/generation/operations/<operation>.yaml` | Apparatus and operation supports and constraints |
-| `configs/generation/materials/<family>.yaml` | Role-neutral family values, natural supports, coupled records, targets, evidence |
-| `configs/generation/profiles/<profile>.yaml` | Template, export schema, explicit native mappings, profile conditioning |
-| `configs/generation/campaigns/<profile>/<campaign>.yaml` | Roles, counts, seeds, memberships, package requests |
-| `configs/generation/execution/<site>.yaml` | Execution and retention only; excluded from scientific identity |
-
-Python resolution is the only layer that combines these owners. It validates
-cross-layer compatibility, projects the registry into the selected profile,
-derives identities and allocations, and persists the effective scientific
-configuration. Documentation is not a second parameter registry.
+Those concepts communicate directness and uncertainty without a second
+vocabulary. Configuration ownership and edit locations are summarized once in
+the [operations guide](simulation_generation.md#where-do-i-change-what).
 
 ## Inspect the resolved scientific contract
 
@@ -78,11 +65,8 @@ python -m src.generation.cli.cli_generation validate-config \
   --allow-incomplete
 ```
 
-The output exposes the effective material inventory and roles, source-case
-counts and derived total, memberships, campaign and derived seed plan, package
-requests and expanded package inventory, profile-projected OOD units and exact
-allocation, purpose-specific pilot or smoke scope, bounded static-sentinel
-workload, template identity, execution resources, and readiness gates.
+The output exposes the effective material inventory, resolved parameters,
+dimensions, support roles, OOD allocation, provenance, and identities.
 
 Inspect individual values or complete atomic records through their inherited
 provenance chain:
@@ -101,56 +85,23 @@ python -m src.generation.cli.cli_generation validate-config \
 ```
 
 Inspection distinguishes authored, inherited, selected, and derived evidence.
-It also distinguishes generator consumption, admitted COMSOL CLI overrides, and
-package-fixed values bound to the hashed native template without a Python
-runtime override.
-Use the same command after every valid configuration edit; derived totals,
-dimensions, memberships, packages, and identities must change from the edited
-owners without synchronized Python or documentation edits.
+Use it after a configuration edit to verify the effective values, dimensions,
+supports, and identities.
 
-## Registry, profile, and channel ownership
+## Registry and profile semantics
 
 The registry owns the active sampling blocks, effective dimensions, names,
 units, kinds, transforms, physical OOD groups, and atomic-record components.
 The profile projection determines which registry entries participate in one
 simulation profile. Do not maintain those inventories in prose.
 
-The schema-only public profile contract exposes adapter fields and available
-learning views without loading campaign YAML or native templates:
-
-```bash
-python - <<'PY'
-import json
-from src import generation
-
-def fields(items):
-    return [field.as_dict() for field in items]
-
-for profile_id in generation.contracts.available_profile_ids():
-    contract = generation.contracts.get_profile_contract(profile_id)
-    print(json.dumps({
-        "profile": contract.id,
-        "available_learning_views": contract.available_learning_views,
-        "airflow_source": contract.airflow_source,
-        "coordinate_fields": fields(contract.coordinate_fields),
-        "stationary_fixed_fields": fields(contract.stationary_fixed_fields),
-        "static_fields": fields(contract.static_fields),
-        "transient_fields": fields(contract.transient_fields),
-        "schedule_fields": fields(contract.schedule_fields),
-        "scalar_inputs": fields(contract.scalar_inputs),
-    }, indent=2))
-PY
-```
-
-Dataset task and step contracts remain the authoritative tensor-channel owners.
-Generation profile fields are source and provenance contracts; they must not be
-copied into a separate learning-channel table. A material family is metadata,
-not an implicit one-hot channel, and an evaluation category does not create a
-new model, equation, sampling coordinate, or native profile.
+Dataset task and step contracts remain the tensor-channel owners. A material
+family is metadata, not an implicit one-hot channel, and an evaluation category
+does not create a new model, equation, sampling coordinate, or native profile.
 
 ## Canonical parameter catalogue
 
-The registry declares 63 canonical entries. Sampling coordinates contribute 28 dimensions to `steady_flow` and 54 to `transient_drying`; coupled records and derived or fixed entries add no independent coordinates. OOD is admitted only when the resolved record supplies a valid tail or alternate complete record.
+The registry declares 62 canonical entries. Sampling coordinates contribute 27 dimensions to `steady_flow` and 53 to `transient_drying`; coupled records, latent packing scatter, and derived or fixed entries add no independent coordinates. OOD is admitted only when the resolved record supplies a valid tail or alternate complete record.
 
 | Name | Symbol | Unit | Class | Profiles | Transform | Owner/block | OOD group | Meaning |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -170,7 +121,6 @@ The registry declares 63 canonical entries. Sampling coordinates contribute 28 d
 | `permeability.anisotropy.strength` | `s_K` | `1` | sampled | `steady_flow`, `transient_drying` | `linear` | `airflow` | `bed` | Multiplier controlling permeability-tensor anisotropy. |
 | `permeability.orientation.jitter` | `j_{\theta}` | `1` | sampled | `steady_flow`, `transient_drying` | `linear` | `airflow` | `bed` | Random perturbation amplitude for permeability orientation. |
 | `permeability.orientation.smooth_len_rel` | `\ell_{\theta}/L_x` | `1` | sampled | `steady_flow`, `transient_drying` | `log` | `airflow` | `bed` | Relative smoothing length for permeability orientation. |
-| `porosity.kc_anchor_factor` | `a_KC` | `1` | sampled | `steady_flow`, `transient_drying` | `log` | `airflow` | `bed` | Dimensionless factor scaling the material-calibrated Kozeny-Carman reference coefficient. |
 | `porosity.smooth_len_rel` | `\ell_{\varepsilon}/L_x` | `1` | sampled | `steady_flow`, `transient_drying` | `linear` | `airflow` | `bed` | Relative smoothing length for the porosity latent field. |
 | `porosity.texture_amp` | `\Delta\varepsilon` | `1` | sampled | `steady_flow`, `transient_drying` | `linear` | `airflow` | `bed` | Porosity texture amplitude around the calibrated reference. |
 | `pressure_bc.mean` | `\bar{p}_{\mathrm{in}}` | `Pa` | sampled | `steady_flow`, `transient_drying` | `linear` | `airflow` | `operation` | Mean inlet pressure boundary magnitude. |
@@ -287,7 +237,6 @@ These are natural or ID supports from `fixed_bed.yaml`; transforms and OOD group
 | `permeability.anisotropy.strength` | 0.4-1 | 0.7 | `1` | `synthetic_design` |
 | `permeability.orientation.jitter` | 0.005-0.02 | 0.012 | `1` | `project_baseline` |
 | `permeability.orientation.smooth_len_rel` | 0.04-0.16 | 0.08 | `1` | `project_baseline` |
-| `porosity.kc_anchor_factor` | 1.0 | 1 | `1` | `synthetic_design` |
 | `porosity.smooth_len_rel` | 0.03-0.09 | 0.055 | `1` | `project_baseline` |
 | `porosity.texture_amp` | 0.003-0.015 | 0.008 | `1` | `project_baseline` |
 | `initial_moisture.structure.coarse_len_rel` | 0.08-0.24 | 0.14 | `1` | `synthetic_design` |
@@ -297,11 +246,33 @@ These are natural or ID supports from `fixed_bed.yaml`; transforms and OOD group
 | `initial_moisture.structure.fine_ani_y` | 0.7-1.4 | 1 | `1` | `synthetic_design` |
 | `initial_moisture.structure.cross_scale_corr` | 0.25-0.7 | 0.5 | `1` | `synthetic_design` |
 
-## Material-specific natural supports
+## Uniform material contract
 
-Moisture supports are dry basis (`kg water/kg dry solid`) except `X_target_wb`, which is wet basis. Oswin values are the complete `A_osw, B_osw, C_osw` record; kinetics are supports for `r_surf_0, r_int_surf, f_surf`. Exact OOD records, evidence classes, source references, methods, and genuine applicability limits remain beside each value in material YAML.
+Every maintained family uses the same role-neutral material schema and can
+participate in every scientifically applicable material-owned OOD role. Evidence
+quality and numerical values may differ by family; required fields, OOD role
+inventory, provenance shape, validation, resolution, persistence, and static
+sentinel coverage do not. Campaign membership remains a separate experiment
+design decision.
 
-| Material | kappa_mean m^2 | packing eps | rho_bu_dry_ref kg/m^3; eps ref | k_gr W/(m*K) | cp_gr_dry J/(kg*K) | initial mean db | X_target_wb | Oswin A,B,C | kinetics supports |
+| Contract item | Classification | Authoritative owner |
+| --- | --- | --- |
+| Material identity, scope, natural values, supports, targets, and source evidence | `AUTHORED` | Material YAML |
+| Lower/upper scalar stress intervals and complete coupled stress records | `AUTHORED` synthetic design | Material YAML `ood_supports` or `ood_records` with separate `ood_provenance` |
+| Fixed KC coefficient, KC-compatible support, mapped porosity tails, and inferred dry particle density | `DERIVED` and deterministic | Material resolver |
+| Natural or OOD scalar values and selected complete records | `SAMPLED` or atomically selected | Case generator from the resolved contract |
+| Bounded latent packing deviation | `SAMPLED` from its semantic seed, but not a DOE coordinate | Case generator |
+| Seen/family-OOD role and production case count | `AUTHORED` experiment design | Campaign YAML |
+
+### Natural values and supports
+
+Moisture supports are dry basis (`kg water/kg dry solid`) except `X_target_wb`,
+which is wet basis. Oswin values are the complete `A_osw, B_osw, C_osw` record;
+kinetics are supports for `r_surf_0, r_int_surf, f_surf`. Exact evidence, source
+references, methods, and applicability limits remain beside each value in the
+material YAML.
+
+| Material | authored kappa_mean m^2 | packing eps | rho_bu_dry_ref kg/m^3; eps ref | k_gr W/(m*K) | cp_gr_dry J/(kg*K) | initial mean db | X_target_wb | Oswin A,B,C | kinetics supports |
 | --- | --- | --- | --- | --- | --- | --- | ---: | --- | --- |
 | `chickpea` | 8e-09-3e-08 | 0.37-0.45 | 620-730; 0.403 | 0.24-0.38 | 1600-2200 | 0.190476-0.315789 | 0.12 | 11.2175, -0.0615631, 0.49142 | 3e-06-1.4e-05; 0.06-0.3; 0.28-0.62 |
 | `field_pea` | 8e-09-4e-08 | 0.37-0.43 | 530-620; 0.3938 | 0.25-0.38 | 1650-2250 | 0.190476-0.315789 | 0.12 | 12.062, -0.0573838, 0.343383 | 3.5e-06-1.6e-05; 0.06-0.3; 0.28-0.62 |
@@ -309,6 +280,39 @@ Moisture supports are dry basis (`kg water/kg dry solid`) except `X_target_wb`, 
 | `lentil` | 5e-09-1.3e-08 | 0.29-0.36 | 590-680; 0.3125 | 0.3-0.44 | 1800-2300 | 0.190476-0.315789 | 0.12 | 12.062, -0.0573838, 0.343383 | 5e-06-2e-05; 0.08-0.35; 0.3-0.65 |
 | `rapeseed` | 2e-09-9e-09 | 0.365-0.422 | 590-640; 0.4 | 0.15-0.25 | 1600-2100 | 0.0989011-0.190476 | 0.06 | 6.95472, -0.032779, 0.470207 | 5e-06-2.5e-05; 0.08-0.4; 0.3-0.68 |
 | `sunflower_seed` | 4e-08-1.5e-07 | 0.5-0.57 | 330-410; 0.5306 | 0.16-0.3 | 500-1000 | 0.0989011-0.219512 | 0.06 | 4.8, -0.0158, 0.622278 | 3e-06-1.6e-05; 0.05-0.3; 0.25-0.65 |
+
+### Required material OOD inventory
+
+Every family authors exactly two ordered tails for `kappa_mean`, `k_gr`, and
+`cp_gr_dry` (lower, then upper); one upper tail for initial-moisture mean and
+amplitude; complete `loose_low_density` and `dense_high_density` records at the
+reference inferred dry particle density; and complete `slow_internal_limited`
+and `fast_surface_exposed` kinetics records. Missing, extra, misdirected, or
+mis-provenanced roles fail material resolution.
+
+| Material | kappa lower / upper m^2 | k_gr lower / upper | cp_gr_dry lower / upper | initial mean upper | amplitude upper |
+| --- | --- | --- | --- | --- | --- |
+| `chickpea` | 2.5e-09-5e-09 / 4.8e-08-8e-08 | 0.16-0.20 / 0.46-0.58 | 1200-1450 / 2500-2900 | 0.36-0.45 | 0.055-0.080 |
+| `field_pea` | 2.4e-09-5.2e-09 / 6.4e-08-1.1e-07 | 0.16-0.21 / 0.46-0.58 | 1200-1500 / 2550-2950 | 0.36-0.45 | 0.055-0.080 |
+| `kidney_bean` | 4e-09-9e-09 / 1.3e-07-2.2e-07 | 0.16-0.21 / 0.49-0.62 | 1200-1450 / 2500-2900 | 0.44-0.55 | 0.065-0.095 |
+| `lentil` | 1.8e-09-3.5e-09 / 2e-08-3.8e-08 | 0.20-0.26 / 0.52-0.65 | 1300-1600 / 2600-3000 | 0.36-0.45 | 0.055-0.080 |
+| `rapeseed` | 6e-10-1.3e-09 / 1.44e-08-2.475e-08 | 0.09-0.12 / 0.31-0.40 | 1200-1450 / 2400-2800 | 0.23-0.30 | 0.035-0.050 |
+| `sunflower_seed` | 1.2e-08-2.6e-08 / 2.4e-07-4.125e-07 | 0.10-0.13 / 0.38-0.50 | 300-400 / 1200-1500 | 0.27-0.36 | 0.042-0.060 |
+
+| Material | density records: rho_bu_dry_ref, eps_bed_cal_ref | kinetics records: r_surf_0, r_int_surf, f_surf |
+| --- | --- | --- |
+| `chickpea` | loose 505, 0.55401627; dense 855, 0.24491864 | slow 1.75e-06, 0.075, 0.30; fast 2.45e-05, 0.225, 0.60 |
+| `field_pea` | loose 430, 0.54116177; dense 710, 0.24238338 | slow 2e-06, 0.08, 0.31; fast 2.8e-05, 0.24, 0.61 |
+| `kidney_bean` | loose 415, 0.59685714; dense 740, 0.28114286 | slow 1.25e-06, 0.05, 0.23; fast 1.75e-05, 0.15, 0.53 |
+| `lentil` | loose 475, 0.48164683; dense 720, 0.21428571 | slow 2.5e-06, 0.10, 0.35; fast 3.5e-05, 0.30, 0.65 |
+| `rapeseed` | loose 500, 0.51612903; dense 800, 0.22580645 | slow 3e-06, 0.11, 0.35; fast 4.2e-05, 0.33, 0.65 |
+| `sunflower_seed` | loose 270, 0.66418124; dense 610, 0.24129836 | slow 2e-06, 0.075, 0.30; fast 2.8e-05, 0.225, 0.60 |
+
+The current family-generalization campaigns intentionally allocate production
+parameter-OOD cases only to the three `seen` families; the other three families
+remain natural-support family-OOD evaluations. That campaign policy is not a
+material-schema exception: static sentinels resolve and exercise the complete
+material-owned OOD inventory for all six families.
 
 ## Canonical coupling equations
 
@@ -363,31 +367,64 @@ parameter inspection. The stable interpretation is:
 These relationships are executable bindings, not a claim that one cited source
 reported every final configured coefficient or range.
 
-### Material-calibrated porosity
+### Material-calibrated Kozeny--Carman trend and packing scatter
 
-There is one physical porosity field. Its scalar calibration reference comes
-from the active complete density-calibration record and is not another field.
-The material YAML owns the natural representative-porosity support; common
-configuration owns pointwise numerical guards.
+The Kozeny--Carman relation defines a material-specific reference trend between
+mean permeability and packing porosity. For
+`g(epsilon) = epsilon^3/(1-epsilon)^2`, the generator derives one fixed
+`A_KC_reference = kappa_nominal/g(eps_bed_cal_ref)` from the canonical material
+reference record. A case-specific density-calibration OOD record does not change
+this coefficient. The deterministic trend is
+`eps_kc_trend = g^-1(kappa_mean/A_KC_reference)`, so `kappa_mean` is the only DOE
+coordinate governing the global permeability/packing coupling and the trend is
+strictly increasing.
 
-The Kozeny-Carman anchor deterministically couples the selected permeability,
-calibration reference, and sampled anchor factor. Natural sampling resolves a
-case- and material-specific conditional support. Parameter OOD resolves disjoint
-transformed tails using the registry-owned separation policy. Tail separation
-and width are not restated here; inspect `porosity.kc_anchor_factor` and the
-resolved `parameter_ood` allocation for the exact active contract.
+The authored permeability support is intersected before sampling with the
+permeability interval obtained by mapping the natural packing-porosity support
+through the fixed KC relation. The resolved configuration preserves both
+intervals and labels their intersection as the effective joint ID support; it
+never presents the narrowed interval as the authored source range.
 
-Local morphology is generated from the shared background field and the resolved
-porosity texture settings. Permeability and porosity share spatial structure,
-but realized local permeability components do not directly become porosity
-texture inputs. The same realized porosity is consumed by airflow, transient
-transport and heat transfer, material density, water inventory, native solves,
-HDF5, and maintained dataset views.
+| Material | Authored permeability | KC-compatible permeability | Effective ID permeability | Natural porosity | Lower/upper permeability-OOD mapped porosity |
+| --- | --- | --- | --- | --- | --- |
+| `chickpea` | 8e-09--3e-08 | 9.93788e-09--2.34575e-08 | 9.93788e-09--2.34575e-08 | 0.37--0.45 | 0.260018--0.312058 / 0.521007--0.572562 |
+| `field_pea` | 8e-09--4e-08 | 1.26711e-08--2.42965e-08 | 1.26711e-08--2.42965e-08 | 0.37--0.43 | 0.240657--0.296068 / 0.525511--0.580167 |
+| `kidney_bean` | 1.5e-08--8e-08 | 2.49518e-08--5.66474e-08 | 2.49518e-08--5.66474e-08 | 0.42--0.50 | 0.266757--0.329360 / 0.583695--0.636010 |
+| `lentil` | 5e-09--1.3e-08 | 5.90471e-09--1.39017e-08 | 5.90471e-09--1.3e-08 | 0.29--0.36 | 0.209637--0.252181 / 0.392517--0.453211 |
+| `rapeseed` | 2e-09--9e-09 | 2.71340e-09--5.06132e-09 | 2.71340e-09--5.06132e-09 | 0.365--0.422 | 0.247228--0.303703 / 0.524789--0.579445 |
+| `sunflower_seed` | 4e-08--1.5e-07 | 5.89990e-08--1.18185e-07 | 5.89990e-08--1.18185e-07 | 0.50--0.57 | 0.350184--0.420045 / 0.640540--0.692071 |
+
+A small bounded case-level deviation represents unresolved packing morphology.
+For the active natural or mapped `kappa_mean`-OOD porosity support, the generator
+uses `margin = min(eps_kc_trend-lower, upper-eps_kc_trend)`,
+`sigma = margin/3`, draws a true standard normal truncated to `(-3, 3)` from its
+own semantic `packing_scatter` seed, and sets
+`eps_reference = eps_kc_trend + sigma*packing_scatter_z`. The symmetric scatter
+is a synthetic modelling assumption, not an experimentally calibrated
+parameter. It is not a DOE coordinate, OOD unit, configurable scientific
+parameter, model input, or dataset channel. The draw and scalar reference are
+fixed across retries of local spatial fields.
+
+Local morphology remains `eps(x) = eps_reference + Delta-epsilon*chi(x)` using
+the existing shared background, texture, pointwise physical guards, and clipping
+diagnostics. No pointwise Kozeny--Carman relation is imposed between
+`kappa(x)` and `eps(x)`. Lower and upper `kappa_mean` OOD intervals use their
+complete KC-mapped porosity intervals for scatter, so scatter cannot return an
+OOD case to the natural packing interval. Case provenance records the active
+permeability interval as `active_kappa_mean_support` beside the authored,
+KC-compatible, and effective ID intervals.
+
+The active generation and persisted contract version is exactly `1`. Changed
+registry, resolved-support, seed, metadata, case, batch, HDF5, and dataset
+content changes the existing digests and identities. Dataset package identity
+and admission include the exact current case/porosity contract digest, so old
+version-1 anchor-factor artifacts are not reinterpreted, migrated, or loadable
+as current packages.
 
 ### Inlet schedule
 
 `generation_cases_schedule.py` is the one canonical temporal generator for
-natural, parameter-OOD, and stress views. It is deliberately separate from the
+natural and parameter-OOD views. It is deliberately separate from the
 spatial pressure and field generator. The smooth component filters seeded
 one-dimensional white excitation with a reflected Gaussian kernel;
 `schedule.timescale_rel` is the ideal filtered process's e-folding correlation
@@ -426,8 +463,8 @@ evaluation metadata, not learned fields or scalar inputs.
 
 The Generation profile contract owns one ordered 12-field case-dependent
 runtime handoff. Each transient case writes exactly these values to
-`scalars.csv`, admits the file before process creation, and supplies the same
-ordered values to COMSOL through an argument vector without a shell.
+`scalars.csv`; runtime admission and canonical HDF5 publication require the same
+names, order, units, finite float64 values, and case representations.
 
 | Position | Field | Unit |
 | ---: | --- | --- |
@@ -444,53 +481,17 @@ ordered values to COMSOL through an argument vector without a shell.
 | 11 | `B_osw` | `1/K` |
 | 12 | `C_osw` | `1` |
 
-`T_init` is not an independent runtime value. Python supplies `T_amb`, and the
-canonical COMSOL template derives `T_init = T_amb`. The template/package-fixed
-values `T_flow_ref`, `p_ref`, `p_out`, and `f_wet_dm_max` remain with their
-existing canonical scientific-configuration/template owners; they are not
-duplicated into `scalars.csv`. Other fixed template parameters such as `cp_w`,
-`h_fg`, `d_wall`, `k_wall`, `h_ext`, and `U_wall` likewise do not belong in the
-case handoff.
+`T_init` is derived from `T_amb`. Template-fixed values are not duplicated into
+the case handoff. The learned transient Dataset view is a separate eight-field
+projection: the three transfer terms, three Oswin coefficients, `k_gr`, and
+`cp_gr_dry`. `T_amb` is step-boundary conditioning; the realized `eps_bed` and
+`rho_bu_dry` static fields represent the two density-calibration values;
+`X_target_wb` controls termination diagnostics.
 
-`generation.contracts.generation_contracts_scalar_handoff` is the sole reader
-and admission owner. It binds the source filename, hash, size, exact header and
-row order, canonical units, finite float64 values, case JSON representations,
-ownership, and workspace containment before solver evidence or process
-creation. Canonical HDF5 publication calls the same owner and writes an exact
-`(12,)` float64 runtime-scalar dataset with the same names, units, ownership,
-and values. Older scalar layouts fail exact admission and must be regenerated.
-The learned Dataset view remains a separately name-selected eight-field
-projection owned by
-`src/datasets/contracts/dataset_contracts_transient.py`:
-`r_surf_0`, `r_int_surf`, `f_surf`, `A_osw`, `B_osw`, `C_osw`, `k_gr`, and
-`cp_gr_dry`. The three transfer terms and three Oswin coefficients preserve the
-case-specific moisture kinetics and equilibrium relation; the two thermal
-properties preserve granular heat transport and storage. The four remaining
-runtime values have other model-facing owners: `T_amb` is step-boundary
-conditioning, while `eps_bed_cal_ref` and `rho_bu_dry_ref` are represented by
-the realized `eps_bed` and `rho_bu_dry` static fields. `X_target_wb` controls
-termination diagnostics and is not a training transition or rollout input.
-
-The schedule is a separate four-column time-dependent adapter:
-`t,T_in_bc,omega_in_bc,phi_in_bc`. The corrected native interpolation feature
-uses column 1 as its `h` argument and columns 2--4 as
-`T_in_bc_file`, `omega_in_bc_file`, and `phi_in_bc_file`, with units `K`,
-`kg/kg`, and `1`. It uses linear interpolation and constant extrapolation. Each
-hourly interval is therefore determined by its adjacent endpoint values; no
-interval mean, integral, or additional scalar is needed.
-
-After a successful solver exit, runtime accepts exactly one new or replaced
-nonempty regular `solved*.mph` candidate. A sole suffixed candidate is
-atomically renamed to `solved.mph`; stale, empty, symbolic-link, missing, or
-ambiguous candidates fail closed. Execution provenance records both the
-produced and canonical names.
-
-The test-owned fake COMSOL executable proves the Python handoff and output
-contract. Static archive inspection proves the saved template descriptor and
-the SHA-256 sidecar binds its exact bytes. Neither is native execution evidence:
-a real transient technical smoke remains required to prove native parameter
-application, schedule-file reload, retained output, HDF5, packages, and both
-DataLoader worker modes.
+The independent time-dependent adapter contains
+`t,T_in_bc,omega_in_bc,phi_in_bc`. Exact adapter, runtime, native mapping,
+solver-output, and publication procedures belong to the operations guide and
+executable contracts.
 
 ## Material records and atomic selection
 
@@ -519,9 +520,11 @@ Inspect `material_roles`, `material_memberships`, and
 uses natural material support only and never invokes parameter OOD.
 
 Each parameter-OOD case activates one profile-eligible unit. Eligibility comes
-from registry classification, profile projection, parameter kind, and actual
-configured tails or alternate records. Deterministic round-robin allocation
-covers every eligible unit when capacity permits and balances remaining cases.
+from registry classification, profile projection, parameter kind, and the
+required material-owned tails or alternate records. Complete material
+capability is validated independently of campaign membership. Deterministic
+round-robin allocation covers every eligible unit when capacity permits and
+balances remaining cases.
 The resolved summary and persisted provenance provide, per batch:
 
 - eligible unit identifiers, physical groups, and unit kinds;
@@ -532,20 +535,16 @@ The resolved summary and persisted provenance provide, per batch:
 Scalar tails are nonempty, separated from natural support in the declared
 transform, and fail closed when invalid. Natural cases have no active OOD unit.
 
-## Adapters and persistence
+## Persisted scientific evidence
 
-Grid shape, geometry, regular times, exact-stop handling, adapter fields, export
-roles, units, HDF5 layout, chunks, compression, and tolerances are resolved from
-common and profile configuration. Use `validate-config`, parameter inspection,
-and the public profile contract instead of copying their current values into
-prose.
-
-Canonical HDF5 binds scientific and case identities, material role, evaluation
-and sampling regimes, natural-support state, sampled values and units, seed and
-block evidence, complete OOD and coupled-record provenance, inputs, outputs,
-diagnostics, hashes, template identity, source-export identity, and the embedded
-resolved scientific configuration. Dataset package admission validates this
-evidence against the requested source role and regime.
+Resolved configuration and generated artifacts preserve exact scientific and
+case identities, material family and role, natural and OOD supports, selected
+values or atomic records, material OOD provenance, semantic seeds, coupled KC
+and packing-scatter evidence, diagnostics, hashes, and the embedded resolved
+scientific configuration. Exact admission rejects stale or structurally
+incompatible version-1 artifacts. File layouts, adapters, publication, and
+Dataset workflow are specified in the operations guide and executable
+contracts.
 
 ## Source provenance
 
@@ -584,7 +583,10 @@ evidence against the requested source role and regime.
 - `transient_comsol_model_report` - COMSOL Multiphysics 6.4 model report: transient_drying_template, generated 2026-08-09. (SHA-256 463ecea45bad7c221f3c85ef53c92dbf77a603dc4b2fda2d54bf8e852d3e96a5)
 - `vm2_project` - Albertin, R. M. (2026). VM2 Vertiefungsprojekt. OST. (local project report)
 
-A citation does not imply that the final configured number appears directly in it. Follow `evidence`, `source_refs`, and any `method`, positive `verification`, `applicability`, or `note` to distinguish direct values, conversions, refits, transfers, inversions, estimates, priors, synthetic supports, and modelling decisions.
+A citation does not imply that the final configured number appears directly in
+it. Follow the complete provenance chain to distinguish direct values,
+conversions, refits, transfers, inversions, estimates, priors, synthetic
+supports, and modelling decisions.
 
 ## Operational cross-reference
 

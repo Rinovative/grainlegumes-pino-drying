@@ -2699,6 +2699,11 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
     success = _load_json_object(success_path, label=f"{stage} case success marker")
     provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
     case_payload = _load_json_object(directory / "case.json", label=f"{stage} canonical case provenance")
+    try:
+        case_service.validate_case_payload_schema(case_payload)
+    except (KeyError, TypeError, ValueError) as error:
+        msg = f"Canonical case provenance does not match the active exact schema: {directory}"
+        raise RuntimeError(msg) from error
     if (
         set(success) != _CASE_SUCCESS_KEYS
         or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND

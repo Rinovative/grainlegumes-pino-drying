@@ -86,7 +86,7 @@ def _case_indexes(
     )
 
 
-def _schema_identity(dataset_view: str) -> dict[str, int]:
+def _schema_identity(dataset_view: str) -> dict[str, int | str]:
     """Return view-specific payload schema identity in the package-v1 envelope."""
     if dataset_view == "transient_drying":
         payload_schema_version = trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
@@ -98,6 +98,7 @@ def _schema_identity(dataset_view: str) -> dict[str, int]:
     return {
         "package": DATASET_PACKAGE_SCHEMA_VERSION,
         "case_hdf5": storage_schema_version(),
+        "generation_case": generation.cases.case.CASE_CONTRACT_DIGEST,
         "transient_index": payload_schema_version,
     }
 
