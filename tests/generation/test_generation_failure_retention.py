@@ -134,8 +134,9 @@ def test_technical_smoke_conversion_failure_retains_and_diagnoses_before_cleanup
     assert receipt["failure_diagnostics"]["transient_initial_state"]["status"] == "complete"
     assert receipt["scratch_cleanup"]["status"] == "complete"
     diagnostic = json.loads((retained / "diagnostics/initial_state_diagnostic.json").read_text(encoding="utf-8"))
-    assert diagnostic["validator"]["rtol"] == config.scientific_values["storage"]["float32_rtol"]
-    assert diagnostic["validator"]["atol"] == config.scientific_values["storage"]["float32_atol"]
+    tolerance = config.scientific_values["validation"]["transient_initial_state"]
+    assert diagnostic["validator"]["rtol"] == tolerance["rtol"]
+    assert diagnostic["validator"]["atol"] == tolerance["atol"]
     assert diagnostic["diagnostic_classification"] == "approximately_canonical"
     assert generation.runtime.case_failure_is_recorded(
         config,

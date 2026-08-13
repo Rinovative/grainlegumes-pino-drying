@@ -9,7 +9,7 @@ Responsibilities:
   - Persist hash-bound JSON and full-grid CSV diagnostic evidence
 Design principles:
   - Diagnostics never execute solvers or scheduler commands
-  - Configured float32 validation tolerances define numerical interpretation
+  - Configured transient initial-state tolerances define numerical interpretation
   - Every metric is derived from canonical production parser outputs
 This module does NOT:
   - Modify model, solver, or scientific initialization semantics
@@ -248,20 +248,19 @@ def write_initial_state_diagnostic(
     surface, interior = reconstructed.transient_states[0, states.index("w_surf")], reconstructed.transient_states[0, states.index("w_int")]
     scalar_names = reconstructed.scalar_handoff.field_names
     f_surf = float(reconstructed.scalar_handoff.values[scalar_names.index("f_surf")])
-    rtol, atol = (float(config.scientific_values["storage"][name]) for name in ("float32_rtol", "float32_atol"))
+    rtol, atol = storage.transient_initial_state_tolerance(config)
     weighted = f_surf * surface + (1.0 - f_surf) * interior
     surface_canonical, interior_canonical = _comparison(surface, expected), _comparison(interior, expected)
     surface_split, interior_split = _hypothesis(surface, f_surf * expected), _hypothesis(interior, (1.0 - f_surf) * expected)
-    canonical_pass = bool(np.allclose(surface, expected, rtol=rtol, atol=atol) and np.allclose(interior, expected, rtol=rtol, atol=atol))
-    weighted_pass = bool(np.allclose(weighted, expected, rtol=rtol, atol=atol))
-    surface_split_match = bool(np.allclose(surface, f_surf * expected, rtol=rtol, atol=atol))
-    interior_split_match = bool(
-        np.allclose(
-            interior,
-            (1.0 - f_surf) * expected,
-            rtol=rtol,
-            atol=atol,
-        )
+    surface_pass = storage.transient_initial_state_matches(config, surface, expected)
+    interior_pass = storage.transient_initial_state_matches(config, interior, expected)
+    canonical_pass = surface_pass and interior_pass
+    weighted_pass = storage.transient_initial_state_matches(config, weighted, expected)
+    surface_split_match = storage.transient_initial_state_matches(config, surface, f_surf * expected)
+    interior_split_match = storage.transient_initial_state_matches(
+        config,
+        interior,
+        (1.0 - f_surf) * expected,
     )
     surface_split_better = (
         surface_canonical["error"]["rmse"] > 0.0 and surface_split["rmse"] <= _MATERIAL_HYPOTHESIS_IMPROVEMENT * surface_canonical["error"]["rmse"]
@@ -297,8 +296,8 @@ def write_initial_state_diagnostic(
         "validator": {
             "rtol": rtol,
             "atol": atol,
-            "w_surf_allclose": bool(np.allclose(surface, expected, rtol=rtol, atol=atol)),
-            "w_int_allclose": bool(np.allclose(interior, expected, rtol=rtol, atol=atol)),
+            "w_surf_allclose": surface_pass,
+            "w_int_allclose": interior_pass,
         },
         "expected_w_gr_0": _basic(expected),
         "w_surf": {

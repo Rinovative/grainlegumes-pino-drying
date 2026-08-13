@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import shlex
 import time
@@ -66,6 +67,48 @@ def test_float32_conversion_requires_explicit_tolerance() -> None:
     assert converted.dtype == np.float32
     with pytest.raises(ValueError, match="exceeds configured tolerance"):
         generation.publication.storage.validate_float32_conversion(values, rtol=0.0, atol=0.0, label="synthetic")
+
+
+def test_transient_initial_state_tolerance_is_independent_of_float32_storage(
+    generation_config_factory: Any,
+) -> None:
+    """Keep semantic admission independent of float32 representation fidelity."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    expected = np.asarray((140.0, 145.0, 151.0), dtype=np.float64)
+    solver_scale = expected * np.asarray((1.0 - 2.1043e-5, 1.0 - 1.13e-5, 1.0 + 7.93e-6))
+    assert generation.publication.storage.transient_initial_state_tolerance(config) == (1.0e-4, 1.0e-10)
+    assert generation.publication.storage.transient_initial_state_matches(config, solver_scale, expected)
+    assert not generation.publication.storage.transient_initial_state_matches(config, expected * (1.0 + 2.0e-4), expected)
+    assert not generation.publication.storage.transient_initial_state_matches(config, 0.64 * expected, expected)
+    assert not generation.publication.storage.transient_initial_state_matches(config, 1.03 * expected, expected)
+
+    storage_changed = copy.deepcopy(config.scientific_values)
+    storage_changed["storage"]["float32_rtol"] = 0.0
+    storage_changed["storage"]["float32_atol"] = 0.0
+    assert generation.publication.storage.transient_initial_state_matches(
+        replace(config, scientific_values=storage_changed),
+        solver_scale,
+        expected,
+    )
+
+    semantic_changed = copy.deepcopy(config.scientific_values)
+    semantic_changed["validation"]["transient_initial_state"]["rtol"] = 1.0e-8
+    assert not generation.publication.storage.transient_initial_state_matches(
+        replace(config, scientific_values=semantic_changed),
+        solver_scale,
+        expected,
+    )
+    converted = generation.publication.storage.validate_float32_conversion(
+        expected,
+        rtol=float(semantic_changed["storage"]["float32_rtol"]),
+        atol=float(semantic_changed["storage"]["float32_atol"]),
+        label="synthetic",
+    )
+    assert converted.dtype == np.float32
 
 
 def test_resolved_science_and_execution_are_persisted_separately(

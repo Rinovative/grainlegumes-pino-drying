@@ -275,6 +275,10 @@ input_contract:
     - T_in_bc
     - omega_in_bc
     - phi_in_bc
+validation:
+  transient_initial_state:
+    rtol: 1.0e-04
+    atol: 1.0e-10
 storage:
   schema_version: 1
   converter_version: 1

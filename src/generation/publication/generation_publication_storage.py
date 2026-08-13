@@ -608,6 +608,22 @@ def _outside_unit_interval(values: np.ndarray) -> np.ndarray:
     return (values < -_UNIT_INTERVAL_ROUNDOFF_ATOL) | (values > 1.0 + _UNIT_INTERVAL_ROUNDOFF_ATOL)
 
 
+def transient_initial_state_tolerance(config: GenerationConfig) -> tuple[float, float]:
+    """Return the configured semantic tolerance for transient initial states."""
+    tolerance = config.scientific_values["validation"]["transient_initial_state"]
+    return float(tolerance["rtol"]), float(tolerance["atol"])
+
+
+def transient_initial_state_matches(
+    config: GenerationConfig,
+    actual: np.ndarray,
+    expected: np.ndarray,
+) -> bool:
+    """Return whether a solved transient initial state is semantically canonical."""
+    rtol, atol = transient_initial_state_tolerance(config)
+    return bool(np.allclose(actual, expected, rtol=rtol, atol=atol))
+
+
 def _validate_transient_outputs(
     config: GenerationConfig,
     static_fields: np.ndarray,
@@ -663,10 +679,12 @@ def _validate_transient_outputs(
     x_initial = static_fields[static_names.index("X_0_db_field")]
     initial_water = rho_bu_dry * x_initial
     state_names = profiles.TRANSIENT_FIELD_NAMES
-    rtol = float(config.scientific_values["storage"]["float32_rtol"])
-    atol = float(config.scientific_values["storage"]["float32_atol"])
     for name in ("w_surf", "w_int"):
-        if not np.allclose(regular_fields[0, state_names.index(name)], initial_water, rtol=rtol, atol=atol):
+        if not transient_initial_state_matches(
+            config,
+            regular_fields[0, state_names.index(name)],
+            initial_water,
+        ):
             message = f"Initial {name} must equal rho_bu_dry*X_0_db_field without compartment splitting."
             raise ValueError(message)
     final_state = regular_fields[-1] if exact_stop_fields is None else exact_stop_fields

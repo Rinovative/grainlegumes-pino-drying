@@ -211,6 +211,14 @@ extra pass. Pilot and Production do not run the transient quantitative
 diagnostic, and Production failure evidence remains compact when raw and solved
 retention are disabled.
 
+Transient `t=0` moisture admission uses the dedicated semantic tolerance in
+`common.validation.transient_initial_state` (`rtol=1e-4`, `atol=1e-10`). This
+allows the very small numerical movement introduced by a completed COMSOL solve
+while continuing to reject materially different physical initial states. It is
+independent of the stricter float32 storage/conversion tolerance. Technical-Smoke
+initial-state diagnostics report the exact semantic tolerance used by production
+admission.
+
 5. Inspect the immutable real-smoke receipt printed by the smoke command:
 
 ```bash

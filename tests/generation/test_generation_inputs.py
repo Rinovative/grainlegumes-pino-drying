@@ -243,6 +243,67 @@ def test_generation_and_hdf5_versions_are_integer_one(
         generation.cases.config.load_campaign_config(config_path)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("rtol", 0.0, "rtol must be positive"),
+        ("rtol", -1.0e-4, "rtol must be positive"),
+        ("atol", -1.0e-10, "atol must be non-negative"),
+        ("rtol", float("nan"), "must be a finite real value"),
+        ("atol", float("inf"), "must be a finite real value"),
+        ("rtol", "1e-4", "must be a finite real value"),
+        ("atol", True, "must be a finite real value"),
+        ("rtol", 1.0e-3, "no greater than"),
+        ("atol", 1.0e-6, "no greater than"),
+    ],
+)
+def test_transient_initial_state_tolerance_validation(
+    generation_config_factory: Any,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Reject malformed or unsafe semantic initial-state tolerances."""
+    config_path, _template = generation_config_factory()
+    common_path = config_path.parent / "common.yaml"
+    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    common["validation"]["transient_initial_state"][key] = value
+    common_path.write_text(yaml.safe_dump(common, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_transient_validation_tolerance_has_scoped_identity_ownership(
+    generation_config_factory: Any,
+) -> None:
+    """Bind admission provenance without changing inputs or steady batches."""
+    transient_path, _template = generation_config_factory()
+    original_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    transient_common_path = transient_path.parent / "common.yaml"
+    transient_common = yaml.safe_load(transient_common_path.read_text(encoding="utf-8"))
+    transient_common["validation"]["transient_initial_state"]["rtol"] = 5.0e-5
+    transient_common_path.write_text(yaml.safe_dump(transient_common, sort_keys=False), encoding="utf-8")
+    changed_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
+
+    assert changed_transient.scientific_config_digest != original_transient.scientific_config_digest
+    assert changed_transient.batch_id != original_transient.batch_id
+    assert changed_transient.case_input_config_digest == original_transient.case_input_config_digest
+
+    steady_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    original_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
+    steady_common_path = steady_path.parent / "common.yaml"
+    steady_common = yaml.safe_load(steady_common_path.read_text(encoding="utf-8"))
+    steady_common["validation"]["transient_initial_state"]["rtol"] = 5.0e-5
+    steady_common_path.write_text(yaml.safe_dump(steady_common, sort_keys=False), encoding="utf-8")
+    changed_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
+
+    assert "validation" not in original_steady.scientific_values
+    assert changed_steady.scientific_config_digest == original_steady.scientific_config_digest
+    assert changed_steady.batch_id == original_steady.batch_id
+    assert changed_steady.case_input_config_digest == original_steady.case_input_config_digest
+
+
 def _temporary_family_campaign(
     tmp_path: Path,
     name: str,

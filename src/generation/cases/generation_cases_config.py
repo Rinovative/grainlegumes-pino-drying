@@ -53,6 +53,8 @@ CANONICAL_HDF5_SCHEMA_VERSION = 1
 CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
 _MAXIMUM_GZIP_COMPRESSION_LEVEL = 9
+_MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL = 1.0e-4
+_MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL = 1.0e-10
 PILOT_CASE_KINDS = ("nominal_reference", "natural_pilot")
 _FINAL_PHYSICAL_FORMULAS = {
     "w_surf_balance": "f_surf*d(w_surf)/dt = j_int - m_evap",
@@ -797,6 +799,42 @@ def _validate_storage(value: Any) -> dict[str, Any]:
     return storage
 
 
+def _validate_validation(value: Any) -> dict[str, Any]:
+    """Validate configured scientific-admission tolerances."""
+    validation = _mapping(value, label="common.validation")
+    _exact_keys(
+        validation,
+        required={"transient_initial_state"},
+        optional=set(),
+        label="common.validation",
+    )
+    initial_state = _mapping(
+        validation["transient_initial_state"],
+        label="common.validation.transient_initial_state",
+    )
+    _exact_keys(
+        initial_state,
+        required={"rtol", "atol"},
+        optional=set(),
+        label="common.validation.transient_initial_state",
+    )
+    initial_state["rtol"] = _finite(
+        initial_state["rtol"],
+        label="common.validation.transient_initial_state.rtol",
+    )
+    initial_state["atol"] = _finite(
+        initial_state["atol"],
+        label="common.validation.transient_initial_state.atol",
+    )
+    if not 0.0 < initial_state["rtol"] <= _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL:
+        message = f"common.validation.transient_initial_state.rtol must be positive and no greater than {_MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL}."
+        raise GenerationConfigError(message)
+    if not 0.0 <= initial_state["atol"] <= _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL:
+        message = f"common.validation.transient_initial_state.atol must be non-negative and no greater than {_MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL}."
+        raise GenerationConfigError(message)
+    return {"transient_initial_state": initial_state}
+
+
 def _validate_provenance_owners(
     value: Any,
     *,
@@ -837,6 +875,7 @@ def _validate_common(
         "time",
         "time_provenance",
         "input_contract",
+        "validation",
         "storage",
     }
     _exact_keys(common_config, required=expected, optional=set(), label="generation common configuration")
@@ -891,6 +930,7 @@ def _validate_common(
         label="common.time_provenance",
     )
     common_config["input_contract"] = _validate_input_contract(common_config["input_contract"])
+    common_config["validation"] = _validate_validation(common_config["validation"])
     common_config["storage"] = _validate_storage(common_config["storage"])
     return common_config
 
@@ -1772,6 +1812,7 @@ def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
     for key in (
         "simulation_profile",
         "output_contract",
+        "validation",
         "available_learning_views",
         "airflow_source",
         "steady_flow_conditioning",
@@ -2043,6 +2084,7 @@ def _build_batch(
                 "schedule_generator_version": schedule_service.SCHEDULE_GENERATOR_VERSION,
                 "physical_formulas": copy.deepcopy(dict(common_config["physical_formulas"])),
                 "physical_formulas_provenance": copy.deepcopy(dict(common_config["physical_formulas_provenance"])),
+                "validation": copy.deepcopy(dict(common_config["validation"])),
                 "time": copy.deepcopy(dict(common_config["time"])),
                 "time_provenance": copy.deepcopy(dict(common_config["time_provenance"])),
                 "operation_constraints": copy.deepcopy(dict(common_config["_operation_constraints"])),

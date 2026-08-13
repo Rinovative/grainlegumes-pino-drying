@@ -22,8 +22,10 @@ if TYPE_CHECKING:
 
 
 _GRID_NODE_COUNT = 4
-_RTOL = 1.0e-6
-_ATOL = 1.0e-12
+_SEMANTIC_RTOL = 1.0e-4
+_SEMANTIC_ATOL = 1.0e-10
+_FLOAT32_RTOL = 1.0e-6
+_FLOAT32_ATOL = 1.0e-12
 _F_SURF = 0.4
 
 
@@ -122,9 +124,15 @@ def _diagnose(
                     )(),
                     "batch_id": "transient_drying__lentil__natural",
                     "scientific_values": {
+                        "validation": {
+                            "transient_initial_state": {
+                                "rtol": _SEMANTIC_RTOL,
+                                "atol": _SEMANTIC_ATOL,
+                            },
+                        },
                         "storage": {
-                            "float32_rtol": _RTOL,
-                            "float32_atol": _ATOL,
+                            "float32_rtol": _FLOAT32_RTOL,
+                            "float32_atol": _FLOAT32_ATOL,
                         },
                         "time": {
                             "start": 0.0,
@@ -165,8 +173,8 @@ def test_initial_state_diagnostic_classifies_canonical_and_persists_full_grid(
     assert payload["schema_version"] == diagnostics.DIAGNOSTIC_SCHEMA_VERSION
     assert payload["diagnostic_classification"] == "approximately_canonical"
     assert payload["validator"] == {
-        "rtol": _RTOL,
-        "atol": _ATOL,
+        "rtol": _SEMANTIC_RTOL,
+        "atol": _SEMANTIC_ATOL,
         "w_surf_allclose": True,
         "w_int_allclose": True,
     }
@@ -233,7 +241,7 @@ def test_initial_state_diagnostic_distinguishes_split_and_redistribution(
         redistributed.payload["weighted_total"]["error"]["max_abs"],
         0.0,
         rtol=0.0,
-        atol=_ATOL,
+        atol=_SEMANTIC_ATOL,
     )
 
 
@@ -245,21 +253,44 @@ def test_initial_state_diagnostic_uses_exact_configured_tolerance(
     below = _diagnose(
         tmp_path / "below",
         monkeypatch,
-        surface_scale=1.0 + 0.5 * _RTOL,
-        interior_scale=1.0 + 0.5 * _RTOL,
+        surface_scale=1.0 + 0.5 * _SEMANTIC_RTOL,
+        interior_scale=1.0 + 0.5 * _SEMANTIC_RTOL,
     )
     above = _diagnose(
         tmp_path / "above",
         monkeypatch,
-        surface_scale=1.0 + 2.0 * _RTOL,
-        interior_scale=1.0 + 2.0 * _RTOL,
+        surface_scale=1.0 + 2.0 * _SEMANTIC_RTOL,
+        interior_scale=1.0 + 2.0 * _SEMANTIC_RTOL,
     )
 
     assert below.payload["diagnostic_classification"] == "approximately_canonical"
     assert below.payload["validator"]["w_surf_allclose"] is True
     assert above.payload["diagnostic_classification"] == "other"
     assert above.payload["validator"]["w_surf_allclose"] is False
-    assert above.payload["w_surf"]["relative_error"]["median"] > _RTOL
+    assert above.payload["w_surf"]["relative_error"]["median"] > _SEMANTIC_RTOL
+
+
+def test_real_solver_scale_discrepancy_is_approximately_canonical(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Admit the observed solver-initialization regime with the semantic tolerance."""
+    result = _diagnose(
+        tmp_path,
+        monkeypatch,
+        surface_scale=np.asarray(((1.0 - 2.1043e-5, 1.0 - 1.33e-5), (1.0 - 8.0e-6, 1.0 - 3.6e-6))),
+        interior_scale=np.asarray(((1.0 - 1.1296e-5, 1.0), (1.0 + 7.93e-6, 1.0 - 2.0e-11))),
+    )
+
+    assert result.payload["diagnostic_classification"] == "approximately_canonical"
+    assert result.payload["validator"]["w_surf_allclose"] is True
+    assert result.payload["validator"]["w_int_allclose"] is True
+    assert result.payload["validator"] == {
+        "rtol": _SEMANTIC_RTOL,
+        "atol": _SEMANTIC_ATOL,
+        "w_surf_allclose": True,
+        "w_int_allclose": True,
+    }
 
 
 def test_diagnostic_module_cannot_launch_solver_or_scheduler() -> None:
