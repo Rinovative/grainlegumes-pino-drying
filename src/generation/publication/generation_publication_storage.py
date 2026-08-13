@@ -75,6 +75,18 @@ class CanonicalCase:
     source_export_hashes: dict[str, dict[str, Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class TransientBulkMoistureConsistency:
+    """Canonical exported-versus-reconstructed transient bulk moisture."""
+
+    time: np.ndarray
+    exported: np.ndarray
+    reconstructed: np.ndarray
+    rtol: float
+    atol: float
+    matches: bool
+
+
 def time_classification_tolerance(time_contract: Mapping[str, Any]) -> float:
     """Return the numerical state-time classification tolerance."""
     scale = max(
@@ -452,7 +464,16 @@ def _combined_state_time(
     return np.concatenate((regular_time, np.asarray([exact_stop_time], dtype=np.float64)))
 
 
-def _validate_global_bulk_moisture(
+def transient_bulk_moisture_tolerance(
+    config: GenerationConfig,
+) -> tuple[float, float]:
+    """Return the configured semantic tolerance for transient bulk moisture."""
+    tolerance = config.scientific_values["validation"]["transient_bulk_moisture"]
+    return float(tolerance["rtol"]), float(tolerance["atol"])
+
+
+def evaluate_transient_bulk_moisture_consistency(
+    config: GenerationConfig,
     static_fields: np.ndarray,
     state_time: np.ndarray,
     regular_fields: np.ndarray,
@@ -461,8 +482,8 @@ def _validate_global_bulk_moisture(
     *,
     f_surf: float,
     time_tolerance: float,
-) -> None:
-    """Validate exported bulk moisture without a second full state tensor."""
+) -> TransientBulkMoistureConsistency:
+    """Reconstruct and compare the canonical transient bulk-moisture series."""
     rho_bu_dry = static_fields[profiles.TRANSIENT_STATIC_FIELD_NAMES.index("rho_bu_dry")]
     surface_index = profiles.TRANSIENT_FIELD_NAMES.index("w_surf")
     interior_index = profiles.TRANSIENT_FIELD_NAMES.index("w_int")
@@ -495,8 +516,47 @@ def _validate_global_bulk_moisture(
         message = "Global diagnostics must contain exactly one row for every regular and optional exact-stop state."
         raise ValueError(message)
     column = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]
-    if not np.allclose(column, expected, rtol=1e-6, atol=1e-9):
-        maximum = float(np.max(np.abs(column - expected)))
+    if not np.isfinite(expected).all():
+        message = "Reconstructed X_wb_bulk contains non-finite values."
+        raise ValueError(message)
+    if not np.isfinite(column).all():
+        message = "Exported X_wb_bulk contains non-finite values."
+        raise ValueError(message)
+    rtol, atol = transient_bulk_moisture_tolerance(config)
+    return TransientBulkMoistureConsistency(
+        time=np.asarray(state_time, dtype=np.float64),
+        exported=np.asarray(column, dtype=np.float64),
+        reconstructed=expected,
+        rtol=rtol,
+        atol=atol,
+        matches=bool(np.allclose(column, expected, rtol=rtol, atol=atol)),
+    )
+
+
+def _validate_global_bulk_moisture(
+    config: GenerationConfig,
+    static_fields: np.ndarray,
+    state_time: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_fields: np.ndarray | None,
+    global_values: np.ndarray,
+    *,
+    f_surf: float,
+    time_tolerance: float,
+) -> None:
+    """Validate exported bulk moisture against integrated dry and water mass."""
+    result = evaluate_transient_bulk_moisture_consistency(
+        config,
+        static_fields,
+        state_time,
+        regular_fields,
+        exact_stop_fields,
+        global_values,
+        f_surf=f_surf,
+        time_tolerance=time_tolerance,
+    )
+    if not result.matches:
+        maximum = float(np.max(np.abs(result.exported - result.reconstructed)))
         message = f"Exported X_wb_bulk disagrees with weighted integrated dry and water mass; maximum error={maximum}."
         raise ValueError(message)
 
@@ -715,6 +775,7 @@ def _validate_transient_outputs(
         message = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
         raise ValueError(message)
     _validate_global_bulk_moisture(
+        config,
         static_fields,
         state_time,
         regular_fields,
@@ -1864,6 +1925,14 @@ class ReconstructedTransientInitialState:
     source_artifacts: dict[str, dict[str, Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class ReconstructedTransientBulkMoisture:
+    """Production-parsed bulk-moisture comparison and source evidence."""
+
+    consistency: TransientBulkMoistureConsistency
+    source_artifacts: dict[str, dict[str, Any]]
+
+
 def reconstruct_transient_initial_state(
     config: GenerationConfig,
     case_payload: Mapping[str, Any],
@@ -1950,6 +2019,86 @@ def reconstruct_transient_initial_state(
                 "size_bytes": source.stat().st_size,
             }
             for name, source in source_paths.items()
+        },
+    )
+
+
+def reconstruct_transient_bulk_moisture(
+    config: GenerationConfig,
+    case_payload: Mapping[str, Any],
+    *,
+    stationary_export: Path | str,
+    transient_export: Path | str,
+    global_export: Path | str,
+    work_directory: Path | str,
+) -> ReconstructedTransientBulkMoisture:
+    """Reconstruct bulk moisture through the canonical production parsers."""
+    if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
+        message = "Bulk-moisture reconstruction requires transient_drying."
+        raise ValueError(message)
+    paths = {
+        "stationary_fields": Path(stationary_export),
+        "transient_states": Path(transient_export),
+        "global_time_series": Path(global_export),
+    }
+    roles = {
+        "stationary_fields": profiles.STEADY_FLOW_EXPORT_ROLE,
+        "transient_states": profiles.TRANSIENT_RAW_EXPORT_ROLE,
+        "global_time_series": profiles.GLOBAL_EXPORT_ROLE,
+    }
+    for name, path in paths.items():
+        if not path.is_file() or path.is_symlink():
+            message = f"Bulk-moisture reconstruction requires one safe {roles[name]!r} export: {path}"
+            raise FileNotFoundError(message)
+    exports = tuple(_DiagnosticExport(paths[name], roles[name]) for name in paths)
+    x_axis, y_axis, stationary_fields = _static_fields(config, exports)
+    regular_time, regular_fields, exact_stop_time, exact_stop_fields = _transient_fields(
+        config,
+        exports,
+        x_axis=x_axis,
+        y_axis=y_axis,
+    )
+    global_values = _ordered_values(
+        config,
+        exports,
+        profiles.GLOBAL_EXPORT_ROLE,
+        profiles.GLOBAL_FIELD_NAMES,
+    )
+    scalar_handoff = scalar_handoff_contract.admit_case_scalar_handoff(
+        case_payload,
+        work_directory,
+    )
+    scalar_names = profiles.scalar_input_fields(config.profile.id)
+    f_surf = float(scalar_handoff.values[scalar_names.index("f_surf")])
+    state_time = _combined_state_time(
+        regular_time,
+        exact_stop_time,
+        exact_stop_fields,
+    )
+    consistency = evaluate_transient_bulk_moisture_consistency(
+        config,
+        stationary_fields,
+        state_time,
+        regular_fields,
+        exact_stop_fields,
+        global_values,
+        f_surf=f_surf,
+        time_tolerance=time_classification_tolerance(config.scientific_values["time"]),
+    )
+    work_root = Path(work_directory).resolve()
+    resolved = {name: path.resolve() for name, path in paths.items()}
+    if any(not source.is_relative_to(work_root) for source in resolved.values()):
+        message = "Bulk-moisture diagnostic exports must remain inside the case work directory."
+        raise ValueError(message)
+    return ReconstructedTransientBulkMoisture(
+        consistency=consistency,
+        source_artifacts={
+            name: {
+                "relative_path": source.relative_to(work_root).as_posix(),
+                "sha256": common.serialization.file_sha256(source),
+                "size_bytes": source.stat().st_size,
+            }
+            for name, source in resolved.items()
         },
     )
 

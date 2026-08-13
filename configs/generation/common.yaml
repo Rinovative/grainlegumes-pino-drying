@@ -279,6 +279,9 @@ validation:
   transient_initial_state:
     rtol: 1.0e-04
     atol: 1.0e-10
+  transient_bulk_moisture:
+    rtol: 1.0e-05
+    atol: 1.0e-09
 storage:
   schema_version: 1
   converter_version: 1

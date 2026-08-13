@@ -4,6 +4,7 @@ Native solver, workspace, cluster, and single-batch execution services.
 Provides:
 - batch: single-case execution and terminal batch admission
 - cluster: scheduler planning and submission
+- license: bounded temporary floating-license retry evidence
 - comsol: fixed COMSOL command and workspace-name conventions
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_batch as batch
     from . import generation_runtime_cluster as cluster
     from . import generation_runtime_comsol as comsol
+    from . import generation_runtime_license as license  # noqa: A004 -- public service name
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
     from . import generation_runtime_workspace as workspace
@@ -110,6 +112,7 @@ _MODULES = {
     "batch": "generation_runtime_batch",
     "cluster": "generation_runtime_cluster",
     "comsol": "generation_runtime_comsol",
+    "license": "generation_runtime_license",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
     "workspace": "generation_runtime_workspace",
@@ -193,6 +196,7 @@ __all__ = [
     "execute_prepared_case",
     "finalize_batch",
     "initialize_batch_metadata",
+    "license",
     "preflight",
     "preparation",
     "prepare_case_work_directory",

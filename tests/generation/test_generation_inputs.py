@@ -1114,3 +1114,156 @@ def test_material_scalar_ood_provenance_is_required() -> None:
     record["ood_provenance"] = {"evidence": "project_baseline", "source_refs": []}
     with pytest.raises(ValueError, match="evidence must be synthetic_design"):
         materials._support_record(record, sources={}, label="synthetic")
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("rtol", 0.0, "rtol must be positive"),
+        ("rtol", -1.0e-5, "rtol must be positive"),
+        ("atol", -1.0e-9, "atol must be non-negative"),
+        ("rtol", float("nan"), "finite real value"),
+        ("atol", float("inf"), "finite real value"),
+        ("rtol", True, "finite real value"),
+        ("rtol", 1.0e-4, "no greater than"),
+        ("atol", 1.0e-8, "no greater than"),
+    ],
+)
+def test_transient_bulk_moisture_tolerance_validation(
+    generation_config_factory: Any,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Reject malformed or scientifically over-broad bulk tolerances."""
+    config_path, _template = generation_config_factory()
+    common_path = config_path.parent / "common.yaml"
+    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    common["validation"]["transient_bulk_moisture"][key] = value
+    common_path.write_text(
+        yaml.safe_dump(common, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        generation.cases.config.GenerationConfigError,
+        match=message,
+    ):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "exception", "message"),
+    [
+        ("enabled", 1, TypeError, "must be boolean"),
+        (
+            "initial_delay_seconds",
+            True,
+            generation.cases.config.GenerationConfigError,
+            "finite real value",
+        ),
+        (
+            "initial_delay_seconds",
+            0,
+            generation.cases.config.GenerationConfigError,
+            "must be positive",
+        ),
+        (
+            "maximum_delay_seconds",
+            float("inf"),
+            generation.cases.config.GenerationConfigError,
+            "finite real value",
+        ),
+        (
+            "maximum_wait_seconds",
+            -1,
+            generation.cases.config.GenerationConfigError,
+            "must be positive",
+        ),
+    ],
+)
+def test_temporary_license_retry_configuration_validation(
+    generation_config_factory: Any,
+    key: str,
+    value: object,
+    exception: type[Exception],
+    message: str,
+) -> None:
+    """Reject non-boolean controls and non-finite or non-positive delays."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["runtime"]["temporary_license_retry"][key] = value
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(exception, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("maximum_key", "maximum_value"),
+    [
+        ("maximum_delay_seconds", 59),
+        ("maximum_wait_seconds", 59),
+    ],
+)
+def test_temporary_license_retry_configuration_bounds(
+    generation_config_factory: Any,
+    maximum_key: str,
+    maximum_value: int,
+) -> None:
+    """Require both retry maxima to cover at least the initial delay."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["runtime"]["temporary_license_retry"][maximum_key] = maximum_value
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        generation.cases.config.GenerationConfigError,
+        match="must be at least initial_delay_seconds",
+    ):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_bulk_tolerance_and_retry_policy_have_separate_identity_ownership(
+    generation_config_factory: Any,
+) -> None:
+    """Separate scientific admission provenance from execution behavior."""
+    config_path, _template = generation_config_factory()
+    original = generation.cases.config.load_campaign_config(config_path)
+    original_batch = original.batches[0]
+
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["runtime"]["temporary_license_retry"]["initial_delay_seconds"] = 90
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
+    )
+    execution_changed = generation.cases.config.load_campaign_config(config_path)
+    execution_batch = execution_changed.batches[0]
+    assert execution_changed.campaign_digest == original.campaign_digest
+    assert execution_batch.scientific_config_digest == (original_batch.scientific_config_digest)
+    assert execution_batch.batch_id == original_batch.batch_id
+    assert execution_batch.case_input_config_digest == (original_batch.case_input_config_digest)
+    assert execution_changed.execution_values != original.execution_values
+
+    common_path = config_path.parent / "common.yaml"
+    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    common["validation"]["transient_bulk_moisture"]["rtol"] = 5.0e-6
+    common_path.write_text(
+        yaml.safe_dump(common, sort_keys=False),
+        encoding="utf-8",
+    )
+    science_changed = generation.cases.config.load_campaign_config(config_path)
+    science_batch = science_changed.batches[0]
+    assert science_batch.scientific_config_digest != (execution_batch.scientific_config_digest)
+    assert science_batch.batch_id != execution_batch.batch_id
+    assert science_batch.case_input_config_digest == (execution_batch.case_input_config_digest)

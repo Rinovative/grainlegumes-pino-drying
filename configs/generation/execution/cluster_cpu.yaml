@@ -4,6 +4,11 @@ runtime:
   timeout_seconds: 3600
   maximum_failures: 1
   extra_arguments: []
+  temporary_license_retry:
+    enabled: true
+    initial_delay_seconds: 60
+    maximum_delay_seconds: 300
+    maximum_wait_seconds: 3600
 retention:
   family_generalization:
     retain_raw_csv: false

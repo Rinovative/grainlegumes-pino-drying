@@ -171,6 +171,7 @@ def _validate_campaign_run_header(
         "submission_unknown",
         "scheduler_unknown",
         "failure_threshold_reached",
+        "waiting_retry",
         "complete",
         "cancel_requested",
     }
@@ -210,6 +211,7 @@ def _validate_submission_configuration(
         "max_running_cases",
         "cores_per_case",
         "maximum_failures",
+        "temporary_license_retry",
         "partition",
         "wall_time",
         "scheduler_options",
@@ -226,6 +228,30 @@ def _validate_submission_configuration(
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."
             raise ValueError(message)
+    retry = submission["temporary_license_retry"]
+    if (
+        not isinstance(retry, dict)
+        or set(retry)
+        != {
+            "enabled",
+            "initial_delay_seconds",
+            "maximum_delay_seconds",
+            "maximum_wait_seconds",
+        }
+        or not isinstance(retry.get("enabled"), bool)
+        or any(
+            isinstance(retry.get(key), bool) or not isinstance(retry.get(key), (int, float)) or not 0.0 < float(retry[key]) < float("inf")
+            for key in (
+                "initial_delay_seconds",
+                "maximum_delay_seconds",
+                "maximum_wait_seconds",
+            )
+        )
+        or retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]
+        or retry["maximum_wait_seconds"] < retry["initial_delay_seconds"]
+    ):
+        message = f"Campaign-run temporary-license retry configuration is malformed: {run_id}."
+        raise ValueError(message)
     max_running = submission["max_running_cases"]
     if max_running is not None and (isinstance(max_running, bool) or not isinstance(max_running, int) or max_running < 1):
         message = f"Campaign-run max_running_cases is malformed: {run_id}."
@@ -258,7 +284,7 @@ def _validate_submission_record(
             "error",
         }
         or record.get("submission_index") != index
-        or record.get("mode") not in {"initial", "resume"}
+        or record.get("mode") not in {"initial", "resume", "license_retry"}
         or not isinstance(record.get("recorded_at"), str)
         or not isinstance(record.get("case"), dict)
         or set(record["case"]) != {"batch_name", "batch_id", "case_index", "case_id"}

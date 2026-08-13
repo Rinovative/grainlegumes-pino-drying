@@ -536,6 +536,43 @@ def test_resume_does_not_duplicate_active_scheduler_work(
         }
     ]
 
+    exhausted_records = [*all_success]
+    exhausted_records[0] = {
+        **failed_records[0],
+        "temporary_license_retry": {"retry_budget_remaining": False},
+    }
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_result_records",
+        lambda *_args, **_kwargs: exhausted_records,
+    )
+    exhausted = generation.benchmark.core_benchmark_status(
+        _BENCHMARK_RUN_ID,
+        storage_root=tmp_path,
+    )
+    assert exhausted["state"] == "retry_exhausted"
+    assert exhausted["retry_repetitions"] == []
+    assert exhausted["suggested_next_command"].startswith("finalize-core-benchmark")
+
+    mixed_records = [*exhausted_records]
+    mixed_records[1] = {
+        "status": "pending",
+        "variant_id": suite.variants[0].variant_id,
+        "repetition": 2,
+        "repetition_id": suite.repetition_id(suite.variants[0], 2),
+    }
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_result_records",
+        lambda *_args, **_kwargs: mixed_records,
+    )
+    mixed = generation.benchmark.core_benchmark_status(
+        _BENCHMARK_RUN_ID,
+        storage_root=tmp_path,
+    )
+    assert mixed["state"] == "incomplete"
+    assert mixed["suggested_next_command"].startswith("resume-core-benchmark")
+
     monkeypatch.setattr(
         generation.benchmark,
         "_result_records",
@@ -578,6 +615,115 @@ def test_transfer_publication_is_bound_to_pretransfer_inventory() -> None:
         )
 
 
+def test_benchmark_resume_rejects_forged_retry_delay(
+    tmp_path: Path,
+) -> None:
+    """Fail closed when resume sees retry timing outside the bounded policy."""
+    suite = _suite()
+    variant = suite.variants[0]
+    record = _success_record(suite, variant, 1)
+    record.update(
+        {
+            "status": "pending",
+            "recorded_at": "2026-01-01T00:00:20+00:00",
+            "timings_s": {
+                "case_materialization": 0.5,
+                "complete_case": 1.0,
+            },
+            "temporary_license_retry": {
+                "classification": generation.runtime.license.TEMPORARY_LICENSE_CAPACITY,
+                "detected_feature": "CFD Module",
+                "detected_license_code": "-4",
+                "matched_signatures": [
+                    "Could not obtain license for 'CFD Module'",
+                    "License error: -4",
+                ],
+                "retry_attempt_index": 1,
+                "delay_before_next_attempt_seconds": 7200.0,
+                "cumulative_wait_seconds": 7200.0,
+                "retry_budget_remaining": True,
+                "next_eligible_at": "2026-01-01T02:00:20+00:00",
+            },
+        }
+    )
+    record.pop("hdf5")
+    directory = tmp_path / "benchmark"
+    attempt_directory = directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, 1)
+    attempt_directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(
+        attempt_directory / "attempt-0001.json",
+        record,
+    )
+    manifest = {
+        "submission_history": [
+            {
+                "role": "measure",
+                "variant_id": variant.variant_id,
+                "repetitions": [1],
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="retry history is inconsistent"):
+        generation.benchmark._latest_benchmark_license_retry(
+            manifest,
+            suite,
+            directory,
+        )
+
+
+def test_benchmark_resume_rejects_forged_retry_exhaustion(
+    tmp_path: Path,
+) -> None:
+    """Do not suppress work from an unproven exhausted retry receipt."""
+    suite = _suite()
+    variant = suite.variants[0]
+    record = _success_record(suite, variant, 1)
+    record.update(
+        {
+            "status": "failed",
+            "recorded_at": "2026-01-01T00:00:20+00:00",
+            "timings_s": {
+                "case_materialization": 0.5,
+                "complete_case": 1.0,
+            },
+            "error": {
+                "type": "TemporaryLicenseCapacityExhausted",
+                "message": generation.runtime.license.EXHAUSTED_REASON,
+            },
+            "temporary_license_retry": {
+                "classification": generation.runtime.license.TEMPORARY_LICENSE_CAPACITY,
+                "detected_feature": "CFD Module",
+                "detected_license_code": "-4",
+                "matched_signatures": [
+                    "Could not obtain license for 'CFD Module'",
+                    "License error: -4",
+                ],
+                "retry_attempt_index": 1,
+                "delay_before_next_attempt_seconds": 0.0,
+                "cumulative_wait_seconds": 0.0,
+                "retry_budget_remaining": False,
+                "next_eligible_at": None,
+            },
+        }
+    )
+    record.pop("hdf5")
+    directory = tmp_path / "benchmark"
+    attempt_directory = directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, 1)
+    attempt_directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(
+        attempt_directory / "attempt-0001.json",
+        record,
+    )
+
+    with pytest.raises(ValueError, match="retry history is inconsistent"):
+        generation.benchmark._pending_repetitions(
+            directory,
+            suite,
+            variant,
+        )
+
+
 def test_summary_view_retry_repairs_only_missing_deterministic_files(
     tmp_path: Path,
 ) -> None:
@@ -611,3 +757,50 @@ def test_summary_view_retry_repairs_only_missing_deterministic_files(
             records,
             repair_missing=True,
         )
+
+
+def test_benchmark_license_retry_uses_bounded_shared_policy(
+    tmp_path: Path,
+) -> None:
+    """Reuse canonical backoff and keep exhausted repetitions terminal."""
+    suite = _suite()
+    evidence = generation.runtime.license.classify_temporary_license_capacity(
+        "Could not obtain license for 'CFD Module'.\nLicense error: -4.\nLicensed number of users already reached."
+    )
+    assert evidence is not None
+    variant = suite.variants[0]
+    directory = tmp_path / "benchmark" / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, 1)
+    directory.mkdir(parents=True)
+    attempts: list[Path] = []
+    delays: list[float] = []
+    for attempt_index in range(1, 16):
+        retry = generation.benchmark._benchmark_license_retry_metadata(
+            suite.case_config,
+            attempts,
+            evidence,
+            recorded_at="2026-01-01T00:00:00+00:00",
+        )
+        delays.append(retry["delay_before_next_attempt_seconds"])
+        path = directory / f"attempt-{attempt_index:04d}.json"
+        common.serialization.atomic_write_json(
+            path,
+            {
+                "status": ("pending" if retry["retry_budget_remaining"] else "failed"),
+                "recorded_at": "2026-01-01T00:00:00+00:00",
+                "temporary_license_retry": retry,
+            },
+        )
+        attempts.append(path)
+
+    assert delays[:4] == [60.0, 120.0, 240.0, 300.0]
+    assert delays[-2:] == [180.0, 0.0]
+    assert sum(delays) == 3600.0
+    assert retry["retry_budget_remaining"] is False
+
+    pending = generation.benchmark._pending_repetitions(
+        tmp_path / "benchmark",
+        suite,
+        variant,
+    )
+    assert 1 not in pending
+    assert pending == tuple(range(2, suite.repetitions + 1))

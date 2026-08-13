@@ -32,7 +32,7 @@ import statistics
 import subprocess
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -45,6 +45,7 @@ from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_storage as storage_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
+from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_preparation as preparation_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
 
@@ -1321,6 +1322,7 @@ def _validate_failure_result(
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
     repetition: int,
+    attempts: Sequence[Path],
 ) -> None:
     """Validate one append-only failed repetition attempt."""
     _validate_result_identity(
@@ -1364,6 +1366,219 @@ def _validate_failure_result(
     if not isinstance(error, dict) or not isinstance(error.get("type"), str) or not error["type"] or not isinstance(error.get("message"), str):
         message = f"Benchmark failure error evidence is malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
+    if result.get("temporary_license_retry") is not None:
+        retry_count, _, exhausted = _validated_benchmark_license_retry_history(
+            suite.case_config,
+            attempts,
+            repetition_label=suite.repetition_id(variant, repetition),
+        )
+        if (
+            retry_count < 1
+            or not exhausted
+            or error.get("type") != "TemporaryLicenseCapacityExhausted"
+            or error.get("message") != license_service.EXHAUSTED_REASON
+        ):
+            message = f"Benchmark exhausted temporary-license evidence is malformed for {suite.repetition_id(variant, repetition)}."
+            raise ValueError(message)
+
+
+def _validate_pending_license_result(
+    result: Mapping[str, Any],
+    *,
+    suite: CoreBenchmarkSuite,
+    variant: CoreBenchmarkVariant,
+    repetition: int,
+    attempts: Sequence[Path],
+) -> None:
+    """Validate one append-only pending temporary-license attempt."""
+    _validate_result_identity(
+        result,
+        suite=suite,
+        variant=variant,
+        repetition=repetition,
+        status="pending",
+    )
+    _validate_resource_evidence(
+        result,
+        suite=suite,
+        variant=variant,
+        repetition=repetition,
+    )
+    _validate_scheduler_timing(
+        result,
+        repetition_id=suite.repetition_id(variant, repetition),
+    )
+    timings = result.get("timings_s")
+    if not isinstance(timings, dict) or set(timings) != {
+        "case_materialization",
+        "complete_case",
+    }:
+        message = f"Benchmark temporary-license timings are malformed for {suite.repetition_id(variant, repetition)}."
+        raise ValueError(message)
+    retry_count, _, exhausted = _validated_benchmark_license_retry_history(
+        suite.case_config,
+        attempts,
+        repetition_label=suite.repetition_id(variant, repetition),
+    )
+    if retry_count < 1 or exhausted:
+        message = f"Benchmark temporary-license evidence is malformed for {suite.repetition_id(variant, repetition)}."
+        raise ValueError(message)
+
+
+def _validated_benchmark_license_retry_history(
+    config: config_service.GenerationConfig,
+    attempts: Sequence[Path],
+    *,
+    repetition_label: str,
+) -> tuple[int, float, bool]:
+    """Validate and summarize one append-only benchmark retry chain."""
+    policy = config.execution_values["runtime"]["temporary_license_retry"]
+    expected_keys = {
+        "classification",
+        "detected_feature",
+        "detected_license_code",
+        "matched_signatures",
+        "retry_attempt_index",
+        "delay_before_next_attempt_seconds",
+        "cumulative_wait_seconds",
+        "retry_budget_remaining",
+        "next_eligible_at",
+    }
+    retry_count = 0
+    cumulative_wait = 0.0
+    exhausted = False
+    for attempt_path in attempts:
+        payload = _load_json(
+            attempt_path,
+            label="benchmark repetition attempt",
+        )
+        retry = payload.get("temporary_license_retry")
+        if retry is None:
+            continue
+        if exhausted:
+            message = f"Benchmark temporary-license retry history extends past exhaustion: {attempt_path}"
+            raise ValueError(message)
+        expected_index = retry_count + 1
+        expected_delay = license_service.bounded_retry_delay_seconds(
+            policy,
+            attempt_index=expected_index,
+            cumulative_wait_seconds=cumulative_wait,
+        )
+        expected_cumulative = cumulative_wait + expected_delay
+        expected_remaining = expected_delay > 0.0
+        detected_code = retry.get("detected_license_code") if isinstance(retry, dict) else None
+        signatures = retry.get("matched_signatures") if isinstance(retry, dict) else None
+        actual_index = retry.get("retry_attempt_index") if isinstance(retry, dict) else None
+        actual_delay = retry.get("delay_before_next_attempt_seconds") if isinstance(retry, dict) else None
+        actual_cumulative = retry.get("cumulative_wait_seconds") if isinstance(retry, dict) else None
+        valid_delay = (
+            not isinstance(actual_delay, bool)
+            and isinstance(actual_delay, (int, float))
+            and math.isfinite(float(actual_delay))
+            and float(actual_delay) == expected_delay
+        )
+        valid_cumulative = (
+            not isinstance(actual_cumulative, bool)
+            and isinstance(actual_cumulative, (int, float))
+            and math.isfinite(float(actual_cumulative))
+            and float(actual_cumulative) == expected_cumulative
+        )
+        if (
+            not isinstance(retry, dict)
+            or set(retry) != expected_keys
+            or retry.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
+            or not isinstance(retry.get("detected_feature"), str)
+            or not retry["detected_feature"]
+            or (detected_code is not None and not isinstance(detected_code, str))
+            or not isinstance(signatures, list)
+            or not signatures
+            or any(not isinstance(signature, str) or not signature for signature in signatures)
+            or isinstance(actual_index, bool)
+            or actual_index != expected_index
+            or not valid_delay
+            or not valid_cumulative
+            or retry.get("retry_budget_remaining") is not expected_remaining
+            or payload.get("status") != ("pending" if expected_remaining else "failed")
+        ):
+            message = f"Benchmark temporary-license retry history is inconsistent: {attempt_path}"
+            raise ValueError(message)
+        recorded_at = _timestamp(payload.get("recorded_at"), label="recorded_at")
+        if expected_remaining:
+            eligible_at = _timestamp(
+                retry.get("next_eligible_at"),
+                label="temporary_license_retry.next_eligible_at",
+            )
+            if eligible_at != recorded_at + timedelta(seconds=expected_delay):
+                message = f"Benchmark temporary-license eligibility is inconsistent for {repetition_label}."
+                raise ValueError(message)
+        elif retry.get("next_eligible_at") is not None:
+            message = f"Benchmark exhausted retry eligibility is inconsistent for {repetition_label}."
+            raise ValueError(message)
+        retry_count = expected_index
+        cumulative_wait = expected_cumulative
+        exhausted = not expected_remaining
+    return retry_count, cumulative_wait, exhausted
+
+
+def _benchmark_license_retry_metadata(
+    config: config_service.GenerationConfig,
+    attempts: Sequence[Path],
+    evidence: license_service.TemporaryLicenseCapacityClassification,
+    *,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """Return the next benchmark retry record from append-only prior attempts."""
+    policy = config.execution_values["runtime"]["temporary_license_retry"]
+    retry_count, prior_cumulative, exhausted = _validated_benchmark_license_retry_history(
+        config,
+        attempts,
+        repetition_label="benchmark repetition",
+    )
+    if exhausted:
+        message = "Benchmark temporary-license retry budget is already exhausted."
+        raise RuntimeError(message)
+    retry_index = retry_count + 1
+    delay = license_service.bounded_retry_delay_seconds(
+        policy,
+        attempt_index=retry_index,
+        cumulative_wait_seconds=prior_cumulative,
+    )
+    cumulative = prior_cumulative + delay
+    recorded = _timestamp(recorded_at, label="recorded_at")
+    return {
+        "classification": evidence.classification,
+        "detected_feature": evidence.feature,
+        "detected_license_code": evidence.license_code,
+        "matched_signatures": list(evidence.matched_signatures),
+        "retry_attempt_index": retry_index,
+        "delay_before_next_attempt_seconds": delay,
+        "cumulative_wait_seconds": cumulative,
+        "retry_budget_remaining": delay > 0.0,
+        "next_eligible_at": ((recorded + timedelta(seconds=delay)).isoformat() if delay > 0.0 else None),
+    }
+
+
+def _latest_benchmark_license_retry(
+    manifest: Mapping[str, Any],
+    suite: CoreBenchmarkSuite,
+    directory: Path,
+) -> Mapping[str, Any] | None:
+    """Return pending retry evidence for the latest measured submission."""
+    if not manifest["submission_history"]:
+        return None
+    latest = manifest["submission_history"][-1]
+    repetitions = latest.get("repetitions")
+    if latest.get("role") != "measure" or not isinstance(repetitions, list) or len(repetitions) != 1:
+        return None
+    matches = [
+        record
+        for record in _result_records(directory, suite)
+        if record.get("variant_id") == latest.get("variant_id") and record.get("repetition") == repetitions[0]
+    ]
+    if len(matches) != 1 or matches[0].get("status") != "pending":
+        return None
+    retry = matches[0].get("temporary_license_retry")
+    return retry if isinstance(retry, dict) else None
 
 
 def _validate_materialized_case_proof(
@@ -1466,7 +1681,16 @@ def _pending_repetitions(
                 repetition=repetition,
             )
         else:
-            pending.append(repetition)
+            attempts = tuple(
+                sorted((directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, repetition)).glob("attempt-*.json"))
+            )
+            _, _, exhausted = _validated_benchmark_license_retry_history(
+                suite.case_config,
+                attempts,
+                repetition_label=suite.repetition_id(variant, repetition),
+            )
+            if not exhausted:
+                pending.append(repetition)
     return tuple(pending)
 
 
@@ -1508,6 +1732,18 @@ def _submit_pending(
             _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
             return manifest
         latest_result = _latest_submission_result_state(manifest, suite, directory)
+        latest_retry = _latest_benchmark_license_retry(
+            manifest,
+            suite,
+            directory,
+        )
+        if latest_retry is not None and not license_service.retry_attempt_is_eligible(latest_retry):
+            manifest["state"] = "waiting_retry"
+            _persist_manifest(
+                _manifest_path(run_id, storage_root=storage),
+                manifest,
+            )
+            return manifest
         if latest_result == "pending" and not _latest_job_is_terminal_without_result(
             manifest,
             suite,
@@ -1559,7 +1795,14 @@ def _submit_pending(
     )
     if next_execution is None:
         remaining = sum(len(_pending_repetitions(directory, suite, variant)) for variant in suite.variants)
-        manifest["state"] = "complete" if remaining == 0 else "incomplete"
+        records = _result_records(directory, suite)
+        retry_exhausted = any(
+            record.get("status") == "failed"
+            and isinstance(record.get("temporary_license_retry"), dict)
+            and record["temporary_license_retry"].get("retry_budget_remaining") is False
+            for record in records
+        )
+        manifest["state"] = "retry_exhausted" if retry_exhausted else "complete" if remaining == 0 else "incomplete"
         _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
         return manifest
     variant, repetition = next_execution
@@ -1950,11 +2193,22 @@ def run_core_benchmark_repetition(
             )
         except BaseException as error:
             completion_time = _utc_now()
+            retry_metadata = None
+            if isinstance(
+                error,
+                license_service.TemporaryLicenseCapacityError,
+            ) and bool(suite.case_config.execution_values["runtime"]["temporary_license_retry"]["enabled"]):
+                retry_metadata = _benchmark_license_retry_metadata(
+                    suite.case_config,
+                    attempts,
+                    error.evidence,
+                    recorded_at=completion_time,
+                )
             failure = {
                 "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
                 "schema_version": BENCHMARK_SCHEMA_VERSION,
-                "status": "failed",
-                "recorded_at": _utc_now(),
+                "status": ("pending" if retry_metadata is not None and retry_metadata["retry_budget_remaining"] else "failed"),
+                "recorded_at": completion_time,
                 "benchmark_run_id": run_id,
                 "suite_digest": suite.suite_digest,
                 "variant_id": variant.variant_id,
@@ -1986,10 +2240,20 @@ def run_core_benchmark_repetition(
                     "complete_case": time.monotonic() - total_start,
                 },
                 "error": {
-                    "type": type(error).__name__,
-                    "message": str(error),
+                    "type": (
+                        "TemporaryLicenseCapacityExhausted"
+                        if retry_metadata is not None and not retry_metadata["retry_budget_remaining"]
+                        else type(error).__name__
+                    ),
+                    "message": (
+                        license_service.EXHAUSTED_REASON
+                        if retry_metadata is not None and not retry_metadata["retry_budget_remaining"]
+                        else str(error)
+                    ),
                 },
             }
+            if retry_metadata is not None:
+                failure["temporary_license_retry"] = retry_metadata
             if not attempt_path.exists():
                 _write_immutable_json(
                     attempt_path,
@@ -2039,6 +2303,7 @@ def _result_records(
                         suite=suite,
                         variant=variant,
                         repetition=repetition,
+                        attempts=attempts,
                     )
                     records.append(attempt)
                     continue
@@ -2049,6 +2314,16 @@ def _result_records(
                         variant=variant,
                         repetition=repetition,
                     )
+                elif attempt.get("status") == "pending":
+                    _validate_pending_license_result(
+                        attempt,
+                        suite=suite,
+                        variant=variant,
+                        repetition=repetition,
+                        attempts=attempts,
+                    )
+                    records.append(attempt)
+                    continue
                 else:
                     message = f"Benchmark attempt has an unsupported status: {attempts[-1]}"
                     raise ValueError(message)
@@ -2359,6 +2634,14 @@ def core_benchmark_status(
     success_count = sum(record["status"] == "success" for record in records)
     failure_count = sum(record["status"] == "failed" for record in records)
     pending_count = sum(record["status"] == "pending" for record in records)
+    exhausted_retries = [
+        record
+        for record in records
+        if record.get("status") == "failed"
+        and isinstance(record.get("temporary_license_retry"), dict)
+        and record["temporary_license_retry"].get("retry_budget_remaining") is False
+    ]
+    retryable_failure_count = failure_count - len(exhausted_retries)
     job_ids = [*manifest["preparation_job_ids"], *manifest["measured_job_ids"]]
     scheduler = (
         _scheduler_evidence(job_ids)
@@ -2371,12 +2654,21 @@ def core_benchmark_status(
     if query_scheduler and scheduler["squeue"]["error"] is not None:
         message = f"Could not query active core benchmark jobs: {scheduler['squeue']['error']}"
         raise RuntimeError(message)
+    latest_retry = _latest_benchmark_license_retry(
+        manifest,
+        suite,
+        directory,
+    )
     if scheduler["squeue"]["output"]:
         state = "running"
+    elif latest_retry is not None and not license_service.retry_attempt_is_eligible(latest_retry):
+        state = "waiting_retry"
     elif success_count == len(records):
         state = "complete"
-    elif failure_count:
+    elif retryable_failure_count:
         state = "retry_required"
+    elif exhausted_retries and pending_count == 0:
+        state = "retry_exhausted"
     elif query_scheduler and manifest["submission_history"] and _latest_submission_result_state(manifest, suite, directory) == "pending":
         state = (
             "retry_required"
@@ -2398,7 +2690,7 @@ def core_benchmark_status(
             "evidence_status": "failed",
         }
         for record in records
-        if record["status"] == "failed"
+        if record["status"] == "failed" and record not in exhausted_retries
     ]
     if state == "retry_required" and not retry_repetitions:
         latest = manifest["submission_history"][-1]
@@ -2425,7 +2717,7 @@ def core_benchmark_status(
         "scheduler": scheduler,
         "suggested_next_command": (
             f"finalize-core-benchmark {run_id}"
-            if state == "complete"
+            if state in {"complete", "retry_exhausted"}
             else f"resume-core-benchmark {run_id}"
             if state in {"retry_required", "incomplete"}
             else f"core-benchmark-status {run_id}"

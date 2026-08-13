@@ -111,6 +111,198 @@ def test_transient_initial_state_tolerance_is_independent_of_float32_storage(
     assert converted.dtype == np.float32
 
 
+def _bulk_moisture_arrays(
+    discrepancy: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return a three-time, four-node X_wb_bulk=0.1 consistency fixture."""
+    static = np.zeros(
+        (len(profile_contract.TRANSIENT_STATIC_FIELD_NAMES), 2, 2),
+        dtype=np.float64,
+    )
+    static[
+        profile_contract.TRANSIENT_STATIC_FIELD_NAMES.index(
+            "rho_bu_dry",
+        )
+    ] = 9.0
+    time_axis = np.asarray((0.0, 1.0, 2.0), dtype=np.float64)
+    states = np.zeros(
+        (
+            time_axis.size,
+            len(profile_contract.TRANSIENT_FIELD_NAMES),
+            2,
+            2,
+        ),
+        dtype=np.float64,
+    )
+    for name in ("w_surf", "w_int"):
+        states[
+            :,
+            profile_contract.TRANSIENT_FIELD_NAMES.index(name),
+        ] = 1.0
+    globals_ = np.zeros(
+        (
+            time_axis.size,
+            len(profile_contract.GLOBAL_FIELD_NAMES),
+        ),
+        dtype=np.float64,
+    )
+    globals_[
+        :,
+        profile_contract.GLOBAL_FIELD_NAMES.index("t"),
+    ] = time_axis
+    globals_[
+        :,
+        profile_contract.GLOBAL_FIELD_NAMES.index("X_wb_bulk"),
+    ] = 0.1 + discrepancy
+    return static, time_axis, states, globals_
+
+
+@pytest.mark.parametrize(
+    ("discrepancy", "expected"),
+    [
+        (0.0, True),
+        (1.8912875530963102e-7, True),
+        (5.0e-7, True),
+        (1.1e-5, False),
+        (1.0e-2, False),
+    ],
+)
+def test_transient_bulk_moisture_semantic_tolerance_is_strict(
+    generation_config_factory: Any,
+    discrepancy: float,
+    expected: bool,
+) -> None:
+    """Admit solver-scale disagreement and reject material mismatches."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    static, time_axis, states, globals_ = _bulk_moisture_arrays(
+        discrepancy,
+    )
+    result = generation.publication.storage.evaluate_transient_bulk_moisture_consistency(
+        config,
+        static,
+        time_axis,
+        states,
+        None,
+        globals_,
+        f_surf=0.4,
+        time_tolerance=1.0e-12,
+    )
+
+    assert generation.publication.storage.transient_bulk_moisture_tolerance(
+        config,
+    ) == (1.0e-5, 1.0e-9)
+    assert result.matches is expected
+    if discrepancy == 1.8912875530963102e-7:
+        assert np.max(
+            np.abs(result.exported - result.reconstructed),
+        ) == pytest.approx(discrepancy)
+
+
+def test_bulk_moisture_tolerance_is_independent_of_other_contracts(
+    generation_config_factory: Any,
+) -> None:
+    """Keep bulk, initial-state, and float32 tolerances independent."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    static, time_axis, states, globals_ = _bulk_moisture_arrays(
+        1.8912875530963102e-7,
+    )
+
+    def evaluate(candidate: Any) -> bool:
+        return generation.publication.storage.evaluate_transient_bulk_moisture_consistency(
+            candidate,
+            static,
+            time_axis,
+            states,
+            None,
+            globals_,
+            f_surf=0.4,
+            time_tolerance=1.0e-12,
+        ).matches
+
+    assert evaluate(config)
+    unrelated = copy.deepcopy(config.scientific_values)
+    unrelated["storage"]["float32_rtol"] = 0.0
+    unrelated["storage"]["float32_atol"] = 0.0
+    unrelated["validation"]["transient_initial_state"]["rtol"] = 1.0e-8
+    unrelated["validation"]["transient_initial_state"]["atol"] = 0.0
+    assert evaluate(replace(config, scientific_values=unrelated))
+
+    strict_bulk = copy.deepcopy(config.scientific_values)
+    strict_bulk["validation"]["transient_bulk_moisture"]["rtol"] = 1.0e-8
+    strict_bulk["validation"]["transient_bulk_moisture"]["atol"] = 0.0
+    assert not evaluate(replace(config, scientific_values=strict_bulk))
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_bulk_moisture_consistency_fails_closed_on_non_finite_globals(
+    generation_config_factory: Any,
+    invalid: float,
+) -> None:
+    """Reject NaN and Inf before semantic comparison."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    static, time_axis, states, globals_ = _bulk_moisture_arrays(0.0)
+    globals_[
+        1,
+        profile_contract.GLOBAL_FIELD_NAMES.index("X_wb_bulk"),
+    ] = invalid
+
+    with pytest.raises(ValueError, match="non-finite"):
+        (
+            generation.publication.storage.evaluate_transient_bulk_moisture_consistency(
+                config,
+                static,
+                time_axis,
+                states,
+                None,
+                globals_,
+                f_surf=0.4,
+                time_tolerance=1.0e-12,
+            )
+        )
+
+
+def test_bulk_moisture_consistency_preserves_strict_time_alignment(
+    generation_config_factory: Any,
+) -> None:
+    """Reject misaligned global time without weakening temporal admission."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    static, time_axis, states, globals_ = _bulk_moisture_arrays(0.0)
+    globals_[
+        1,
+        profile_contract.GLOBAL_FIELD_NAMES.index("t"),
+    ] = 1.1
+
+    with pytest.raises(ValueError, match="exactly one row"):
+        (
+            generation.publication.storage.evaluate_transient_bulk_moisture_consistency(
+                config,
+                static,
+                time_axis,
+                states,
+                None,
+                globals_,
+                f_surf=0.4,
+                time_tolerance=1.0e-12,
+            )
+        )
+
+
 def test_resolved_science_and_execution_are_persisted_separately(
     generation_config_factory: Any,
     tmp_path: Path,

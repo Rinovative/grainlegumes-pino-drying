@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import pytest
 
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff
@@ -301,3 +302,107 @@ def test_diagnostic_module_cannot_launch_solver_or_scheduler() -> None:
 
     assert "subprocess" not in imported_modules
     assert not any(name.endswith(("generation_runtime_batch", "generation_runtime_comsol")) for name in imported_from_modules)
+
+
+def test_bulk_moisture_diagnostic_uses_production_result_and_tolerance(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Persist compact metrics from the exact production comparison result."""
+    discrepancy = 1.8912875530963102e-7
+    time_axis = np.asarray((0.0, 1.0, 2.0), dtype=np.float64)
+    expected = np.asarray((0.12, 0.11, 0.10), dtype=np.float64)
+    exported = expected + np.asarray(
+        (2.0e-8, discrepancy, -4.0e-8),
+        dtype=np.float64,
+    )
+    consistency = storage.TransientBulkMoistureConsistency(
+        time=time_axis,
+        exported=exported,
+        reconstructed=expected,
+        rtol=1.0e-5,
+        atol=1.0e-9,
+        matches=True,
+    )
+    reconstructed = storage.ReconstructedTransientBulkMoisture(
+        consistency=consistency,
+        source_artifacts={
+            "stationary_fields": {
+                "relative_path": "exports/stationary_fields.csv",
+                "sha256": "a" * 64,
+                "size_bytes": 101,
+            },
+            "transient_states": {
+                "relative_path": "exports/transient_states.csv",
+                "sha256": "b" * 64,
+                "size_bytes": 202,
+            },
+            "global_time_series": {
+                "relative_path": "exports/global_timeseries.csv",
+                "sha256": "c" * 64,
+                "size_bytes": 303,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        diagnostics.storage,
+        "reconstruct_transient_bulk_moisture",
+        lambda *_args, **_kwargs: reconstructed,
+    )
+    config = cast(
+        "GenerationConfig",
+        cast(
+            "object",
+            type(
+                "SyntheticGenerationConfig",
+                (),
+                {
+                    "profile": type(
+                        "SyntheticProfile",
+                        (),
+                        {"id": profiles.TRANSIENT_DRYING_PROFILE},
+                    )(),
+                    "batch_id": "transient_drying__lentil__natural",
+                },
+            )(),
+        ),
+    )
+    result = diagnostics.write_bulk_moisture_consistency_diagnostic(
+        config,
+        {
+            "case_id": "case_0001",
+            "template": {"sha256": "d" * 64},
+        },
+        stationary_export=tmp_path / "stationary_fields.csv",
+        transient_export=tmp_path / "transient_states.csv",
+        global_export=tmp_path / "global_timeseries.csv",
+        work_directory=tmp_path,
+        output_directory=tmp_path / "diagnostics",
+        campaign_run_id="technical-smoke__0123456789abcdef",
+    )
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert result.json_path.name == ("bulk_moisture_consistency_diagnostic.json")
+    assert payload["schema_kind"] == (diagnostics.BULK_MOISTURE_DIAGNOSTIC_SCHEMA_KIND)
+    assert payload["schema_version"] == 1
+    assert payload["validator"] == {
+        "rtol": 1.0e-5,
+        "atol": 1.0e-9,
+        "allclose": True,
+    }
+    assert payload["time_axis"] == {
+        "number_of_time_points": 3,
+        "first_time": 0.0,
+        "final_time": 2.0,
+    }
+    assert payload["error"]["maximum_absolute_error"] == pytest.approx(
+        discrepancy,
+    )
+    assert payload["error"]["time_of_maximum_error"] == 1.0
+    assert payload["error"]["exported_X_wb_bulk_at_max_error"] == pytest.approx(exported[1])
+    assert payload["error"]["reconstructed_X_wb_bulk_at_max_error"] == pytest.approx(expected[1])
+    assert set(payload["error"]["absolute_error_quantiles"]) == {
+        "q50",
+        "q95",
+        "q99",
+    }

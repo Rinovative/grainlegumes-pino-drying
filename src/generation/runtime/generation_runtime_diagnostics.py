@@ -2,11 +2,11 @@
 ===============================================================================
 generation_runtime_diagnostics.py
 ===============================================================================
-Measure failed transient initial states from already-produced raw exports.
+Measure failed transient semantic gates from already-produced raw exports.
 Responsibilities:
   - Reuse production canonical reconstruction before failed HDF5 publication
-  - Quantify canonical, compartment-split, and conserved-total hypotheses
-  - Persist hash-bound JSON and full-grid CSV diagnostic evidence
+  - Quantify initial-state hypotheses and bulk-moisture mass consistency
+  - Persist hash-bound compact JSON and initial-state full-grid CSV evidence
 Design principles:
   - Diagnostics never execute solvers or scheduler commands
   - Configured transient initial-state tolerances define numerical interpretation
@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 DIAGNOSTIC_SCHEMA_KIND = "vp2_transient_initial_state_diagnostic"
 DIAGNOSTIC_SCHEMA_VERSION = 1
+BULK_MOISTURE_DIAGNOSTIC_SCHEMA_KIND = "vp2_transient_bulk_moisture_consistency_diagnostic"
+BULK_MOISTURE_DIAGNOSTIC_SCHEMA_VERSION = 1
 _NUMERICAL_FLOOR = np.finfo(np.float64).tiny
 _MINIMUM_TIMES_WITH_SECOND = 2
 _MATERIAL_HYPOTHESIS_IMPROVEMENT = 0.1
@@ -68,6 +70,14 @@ class InitialStateDiagnostic:
 
     json_path: Path
     csv_path: Path
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class BulkMoistureDiagnostic:
+    """Published compact bulk-moisture evidence for one failed case."""
+
+    json_path: Path
     payload: dict[str, Any]
 
 
@@ -321,3 +331,83 @@ def write_initial_state_diagnostic(
         _csv_text(reconstructed.x_axis, reconstructed.y_axis, rho, x0, expected, surface, interior, f_surf),
     )
     return InitialStateDiagnostic(json_path=json_path, csv_path=csv_path, payload=payload)
+
+
+def write_bulk_moisture_consistency_diagnostic(
+    config: GenerationConfig,
+    case_payload: Mapping[str, Any],
+    *,
+    stationary_export: Path,
+    transient_export: Path,
+    global_export: Path,
+    work_directory: Path,
+    output_directory: Path,
+    campaign_run_id: str,
+) -> BulkMoistureDiagnostic:
+    """Persist compact bulk-moisture metrics from canonical production arrays."""
+    reconstructed = storage.reconstruct_transient_bulk_moisture(
+        config,
+        case_payload,
+        stationary_export=stationary_export,
+        transient_export=transient_export,
+        global_export=global_export,
+        work_directory=work_directory,
+    )
+    consistency = reconstructed.consistency
+    error = consistency.exported - consistency.reconstructed
+    absolute = np.abs(error)
+    relative = absolute / np.maximum(
+        np.abs(consistency.reconstructed),
+        _NUMERICAL_FLOOR,
+    )
+    maximum_position = int(np.argmax(absolute))
+    payload: dict[str, Any] = {
+        "schema_kind": BULK_MOISTURE_DIAGNOSTIC_SCHEMA_KIND,
+        "schema_version": BULK_MOISTURE_DIAGNOSTIC_SCHEMA_VERSION,
+        "simulation_profile": config.profile.id,
+        "campaign_run_id": campaign_run_id,
+        "batch_id": config.batch_id,
+        "case_id": case_payload["case_id"],
+        "template_sha256": case_payload["template"]["sha256"],
+        "source_artifacts": reconstructed.source_artifacts,
+        "validator": {
+            "rtol": consistency.rtol,
+            "atol": consistency.atol,
+            "allclose": consistency.matches,
+        },
+        "time_axis": {
+            "number_of_time_points": int(consistency.time.size),
+            "first_time": float(consistency.time[0]),
+            "final_time": float(consistency.time[-1]),
+        },
+        "error": {
+            "maximum_absolute_error": float(absolute[maximum_position]),
+            "maximum_relative_error": float(np.max(relative)),
+            "mean_absolute_error": float(np.mean(absolute)),
+            "median_absolute_error": float(np.median(absolute)),
+            "time_of_maximum_error": float(consistency.time[maximum_position]),
+            "exported_X_wb_bulk_at_max_error": float(consistency.exported[maximum_position]),
+            "reconstructed_X_wb_bulk_at_max_error": float(consistency.reconstructed[maximum_position]),
+            "absolute_error_quantiles": {
+                name: float(value)
+                for name, value in zip(
+                    ("q50", "q95", "q99"),
+                    np.quantile(absolute, (0.50, 0.95, 0.99)),
+                    strict=True,
+                )
+            },
+            "relative_error_quantiles": {
+                name: float(value)
+                for name, value in zip(
+                    ("q50", "q95", "q99"),
+                    np.quantile(relative, (0.50, 0.95, 0.99)),
+                    strict=True,
+                )
+            },
+        },
+    }
+    json_path = common.serialization.atomic_write_json(
+        output_directory / "bulk_moisture_consistency_diagnostic.json",
+        payload,
+    )
+    return BulkMoistureDiagnostic(json_path=json_path, payload=payload)

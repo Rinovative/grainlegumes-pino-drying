@@ -55,6 +55,8 @@ CASE_ID_WIDTH = 4
 _MAXIMUM_GZIP_COMPRESSION_LEVEL = 9
 _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL = 1.0e-4
 _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL = 1.0e-10
+_MAXIMUM_TRANSIENT_BULK_MOISTURE_RTOL = 1.0e-5
+_MAXIMUM_TRANSIENT_BULK_MOISTURE_ATOL = 1.0e-9
 PILOT_CASE_KINDS = ("nominal_reference", "natural_pilot")
 _FINAL_PHYSICAL_FORMULAS = {
     "w_surf_balance": "f_surf*d(w_surf)/dt = j_int - m_evap",
@@ -804,35 +806,46 @@ def _validate_validation(value: Any) -> dict[str, Any]:
     validation = _mapping(value, label="common.validation")
     _exact_keys(
         validation,
-        required={"transient_initial_state"},
+        required={"transient_initial_state", "transient_bulk_moisture"},
         optional=set(),
         label="common.validation",
     )
-    initial_state = _mapping(
-        validation["transient_initial_state"],
-        label="common.validation.transient_initial_state",
-    )
-    _exact_keys(
-        initial_state,
-        required={"rtol", "atol"},
-        optional=set(),
-        label="common.validation.transient_initial_state",
-    )
-    initial_state["rtol"] = _finite(
-        initial_state["rtol"],
-        label="common.validation.transient_initial_state.rtol",
-    )
-    initial_state["atol"] = _finite(
-        initial_state["atol"],
-        label="common.validation.transient_initial_state.atol",
-    )
-    if not 0.0 < initial_state["rtol"] <= _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL:
-        message = f"common.validation.transient_initial_state.rtol must be positive and no greater than {_MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL}."
-        raise GenerationConfigError(message)
-    if not 0.0 <= initial_state["atol"] <= _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL:
-        message = f"common.validation.transient_initial_state.atol must be non-negative and no greater than {_MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL}."
-        raise GenerationConfigError(message)
-    return {"transient_initial_state": initial_state}
+    specifications = {
+        "transient_initial_state": (
+            _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL,
+            _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL,
+        ),
+        "transient_bulk_moisture": (
+            _MAXIMUM_TRANSIENT_BULK_MOISTURE_RTOL,
+            _MAXIMUM_TRANSIENT_BULK_MOISTURE_ATOL,
+        ),
+    }
+    result: dict[str, Any] = {}
+    for name, (maximum_rtol, maximum_atol) in specifications.items():
+        label = f"common.validation.{name}"
+        tolerance = _mapping(validation[name], label=label)
+        _exact_keys(
+            tolerance,
+            required={"rtol", "atol"},
+            optional=set(),
+            label=label,
+        )
+        tolerance["rtol"] = _finite(
+            tolerance["rtol"],
+            label=f"{label}.rtol",
+        )
+        tolerance["atol"] = _finite(
+            tolerance["atol"],
+            label=f"{label}.atol",
+        )
+        if not 0.0 < tolerance["rtol"] <= maximum_rtol:
+            message = f"{label}.rtol must be positive and no greater than {maximum_rtol}."
+            raise GenerationConfigError(message)
+        if not 0.0 <= tolerance["atol"] <= maximum_atol:
+            message = f"{label}.atol must be non-negative and no greater than {maximum_atol}."
+            raise GenerationConfigError(message)
+        result[name] = tolerance
+    return result
 
 
 def _validate_provenance_owners(
@@ -1704,7 +1717,12 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     runtime = _mapping(execution["runtime"], label="execution.runtime")
     _exact_keys(
         runtime,
-        required={"timeout_seconds", "maximum_failures", "extra_arguments"},
+        required={
+            "timeout_seconds",
+            "maximum_failures",
+            "extra_arguments",
+            "temporary_license_retry",
+        },
         optional=set(),
         label="execution.runtime",
     )
@@ -1717,6 +1735,43 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         label="execution.runtime.maximum_failures",
         minimum=1,
     )
+    retry = _mapping(
+        runtime["temporary_license_retry"],
+        label="execution.runtime.temporary_license_retry",
+    )
+    _exact_keys(
+        retry,
+        required={
+            "enabled",
+            "initial_delay_seconds",
+            "maximum_delay_seconds",
+            "maximum_wait_seconds",
+        },
+        optional=set(),
+        label="execution.runtime.temporary_license_retry",
+    )
+    if not isinstance(retry["enabled"], bool):
+        message = "execution.runtime.temporary_license_retry.enabled must be boolean."
+        raise TypeError(message)
+    for key in (
+        "initial_delay_seconds",
+        "maximum_delay_seconds",
+        "maximum_wait_seconds",
+    ):
+        retry[key] = _finite(
+            retry[key],
+            label=f"execution.runtime.temporary_license_retry.{key}",
+        )
+        if retry[key] <= 0.0:
+            message = f"execution.runtime.temporary_license_retry.{key} must be positive."
+            raise GenerationConfigError(message)
+    if retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]:
+        message = "execution.runtime.temporary_license_retry.maximum_delay_seconds must be at least initial_delay_seconds."
+        raise GenerationConfigError(message)
+    if retry["maximum_wait_seconds"] < retry["initial_delay_seconds"]:
+        message = "execution.runtime.temporary_license_retry.maximum_wait_seconds must be at least initial_delay_seconds."
+        raise GenerationConfigError(message)
+    runtime["temporary_license_retry"] = retry
 
     arguments = runtime["extra_arguments"]
     if not isinstance(arguments, list) or not all(

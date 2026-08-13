@@ -369,6 +369,14 @@ mode = os.environ.get("FAKE_COMSOL_MODE", "success")
 if mode == "failure":
     print("synthetic failure", file=sys.stderr)
     raise SystemExit(7)
+if mode == "license_capacity":
+    print("Could not obtain license for 'Brinkman Equations (br)'.")
+    print("Required product: CFD Module.")
+    print("License error: -4.", file=sys.stderr)
+    print("Licensed number of users already reached.", file=sys.stderr)
+    print("Feature: COMSOL", file=sys.stderr)
+    print("FlexNet Licensing error:-4,132", file=sys.stderr)
+    raise SystemExit(0)
 update_tracker(1)
 try:
     wait_for_expected_starts()

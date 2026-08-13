@@ -36,6 +36,7 @@ from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .runtime import generation_runtime_batch as batch_runtime
 from .runtime import generation_runtime_cluster as cluster_service
+from .runtime import generation_runtime_license as license_service
 from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
@@ -131,6 +132,7 @@ def _submission_config(campaign: config_service.CampaignConfig) -> dict[str, Any
         "max_running_cases": submission["max_running_cases"],
         "cores_per_case": int(cluster["cores_per_case"]),
         "maximum_failures": int(campaign.execution_values["runtime"]["maximum_failures"]),
+        "temporary_license_retry": dict(campaign.execution_values["runtime"]["temporary_license_retry"]),
         "partition": cluster["partition"],
         "wall_time": cluster["wall_time"],
         "scheduler_options": list(cluster["scheduler_options"]),
@@ -486,7 +488,12 @@ def _task_state(
     """Reconcile one case from immutable evidence and its exact submitted jobs."""
     batch = campaign.batch(task.batch_name)
     submissions = _task_submissions(manifest, task)
-    if batch_runtime.completed_case_is_valid(batch, task.case_index, storage_root=storage_root):
+    retry_attempt: Mapping[str, Any] | None = None
+    if batch_runtime.completed_case_is_valid(
+        batch,
+        task.case_index,
+        storage_root=storage_root,
+    ):
         state = "successful"
         reason = "validated_case_evidence"
     else:
@@ -496,6 +503,7 @@ def _task_state(
             for record in submissions
             if record["status"] == "submitted" and record["job_id"] not in scheduler["active"] and record["job_id"] not in scheduler["accounted"]
         ]
+        latest_submission = submissions[-1] if submissions else None
         latest_accounted = next(
             (scheduler["accounted"][record["job_id"]] for record in reversed(submissions) if record["job_id"] in scheduler["accounted"]),
             None,
@@ -506,30 +514,53 @@ def _task_state(
         elif unknown_records:
             state = "scheduler_unknown"
             reason = str(unknown_records[-1]["job_id"])
-        elif batch_runtime.case_failure_is_recorded(
-            batch,
-            task.case_index,
-            storage_root=storage_root,
-            execution_run_id=str(manifest["campaign_run_id"]),
-            git_commit=str(manifest["git_commit"]),
-        ):
-            state = "failed"
-            reason = "case_failure_evidence"
-        elif latest_accounted is not None:
-            terminal_state = _scheduler_state(latest_accounted[1])
-            state = "failed"
-            reason = f"scheduler_{terminal_state.lower()}" if terminal_state in _TERMINAL_FAILURE_STATES else "completed_without_valid_case_evidence"
-        elif submissions:
-            state = "submission_failed"
-            reason = str(submissions[-1]["error"])
         else:
-            state = "unsent"
-            reason = "not_submitted"
+            if latest_submission is not None:
+                retry_attempt = license_service.latest_attempt_for_job(
+                    batch,
+                    task.case_index,
+                    campaign_run_id=str(manifest["campaign_run_id"]),
+                    job_id=str(latest_submission["job_id"]),
+                    storage_root=storage_root,
+                )
+            failure_recorded = batch_runtime.case_failure_is_recorded(
+                batch,
+                task.case_index,
+                storage_root=storage_root,
+                execution_run_id=str(manifest["campaign_run_id"]),
+                git_commit=str(manifest["git_commit"]),
+            )
+            if failure_recorded:
+                state = "failed"
+                reason = "case_failure_evidence"
+            elif retry_attempt is not None:
+                if not retry_attempt["retry_budget_remaining"]:
+                    state = "failed"
+                    reason = license_service.EXHAUSTED_REASON
+                elif license_service.retry_attempt_is_eligible(retry_attempt):
+                    state = "retry_eligible"
+                    reason = license_service.TEMPORARY_LICENSE_CAPACITY
+                else:
+                    state = "retry_waiting"
+                    reason = license_service.TEMPORARY_LICENSE_CAPACITY
+            elif latest_accounted is not None:
+                terminal_state = _scheduler_state(latest_accounted[1])
+                state = "failed"
+                reason = (
+                    f"scheduler_{terminal_state.lower()}" if terminal_state in _TERMINAL_FAILURE_STATES else "completed_without_valid_case_evidence"
+                )
+            elif submissions:
+                state = "submission_failed"
+                reason = str(submissions[-1]["error"])
+            else:
+                state = "unsent"
+                reason = "not_submitted"
     return {
         **_task_payload(task),
         "state": state,
         "reason": reason,
         "submission_count": len(submissions),
+        "temporary_license_retry": retry_attempt,
     }
 
 
@@ -578,7 +609,7 @@ def _submit_one(
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
     """Persist one intent, submit one case, and atomically persist its job ID."""
-    if mode not in {"initial", "resume"}:
+    if mode not in {"initial", "resume", "license_retry"}:
         message = f"Unsupported campaign submission mode: {mode!r}."
         raise ValueError(message)
     index = len(manifest["submissions"]) + 1
@@ -702,10 +733,28 @@ def feed_campaign(
                 manifest,
             )
             return manifest
-        eligible_states = {"failed", "submission_failed"} if retry_failed else {"unsent"}
-        next_view = next((view for view in task_views if view["state"] in eligible_states), None)
+        if retry_failed:
+            next_view = next(
+                (
+                    view
+                    for view in task_views
+                    if view["state"] in {"failed", "submission_failed"} and view["reason"] != license_service.EXHAUSTED_REASON
+                ),
+                None,
+            )
+        else:
+            next_view = next(
+                (view for view in task_views if view["state"] in {"unsent", "retry_eligible"}),
+                None,
+            )
         if next_view is None:
-            manifest["state"] = "active" if scheduler["active"] else "failure_threshold_reached"
+            manifest["state"] = (
+                "active"
+                if scheduler["active"]
+                else "waiting_retry"
+                if any(view["state"] == "retry_waiting" for view in task_views)
+                else "failure_threshold_reached"
+            )
             common.serialization.atomic_write_json(
                 campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage_root),
                 manifest,
@@ -716,7 +765,7 @@ def feed_campaign(
             manifest,
             campaign,
             task,
-            mode="resume" if retry_failed else "initial",
+            mode=("resume" if retry_failed else "license_retry" if next_view["state"] == "retry_eligible" else "initial"),
             storage_root=storage_root,
         )
 
@@ -889,6 +938,8 @@ def _batch_status(
         "completed": sum(view["state"] == "successful" for view in selected),
         "active": sum(view["state"] == "active" for view in selected),
         "failed": sum(view["state"] in {"failed", "submission_failed"} for view in selected),
+        "retry_waiting": sum(view["state"] == "retry_waiting" for view in selected),
+        "retry_eligible": sum(view["state"] == "retry_eligible" for view in selected),
         "quarantined": len(tuple(quarantine.iterdir())) if quarantine.is_dir() else 0,
         "pending": sum(view["state"] in {"unsent", "scheduler_unknown"} for view in selected),
         "terminal_manifest": str(terminal_path),
@@ -928,6 +979,8 @@ def campaign_status(
     failed_cases = sum(view["state"] in {"failed", "submission_failed"} for view in task_views)
     unsent_cases = sum(view["state"] == "unsent" for view in task_views)
     unknown_cases = sum(view["state"] == "scheduler_unknown" for view in task_views)
+    retry_waiting_cases = sum(view["state"] == "retry_waiting" for view in task_views)
+    retry_eligible_cases = sum(view["state"] == "retry_eligible" for view in task_views)
     planned_cases = len(task_views)
     cancellation_receipt = (campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / "cancellations.json").is_file()
     transfer_receipt = (campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / "transfer_complete.json").is_file()
@@ -955,7 +1008,10 @@ def campaign_status(
     elif pending_jobs:
         state = "submitted"
         next_command = f"feed-campaign {run_id}"
-    elif unsent_cases:
+    elif retry_waiting_cases:
+        state = "waiting_retry"
+        next_command = f"feed-campaign {run_id}"
+    elif retry_eligible_cases or unsent_cases:
         state = "feeding"
         next_command = f"feed-campaign {run_id}"
     elif failed_cases:
@@ -978,6 +1034,8 @@ def campaign_status(
         "running_jobs": running_jobs,
         "unsent_cases": unsent_cases,
         "unknown_cases": unknown_cases,
+        "retry_waiting_cases": retry_waiting_cases,
+        "retry_eligible_cases": retry_eligible_cases,
         "squeue": manifest_scheduler_view(scheduler["squeue"]),
         "sacct": manifest_scheduler_view(scheduler["sacct"]),
         "batches": batches,

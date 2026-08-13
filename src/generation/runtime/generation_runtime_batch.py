@@ -50,6 +50,7 @@ from src.generation.publication import generation_publication_storage as storage
 
 from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_diagnostics as diagnostics_service
+from . import generation_runtime_license as license_service
 from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
@@ -1152,6 +1153,16 @@ def execute_prepared_case(
             exit_code=exit_code,
             timed_out=True,
         )
+    license_evidence = license_service.classify_temporary_license_capacity(solver_log.read_text(encoding="utf-8", errors="replace"))
+    if license_evidence is not None:
+        message = f"COMSOL could not obtain temporary floating-license capacity for {license_evidence.feature!r}."
+        raise license_service.TemporaryLicenseCapacityError(
+            message,
+            work_directory=prepared.work_directory,
+            command=tuple(command),
+            exit_code=exit_code,
+            evidence=license_evidence,
+        )
     if exit_code != 0:
         msg = f"COMSOL case exited with status {exit_code}."
         raise CaseExecutionError(
@@ -1826,6 +1837,129 @@ def _initial_state_failure_diagnostic(
     }
 
 
+def _bulk_diagnostic_artifact_relative_path(
+    result: diagnostics_service.BulkMoistureDiagnostic,
+    *,
+    staging: Path,
+) -> str:
+    """Return the exact compact diagnostic path or reject misplaced output."""
+    relative = result.json_path.relative_to(staging).as_posix()
+    if relative != "diagnostics/bulk_moisture_consistency_diagnostic.json":
+        message = "Bulk-moisture diagnostic published outside its owned artifact path."
+        raise ValueError(message)
+    return relative
+
+
+def _bulk_moisture_failure_diagnostic(
+    config: config_contract.GenerationConfig,
+    *,
+    work_directory: Path | None,
+    configured_exports: Mapping[str, tuple[Path, ...]],
+    staging: Path | None,
+    enabled: bool,
+) -> dict[str, dict[str, Any]]:
+    """Run compact bulk-moisture diagnostics only for failed Technical Smoke."""
+    if (
+        not enabled
+        or config.scientific_values.get("campaign_purpose") != "technical_runtime_smoke"
+        or config.profile.id != profiles.TRANSIENT_DRYING_PROFILE
+    ):
+        return {}
+    unavailable = {
+        "status": "inputs_unavailable",
+        "error": None,
+        "json_relative_path": None,
+    }
+    if work_directory is None or staging is None:
+        return {"transient_bulk_moisture": unavailable}
+    stationary = configured_exports.get(
+        profiles.STEADY_FLOW_EXPORT_ROLE,
+        (),
+    )
+    transient = configured_exports.get(
+        profiles.TRANSIENT_RAW_EXPORT_ROLE,
+        (),
+    )
+    global_series = configured_exports.get(
+        profiles.GLOBAL_EXPORT_ROLE,
+        (),
+    )
+    if len(stationary) != 1 or len(transient) != 1 or len(global_series) != 1:
+        return {"transient_bulk_moisture": unavailable}
+    case_payload = _optional_json_object(work_directory / "case.json")
+    if case_payload is None:
+        return {
+            "transient_bulk_moisture": {
+                "status": "failed",
+                "error": "case.json is unavailable or malformed.",
+                "json_relative_path": None,
+            }
+        }
+    diagnostic_root = staging / "diagnostics"
+    expected_path = diagnostic_root / "bulk_moisture_consistency_diagnostic.json"
+    try:
+        result = diagnostics_service.write_bulk_moisture_consistency_diagnostic(
+            config,
+            case_payload,
+            stationary_export=stationary[0],
+            transient_export=transient[0],
+            global_export=global_series[0],
+            work_directory=work_directory,
+            output_directory=diagnostic_root,
+            campaign_run_id=workspace_service.workspace_run_id(
+                config,
+            ),
+        )
+        json_relative = _bulk_diagnostic_artifact_relative_path(
+            result,
+            staging=staging,
+        )
+    except Exception as error:  # noqa: BLE001 -- diagnostics remain secondary to the original failure
+        with suppress(OSError):
+            expected_path.unlink(missing_ok=True)
+        return {
+            "transient_bulk_moisture": {
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "json_relative_path": None,
+            }
+        }
+    return {
+        "transient_bulk_moisture": {
+            "status": "complete",
+            "error": None,
+            "json_relative_path": json_relative,
+        }
+    }
+
+
+def _technical_smoke_failure_diagnostics(
+    config: config_contract.GenerationConfig,
+    *,
+    work_directory: Path | None,
+    configured_exports: Mapping[str, tuple[Path, ...]],
+    staging: Path | None,
+    enabled: bool,
+) -> dict[str, dict[str, Any]]:
+    """Return the closed set of transient Technical-Smoke diagnostics."""
+    return {
+        **_initial_state_failure_diagnostic(
+            config,
+            work_directory=work_directory,
+            configured_exports=configured_exports,
+            staging=staging,
+            enabled=enabled,
+        ),
+        **_bulk_moisture_failure_diagnostic(
+            config,
+            work_directory=work_directory,
+            configured_exports=configured_exports,
+            staging=staging,
+            enabled=enabled,
+        ),
+    }
+
+
 def _failure_artifact_records(root: Path) -> dict[str, dict[str, Any]]:
     """Return exact file identities beneath one safe retained-artifact root."""
     if not root.is_dir() or root.is_symlink():
@@ -1889,7 +2023,7 @@ def _retain_failure_artifacts(
         and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
     )
     if work_directory is None:
-        unavailable_diagnostics = _initial_state_failure_diagnostic(
+        unavailable_diagnostics = _technical_smoke_failure_diagnostics(
             config,
             work_directory=None,
             configured_exports={},
@@ -1951,7 +2085,7 @@ def _retain_failure_artifacts(
                     solved_model,
                     staging / comsol_service.RETAINED_MODEL_FILENAME,
                 )
-        diagnostics = _initial_state_failure_diagnostic(
+        diagnostics = _technical_smoke_failure_diagnostics(
             config,
             work_directory=work_directory,
             configured_exports=configured_exports,
@@ -2111,6 +2245,19 @@ def _report_technical_smoke_failure_artifacts(
             / relative,
             file=sys.stderr,
         )
+    bulk = diagnostics.get("transient_bulk_moisture") if isinstance(diagnostics, dict) else None
+    if isinstance(bulk, dict) and bulk.get("status") == "complete":
+        relative = bulk["json_relative_path"]
+        print(
+            "Bulk-moisture diagnostic:",
+            case_failure_artifacts_directory(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            / relative,
+            file=sys.stderr,
+        )
 
 
 def _complete_failure_cleanup(
@@ -2187,6 +2334,7 @@ def _forbidden_failure_artifact_paths(
             {
                 "diagnostics/initial_state_diagnostic.json",
                 "diagnostics/initial_state_diagnostic.csv",
+                "diagnostics/bulk_moisture_consistency_diagnostic.json",
             }
         )
     forbidden_paths: set[str] = set()
@@ -2291,7 +2439,20 @@ def _validate_failure_diagnostics(
     if not isinstance(diagnostics, dict) or not isinstance(retained, dict):
         message = f"Case failure diagnostic evidence is invalid: {failure_path}"
         raise TypeError(message)
-    if set(diagnostics).difference({"transient_initial_state"}):
+    specifications = {
+        "transient_initial_state": {
+            "paths": {
+                "json_relative_path": ("diagnostics/initial_state_diagnostic.json"),
+                "csv_relative_path": ("diagnostics/initial_state_diagnostic.csv"),
+            },
+        },
+        "transient_bulk_moisture": {
+            "paths": {
+                "json_relative_path": ("diagnostics/bulk_moisture_consistency_diagnostic.json"),
+            },
+        },
+    }
+    if set(diagnostics).difference(specifications):
         message = f"Case failure diagnostic evidence has unknown members: {failure_path}"
         raise ValueError(message)
     applicable = (
@@ -2299,59 +2460,52 @@ def _validate_failure_diagnostics(
         and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
         and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
     )
-    if (not applicable and diagnostics) or (applicable and not retention_failed and set(diagnostics) != {"transient_initial_state"}):
+    if not applicable and diagnostics:
         message = f"Case failure diagnostic evidence violates execution policy: {failure_path}"
         raise ValueError(message)
-    record = diagnostics.get("transient_initial_state")
-    if record is None:
-        if any(str(relative).startswith("diagnostics/") for relative in retained) and (not retention_failed or not applicable):
-            message = f"Undeclared case failure diagnostic artifacts exist: {failure_path}"
+    if retention_failed:
+        if diagnostics:
+            message = f"Failed retention cannot claim current diagnostic evidence: {failure_path}"
             raise ValueError(message)
         return
-    expected_keys = {
-        "status",
-        "error",
-        "json_relative_path",
-        "csv_relative_path",
-    }
-    if not isinstance(record, dict) or set(record) != expected_keys:
-        message = f"Transient initial-state diagnostic evidence is invalid: {failure_path}"
+    if applicable and set(diagnostics) != set(specifications):
+        message = f"Case failure diagnostic evidence violates execution policy: {failure_path}"
         raise ValueError(message)
-    status = record.get("status")
-    error = record.get("error")
-    json_relative = record.get("json_relative_path")
-    csv_relative = record.get("csv_relative_path")
-    if status == "complete":
-        if (
-            error is not None
-            or json_relative != "diagnostics/initial_state_diagnostic.json"
-            or csv_relative != "diagnostics/initial_state_diagnostic.csv"
-            or json_relative not in retained
-            or csv_relative not in retained
-        ):
-            message = f"Completed transient diagnostic evidence is invalid: {failure_path}"
+    declared_paths: set[str] = set()
+    for name, specification in specifications.items():
+        record = diagnostics.get(name)
+        if record is None:
+            continue
+        paths = specification["paths"]
+        expected_keys = {"status", "error", *paths}
+        if not isinstance(record, dict) or set(record) != expected_keys:
+            message = f"{name} diagnostic evidence is invalid: {failure_path}"
             raise ValueError(message)
-    elif status == "failed":
-        if (
-            not isinstance(error, str)
-            or not error
-            or json_relative is not None
-            or csv_relative is not None
-            or any(str(relative).startswith("diagnostics/") for relative in retained)
-        ):
-            message = f"Failed transient diagnostic evidence is invalid: {failure_path}"
+        status = record.get("status")
+        error = record.get("error")
+        if status == "complete":
+            if error is not None:
+                message = f"Completed {name} diagnostic evidence is invalid: {failure_path}"
+                raise ValueError(message)
+            for key, expected_path in paths.items():
+                if record.get(key) != expected_path or expected_path not in retained:
+                    message = f"Completed {name} diagnostic evidence is invalid: {failure_path}"
+                    raise ValueError(message)
+                declared_paths.add(expected_path)
+        elif status == "failed":
+            if not isinstance(error, str) or not error or any(record.get(key) is not None for key in paths):
+                message = f"Failed {name} diagnostic evidence is invalid: {failure_path}"
+                raise ValueError(message)
+        elif status == "inputs_unavailable":
+            if error is not None or any(record.get(key) is not None for key in paths):
+                message = f"Unavailable {name} diagnostic evidence is invalid: {failure_path}"
+                raise ValueError(message)
+        else:
+            message = f"{name} diagnostic status is invalid: {failure_path}"
             raise ValueError(message)
-    elif status == "inputs_unavailable":
-        if (
-            error is not None
-            or json_relative is not None
-            or csv_relative is not None
-            or any(str(relative).startswith("diagnostics/") for relative in retained)
-        ):
-            message = f"Unavailable transient diagnostic evidence is invalid: {failure_path}"
-            raise ValueError(message)
-    else:
-        message = f"Transient diagnostic status is invalid: {failure_path}"
+    retained_paths = {str(relative) for relative in retained if str(relative).startswith("diagnostics/")}
+    if retained_paths != declared_paths:
+        message = f"Case failure diagnostic artifact membership is inconsistent: {failure_path}"
         raise ValueError(message)
 
 
@@ -2470,8 +2624,9 @@ def _case_failure_evidence_state(
         raise ValueError(message)
     retained = payload.get("retained_artifacts")
     diagnostics = payload.get("failure_diagnostics")
-    initial_diagnostic = diagnostics.get("transient_initial_state") if isinstance(diagnostics, dict) else None
-    diagnostic_complete = isinstance(initial_diagnostic, dict) and initial_diagnostic.get("status") == "complete"
+    diagnostic_complete = isinstance(diagnostics, dict) and any(
+        isinstance(record, dict) and record.get("status") == "complete" for record in diagnostics.values()
+    )
     diagnostics_allowed = (
         payload.get("state") == "failed"
         and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
@@ -3174,6 +3329,16 @@ def run_case(
             except Exception:  # noqa: BLE001 -- corruption remains failed, but scratch still closes
                 publication_complete = False
             failure_path: Path | None = None
+            retry_path: Path | None = None
+            temporary_license_error = (
+                error
+                if isinstance(
+                    error,
+                    license_service.TemporaryLicenseCapacityError,
+                )
+                else None
+            )
+            retry_enabled = scheduler_kind == "slurm" and bool(config.execution_values["runtime"]["temporary_license_retry"]["enabled"])
             if publication_complete:
                 _record_case_cleanup_failure(
                     config,
@@ -3182,6 +3347,27 @@ def run_case(
                     work_directory=attempt_directory,
                     storage_root=storage,
                 )
+            elif temporary_license_error is not None and retry_enabled:
+                try:
+                    retry_path = license_service.record_temporary_license_capacity_attempt(
+                        config,
+                        case_index,
+                        temporary_license_error,
+                        storage_root=storage,
+                    )
+                except Exception as retry_error:  # noqa: BLE001 -- failed provenance is terminal
+                    failure_path = record_case_failure(
+                        config,
+                        case_index,
+                        retry_error,
+                        worker_slot=worker_slot,
+                        scheduler_kind=scheduler_kind,
+                        allocated_node=allocated_node,
+                        work_directory=attempt_directory,
+                        storage_root=storage,
+                        scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
+                        failure_stage="solver",
+                    )
             else:
                 failure_path = record_case_failure(
                     config,
@@ -3212,6 +3398,19 @@ def run_case(
                         storage_root=storage,
                     )
                 except BaseException as cleanup_error:  # noqa: BLE001 -- cleanup evidence must survive interruption
+                    if failure_path is None and retry_path is not None:
+                        failure_path = record_case_failure(
+                            config,
+                            case_index,
+                            cleanup_error,
+                            worker_slot=worker_slot,
+                            scheduler_kind=scheduler_kind,
+                            allocated_node=allocated_node,
+                            work_directory=attempt_directory,
+                            storage_root=storage,
+                            scratch_cleanup_status="pending",
+                            failure_stage="solver",
+                        )
                     if failure_path is not None:
                         _complete_failure_cleanup(
                             failure_path,
@@ -3236,6 +3435,11 @@ def run_case(
                         reclaimed_bytes=reclaimed,
                         error=None,
                     )
+            if retry_path is not None:
+                print(
+                    f"Temporary COMSOL license capacity recorded; Slurm allocation will be released: {retry_path}",
+                    flush=True,
+                )
             raise
         clear_case_failure(config, case_index, storage_root=storage)
         try:

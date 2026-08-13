@@ -219,19 +219,21 @@ A failed Technical-Smoke case durably stages the configured raw inputs, native
 exports, and solved model according to the resolved execution-retention policy
 before node-local scratch is cleaned. When a failed transient case already has
 valid stationary and transient exports, Generation also writes quantitative
-initial-state JSON and full-grid CSV diagnostics from those exact outputs; it
-never starts a second COMSOL solve. Successful smoke cases do not perform this
-extra pass. Pilot and Production do not run the transient quantitative
-diagnostic, and Production failure evidence remains compact when raw and solved
-retention are disabled.
+initial-state JSON and full-grid CSV diagnostics from those exact outputs. When
+stationary, transient, and global exports are available, it additionally writes
+a compact `bulk_moisture_consistency_diagnostic.json` using the production
+reconstruction arrays and tolerance; neither diagnostic starts a second COMSOL
+solve. Successful smoke cases do not perform this extra pass. Pilot and
+Production do not run the transient quantitative diagnostics, and Production
+failure evidence remains compact when raw and solved retention are disabled.
 
-Transient `t=0` moisture admission uses the dedicated semantic tolerance in
-`common.validation.transient_initial_state` (`rtol=1e-4`, `atol=1e-10`). This
-allows the very small numerical movement introduced by a completed COMSOL solve
-while continuing to reject materially different physical initial states. It is
-independent of the stricter float32 storage/conversion tolerance. Technical-Smoke
-initial-state diagnostics report the exact semantic tolerance used by production
-admission.
+Transient admission has three independent numerical contracts. Float32 storage
+fidelity remains `rtol=1e-6`, `atol=1e-12`. The `t=0` moisture-state identity
+uses `common.validation.transient_initial_state` (`rtol=1e-4`, `atol=1e-10`).
+The exported `X_wb_bulk` identity against weighted integrated dry and water mass
+uses `common.validation.transient_bulk_moisture` (`rtol=1e-5`, `atol=1e-9`).
+Changing one tolerance does not alter either of the others. Technical-Smoke
+diagnostics report the exact semantic tolerance used by production admission.
 
 5. Inspect the immutable real-smoke receipt printed by the smoke command:
 
@@ -696,6 +698,11 @@ current relevant structure is:
 runtime:
   timeout_seconds: 3600
   maximum_failures: 1
+  temporary_license_retry:
+    enabled: true
+    initial_delay_seconds: 60
+    maximum_delay_seconds: 300
+    maximum_wait_seconds: 3600
 submission:
   pending_buffer: 1
   poll_interval_seconds: 15
@@ -712,8 +719,10 @@ Slurm; changing it from 1 to 2 is a configuration-only operational decision.
 poll_interval_seconds owns the foreground reconciliation cadence.
 max_running_cases is an optional safety cap, where null means that the workflow
 imposes no running target or cap. timeout_seconds and maximum_failures retain
-their existing runtime and stop-policy meanings. These settings affect
-execution provenance, not scientific case_input_id or Dataset identity.
+their existing runtime and stop-policy meanings. A strongly classified temporary
+COMSOL floating-license capacity event uses bounded 60, 120, 240, 300, ...
+second backoff up to 3600 seconds. These settings affect execution provenance,
+not scientific case_input_id or Dataset identity.
 
 Fixed campaign-node packing and array-concurrency controls have no production
 owner. Each scientific case is one
@@ -731,14 +740,15 @@ query squeue and sacct for persisted job IDs only
 for every declared case:
     trust validated immutable case evidence as success
     otherwise classify exact submitted attempts as active, pending,
-    terminal failure, accounting-unknown, or absent
+    temporary-license retry-waiting/eligible, terminal failure,
+    accounting-unknown, or absent
 count pending and running jobs for this campaign only
 stop on unknown accounting or the configured failure threshold
 if optional running cap is set and reached:
     submit nothing
 elif pending count is at least pending_buffer:
     submit nothing
-elif an eligible unsent case remains:
+elif an eligible unsent or temporary-license retry case remains:
     atomically persist its exact case/job submission intent
     submit exactly that one ordinary job
     atomically persist the returned job ID
@@ -750,6 +760,15 @@ running, then restores one waiting job. Once one campaign job remains pending,
 all remaining cases stay unsubmitted. When the pending slot clears, the next
 poll submits exactly one new case. Healthy running or pending jobs are neither
 cancelled nor suspended to make room.
+
+A COMSOL return code is not sufficient license evidence: COMSOL can report a
+floating-license capacity error while returning zero. The worker therefore
+classifies captured stdout/stderr in `solver.log`, persists compact operational
+attempt evidence, cleans scratch, and exits its Slurm job. Backoff occurs in the
+controller with no compute allocation held. While retry budget remains, the
+same deterministic case is resubmitted without consuming `maximum_failures`;
+exhaustion becomes a terminal infrastructure failure. The same policy applies
+to maintained Technical-Smoke, Pilot, Production, and core-benchmark execution.
 
 Resume uses the same manifest, lock, exact persisted job IDs, squeue, sacct,
 case-failure evidence, and validated HDF5 publication. It never reruns a valid

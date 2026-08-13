@@ -125,6 +125,7 @@ def test_technical_smoke_conversion_failure_retains_and_diagnoses_before_cleanup
         "solved.mph",
         "diagnostics/initial_state_diagnostic.json",
         "diagnostics/initial_state_diagnostic.csv",
+        "diagnostics/bulk_moisture_consistency_diagnostic.json",
         *_configured_export_relatives(config),
     }
     assert expected.issubset(receipt["retained_artifacts"])
@@ -132,12 +133,20 @@ def test_technical_smoke_conversion_failure_retains_and_diagnoses_before_cleanup
     assert receipt["failure_stage"] == "conversion"
     assert receipt["error"]["message"] == "synthetic post-export conversion failure"
     assert receipt["failure_diagnostics"]["transient_initial_state"]["status"] == "complete"
+    assert receipt["failure_diagnostics"]["transient_bulk_moisture"]["status"] == "complete"
     assert receipt["scratch_cleanup"]["status"] == "complete"
     diagnostic = json.loads((retained / "diagnostics/initial_state_diagnostic.json").read_text(encoding="utf-8"))
     tolerance = config.scientific_values["validation"]["transient_initial_state"]
     assert diagnostic["validator"]["rtol"] == tolerance["rtol"]
     assert diagnostic["validator"]["atol"] == tolerance["atol"]
     assert diagnostic["diagnostic_classification"] == "approximately_canonical"
+    bulk_diagnostic = json.loads((retained / "diagnostics/bulk_moisture_consistency_diagnostic.json").read_text(encoding="utf-8"))
+    bulk_tolerance = config.scientific_values["validation"]["transient_bulk_moisture"]
+    assert bulk_diagnostic["validator"] == {
+        "rtol": bulk_tolerance["rtol"],
+        "atol": bulk_tolerance["atol"],
+        "allclose": True,
+    }
     assert generation.runtime.case_failure_is_recorded(
         config,
         1,
@@ -174,6 +183,7 @@ def test_technical_smoke_failure_before_exports_records_no_fabricated_diagnostic
     )
     assert receipt["error"]["message"] == "COMSOL case exited with status 7."
     assert receipt["failure_diagnostics"]["transient_initial_state"]["status"] == "inputs_unavailable"
+    assert receipt["failure_diagnostics"]["transient_bulk_moisture"]["status"] == "inputs_unavailable"
     assert not any(relative.startswith("diagnostics/") for relative in receipt["retained_artifacts"])
     assert not raised.value.work_directory.exists()
 
@@ -307,6 +317,7 @@ def test_diagnostic_failure_cannot_mask_original_case_failure(
         "json_relative_path": None,
         "csv_relative_path": None,
     }
+    assert receipt["failure_diagnostics"]["transient_bulk_moisture"]["status"] == "complete"
 
 
 def test_retention_failure_is_secondary_and_scratch_still_cleans(
@@ -425,10 +436,26 @@ def _record_mock_diagnostic_failure(
         )
         return SimpleNamespace(json_path=json_path, csv_path=csv_path)
 
+    def write_bulk_diagnostic(
+        *_args: Any,
+        output_directory: Path,
+        **_kwargs: Any,
+    ) -> Any:
+        json_path = common.serialization.atomic_write_json(
+            output_directory / "bulk_moisture_consistency_diagnostic.json",
+            {"diagnostic": True},
+        )
+        return SimpleNamespace(json_path=json_path)
+
     monkeypatch.setattr(
         diagnostics_service,
         "write_initial_state_diagnostic",
         write_diagnostic,
+    )
+    monkeypatch.setattr(
+        diagnostics_service,
+        "write_bulk_moisture_consistency_diagnostic",
+        write_bulk_diagnostic,
     )
     return generation.runtime.record_case_failure(
         config,
@@ -701,6 +728,7 @@ def test_forged_retention_error_cannot_admit_production_diagnostics(
         "exports/airflow.csv",
         "diagnostics/initial_state_diagnostic.json",
         "diagnostics/initial_state_diagnostic.csv",
+        "diagnostics/bulk_moisture_consistency_diagnostic.json",
     ],
 )
 def test_retained_failure_mutation_fails_hash_validation(
