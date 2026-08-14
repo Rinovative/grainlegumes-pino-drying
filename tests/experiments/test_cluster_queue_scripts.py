@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 from support import configs
 
+pytestmark = pytest.mark.integration
+
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _DIRECT_CONFIG_RELATIVE = "configs/learning/steady_flow/experiments/synthetic/direct.yaml"
 _DIRECT_REPOSITORY_RELATIVE = _DIRECT_CONFIG_RELATIVE
@@ -79,6 +81,7 @@ def _harness(
     exported_key: str | None = "mock API key with spaces",
     file_key: str | None = None,
     gpu_report: str | None = None,
+    preflight_summary: str | None = None,
 ) -> _Harness:
     """
     Create safe command stubs around copied launcher scripts and minimal configs.
@@ -233,6 +236,10 @@ case "${1-}" in
         printf '%s' "${PREFLIGHT_CONTAINER_STDERR-}" >&2
         exit "${PREFLIGHT_CONTAINER_EXIT_CODE}"
       fi
+      if [[ -n "${PREFLIGHT_STUB_SUMMARY-}" ]]; then
+        printf '%s\n' "${PREFLIGHT_STUB_SUMMARY}"
+        exit 0
+      fi
       workflow="${arguments[bootstrap_index + 1]}"
       config="${arguments[bootstrap_index + 2]}"
       case "${config}" in
@@ -347,6 +354,8 @@ esac
         environment.pop("WANDB_API_KEY", None)
     else:
         environment["WANDB_API_KEY"] = exported_key
+    if preflight_summary is not None:
+        environment["PREFLIGHT_STUB_SUMMARY"] = preflight_summary
     return _Harness(
         repository=repository,
         environment=environment,
@@ -605,7 +614,10 @@ def test_optuna_submission_uses_explicit_gpu_and_forwards_arguments(
     tmp_path: Path,
 ) -> None:
     """Forward a valid Optuna request to the explicitly selected device."""
-    harness = _harness(tmp_path)
+    harness = _harness(
+        tmp_path,
+        preflight_summary=f"optuna\tsteady_flow\t{_OPTUNA_CONFIG_RELATIVE}",
+    )
     arguments = [
         _OPTUNA_CONFIG_RELATIVE,
         "--n-trials",
@@ -694,7 +706,10 @@ def test_wrong_config_family_fails_before_gpu_and_queue(
 
 def test_host_paths_are_translated_to_container_domains(tmp_path: Path) -> None:
     """Translate repository configs and host storage paths to container paths."""
-    harness = _harness(tmp_path)
+    harness = _harness(
+        tmp_path,
+        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}",
+    )
     resume = Path(harness.environment["STORAGE_ROOT"]) / "03_experiments/steady_flow/runs/synthetic run"
     resume.mkdir(parents=True)
     output = Path(harness.environment["STORAGE_ROOT"]) / "03_experiments/new output"
@@ -733,7 +748,10 @@ def test_host_paths_are_translated_to_container_domains(tmp_path: Path) -> None:
 
 def test_scheduler_submission_failure_is_propagated(tmp_path: Path) -> None:
     """Return the scheduler failure without claiming successful admission."""
-    harness = _harness(tmp_path)
+    harness = _harness(
+        tmp_path,
+        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}",
+    )
     harness.environment["QUEUE_SUBMISSION_EXIT"] = "37"
     harness.environment["QUEUE_PARTIAL_OUTPUT"] = "synthetic scheduler diagnostic\n"
 

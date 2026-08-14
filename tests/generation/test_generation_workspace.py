@@ -186,6 +186,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     )
 
 
+@pytest.mark.integration
 def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
     generation_config_factory: Any,
     tmp_path: Path,

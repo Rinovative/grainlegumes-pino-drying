@@ -88,6 +88,7 @@ def test_license_retry_backoff_is_exponential_and_bounded() -> None:
     assert all(delay >= 0.0 for delay in delays)
 
 
+@pytest.mark.integration
 def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -214,6 +215,7 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     assert attempts[-1]["next_eligible_at"] is None
 
 
+@pytest.mark.integration
 def test_license_retry_cleanup_failure_becomes_terminal(
     generation_config_factory: Any,
     fake_comsol: Path,

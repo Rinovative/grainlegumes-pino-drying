@@ -15,6 +15,8 @@ from src import common, generation
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_workspace as workspace
 
+pytestmark = pytest.mark.integration
+
 _RUN_ID = "synthetic_workflow__0123456789abcdef"
 _COMMIT = "a" * 40
 _AUTH_DIGESTS = {

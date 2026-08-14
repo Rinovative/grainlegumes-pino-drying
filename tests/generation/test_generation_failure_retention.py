@@ -16,6 +16,8 @@ from src.generation.publication import generation_publication_storage as storage
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_diagnostics as diagnostics_service
 
+pytestmark = pytest.mark.integration
+
 
 def _transient_config(
     generation_config_factory: Any,
@@ -290,6 +292,23 @@ def test_diagnostic_failure_cannot_mask_original_case_failure(
         diagnostics_service,
         "write_initial_state_diagnostic",
         fail_diagnostic,
+    )
+
+    def write_bulk_diagnostic(
+        *_args: Any,
+        output_directory: Path,
+        **_kwargs: Any,
+    ) -> Any:
+        json_path = common.serialization.atomic_write_json(
+            output_directory / "bulk_moisture_consistency_diagnostic.json",
+            {"diagnostic": True},
+        )
+        return SimpleNamespace(json_path=json_path)
+
+    monkeypatch.setattr(
+        diagnostics_service,
+        "write_bulk_moisture_consistency_diagnostic",
+        write_bulk_diagnostic,
     )
     with pytest.raises(
         generation.runtime.CaseExecutionError,

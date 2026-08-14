@@ -15,6 +15,8 @@ import yaml
 
 from src import common, datasets, domain, generation
 
+pytestmark = pytest.mark.integration
+
 
 def _dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     """Return one required test HDF5 dataset."""

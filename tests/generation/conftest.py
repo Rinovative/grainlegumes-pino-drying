@@ -20,6 +20,7 @@ _TEST_MATERIAL_FAMILY = "lentil"
 _TEST_STEADY_SEED = 41001
 _TEST_TRANSIENT_SEED = 41002
 _TEST_PAIRED_SEED = 41003
+_TEST_GRID = {"nx": 17, "ny": 11}
 
 
 def _steady_flow_conditioning(
@@ -168,12 +169,18 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         natural_count: int = _SMOKE_CASE_COUNT,
         parameter_ood_count: int = 0,
         max_running_cases: int | None = None,
+        grid_overrides: Mapping[str, int | float] | None = None,
     ) -> tuple[Path, Path]:
         tests_root = project_root / "configs/generation/campaigns/test_support"
         campaign_number = len(list(tests_root.glob("campaign_*"))) if tests_root.exists() else 0
         directory = tests_root / f"campaign_{campaign_number}"
         directory.mkdir(parents=True)
         common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
+        common["grid"] = {
+            **common["grid"],
+            **_TEST_GRID,
+            **({} if grid_overrides is None else dict(grid_overrides)),
+        }
         operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
         template_relative_path = f"templates/{simulation_profile}_{campaign_number}.mph"
         template_path = project_root / template_relative_path

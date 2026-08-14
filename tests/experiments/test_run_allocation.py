@@ -660,6 +660,7 @@ def test_file_lock_blocks_another_thread_in_the_same_process(tmp_path: Path) -> 
     assert outcomes.get_nowait() == "blocked"
 
 
+@pytest.mark.integration
 def test_resume_prevalidation_rejects_a_second_process_writer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

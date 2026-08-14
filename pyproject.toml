@@ -26,6 +26,7 @@ namespaces = false
 [tool.pytest.ini_options]
 markers = [
   "real_data: strict opt-in acceptance requiring RUN_REAL_DATA_TESTS=1 and an explicit STORAGE_ROOT",
+  "integration: End-to-end lifecycle, subprocess, shell-wrapper, package-publication, worker, or training/artifact workflow tests.",
 ]
 
 # ============================================================

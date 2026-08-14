@@ -8,13 +8,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
+
+import pytest
 
 from src import generation
 from src.generation.cli import cli_generation
 
-if TYPE_CHECKING:
-    import pytest
+pytestmark = pytest.mark.integration
 
 _COMMIT = "a" * 40
 _RUN_ID = "steady_flow_family_generalization__0123456789abcdef"

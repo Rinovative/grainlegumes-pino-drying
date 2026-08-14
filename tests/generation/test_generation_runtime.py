@@ -462,6 +462,7 @@ def test_steady_command_is_parameter_free(
     assert not {"-pname", "-plist", "-pindex"}.intersection(command)
 
 
+@pytest.mark.integration
 def test_preparation_failure_is_recorded_without_a_work_directory(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -583,6 +584,7 @@ def test_malformed_or_symlinked_failure_receipt_fails_closed(
         )
 
 
+@pytest.mark.integration
 def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -672,6 +674,7 @@ def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
     )
 
 
+@pytest.mark.integration
 def test_failure_timeout_missing_export_and_case_lock(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -744,6 +747,7 @@ def test_failure_timeout_missing_export_and_case_lock(
             future.result()
 
 
+@pytest.mark.integration
 def test_no_save_case_converts_and_publishes_without_solved_model(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -792,6 +796,7 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
     assert (outcome.processed_directory / "case.h5").is_file()
 
 
+@pytest.mark.integration
 def test_suffixed_solver_output_is_published_canonically_before_cleanup(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -851,6 +856,7 @@ def test_suffixed_solver_output_is_published_canonically_before_cleanup(
     assert solved_model.stat().st_size > 0
 
 
+@pytest.mark.integration
 def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -914,6 +920,7 @@ def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
         )
 
 
+@pytest.mark.integration
 def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -977,6 +984,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
     assert concurrency["maximum"] == 2
 
 
+@pytest.mark.integration
 def test_publication_failure_records_evidence_before_scratch_cleanup(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -1048,6 +1056,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
     )
 
 
+@pytest.mark.integration
 def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
     generation_config_factory: Any,
     fake_comsol: Path,

@@ -28,6 +28,8 @@ from support.synthetic_task import build_synthetic_generated_batch_identity
 
 from src import analysis, common, datasets, domain, experiments, learning
 
+pytestmark = pytest.mark.integration
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

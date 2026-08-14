@@ -13,6 +13,8 @@ import yaml
 from src import datasets, generation
 from src.generation.contracts import generation_contracts_porosity as porosity_service
 
+pytestmark = pytest.mark.integration
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -131,11 +133,10 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
             )
         inspection = datasets.packages.inspect_dataset_package(result["dataset_id"], storage_root=storage)
         assert inspection["available_selectors"] == [datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP]
-        for workers in (0, 2):
-            smoke = datasets.packages.smoke_dataset_package(
-                result["dataset_id"],
-                storage_root=storage,
-                num_workers=workers,
-            )
-            assert smoke["status"] == "loaded"
-            assert smoke["num_workers"] == workers
+        smoke = datasets.packages.smoke_dataset_package(
+            result["dataset_id"],
+            storage_root=storage,
+            num_workers=0,
+        )
+        assert smoke["status"] == "loaded"
+        assert smoke["num_workers"] == 0

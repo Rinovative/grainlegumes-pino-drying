@@ -146,6 +146,23 @@ def _synthetic_scientific_contract() -> dict[str, Any]:
     }
 
 
+def _small_scientific_contract() -> dict[str, Any]:
+    """Return a compact two-dimensional contract for loader lifecycle tests."""
+    scientific = _synthetic_scientific_contract()
+    scientific["grid"].update(
+        {
+            "nx": 5,
+            "ny": 4,
+            "Lx": 0.4,
+            "Ly": 0.3,
+            "Lz": 0.2,
+            "dx": 0.1,
+            "dy": 0.1,
+        }
+    )
+    return scientific
+
+
 def _hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     """Return one required synthetic HDF5 dataset."""
     value = handle.get(name)
@@ -668,18 +685,7 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
 
 def test_temporal_policy_and_sampling_preserve_source_hdf5_identity(tmp_path: Path) -> None:
     """Keep training-only time choices out of source and physical HDF5 identity."""
-    scientific = _synthetic_scientific_contract()
-    scientific["grid"].update(
-        {
-            "nx": 5,
-            "ny": 4,
-            "Lx": 0.4,
-            "Ly": 0.3,
-            "Lz": 0.2,
-            "dx": 0.1,
-            "dy": 0.1,
-        }
-    )
+    scientific = _small_scientific_contract()
     scientific["time"].update(
         {
             "stop": 4.0,
@@ -752,18 +758,7 @@ def test_temporal_policy_and_sampling_preserve_source_hdf5_identity(tmp_path: Pa
 
 def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path: Path) -> None:
     """Protect deterministic aligned windows, time tensors, and regular-only endpoints."""
-    scientific = _synthetic_scientific_contract()
-    scientific["grid"].update(
-        {
-            "nx": 5,
-            "ny": 4,
-            "Lx": 0.4,
-            "Ly": 0.3,
-            "Lz": 0.2,
-            "dx": 0.1,
-            "dy": 0.1,
-        }
-    )
+    scientific = _small_scientific_contract()
     scientific["time"].update(
         {
             "stop": 6.0,
@@ -866,29 +861,24 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
     assert [dataset[index]["metadata"]["sample_id"] for index in range(len(dataset))] == [
         duplicate[index]["metadata"]["sample_id"] for index in range(len(duplicate))
     ]
-    for num_workers in (0, 2):
-        worker_dataset = datasets.runtime.transient.TransientPhysicalDataset(
-            index_path,
-            sampling=sampling,
-            source_root=tmp_path,
+    loader_dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=sampling,
+        source_root=tmp_path,
+        hdf5_cache_size=1,
+    )
+    loader = datasets.runtime.factory.make_data_loader(
+        loader_dataset,
+        datasets.runtime.factory.LoaderSettings(
+            batch_size=2,
             hdf5_cache_size=1,
-        )
-        loader = datasets.runtime.factory.make_data_loader(
-            worker_dataset,
-            datasets.runtime.factory.LoaderSettings(
-                batch_size=2,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0,
-                prefetch_factor=1 if num_workers > 0 else None,
-                hdf5_cache_size=1,
-            ),
-        )
-        batch = next(iter(loader))
-        assert batch["state"].shape == (2, 4, 4, 5)
-        assert batch["target"].shape == (2, 2, 4, 4, 5)
-        assert batch["time"]["t_n"].shape == (2, 2)
-        del loader
-        worker_dataset.close()
+        ),
+    )
+    batch = next(iter(loader))
+    assert batch["state"].shape == (2, 4, 4, 5)
+    assert batch["target"].shape == (2, 2, 4, 4, 5)
+    assert batch["time"]["t_n"].shape == (2, 2)
+    loader_dataset.close()
     with pytest.raises(ValueError, match="no complete rollout window"):
         datasets.runtime.transient.TransientPhysicalDataset(
             index_path,
@@ -902,10 +892,11 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
         )
 
 
+@pytest.mark.integration
 def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: Path) -> None:
     """Protect zero/multi-worker collation, bounded handles, and source integrity."""
     source = tmp_path / "case.h5"
-    _write_transient_case(source)
+    _write_transient_case(source, scientific_contract=_small_scientific_contract())
     index_path = tmp_path / "index.json"
     _build_index(source, index_path)
 
@@ -919,7 +910,7 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         datasets.runtime.factory.LoaderSettings(batch_size=2),
     )
     zero_batch = next(iter(zero_loader))
-    assert zero_batch["state"].shape == (2, 4, 251, 401)
+    assert zero_batch["state"].shape == (2, 4, 4, 5)
     assert zero_batch["metadata"]["sample_id"] == [
         "synthetic_transient__case_0001__step_0000",
         "synthetic_transient__case_0001__step_0001",
@@ -943,7 +934,7 @@ def test_transient_loader_is_worker_safe_and_rejects_source_mutation(tmp_path: P
         ),
     )
     worker_batch = next(iter(worker_loader))
-    assert worker_batch["target"].shape == (1, 4, 251, 401)
+    assert worker_batch["target"].shape == (1, 4, 4, 5)
     del worker_loader
 
     with source.open("ab") as stream:
