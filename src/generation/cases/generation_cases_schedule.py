@@ -7,6 +7,7 @@ Responsibilities:
   - Compose dedicated smooth, event, and trend processes on the regular time grid
   - Realize exact temperature and humidity-ratio amplitude and correlation contracts
   - Derive relative humidity thermodynamically and report schedule-quality evidence
+  - Transform accepted schedules into validated COMSOL boundary interpolation tables
 Design principles:
   - One temporal process family serves natural, parameter-OOD, and stress supports
   - Simplex weights mean relative component contribution exactly once
@@ -19,6 +20,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -33,10 +35,12 @@ from . import generation_cases_seeding as seeding
 
 _MAX_SCHEDULE_ATTEMPTS = 32
 _MINIMUM_SCHEDULE_NODES = 2
+_TABLE_RANK = 2
 _GAUSSIAN_KERNEL_STANDARD_DEVIATIONS = 4.0
 _RANDOM_BINARY_THRESHOLD = 0.5
 _MINIMUM_LAG1_NODES = 3
 SCHEDULE_GENERATOR_VERSION: Final = 2
+COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
 CORRELATION_TOLERANCE: Final = 2.0e-12
 MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
 MINIMUM_EVENT_WIDTH_INTERVALS: Final = 2.0
@@ -111,6 +115,273 @@ class Schedule:
     def diagnostics(self) -> dict[str, float | int | bool | None]:
         """Return the canonical generated-schedule diagnostic values."""
         return {name: self.metadata[name] for name in SCHEDULE_DIAGNOSTIC_UNITS}
+
+
+@dataclass(frozen=True, slots=True)
+class ComsolBoundarySchedule:
+    """One final COMSOL interpolation table and its canonical provenance."""
+
+    values: np.ndarray
+    metadata: dict[str, Any]
+
+
+def _startup_ramp_policy(value: Mapping[str, Any], *, regular_interval: float) -> tuple[bool, float]:
+    """Return one validated startup-ramp policy."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"enabled", "duration_h"}
+        or not isinstance(value["enabled"], bool)
+        or isinstance(value["duration_h"], bool)
+    ):
+        msg = "Startup-ramp policy must contain exact boolean enabled and numeric duration_h values."
+        raise ValueError(msg)
+    duration_h = float(value["duration_h"])
+    if not math.isfinite(duration_h) or not 0.0 < duration_h < regular_interval:
+        msg = "Startup-ramp duration_h must be finite, positive, and shorter than the regular interval."
+        raise ValueError(msg)
+    return value["enabled"], duration_h
+
+
+def _boundary_handoff_metadata(
+    canonical: Schedule,
+    *,
+    enabled: bool,
+    duration_h: float,
+    regular_interval: float,
+    rejoin_row: np.ndarray | None,
+) -> dict[str, Any]:
+    """Describe how the canonical schedule becomes the COMSOL interpolation table."""
+    canonical_values = np.asarray(canonical.values, dtype=np.float64)
+    return {
+        "handoff_version": COMSOL_BOUNDARY_HANDOFF_VERSION,
+        "representation": "comsol_linear_interpolation_table",
+        "startup_ramp": {
+            "enabled": enabled,
+            "duration_h": duration_h,
+            "temperature_start_source": "T_init",
+            "temperature_source_relationship": "T_init=T_amb",
+            "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
+            "rejoin_policy": "linear_interpolation_of_original_canonical_schedule",
+        },
+        "canonical_regular_grid": {
+            "start_h": float(canonical_values[0, 0]),
+            "stop_h": float(canonical_values[-1, 0]),
+            "interval_h": regular_interval,
+            "node_count": int(canonical_values.shape[0]),
+        },
+        "canonical_start_row": [float(value) for value in canonical_values[0]],
+        "rejoin_row": None if rejoin_row is None else [float(value) for value in rejoin_row],
+        "regular_output_time_policy": "common.time.regular_times_unchanged",
+    }
+
+
+def validate_comsol_boundary_schedule(
+    schedule_values: np.ndarray,
+    *,
+    regular_times: np.ndarray,
+    startup_ramp: Mapping[str, Any],
+    initial_temperature: float,
+    pressure: float,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Validate the dedicated physical and temporal COMSOL handoff contract."""
+    if not isinstance(metadata, Mapping):
+        msg = "COMSOL boundary schedule metadata must be a mapping."
+        raise TypeError(msg)
+    values = np.asarray(schedule_values, dtype=np.float64)
+    regular = np.asarray(regular_times, dtype=np.float64)
+    if regular.ndim != 1 or regular.size < _MINIMUM_SCHEDULE_NODES or not np.isfinite(regular).all():
+        msg = "COMSOL boundary handoff requires finite canonical regular times."
+        raise ValueError(msg)
+    differences = np.diff(regular)
+    regular_interval = float(differences[0])
+    tolerance = np.finfo(np.float64).eps * max(1.0, abs(regular_interval)) * 16
+    if (
+        not math.isfinite(regular_interval)
+        or regular_interval <= 0.0
+        or not np.allclose(differences, regular_interval, rtol=0.0, atol=tolerance)
+        or regular[0] != 0.0
+    ):
+        msg = "COMSOL boundary handoff requires a regular canonical grid beginning at t=0."
+        raise ValueError(msg)
+    enabled, duration_h = _startup_ramp_policy(startup_ramp, regular_interval=regular_interval)
+    expected_times = np.concatenate((regular[:1], [duration_h], regular[1:])) if enabled else regular
+    if (
+        values.ndim != _TABLE_RANK
+        or values.shape != (expected_times.size, len(profiles.SCHEDULE_FIELDS))
+        or not np.isfinite(values).all()
+        or not np.array_equal(values[:, 0], expected_times)
+        or np.any(np.diff(values[:, 0]) <= 0.0)
+    ):
+        msg = "COMSOL boundary schedule has invalid shape, times, ordering, or finite values."
+        raise ValueError(msg)
+    if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
+        msg = "COMSOL startup temperature source must be finite and physically positive."
+        raise ValueError(msg)
+    if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0) or np.any((values[:, 3] < 0.0) | (values[:, 3] > 1.0)):
+        msg = "COMSOL boundary temperature, humidity ratio, or relative humidity is physically invalid."
+        raise ValueError(msg)
+    source_phi = humidity_ratio_to_relative_humidity(
+        values[:, 2],
+        np.full(values.shape[0], initial_temperature, dtype=np.float64),
+        pressure=pressure,
+    )
+    if np.any((source_phi <= 0.0) | (source_phi > 1.0)) or np.any(values[:, 1] < initial_temperature):
+        msg = "COMSOL boundary schedule violates heater-only source-air physics."
+        raise ValueError(msg)
+
+    handoff = metadata.get("boundary_handoff")
+    if not isinstance(handoff, Mapping):
+        msg = "COMSOL boundary schedule lacks handoff provenance."
+        raise TypeError(msg)
+    expected_handoff_keys = {
+        "handoff_version",
+        "representation",
+        "startup_ramp",
+        "canonical_regular_grid",
+        "canonical_start_row",
+        "rejoin_row",
+        "regular_output_time_policy",
+    }
+    if set(handoff) != expected_handoff_keys:
+        msg = "COMSOL boundary handoff provenance has invalid fields."
+        raise ValueError(msg)
+    expected_startup_metadata = {
+        "enabled": enabled,
+        "duration_h": duration_h,
+        "temperature_start_source": "T_init",
+        "temperature_source_relationship": "T_init=T_amb",
+        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
+        "rejoin_policy": "linear_interpolation_of_original_canonical_schedule",
+    }
+    expected_grid_metadata = {
+        "start_h": float(regular[0]),
+        "stop_h": float(regular[-1]),
+        "interval_h": regular_interval,
+        "node_count": int(regular.size),
+    }
+    canonical_start = np.asarray(handoff["canonical_start_row"], dtype=np.float64)
+    if (
+        handoff["handoff_version"] != COMSOL_BOUNDARY_HANDOFF_VERSION
+        or handoff["representation"] != "comsol_linear_interpolation_table"
+        or handoff["startup_ramp"] != expected_startup_metadata
+        or handoff["canonical_regular_grid"] != expected_grid_metadata
+        or handoff["regular_output_time_policy"] != "common.time.regular_times_unchanged"
+        or canonical_start.shape != (len(profiles.SCHEDULE_FIELDS),)
+        or not np.isfinite(canonical_start).all()
+        or canonical_start[0] != regular[0]
+    ):
+        msg = "COMSOL boundary handoff provenance disagrees with the active schedule contract."
+        raise ValueError(msg)
+
+    thermodynamic_tolerance = 64.0 * np.finfo(np.float64).eps
+    if enabled:
+        fraction = duration_h / regular_interval
+        expected_rejoin = canonical_start + fraction * (values[2] - canonical_start)
+        expected_rejoin[0] = duration_h
+        rejoin_row = np.asarray(handoff["rejoin_row"], dtype=np.float64)
+        expected_start_phi = humidity_ratio_to_relative_humidity(
+            values[:1, 2],
+            values[:1, 1],
+            pressure=pressure,
+        )[0]
+        if (
+            values[0, 1] != initial_temperature
+            or values[0, 2] != canonical_start[2]
+            or not math.isclose(values[0, 3], expected_start_phi, rel_tol=thermodynamic_tolerance, abs_tol=thermodynamic_tolerance)
+            or rejoin_row.shape != (len(profiles.SCHEDULE_FIELDS),)
+            or not np.array_equal(values[1], expected_rejoin)
+            or not np.array_equal(rejoin_row, expected_rejoin)
+            or not np.array_equal(values[2:, 0], regular[1:])
+        ):
+            msg = "COMSOL startup node, rejoin node, or retained regular nodes are invalid."
+            raise ValueError(msg)
+        thermodynamic_rows = np.concatenate(
+            (canonical_start[np.newaxis, :], values[:1], values[2:]),
+            axis=0,
+        )
+    else:
+        if handoff["rejoin_row"] is not None or not np.array_equal(values[0], canonical_start):
+            msg = "Disabled COMSOL startup ramp must retain the canonical schedule exactly."
+            raise ValueError(msg)
+        thermodynamic_rows = values
+    expected_phi = humidity_ratio_to_relative_humidity(
+        thermodynamic_rows[:, 2],
+        thermodynamic_rows[:, 1],
+        pressure=pressure,
+    )
+    if not np.allclose(
+        thermodynamic_rows[:, 3],
+        expected_phi,
+        rtol=thermodynamic_tolerance,
+        atol=thermodynamic_tolerance,
+    ):
+        msg = "COMSOL boundary schedule is thermodynamically inconsistent at physical state nodes."
+        raise ValueError(msg)
+
+
+def build_comsol_boundary_schedule(
+    canonical: Schedule,
+    startup_ramp: Mapping[str, Any],
+    *,
+    initial_temperature: float,
+    pressure: float,
+) -> ComsolBoundarySchedule:
+    """Apply the configured startup handoff after canonical schedule validation."""
+    canonical_values = np.asarray(canonical.values, dtype=np.float64)
+    if (
+        canonical_values.ndim != _TABLE_RANK
+        or canonical_values.shape[0] < _MINIMUM_SCHEDULE_NODES
+        or canonical_values.shape[1] != len(profiles.SCHEDULE_FIELDS)
+        or not np.isfinite(canonical_values).all()
+    ):
+        msg = "Canonical schedule has invalid shape or values for COMSOL handoff."
+        raise ValueError(msg)
+    regular_times = canonical_values[:, 0]
+    regular_interval = float(regular_times[1] - regular_times[0])
+    enabled, duration_h = _startup_ramp_policy(startup_ramp, regular_interval=regular_interval)
+    if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
+        msg = "COMSOL startup temperature source must be finite and physically positive."
+        raise ValueError(msg)
+    rejoin_row: np.ndarray | None = None
+    if enabled:
+        start_row = canonical_values[0].copy()
+        start_row[1] = initial_temperature
+        start_row[3] = humidity_ratio_to_relative_humidity(
+            start_row[2:3],
+            start_row[1:2],
+            pressure=pressure,
+        )[0]
+        fraction = duration_h / regular_interval
+        constructed_rejoin = canonical_values[0] + fraction * (canonical_values[1] - canonical_values[0])
+        constructed_rejoin[0] = duration_h
+        handoff_values = np.concatenate(
+            (start_row[np.newaxis, :], constructed_rejoin[np.newaxis, :], canonical_values[1:]),
+            axis=0,
+        )
+        rejoin_row = constructed_rejoin
+        if not np.array_equal(handoff_values[2:], canonical_values[1:]):
+            msg = "COMSOL startup transformation changed retained canonical regular nodes."
+            raise RuntimeError(msg)
+    else:
+        handoff_values = canonical_values.copy()
+    metadata = copy.deepcopy(canonical.metadata)
+    metadata["boundary_handoff"] = _boundary_handoff_metadata(
+        canonical,
+        enabled=enabled,
+        duration_h=duration_h,
+        regular_interval=regular_interval,
+        rejoin_row=rejoin_row,
+    )
+    validate_comsol_boundary_schedule(
+        handoff_values,
+        regular_times=regular_times,
+        startup_ramp=startup_ramp,
+        initial_temperature=initial_temperature,
+        pressure=pressure,
+        metadata=metadata,
+    )
+    return ComsolBoundarySchedule(values=handoff_values, metadata=metadata)
 
 
 def saturation_vapor_pressure(temperature: np.ndarray) -> np.ndarray:

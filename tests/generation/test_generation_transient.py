@@ -97,6 +97,12 @@ def _synthetic_scientific_contract() -> dict[str, Any]:
             "irregular_stop_state": "diagnostic_only",
             "regular_times": [float(index) for index in range(169)],
         },
+        "boundary_schedule": {
+            "startup_ramp": {
+                "enabled": True,
+                "duration_h": 1.0 / 6.0,
+            }
+        },
         "storage": {
             "schema_version": generation.publication.storage.HDF5_SCHEMA_VERSION,
             "converter_version": generation.publication.storage.HDF5_CONVERTER_VERSION,
@@ -233,6 +239,17 @@ def _write_transient_case(
         schedule[:, 1],
         pressure=float(scientific["scientific_fixed_values"]["p_ref"]),
     )
+    conversion_pressure = {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"}
+    boundary_schedule = schedule_service.build_comsol_boundary_schedule(
+        schedule_service.Schedule(
+            values=schedule,
+            metadata={"conversion_pressure": conversion_pressure},
+        ),
+        scientific["boundary_schedule"]["startup_ramp"],
+        initial_temperature=scalar_values["T_amb"],
+        pressure=float(scientific["scientific_fixed_values"]["p_ref"]),
+    )
+    schedule = boundary_schedule.values
     global_values = np.zeros((complete_time.size, len(profiles.GLOBAL_FIELD_NAMES)), dtype=np.float64)
     global_values[:, 0] = complete_time
     f_surf = scalar_values["f_surf"]
@@ -287,7 +304,6 @@ def _write_transient_case(
         "runtime_validation": "required",
         "entries": scalar_entries,
     }
-    conversion_pressure = {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"}
     case_scientific_provenance = {
         "schema_kind": "vp2_case_scientific_provenance",
         "schema_version": 1,
@@ -302,12 +318,18 @@ def _write_transient_case(
         "natural_support_state": "natural",
         "seed_evidence": {},
         "block_provenance": {"airflow": {}, "initial_moisture": {}, "operation": {}, "material_properties": {}},
-        "sampled_values": {name: scalar_values[name] for name in scalar_names},
-        "sampled_units": dict(zip(scalar_names, profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
+        "sampled_values": {
+            **{name: scalar_values[name] for name in scalar_names},
+            "T_init": scalar_values["T_amb"],
+        },
+        "sampled_units": {
+            **dict(zip(scalar_names, profiles.TRANSIENT_SCALAR_INPUT_UNITS, strict=True)),
+            "T_init": "K",
+        },
         "coupled_selections": {},
         "ood": {"natural_support_state": "natural"},
         "spatial_diagnostics": {"porosity": _porosity_diagnostics()},
-        "schedule_diagnostics": {},
+        "schedule_diagnostics": boundary_schedule.metadata,
     }
 
     with h5py.File(path, "w") as handle:
@@ -438,6 +460,7 @@ def _write_transient_case(
         schedule_dataset.attrs["units"] = _json(list(profiles.SCHEDULE_UNITS))
         schedule_dataset.attrs["conversion_pressure"] = _json(conversion_pressure)
         schedule_dataset.attrs["humidity_conversion_owner"] = "generation_schedule"
+        schedule_dataset.attrs["boundary_handoff"] = _json(boundary_schedule.metadata["boundary_handoff"])
         global_dataset = handle.create_group("global").create_dataset(
             "values",
             data=global_values,
@@ -503,7 +526,11 @@ def test_hdf5_validation_uses_embedded_noncurrent_contract(tmp_path: Path) -> No
         assert transient.chunks == (2, 1, 3, 4)
         assert transient.compression == "gzip"
         assert transient.compression_opts == 6
-        assert _hdf5_dataset(handle, "schedule/values").shape[0] == 5
+        assert _hdf5_dataset(handle, "schedule/values").shape[0] == 6
+        np.testing.assert_array_equal(
+            np.asarray(_hdf5_dataset(handle, "time")),
+            [0.0, 0.5, 1.0],
+        )
 
 
 def _source(
@@ -597,6 +624,27 @@ def test_transient_index_rejects_rehashed_noncanonical_contract_digest(tmp_path:
         datasets.runtime.transient.TransientPhysicalDataset(index_path, sampling=_one_step_sampling(), source_root=tmp_path)
 
 
+def test_transient_runtime_rejects_rehashed_missing_startup_support(tmp_path: Path) -> None:
+    """Bind the required first-transition support to source handoff provenance."""
+    source = tmp_path / "case.h5"
+    _write_transient_case(source)
+    index_path = tmp_path / "index.json"
+    payload = _build_index(source, index_path)
+    payload["samples"][0]["schedule_support_index"] = None
+    payload["index_digest"] = common.serialization.canonical_json_sha256(datasets.packages.trajectory._index_digest_payload(payload))
+    index_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    dataset = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=_one_step_sampling(),
+        source_root=tmp_path,
+    )
+    with pytest.raises(datasets.packages.trajectory.TransientDataContractError, match="startup support disagrees"):
+        _ = dataset[0]
+
+
 def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path: Path) -> None:
     """Protect exact regular transitions, typed physical tensors, and portable identity."""
     source = tmp_path / "case.h5"
@@ -605,9 +653,14 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     index_path = tmp_path / "index.json"
     payload = _build_index(source, index_path)
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == datasets.packages.trajectory.TRANSIENT_INDEX_SCHEMA_VERSION == 1
     assert payload["sample_count"] == 2
     assert [(sample["time_index_n"], sample["time_index_n_plus_1"]) for sample in payload["samples"]] == [(0, 1), (1, 2)]
+    assert [(sample["schedule_index_n"], sample["schedule_index_n_plus_1"]) for sample in payload["samples"]] == [
+        (0, 2),
+        (2, 3),
+    ]
+    assert [sample["schedule_support_index"] for sample in payload["samples"]] == [1, None]
     assert set(payload["samples"][0]) == {
         "case_index",
         "sample_id",
@@ -615,6 +668,7 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
         "time_index_n_plus_1",
         "schedule_index_n",
         "schedule_index_n_plus_1",
+        "schedule_support_index",
     }
     assert payload["configured_regular_horizon"] == {
         "value": 168.0,
@@ -637,7 +691,15 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     first = dataset[0]
     assert first["state"].shape == (4, 251, 401)
     assert first["static"].shape == (7, 251, 401)
-    assert first["boundary"].shape == (5,)
+    assert first["boundary"].shape == (10,)
+    with h5py.File(source, "r") as handle:
+        support = np.asarray(_hdf5_dataset(handle, "schedule/values")[1], dtype=np.float32)
+    assert first["boundary"][5].item() == pytest.approx(1.0 / 6.0)
+    torch.testing.assert_close(first["boundary"][6:9], torch.from_numpy(support[1:4]))
+    assert first["boundary"][9].item() == 1.0
+    second = dataset[1]
+    assert second["boundary"][5].item() == 0.0
+    assert second["boundary"][9].item() == 0.0
     assert first["scalars"].shape == (8,)
     torch.testing.assert_close(
         first["scalars"],
@@ -833,13 +895,15 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
     third = dataset[2]
     assert first["state"].shape == (4, 4, 5)
     assert first["static"].shape == (7, 4, 5)
-    assert first["boundary"].shape == (2, 5)
+    assert first["boundary"].shape == (2, 10)
     assert first["scalars"].shape == (8,)
     assert first["target"].shape == (2, 4, 4, 5)
     first_time = cast("dict[str, torch.Tensor]", first["time"])
     torch.testing.assert_close(first["state"][:, 0, 0], torch.tensor([296.0, 0.41, 109.5, 109.75]))
     torch.testing.assert_close(first["boundary"][:, :2], torch.tensor([[295.01, 295.02], [295.02, 295.03]]))
     torch.testing.assert_close(first["boundary"][0, 3], first["boundary"][1, 2])
+    torch.testing.assert_close(first["boundary"][:, 5], torch.zeros(2))
+    torch.testing.assert_close(first["boundary"][:, 9], torch.zeros(2))
     assert {name: value.shape for name, value in first_time.items()} == {
         "t_n": (2,),
         "t_n_plus_1": (2,),

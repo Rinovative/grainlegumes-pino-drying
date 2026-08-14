@@ -387,6 +387,21 @@ def _case_record(
             message = f"Transient boundary or scalar conditioning is not canonical: {path}."
             raise TransientDataContractError(message)
         schedule_time = np.asarray(schedule_dataset[:, schedule_names.index("t")], dtype=np.float64)
+        boundary_handoff = json.loads(
+            _text_attribute(
+                schedule_dataset.attrs.get("boundary_handoff"),
+                label="schedule.boundary_handoff",
+            )
+        )
+        startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
+        if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
+            message = f"Transient schedule lacks startup-handoff provenance: {path}."
+            raise TransientDataContractError(message)
+        startup_duration = startup.get("duration_h")
+        if isinstance(startup_duration, bool) or not isinstance(startup_duration, (int, float)) or not math.isfinite(float(startup_duration)):
+            message = f"Transient schedule startup duration is invalid: {path}."
+            raise TransientDataContractError(message)
+        startup_time = float(startup_duration)
         samples: list[dict[str, Any]] = []
         for time_index in range(0, max(regular_count - transition_stride, 0), transition_stride):
             t_n = float(time[time_index])
@@ -396,6 +411,13 @@ def _case_record(
             if current.size != 1 or following.size != 1:
                 message = f"Schedule lacks exact endpoints for transition {t_n} -> {t_np1} h: {path}."
                 raise TransientDataContractError(message)
+            support_index: int | None = None
+            if startup["enabled"] and t_n + tolerance < startup_time < t_np1 - tolerance:
+                support = np.flatnonzero(np.isclose(schedule_time, startup_time, rtol=0.0, atol=tolerance))
+                if support.size != 1:
+                    message = f"Schedule lacks its startup support for transition {t_n} -> {t_np1} h: {path}."
+                    raise TransientDataContractError(message)
+                support_index = int(support[0])
             samples.append(
                 {
                     "sample_id": f"{source.package_case_id}__step_{time_index:04d}",
@@ -403,6 +425,7 @@ def _case_record(
                     "time_index_n_plus_1": time_index + transition_stride,
                     "schedule_index_n": int(current[0]),
                     "schedule_index_n_plus_1": int(following[0]),
+                    "schedule_support_index": support_index,
                 }
             )
     if not samples:
@@ -610,6 +633,7 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         "time_index_n_plus_1",
         "schedule_index_n",
         "schedule_index_n_plus_1",
+        "schedule_support_index",
     }
     package_case_ids: set[str] = set()
     simulation_case_ids: set[str] = set()
@@ -671,12 +695,21 @@ def load_transient_index(path: Path) -> dict[str, Any]:
             raise TransientDataContractError(message)
         case_index = sample["case_index"]
         positions = tuple(sample[key] for key in ("time_index_n", "time_index_n_plus_1", "schedule_index_n", "schedule_index_n_plus_1"))
+        support_index = sample["schedule_support_index"]
         if (
             isinstance(case_index, bool)
             or not isinstance(case_index, int)
             or not 0 <= case_index < case_count
             or case_index < previous_case_index
             or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in positions)
+            or (
+                support_index is not None
+                and (
+                    isinstance(support_index, bool)
+                    or not isinstance(support_index, int)
+                    or not sample["schedule_index_n"] < support_index < sample["schedule_index_n_plus_1"]
+                )
+            )
         ):
             message = f"Transient sample references invalid or unordered source indices: {path}."
             raise TransientDataContractError(message)
@@ -700,16 +733,16 @@ def load_transient_index(path: Path) -> dict[str, Any]:
             message = f"Transient case transition counts disagree with indexed samples: {path}."
             raise TransientDataContractError(message)
         time_stride = case_samples[0]["time_index_n_plus_1"] - case_samples[0]["time_index_n"]
-        schedule_stride = case_samples[0]["schedule_index_n_plus_1"] - case_samples[0]["schedule_index_n"]
+        previous_schedule_endpoint = 0
         for step_index, sample in enumerate(case_samples):
             if (
                 sample["time_index_n"] != step_index * time_stride
                 or sample["time_index_n_plus_1"] != (step_index + 1) * time_stride
-                or sample["schedule_index_n"] != step_index * schedule_stride
-                or sample["schedule_index_n_plus_1"] != (step_index + 1) * schedule_stride
+                or sample["schedule_index_n"] != previous_schedule_endpoint
             ):
                 message = f"Transient samples are not one deterministic consecutive regular prefix: {path}."
                 raise TransientDataContractError(message)
+            previous_schedule_endpoint = sample["schedule_index_n_plus_1"]
         unused_regular_steps = case["sequence_length"] - 1 - case_samples[-1]["time_index_n_plus_1"]
         if not 0 <= unused_regular_steps < time_stride:
             message = f"Transient samples omit a complete regular transition: {path}."

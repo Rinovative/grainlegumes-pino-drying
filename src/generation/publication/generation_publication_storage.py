@@ -625,6 +625,8 @@ def _schedule_values(
     *,
     p_ref: float,
     time_contract: Mapping[str, Any],
+    startup_ramp: Mapping[str, Any],
+    initial_temperature: float,
 ) -> np.ndarray:
     """Read and revalidate the configured schedule bound by case.json."""
     spec = case_payload["input_contract"]["schedule"]
@@ -634,33 +636,25 @@ def _schedule_values(
         msg = "Schedule adapter bytes changed after case-input identity was computed."
         raise RuntimeError(msg)
     header, values = _read_input_adapter_table(path, delimiter=spec["delimiter"])
-    expected_time = np.asarray(time_contract["regular_times"], dtype=np.float64)
-    if header != list(profiles.SCHEDULE_FIELDS) or values.shape != (
-        expected_time.size,
-        len(profiles.SCHEDULE_FIELDS),
-    ):
-        msg = "Schedule adapter does not match the configured regular-time contract."
-        raise ValueError(msg)
-    if not np.array_equal(values[:, 0], expected_time):
-        msg = "Schedule adapter time must match the configured regular nodes."
-        raise ValueError(msg)
-    if np.any((values[:, 3] < 0.0) | (values[:, 3] > 1.0)):
-        msg = "Schedule relative humidity must lie in [0, 1]."
-        raise ValueError(msg)
-    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(values[:, 2], values[:, 1], pressure=p_ref)
-    if not np.allclose(
-        values[:, 3],
-        expected_phi,
-        rtol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
-        atol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
-    ):
-        msg = "Schedule phi_in_bc is inconsistent with omega_in_bc, T_in_bc, and package-fixed p_ref."
+    if header != list(profiles.SCHEDULE_FIELDS):
+        msg = "Schedule adapter does not match the configured four-column contract."
         raise ValueError(msg)
     metadata = case_payload.get("schedule_diagnostics")
-    conversion = metadata.get("conversion_pressure") if isinstance(metadata, dict) else None
+    if not isinstance(metadata, Mapping):
+        msg = "Schedule handoff provenance must be a mapping."
+        raise TypeError(msg)
+    conversion = metadata.get("conversion_pressure")
     if conversion != {"name": "p_ref", "value": p_ref, "unit": "Pa", "owner": "package_fixed"}:
         msg = "Schedule conversion-pressure provenance is missing or inconsistent."
         raise ValueError(msg)
+    schedule_service.validate_comsol_boundary_schedule(
+        values,
+        regular_times=np.asarray(time_contract["regular_times"], dtype=np.float64),
+        startup_ramp=startup_ramp,
+        initial_temperature=initial_temperature,
+        pressure=p_ref,
+        metadata=metadata,
+    )
     return values
 
 
@@ -1128,6 +1122,7 @@ def _write_hdf5(
             schedule_dataset.attrs["units"] = _json_attribute(list(profiles.SCHEDULE_UNITS))
             schedule_dataset.attrs["conversion_pressure"] = _json_attribute(case_payload["schedule_diagnostics"]["conversion_pressure"])
             schedule_dataset.attrs["humidity_conversion_owner"] = "generation_schedule"
+            schedule_dataset.attrs["boundary_handoff"] = _json_attribute(case_payload["schedule_diagnostics"]["boundary_handoff"])
             global_group = handle.create_group("global")
             global_dataset = global_group.create_dataset("values", data=np.asarray(global_values, dtype=np.float64), **compression)
             global_dataset.attrs["field_names"] = _json_attribute(list(profiles.GLOBAL_FIELD_NAMES))
@@ -1661,22 +1656,19 @@ def _validate_hdf5_schedule(
     handle: h5py.File,
     scientific: Mapping[str, Any],
 ) -> None:
-    """Validate configured schedule fields and thermodynamic conversion."""
+    """Validate the exact COMSOL boundary table without changing regular output time."""
     _require_group_members(handle, "schedule", {"values"})
     schedule = _hdf5_dataset(handle, "schedule/values")
     values = np.asarray(schedule, dtype=np.float64)
-    expected_time = np.asarray(scientific["time"]["regular_times"], dtype=np.float64)
     storage = scientific["storage"]
     if (
         schedule.dtype != np.float64
-        or schedule.shape != (expected_time.size, len(profiles.SCHEDULE_FIELDS))
+        or values.ndim != _TABLE_RANK
+        or values.shape[1] != len(profiles.SCHEDULE_FIELDS)
         or not np.isfinite(values).all()
         or not _compression_matches(schedule, storage)
     ):
-        msg = "Canonical schedule dtype, shape, finiteness, or compression is invalid."
-        raise ValueError(msg)
-    if not np.array_equal(values[:, 0], expected_time):
-        msg = "Canonical schedule time coverage is invalid."
+        msg = "COMSOL boundary schedule dtype, shape, finiteness, or compression is invalid."
         raise ValueError(msg)
     _dataset_contract(
         schedule,
@@ -1695,6 +1687,15 @@ def _validate_hdf5_schedule(
         schedule.attrs.get("humidity_conversion_owner", ""),
         label="schedule.humidity_conversion_owner",
     )
+    case_scientific = _hdf5_json_dataset(handle, "provenance/case_scientific_provenance_json")
+    metadata = case_scientific.get("schedule_diagnostics")
+    sampled_values = case_scientific.get("sampled_values")
+    boundary_handoff = json.loads(
+        _hdf5_text_attribute(
+            schedule.attrs.get("boundary_handoff", ""),
+            label="schedule.boundary_handoff",
+        )
+    )
     if (
         conversion
         != {
@@ -1704,22 +1705,20 @@ def _validate_hdf5_schedule(
             "owner": "package_fixed",
         }
         or conversion_owner != "generation_schedule"
+        or not isinstance(metadata, Mapping)
+        or not isinstance(sampled_values, Mapping)
+        or boundary_handoff != metadata.get("boundary_handoff")
     ):
-        msg = "Canonical schedule conversion-pressure provenance is invalid."
+        msg = "COMSOL boundary schedule provenance is invalid."
         raise ValueError(msg)
-    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(
-        values[:, 2],
-        values[:, 1],
+    schedule_service.validate_comsol_boundary_schedule(
+        values,
+        regular_times=np.asarray(scientific["time"]["regular_times"], dtype=np.float64),
+        startup_ramp=scientific["boundary_schedule"]["startup_ramp"],
+        initial_temperature=float(sampled_values["T_init"]),
         pressure=p_ref,
+        metadata=metadata,
     )
-    if not np.allclose(
-        values[:, 3],
-        expected_phi,
-        rtol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
-        atol=_THERMODYNAMIC_ROUNDTRIP_ATOL,
-    ):
-        msg = "Canonical schedule thermodynamic conversion is inconsistent."
-        raise ValueError(msg)
 
 
 def _complete_hdf5_time(
@@ -2156,6 +2155,8 @@ def convert_exports_to_hdf5(
             work_directory,
             p_ref=p_ref,
             time_contract=config.scientific_values["time"],
+            startup_ramp=config.scientific_values["boundary_schedule"]["startup_ramp"],
+            initial_temperature=float(case_payload["sampled_values"]["T_init"]),
         )
         global_values = _ordered_values(config, exports, profiles.GLOBAL_EXPORT_ROLE, profiles.GLOBAL_FIELD_NAMES)
         if np.any(np.diff(global_values[:, 0]) <= 0):

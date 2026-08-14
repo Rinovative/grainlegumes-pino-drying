@@ -584,6 +584,28 @@ def schedule_diagnostics(
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in metadata_values):
         message = "Pilot schedule metadata lacks finite source-air and heater diagnostics."
         raise ValueError(message)
+    handoff = schedule_metadata.get("boundary_handoff")
+    if not isinstance(handoff, Mapping):
+        message = "Pilot schedule metadata lacks boundary-handoff provenance."
+        raise TypeError(message)
+    startup = handoff.get("startup_ramp")
+    if not isinstance(startup, Mapping) or not isinstance(startup.get("enabled"), bool):
+        message = "Pilot schedule metadata lacks startup-handoff provenance."
+        raise TypeError(message)
+    duration_h = startup.get("duration_h")
+    if isinstance(duration_h, bool) or not isinstance(duration_h, (int, float)) or not math.isfinite(float(duration_h)):
+        message = "Pilot startup-ramp duration is invalid."
+        raise ValueError(message)
+    duration_value = float(duration_h)
+    enabled = bool(startup["enabled"])
+    time = columns["t"]
+    startup_handoff_valid = bool(
+        np.all(np.diff(time) > 0.0)
+        and time[0] == 0.0
+        and ((enabled and time.size > _MINIMUM_BALANCE_STATES and time[1] == duration_value) or (not enabled and handoff.get("rejoin_row") is None))
+    )
+    operating = time >= duration_value if enabled else np.ones(time.shape, dtype=bool)
+    startup_segment = time < duration_value if enabled else np.zeros(time.shape, dtype=bool)
     source_min_value = float(cast("float", source_min))
     source_max_value = float(cast("float", source_max))
     heater_rise_value = float(cast("float", heater_rise))
@@ -591,7 +613,11 @@ def schedule_diagnostics(
         "T_in_bc_at_or_above_T_amb": bool(np.all(columns["T_in_bc"] >= ambient_temperature)),
         "omega_in_bc_positive": bool(np.all(columns["omega_in_bc"] > 0.0)),
         "phi_source_air_physical": bool(0.0 < source_min_value <= source_max_value <= 1.0),
-        "phi_in_bc_operational": bool(np.all((columns["phi_in_bc"] >= phi_operational_min) & (columns["phi_in_bc"] <= phi_operational_max))),
+        "phi_in_bc_operational": bool(
+            np.all((columns["phi_in_bc"][operating] >= phi_operational_min) & (columns["phi_in_bc"][operating] <= phi_operational_max))
+        ),
+        "startup_phi_in_bc_physical": bool(np.all((columns["phi_in_bc"][startup_segment] >= 0.0) & (columns["phi_in_bc"][startup_segment] <= 1.0))),
+        "startup_handoff_valid": startup_handoff_valid,
     }
     return {
         "status": "pass" if all(checks.values()) else "violation",

@@ -321,12 +321,39 @@ def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None
             "min_phi_source_air": 0.35,
             "max_phi_source_air": 0.55,
             "min_heater_temperature_rise": 4.0,
+            "boundary_handoff": {
+                "startup_ramp": {"enabled": False, "duration_h": 1.0 / 6.0},
+                "rejoin_row": None,
+            },
         },
         ambient_temperature=300.0,
         phi_operational_min=0.05,
         phi_operational_max=0.85,
     )
     assert schedule["status"] == "pass"
+
+    startup_schedule = analysis_service.schedule_diagnostics(
+        [
+            [0.0, 300.0, 0.01, 0.9],
+            [1.0 / 6.0, 305.0, 0.01, 0.4],
+            [1.0, 306.0, 0.011, 0.5],
+        ],
+        schedule_metadata={
+            "min_phi_source_air": 0.35,
+            "max_phi_source_air": 0.55,
+            "min_heater_temperature_rise": 4.0,
+            "boundary_handoff": {
+                "startup_ramp": {"enabled": True, "duration_h": 1.0 / 6.0},
+                "rejoin_row": [1.0 / 6.0, 305.0, 0.01, 0.4],
+            },
+        },
+        ambient_temperature=300.0,
+        phi_operational_min=0.05,
+        phi_operational_max=0.85,
+    )
+    assert startup_schedule["status"] == "pass"
+    assert startup_schedule["checks"]["phi_in_bc_operational"] is True
+    assert startup_schedule["checks"]["startup_phi_in_bc_physical"] is True
 
     invalid_static = {name: values.copy() for name, values in static.items()}
     invalid_states = [{name: values.copy() for name, values in state.items()} for state in states]

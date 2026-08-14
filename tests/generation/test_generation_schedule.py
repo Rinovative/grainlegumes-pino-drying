@@ -85,6 +85,83 @@ def test_schedule_replays_byte_identically_and_uses_weights_once() -> None:
     np.testing.assert_array_equal(schedule_service._compose(components, weights), expected)
 
 
+def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly() -> None:
+    """Add one physical startup node without changing the canonical realization."""
+    canonical = _schedule()
+    canonical_values = canonical.values.copy()
+    canonical_metadata = canonical.metadata.copy()
+    duration_h = 1.0 / 6.0
+
+    handoff = schedule_service.build_comsol_boundary_schedule(
+        canonical,
+        {"enabled": True, "duration_h": duration_h},
+        initial_temperature=293.15,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+    np.testing.assert_array_equal(canonical.values, canonical_values)
+    assert canonical.metadata == canonical_metadata
+    np.testing.assert_array_equal(handoff.values[:5, 0], [0.0, duration_h, 1.0, 2.0, 3.0])
+    assert handoff.values[-1, 0] == 168.0
+    assert handoff.values[0, 1] == 293.15
+    assert handoff.values[0, 2] == canonical.values[0, 2]
+    expected_start_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        handoff.values[:1, 2],
+        handoff.values[:1, 1],
+        pressure=float(_FIXED["p_ref"]),
+    )[0]
+    assert handoff.values[0, 3] == expected_start_phi
+
+    fraction = duration_h / float(_TIME["interval"])
+    expected_rejoin = canonical.values[0] + fraction * (canonical.values[1] - canonical.values[0])
+    expected_rejoin[0] = duration_h
+    np.testing.assert_array_equal(handoff.values[1], expected_rejoin)
+    np.testing.assert_array_equal(handoff.values[2:], canonical.values[1:])
+
+    representative_times = np.asarray([duration_h, 0.25, 0.5, 1.0, 1.5, 17.25, 167.5])
+    for column in range(1, len(schedule_service.profiles.SCHEDULE_FIELDS)):
+        original = np.interp(representative_times, canonical.values[:, 0], canonical.values[:, column])
+        transformed = np.interp(representative_times, handoff.values[:, 0], handoff.values[:, column])
+        np.testing.assert_allclose(transformed, original, rtol=0.0, atol=2.0e-15)
+
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+    assert startup == {
+        "enabled": True,
+        "duration_h": duration_h,
+        "temperature_start_source": "T_init",
+        "temperature_source_relationship": "T_init=T_amb",
+        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
+        "rejoin_policy": "linear_interpolation_of_original_canonical_schedule",
+    }
+
+
+def test_disabled_comsol_startup_handoff_is_exactly_canonical() -> None:
+    """Keep the previous final table bytes when the startup policy is disabled."""
+    canonical = _schedule()
+    handoff = schedule_service.build_comsol_boundary_schedule(
+        canonical,
+        {"enabled": False, "duration_h": 1.0 / 6.0},
+        initial_temperature=293.15,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+    np.testing.assert_array_equal(handoff.values, canonical.values)
+    assert handoff.values.tobytes() == canonical.values.tobytes()
+    assert handoff.metadata["boundary_handoff"]["rejoin_row"] is None
+
+
+def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
+    """Keep startup validity separate from the canonical operating envelope."""
+    canonical = _schedule()
+    with pytest.raises(ValueError, match="physically positive"):
+        schedule_service.build_comsol_boundary_schedule(
+            canonical,
+            {"enabled": True, "duration_h": 1.0 / 6.0},
+            initial_temperature=-1.0,
+            pressure=float(_FIXED["p_ref"]),
+        )
+
+
 def test_event_count_is_the_only_event_presence_switch() -> None:
     """Protect deterministic event semantics without hidden activation draws."""
     time = np.asarray(_TIME["regular_times"], dtype=np.float64)

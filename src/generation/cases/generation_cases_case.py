@@ -227,8 +227,8 @@ def _write_scalar_file(
     return path, entries
 
 
-def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: schedule_service.Schedule) -> Path:
-    """Write the exact four-column regular schedule adapter."""
+def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: schedule_service.ComsolBoundarySchedule) -> Path:
+    """Write the exact four-column COMSOL boundary interpolation table."""
     columns = list(spec["columns"])
     if tuple(columns) != profiles.SCHEDULE_FIELDS or schedule.values.ndim != _TABLE_RANK or schedule.values.shape[1] != len(columns):
         msg = "Generated schedule does not satisfy the configured adapter field contract."
@@ -392,6 +392,15 @@ def generate_case_input_bundle(
                 for name in schedule_seed_names
             },
         )
+    boundary_schedule: schedule_service.ComsolBoundarySchedule | None = None
+    if schedule is not None:
+        boundary_schedule = schedule_service.build_comsol_boundary_schedule(
+            schedule,
+            config.scientific_values["boundary_schedule"]["startup_ramp"],
+            initial_temperature=float(values["T_init"]),
+            pressure=float(fixed["p_ref"]),
+        )
+
     input_contract = config.scientific_values["input_contract"]
     spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
     input_paths_list = [spatial_path]
@@ -405,8 +414,8 @@ def generate_case_input_bundle(
             units,
         )
         input_paths_list.append(scalar_path)
-    if schedule is not None:
-        input_paths_list.append(_write_schedule_file(bundle_dir, input_contract["schedule"], schedule))
+    if boundary_schedule is not None:
+        input_paths_list.append(_write_schedule_file(bundle_dir, input_contract["schedule"], boundary_schedule))
     input_paths = tuple(sorted(input_paths_list, key=lambda item: item.name))
     input_files = {
         path.name: {
@@ -497,8 +506,8 @@ def generate_case_input_bundle(
             "entries": scalar_entries_payload,
         }
         case_payload["scalars"] = scalar_entries_payload
-    if schedule is not None:
-        case_payload["schedule_diagnostics"] = schedule.metadata
+    if boundary_schedule is not None:
+        case_payload["schedule_diagnostics"] = boundary_schedule.metadata
     scalar_admission = (
         None
         if scalar_path is None

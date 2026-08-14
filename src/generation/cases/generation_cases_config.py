@@ -1256,6 +1256,7 @@ def _validate_operations(
         "schema_version",
         "operation_id",
         "constraints",
+        "boundary_schedule",
         "parameter_values",
     }
     _exact_keys(operations, required=expected, optional=set(), label="generation operations configuration")
@@ -1284,6 +1285,43 @@ def _validate_operations(
         message = "operations.constraints must match the supplied heater, humidity, rejection, and porosity policies."
         raise GenerationConfigError(message)
     operations["constraints"] = constraints
+
+    boundary_schedule = _mapping(
+        operations["boundary_schedule"],
+        label="operations.boundary_schedule",
+    )
+    _exact_keys(
+        boundary_schedule,
+        required={"startup_ramp"},
+        optional=set(),
+        label="operations.boundary_schedule",
+    )
+    startup_ramp = _mapping(
+        boundary_schedule["startup_ramp"],
+        label="operations.boundary_schedule.startup_ramp",
+    )
+    _exact_keys(
+        startup_ramp,
+        required={"enabled", "duration_h"},
+        optional=set(),
+        label="operations.boundary_schedule.startup_ramp",
+    )
+    if not isinstance(startup_ramp["enabled"], bool):
+        message = "operations.boundary_schedule.startup_ramp.enabled must be boolean."
+        raise GenerationConfigError(message)
+    duration_h = _finite(
+        startup_ramp["duration_h"],
+        label="operations.boundary_schedule.startup_ramp.duration_h",
+    )
+    regular_interval = float(time_contract["interval"])
+    if not 0.0 < duration_h < regular_interval:
+        message = "operations.boundary_schedule.startup_ramp.duration_h must be strictly positive and shorter than common.time.interval."
+        raise GenerationConfigError(message)
+    boundary_schedule["startup_ramp"] = {
+        "enabled": startup_ramp["enabled"],
+        "duration_h": duration_h,
+    }
+    operations["boundary_schedule"] = boundary_schedule
 
     parameter_values = _mapping(operations["parameter_values"], label="operations.parameter_values")
     material_owned = {
@@ -2136,6 +2174,8 @@ def _build_batch(
     if profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         scientific.update(
             {
+                "boundary_schedule": copy.deepcopy(dict(common_config["_boundary_schedule"])),
+                "boundary_schedule_handoff_version": schedule_service.COMSOL_BOUNDARY_HANDOFF_VERSION,
                 "schedule_generator_version": schedule_service.SCHEDULE_GENERATOR_VERSION,
                 "physical_formulas": copy.deepcopy(dict(common_config["physical_formulas"])),
                 "physical_formulas_provenance": copy.deepcopy(dict(common_config["physical_formulas_provenance"])),
@@ -2428,6 +2468,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     common_with_profile["_profile_exports"] = profile_config["exports"]
     common_with_profile["_steady_flow_conditioning"] = profile_config["steady_flow_conditioning"]
     common_with_profile["_operation_constraints"] = operations["constraints"]
+    common_with_profile["_boundary_schedule"] = operations["boundary_schedule"]
     active_names = set(materials.profile_parameter_names(definitions, profile.id))
     active_operation = {name: operations["parameter_values"][name] for name in operations["parameter_values"] if name in active_names}
     active_constraints = (
@@ -2435,13 +2476,13 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         if profile.id == profiles.TRANSIENT_DRYING_PROFILE
         else {"porosity_natural_support_policy": operations["constraints"]["porosity_natural_support_policy"]}
     )
-    operations_digest = common.serialization.canonical_json_sha256(
-        {
-            "operation_id": operations["operation_id"],
-            "parameter_values": active_operation,
-            "constraints": active_constraints,
-        }
-    )
+    operation_identity = {
+        "operation_id": operations["operation_id"],
+        "parameter_values": active_operation,
+        "constraints": active_constraints,
+        **({"boundary_schedule": operations["boundary_schedule"]} if profile.id == profiles.TRANSIENT_DRYING_PROFILE else {}),
+    }
+    operations_digest = common.serialization.canonical_json_sha256(operation_identity)
 
     batches: list[GenerationConfig] = []
     for sampling_regime in sampling_regimes:

@@ -184,10 +184,10 @@ def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None
                 assert sample.ood_provenance["units_per_case"] == 1
 
 
-def test_generation_and_hdf5_versions_are_integer_one(
+def test_generation_and_hdf5_versions_are_explicit_integers(
     generation_config_factory: Any,
 ) -> None:
-    """Reject pre-dataset named version strings at the owning config loader."""
+    """Reject named versions and preserve the active persisted schema identities."""
     config_path, _template = generation_config_factory()
     batch = generation.cases.config.load_campaign_config(config_path).batches[0]
     versions = (
@@ -271,6 +271,63 @@ def test_transient_validation_tolerance_has_scoped_identity_ownership(
     assert changed_steady.scientific_config_digest == original_steady.scientific_config_digest
     assert changed_steady.batch_id == original_steady.batch_id
     assert changed_steady.case_input_config_digest == original_steady.case_input_config_digest
+
+
+def test_startup_ramp_has_transient_input_identity_without_affecting_steady_batches(
+    generation_config_factory: Any,
+) -> None:
+    """Bind the COMSOL handoff policy only to transient scientific inputs."""
+    transient_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    original_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    operations_path = transient_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+    changed_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
+
+    assert changed_transient.scientific_values["boundary_schedule"] == {"startup_ramp": {"enabled": True, "duration_h": 0.25}}
+    assert changed_transient.scientific_values["time"] == original_transient.scientific_values["time"]
+    assert changed_transient.scientific_config_digest != original_transient.scientific_config_digest
+    assert changed_transient.case_input_config_digest != original_transient.case_input_config_digest
+    assert changed_transient.batch_id != original_transient.batch_id
+
+    steady_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    original_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
+    steady_operations_path = steady_path.parent / "operations.yaml"
+    steady_operations = yaml.safe_load(steady_operations_path.read_text(encoding="utf-8"))
+    steady_operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
+    steady_operations_path.write_text(yaml.safe_dump(steady_operations, sort_keys=False), encoding="utf-8")
+    changed_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
+
+    assert "boundary_schedule" not in changed_steady.scientific_values
+    assert changed_steady.scientific_config_digest == original_steady.scientific_config_digest
+    assert changed_steady.case_input_config_digest == original_steady.case_input_config_digest
+    assert changed_steady.batch_id == original_steady.batch_id
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("enabled", "true", "enabled must be boolean"),
+        ("duration_h", 0.0, "strictly positive and shorter"),
+        ("duration_h", 1.0, "strictly positive and shorter"),
+    ],
+)
+def test_startup_ramp_configuration_is_strict(
+    generation_config_factory: Any,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Reject disabled types and durations outside one regular interval."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    operations["boundary_schedule"]["startup_ramp"][key] = value
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
+        generation.cases.config.load_campaign_config(config_path)
 
 
 def _temporary_family_campaign(
@@ -635,6 +692,41 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
         inventory.inspect_campaign_parameter(steady, "density_calibration")
     with pytest.raises(ValueError, match="not applicable to profile 'steady_flow'"):
         inventory.inspect_campaign_parameter(steady, "time.stop")
+
+
+def test_schedule_csv_is_the_identity_bound_comsol_handoff(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Hash the transformed table while retaining the separate hourly output grid."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=generation.cases.config.build_batch_name(
+            "transient_drying",
+            "lentil",
+            "natural",
+        ),
+    )
+    bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "startup_case")
+    schedule_path = bundle.directory / "schedule.csv"
+    schedule = np.loadtxt(schedule_path, delimiter=";", skiprows=1)
+    duration_h = config.scientific_values["boundary_schedule"]["startup_ramp"]["duration_h"]
+
+    np.testing.assert_array_equal(schedule[:5, 0], [0.0, duration_h, 1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(
+        config.scientific_values["time"]["regular_times"],
+        np.arange(169, dtype=np.float64),
+    )
+    assert schedule.shape[0] == len(config.scientific_values["time"]["regular_times"]) + 1
+    assert schedule[0, 1] == bundle.case_payload["sampled_values"]["T_init"]
+    schedule_identity = bundle.case_payload["input_files"]["schedule.csv"]
+    assert schedule_identity == {
+        "sha256": common.serialization.file_sha256(schedule_path),
+        "size_bytes": schedule_path.stat().st_size,
+    }
+    assert bundle.case_payload["case_input_id"] == generation.cases.case.compute_case_input_id(bundle.case_payload)
+    assert bundle.case_payload["schedule_diagnostics"]["boundary_handoff"]["startup_ramp"]["enabled"] is True
 
 
 def test_scalar_handoff_rejects_an_unknown_name(

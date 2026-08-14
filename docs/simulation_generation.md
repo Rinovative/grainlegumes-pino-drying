@@ -161,6 +161,16 @@ and CPU source are retained. A failed smoke never publishes Production
 evidence; inspect its retained case and export diagnostics rather than deleting
 or recreating evidence manually.
 
+Transient boundary input also separates the canonical hourly stochastic
+schedule from the final COMSOL interpolation table. The fixed-bed
+`boundary_schedule.startup_ramp` policy adds only the configured startup support
+node (10 minutes by default); it does not change `common.time.interval`, COMSOL
+output times, HDF5 state times, or Dataset transitions. The transformed
+`schedule.csv` is built before its case-input hash, and HDF5 retains it as source
+boundary evidence. Dataset state and target indices remain exactly regular; the
+optional startup support is attached to the first hourly transition as boundary
+conditioning rather than becoming another timestep.
+
 Transient admission uses distinct numerical contracts for initial-state
 consistency, bulk-moisture consistency, and float32 storage fidelity. Their
 scientific purpose and single documentation owner are described in the

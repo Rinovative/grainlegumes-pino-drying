@@ -20,6 +20,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections import OrderedDict
@@ -352,16 +353,63 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
             }
             scalar_lookup["T_amb"] = float(scalar_dataset[scalar_names.index("T_amb")])
+            raw_handoff = schedule_dataset.attrs.get("boundary_handoff")
+            if isinstance(raw_handoff, bytes):
+                raw_handoff = raw_handoff.decode("utf-8")
+            if not isinstance(raw_handoff, str):
+                message = f"Transient source lacks boundary-handoff metadata: {path}."
+                raise trajectory.TransientDataContractError(message)
+            try:
+                boundary_handoff = json.loads(raw_handoff)
+            except json.JSONDecodeError as error:
+                message = f"Transient source boundary-handoff metadata is invalid: {path}."
+                raise trajectory.TransientDataContractError(message) from error
+            startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
+            if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
+                message = f"Transient source startup-handoff metadata is invalid: {path}."
+                raise trajectory.TransientDataContractError(message)
+            startup_time = startup.get("duration_h")
+            if isinstance(startup_time, bool) or not isinstance(startup_time, (int, float)) or not math.isfinite(float(startup_time)):
+                message = f"Transient source startup duration is invalid: {path}."
+                raise trajectory.TransientDataContractError(message)
+            startup_time_value = float(startup_time)
             boundary_rows: list[list[float]] = []
             for sample in samples:
                 schedule_n = int(sample["schedule_index_n"])
                 schedule_n_plus_1 = int(sample["schedule_index_n_plus_1"])
+                raw_support_index = sample["schedule_support_index"]
+                schedule_time_n = float(schedule_dataset[schedule_n, schedule_names.index("t")])
+                schedule_time_n_plus_1 = float(schedule_dataset[schedule_n_plus_1, schedule_names.index("t")])
+                support_required = bool(startup["enabled"] and schedule_time_n < startup_time_value < schedule_time_n_plus_1)
+                if support_required != (raw_support_index is not None):
+                    message = f"Transient index startup support disagrees with source handoff: {path}."
+                    raise trajectory.TransientDataContractError(message)
+                support_index = schedule_n if raw_support_index is None else int(raw_support_index)
+                if raw_support_index is not None and not math.isclose(
+                    float(schedule_dataset[support_index, schedule_names.index("t")]),
+                    startup_time_value,
+                    rel_tol=0.0,
+                    abs_tol=tolerance,
+                ):
+                    message = f"Transient index startup support points to the wrong source row: {path}."
+                    raise trajectory.TransientDataContractError(message)
+                support_time_offset = (
+                    0.0
+                    if raw_support_index is None
+                    else float(schedule_dataset[support_index, schedule_names.index("t")])
+                    - float(schedule_dataset[schedule_n, schedule_names.index("t")])
+                )
                 boundary_values = {
                     "T_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in_bc")]),
                     "T_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("T_in_bc")]),
                     "phi_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("phi_in_bc")]),
                     "phi_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("phi_in_bc")]),
                     "T_amb": scalar_lookup["T_amb"],
+                    "startup_support_time_offset": support_time_offset,
+                    "T_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("T_in_bc")]),
+                    "omega_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("omega_in_bc")]),
+                    "phi_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("phi_in_bc")]),
+                    "startup_support_present": float(raw_support_index is not None),
                 }
                 boundary_rows.append([boundary_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning])
             boundary_array = np.asarray(boundary_rows, dtype=np.float32)

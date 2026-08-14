@@ -16,7 +16,7 @@ from src.datasets.runtime import dataset_runtime_transient as transient_runtime
 from src.generation.cases import generation_cases_case as case_contract
 
 _STEADY_DIGEST = "d40dc74f5f8e70dc19a7e592e4d720ff27ca6131b70bd64d88556791566fac0a"
-_TRANSIENT_DIGEST = "40715d172f8bbda1a863e0f59f014e604c53f1c0bf4428ae0e2fc58ee82f1823"
+_TRANSIENT_DIGEST = "ee84455fb6265aba26abe19c3f0167226aad9b672d2228096cb74e59be36d077"
 
 
 def test_package_payload_schema_identity_is_view_specific() -> None:
@@ -87,8 +87,8 @@ def test_contract_inspection_is_uniform_immutable_and_preserves_persisted_identi
     assert tuple(field.name for field in transient.temporal.fields) == ("t_n", "t_n_plus_1", "dt")
     assert transient.temporal.authoritative_source == "canonical_hdf5_regular_time_axis"
     assert transient.temporal.configured_horizon_source == "generation_scientific_config.time.stop"
-    assert transient.temporal.boundary_interval_interpolation == "linear_between_regular_schedule_nodes"
-    assert transient.temporal.boundary_interval_representation == "endpoint_values_complete_no_redundant_interval_features"
+    assert transient.temporal.boundary_interval_interpolation == "linear_between_boundary_schedule_support_nodes"
+    assert transient.temporal.boundary_interval_representation == "regular_endpoints_plus_optional_startup_support_without_extra_training_timestep"
     assert transient.sampling_modes == ("one_step_transition", "rollout_window")
     assert transient.storage_representation == step.canonical_storage_representation
     assert transient.target_semantics == "next_state_minus_current_state"
@@ -131,6 +131,13 @@ def test_transient_contract_derives_source_fields_and_owns_persisted_serializer(
     )
     assert {field.name for field in contract.static_spatial_conditioning}.issuperset({"eps_bed", "rho_bu_dry"})
     assert "T_amb" in {field.name for field in contract.step_boundary_conditioning}
+    assert tuple(field.name for field in contract.step_boundary_conditioning[-5:]) == (
+        "startup_support_time_offset",
+        "T_in_bc_startup_support",
+        "omega_in_bc_startup_support",
+        "phi_in_bc_startup_support",
+        "startup_support_present",
+    )
     assert contract.temporal.exact_stop_usage == "diagnostic_only_no_training_transition_or_rollout"
     payload = transient_contract.transient_contract_payload()
     assert payload["time"]["fields"] == [
@@ -140,8 +147,8 @@ def test_transient_contract_derives_source_fields_and_owns_persisted_serializer(
     ]
     assert payload["time"]["configured_horizon_source"] == "generation_scientific_config.time.stop"
     assert payload["boundary_interval"] == {
-        "interpolation": "linear_between_regular_schedule_nodes",
-        "representation": "endpoint_values_complete_no_redundant_interval_features",
+        "interpolation": "linear_between_boundary_schedule_support_nodes",
+        "representation": "regular_endpoints_plus_optional_startup_support_without_extra_training_timestep",
     }
     assert not {"interval_mean", "interval_integral", "interval_sequence"}.intersection(field["name"] for field in payload["boundary"])
     assert payload["sampling"]["modes"] == ["one_step_transition", "rollout_window"]

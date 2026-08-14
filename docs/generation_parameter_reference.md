@@ -166,6 +166,26 @@ candidate is rejected as a whole rather than repaired by pointwise clipping.
 Schedule supports and composition are synthetic design assumptions, not
 literature measurements.
 
+The accepted stochastic schedule remains canonical on `common.time.regular_times`
+(`0 h, 1 h, ..., 168 h` for the current configuration). The fixed-bed operation
+then applies a separate COMSOL handoff policy from
+`boundary_schedule.startup_ramp`: `enabled` selects the transformation and
+`duration_h` must lie strictly between zero and the regular interval. With the
+default `duration_h: 0.16666666666666666`, the final interpolation table begins
+at `0 h, 1/6 h, 1 h, ...`. At zero, `T_in_bc` uses the established
+`T_init = T_amb` source, `omega_in_bc` retains the canonical incoming-air
+composition, and `phi_in_bc` is recomputed by the central psychrometric
+conversion. The rejoin row is the original COMSOL-linear interpolation at
+`1/6 h`; all passed schedule functions are therefore identical to the original
+continuous schedule from that point onward.
+
+The extra row is boundary interpolation support, not a regular output state.
+COMSOL output, HDF5 state time, and Dataset transitions continue to use only
+`common.time.regular_times`. The final `schedule.csv` bytes are hashed before
+execution and are persisted with handoff version, policy, source, humidity, and
+rejoin provenance. Disabling the ramp retains the previous canonical table
+values and times exactly.
+
 ### Moisture, heat, and equilibrium coupling
 
 Granular water is divided between surface and internal compartments:
@@ -243,11 +263,13 @@ role, natural or OOD selection, selected values or complete records, scientific
 configuration, relevant diagnostics, and content identities. Exact admission
 rejects stale or structurally incompatible artifacts.
 
-The active Generation YAML, case, and persisted schema contracts are version 1.
-The schedule generator is a separately persisted algorithm contract and is
-currently version 2. These are different version domains: a schema version does
-not describe the schedule algorithm, and content changes can change identities
-without changing either version number.
+The active Generation YAML, case, canonical HDF5, and transient-transition
+index schema contracts are version 1. The persisted boundary table carries
+startup-handoff support, and the first regular transition indexes that support
+explicitly. The schedule generator is a separately persisted algorithm contract
+at version 2; the COMSOL boundary handoff algorithm is version 1. These are distinct version domains:
+schema versions describe persisted structure, while algorithm versions describe how
+scientific values are constructed.
 
 ## Source attribution
 
