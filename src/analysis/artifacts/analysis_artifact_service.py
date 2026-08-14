@@ -814,30 +814,8 @@ def _read_artifact_provenance(path: Path) -> Mapping[str, Any]:
 
 
 def _scientific_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
-    """
-    Isolate the scientific request identity used to compare cache provenance.
-
-    Operational device facts, generated aggregate values, and output digests
-    are excluded. The saved online-evaluation batch size remains under generation
-    provenance because batch-sensitive operators must reproduce that exact path.
-    """
-    identity = dict(provenance)
-    identity.pop("runtime", None)
-    identity.pop("aggregate", None)
-    identity.pop("outputs", None)
-    run = identity.get("run")
-    if isinstance(run, Mapping) and run.get("is_provisional") is not True:
-        normalized_run = dict(run)
-        for field in (
-            "best_checkpoint_epoch",
-            "lifecycle_status",
-            "is_completed",
-            "is_provisional",
-            "selected_checkpoint_role",
-        ):
-            normalized_run.pop(field, None)
-        identity["run"] = normalized_run
-    return identity
+    """Return the centralized positive evaluation-artifact identity payload."""
+    return contracts.artifact_identity_payload(provenance)
 
 
 def _require_current_provenance_schema(provenance: Mapping[str, Any]) -> None:

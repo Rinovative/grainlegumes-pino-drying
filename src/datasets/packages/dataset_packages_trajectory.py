@@ -124,7 +124,7 @@ def _scientific_config(
         message = f"Transient scientific config provenance is invalid JSON: {path}."
         raise TransientDataContractError(message) from error
     digest = _text_attribute(handle.attrs.get("scientific_config_digest"), label="scientific_config_digest")
-    if not isinstance(scientific, dict) or common.serialization.canonical_json_sha256(scientific) != digest:
+    if not isinstance(scientific, dict) or generation.cases.config.compute_scientific_config_digest(scientific) != digest:
         message = f"Transient scientific config provenance disagrees with its HDF5 identity: {path}."
         raise TransientDataContractError(message)
     return scientific

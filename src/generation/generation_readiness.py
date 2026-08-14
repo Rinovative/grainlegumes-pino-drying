@@ -95,7 +95,7 @@ def _profile_mapping_missing(campaign_path: Path) -> list[str]:
     profile_path = configured if configured.is_absolute() else common.paths.get_project_root() / configured
     profile = _yaml(profile_path)
     prefix = _relative(profile_path)
-    profile_spec = profiles.get_profile(str(profile["simulation_profile"]))
+    profile_spec = profiles.resolve_profile(str(profile["simulation_profile"]))
     missing: list[str] = []
     for index, export in enumerate(profile["exports"]):
         role_spec = profile_spec.export_role(str(export["role"]))

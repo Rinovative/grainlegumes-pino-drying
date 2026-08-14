@@ -28,6 +28,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,178 @@ NORMALIZED_DIAGNOSTIC_TOLERANCE = {"rtol": 2e-5, "atol": 1e-12}
 EVAL_PAD = 2
 ARTIFACT_DERIVATIVE_KIND = "spectral"
 ARTIFACT_DERIVATIVE_EXTENSION = "reflect"
+_ARTIFACT_IDENTITY_CONTRACT = {
+    "schema_kind": "evaluation_artifact_semantic_identity",
+    "schema_version": 1,
+    "checkpoint_semantics": "exact_best_checkpoint_bytes",
+    "dataset_semantics": "exact_dataset_and_ordered_split_membership",
+    "evaluation_semantics": "resolved_metric_evaluator_and_physics_contracts",
+    "output_integrity": "separate_manifest_of_exact_payload_bytes",
+}
+ARTIFACT_IDENTITY_CONTRACT_DIGEST = hashlib.sha256(
+    json.dumps(
+        _ARTIFACT_IDENTITY_CONTRACT,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
+
+
+def _identity_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    """Return one mapping used by evaluation-artifact semantic identity."""
+    if not isinstance(value, Mapping):
+        message = f"Artifact identity {label} must be a mapping."
+        raise TypeError(message)
+    return value
+
+
+def _selected_identity_fields(
+    value: Any,
+    *,
+    fields: tuple[str, ...],
+    label: str,
+) -> dict[str, Any]:
+    """Select required semantic fields from one persisted provenance section."""
+    mapping = _identity_mapping(value, label=label)
+    missing = [field for field in fields if field not in mapping]
+    if missing:
+        message = f"Artifact identity {label} is missing semantic fields {missing}."
+        raise ValueError(message)
+    return {field: deepcopy(mapping[field]) for field in fields}
+
+
+def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    """Return positive model, Dataset, split, evaluator, and physics dependencies."""
+    required_top_level = (
+        "provenance_schema_version",
+        "artifact_schema_version",
+        "run",
+        "model",
+        "split_role",
+        "dataset",
+        "selection",
+        "normalizer",
+        "evaluator",
+        "generation",
+    )
+    missing = [field for field in required_top_level if field not in provenance]
+    if missing:
+        message = f"Artifact identity provenance is missing semantic sections {missing}."
+        raise ValueError(message)
+    run = _selected_identity_fields(
+        provenance["run"],
+        fields=(
+            "task",
+            "task_contract_digest",
+            "effective_config_digest",
+            "best_checkpoint_sha256",
+            "normalizer_sha256",
+        ),
+        label="run",
+    )
+    model_mapping = _identity_mapping(provenance["model"], label="model")
+    model = _selected_identity_fields(
+        model_mapping,
+        fields=("kind", "architecture", "physics_enabled"),
+        label="model",
+    )
+    if "parameter_counts" in model_mapping:
+        model["parameter_counts"] = deepcopy(model_mapping["parameter_counts"])
+    payload = {
+        "identity_contract_sha256": ARTIFACT_IDENTITY_CONTRACT_DIGEST,
+        "provenance_schema_version": deepcopy(provenance["provenance_schema_version"]),
+        "artifact_schema_version": deepcopy(provenance["artifact_schema_version"]),
+        "run": run,
+        "model": model,
+        "split_role": deepcopy(provenance["split_role"]),
+        "dataset": _selected_identity_fields(
+            provenance["dataset"],
+            fields=("name", "full_case_count", "fingerprint", "data_contract_digest", "saved_membership_digest"),
+            label="dataset",
+        ),
+        "selection": _selected_identity_fields(
+            provenance["selection"],
+            fields=(
+                "full_selected_case_count",
+                "effective_case_count",
+                "generation_limit",
+                "full_ordered_source_indices_sha256",
+                "effective_ordered_source_indices_sha256",
+            ),
+            label="selection",
+        ),
+        "normalizer": _selected_identity_fields(
+            provenance["normalizer"],
+            fields=(
+                "sha256",
+                "fit_split",
+                "output_normalization",
+                "denominator_floor",
+                "output_standard_deviations",
+            ),
+            label="normalizer",
+        ),
+        "evaluator": _selected_identity_fields(
+            provenance["evaluator"],
+            fields=(
+                "metrics",
+                "objective",
+                "input_fields",
+                "input_units",
+                "output_fields",
+                "output_units",
+                "output_groups",
+                "physics_kind",
+                "group_objective_evidence",
+                "predictive_metrics",
+            ),
+            label="evaluator",
+        ),
+        "generation": _selected_identity_fields(
+            provenance["generation"],
+            fields=("effective_case_limit", "inference_batch_size", "compression"),
+            label="generation",
+        ),
+    }
+    if "physics" in provenance:
+        payload["physics"] = _selected_identity_fields(
+            provenance["physics"],
+            fields=(
+                "residual_schema_version",
+                "task_id",
+                "task_contract_digest",
+                "equation_kind",
+                "equation_set",
+                "boundary_condition_kind",
+                "selected_training_continuity",
+                "evaluated_continuity_formulations",
+                "constants",
+                "permeability_representation",
+                "derivatives",
+                "interior_crop",
+                "residual_evaluation_region",
+                "scalar_definitions",
+                "array_definitions",
+            ),
+            label="physics",
+        )
+    return payload
+
+
+def artifact_identity_digest(provenance: Mapping[str, Any]) -> str:
+    """Hash the current dependency-scoped evaluation-artifact identity."""
+    payload = artifact_identity_payload(provenance)
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def resolve_case_payload_path(

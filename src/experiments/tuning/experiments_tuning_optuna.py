@@ -731,21 +731,8 @@ def _validate_study_contract(config: OptunaStudyConfig) -> tuple[OptunaStudyConf
 
 
 def _scientific_base_config(base_config: Mapping[str, Any]) -> dict[str, Any]:
-    """
-    Project the resolved base config into invocation-independent science identity.
-
-    Paths, W&B policy, device, generated run name, and suffix are removed.
-    Task, data, model, loss, objective, optimizer, scheduler, duration, seed, and
-    deterministic semantics remain signature-bearing.
-    """
-    scientific = copy.deepcopy(dict(base_config))
-    scientific.pop("paths", None)
-    scientific.pop("tracking", None)
-    run = dict(_as_mapping(scientific.get("run"), label="base_config.run"))
-    for key in ("device", "name", "suffix"):
-        run.pop(key, None)
-    scientific["run"] = run
-    return scientific
+    """Reuse the positive completed-training dependency payload for study identity."""
+    return learning.training.checkpoint.effective_config_identity_payload(base_config)
 
 
 def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
@@ -1407,6 +1394,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         checkpoint_identity = learning.training.checkpoint.build_checkpoint_identity(
             config,
             dataloaders["split_indices"],
+            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=config,
         )
         amp_enabled = bool(config["training"]["mixed_precision"])

@@ -1,6 +1,7 @@
 schema_kind: generation_profile
 schema_version: 1
 simulation_profile: transient_drying
+template: simulation/transient_drying/transient_drying_template.mph
 steady_flow_conditioning:
   schema_kind: steady_flow_conditioning
   schema_version: 1

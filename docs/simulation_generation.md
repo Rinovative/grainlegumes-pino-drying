@@ -95,7 +95,8 @@ configuration and generated evidence.
 | Parameter meanings, units, transforms, sampling blocks, OOD eligibility | `configs/generation/registry.yaml` |
 | Material values, natural supports, OOD supports/records, source references | `configs/generation/materials/*.yaml` |
 | Boundary conditions, schedule supports, and physical constraints | `configs/generation/operations/fixed_bed.yaml` |
-| Profile inputs, exports, mappings, and template identity | `configs/generation/profiles/*.yaml` |
+| Profile inputs, exports, mappings, and the concrete template locator | `configs/generation/profiles/*.yaml` |
+| Expected template-byte digest | Adjacent, mechanically derived `.sha256` sidecar |
 | Campaign purpose, material roles, counts, membership, seeds, Dataset requests | `configs/generation/campaigns/<profile>/*.yaml` |
 | Per-case resources, feeder, retry, timeout, retention, CPU site | `configs/generation/execution/cluster_cpu.yaml` |
 | Core-benchmark variants and repetitions | `configs/generation/benchmarks/transient_core_scaling/*.yaml` |
@@ -107,6 +108,77 @@ configuration and generated evidence.
 Use `validate-config --allow-incomplete`, `readiness-report`, and `plan` to
 inspect current resolved supports, counts, seeds, OOD allocation, identities,
 resources, and gates. Do not maintain those derived snapshots in documentation.
+
+### Updating a COMSOL template
+
+A profile YAML owns one repository-relative `template:` value. The resolver
+requires a regular, non-symlink `.mph` file inside the repository and derives
+its sidecar with `Path.with_suffix(".sha256")`. The profile does not repeat the
+digest or sidecar path.
+
+Template changes are an explicit four-step workflow:
+
+1. Edit and save the `.mph` bytes named by the selected profile. If the file is
+   renamed, update only that profile's `template:` value.
+2. Regenerate the adjacent sidecar deliberately:
+
+   ```bash
+   TEMPLATE="<value copied from the selected profile YAML>"
+   SIDECAR="${TEMPLATE%.mph}.sha256"
+   sha256sum -- "${TEMPLATE}" | cut -d ' ' -f 1 > "${SIDECAR}"
+   ```
+
+3. Run `validate-config --allow-incomplete` for a campaign using that profile,
+   then run the relevant static checks and Technical Smoke before Production.
+4. Review and commit the intended profile, template, and sidecar changes
+   together.
+
+The canonical sidecar contains exactly one lowercase 64-character digest
+followed by a newline. Validation, planning, launch, smoke, and COMSOL execution
+never rewrite or accept a new digest automatically.
+
+### Identity and provenance policy
+
+An identity includes only dependencies needed to distinguish its meaning:
+
+- **Semantic dependencies** change scientific values, tensor contents, ordered
+  membership, model behavior, or evaluation results.
+- **Implementation-contract dependencies** are explicit digests for algorithms,
+  schemas, mappings, and validators whose behavior affects those results.
+- **Execution dependencies** select or control one native run, such as the exact
+  Git commit and resolved CPU resource configuration.
+- **Provenance and operational locators** explain where, when, and how work ran
+  without defining portable scientific meaning.
+
+Complete provenance remains persisted and integrity-checked; it is not broadly
+subtracted from a hash. Each durable identity is built from a positive,
+owner-declared payload.
+
+| Identity layer | Included dependencies | Excluded from portable semantic identity | Creates a new identity when |
+| --- | --- | --- | --- |
+| Case input | Canonical generated inputs, parameter values, seeds, input contracts | Template bytes/path, Git, host, job, time | Generated inputs, values, seeds, or their contract change |
+| Simulation case and batch | Case-input identity, template SHA-256, scientific configuration, export/native mapping, HDF5 and conditioning contracts | Template path, Git, CPU resources, scheduler evidence | Template bytes, scientific configuration, mappings, or simulation contracts change |
+| Campaign science | Ordered batch identities, memberships, sampling policy, campaign seed, requested Dataset semantics | Campaign YAML path, Git, host, Slurm IDs | Scientific membership, sampling, seed, batch, or Dataset request changes |
+| Campaign run | Campaign digest and batches plus exact Git commit and resolved execution configuration | Not portable: this is an execution identity | Active source revision or native execution configuration changes |
+| Dataset package | Ordered source simulation/HDF5 identities, converter, view/channel, membership, and package contracts | Source paths, Git, host/time, success/provenance receipt hashes | HDF5 bytes, source semantics/order, conversion, view, channel, or membership changes |
+| Split and preprocessing | Dataset identity, ordered role membership, split seed/policy, fitted normalizer state and contract | Storage paths, worker count, tracking labels | Dataset/order/split or fitted preprocessing changes |
+| Training and checkpoint | Effective model/loss/optimizer/training configuration, task contract, Dataset/split identities, normalizer hash, objective | Paths, device, worker count, tracking, run labels, timestamps | A represented training, data, split, normalization, or objective dependency changes |
+| Optuna study/trial | Scientific base configuration, search space, objective, sampler, pruner, and lifecycle contracts | Paths, tracking, device, generated run names | Search or represented scientific/optimization behavior changes |
+| Evaluation artifact | Exact checkpoint and normalizer bytes, Dataset/split identity, resolved evaluation configuration, evaluator/metric/physics contracts | Current HEAD, run path/name, runtime summaries, output locators | Model bytes, data/split, evaluation configuration, or evaluator/metric contracts change |
+| Output manifest | Exact published output inventory and byte hashes | Unrelated repository state | Any published output byte or inventory entry changes |
+
+The template locator is provenance: moving identical bytes and updating the
+profile does not change portable semantic identity. Changing template bytes
+changes simulation and batch identity, then Dataset, model, and evaluation
+identity downstream; it deliberately does not change `case_input_id` when the
+generated inputs are unchanged.
+
+Active native planning, launch, feeding, and resume remain bound to an exact
+clean Git commit because code is an execution dependency for work still being
+performed. A later unrelated commit does not invalidate a completed immutable
+Dataset, checkpoint, model, or evaluation artifact: completed readers verify its
+persisted semantic contracts and exact artifact bytes. All active readers
+require the current positive semantic payloads without changing schema version 1.
 
 ## Execution model and safety
 
@@ -221,6 +293,29 @@ The foreground `all` or `resume` process performs polling and queue feeding.
 If it disconnects, already submitted Slurm jobs continue; disconnecting does not
 cancel them. Resume reconciles persisted job IDs, scheduler accounting, and
 validated case evidence before submitting anything else.
+
+### Terminal output and detailed evidence
+
+The high-level `all`, `resume`, `pilot-check`, and `benchmark-cores`
+commands print stable plain-text stages. Polling renders immediately when state
+or available counts change, remains quiet while unchanged, and emits at most one
+unchanged heartbeat every five minutes. Redirected and non-interactive logs use
+the same text without colour or cursor control.
+
+Direct detail and machine surfaces retain their existing output: `plan` and
+`launch` expose their JSON, status and scheduler commands expose current state,
+and inner JSON/TSV/path formats remain parseable. The concise wrappers capture
+those documents rather than replaying complete plans, transfer inventories,
+Dataset manifests, or workflow receipts.
+
+Canonical Generation evidence remains under `01_generation`; campaign and
+batch manifests record exact scheduler-log and case-evidence locations.
+Immutable Dataset manifests remain under `02_datasets`, and training,
+checkpoint, artifact, and evaluation evidence remains under `03_experiments`.
+A failed consolidated workflow prints the exact append-only failure-record path,
+retained CPU bytes, and copyable resume command. Use `status`, `accounting`,
+and the printed evidence paths for full details; terminal excerpts never replace
+the durable logs.
 
 ## Evidence, readiness, and retention
 

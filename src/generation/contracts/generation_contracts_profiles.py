@@ -4,30 +4,24 @@ generation_contracts_profiles.py
 ===============================================================================
 Define the authoritative reference-simulation profile contracts.
 Responsibilities:
-  - Register the exact supported profile and immutable template identities
+  - Register the exact supported logical simulation profiles
   - Declare canonical input, export-role, unit, and learning-view contracts
-  - Validate repository template digests before generation or execution
+  - Expose profile-owned downstream interpretation invariants
 Design principles:
-  - Logical fields are stable while COMSOL headers remain explicit configuration
+  - Logical fields are stable while concrete templates remain configuration
   - Profile selection is explicit and never inferred from filenames or tasks
   - The registered steady-flow TaskSpec shares the canonical field names
 This module does NOT:
-  - Guess COMSOL tags, expressions, filenames, or sign conventions
+  - Own concrete template or sidecar paths
   - Load YAML, generate fields, execute COMSOL, or register transient learning
 ===============================================================================
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
-
-from src import common
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from typing import Final
 
 STEADY_FLOW_PROFILE = "steady_flow"
 TRANSIENT_DRYING_PROFILE = "transient_drying"
@@ -40,8 +34,6 @@ FINAL_STATUS_EXPORT_ROLE = "final_status"
 STEADY_FLOW_LEARNING_VIEW = "steady_flow"
 TRANSIENT_DRYING_LEARNING_VIEW = "transient_drying"
 STATIONARITY_TOLERANCE = 1e-10
-_SIDECAR_PART_COUNT = 2
-_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 STEADY_SPATIAL_INPUT_FIELDS: Final = (
     "x",
@@ -174,34 +166,9 @@ class SimulationProfile:
     """Describe one immutable reference-simulation profile."""
 
     id: str
-    template_relative_path: str
-    template_sha256_source: str
     export_roles: tuple[ExportRoleSpec, ...]
     available_learning_views: tuple[str, ...]
     airflow_source: str
-
-    @property
-    def template_path(self) -> Path:
-        """Return the repository-owned immutable template path."""
-        return (common.paths.get_project_root() / self.template_relative_path).resolve()
-
-    @property
-    def template_sha256(self) -> str:
-        """Return the one authoritative expected template digest."""
-        source = self.template_sha256_source
-        if _SHA256_PATTERN.fullmatch(source) is not None:
-            return source
-        sidecar = (common.paths.get_project_root() / source).resolve()
-        try:
-            line = sidecar.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeDecodeError) as error:
-            message = f"Could not read template identity sidecar for profile {self.id!r}: {sidecar}"
-            raise ValueError(message) from error
-        parts = line.split()
-        if len(parts) != _SIDECAR_PART_COUNT or _SHA256_PATTERN.fullmatch(parts[0]) is None or parts[1] != self.template_relative_path:
-            message = f"Template identity sidecar is malformed for profile {self.id!r}: {sidecar}"
-            raise ValueError(message)
-        return parts[0]
 
     @property
     def required_export_roles(self) -> tuple[str, ...]:
@@ -238,16 +205,12 @@ _PROFILES: Final = MappingProxyType(
     {
         STEADY_FLOW_PROFILE: SimulationProfile(
             id=STEADY_FLOW_PROFILE,
-            template_relative_path="simulation/steady_flow/steady_flow_template.mph",
-            template_sha256_source="simulation/steady_flow/steady_flow_template.sha256",
             export_roles=(_STANDALONE_STEADY_ROLE,),
             available_learning_views=(STEADY_FLOW_LEARNING_VIEW,),
             airflow_source=STEADY_AIRFLOW_SOURCE,
         ),
         TRANSIENT_DRYING_PROFILE: SimulationProfile(
             id=TRANSIENT_DRYING_PROFILE,
-            template_relative_path="simulation/transient_drying/transient_drying_template.mph",
-            template_sha256_source="simulation/transient_drying/transient_drying_template.sha256",
             export_roles=(
                 _TRANSIENT_STEADY_ROLE,
                 ExportRoleSpec(
@@ -350,17 +313,3 @@ def resolve_profile(profile_id: str) -> SimulationProfile:
         available = ", ".join(available_profiles())
         message = f"Unknown simulation_profile {profile_id!r}. Available profiles: {available}."
         raise ValueError(message) from error
-
-
-def get_profile(profile_id: str) -> SimulationProfile:
-    """Resolve one profile and validate its immutable template bytes."""
-    profile = resolve_profile(profile_id)
-    path = profile.template_path
-    if not path.is_file() or path.suffix.lower() != ".mph":
-        message = f"Required COMSOL template is missing for profile {profile.id!r}: {path}"
-        raise FileNotFoundError(message)
-    actual = common.serialization.file_sha256(path)
-    if actual != profile.template_sha256:
-        message = f"COMSOL template SHA-256 mismatch for profile {profile.id!r}: expected {profile.template_sha256}, got {actual}."
-        raise ValueError(message)
-    return profile

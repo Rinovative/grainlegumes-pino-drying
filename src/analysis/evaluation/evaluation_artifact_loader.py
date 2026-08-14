@@ -928,8 +928,15 @@ def _bind_artifact_to_run(
         evaluation=evaluation,
     )
     actual_run = dict(_mapping(provenance.get("run"), label="artifact provenance run"))
-    if actual_run != expected_run:
-        msg = "Artifact run provenance does not match the authoritative evaluable run and selected checkpoint."
+    semantic_run_keys = (
+        "task",
+        "task_contract_digest",
+        "effective_config_digest",
+        "best_checkpoint_sha256",
+        "normalizer_sha256",
+    )
+    if {key: actual_run.get(key) for key in semantic_run_keys} != {key: expected_run.get(key) for key in semantic_run_keys}:
+        msg = "Artifact run identity does not match the authoritative config, checkpoint, and normalizer."
         raise ValueError(msg)
     expected_model = _expected_model_provenance(config=config, summary=summary)
     if dict(_mapping(provenance.get("model"), label="artifact provenance model")) != expected_model:
@@ -991,7 +998,7 @@ def _bind_artifact_to_run(
     if runtime_batch_size != evaluation_batch_size:
         msg = "Artifact runtime batch size does not match the evaluable run evaluation batch size."
         raise ValueError(msg)
-    return common.serialization.canonical_json_sha256(dict(provenance))
+    return contracts.artifact_identity_digest(provenance)
 
 
 def _load_role(

@@ -261,7 +261,10 @@ implementation-owned.
 Resolved configuration and generated artifacts preserve material family and
 role, natural or OOD selection, selected values or complete records, scientific
 configuration, relevant diagnostics, and content identities. Exact admission
-rejects stale or structurally incompatible artifacts.
+rejects stale or structurally incompatible artifacts. The maintained
+[identity and provenance policy](simulation_generation.md#identity-and-provenance-policy)
+defines semantic, implementation, execution, and provenance dependencies without
+duplicating them here.
 
 The active Generation YAML, case, canonical HDF5, and transient-transition
 index schema contracts are version 1. The persisted boundary table carries

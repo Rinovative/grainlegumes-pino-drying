@@ -910,7 +910,12 @@ def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
     config = experiments.config.loader.validate_resolved_config(config)
     experiments.config.loader.save_yaml(config, config_path)
     split = torch.load(common.paths.resolve_split_indices_path(run_dir), map_location="cpu", weights_only=False)
-    identity = learning.training.checkpoint.build_checkpoint_identity(config, split, persisted_config=config)
+    identity = learning.training.checkpoint.build_checkpoint_identity(
+        config,
+        split,
+        normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
+        persisted_config=config,
+    )
     for checkpoint_path in (
         common.paths.resolve_best_checkpoint_file(run_dir),
         common.paths.resolve_last_checkpoint_file(run_dir),

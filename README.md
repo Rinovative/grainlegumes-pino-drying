@@ -26,7 +26,9 @@ extensions are not yet implemented.
 Generation, Dataset publication, preprocessing, training, resume, and evaluation
 are identity-bound and fail closed. Current values, campaign inventories, seeds,
 and derived supports are resolved from configuration rather than maintained as
-parallel documentation snapshots.
+parallel documentation snapshots. The
+[identity and provenance policy](docs/simulation_generation.md#identity-and-provenance-policy)
+defines which dependencies invalidate each durable stage.
 
 > Configured scientific values are modelling and sampling decisions. Source
 > references and resolved evidence classifications distinguish measurements,

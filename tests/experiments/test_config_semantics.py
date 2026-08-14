@@ -113,6 +113,31 @@ def test_runtime_location_changes_preserve_scientific_and_resume_identity(
     assert experiments.run.validate_resume_config(second, first) == int(first["training"]["epochs"])
 
 
+def test_reporting_and_data_worker_changes_preserve_training_identity() -> None:
+    """Exclude run labels, reporting, paths, devices, and loader workers from model science."""
+    original = experiments.config.loader.resolve_config(configs.direct_config())
+    operational = copy.deepcopy(original)
+    operational["run"].update(
+        {
+            "name": "relabeled-run",
+            "suffix": "reporting-only",
+            "device": "cuda",
+        }
+    )
+    operational["data"].update(
+        {
+            "num_workers": 17,
+            "pin_memory": not original["data"]["pin_memory"],
+            "persistent_workers": not original["data"]["persistent_workers"],
+        }
+    )
+    operational["paths"] = {"output_root": "/relocated/output"}
+    operational["tracking"] = {"wandb": {"enabled": False, "project": "reporting-only"}}
+
+    assert learning.training.checkpoint.config_digest(operational) == learning.training.checkpoint.config_digest(original)
+    assert learning.training.checkpoint.resume_contract_digest(operational) == (learning.training.checkpoint.resume_contract_digest(original))
+
+
 def test_objective_change_is_resume_incompatible() -> None:
     """Bind model selection semantics to persisted continuation identity."""
     first = experiments.config.loader.resolve_config(configs.direct_config())

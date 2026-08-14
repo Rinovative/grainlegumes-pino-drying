@@ -182,7 +182,7 @@ def test_artifact_metadata_requires_a_json_object(
         analysis.evaluation.dataframe.build_eval_df(_current_generic_frame(metadata=metadata))
 
 
-def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> None:
+def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
     """
     Separate scientific cache identity from operational runtime facts.
 
@@ -193,52 +193,97 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "run": {
+            "name": "run-a",
+            "task": "synthetic",
             "task_contract_digest": "task-a",
+            "effective_config_digest": "config-a",
             "best_checkpoint_sha256": "checkpoint-a",
             "normalizer_sha256": "normalizer-a",
+            "lifecycle_status": "completed",
         },
+        "model": {
+            "kind": "fno",
+            "architecture": {"hidden_channels": 8},
+            "physics_enabled": True,
+            "parameter_counts": {"total": 10, "trainable": 10},
+        },
+        "split_role": "eval",
         "dataset": {
+            "name": "dataset-a",
+            "full_case_count": 2,
             "fingerprint": "dataset-a",
             "data_contract_digest": "data-a",
+            "saved_membership_digest": "membership-a",
         },
-        "selection": {"effective_ordered_source_indices_sha256": "membership-a"},
+        "selection": {
+            "full_selected_case_count": 2,
+            "effective_case_count": 2,
+            "generation_limit": None,
+            "full_ordered_source_indices_sha256": "full-membership-a",
+            "effective_ordered_source_indices_sha256": "membership-a",
+        },
         "normalizer": {
             "sha256": "normalizer-a",
+            "fit_split": "train",
+            "output_normalization": "per_channel_standardization",
             "output_standard_deviations": {"first": 1.0, "second": 2.0},
             "denominator_floor": 1.0e-6,
         },
         "evaluator": {
+            "metrics": [{"id": "rel_l2", "fields": ["first", "second"]}],
             "objective": {
                 **analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_DEFINITION,
                 "fields": "all",
             },
+            "input_fields": ["input"],
+            "input_units": {"input": "1"},
             "output_fields": ["first", "second"],
+            "output_units": {"first": "1", "second": "1"},
             "output_groups": [
                 {"id": "first_group", "fields": ["first"]},
                 {"id": "second_group", "fields": ["second"]},
             ],
+            "physics_kind": "steady_brinkman",
+            "group_objective_evidence": {"reduction": "equal_group_mean"},
+            "predictive_metrics": {"rel_l2": "per_case"},
         },
         "physics": {
             "residual_schema_version": 1,
+            "task_id": "synthetic",
+            "task_contract_digest": "task-a",
+            "equation_kind": "steady_brinkman",
+            "equation_set": ["momentum", "continuity"],
+            "boundary_condition_kind": "pressure_drop",
             "selected_training_continuity": "div_eps_velocity",
+            "evaluated_continuity_formulations": ["div_velocity", "div_eps_velocity"],
             "derivatives": {"kind": "spectral", "extension": "reflect"},
             "interior_crop": 2,
+            "residual_evaluation_region": {"kind": "interior"},
             "constants": {"dynamic_viscosity_pa_s": 1.8139e-5},
+            "permeability_representation": {"kind": "symmetric_tensor"},
             "scalar_definitions": {"div_velocity_mse": "mean(div(u)**2)"},
+            "array_definitions": {"div_u": "du/dx + dv/dy"},
         },
-        "generation": {"effective_case_limit": None, "inference_batch_size": 1},
+        "generation": {
+            "effective_case_limit": None,
+            "inference_batch_size": 1,
+            "compression": "numpy savez_compressed",
+        },
         "runtime": {"requested_policy": "cpu", "resolved_device": "cpu", "batch_size": 1},
     }
-    baseline = analysis.artifacts.service._scientific_provenance(provenance)
+    baseline = analysis.artifacts.contracts.artifact_identity_digest(provenance)
     mutations = [
         (("artifact_schema_version",), 999),
         (("run", "task_contract_digest"), "task-b"),
+        (("run", "effective_config_digest"), "config-b"),
         (("run", "best_checkpoint_sha256"), "checkpoint-b"),
+        (("model", "architecture", "hidden_channels"), 16),
         (("normalizer", "sha256"), "normalizer-b"),
         (("dataset", "fingerprint"), "dataset-b"),
         (("dataset", "data_contract_digest"), "data-b"),
         (("selection", "effective_ordered_source_indices_sha256"), "membership-b"),
         (("evaluator", "objective", "reduction"), "wrong-reduction"),
+        (("evaluator", "metrics", 0, "id"), "different-metric"),
         (("evaluator", "output_fields"), ["second", "first"]),
         (("evaluator", "output_groups", 0, "fields"), ["second"]),
         (("normalizer", "output_standard_deviations", "second"), 3.0),
@@ -251,6 +296,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         (("physics", "scalar_definitions", "div_velocity_mse"), "different"),
         (("generation", "effective_case_limit"), 4),
         (("generation", "inference_batch_size"), 2),
+        (("generation", "compression"), "uncompressed"),
     ]
     for keys, replacement in mutations:
         changed = copy.deepcopy(provenance)
@@ -260,7 +306,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
             target = target[key]
         assert isinstance(target, (dict, list))
         target[keys[-1]] = replacement
-        assert analysis.artifacts.service._scientific_provenance(changed) != baseline
+        assert analysis.artifacts.contracts.artifact_identity_digest(changed) != baseline
 
     operational = copy.deepcopy(provenance)
     operational["runtime"] = {
@@ -268,9 +314,14 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         "resolved_device": "cuda:7",
         "batch_size": 19,
     }
+    operational["run"]["name"] = "renamed-run"
+    operational["run"]["lifecycle_status"] = "archived"
+    operational["selection"]["index_key"] = "relocated_indices"
+    operational["normalizer"]["identity"] = "relocated/normalizer.pt"
+    operational["dataset"]["source_path"] = "/relocated/dataset.pt"
     operational["outputs"] = {"generated": "digest"}
     operational["aggregate"] = {"value": 123.0}
-    assert analysis.artifacts.service._scientific_provenance(operational) == baseline
+    assert analysis.artifacts.contracts.artifact_identity_digest(operational) == baseline
 
 
 @pytest.mark.parametrize(

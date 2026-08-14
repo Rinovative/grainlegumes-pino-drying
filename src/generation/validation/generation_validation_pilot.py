@@ -1667,7 +1667,7 @@ def prepare_pilot_receipt(
             "campaign_digest": campaign.campaign_digest,
             "batch_scientific_config_digests": {batch.batch_name: batch.scientific_config_digest for batch in campaign.batches},
         },
-        "template_digest": campaign.profile.template_sha256,
+        "template_digest": campaign.template_sha256,
         "execution_resources": copy.deepcopy(campaign.execution_values),
         "materials": list(campaign.material_inventory),
         "cases_per_material": terminal["cases_per_material"],

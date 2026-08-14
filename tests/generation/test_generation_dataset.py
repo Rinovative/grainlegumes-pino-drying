@@ -10,8 +10,9 @@ from typing import Any
 import h5py
 import pytest
 import torch
+import yaml
 
-from src import datasets, domain, generation
+from src import common, datasets, domain, generation
 
 
 def _dataset(handle: h5py.File, name: str) -> h5py.Dataset:
@@ -19,6 +20,64 @@ def _dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     value = handle.get(name)
     assert isinstance(value, h5py.Dataset)
     return value
+
+
+def _assert_provenance_and_relocation_preserve_hdf5(
+    *,
+    config_path: Path,
+    template: Path,
+    original_batch: Any,
+    original_hdf5: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regenerate identical science after locator, evidence, and Git changes."""
+    project_root = template.parents[1]
+    relocated_template = project_root / "relocated/steady_reference.mph"
+    relocated_template.parent.mkdir(parents=True)
+    relocated_template.write_bytes(template.read_bytes())
+    relocated_template.with_suffix(".sha256").write_text(
+        f"{common.serialization.file_sha256(relocated_template)}\n",
+        encoding="utf-8",
+    )
+    profile_path = config_path.parent / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["template"] = relocated_template.relative_to(project_root).as_posix()
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    operations["parameter_values"]["pressure_bc.mean"]["provenance"]["note"] = "Changed evidence description only."
+    operations_path.write_text(
+        yaml.safe_dump(operations, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    relocated_campaign = generation.cases.config.load_campaign_config(config_path)
+    relocated_batch = relocated_campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+    )
+    assert relocated_batch.scientific_values != original_batch.scientific_values
+    assert relocated_batch.batch_id == original_batch.batch_id
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", "b" * 40)
+    try:
+        relocated_outcome = generation.runtime.run_case(
+            relocated_batch,
+            1,
+            cores_per_case=1,
+            storage_root=tmp_path / "relocated-storage",
+            work_root=tmp_path / "relocated-work",
+        )
+    finally:
+        monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
+    relocated_hdf5 = relocated_outcome.processed_directory / "case.h5"
+    assert common.serialization.file_sha256(relocated_hdf5) == (common.serialization.file_sha256(original_hdf5))
+    identity = generation.publication.storage.validate_case_hdf5(
+        relocated_hdf5,
+        expected_profile="steady_flow",
+    )
+    assert identity["git_commit"] is None
 
 
 def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
@@ -77,7 +136,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         "raw_csv/inputs/fields.csv",
     ]
     identity = generation.publication.storage.validate_case_hdf5(completed / "case.h5", expected_profile="steady_flow")
-    assert identity["git_commit"] == "a" * 40
+    assert identity["git_commit"] is None
     with h5py.File(completed / "case.h5", "r") as handle:
         assert set(handle) == {
             "coords",
@@ -98,9 +157,19 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         fixed = _dataset(handle, "stationary_fixed/values")
         assert fixed.shape == (len(profile_contract.stationary_fixed_fields),)
         assert fixed.attrs["runtime_source"] == "canonical_template"
+        assert "template_relative_path" not in handle.attrs
     case = json.loads((completed / "case.json").read_text(encoding="utf-8"))
     assert identity["case_input_id"] == case["case_input_id"]
     assert identity["simulation_case_id"] == case["simulation_case_id"]
+
+    _assert_provenance_and_relocation_preserve_hdf5(
+        config_path=config_path,
+        template=template,
+        original_batch=batch,
+        original_hdf5=completed / "case.h5",
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
     assert (
         generation.runtime.run_case(
             batch,
@@ -119,9 +188,9 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     missing_project = tmp_path / "project without templates"
     missing_project.mkdir()
     monkeypatch.setenv("PROJECT_ROOT", str(missing_project))
-    assert not (missing_project / batch.profile.template_relative_path).exists()
+    assert not (missing_project / batch.template_relative_path).exists()
     admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
-    assert admitted.case("case_0001").hdf5_identity.git_commit == "a" * 40
+    assert admitted.case("case_0001").hdf5_identity.git_commit is None
     unexpected = admitted.processed_directory / "unexpected_case"
     unexpected.mkdir()
     with pytest.raises(RuntimeError, match="membership mismatch"):
@@ -143,7 +212,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         storage_root=storage,
     )
     assert manifest["training_eligible"] is False
-    assert manifest["builder_identity"] == "src.datasets.dataset_packages.build_campaign_packages"
+    assert manifest["builder_identity"] == datasets.contracts.identity.dataset_conversion_contract_identity("steady_flow")
     assert manifest["split_membership"] == {datasets.contracts.views.TECHNICAL_SMOKE_MEMBERSHIP: manifest["included_source_cases"]}
     assert manifest["source_git_commits"] == ["a" * 40]
     conditioning = manifest["steady_flow_conditioning"]

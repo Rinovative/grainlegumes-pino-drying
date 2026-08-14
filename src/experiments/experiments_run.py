@@ -1209,6 +1209,7 @@ def _execute_prepared_run_locked(
         identity = learning.training.checkpoint.build_checkpoint_identity(
             config,
             split_indices,
+            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=persisted_config,
         )
 
@@ -1546,6 +1547,7 @@ def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
     identity = learning.training.checkpoint.build_checkpoint_identity(
         config,
         split_indices,
+        normalizer_sha256=common.serialization.file_sha256(normalizer_path),
         persisted_config=config,
     )
     scientific_run_name = config["run"]["name"]
@@ -1566,7 +1568,6 @@ def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
         "split_indices_sha256": common.serialization.file_sha256(split_path),
         "normalizer_sha256": common.serialization.file_sha256(normalizer_path),
         "best_checkpoint_sha256": common.serialization.file_sha256(checkpoint_path),
-        "effective_config_digest": identity["effective_config_digest"],
     }
     for label, actual in current_digests.items():
         recorded = summary.get(label)
@@ -1593,6 +1594,10 @@ def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
     except (FileNotFoundError, TypeError, ValueError, RuntimeError) as error:
         msg = f"Evaluable run has no valid best checkpoint at {checkpoint_path}: {error}"
         raise RunLifecycleError(msg) from error
+    recorded_config_digest = summary.get("effective_config_digest")
+    if recorded_config_digest is not None and recorded_config_digest != best["identity"]["effective_config_digest"]:
+        message = "Evaluable run recorded config digest disagrees with best_checkpoint.pt."
+        raise RunLifecycleError(message)
     if "best_metric" in summary and summary.get("best_metric") != best["best_metric"]:
         msg = "Evaluable run summary best_metric disagrees with best_checkpoint.pt."
         raise RunLifecycleError(msg)
@@ -1605,7 +1610,7 @@ def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
         config=config,
         split_indices=split_indices,
         normalizer_state=normalizer_state,
-        checkpoint_identity=identity,
+        checkpoint_identity=best["identity"],
         best_checkpoint=best,
         lifecycle_status=str(status),
         is_completed=False,
@@ -1694,11 +1699,9 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     identity = learning.training.checkpoint.build_checkpoint_identity(
         config,
         split_indices,
+        normalizer_sha256=common.serialization.file_sha256(normalizer_path),
         persisted_config=config,
     )
-    if summary.get("effective_config_digest") != identity["effective_config_digest"]:
-        msg = "Completed run summary/config digest mismatch."
-        raise RunLifecycleError(msg)
     expected_file_digests = {
         "config_sha256": common.serialization.file_sha256(config_path),
         "split_indices_sha256": common.serialization.file_sha256(split_path),
@@ -1729,6 +1732,10 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
         amp_expected=amp_enabled,
         require_best=True,
     )
+    saved_identities = (best["identity"], last["identity"])
+    if saved_identities[0] != saved_identities[1] or summary.get("effective_config_digest") != saved_identities[0]["effective_config_digest"]:
+        message = "Completed run summary/config/checkpoint identity mismatch."
+        raise RunLifecycleError(message)
     if summary.get("best_checkpoint_sha256") != common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(path)):
         msg = "Completed run best checkpoint digest mismatch."
         raise RunLifecycleError(msg)
@@ -1761,7 +1768,7 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
             config=config,
             split_indices=split_indices,
             normalizer_state=normalizer_state,
-            checkpoint_identity=identity,
+            checkpoint_identity=best["identity"],
             best_checkpoint=best,
             lifecycle_status="completed",
             is_completed=True,
@@ -1921,6 +1928,7 @@ def run_experiment(
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,
             split_indices,
+            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=saved_config,
         )
         amp_enabled = bool(runtime_config["training"]["mixed_precision"])

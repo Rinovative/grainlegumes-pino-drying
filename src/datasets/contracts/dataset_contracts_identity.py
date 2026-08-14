@@ -46,7 +46,7 @@ TRAINING_TENSOR_DTYPE: Final = "float32"
 _SHA256_HEX_LENGTH = 64
 _TENSOR_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
-_GENERATED_BATCH_IDENTITY_KEYS = frozenset(
+_GENERATED_BATCH_IDENTITY_KEYS: Final = frozenset(
     {
         "schema_version",
         "batch_id",
@@ -60,8 +60,49 @@ _GENERATED_BATCH_IDENTITY_KEYS = frozenset(
         "intended_case_ids",
         "cases",
         "batch_manifest_identity_sha256",
+        "identity_contract_sha256",
     }
 )
+_GENERATED_BATCH_SEMANTIC_CONTRACT: Final = {
+    "schema_kind": "generated_batch_semantic_identity",
+    "schema_version": 1,
+    "template_locator_semantics": "provenance_only",
+    "case_artifact_semantics": "canonical_hdf5_content",
+    "case_receipt_semantics": "provenance_only",
+}
+GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST: Final = hashlib.sha256(
+    json.dumps(
+        _GENERATED_BATCH_SEMANTIC_CONTRACT,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
+_DATASET_CONVERSION_CONTRACTS: Final = {
+    "steady_flow": {
+        "schema_kind": "dataset_conversion_contract",
+        "schema_version": 1,
+        "source_schema_version": 1,
+        "tensor_dtype": TRAINING_TENSOR_DTYPE,
+        "case_fingerprint_version": CASE_FINGERPRINT_VERSION,
+        "permeability_representation": {
+            "Kxx": "log10",
+            "Kxy": "Kxy/sqrt(Kxx*Kyy)",
+            "Kyy": "log10",
+        },
+        "payload_semantics": "ordered_eager_task_tensors",
+    },
+    "transient_drying": {
+        "schema_kind": "dataset_conversion_contract",
+        "schema_version": 1,
+        "source_schema_version": 1,
+        "index_schema_version": 1,
+        "transition_selection": "consecutive_regular_states_excluding_irregular_stop",
+        "target_semantics": "next_state_minus_current_state",
+        "payload_semantics": "portable_source_hdf5_transition_index",
+    },
+}
 _GENERATED_TEMPLATE_KEYS = frozenset({"relative_path", "sha256"})
 _GENERATED_CASE_KEYS = frozenset(
     {
@@ -166,18 +207,105 @@ def _canonical_json(value: Any, *, label: str) -> bytes:
         raise TypeError(msg) from error
 
 
+def dataset_conversion_contract_identity(dataset_view: str) -> dict[str, Any]:
+    """Return the maintained content-conversion contract for one Dataset view."""
+    contract = _DATASET_CONVERSION_CONTRACTS.get(dataset_view)
+    if contract is None:
+        message = f"Unsupported Dataset conversion view {dataset_view!r}."
+        raise ValueError(message)
+    digest = hashlib.sha256(_canonical_json(contract, label="Dataset conversion contract")).hexdigest()
+    return {
+        "schema_kind": "dataset_conversion_identity",
+        "schema_version": 1,
+        "dataset_view": dataset_view,
+        "contract_sha256": digest,
+    }
+
+
+def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the positive content and interpretation dependencies of a package."""
+    value = dict(provenance)
+    dataset_view = _require_non_empty_string(value.get("dataset_view"), label="Dataset package dataset_view")
+    expected_conversion = dataset_conversion_contract_identity(dataset_view)
+    if value.get("builder_identity") != expected_conversion:
+        message = "Dataset package builder_identity does not match the maintained conversion contract."
+        raise ValueError(message)
+    source_cases = value.get("source_case_identities")
+    if not isinstance(source_cases, list) or not source_cases:
+        message = "Dataset package source_case_identities must be a non-empty ordered list."
+        raise ValueError(message)
+    case_keys = (
+        "package_case_id",
+        "batch_id",
+        "source_case_id",
+        "case_input_id",
+        "simulation_case_id",
+        "case_hdf5_sha256",
+        "material_family",
+        "material_role",
+        "evaluation_regime",
+        "natural_support_state",
+        "simulation_profile",
+        "membership",
+        "ood_group",
+        "ood_parameters",
+        "task_relevant_ood_parameters",
+    )
+    projected_cases: list[dict[str, Any]] = []
+    for index, source_case in enumerate(source_cases):
+        if not isinstance(source_case, Mapping):
+            message = f"Dataset package source_case_identities[{index}] must be a mapping."
+            raise TypeError(message)
+        missing = [key for key in case_keys if key not in source_case]
+        if missing:
+            message = f"Dataset package source_case_identities[{index}] is missing semantic fields {missing}."
+            raise ValueError(message)
+        projected_cases.append({key: copy.deepcopy(source_case[key]) for key in case_keys})
+    package_keys = (
+        "schema_kind",
+        "schema_version",
+        "dataset_name",
+        "dataset_view",
+        "registered_task_id",
+        "evaluation_regime",
+        "materials",
+        "channel_contract",
+        "channel_contract_digest",
+        "source_simulation_profiles",
+        "source_batch_ids",
+        "source_template_digests",
+        "included_source_cases",
+        "matched_case_input_ids",
+        "airflow_provenance",
+        "steady_flow_conditioning",
+        "operation_config_digests",
+        "source_role",
+        "training_eligible",
+        "duplicate_case_input_policy",
+        "case_membership",
+        "split_membership",
+        "membership_counts",
+        "available_ood_groups",
+        "ood_group_indexes",
+        "ood_parameter_indexes",
+        "task_relevant_ood_parameters",
+        "builder_identity",
+        "schema_identity",
+    )
+    missing = [key for key in package_keys if key not in value]
+    if missing:
+        message = f"Dataset package semantic identity is missing fields {missing}."
+        raise ValueError(message)
+    payload = {key: copy.deepcopy(value[key]) for key in package_keys}
+    payload["source_case_identities"] = projected_cases
+    return payload
+
+
 def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str, str]:
-    """Return one immutable package ID without operational source locators."""
-    identity_provenance = copy.deepcopy(dict(provenance))
-    source_cases = identity_provenance.get("source_case_identities")
-    if isinstance(source_cases, list):
-        for source_case in source_cases:
-            if isinstance(source_case, dict):
-                source_case.pop("source_relative_path", None)
-    digest = hashlib.sha256(
-        _canonical_json(identity_provenance, label="Dataset package provenance"),
-    ).hexdigest()
-    name = str(provenance["dataset_name"])
+    """Return the current package identity from semantic provenance."""
+    payload = package_semantic_identity_payload(provenance)
+    digest = hashlib.sha256(_canonical_json(payload, label="Dataset package identity")).hexdigest()
+    name = _require_non_empty_string(provenance.get("dataset_name"), label="Dataset package dataset_name")
     return f"{name}__{digest[:16]}", digest
 
 
@@ -282,14 +410,54 @@ def _require_exact_mapping(
     return normalized
 
 
+def _generated_cases_semantic_payload(cases: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Select source-case content identities without receipt provenance."""
+    case_keys = (
+        "case_id",
+        "material_family",
+        "case_input_id",
+        "simulation_case_id",
+        "case_hdf5_sha256",
+    )
+    return [{key: copy.deepcopy(case[key]) for key in case_keys} for case in cases]
+
+
+def _generated_batch_semantic_payload(batch_identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Select generated content identity without locator or receipt provenance."""
+    cases = batch_identity.get("cases")
+    if not isinstance(cases, list):
+        message = "Generated batch semantic identity cases must be a list."
+        raise TypeError(message)
+    return {
+        "identity_contract_sha256": batch_identity["identity_contract_sha256"],
+        "schema_version": batch_identity["schema_version"],
+        "batch_id": batch_identity["batch_id"],
+        "simulation_profile": batch_identity["simulation_profile"],
+        "batch_identity": batch_identity["batch_identity"],
+        "scientific_config_digest": batch_identity["scientific_config_digest"],
+        "template": {"sha256": batch_identity["template"]["sha256"]},
+        "export_contract_sha256": batch_identity["export_contract_sha256"],
+        "available_learning_views": copy.deepcopy(batch_identity["available_learning_views"]),
+        "airflow_source": batch_identity["airflow_source"],
+        "intended_case_ids": copy.deepcopy(batch_identity["intended_case_ids"]),
+        "cases": _generated_cases_semantic_payload(cases),
+    }
+
+
 def _validate_generated_batch_identity(
     value: Any,
     *,
     sample_ids: Sequence[str],
     label: str,
 ) -> dict[str, Any]:
-    """Validate the current profile-qualified generated-batch identity."""
-    batch_identity = _require_exact_mapping(value, _GENERATED_BATCH_IDENTITY_KEYS, label=label)
+    """Validate one current generated-batch semantic identity."""
+    batch_identity = _json_mapping_copy(value, label=label)
+    keys = set(batch_identity)
+    if keys != _GENERATED_BATCH_IDENTITY_KEYS:
+        missing = sorted(_GENERATED_BATCH_IDENTITY_KEYS.difference(keys))
+        unexpected = sorted(keys.difference(_GENERATED_BATCH_IDENTITY_KEYS))
+        message = f"{label} keys do not match. Missing: {missing}. Unexpected: {unexpected}."
+        raise ValueError(message)
     schema_version = batch_identity["schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != GENERATED_BATCH_IDENTITY_SCHEMA_VERSION:
         msg = f"{label}.schema_version must be integer {GENERATED_BATCH_IDENTITY_SCHEMA_VERSION}."
@@ -356,8 +524,15 @@ def _validate_generated_batch_identity(
         normalized_cases.append(case)
     batch_identity["template"] = template
     batch_identity["cases"] = normalized_cases
-    content = {key: batch_identity[key] for key in batch_identity if key != "batch_manifest_identity_sha256"}
-    expected_digest = hashlib.sha256(_canonical_json(content, label=label)).hexdigest()
+    contract_digest = _require_sha256(
+        batch_identity["identity_contract_sha256"],
+        label=f"{label}.identity_contract_sha256",
+    )
+    if contract_digest != GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST:
+        message = f"{label}.identity_contract_sha256 is not the maintained generated-batch semantic contract."
+        raise ValueError(message)
+    digest_payload = _generated_batch_semantic_payload(batch_identity)
+    expected_digest = hashlib.sha256(_canonical_json(digest_payload, label=label)).hexdigest()
     actual_digest = _require_sha256(
         batch_identity["batch_manifest_identity_sha256"],
         label=f"{label}.batch_manifest_identity_sha256",
@@ -366,6 +541,18 @@ def _validate_generated_batch_identity(
         msg = f"{label}.batch_manifest_identity_sha256 does not match its content."
         raise ValueError(msg)
     return batch_identity
+
+
+def generated_batch_semantic_identity_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the validated current generated-batch semantic identity payload."""
+    intended = value.get("intended_case_ids")
+    sample_ids = _require_string_sequence(intended, label="Generated batch intended_case_ids", unique=True)
+    normalized = _validate_generated_batch_identity(
+        value,
+        sample_ids=sample_ids,
+        label="Generated batch identity",
+    )
+    return _generated_batch_semantic_payload(normalized)
 
 
 def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -396,6 +583,7 @@ def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[s
         )
     content: dict[str, Any] = {
         "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
+        "identity_contract_sha256": GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST,
         "batch_id": manifest.get("batch_id"),
         "simulation_profile": manifest.get("simulation_profile"),
         "batch_identity": manifest.get("batch_identity"),
@@ -408,7 +596,9 @@ def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[s
         "cases": cases,
     }
     result = dict(content)
-    result["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated batch identity")).hexdigest()
+    result["batch_manifest_identity_sha256"] = hashlib.sha256(
+        _canonical_json(_generated_batch_semantic_payload(result), label="Generated batch identity")
+    ).hexdigest()
     return _validate_generated_batch_identity(
         result,
         sample_ids=intended,
@@ -430,19 +620,21 @@ def build_generated_package_identity(
     """Build one aggregate generated-source identity for a multi-batch package."""
     normalized_cases = [_json_mapping_copy(case, label=f"Package cases[{index}]") for index, case in enumerate(cases)]
     sample_ids = [str(case.get("case_id")) for case in normalized_cases]
+    template_mapping = _require_mapping(template, label="Generated package template")
     source_digest_payload = {
         "dataset_name": dataset_name,
         "simulation_profile": simulation_profile,
         "campaign_digest": campaign_digest,
-        "template": dict(template),
+        "template": {"sha256": template_mapping.get("sha256")},
         "export_contract_sha256": export_contract_sha256,
         "available_learning_views": list(available_learning_views),
         "airflow_source": airflow_source,
-        "cases": normalized_cases,
+        "cases": _generated_cases_semantic_payload(normalized_cases),
     }
     source_digest = hashlib.sha256(_canonical_json(source_digest_payload, label="Generated package source identity")).hexdigest()
     content: dict[str, Any] = {
         "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
+        "identity_contract_sha256": GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST,
         "batch_id": dataset_name,
         "simulation_profile": simulation_profile,
         "batch_identity": source_digest,
@@ -455,7 +647,9 @@ def build_generated_package_identity(
         "cases": normalized_cases,
     }
     result = dict(content)
-    result["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated package identity")).hexdigest()
+    result["batch_manifest_identity_sha256"] = hashlib.sha256(
+        _canonical_json(_generated_batch_semantic_payload(result), label="Generated package identity")
+    ).hexdigest()
     return _validate_generated_batch_identity(
         result,
         sample_ids=sample_ids,
@@ -632,6 +826,20 @@ def compute_case_fingerprint(
     return _content_fingerprint(metadata, (("inputs", normalized_inputs), ("outputs", normalized_outputs)))
 
 
+def _training_fingerprint_metadata(
+    payload: Mapping[str, Any],
+    *,
+    generated_batch_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select payload metadata while excluding source provenance and locators."""
+    metadata = {
+        key: value for key, value in payload.items() if key not in {"inputs", "outputs", "dataset_fingerprint", "dataset_id", "source_provenance"}
+    }
+    if "identity_contract_sha256" in generated_batch_identity:
+        metadata["generated_batch_identity"] = _generated_batch_semantic_payload(generated_batch_identity)
+    return metadata
+
+
 def build_training_dataset_payload(
     *,
     task: TaskSpec,
@@ -703,9 +911,10 @@ def build_training_dataset_payload(
         "outputs": normalized_outputs,
         "dataset_fingerprint": "",
     }
-    fingerprint_metadata = {
-        key: value for key, value in payload.items() if key not in {"inputs", "outputs", "dataset_fingerprint", "dataset_id", "source_provenance"}
-    }
+    fingerprint_metadata = _training_fingerprint_metadata(
+        payload,
+        generated_batch_identity=normalized_batch_identity,
+    )
     payload["dataset_fingerprint"] = _content_fingerprint(
         fingerprint_metadata,
         (("inputs", normalized_inputs), ("outputs", normalized_outputs)),
@@ -792,11 +1001,10 @@ def validate_training_dataset_payload(
         normalized_mapping["source_identities"] = normalized_sources
         normalized_mapping["source_metadata"] = normalized_metadata
         normalized_mapping["source_provenance"] = source_provenance
-        fingerprint_metadata = {
-            key: value
-            for key, value in normalized_mapping.items()
-            if key not in {"inputs", "outputs", "dataset_fingerprint", "dataset_id", "source_provenance"}
-        }
+        fingerprint_metadata = _training_fingerprint_metadata(
+            normalized_mapping,
+            generated_batch_identity=generated_batch_identity,
+        )
         expected = _content_fingerprint(fingerprint_metadata, (("inputs", inputs), ("outputs", outputs)))
         if fingerprint != expected:
             msg = f"Training dataset fingerprint mismatch for {dataset_id!r}."

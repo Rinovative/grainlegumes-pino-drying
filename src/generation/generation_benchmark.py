@@ -234,7 +234,7 @@ class CoreBenchmarkSuite:
             "scientific_config_digest": self.case_config.scientific_config_digest,
             "case_input_config_digest": self.case_config.case_input_config_digest,
             "template": {
-                "relative_path": self.case_config.profile.template_relative_path,
+                "relative_path": self.case_config.template_relative_path,
                 "sha256": self.case_config.template_sha256,
             },
             "selection_digest": common.serialization.canonical_json_sha256(

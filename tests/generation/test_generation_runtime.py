@@ -322,7 +322,7 @@ def test_resolved_science_and_execution_are_persisted_separately(
     assert len(execution_files) == 1
     execution = json.loads(execution_files[0].read_text(encoding="utf-8"))
     assert execution == config.execution_values
-    assert common.serialization.canonical_json_sha256(scientific) == config.scientific_config_digest
+    assert generation.cases.config.compute_scientific_config_digest(scientific) == config.scientific_config_digest
 
 
 @pytest.mark.parametrize(
@@ -609,7 +609,7 @@ def test_terminal_case_identity_binds_persisted_input_configuration(
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
         "template": {
-            "relative_path": config.profile.template_relative_path,
+            "relative_path": config.template_relative_path,
             "sha256": config.template_sha256,
         },
         "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
@@ -694,7 +694,7 @@ def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
         }
     )
     scientific.pop("paired_equivalence_seed", None)
-    scientific_digest = common.serialization.canonical_json_sha256(scientific)
+    scientific_digest = generation.cases.config.compute_scientific_config_digest(scientific)
     case_input_digest = generation.cases.config.compute_case_input_config_digest(scientific)
     execution = json.loads(json.dumps(original.execution_values))
     execution["retention"]["retain_solved_model"] = True

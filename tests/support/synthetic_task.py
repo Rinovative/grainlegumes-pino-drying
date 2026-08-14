@@ -8,11 +8,11 @@ is never registered, trained, or published.
 """
 
 import hashlib
-import json
 from collections.abc import Sequence
 from typing import Any
 
 from src import domain
+from src.datasets.contracts import dataset_contracts_identity as dataset_identity
 
 
 def build_synthetic_generated_batch_identity(
@@ -21,43 +21,31 @@ def build_synthetic_generated_batch_identity(
     sample_ids: Sequence[str],
 ) -> dict[str, Any]:
     """Return one deterministic current profile-qualified batch identity."""
-    case_ids = list(sample_ids)
-    content: dict[str, Any] = {
-        "schema_version": 1,
-        "batch_id": batch_id,
-        "simulation_profile": "steady_flow",
-        "batch_identity": hashlib.sha256(f"{batch_id}:batch".encode()).hexdigest(),
-        "scientific_config_digest": hashlib.sha256(f"{batch_id}:scientific".encode()).hexdigest(),
-        "template": {
-            "relative_path": "simulation/steady_flow/steady_flow_template.mph",
+    cases = [
+        {
+            "case_id": case_id,
+            "material_family": "lentil",
+            "case_input_id": hashlib.sha256(f"{batch_id}:{case_id}:input".encode()).hexdigest(),
+            "simulation_case_id": hashlib.sha256(f"{batch_id}:{case_id}:simulation".encode()).hexdigest(),
+            "case_hdf5_sha256": hashlib.sha256(f"{batch_id}:{case_id}:hdf5".encode()).hexdigest(),
+            "success_sha256": hashlib.sha256(f"{batch_id}:{case_id}:success".encode()).hexdigest(),
+            "provenance_sha256": hashlib.sha256(f"{batch_id}:{case_id}:provenance".encode()).hexdigest(),
+        }
+        for case_id in sample_ids
+    ]
+    return dataset_identity.build_generated_package_identity(
+        dataset_name=batch_id,
+        simulation_profile="steady_flow",
+        campaign_digest=hashlib.sha256(f"{batch_id}:scientific".encode()).hexdigest(),
+        template={
+            "relative_path": "synthetic/templates/reference.mph",
             "sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
         },
-        "export_contract_sha256": hashlib.sha256(b"synthetic-exports").hexdigest(),
-        "available_learning_views": ["steady_flow"],
-        "airflow_source": "comsol_steady_reference",
-        "intended_case_ids": case_ids,
-        "cases": [
-            {
-                "case_id": case_id,
-                "material_family": "lentil",
-                "case_input_id": hashlib.sha256(f"{batch_id}:{case_id}:input".encode()).hexdigest(),
-                "simulation_case_id": hashlib.sha256(f"{batch_id}:{case_id}:simulation".encode()).hexdigest(),
-                "case_hdf5_sha256": hashlib.sha256(f"{batch_id}:{case_id}:hdf5".encode()).hexdigest(),
-                "success_sha256": hashlib.sha256(f"{batch_id}:{case_id}:success".encode()).hexdigest(),
-                "provenance_sha256": hashlib.sha256(f"{batch_id}:{case_id}:provenance".encode()).hexdigest(),
-            }
-            for case_id in case_ids
-        ],
-    }
-    encoded = json.dumps(
-        content,
-        ensure_ascii=True,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    content["batch_manifest_identity_sha256"] = hashlib.sha256(encoded).hexdigest()
-    return content
+        export_contract_sha256=hashlib.sha256(b"synthetic-exports").hexdigest(),
+        available_learning_views=("steady_flow",),
+        airflow_source="comsol_steady_reference",
+        cases=cases,
+    )
 
 
 def build_synthetic_task() -> domain.tasks.spec.TaskSpec:

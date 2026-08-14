@@ -479,7 +479,7 @@ def generate_case_input_bundle(
         "spatial_diagnostics": fields.metadata,
         "input_contract": input_contract,
         "template": {
-            "relative_path": config.profile.template_relative_path,
+            "relative_path": config.template_relative_path,
             "filename": config.template_path.name,
             "sha256": config.template_sha256,
         },

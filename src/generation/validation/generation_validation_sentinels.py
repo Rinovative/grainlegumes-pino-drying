@@ -133,17 +133,18 @@ def _sentinel_view(
         blocks=blocks,
         block_parameters=block_parameters,
     )
-    digest = common.serialization.canonical_json_sha256(scientific)
+    scientific_digest = config_service.compute_scientific_config_digest(scientific)
+    case_input_digest = config_service.compute_case_input_config_digest(scientific)
     return replace(
         batch,
         scientific_values=scientific,
         case_indices=tuple(assignments),
         seed_base=seed_base,
         assignments=assignments,
-        scientific_config_digest=digest,
-        case_input_config_digest=digest,
-        batch_identity=digest,
-        batch_id=config_service.build_batch_id(f"static_sentinel__{batch.batch_name}", digest),
+        scientific_config_digest=scientific_digest,
+        case_input_config_digest=case_input_digest,
+        batch_identity=scientific_digest,
+        batch_id=config_service.build_batch_id(f"static_sentinel__{batch.batch_name}", scientific_digest),
     )
 
 

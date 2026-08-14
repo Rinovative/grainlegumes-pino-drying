@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any, Final
 from src import common
 
 from .cases import generation_cases_config as config_service
-from .contracts import generation_contracts_profiles as profiles
 from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .runtime import generation_runtime_batch as batch_runtime
@@ -300,10 +299,10 @@ def plan_campaign(
         },
         "templates": {
             profile_id: {
-                "path": str(profiles.get_profile(profile_id).template_path),
-                "sha256": profiles.get_profile(profile_id).template_sha256,
+                "path": str(template.absolute_path),
+                "sha256": template.sha256,
             }
-            for profile_id in profiles.available_profiles()
+            for profile_id, template in config_service.discover_profile_template_identities().items()
         },
         "execution_config": campaign.execution_values,
         "submission_config": _submission_config(campaign),

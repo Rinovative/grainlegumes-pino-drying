@@ -1324,6 +1324,32 @@ def test_temporary_license_retry_configuration_bounds(
         generation.cases.config.load_campaign_config(config_path)
 
 
+def test_operation_provenance_does_not_change_scientific_identity(
+    generation_config_factory: Any,
+) -> None:
+    """Keep evidence descriptions outside generated-value identity."""
+    config_path, _template = generation_config_factory()
+    original = generation.cases.config.load_campaign_config(config_path)
+    original_batch = original.batches[0]
+
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    record = operations["parameter_values"]["pressure_bc.mean"]
+    record["provenance"]["note"] = "Changed evidence description only."
+    operations_path.write_text(
+        yaml.safe_dump(operations, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    changed = generation.cases.config.load_campaign_config(config_path)
+    changed_batch = changed.batches[0]
+    assert changed_batch.scientific_values != original_batch.scientific_values
+    assert changed_batch.scientific_config_digest == original_batch.scientific_config_digest
+    assert changed_batch.case_input_config_digest == original_batch.case_input_config_digest
+    assert changed_batch.batch_id == original_batch.batch_id
+    assert changed.campaign_digest == original.campaign_digest
+
+
 def test_bulk_tolerance_and_retry_policy_have_separate_identity_ownership(
     generation_config_factory: Any,
 ) -> None:

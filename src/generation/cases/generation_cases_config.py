@@ -25,7 +25,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import yaml
 
@@ -33,6 +33,7 @@ from src import common
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_provenance as provenance_service
+from src.generation.contracts import generation_contracts_templates as templates
 from src.generation.contracts.generation_contracts_vocabulary import (
     CAMPAIGN_PURPOSES,
     EVALUATION_REGIMES,
@@ -151,8 +152,18 @@ def build_batch_id(batch_name: str, scientific_config_digest: str) -> str:
     return f"{name}__{scientific_config_digest[:16]}"
 
 
+def scientific_config_identity_payload(scientific: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the current semantic configuration identity payload."""
+    return _scientific_identity_config(scientific)
+
+
+def compute_scientific_config_digest(scientific: Mapping[str, Any]) -> str:
+    """Compute the current scientific configuration identity."""
+    return common.serialization.canonical_json_sha256(scientific_config_identity_payload(scientific))
+
+
 def compute_case_input_config_digest(scientific: Mapping[str, Any]) -> str:
-    """Compute the canonical adapter-input configuration identity."""
+    """Compute the current adapter input identity."""
     return common.serialization.canonical_json_sha256(_input_identity_config(scientific))
 
 
@@ -169,8 +180,7 @@ class GenerationConfig:
     batch_name: str
     scientific_values: dict[str, Any]
     execution_values: dict[str, Any]
-    template_path: Path
-    template_sha256: str
+    template: templates.ResolvedTemplateIdentity
     case_indices: tuple[int, ...]
     seed_base: int | None
     assignments: dict[int, dict[str, Any]]
@@ -178,6 +188,21 @@ class GenerationConfig:
     case_input_config_digest: str
     batch_identity: str
     batch_id: str
+
+    @property
+    def template_path(self) -> Path:
+        """Return the configured repository template path."""
+        return self.template.absolute_path
+
+    @property
+    def template_relative_path(self) -> str:
+        """Return the configured repository-relative template locator."""
+        return self.template.relative_path
+
+    @property
+    def template_sha256(self) -> str:
+        """Return the verified configured template byte digest."""
+        return self.template.sha256
 
     def case_id(self, case_index: int) -> str:
         """Return the canonical directory identifier for one batch member."""
@@ -220,6 +245,7 @@ class CampaignConfig:
     campaign_purpose: str
     evaluation_regimes: tuple[str, ...]
     profile: profiles.SimulationProfile
+    template: templates.ResolvedTemplateIdentity
     material_roles: dict[str, tuple[str, ...]]
     material_memberships: dict[str, tuple[str, ...]]
     membership: dict[str, Any]
@@ -231,6 +257,21 @@ class CampaignConfig:
     dataset_packages: tuple[dict[str, Any], ...]
     duplicate_case_input_policy: str
     execution_values: dict[str, Any]
+
+    @property
+    def template_path(self) -> Path:
+        """Return the configured repository template path."""
+        return self.template.absolute_path
+
+    @property
+    def template_relative_path(self) -> str:
+        """Return the configured repository-relative template locator."""
+        return self.template.relative_path
+
+    @property
+    def template_sha256(self) -> str:
+        """Return the verified configured template byte digest."""
+        return self.template.sha256
 
     @property
     def material_inventory(self) -> tuple[str, ...]:
@@ -1111,8 +1152,8 @@ def _validate_profile_config(
     profile: profiles.SimulationProfile,
     fixed_values: Mapping[str, Any],
     require_executable: bool,
-) -> dict[str, Any]:
-    """Validate expected export mappings without inventing missing declarations."""
+) -> tuple[dict[str, Any], templates.ResolvedTemplateIdentity]:
+    """Validate configured template identity and explicit export mappings."""
     if not isinstance(require_executable, bool):
         message = "require_executable must be boolean."
         raise TypeError(message)
@@ -1121,6 +1162,7 @@ def _validate_profile_config(
         "schema_kind",
         "schema_version",
         "simulation_profile",
+        "template",
         "steady_flow_conditioning",
         "exports",
     }
@@ -1137,6 +1179,8 @@ def _validate_profile_config(
     ):
         message = "Generation profile configuration schema or profile identity is invalid."
         raise GenerationConfigError(message)
+    template = templates.resolve_template_identity(config["template"])
+    config["template"] = template.relative_path
     config["steady_flow_conditioning"] = _validate_steady_flow_conditioning(
         config["steady_flow_conditioning"],
         fixed_values=fixed_values,
@@ -1239,7 +1283,7 @@ def _validate_profile_config(
             message = f"Executable generation profile has incomplete required export declarations: {unresolved}."
             raise GenerationConfigError(message)
     config["exports"] = validated
-    return config
+    return config, template
 
 
 def _validate_operations(
@@ -1899,24 +1943,314 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     return execution
 
 
-def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
-    """Return science that determines adapter inputs, excluding output behavior."""
-    value = copy.deepcopy(dict(scientific))
-    for key in (
-        "simulation_profile",
-        "output_contract",
-        "validation",
-        "available_learning_views",
-        "airflow_source",
-        "steady_flow_conditioning",
+_MATERIAL_PARAMETER_SEMANTIC_KEYS: Final = frozenset(
+    {
+        "alpha",
+        "atomic_record",
+        "block",
+        "classification",
+        "components",
+        "derivation",
+        "distribution",
+        "kind",
+        "lower",
+        "maximum_each",
+        "minimum_each",
+        "nominal",
+        "ood",
+        "ood_group",
+        "profile_applicability",
+        "selection",
+        "sets",
+        "sources",
+        "transform",
+        "unit",
+        "units",
+        "upper",
+        "value",
+    }
+)
+_MATERIAL_PARAMETER_PROVENANCE_KEYS: Final = frozenset({"provenance", "ood_provenance"})
+_OPERATION_PARAMETER_SEMANTIC_KEYS: Final = _MATERIAL_PARAMETER_SEMANTIC_KEYS | {"record_id"}
+_ATOMIC_RECORD_SEMANTIC_KEYS: Final = frozenset(
+    {
+        "components",
+        "equation",
+        "ood_records",
+        "record_id",
+        "reference",
+        "rho_bu_dry_ref_support",
+        "selection_rule",
+        "temperature_variable",
+        "units",
+    }
+)
+_COUPLED_RECORD_SEMANTIC_KEYS: Final = frozenset(
+    {
+        "block",
+        "components",
+        "natural_packing_support",
+        "ood_group",
+        "records",
+        "selection_rule",
+        "units",
+    }
+)
+_MATERIAL_PROVENANCE_KEYS: Final = frozenset({"effective_parameter_provenance", "material_scope"})
+_SCIENTIFIC_IDENTITY_KEYS: Final = (
+    "schema_kind",
+    "schema_version",
+    "generator_version",
+    "simulation_profile",
+    "reference_template",
+    "campaign_seed",
+    "material",
+    "operation_config_digest",
+    "sampling_regime",
+    "case_count",
+    "sampling",
+    "parameter_ood",
+    "assignments",
+    "scientific_fixed_values",
+    "stationary_fixed_ownership",
+    "grid",
+    "input_contract",
+    "output_contract",
+    "storage",
+    "available_learning_views",
+    "airflow_source",
+    "paired_equivalence_seed",
+    "pilot_check",
+    "boundary_schedule",
+    "boundary_schedule_handoff_version",
+    "schedule_generator_version",
+    "physical_formulas",
+    "validation",
+    "time",
+    "operation_constraints",
+    "steady_flow_conditioning",
+)
+_SCIENTIFIC_PROVENANCE_KEYS: Final = frozenset(
+    {
         "campaign_id",
         "campaign_purpose",
         "material_role",
         "evaluation_regime",
         "natural_support_state",
-    ):
-        value.pop(key, None)
-    return value
+        "material_config_digest",
+        "registry_metadata",
+        "scientific_fixed_records",
+        "grid_provenance",
+        "physical_formulas_provenance",
+        "time_provenance",
+    }
+)
+_CASE_INPUT_IDENTITY_KEYS: Final = (
+    "schema_version",
+    "generator_version",
+    "campaign_seed",
+    "material",
+    "operation_config_digest",
+    "sampling_regime",
+    "case_count",
+    "sampling",
+    "parameter_ood",
+    "assignments",
+    "scientific_fixed_values",
+    "stationary_fixed_ownership",
+    "grid",
+    "input_contract",
+    "paired_equivalence_seed",
+    "pilot_check",
+    "boundary_schedule",
+    "boundary_schedule_handoff_version",
+    "schedule_generator_version",
+    "physical_formulas",
+    "time",
+    "operation_constraints",
+)
+
+
+def _selected_mapping(
+    value: Mapping[str, Any],
+    *,
+    allowed: frozenset[str],
+    ignored: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    """Select declared semantic fields and reject unclassified dependencies."""
+    unknown = sorted(set(value).difference(allowed | ignored))
+    if unknown:
+        message = f"{label} contains unclassified identity fields: {unknown}."
+        raise GenerationConfigError(message)
+    return {key: copy.deepcopy(value[key]) for key in value if key in allowed}
+
+
+def _operation_identity_config(value: Any) -> dict[str, Any]:
+    """Return active operation values and rules without evidence provenance."""
+    operation = _mapping(value, label="resolved operation identity")
+    _exact_keys(
+        operation,
+        required={"operation_id", "parameter_values", "constraints"},
+        optional={"boundary_schedule"},
+        label="resolved operation identity",
+    )
+    parameter_values = _mapping(
+        operation["parameter_values"],
+        label="resolved operation parameter values",
+    )
+    result = {
+        "operation_id": copy.deepcopy(operation["operation_id"]),
+        "parameter_values": {
+            name: _selected_mapping(
+                _mapping(record, label=f"resolved operation parameter {name}"),
+                allowed=_OPERATION_PARAMETER_SEMANTIC_KEYS,
+                ignored=_MATERIAL_PARAMETER_PROVENANCE_KEYS,
+                label=f"resolved operation parameter {name}",
+            )
+            for name, record in parameter_values.items()
+        },
+        "constraints": copy.deepcopy(operation["constraints"]),
+    }
+    if "boundary_schedule" in operation:
+        result["boundary_schedule"] = copy.deepcopy(operation["boundary_schedule"])
+    return result
+
+
+def _material_identity_config(value: Any) -> dict[str, Any]:
+    """Return exact material values and rules without source-description provenance."""
+    material = _mapping(value, label="resolved material identity")
+    required = frozenset(
+        {
+            "material_family",
+            "packing_porosity_mean_support",
+            "porosity_coupling",
+            "parameter_registry",
+            "active_sampling_blocks",
+            "active_coordinate_names",
+            "coupled_ood_records",
+            "atomic_records",
+        }
+    )
+    optional = frozenset({"initial_moisture_bounds", "initial_moisture_field_constraint"})
+    unknown = sorted(set(material).difference(required | optional | _MATERIAL_PROVENANCE_KEYS))
+    missing = sorted(required.difference(material))
+    if missing or unknown:
+        message = f"Resolved material identity fields are unclassified: missing={missing}, unknown={unknown}."
+        raise GenerationConfigError(message)
+    registry = _mapping(material["parameter_registry"], label="resolved material parameter registry")
+    material["parameter_registry"] = {
+        name: _selected_mapping(
+            _mapping(spec, label=f"resolved material parameter {name}"),
+            allowed=_MATERIAL_PARAMETER_SEMANTIC_KEYS,
+            ignored=_MATERIAL_PARAMETER_PROVENANCE_KEYS,
+            label=f"resolved material parameter {name}",
+        )
+        for name, spec in registry.items()
+    }
+    atomic = _mapping(material["atomic_records"], label="resolved material atomic records")
+    material["atomic_records"] = {
+        name: _selected_mapping(
+            _mapping(record, label=f"resolved atomic record {name}"),
+            allowed=_ATOMIC_RECORD_SEMANTIC_KEYS,
+            ignored=_MATERIAL_PARAMETER_PROVENANCE_KEYS,
+            label=f"resolved atomic record {name}",
+        )
+        for name, record in atomic.items()
+    }
+    coupled = _mapping(material["coupled_ood_records"], label="resolved material coupled OOD records")
+    material["coupled_ood_records"] = {
+        name: _selected_mapping(
+            _mapping(record, label=f"resolved coupled OOD record {name}"),
+            allowed=_COUPLED_RECORD_SEMANTIC_KEYS,
+            ignored=_MATERIAL_PARAMETER_PROVENANCE_KEYS,
+            label=f"resolved coupled OOD record {name}",
+        )
+        for name, record in coupled.items()
+    }
+    support = _mapping(
+        material["packing_porosity_mean_support"],
+        label="resolved packing porosity support",
+    )
+    material["packing_porosity_mean_support"] = _selected_mapping(
+        support,
+        allowed=frozenset({"lower", "upper", "unit"}),
+        ignored=frozenset({"provenance"}),
+        label="resolved packing porosity support",
+    )
+    return {key: copy.deepcopy(material[key]) for key in (*sorted(required), *sorted(optional)) if key in material}
+
+
+def _assignment_identity(value: Any, *, index: int) -> dict[str, Any]:
+    """Return one case assignment projected to seed and input semantics."""
+    assignment = _mapping(value, label=f"resolved assignment {index}")
+    semantic = frozenset(
+        {
+            "case_index",
+            "regime_index",
+            "material_family",
+            "sampling_regime",
+            "assignment_role",
+            "ood_group",
+            "ood_unit_id",
+            "ood_units_per_case",
+            "pilot_case_kind",
+        }
+    )
+    return _selected_mapping(
+        assignment,
+        allowed=semantic,
+        ignored=frozenset({"material_role", "evaluation_regime"}),
+        label=f"resolved assignment {index}",
+    )
+
+
+def _scientific_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the positive dependency payload for generated scientific content."""
+    value = _mapping(scientific, label="resolved scientific batch")
+    allowed = frozenset(_SCIENTIFIC_IDENTITY_KEYS)
+    unknown = sorted(set(value).difference(allowed | _SCIENTIFIC_PROVENANCE_KEYS))
+    if unknown:
+        message = f"Resolved scientific batch contains unclassified identity fields: {unknown}."
+        raise GenerationConfigError(message)
+    missing = sorted(
+        {
+            "schema_kind",
+            "schema_version",
+            "generator_version",
+            "simulation_profile",
+            "reference_template",
+            "campaign_seed",
+            "material",
+            "sampling_regime",
+            "case_count",
+            "sampling",
+            "assignments",
+            "scientific_fixed_values",
+            "grid",
+            "input_contract",
+            "output_contract",
+            "storage",
+            "operation_constraints",
+        }.difference(value)
+    )
+    if missing:
+        message = f"Resolved scientific batch identity is incomplete: {missing}."
+        raise GenerationConfigError(message)
+    result: dict[str, Any] = {key: copy.deepcopy(value[key]) for key in _SCIENTIFIC_IDENTITY_KEYS if key in value}
+    result["material"] = _material_identity_config(value["material"])
+    assignments = value["assignments"]
+    if not isinstance(assignments, list):
+        message = "Resolved scientific batch assignments must be a list."
+        raise TypeError(message)
+    result["assignments"] = [_assignment_identity(assignment, index=index) for index, assignment in enumerate(assignments)]
+    return result
+
+
+def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the positive dependency payload that determines adapter inputs."""
+    semantic = _scientific_identity_config(scientific)
+    return {key: copy.deepcopy(semantic[key]) for key in _CASE_INPUT_IDENTITY_KEYS if key in semantic}
 
 
 def _campaign_name(value: Any) -> str:
@@ -2017,6 +2351,7 @@ def _build_batch(
     *,
     source_path: Path,
     profile: profiles.SimulationProfile,
+    template: templates.ResolvedTemplateIdentity,
     material: Mapping[str, Any],
     sampling_regime: str,
     case_count: int,
@@ -2115,6 +2450,7 @@ def _build_batch(
         "schema_version": CONFIG_SCHEMA_VERSION,
         "generator_version": seeding.GENERATOR_VERSION,
         "simulation_profile": profile.id,
+        "reference_template": {"sha256": template.sha256},
         "campaign_id": campaign_id,
         "campaign_purpose": campaign_purpose,
         "campaign_seed": campaign_seed,
@@ -2193,7 +2529,7 @@ def _build_batch(
     if conditioning is not None:
         scientific["steady_flow_conditioning"] = copy.deepcopy(conditioning)
 
-    scientific_digest = common.serialization.canonical_json_sha256(scientific)
+    scientific_digest = compute_scientific_config_digest(scientific)
     case_input_digest = compute_case_input_config_digest(scientific)
     batch_id = build_batch_id(batch_name, scientific_digest)
     return GenerationConfig(
@@ -2206,8 +2542,7 @@ def _build_batch(
         batch_name=batch_name,
         scientific_values=scientific,
         execution_values=copy.deepcopy(dict(execution)),
-        template_path=profile.template_path,
-        template_sha256=profile.template_sha256,
+        template=template,
         case_indices=case_indices,
         seed_base=batch_seed,
         assignments=assignments,
@@ -2216,21 +2551,6 @@ def _build_batch(
         batch_identity=scientific_digest,
         batch_id=batch_id,
     )
-
-
-def _registry_catalog_digest(config: Mapping[str, Any]) -> str:
-    """Hash registry catalogue semantics; batch plans bind coordinate order."""
-    payload = copy.deepcopy(dict(config))
-    parameters = payload.get("parameters")
-    if not isinstance(parameters, Mapping):
-        message = "Generation parameter registry must contain a parameters mapping."
-        raise TypeError(message)
-    for entry in parameters.values():
-        if not isinstance(entry, dict):
-            message = "Generation parameter registry entries must be mappings."
-            raise TypeError(message)
-        entry.pop("sampling_order", None)
-    return common.serialization.canonical_json_sha256(payload)
 
 
 def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign resolver
@@ -2279,8 +2599,8 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     if not isinstance(profile_id, str):
         message = "generation profile simulation_profile must be text."
         raise TypeError(message)
-    profile = profiles.get_profile(profile_id)
-    profile_config = _validate_profile_config(
+    profile = profiles.resolve_profile(profile_id)
+    profile_config, template = _validate_profile_config(
         profile_raw,
         profile=profile,
         fixed_values=common_config["scientific_fixed_values"],
@@ -2482,7 +2802,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         "constraints": active_constraints,
         **({"boundary_schedule": operations["boundary_schedule"]} if profile.id == profiles.TRANSIENT_DRYING_PROFILE else {}),
     }
-    operations_digest = common.serialization.canonical_json_sha256(operation_identity)
+    operations_digest = common.serialization.canonical_json_sha256(_operation_identity_config(operation_identity))
 
     batches: list[GenerationConfig] = []
     for sampling_regime in sampling_regimes:
@@ -2501,6 +2821,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
                 _build_batch(
                     source_path=source_path,
                     profile=profile,
+                    template=template,
                     material=resolved_materials[material_family],
                     sampling_regime=sampling_regime,
                     case_count=count,
@@ -2556,11 +2877,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         "batch_ids": [batch.batch_id for batch in batches],
         "dataset_packages": list(dataset_packages),
         "duplicate_case_input_policy": duplicate_case_input_policy,
-        "sources_config_digest": common.serialization.canonical_json_sha256(source_config),
-        "registry_config_digest": _registry_catalog_digest(registry_config),
-        "common_config_digest": common.serialization.canonical_json_sha256(common_config),
-        "operation_config_digest": operations_digest,
-        "material_config_digests": material_digests,
     }
     if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
         campaign_scientific["pilot_plan"] = {
@@ -2580,6 +2896,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         campaign_purpose=campaign_purpose,
         evaluation_regimes=evaluation_regimes,
         profile=profile,
+        template=template,
         material_roles=copy.deepcopy(material_roles),
         material_memberships=material_memberships,
         membership=copy.deepcopy(membership),
@@ -2606,6 +2923,60 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         duplicate_case_input_policy=duplicate_case_input_policy,
         execution_values=execution,
     )
+
+
+def discover_profile_template_identities(
+    repository_root: Path | str | None = None,
+) -> dict[str, templates.ResolvedTemplateIdentity]:
+    """
+    Discover configured template identities without a profile-to-path registry.
+
+    Parameters
+    ----------
+    repository_root : Path | str | None, optional
+        Repository tree containing maintained Generation profile YAML.
+
+    Returns
+    -------
+    dict[str, ResolvedTemplateIdentity]
+        Verified identities keyed by the profile IDs declared by configuration.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the maintained profile configuration directory is absent.
+    ValueError
+        If declarations are missing, duplicated, unsupported, or invalid.
+
+    """
+    root = common.paths.get_project_root().resolve() if repository_root is None else Path(repository_root).expanduser().resolve()
+    profile_root = root / "configs" / "generation" / "profiles"
+    if not profile_root.is_dir() or profile_root.is_symlink():
+        message = f"Generation profile configuration directory is missing or unsafe: {profile_root}"
+        raise FileNotFoundError(message)
+    identities: dict[str, templates.ResolvedTemplateIdentity] = {}
+    for candidate in sorted(profile_root.rglob("*.yaml")):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        raw = _load_yaml(candidate, label="generation profile configuration")
+        if raw.get("schema_kind") != "generation_profile":
+            continue
+        profile_id = raw.get("simulation_profile")
+        if not isinstance(profile_id, str):
+            message = f"Generation profile simulation_profile must be text: {candidate}"
+            raise TypeError(message)
+        profiles.resolve_profile(profile_id)
+        if profile_id in identities:
+            message = f"Generation profile {profile_id!r} is declared more than once under {profile_root}."
+            raise ValueError(message)
+        identities[profile_id] = templates.resolve_template_identity(
+            raw.get("template"),
+            repository_root=root,
+        )
+    if not identities:
+        message = f"No maintained Generation profile templates were discovered under {profile_root}."
+        raise ValueError(message)
+    return dict(sorted(identities.items()))
 
 
 def discover_campaign_configs(

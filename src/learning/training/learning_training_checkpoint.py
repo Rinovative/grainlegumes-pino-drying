@@ -30,7 +30,7 @@ import math
 import random
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import numpy as np
 import torch
@@ -44,17 +44,51 @@ if TYPE_CHECKING:
 
 CheckpointRole = Literal["best", "last"]
 CHECKPOINT_SCHEMA_VERSION = 1
-_CHECKPOINT_IDENTITY_KEYS = frozenset(
+_SHA256_LENGTH: Final = 64
+_CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
     {
+        "identity_contract_sha256",
         "task",
         "task_contract_digest",
         "effective_config_digest",
         "resume_contract_digest",
+        "dataset_ids",
         "dataset_fingerprints",
+        "split_contract_digest",
         "split_membership_digests",
+        "normalizer_sha256",
         "objective",
     }
 )
+_TRAINING_IDENTITY_CONTRACT: Final = {
+    "schema_kind": "training_semantic_identity",
+    "schema_version": 1,
+    "model_construction": "resolved_model_kind_and_parameters",
+    "loss_construction": "resolved_data_and_physics_loss",
+    "optimization": "resolved_optimizer_scheduler_and_training",
+    "preprocessing": "fitted_normalizer_artifact_sha256",
+    "selection": "resolved_evaluation_objective_and_ordered_split",
+}
+TRAINING_IDENTITY_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(_TRAINING_IDENTITY_CONTRACT)
+_CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
+    {
+        "task",
+        "task_contract",
+        "run",
+        "data",
+        "model",
+        "loss",
+        "evaluation",
+        "optimizer",
+        "scheduler",
+        "training",
+    }
+)
+_CONFIG_PROVENANCE_ROOT_KEYS: Final = frozenset({"paths", "tracking"})
+_RUN_SEMANTIC_KEYS: Final = frozenset({"seed", "deterministic"})
+_RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "suffix"})
+_DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "ood_datasets", "train_ratio", "ood_fraction", "batch_size"})
+_DATA_EXECUTION_KEYS: Final = frozenset({"num_workers", "pin_memory", "persistent_workers"})
 _CHECKPOINT_KEYS = frozenset(
     {
         "schema_version",
@@ -82,71 +116,88 @@ _CHECKPOINT_KEYS = frozenset(
 )
 
 
-def _config_identity_view(config: Mapping[str, Any]) -> dict[str, Any]:
-    """
-    Copy the config semantics that must remain fixed across exact resume.
+def _selected_config_mapping(
+    value: Any,
+    *,
+    semantic_keys: frozenset[str],
+    ignored_keys: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    """Select declared semantic fields and reject unclassified config keys."""
+    if not isinstance(value, Mapping):
+        message = f"Training identity {label} must be a mapping."
+        raise TypeError(message)
+    unknown = sorted(set(value).difference(semantic_keys | ignored_keys))
+    missing = sorted(semantic_keys.difference(value))
+    if missing or unknown:
+        message = f"Training identity {label} fields are unclassified: missing={missing}, unknown={unknown}."
+        raise ValueError(message)
+    return {key: copy.deepcopy(value[key]) for key in sorted(semantic_keys)}
 
-    Resolved locations, requested device policy, and terminal epoch count are
-    removed because resume may relocate execution metadata or extend duration.
-    Every remaining scientific, data, optimizer, and lifecycle field retains
-    identity significance.
-    """
-    view = copy.deepcopy(dict(config))
-    view.pop("paths", None)
-    run = view.get("run")
-    if isinstance(run, dict):
-        run.pop("device", None)
-    training = view.get("training")
-    if isinstance(training, dict):
+
+def effective_config_identity_payload(
+    config: Mapping[str, Any],
+    *,
+    include_epochs: bool = True,
+) -> dict[str, Any]:
+    """Return positive model-training dependencies without paths or reporting."""
+    keys = set(config)
+    if keys == {"task", "temporal"}:
+        temporal = _required_mapping(config["temporal"], label="config temporal")
+        return {
+            "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
+            "task": copy.deepcopy(config["task"]),
+            "temporal": copy.deepcopy(dict(temporal)),
+        }
+    unknown = sorted(keys.difference(_CONFIG_SEMANTIC_ROOT_KEYS | _CONFIG_PROVENANCE_ROOT_KEYS))
+    missing = sorted(_CONFIG_SEMANTIC_ROOT_KEYS.difference(keys))
+    if missing or unknown:
+        message = f"Resolved training config fields are unclassified: missing={missing}, unknown={unknown}."
+        raise ValueError(message)
+    run = _selected_config_mapping(
+        config["run"],
+        semantic_keys=_RUN_SEMANTIC_KEYS,
+        ignored_keys=_RUN_PROVENANCE_KEYS,
+        label="run",
+    )
+    data = _selected_config_mapping(
+        config["data"],
+        semantic_keys=_DATA_SEMANTIC_KEYS,
+        ignored_keys=_DATA_EXECUTION_KEYS,
+        label="data",
+    )
+    task_contract = _required_mapping(config["task_contract"], label="config task_contract")
+    required_task_contract = {"schema_version", "task", "digest", "data_contract_digest"}
+    missing_contract = sorted(required_task_contract.difference(task_contract))
+    if missing_contract:
+        message = f"Training task contract is missing identity fields {missing_contract}."
+        raise ValueError(message)
+    training = copy.deepcopy(dict(_required_mapping(config["training"], label="config training")))
+    if not include_epochs:
         training.pop("epochs", None)
-    return view
+    return {
+        "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
+        "task": copy.deepcopy(config["task"]),
+        "task_contract": {key: copy.deepcopy(task_contract[key]) for key in sorted(required_task_contract)},
+        "run": run,
+        "data": data,
+        "model": copy.deepcopy(config["model"]),
+        "loss": copy.deepcopy(config["loss"]),
+        "evaluation": copy.deepcopy(config["evaluation"]),
+        "optimizer": copy.deepcopy(config["optimizer"]),
+        "scheduler": copy.deepcopy(config["scheduler"]),
+        "training": training,
+    }
 
 
 def config_digest(config: Mapping[str, Any]) -> str:
-    """
-    Return the scientific effective-config digest for a persisted config.
-
-    The requested device policy is retained in ``config.yaml`` as operational
-    provenance but excluded from scientific identity. Concrete runtime device
-    facts never enter this function.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Fully resolved saved config.
-
-    Returns
-    -------
-    str
-        Canonical SHA-256 digest excluding only the operational device policy.
-
-    """
-    view = copy.deepcopy(dict(config))
-    run = view.get("run")
-    if isinstance(run, dict):
-        run.pop("device", None)
-    return common.serialization.canonical_json_sha256(view)
+    """Return the dependency-scoped identity of a completed training config."""
+    return common.serialization.canonical_json_sha256(effective_config_identity_payload(config))
 
 
 def resume_contract_digest(config: Mapping[str, Any]) -> str:
-    """
-    Return the config digest excluding explicitly allowed runtime changes.
-
-    The only excluded semantic duration field is ``training.epochs``. Resolved
-    paths and ``run.device`` are runtime location/execution metadata.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Fully resolved saved or resume-requested config.
-
-    Returns
-    -------
-    str
-        Canonical SHA-256 digest of the resume-fixed comparison view.
-
-    """
-    return common.serialization.canonical_json_sha256(_config_identity_view(config))
+    """Return training semantics fixed across exact resume, excluding duration."""
+    return common.serialization.canonical_json_sha256(effective_config_identity_payload(config, include_epochs=False))
 
 
 def _required_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -154,6 +205,14 @@ def _required_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         msg = f"Checkpoint {label} must be a mapping."
         raise TypeError(msg)
+    return value
+
+
+def _required_sha256(value: Any, *, label: str) -> str:
+    """Return one strict lowercase SHA-256 checkpoint identity field."""
+    if not isinstance(value, str) or len(value) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in value):
+        message = f"Checkpoint {label} must be one lowercase SHA-256 digest."
+        raise ValueError(message)
     return value
 
 
@@ -192,39 +251,49 @@ def _validate_objective(value: Any, *, label: str) -> dict[str, Any]:
 
 
 def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
-    """
-    Validate and isolate the complete current checkpoint identity schema.
-
-    Task/config digests, train/OOD fingerprints, all split membership digests,
-    and the full objective must be present with no unknown keys. Validation is
-    performed before any runtime component is restored.
-    """
+    """Validate one current dependency-scoped checkpoint identity."""
     identity = _required_mapping(value, label=label)
-    missing = sorted(_CHECKPOINT_IDENTITY_KEYS.difference(identity))
-    unknown = sorted(set(identity).difference(_CHECKPOINT_IDENTITY_KEYS))
-    if missing or unknown:
-        msg = f"Checkpoint {label} keys do not match. Missing: {missing}. Unknown: {unknown}."
-        raise ValueError(msg)
-    for key in (
-        "task",
-        "task_contract_digest",
-        "effective_config_digest",
-        "resume_contract_digest",
-    ):
-        if not isinstance(identity[key], str) or not identity[key]:
-            msg = f"Checkpoint {label}.{key} must be a non-empty string."
-            raise TypeError(msg)
+    keys = set(identity)
+    if keys != _CHECKPOINT_IDENTITY_KEYS:
+        missing = sorted(_CHECKPOINT_IDENTITY_KEYS.difference(keys))
+        unknown = sorted(keys.difference(_CHECKPOINT_IDENTITY_KEYS))
+        message = f"Checkpoint {label} keys do not match. Missing: {missing}. Unknown: {unknown}."
+        raise ValueError(message)
+    if not isinstance(identity["task"], str) or not identity["task"]:
+        message = f"Checkpoint {label}.task must be a non-empty string."
+        raise TypeError(message)
+    for key in ("task_contract_digest", "effective_config_digest", "resume_contract_digest"):
+        _required_sha256(identity[key], label=f"{label}.{key}")
     objective = _validate_objective(identity["objective"], label=f"{label}.objective")
+    normalized_roles: dict[str, dict[str, Any]] = {}
     for key, roles in (
         ("dataset_fingerprints", {"train", "ood"}),
         ("split_membership_digests", {"train", "eval", "ood"}),
     ):
         values = _required_mapping(identity[key], label=f"{label}.{key}")
-        if set(values) != roles or not all(isinstance(item, str) and item for item in values.values()):
-            msg = f"Checkpoint {label}.{key} must contain exactly non-empty values for {sorted(roles)}."
-            raise ValueError(msg)
+        if set(values) != roles:
+            message = f"Checkpoint {label}.{key} must contain exactly values for {sorted(roles)}."
+            raise ValueError(message)
+        for role, digest in values.items():
+            _required_sha256(digest, label=f"{label}.{key}.{role}")
+        normalized_roles[key] = copy.deepcopy(dict(values))
     result = copy.deepcopy(dict(identity))
     result["objective"] = objective
+    result.update(normalized_roles)
+    contract_digest = _required_sha256(
+        identity["identity_contract_sha256"],
+        label=f"{label}.identity_contract_sha256",
+    )
+    if contract_digest != TRAINING_IDENTITY_CONTRACT_DIGEST:
+        message = f"Checkpoint {label}.identity_contract_sha256 is not the maintained training contract."
+        raise ValueError(message)
+    dataset_ids = _required_mapping(identity["dataset_ids"], label=f"{label}.dataset_ids")
+    if set(dataset_ids) != {"train", "ood"} or not all(isinstance(item, str) and item for item in dataset_ids.values()):
+        message = f"Checkpoint {label}.dataset_ids must contain non-empty train and ood identifiers."
+        raise ValueError(message)
+    result["dataset_ids"] = copy.deepcopy(dict(dataset_ids))
+    _required_sha256(identity["split_contract_digest"], label=f"{label}.split_contract_digest")
+    _required_sha256(identity["normalizer_sha256"], label=f"{label}.normalizer_sha256")
     return result
 
 
@@ -232,27 +301,10 @@ def build_checkpoint_identity(
     config: Mapping[str, Any],
     split_indices: Mapping[str, Any],
     *,
+    normalizer_sha256: str,
     persisted_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Build the immutable run identity stored in every checkpoint.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Effective runtime config.
-    split_indices : Mapping[str, Any]
-        Validated saved split contract.
-    persisted_config : Mapping[str, Any] | None, optional
-        Immutable config.yaml payload. Resume may use a larger runtime epoch
-        limit while retaining this original persisted identity.
-
-    Returns
-    -------
-    dict[str, Any]
-        Task, config, dataset, split, and objective identity.
-
-    """
+    """Build current task, config, Dataset, split, normalizer, and objective identity."""
     task = config.get("task")
     task_contract = _required_mapping(config.get("task_contract"), label="config task_contract")
     evaluation = _required_mapping(config.get("evaluation"), label="config evaluation")
@@ -262,30 +314,44 @@ def build_checkpoint_identity(
     )
     task_digest = task_contract.get("digest")
     if not isinstance(task, str) or not task:
-        msg = "Config task must be a non-empty string for checkpoint identity."
-        raise TypeError(msg)
-    if not isinstance(task_digest, str) or not task_digest:
-        msg = "Config task_contract.digest must be a non-empty string for checkpoint identity."
-        raise TypeError(msg)
+        message = "Config task must be a non-empty string for checkpoint identity."
+        raise TypeError(message)
+    task_digest = _required_sha256(task_digest, label="config task_contract.digest")
+    normalizer_digest = _required_sha256(normalizer_sha256, label="normalizer_sha256")
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     if split_contract.task != task or split_contract.task_contract_digest != task_digest:
-        msg = "Split task identity must match the checkpoint config contract."
-        raise ValueError(msg)
-    fingerprints = {
-        "train": split_contract.role("train").source.fingerprint,
-        "ood": split_contract.role("ood").source.fingerprint,
+        message = "Split task identity must match the checkpoint config contract."
+        raise ValueError(message)
+    sources = {
+        "train": split_contract.role("train").source,
+        "ood": split_contract.role("ood").source,
     }
+    dataset_ids = {role: source.dataset_id for role, source in sources.items()}
+    fingerprints = {role: source.fingerprint for role, source in sources.items()}
     membership_values = {role: split_contract.role(role).membership_digest for role in datasets.preprocessing.splits.SPLIT_ROLES}
-
+    split_payload = {
+        "schema_version": split_contract.schema_version,
+        "task": split_contract.task,
+        "task_contract_digest": split_contract.task_contract_digest,
+        "train_ratio": split_contract.train_ratio,
+        "ood_fraction": split_contract.ood_fraction,
+        "split_seed": split_contract.split_seed,
+        "datasets": {role: source.as_dict() for role, source in sources.items()},
+        "membership_digests": membership_values,
+    }
     persisted = dict(persisted_config or config)
     return _validate_checkpoint_identity(
         {
+            "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
             "task": task,
             "task_contract_digest": task_digest,
             "effective_config_digest": config_digest(persisted),
             "resume_contract_digest": resume_contract_digest(persisted),
+            "dataset_ids": dataset_ids,
             "dataset_fingerprints": fingerprints,
+            "split_contract_digest": common.serialization.canonical_json_sha256(split_payload),
             "split_membership_digests": membership_values,
+            "normalizer_sha256": normalizer_digest,
             "objective": objective,
         },
         label="built identity",
@@ -550,7 +616,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     identity = _validate_checkpoint_identity(payload["identity"], label="identity")
     expected = _validate_checkpoint_identity(expected_identity, label="expected identity")
     if identity != expected:
-        msg = "Checkpoint run identity is incompatible with config, task, dataset, split, or objective state."
+        msg = "Checkpoint run identity is incompatible with config, task, dataset, split, normalizer, or objective state."
         raise ValueError(msg)
 
     completed_epoch = payload["completed_epoch"]

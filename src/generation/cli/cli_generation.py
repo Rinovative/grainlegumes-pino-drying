@@ -788,8 +788,8 @@ def _campaign_summary(
             "id": campaign.profile.id,
             "available_learning_views": list(campaign.profile.available_learning_views),
             "airflow_source": campaign.profile.airflow_source,
-            "template_path": str(campaign.profile.template_path),
-            "template_sha256": campaign.profile.template_sha256,
+            "template_path": str(campaign.template_path),
+            "template_sha256": campaign.template_sha256,
         },
         "execution_resources": {
             "site": campaign.execution_values["site"],

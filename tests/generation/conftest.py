@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -68,7 +69,7 @@ def _profile_configuration(
 ) -> dict[str, Any]:
     """Return complete test-owned mappings without inspecting template binaries."""
     del repeated_airflow_times
-    profile = profiles.get_profile(simulation_profile)
+    profile = profiles.resolve_profile(simulation_profile)
     patterns = {
         "steady_flow_fields": "airflow.csv",
         "transient_fields": "transient.csv",
@@ -113,22 +114,9 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     """Return a factory for complete layered synthetic campaign configurations."""
     repository_root = Path(__file__).resolve().parents[2]
     project_root = tmp_path / "project"
-    links = {
-        "simulation/steady_flow/steady_flow_template.mph": repository_root / "simulation/steady_flow/steady_flow_template.mph",
-        "simulation/steady_flow/steady_flow_template.sha256": repository_root / "simulation/steady_flow/steady_flow_template.sha256",
-        "simulation/transient_drying/transient_drying_template.mph": repository_root / "simulation/transient_drying/transient_drying_template.mph",
-        "simulation/transient_drying/transient_drying_template.sha256": repository_root
-        / "simulation/transient_drying/transient_drying_template.sha256",
-        "scripts/generation_campaign_node.sh": repository_root / "scripts/generation_campaign_node.sh",
-    }
-    for relative, source in links.items():
-        destination = project_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
-            if relative == "scripts/generation_campaign_node.sh":
-                shutil.copy2(source, destination)
-            else:
-                destination.symlink_to(source)
+    node_script = project_root / "scripts/generation_campaign_node.sh"
+    node_script.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(repository_root / "scripts/generation_campaign_node.sh", node_script)
     monkeypatch.setenv("PROJECT_ROOT", str(project_root))
 
     registry = yaml.safe_load((repository_root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))
@@ -140,6 +128,29 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         material = yaml.safe_load(source.read_text(encoding="utf-8"))
         (materials_root / f"{material_family}.yaml").write_text(
             yaml.safe_dump(material, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    catalog_common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
+    profiles_root = project_root / "configs/generation/profiles"
+    profiles_root.mkdir(parents=True, exist_ok=True)
+    for profile_id in profiles.available_profiles():
+        template_relative_path = f"templates/catalog_{profile_id}.mph"
+        template_path = project_root / template_relative_path
+        template_path.parent.mkdir(parents=True, exist_ok=True)
+        template_path.write_bytes(f"synthetic catalog template for {profile_id}\n".encode())
+        template_path.with_suffix(".sha256").write_text(
+            f"{hashlib.sha256(template_path.read_bytes()).hexdigest()}\n",
+            encoding="utf-8",
+        )
+        profile = _profile_configuration(
+            profile_id,
+            repeated_airflow_times=False,
+            fixed_values=catalog_common["scientific_fixed_values"],
+        )
+        profile["template"] = template_relative_path
+        (profiles_root / f"{profile_id}.yaml").write_text(
+            yaml.safe_dump(profile, sort_keys=False),
             encoding="utf-8",
         )
 
@@ -164,11 +175,20 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         directory.mkdir(parents=True)
         common = yaml.safe_load((repository_root / "configs/generation/common.yaml").read_text(encoding="utf-8"))
         operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
+        template_relative_path = f"templates/{simulation_profile}_{campaign_number}.mph"
+        template_path = project_root / template_relative_path
+        template_path.parent.mkdir(parents=True, exist_ok=True)
+        template_path.write_bytes(f"synthetic COMSOL template for {simulation_profile} #{campaign_number}\n".encode())
+        template_path.with_suffix(".sha256").write_text(
+            f"{hashlib.sha256(template_path.read_bytes()).hexdigest()}\n",
+            encoding="utf-8",
+        )
         profile = _profile_configuration(
             simulation_profile,
             repeated_airflow_times=repeated_airflow_times,
             fixed_values=common["scientific_fixed_values"],
         )
+        profile["template"] = template_relative_path
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
         execution["runtime"]["timeout_seconds"] = timeout
         execution["runtime"]["extra_arguments"] = list(extra_arguments)
@@ -251,7 +271,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         }
         config_path = directory / "campaign.yaml"
         config_path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
-        return config_path, profiles.get_profile(simulation_profile).template_path
+        return config_path, template_path
 
     return build
 

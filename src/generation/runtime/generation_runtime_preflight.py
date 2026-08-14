@@ -32,7 +32,6 @@ from typing import Any
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
-from src.generation.contracts import generation_contracts_profiles as profiles
 
 from . import generation_runtime_workspace as workspace_service
 
@@ -216,12 +215,11 @@ def _command_versions(
 def _template_evidence() -> dict[str, Any]:
     """Validate both canonical template sidecars and return exact identities."""
     evidence: dict[str, Any] = {}
-    for profile_id in profiles.available_profiles():
-        profile = profiles.get_profile(profile_id)
+    for profile_id, template in config_service.discover_profile_template_identities().items():
         evidence[profile_id] = {
-            "path": str(profile.template_path),
-            "size_bytes": profile.template_path.stat().st_size,
-            "sha256": profile.template_sha256,
+            "path": str(template.absolute_path),
+            "size_bytes": template.absolute_path.stat().st_size,
+            "sha256": template.sha256,
             "sidecar_validation": "pass",
             "comsol_internal_contract": "runtime_unverified",
         }

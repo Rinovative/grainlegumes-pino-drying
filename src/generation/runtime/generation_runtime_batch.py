@@ -46,6 +46,7 @@ from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.contracts import generation_contracts_source as source_service
+from src.generation.contracts import generation_contracts_templates as templates
 from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol as comsol_service
@@ -389,8 +390,8 @@ class HDF5IdentityEvidence:
     """Describe identities admitted from one canonical case HDF5 payload."""
 
     simulation_profile: str
-    git_commit: str
-    template_relative_path: str
+    git_commit: str | None
+    template_relative_path: str | None
     template_sha256: str
     case_input_id: str
     simulation_case_id: str
@@ -621,7 +622,7 @@ def initialize_batch_metadata(
         label="resolved scientific generation configuration",
     )
     persisted_scientific = json.loads(scientific_path.read_text(encoding="utf-8"))
-    if common.serialization.canonical_json_sha256(persisted_scientific) != config.scientific_config_digest:
+    if config_contract.compute_scientific_config_digest(persisted_scientific) != config.scientific_config_digest:
         msg = "Persisted resolved_generation_config.json digest disagrees with scientific identity."
         raise RuntimeError(msg)
     execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
@@ -2823,8 +2824,8 @@ def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
         raise RuntimeError(msg)
     return HDF5IdentityEvidence(
         simulation_profile=str(identity["simulation_profile"]),
-        git_commit=str(identity["git_commit"]),
-        template_relative_path=str(identity["template_relative_path"]),
+        git_commit=(None if identity["git_commit"] is None else str(identity["git_commit"])),
+        template_relative_path=(None if identity["template_relative_path"] is None else str(identity["template_relative_path"])),
         template_sha256=_require_sha256(identity["template_sha256"], label="HDF5 template_sha256"),
         case_input_id=_require_sha256(identity["case_input_id"], label="HDF5 case_input_id"),
         simulation_case_id=_require_sha256(identity["simulation_case_id"], label="HDF5 simulation_case_id"),
@@ -2910,12 +2911,15 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
     if not isinstance(template, dict) or set(template) != {"relative_path", "filename", "sha256"}:
         msg = f"Canonical case template descriptor is malformed: {directory}"
         raise RuntimeError(msg)
+    template_relative_path = templates.validate_template_relative_path(
+        template["relative_path"],
+        label="case template relative_path",
+    )
     template_sha256 = _require_sha256(template["sha256"], label="case template sha256")
     if (
         views != list(profile.available_learning_views)
         or case_payload.get("airflow_source") != profile.airflow_source
-        or template["relative_path"] != profile.template_relative_path
-        or template["filename"] != Path(profile.template_relative_path).name
+        or template["filename"] != Path(template_relative_path).name
     ):
         msg = f"Canonical case profile or template descriptor is invalid: {directory}"
         raise RuntimeError(msg)
@@ -2980,8 +2984,8 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         )
         expected_hdf5 = HDF5IdentityEvidence(
             simulation_profile=profile.id,
-            git_commit=git_commit,
-            template_relative_path=profile.template_relative_path,
+            git_commit=(None if hdf5_identity.git_commit is None else git_commit),
+            template_relative_path=(None if hdf5_identity.template_relative_path is None else template_relative_path),
             template_sha256=template_sha256,
             case_input_id=case_input_id,
             simulation_case_id=simulation_case_id,
@@ -3026,7 +3030,7 @@ def _require_case_payload_matches_config(
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
         "template": {
-            "relative_path": config.profile.template_relative_path,
+            "relative_path": config.template_relative_path,
             "filename": config.template_path.name,
             "sha256": config.template_sha256,
         },
@@ -3541,7 +3545,7 @@ def finalize_batch(
         "sampling_regime": config.sampling_regime,
         "git_commit": git_commit,
         "scientific_config_digest": config.scientific_config_digest,
-        "template": {"relative_path": config.profile.template_relative_path, "sha256": config.template_sha256},
+        "template": {"relative_path": config.template_relative_path, "sha256": config.template_sha256},
         "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
         "intended_case_indices": list(config.case_indices),
         "cases": records,
@@ -3578,8 +3582,15 @@ def _validate_terminal_scientific_config(
     material = scientific.get("material")
     output_contract = scientific.get("output_contract")
     assignments = scientific.get("assignments")
+    reference_template = scientific.get("reference_template")
+    reference_template_matches = (
+        isinstance(reference_template, Mapping)
+        and set(reference_template) == {"sha256"}
+        and reference_template.get("sha256") == manifest["template"]["sha256"]
+    )
     if (
-        scientific.get("schema_kind") != "resolved_generation_batch"
+        not reference_template_matches
+        or scientific.get("schema_kind") != "resolved_generation_batch"
         or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
         or scientific.get("simulation_profile") != manifest["simulation_profile"]
         or scientific.get("sampling_regime") != manifest["sampling_regime"]
@@ -3727,7 +3738,7 @@ def admit_terminal_batch(
         manifest.get("export_contract_sha256"),
         label="terminal export_contract_sha256",
     )
-    if batch_identity != scientific_digest or common.serialization.canonical_json_sha256(scientific) != scientific_digest:
+    if batch_identity != scientific_digest or config_contract.compute_scientific_config_digest(scientific) != scientific_digest:
         msg = f"Terminal batch identity is not bound to persisted resolved science: {manifest_path}"
         raise RuntimeError(msg)
     profile_id = manifest.get("simulation_profile")
@@ -3739,12 +3750,12 @@ def admit_terminal_batch(
     if not isinstance(template, dict) or set(template) != {"relative_path", "sha256"}:
         msg = f"Terminal template descriptor is malformed: {manifest_path}"
         raise RuntimeError(msg)
+    template_relative_path = templates.validate_template_relative_path(
+        template["relative_path"],
+        label="terminal template relative_path",
+    )
     template_sha256 = _require_sha256(template["sha256"], label="terminal template sha256")
-    if (
-        manifest.get("available_learning_views") != list(profile.available_learning_views)
-        or manifest.get("airflow_source") != profile.airflow_source
-        or template["relative_path"] != profile.template_relative_path
-    ):
+    if manifest.get("available_learning_views") != list(profile.available_learning_views) or manifest.get("airflow_source") != profile.airflow_source:
         msg = f"Terminal profile or template descriptor is invalid: {manifest_path}"
         raise RuntimeError(msg)
     material_family = materials.validate_material_family(manifest.get("material_family"))
@@ -3885,7 +3896,7 @@ def admit_terminal_batch(
         sampling_regime=str(sampling_regime),
         git_commit=git_commit,
         scientific_config_digest=scientific_digest,
-        template_relative_path=profile.template_relative_path,
+        template_relative_path=template_relative_path,
         template_sha256=template_sha256,
         export_contract_sha256=export_contract_sha256,
         cases=tuple(admitted_cases),
@@ -3913,7 +3924,7 @@ def validate_terminal_batch(
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "scientific_config_digest": config.scientific_config_digest,
-        "template_relative_path": config.profile.template_relative_path,
+        "template_relative_path": config.template_relative_path,
         "template_sha256": config.template_sha256,
         "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
         "cases": tuple(config.case_indices),

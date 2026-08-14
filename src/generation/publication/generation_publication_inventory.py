@@ -457,11 +457,13 @@ def _inspect_fixed_value(
             "effective_downstream_consumers": consumers,
             "runtime_mapping_state": runtime_state,
             "case_provenance": ("case.json.sampled_values and scalar_handoff" if scalar_provenance else "resolved scientific config only"),
-            "hdf5_config_provenance": "provenance/scientific_config_json.scientific_fixed_records",
+            "hdf5_config_provenance": (
+                "provenance/scientific_config_json.scientific_fixed_values; full evidence in resolved_generation_config.json.scientific_fixed_records"
+            ),
             "hdf5_realized_provenance": (
                 "scalar values and provenance/case_scientific_provenance_json.sampled_values"
                 if scalar_provenance
-                else "no separate realized value; fixed contract remains in scientific_config_json"
+                else "no separate realized value; semantic fixed values remain in scientific_config_json"
             ),
         },
     }
@@ -543,7 +545,7 @@ def _inspect_common_record(
             "effective_downstream_consumers": consumers,
             "runtime_mapping_state": runtime_state,
             "case_provenance": "resolved case scientific configuration",
-            "hdf5_config_provenance": f"provenance/scientific_config_json.{prefix}",
+            "hdf5_config_provenance": (f"provenance/scientific_config_json.{prefix}; full evidence in resolved_generation_config.json"),
             "hdf5_realized_provenance": (
                 "realized coordinates, fields, and time datasets plus the fixed scientific contract"
                 if prefix != "physical_formulas"
@@ -599,8 +601,10 @@ def _inspect_porosity_support(
                 "generation.validation.generation_validation_sentinels static material-support audit",
             ],
             "case_provenance": "case.json scientific_config.material.packing_porosity_mean_support",
-            "hdf5_config_provenance": ("provenance/scientific_config_json.material.packing_porosity_mean_support"),
-            "hdf5_realized_provenance": ("porosity field and generator diagnostics; support remains in scientific_config_json"),
+            "hdf5_config_provenance": (
+                "provenance/scientific_config_json.material.packing_porosity_mean_support; full evidence in resolved_generation_config.json"
+            ),
+            "hdf5_realized_provenance": ("porosity field and generator diagnostics; semantic support remains in scientific_config_json"),
         },
         "materials": material_views,
     }
@@ -732,7 +736,10 @@ def inspect_campaign_parameter(campaign: Any, canonical_name: str) -> dict[str, 
             "realized_components": list(_ATOMIC_RECORD_COMPONENTS.get(canonical_name, ())) or [canonical_name],
             "effective_downstream_consumers": list(consumers),
             "case_provenance": ("case.json.sampled_values / block_provenance / ood / coupled_selections"),
-            "hdf5_config_provenance": ("provenance/scientific_config_json.material.effective_parameter_provenance"),
+            "hdf5_config_provenance": (
+                "provenance/scientific_config_json.material.parameter_registry; full evidence in "
+                "resolved_generation_config.json.material.effective_parameter_provenance"
+            ),
             "hdf5_realized_provenance": ("provenance/case_scientific_provenance_json.sampled_values / block_provenance / ood / coupled_selections"),
         },
         "materials": materials_view,

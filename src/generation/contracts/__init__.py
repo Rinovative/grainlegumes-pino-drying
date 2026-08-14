@@ -13,6 +13,7 @@ Provides:
 - registry: typed scientific parameter registry
 - scalar_handoff: exact transient scalar-source admission and immutable entries
 - source: source-repository provenance validation
+- templates: configured COMSOL template byte identity
 - vocabulary: campaign, evaluation, and membership vocabulary
 - EvaluationRegime: canonical package evaluation-regime type
 - FieldContract: immutable named physical-field descriptor
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from . import generation_contracts_registry as registry
     from . import generation_contracts_scalar_handoff as scalar_handoff
     from . import generation_contracts_source as source
+    from . import generation_contracts_templates as templates
     from . import generation_contracts_vocabulary as vocabulary
     from .generation_contracts_descriptors import (
         EvaluationRegime,
@@ -71,6 +73,7 @@ _MODULES = {
     "registry": "generation_contracts_registry",
     "scalar_handoff": "generation_contracts_scalar_handoff",
     "source": "generation_contracts_source",
+    "templates": "generation_contracts_templates",
     "vocabulary": "generation_contracts_vocabulary",
 }
 _DESCRIPTOR_EXPORTS = frozenset(
@@ -110,6 +113,7 @@ __all__ = [
     "registry",
     "scalar_handoff",
     "source",
+    "templates",
     "validate_git_commit",
     "vocabulary",
 ]

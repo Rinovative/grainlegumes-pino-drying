@@ -883,7 +883,7 @@ def finalize_technical_smoke_evidence(
         "simulation_profile": expected["simulation_profile"],
         "mapping_contract_sha256": expected["mapping_contract_sha256"],
         "template": {
-            "relative_path": campaign.profile.template_relative_path,
+            "relative_path": campaign.template_relative_path,
             "sha256": expected["template_sha256"],
         },
         "comsol": {
@@ -1229,9 +1229,9 @@ def _template_binding(
     """Return exact configured template identities."""
     return {
         campaign.profile.id: {
-            "relative_path": campaign.profile.template_relative_path,
-            "sha256": campaign.profile.template_sha256,
-            "size_bytes": campaign.profile.template_path.stat().st_size,
+            "relative_path": campaign.template_relative_path,
+            "sha256": campaign.template_sha256,
+            "size_bytes": campaign.template_path.stat().st_size,
         }
         for campaign in campaigns
     }

@@ -4,7 +4,7 @@ dataset_packages_builder.py
 ===============================================================================
 Build immutable dual-view Dataset packages from terminal simulation evidence.
 Responsibilities:
-  - Assemble provenance-bound steady payloads and transient indexes
+  - Assemble content-bound steady payloads and transient indexes
   - Compute package identities and publish exact payloads atomically
   - Reuse only existing packages whose manifests and payload hashes agree
 Design principles:
@@ -192,7 +192,7 @@ def _package_provenance(
         "material_counts": dict(sorted(material_counts.items())),
         "source_profile_counts": dict(sorted(profile_counts.items())),
         "candidate_source_case_count": len(prepared.candidates) + len(prepared.excluded),
-        "builder_identity": "src.datasets.dataset_packages.build_campaign_packages",
+        "builder_identity": identity.dataset_conversion_contract_identity(view.id),
         "schema_identity": _schema_identity(view.id),
     }
 

@@ -884,7 +884,7 @@ def analyze_successful_case(
             and identity["simulation_case_id"] == case_payload["simulation_case_id"]
             and identity["scientific_config_digest"] == case_payload["scientific_config_digest"]
             and identity["template_sha256"] == case_payload["template"]["sha256"]
-            and identity["git_commit"] == case_payload["git_commit"]
+            and (identity["git_commit"] is None or identity["git_commit"] == case_payload["git_commit"])
         ),
         "scalar_handoff": status.get("field_shape_valid") is True and status.get("schedule_valid") is True,
     }

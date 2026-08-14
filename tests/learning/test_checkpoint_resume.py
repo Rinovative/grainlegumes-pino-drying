@@ -11,6 +11,7 @@ inference admission are covered by their dedicated modules.
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import random
 from pathlib import Path
@@ -210,22 +211,30 @@ def _config(epochs: int, *, direction: str = "minimize", evaluation_interval: in
 
 def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[str, Any]:
     """
-    Build a complete synthetic checkpoint identity namespaced by one run label.
+    Build a complete current checkpoint identity namespaced by one run label.
 
-    Task, config, resume, dataset, and ordered split digests vary together, while
-    objective direction stays aligned with selection tests to avoid unrelated failures.
+    Task, config, Dataset, split, normalizer, and objective dependencies vary
+    together so selection tests avoid unrelated identity failures.
     """
+
+    def digest(label: str) -> str:
+        return hashlib.sha256(f"{run}:{label}".encode()).hexdigest()
+
     return {
+        "identity_contract_sha256": learning.training.checkpoint.TRAINING_IDENTITY_CONTRACT_DIGEST,
         "task": run,
-        "task_contract_digest": f"{run}-task-digest",
-        "effective_config_digest": f"{run}-config-digest",
-        "resume_contract_digest": f"{run}-resume-digest",
-        "dataset_fingerprints": {"train": f"{run}-train", "ood": f"{run}-ood"},
+        "task_contract_digest": digest("task"),
+        "effective_config_digest": digest("config"),
+        "resume_contract_digest": digest("resume"),
+        "dataset_ids": {"train": f"{run}-train-dataset", "ood": f"{run}-ood-dataset"},
+        "dataset_fingerprints": {"train": digest("train"), "ood": digest("ood")},
+        "split_contract_digest": digest("split-contract"),
         "split_membership_digests": {
-            "train": f"{run}-train-membership",
-            "eval": f"{run}-eval-membership",
-            "ood": f"{run}-ood-membership",
+            "train": digest("train-membership"),
+            "eval": digest("eval-membership"),
+            "ood": digest("ood-membership"),
         },
+        "normalizer_sha256": digest("normalizer"),
         "objective": _objective(direction=direction),
     }
 

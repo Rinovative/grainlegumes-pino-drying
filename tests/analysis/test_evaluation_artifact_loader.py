@@ -489,7 +489,7 @@ def test_completed_run_admission_is_read_only_and_generation_free(
     assert loaded.ood_artifact.frame["source_index"].tolist() == split["ood_indices"].tolist()
     for artifact in (loaded.id_artifact, loaded.ood_artifact):
         provenance = artifact.frame.attrs["artifact_provenance"]
-        assert artifact.identity_sha256 == common.serialization.canonical_json_sha256(provenance)
+        assert artifact.identity_sha256 == contracts.artifact_identity_digest(provenance)
     assert fixture.validate_calls == [fixture.run_dir]
     assert _inventory(fixture.run_dir) == before
     prefix_fixture = _build_fixture(
@@ -517,7 +517,6 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
 
     contradictions = (
         (("run", "best_checkpoint_sha256"), "x" * 64),
-        (("run", "lifecycle_status"), "interrupted"),
         (("dataset", "fingerprint"), "x" * 64),
         (("dataset", "data_contract_digest"), "x" * 64),
         (("dataset", "saved_membership_digest"), "x" * 64),
@@ -534,6 +533,11 @@ def test_artifact_boundary_rejects_missing_changed_and_aliased_evidence(
         assert "incompatible" in message
         rebuild_command = f"./scripts/docker_job.sh --queue-gpu auto artifacts --run-dir {fixture.run_dir} --rebuild"
         assert rebuild_command in message
+
+    provenance_only = _build_fixture(tmp_path / "provenance-only", monkeypatch)
+    _mutate_provenance(provenance_only.id_root, ("run", "lifecycle_status"), "archived")
+    loaded = loader.load_run_artifacts(provenance_only.run_dir)
+    assert loaded.id_artifact is not None
 
     changed = _build_fixture(tmp_path / "changed-payload", monkeypatch)
     npz_path = next((changed.id_root / "npz").glob("*.npz"))

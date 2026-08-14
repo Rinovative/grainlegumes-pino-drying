@@ -145,6 +145,26 @@ exec "${FAKE_REALPATH}" "$@"
 """,
     )
     _executable(
+        fake_bin / "date",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == +%s && -n "${FAKE_CONSOLE_TIMES:-}" ]]; then
+  IFS=',' read -r -a values <<< "${FAKE_CONSOLE_TIMES}"
+  index=0
+  [[ ! -f "${FAKE_CONSOLE_TIME_INDEX_FILE}" ]] ||
+    read -r index < "${FAKE_CONSOLE_TIME_INDEX_FILE}"
+  (( ${#values[@]} > 0 )) || exit 95
+  if (( index >= ${#values[@]} )); then
+    index=$(( ${#values[@]} - 1 ))
+  fi
+  printf '%s\n' "${values[index]}"
+  printf '%s\n' "$(( index + 1 ))" > "${FAKE_CONSOLE_TIME_INDEX_FILE}"
+else
+  exec "${FAKE_REAL_DATE}" "$@"
+fi
+""".replace("$", "$"),
+    )
+    _executable(
         fake_bin / "git",
         r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -218,7 +238,20 @@ elif [[ " $* " == *' campaign-source-status '* ]]; then
     printf 'source-status\t%s\t%s\t%s\tineligible\tFalse\n'       "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
   fi
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format state '* ]]; then
-  printf '%s\n' "${FAKE_CAMPAIGN_STATE}"
+  state="${FAKE_CAMPAIGN_STATE}"
+  if [[ -n "${FAKE_CAMPAIGN_STATES:-}" ]]; then
+    IFS=',' read -r -a states <<< "${FAKE_CAMPAIGN_STATES}"
+    index=0
+    [[ ! -f "${FAKE_CAMPAIGN_STATE_INDEX_FILE}" ]] ||
+      read -r index < "${FAKE_CAMPAIGN_STATE_INDEX_FILE}"
+    (( ${#states[@]} > 0 )) || exit 96
+    if (( index >= ${#states[@]} )); then
+      index=$(( ${#states[@]} - 1 ))
+    fi
+    state="${states[index]}"
+    printf '%s\n' "$(( index + 1 ))" > "${FAKE_CAMPAIGN_STATE_INDEX_FILE}"
+  fi
+  printf '%s\n' "${state}"
 elif [[ " $* " == *' campaign-status '* ]]; then
   printf '%s\n' '{"campaign_purpose":"family_generalization","cases_per_material":null,"submission_config":{"poll_interval_seconds":1}}'
 elif [[ " $* " == *' storage-status '* && " $* " == *' --role cpu '* ]]; then
@@ -255,7 +288,7 @@ elif [[ " $* " == *' submit-campaign'* ]]; then
 elif [[ " $* " == *' plan-campaign'* ]]; then
   printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
 elif [[ "${payload}" == *'sbatch --wait --parsable'* ]]; then
-  printf '%s\n' '12345'
+  printf 'preflight\t12345\t/remote/preflight/fixture\n'
 fi
 """.replace("$", "$"),
     )
@@ -429,6 +462,7 @@ fi
             "FAKE_CAMPAIGN_PURPOSE_FILE": str(state_root / "campaign-purpose"),
             "FAKE_GIT_COMMIT": _COMMIT,
             "FAKE_REALPATH": shutil.which("realpath", path=os.defpath) or "/usr/bin/realpath",
+            "FAKE_REAL_DATE": shutil.which("date", path=os.defpath) or "/usr/bin/date",
             "GENERATION_REPOSITORY_URL": "git@github.com:Rinovative/grainlegumes-pino-drying.git",
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
@@ -442,6 +476,10 @@ fi
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
             "FAKE_CAMPAIGN_STATE": "publication_complete",
+            "FAKE_CAMPAIGN_STATES": "",
+            "FAKE_CAMPAIGN_STATE_INDEX_FILE": str(state_root / "campaign-state-index"),
+            "FAKE_CONSOLE_TIMES": "",
+            "FAKE_CONSOLE_TIME_INDEX_FILE": str(state_root / "console-time-index"),
             "FAKE_SOURCE_STATE": "publication_complete",
             "FAKE_AUTHORIZED_BYTES": str(_AUTHORIZED_BYTES),
             "FAKE_AUTHORIZATION_SHA": _AUTHORIZATION_SHA,
@@ -589,12 +627,12 @@ def test_campaign_source_status_cli_emits_exact_tsv(
 
 
 def test_fresh_campaign_monitoring_keeps_machine_stdout_clean(tmp_path: Path) -> None:
-    """Continue a first active submission despite visible login diagnostics."""
+    """Coalesce human progress while preserving one exact remote submission."""
     workflow, log, environment, storage, _mirror = _harness(tmp_path)
     environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATE"] = "publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "submitted,submitted,running,publication_complete"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     campaign = workflow.parent.parent / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
     assert not storage.exists()
@@ -607,16 +645,46 @@ def test_fresh_campaign_monitoring_keeps_machine_stdout_clean(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert "Malformed CPU source status." not in result.stderr
-    assert f"Campaign {_RUN_ID} state: publication_complete" in result.stdout
-    assert '"state":"active","slurm_job_ids":["591776"]' in result.stdout
+    assert result.stdout.count("state=submitted") == 1
+    assert result.stdout.count("state=running") == 1
+    assert "state=publication_complete" in result.stdout
+    assert f"campaign_run_id={_RUN_ID}" in result.stdout
+    assert "dataset_id=synthetic" in result.stdout
+    assert "[8/8]" in result.stdout
+    assert "DONE:" in result.stdout
+    assert '"filesystem_mutated"' not in result.stdout
+    assert '"slurm_job_ids"' not in result.stdout
+    assert '"status":"complete","packages"' not in result.stdout
+    assert '"workflow_result"' not in result.stdout
     assert "Preflight domain=CPU login" not in result.stdout
-    assert "Preflight domain=CPU login" in result.stderr
+    assert "Preflight domain=CPU login" not in result.stderr
+    assert "\x1b" not in result.stdout
     assert Path(environment["FAKE_SUBMISSION_FILE"]).read_text(encoding="utf-8") == "591776\n"
     log_text = log.read_text(encoding="utf-8")
     assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
     assert "campaign-source-status" in log_text
     assert "campaign-status" in log_text
     assert log_text.count("generation_cpu_login_preflight.sh") == 1
+
+
+def test_unchanged_campaign_heartbeat_is_not_rendered_before_five_minutes(tmp_path: Path) -> None:
+    """Render one unchanged heartbeat at 300 seconds and none at 299 seconds."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATES"] = "submitted,submitted,submitted,publication_complete"
+    environment["FAKE_CONSOLE_TIMES"] = "1000,1299,1300,1301"
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+
+    result = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("state=submitted") == 2
+    assert result.stdout.count("heartbeat=unchanged") == 1
+    assert "state=publication_complete" in result.stdout
 
 
 def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Path) -> None:
@@ -785,7 +853,11 @@ def test_preflight_passes_exact_cpu_checkout_to_relocated_worker(tmp_path: Path)
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.rstrip().endswith("12345")
+    assert "[1/3] Local preflight" in result.stdout
+    assert "[2/3] CPU login preflight" in result.stdout
+    assert "[3/3] CPU compute preflight" in result.stdout
+    assert "job=12345 evidence=/remote/preflight/fixture" in result.stdout
+    assert "preflight\t" not in result.stdout
     log_text = log.read_text(encoding="utf-8")
     assert '--export="ALL,GENERATION_GIT_COMMIT=${commit}"' in log_text
     worker_index = log_text.index('"${repository}/scripts/generation_cpu_smoke.sh"')
@@ -960,7 +1032,7 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
         environment,
     )
     assert normal.returncode != 2
-    assert "Pilot cases: 5 materials x 4 = 20 total." in normal.stdout
+    assert "materials=5 cases_per_material=4 total=20" in normal.stdout
 
     fast_root = tmp_path / "fast"
     fast_root.mkdir()
@@ -977,7 +1049,7 @@ def test_pilot_command_uses_config_default_and_explicit_fast_override(tmp_path: 
         fast_environment,
     )
     assert fast.returncode != 2
-    assert "Pilot cases: 5 materials x 1 = 5 total." in fast.stdout
+    assert "materials=5 cases_per_material=1 total=5" in fast.stdout
     help_result = _run(workflow, ["--help"], environment)
     assert "pilot-check CAMPAIGN [--cases-per-material N]" in help_result.stderr
     assert "duration-check" not in help_result.stderr
@@ -994,12 +1066,14 @@ def test_high_level_core_benchmark_routes_through_docker_cpu_and_dedicated_trans
 
     result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
     assert result.returncode == 0, result.stderr
-    assert f"Core benchmark run ID: {_BENCHMARK_RUN_ID}" in result.stdout
-    assert "Synthetic local core benchmark summary" in result.stdout
-    assert "CPU benchmark evidence retained" in result.stdout
+    assert f"benchmark_run_id={_BENCHMARK_RUN_ID}" in result.stdout
+    assert "[6/6] Final validation" in result.stdout
+    assert "Synthetic local core benchmark summary" not in result.stdout
+    assert '"filesystem_mutated"' not in result.stdout
+    assert '"state":"submitted"' not in result.stdout
     assert remote_directory.is_dir()
     assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()
-    assert f"Core benchmark {_BENCHMARK_RUN_ID} state: complete" in result.stdout
+    assert "state=complete" in result.stdout
     log_text = log.read_text(encoding="utf-8")
     for command in (
         "inspect-core-benchmark",
@@ -1026,7 +1100,8 @@ def test_high_level_core_benchmark_routes_through_docker_cpu_and_dedicated_trans
     assert recovered.returncode == 0, recovered.stderr
     recovered_log = log.read_text(encoding="utf-8")
     assert "<--variant>\n<cores_08>" in recovered_log
-    assert "GPU benchmark publication validated and reused" in recovered.stdout
+    assert "GPU publication" in recovered.stdout
+    assert "REUSED" in recovered.stdout
 
 
 def test_core_benchmark_failure_reports_retry_without_premature_finalization(tmp_path: Path) -> None:
@@ -1037,7 +1112,8 @@ def test_core_benchmark_failure_reports_retry_without_premature_finalization(tmp
     result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
 
     assert result.returncode != 0
-    assert '"variant_id":"cores_16"' in result.stdout
+    assert "variant_id=cores_16" in result.stdout
+    assert '"retry_repetitions"' not in result.stdout
     assert "requires retry" in result.stderr
     assert "<finalize-core-benchmark>" not in log.read_text(encoding="utf-8")
 
@@ -1094,7 +1170,11 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
         environment,
     )
     assert complete.returncode == 0, complete.stderr
-    assert "CPU source cleanup after complete success: enabled" in complete.stdout
+    assert "cleanup=verified-delete" in complete.stdout
+    assert '"source_removed"' not in complete.stdout
+    assert '"status":"complete","packages"' not in complete.stdout
+    assert '"workflow_result"' not in complete.stdout
+    assert "campaign\tsteady_flow_family_generalization" not in complete.stdout
     assert all(not (mirror / relative).exists() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
     positions = [
@@ -1124,7 +1204,7 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
         retained_environment,
     )
     assert retained.returncode == 0, retained.stderr
-    assert "CPU source cleanup after complete success: disabled" in retained.stdout
+    assert "cleanup=retain" in retained.stdout
     assert all((retained_mirror / relative).is_dir() for relative in retained_directories)
     retained_text = retained_log.read_text(encoding="utf-8")
     assert "<--keep-cpu-source>" in retained_text
@@ -1142,8 +1222,12 @@ def test_failure_preserves_cpu_and_gpu_then_resume_reuses_publication_idempotent
         environment,
     )
     assert failed.returncode != 0
-    assert "Stage: dataset build, inspection, and loader smokes" in failed.stderr
+    assert "FAILED: dataset build, inspection, and loader smokes" in failed.stderr
+    assert "cause unavailable from consolidated evidence" in failed.stderr
+    assert "workflow evidence:" in failed.stderr
+    assert "/failure.json" in failed.stderr
     assert f"CPU bytes retained: {_AUTHORIZED_BYTES}" in failed.stderr
+    assert "Resume:" in failed.stderr
     assert "./scripts/generation_workflow.sh resume" in failed.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
     assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()

@@ -39,7 +39,6 @@ from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
-from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1010,7 +1009,6 @@ def _write_hdf5(
             "scientific_config_digest",
             "export_contract_sha256",
             "airflow_source",
-            "git_commit",
         ):
             handle.attrs[key] = case_payload[key]
         case_index = case_payload["case_index"]
@@ -1018,11 +1016,14 @@ def _write_hdf5(
             message = "Case index must be a positive integer before HDF5 publication."
             raise ValueError(message)
         handle.attrs["case_index"] = case_index
-        handle.attrs["template_relative_path"] = case_payload["template"]["relative_path"]
         handle.attrs["template_sha256"] = case_payload["template"]["sha256"]
         handle.attrs["available_learning_views"] = _json_attribute(case_payload["available_learning_views"])
         provenance = handle.create_group("provenance")
-        _write_json_dataset(provenance, "scientific_config_json", config.scientific_values)
+        _write_json_dataset(
+            provenance,
+            "scientific_config_json",
+            config_contract.scientific_config_identity_payload(config.scientific_values),
+        )
         _write_json_dataset(
             provenance,
             "case_scientific_provenance_json",
@@ -1034,7 +1035,7 @@ def _write_hdf5(
             provenance,
             "template_json",
             {
-                **case_payload["template"],
+                "sha256": case_payload["template"]["sha256"],
                 "sha256_validation": "pass",
                 "comsol_internal_contract": "runtime_validation_required",
             },
@@ -1275,7 +1276,7 @@ def _validate_hdf5_provenance(
     handle: h5py.File,
     profile: str,
     profile_contract: profiles.SimulationProfile,
-) -> tuple[dict[str, Any], str, scalar_handoff_contract.ScalarHandoffAdmission | None, dict[str, Any]]:
+) -> tuple[dict[str, Any], str | None, scalar_handoff_contract.ScalarHandoffAdmission | None, dict[str, Any]]:
     """Validate complete scientific, input, conditioning, and template provenance."""
     expected = {
         "scientific_config_json",
@@ -1443,25 +1444,23 @@ def _validate_hdf5_provenance(
         source_exports,
         profile_contract=profile_contract,
     )
-    relative_path = _hdf5_text_attribute(
-        handle.attrs.get("template_relative_path", ""),
-        label="template_relative_path",
-    )
     template_sha256 = _hdf5_text_attribute(
         handle.attrs.get("template_sha256", ""),
         label="template_sha256",
     )
     expected_template = {
-        "relative_path": profile_contract.template_relative_path,
-        "filename": Path(profile_contract.template_relative_path).name,
         "sha256": template_sha256,
         "sha256_validation": "pass",
         "comsol_internal_contract": "runtime_validation_required",
     }
-    if relative_path != profile_contract.template_relative_path or not _is_sha256(template_sha256) or template != expected_template:
+    reference_template = scientific.get("reference_template")
+    if "template_relative_path" in handle.attrs or reference_template != {"sha256": template_sha256}:
+        msg = "Canonical HDF5 template identity must contain bytes only."
+        raise ValueError(msg)
+    if not _is_sha256(template_sha256) or template != expected_template:
         msg = "Canonical HDF5 persisted template identity or runtime-validation provenance is invalid."
         raise ValueError(msg)
-    return scientific, relative_path, scalar_handoff, fixed_ownership
+    return scientific, None, scalar_handoff, fixed_ownership
 
 
 def _validate_hdf5_static_and_parameters(
@@ -1888,13 +1887,15 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         ):
             msg = "Canonical HDF5 export, learning-view, or airflow provenance is invalid."
             raise ValueError(msg)
-        if common.serialization.canonical_json_sha256(scientific) != identities["scientific_config_digest"]:
+        if config_contract.compute_scientific_config_digest(scientific) != identities["scientific_config_digest"]:
             msg = "Canonical HDF5 scientific provenance digest is inconsistent."
             raise ValueError(msg)
-        git_commit = source_service.validate_git_commit(_hdf5_text_attribute(handle.attrs.get("git_commit", ""), label="git_commit"))
+        if "git_commit" in handle.attrs:
+            message = "Canonical HDF5 scientific content must not embed execution Git provenance."
+            raise ValueError(message)
         return {
             "simulation_profile": profile,
-            "git_commit": git_commit,
+            "git_commit": None,
             "template_relative_path": template_relative_path,
             "export_contract_sha256": export_contract_sha256,
             "available_learning_views": tuple(available_views),

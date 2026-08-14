@@ -77,8 +77,27 @@ def _porosity_diagnostics() -> dict[str, Any]:
 def _synthetic_scientific_contract() -> dict[str, Any]:
     """Return the explicit config evidence owned by one synthetic case."""
     return {
+        "schema_kind": "resolved_generation_batch",
         "schema_version": generation.cases.config.CONFIG_SCHEMA_VERSION,
+        "generator_version": generation.cases.seeding.GENERATOR_VERSION,
         "simulation_profile": "transient_drying",
+        "reference_template": {"sha256": "e" * 64},
+        "campaign_seed": 7,
+        "material": {
+            "material_family": "lentil",
+            "packing_porosity_mean_support": {"lower": 0.29, "upper": 0.36, "unit": "1"},
+            "porosity_coupling": {},
+            "parameter_registry": {},
+            "active_sampling_blocks": ["airflow", "initial_moisture", "operation", "material_properties"],
+            "active_coordinate_names": [],
+            "coupled_ood_records": {},
+            "atomic_records": {},
+        },
+        "operation_config_digest": "d" * 64,
+        "sampling_regime": "natural",
+        "case_count": 1,
+        "sampling": {"method": "synthetic"},
+        "assignments": [{"case_index": 1}],
         "grid": {
             "nx": 401,
             "ny": 251,
@@ -103,6 +122,9 @@ def _synthetic_scientific_contract() -> dict[str, Any]:
                 "duration_h": 1.0 / 6.0,
             }
         },
+        "input_contract": {"schema_kind": "synthetic_inputs", "schema_version": 1},
+        "output_contract": {"schema_kind": "synthetic_outputs", "schema_version": 1},
+        "operation_constraints": {},
         "storage": {
             "schema_version": generation.publication.storage.HDF5_SCHEMA_VERSION,
             "converter_version": generation.publication.storage.HDF5_CONVERTER_VERSION,
@@ -286,8 +308,8 @@ def _write_transient_case(
         ],
         dtype=np.float64,
     )
-    profile = profiles.get_profile("transient_drying")
-    scientific_digest = common.serialization.canonical_json_sha256(scientific)
+    template_sha256 = "e" * 64
+    scientific_digest = generation.cases.config.compute_scientific_config_digest(scientific)
     scalar_entries = [
         {"name": name, "value": scalar_values[name], "unit": unit, "owner": owner}
         for name, unit, owner in zip(
@@ -351,9 +373,7 @@ def _write_transient_case(
                 "scientific_config_digest": scientific_digest,
                 "export_contract_sha256": "4" * 64,
                 "airflow_source": "comsol_coupled_reference",
-                "git_commit": "a" * 40,
-                "template_relative_path": profile.template_relative_path,
-                "template_sha256": profile.template_sha256,
+                "template_sha256": template_sha256,
                 "available_learning_views": _json(["steady_flow", "transient_drying"]),
             }
         )
@@ -373,9 +393,7 @@ def _write_transient_case(
                 "exports/final.csv": {"role": "final_status", "sha256": "a" * 64, "size_bytes": 1},
             },
             "template_json": {
-                "relative_path": profile.template_relative_path,
-                "filename": profile.template_path.name,
-                "sha256": profile.template_sha256,
+                "sha256": template_sha256,
                 "sha256_validation": "pass",
                 "comsol_internal_contract": "runtime_validation_required",
             },
@@ -1108,5 +1126,5 @@ def test_transient_time_classification_and_bad_commit(tmp_path: Path) -> None:
     _write_transient_case(bad)
     with h5py.File(bad, "r+") as handle:
         handle.attrs["git_commit"] = "not-a-commit"
-    with pytest.raises(ValueError, match="40-character"):
+    with pytest.raises(ValueError, match="must not embed execution Git provenance"):
         generation.publication.storage.validate_case_hdf5(bad, expected_profile="transient_drying")

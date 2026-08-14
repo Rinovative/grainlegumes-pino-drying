@@ -13,10 +13,12 @@ from typing import Any
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 from src import common, generation
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff
+from src.generation.contracts import generation_contracts_templates as templates
 from src.generation.publication import generation_publication_storage as storage
 from src.generation.runtime import generation_runtime_batch as runtime
 
@@ -339,12 +341,15 @@ def test_scalar_parser_and_admission_have_one_production_owner() -> None:
 
 def test_canonical_template_owns_derived_initial_temperature_and_four_column_schedule() -> None:
     """Protect the corrected native mapping, template bytes, and sidecar owners."""
-    for profile_id in profiles.available_profiles():
-        profile = profiles.get_profile(profile_id)
-        assert common.serialization.file_sha256(profile.template_path) == profile.template_sha256
-
-    profile = profiles.get_profile(profiles.TRANSIENT_DRYING_PROFILE)
-    with ZipFile(profile.template_path) as archive:
+    repository_root = Path(__file__).resolve().parents[2]
+    profile_path = repository_root / "configs/generation/profiles/transient_drying.yaml"
+    profile_document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    assert isinstance(profile_document, dict)
+    template = templates.resolve_template_identity(
+        profile_document["template"],
+        repository_root=repository_root,
+    )
+    with ZipFile(template.absolute_path) as archive:
         descriptor = archive.read("dmodel.xml").decode("utf-8")
         summary = json.loads(archive.read("smodel.json"))
 
