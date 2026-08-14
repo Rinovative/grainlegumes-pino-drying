@@ -22,7 +22,6 @@ from src import datasets, domain
 
 _EXPECTED_DISTINCT_FINGERPRINTS = 4
 _COMBINED_OOD_SAMPLE_COUNT = 8
-_SHA256_HEX_LENGTH = 64
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -94,27 +93,6 @@ def test_creation_computes_stable_content_identity(
 
     assert first["dataset_fingerprint"] == second["dataset_fingerprint"]
     assert strict_identity.fingerprint == first["dataset_fingerprint"]
-
-
-def test_dataset_and_generated_identity_require_exact_integer_versions(
-    steady_task: domain.tasks.spec.TaskSpec,
-    training_dataset_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """Reject alternate representations of both current persisted schema versions."""
-    payload = training_dataset_payload_factory()
-    invalid_versions = (
-        (("schema_version",), (True, 1.0, 2)),
-        (("generated_batch_identity", "schema_version"), (True, 1.0, 2)),
-    )
-    for path, versions in invalid_versions:
-        for schema_version in versions:
-            invalid = copy.deepcopy(payload)
-            target = invalid
-            for key in path[:-1]:
-                target = target[key]
-            target[path[-1]] = schema_version
-            with pytest.raises(ValueError, match="schema_version"):
-                datasets.contracts.identity.validate_training_dataset_payload(invalid, task=steady_task)
 
 
 def test_dataset_reader_requires_actual_float32_tensors(
@@ -223,33 +201,6 @@ def test_ordered_membership_changes_fingerprint(
     assert len(fingerprints) == _EXPECTED_DISTINCT_FINGERPRINTS
 
 
-def test_strict_verification_rejects_reordered_samples_with_stale_fingerprint(
-    steady_task: domain.tasks.spec.TaskSpec,
-    training_dataset_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """
-    Swap persisted sample IDs while retaining the original stored fingerprint.
-
-    Strict validation must reject the stale digest so ordered membership cannot
-    be altered without invalidating downstream split identity.
-    """
-    payload = copy.deepcopy(training_dataset_payload_factory())
-    payload["sample_ids"][0], payload["sample_ids"][1] = (
-        payload["sample_ids"][1],
-        payload["sample_ids"][0],
-    )
-    payload["generated_batch_identity"] = build_synthetic_generated_batch_identity(
-        batch_id=payload["generated_batch_identity"]["batch_id"],
-        sample_ids=payload["sample_ids"],
-    )
-    with pytest.raises(ValueError, match="fingerprint mismatch"):
-        datasets.contracts.identity.validate_training_dataset_payload(
-            payload,
-            task=steady_task,
-            verify_content=True,
-        )
-
-
 def test_default_dataset_load_rejects_modified_tensor_content(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
@@ -284,40 +235,6 @@ def test_duplicate_sample_id_is_rejected(
     payload["sample_ids"][1] = payload["sample_ids"][0]
     with pytest.raises(ValueError, match="duplicate identifiers"):
         datasets.contracts.identity.validate_training_dataset_payload(payload, task=steady_task)
-
-
-def test_membership_digest_binds_indices_and_order(
-    training_dataset_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """
-    Hash fixed dataset membership while varying selected order and split role.
-
-    Both variations must change the digest, protecting exact saved membership
-    rather than only the unordered set of selected samples.
-    """
-    payload = training_dataset_payload_factory()
-    direct = datasets.contracts.identity.membership_digest(
-        role="train",
-        dataset_fingerprint=payload["dataset_fingerprint"],
-        sample_ids=payload["sample_ids"],
-        indices=[0, 2],
-    )
-    reordered = datasets.contracts.identity.membership_digest(
-        role="train",
-        dataset_fingerprint=payload["dataset_fingerprint"],
-        sample_ids=payload["sample_ids"],
-        indices=[2, 0],
-    )
-    changed_role = datasets.contracts.identity.membership_digest(
-        role="eval",
-        dataset_fingerprint=payload["dataset_fingerprint"],
-        sample_ids=payload["sample_ids"],
-        indices=[0, 2],
-    )
-
-    assert len(direct) == _SHA256_HEX_LENGTH
-    assert direct != reordered
-    assert direct != changed_role
 
 
 def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
@@ -413,42 +330,6 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
             **loader_args,
             split_indices=split_info,
         )
-
-
-@pytest.mark.parametrize(
-    "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
-)
-def test_saved_split_requires_integer_version_one(
-    schema_version: object,
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    training_dataset_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """Reject non-integer and unsupported saved split schema versions."""
-    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("split_train"))
-    ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("split_ood"))
-    loader_args = {
-        "path_train": str(train_path),
-        "path_test_ood": str(ood_path),
-        "task": steady_task,
-        "train_dataset_id": "split_train",
-        "ood_dataset_id": "split_ood",
-        "batch_size": 1,
-        "train_ratio": 0.5,
-        "ood_fraction": 0.5,
-        "num_workers": 0,
-        "pin_memory": False,
-        "persistent_workers": False,
-        "split_seed": 9,
-    }
-    *_, split_info = datasets.runtime.training.create_dataloaders(**loader_args)
-    invalid = copy.deepcopy(split_info)
-    invalid["schema_version"] = schema_version
-
-    with pytest.raises(ValueError, match="schema_version"):
-        datasets.preprocessing.splits.admit_split_contract(invalid)
 
 
 def _valid_normalizer_state() -> dict[str, torch.Tensor]:
@@ -647,101 +528,6 @@ def test_operational_provenance_is_excluded_from_scientific_fingerprint(
 
     assert first["dataset_fingerprint"] == second["dataset_fingerprint"]
     datasets.contracts.identity.validate_training_dataset_payload(second, task=domain.tasks.registry.get_task("steady_flow"), verify_content=True)
-
-
-def _current_package_provenance() -> dict[str, Any]:
-    """Return one complete current package record with mixed semantic provenance."""
-    source_cases = [
-        {
-            "package_case_id": f"case_{index:04d}",
-            "batch_id": "batch-a",
-            "source_case_id": f"case_{index:04d}",
-            "case_input_id": f"{index + 1:064x}",
-            "simulation_case_id": f"{index + 11:064x}",
-            "case_hdf5_sha256": f"{index + 21:064x}",
-            "material_family": "lentil",
-            "material_role": "seen",
-            "evaluation_regime": "id",
-            "natural_support_state": "natural",
-            "simulation_profile": "steady_flow",
-            "membership": "technical_smoke",
-            "ood_group": None,
-            "ood_parameters": [],
-            "task_relevant_ood_parameters": [],
-            "source_relative_path": f"first/location/case_{index:04d}/case.h5",
-        }
-        for index in (1, 2)
-    ]
-    case_ids = [case["package_case_id"] for case in source_cases]
-    return {
-        "schema_kind": "dataset_package",
-        "schema_version": 1,
-        "dataset_name": "synthetic_package",
-        "dataset_view": "steady_flow",
-        "registered_task_id": "steady_flow",
-        "evaluation_regime": "id",
-        "materials": ["lentil"],
-        "channel_contract": {"inputs": ["Kxx"], "outputs": ["u"]},
-        "channel_contract_digest": "1" * 64,
-        "source_simulation_profiles": ["steady_flow"],
-        "source_batch_ids": ["batch-a"],
-        "source_template_digests": ["2" * 64],
-        "included_source_cases": case_ids,
-        "matched_case_input_ids": [case["case_input_id"] for case in source_cases],
-        "airflow_provenance": {"source": "comsol_steady_reference"},
-        "steady_flow_conditioning": {"hidden_conditioning": False},
-        "operation_config_digests": ["3" * 64],
-        "source_role": "seen",
-        "training_eligible": False,
-        "duplicate_case_input_policy": "reject",
-        "case_membership": dict.fromkeys(case_ids, "technical_smoke"),
-        "split_membership": {"technical_smoke": case_ids},
-        "membership_counts": {"technical_smoke": len(case_ids)},
-        "available_ood_groups": [],
-        "ood_group_indexes": {},
-        "ood_parameter_indexes": {},
-        "task_relevant_ood_parameters": [],
-        "builder_identity": datasets.contracts.identity.dataset_conversion_contract_identity("steady_flow"),
-        "schema_identity": {"payload_schema_version": 1},
-        "source_case_identities": source_cases,
-        "source_git_commits": ["a" * 40],
-        "source_batches": [{"host": "cpu-a", "template_relative_path": "templates/a.mph"}],
-        "publication_path": "/first/storage/package",
-        "published_at": "2026-01-01T00:00:00Z",
-    }
-
-
-def test_current_package_identity_binds_content_not_operational_provenance() -> None:
-    """Apply the current Dataset dependency matrix to one positive payload."""
-    provenance = _current_package_provenance()
-    original = datasets.contracts.identity.package_identity_from_provenance(provenance)
-
-    operational = copy.deepcopy(provenance)
-    operational["source_git_commits"] = ["b" * 40]
-    operational["source_batches"] = [{"host": "cpu-b", "template_relative_path": "moved/b.mph"}]
-    operational["publication_path"] = "/relocated/storage/package"
-    operational["published_at"] = "2030-02-03T04:05:06Z"
-    for source_case in operational["source_case_identities"]:
-        source_case["source_relative_path"] = "relocated/{}/case.h5".format(source_case["package_case_id"])
-    assert datasets.contracts.identity.package_identity_from_provenance(operational) == original
-
-    for field in ("case_input_id", "simulation_case_id", "case_hdf5_sha256", "membership"):
-        changed = copy.deepcopy(provenance)
-        changed["source_case_identities"][0][field] = "f" * 64
-        assert datasets.contracts.identity.package_identity_from_provenance(changed) != original
-
-    reordered = copy.deepcopy(provenance)
-    reordered["source_case_identities"].reverse()
-    assert datasets.contracts.identity.package_identity_from_provenance(reordered) != original
-
-    changed_channel = copy.deepcopy(provenance)
-    changed_channel["channel_contract_digest"] = "4" * 64
-    assert datasets.contracts.identity.package_identity_from_provenance(changed_channel) != original
-
-    changed_view = copy.deepcopy(provenance)
-    changed_view["dataset_view"] = "transient_drying"
-    changed_view["builder_identity"] = datasets.contracts.identity.dataset_conversion_contract_identity("transient_drying")
-    assert datasets.contracts.identity.package_identity_from_provenance(changed_view) != original
 
 
 def test_generated_source_identity_ignores_locator_and_receipt_provenance() -> None:

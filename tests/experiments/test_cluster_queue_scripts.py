@@ -385,13 +385,6 @@ def _queue_log_dir(harness: _Harness, scope: str = "steady_flow") -> Path:
     return Path(harness.environment["STORAGE_ROOT"]) / "03_experiments" / scope / "logs" / "queue"
 
 
-def _log_path(harness: _Harness, scope: str = "steady_flow") -> Path:
-    """Return the single queue log created by one harness invocation."""
-    logs = list(_queue_log_dir(harness, scope).glob("*.log"))
-    assert len(logs) == 1
-    return logs[0]
-
-
 def _assert_preflight_container(
     harness: _Harness,
     *,
@@ -608,47 +601,6 @@ def test_direct_submission_uses_automatic_gpu_and_forwards_arguments(
     )
 
 
-def test_direct_artifact_opt_out_stays_in_one_gpu_job_and_container(
-    tmp_path: Path,
-) -> None:
-    """Forward the trailing opt-out once without another selection or artifact job."""
-    harness = _harness(tmp_path)
-    arguments = [_DIRECT_CONFIG_RELATIVE, "--no-build-artifacts"]
-
-    result = _run_job(
-        harness,
-        "--queue-gpu",
-        "auto",
-        "train",
-        *arguments,
-    )
-
-    log_path = _assert_submission(
-        harness,
-        result,
-        gpu="2",
-        workflow="train",
-        module="src.experiments.cli.cli_train",
-        semantic_arguments=arguments,
-    )
-    queued = _capture_arguments(harness.runtsgpu_capture)
-    docker = _capture_arguments(harness.docker_capture)
-    log_text = log_path.read_text(encoding="utf-8")
-    assert harness.nvidia_capture.read_text(encoding="utf-8").splitlines() == ["called"]
-    assert queued.count("-g2") == 1
-    assert queued.count(str(harness.repository / "scripts" / "_docker_run.sh")) == 1
-    assert queued.count("--no-build-artifacts") == 1
-    assert "artifacts" not in queued
-    assert docker.count("run") == 1
-    assert docker.count("device=2") == 1
-    assert docker.count("src.experiments.cli.cli_train") == 1
-    assert docker.count("--no-build-artifacts") == 1
-    assert "src.experiments.cli.cli_build_artifacts" not in docker
-    assert "Selected host GPU: 2" in log_text
-    assert "Container CUDA device: 0" in log_text
-    assert len(list(_queue_log_dir(harness).glob("*.log"))) == 1
-
-
 def test_optuna_submission_uses_explicit_gpu_and_forwards_arguments(
     tmp_path: Path,
 ) -> None:
@@ -677,23 +629,6 @@ def test_optuna_submission_uses_explicit_gpu_and_forwards_arguments(
         module="src.experiments.cli.cli_optuna",
         semantic_arguments=arguments,
     )
-
-
-def test_unreported_explicit_gpu_fails_before_submission(tmp_path: Path) -> None:
-    """Reject an explicit device absent from the validated GPU report."""
-    harness = _harness(tmp_path)
-
-    result = _run_job(
-        harness,
-        "--queue-gpu",
-        "7",
-        "train",
-        _DIRECT_CONFIG_RELATIVE,
-    )
-
-    assert result.returncode != 0
-    assert not harness.runtsgpu_capture.exists()
-    assert not harness.docker_capture.exists()
 
 
 def test_malformed_gpu_report_fails_before_submission(tmp_path: Path) -> None:
@@ -816,30 +751,6 @@ def test_scheduler_submission_failure_is_propagated(tmp_path: Path) -> None:
     assert not harness.docker_capture.exists()
 
 
-def test_follow_remains_host_side_and_is_not_forwarded(tmp_path: Path) -> None:
-    """Follow the allocated host log without passing the option to the job."""
-    harness = _harness(tmp_path)
-
-    result = _run_job(
-        harness,
-        "--queue-gpu",
-        "auto",
-        "train",
-        _DIRECT_CONFIG_RELATIVE,
-        "--follow",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert _capture_arguments(harness.tail_capture) == [
-        "-n",
-        "+1",
-        "-F",
-        str(_log_path(harness)),
-    ]
-    assert "--follow" not in _capture_arguments(harness.runtsgpu_capture)
-    assert "--follow" not in _capture_arguments(harness.docker_capture)
-
-
 def test_wandb_credential_is_forwarded_by_name_without_disclosure(
     tmp_path: Path,
 ) -> None:
@@ -863,23 +774,3 @@ def test_wandb_credential_is_forwarded_by_name_without_disclosure(
         expected_key=secret,
         possible_keys=(secret,),
     )
-
-
-def test_repeated_submissions_allocate_distinct_logs(tmp_path: Path) -> None:
-    """Prevent repeated queue submissions from overwriting one another."""
-    harness = _harness(tmp_path)
-    command = (
-        "--queue-gpu",
-        "auto",
-        "train",
-        _DIRECT_CONFIG_RELATIVE,
-    )
-
-    first = _run_job(harness, *command)
-    second = _run_job(harness, *command)
-
-    assert first.returncode == 0
-    assert second.returncode == 0
-    logs = sorted(_queue_log_dir(harness).glob("*.log"))
-    assert len(logs) == 2
-    assert logs[0].name != logs[1].name

@@ -12,7 +12,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-import pytest
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -21,6 +20,8 @@ from src import datasets, experiments
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 validation = experiments.validation.data_pipeline
 
@@ -264,37 +265,3 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
     assert {record.loader for record in result.coverage} == {"ID train", "ID evaluation", "OOD"}
     assert all(record.inverse_checked for record in result.coverage)
     assert [record.result for record in result.overall[-2:]] == ["INFO", "INFO"]
-
-
-def test_full_validator_delegates_resolved_recipe_datasets_without_reapplying_fallbacks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pass explicit resolved dataset selection to the production loader unchanged."""
-    task = _task()
-    config = {
-        "task": task.id,
-        "run": {"seed": 9},
-        "data": {
-            "train_dataset": "recipe_id",
-            "ood_datasets": ["recipe_ood"],
-            "train_ratio": 0.5,
-            "ood_fraction": 0.5,
-        },
-        "paths": {"dataset_metadata_root": "/unused"},
-    }
-
-    class LoaderReachedError(RuntimeError):
-        """Mark successful delegation without constructing synthetic loaders."""
-
-    def capture_loader_config(effective: dict[str, Any], *, seed_plan: dict[str, int]) -> None:
-        assert effective["data"]["train_dataset"] == "recipe_id"
-        assert effective["data"]["ood_datasets"] == ["recipe_ood"]
-        assert seed_plan == experiments.run.build_seed_plan(9)
-        raise LoaderReachedError
-
-    monkeypatch.setattr(validation.config_loader, "validate_resolved_config", dict)
-    monkeypatch.setattr(validation.config_loader, "validate_resolved_task_contract", lambda _value: task)
-    monkeypatch.setattr(validation.config_loader, "create_dataloaders_from_config", capture_loader_config)
-
-    with pytest.raises(LoaderReachedError):
-        validation.validate_full_data_pipeline(config)

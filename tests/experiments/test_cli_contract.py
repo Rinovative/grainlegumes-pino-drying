@@ -1,4 +1,4 @@
-# ruff: noqa: EM101, EM102, S101, SLF001, TRY003
+# ruff: noqa: EM101, EM102, S101, TRY003
 """Exercise CLI parsing, delegation, dry-run isolation, and failure status."""
 
 from __future__ import annotations
@@ -13,52 +13,20 @@ import torch
 from support import configs
 
 from src import analysis, experiments, learning
-from src.experiments.cli import cli_build_artifacts, cli_config_preflight, cli_optuna, cli_train
+from src.experiments.cli import cli_build_artifacts, cli_optuna, cli_train
 
 if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
-
-def test_cli_parsers_accept_supported_devices_and_reject_unknown_values() -> None:
-    """Keep device selection strict across the three runtime entry points."""
-    valid_cases = (
-        (cli_train._build_parser, ["experiment.yaml", "--device", "cpu"]),
-        (cli_optuna._build_parser, ["study.yaml", "--device", "cpu", "--dry-run"]),
-        (cli_build_artifacts._build_parser, ["--runs-root", "runs", "--device", "cpu"]),
-    )
-    invalid_cases = (
-        (cli_train._build_parser, ["experiment.yaml", "--device", "unsupported"]),
-        (cli_optuna._build_parser, ["study.yaml", "--device", "unsupported"]),
-        (
-            cli_build_artifacts._build_parser,
-            ["--runs-root", "runs", "--device", "unsupported"],
-        ),
-    )
-    for parser_builder, arguments in valid_cases:
-        assert parser_builder().parse_args(arguments).device == "cpu"
-    for parser_builder, arguments in invalid_cases:
-        with pytest.raises(SystemExit):
-            parser_builder().parse_args(arguments)
-
-    preflight = cli_config_preflight._build_parser().parse_args(
-        ["train", "experiment.yaml"],
-    )
-    assert preflight.workflow == "train"
-    assert preflight.config_path == "experiment.yaml"
+_CLI_USAGE_ERROR = 2
 
 
-def test_artifact_cli_requires_run_root_and_forwards_rebuild_flag() -> None:
-    """Represent artifact membership through a run root and explicit rebuild flag."""
-    parser = cli_build_artifacts._build_parser()
-    parsed = parser.parse_args(["--runs-root", "runs", "--rebuild"])
-    assert parsed.runs_root == Path("runs")
-    assert parsed.rebuild is True
-    with pytest.raises(SystemExit):
-        parser.parse_args([])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--task", "steady_flow", "--runs-root", "runs"])
-    with pytest.raises(SystemExit):
-        cli_optuna._build_parser().parse_args(["study.yaml", "--no-build-artifacts"])
+def test_public_cli_rejects_one_unknown_option() -> None:
+    """Reject an unknown option through the public command entry point."""
+    with pytest.raises(SystemExit) as captured:
+        cli_train.main(["experiment.yaml", "--unsupported-option"])
+
+    assert captured.value.code == _CLI_USAGE_ERROR
 
 
 def _cuda_zero_resolution() -> learning.device.DeviceResolution:

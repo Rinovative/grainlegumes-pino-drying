@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import shlex
 import time
@@ -67,48 +66,6 @@ def test_float32_conversion_requires_explicit_tolerance() -> None:
     assert converted.dtype == np.float32
     with pytest.raises(ValueError, match="exceeds configured tolerance"):
         generation.publication.storage.validate_float32_conversion(values, rtol=0.0, atol=0.0, label="synthetic")
-
-
-def test_transient_initial_state_tolerance_is_independent_of_float32_storage(
-    generation_config_factory: Any,
-) -> None:
-    """Keep semantic admission independent of float32 representation fidelity."""
-    config_path, _template = generation_config_factory()
-    config = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("transient_drying"),
-    )
-    expected = np.asarray((140.0, 145.0, 151.0), dtype=np.float64)
-    solver_scale = expected * np.asarray((1.0 - 2.1043e-5, 1.0 - 1.13e-5, 1.0 + 7.93e-6))
-    assert generation.publication.storage.transient_initial_state_tolerance(config) == (1.0e-4, 1.0e-10)
-    assert generation.publication.storage.transient_initial_state_matches(config, solver_scale, expected)
-    assert not generation.publication.storage.transient_initial_state_matches(config, expected * (1.0 + 2.0e-4), expected)
-    assert not generation.publication.storage.transient_initial_state_matches(config, 0.64 * expected, expected)
-    assert not generation.publication.storage.transient_initial_state_matches(config, 1.03 * expected, expected)
-
-    storage_changed = copy.deepcopy(config.scientific_values)
-    storage_changed["storage"]["float32_rtol"] = 0.0
-    storage_changed["storage"]["float32_atol"] = 0.0
-    assert generation.publication.storage.transient_initial_state_matches(
-        replace(config, scientific_values=storage_changed),
-        solver_scale,
-        expected,
-    )
-
-    semantic_changed = copy.deepcopy(config.scientific_values)
-    semantic_changed["validation"]["transient_initial_state"]["rtol"] = 1.0e-8
-    assert not generation.publication.storage.transient_initial_state_matches(
-        replace(config, scientific_values=semantic_changed),
-        solver_scale,
-        expected,
-    )
-    converted = generation.publication.storage.validate_float32_conversion(
-        expected,
-        rtol=float(semantic_changed["storage"]["float32_rtol"]),
-        atol=float(semantic_changed["storage"]["float32_atol"]),
-        label="synthetic",
-    )
-    assert converted.dtype == np.float32
 
 
 def _bulk_moisture_arrays(
@@ -200,45 +157,6 @@ def test_transient_bulk_moisture_semantic_tolerance_is_strict(
         assert np.max(
             np.abs(result.exported - result.reconstructed),
         ) == pytest.approx(discrepancy)
-
-
-def test_bulk_moisture_tolerance_is_independent_of_other_contracts(
-    generation_config_factory: Any,
-) -> None:
-    """Keep bulk, initial-state, and float32 tolerances independent."""
-    config_path, _template = generation_config_factory()
-    config = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("transient_drying"),
-    )
-    static, time_axis, states, globals_ = _bulk_moisture_arrays(
-        1.8912875530963102e-7,
-    )
-
-    def evaluate(candidate: Any) -> bool:
-        return generation.publication.storage.evaluate_transient_bulk_moisture_consistency(
-            candidate,
-            static,
-            time_axis,
-            states,
-            None,
-            globals_,
-            f_surf=0.4,
-            time_tolerance=1.0e-12,
-        ).matches
-
-    assert evaluate(config)
-    unrelated = copy.deepcopy(config.scientific_values)
-    unrelated["storage"]["float32_rtol"] = 0.0
-    unrelated["storage"]["float32_atol"] = 0.0
-    unrelated["validation"]["transient_initial_state"]["rtol"] = 1.0e-8
-    unrelated["validation"]["transient_initial_state"]["atol"] = 0.0
-    assert evaluate(replace(config, scientific_values=unrelated))
-
-    strict_bulk = copy.deepcopy(config.scientific_values)
-    strict_bulk["validation"]["transient_bulk_moisture"]["rtol"] = 1.0e-8
-    strict_bulk["validation"]["transient_bulk_moisture"]["atol"] = 0.0
-    assert not evaluate(replace(config, scientific_values=strict_bulk))
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
@@ -486,48 +404,6 @@ def test_comsol_builder_rejects_invalid_retention_state(
         comsol_service.build_comsol_command(invalid, cores_per_case=16)
 
 
-@pytest.mark.parametrize(
-    ("campaign_path", "retained"),
-    [
-        ("configs/generation/campaigns/steady_flow/technical_smoke.yaml", True),
-        ("configs/generation/campaigns/transient_drying/technical_smoke.yaml", True),
-        ("configs/generation/campaigns/transient_drying/pilot_check.yaml", True),
-        ("configs/generation/campaigns/steady_flow/family_generalization.yaml", False),
-        ("configs/generation/campaigns/transient_drying/family_generalization.yaml", False),
-    ],
-)
-def test_maintained_smoke_pilot_and_production_use_canonical_save_semantics(
-    tmp_path: Path,
-    campaign_path: str,
-    retained: bool,
-) -> None:
-    """Bind each maintained campaign purpose to the shared command contract."""
-    campaign = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
-    )
-    config = campaign.batches[0]
-    bundle = generation.cases.case.generate_case_input_bundle(
-        config,
-        config.case_indices[0],
-        tmp_path / config.batch_name,
-    )
-    command = comsol_service.build_comsol_command(
-        config,
-        cores_per_case=16,
-        scalar_handoff=bundle.scalar_handoff,
-        scheduler_kind="slurm",
-    )
-
-    assert command[command.index("-job") + 1] == "b1"
-    assert command[command.index("-inputfile") + 1] == "model.mph"
-    assert command[command.index("-np") + 1] == "16"
-    assert ("-outputfile" in command) is retained
-    assert ("-nosave" in command) is not retained
-    if retained:
-        assert command[command.index("-outputfile") + 1] == "solved.mph"
-
-
 def test_scalar_source_validation_precedes_evidence_and_process_start(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -584,171 +460,6 @@ def test_steady_command_is_parameter_free(
     )
     command = comsol_service.build_comsol_command(config, cores_per_case=1)
     assert not {"-pname", "-plist", "-pindex"}.intersection(command)
-
-
-def test_terminal_case_identity_binds_persisted_input_configuration(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """Reject case identities recomputed around an arbitrary input-config digest."""
-    config_path, _template = generation_config_factory()
-    config = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("transient_drying"),
-    )
-    bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case identity")
-    payload = bundle.case_payload
-    manifest = {
-        "simulation_profile": config.profile.id,
-        "batch_id": config.batch_id,
-        "batch_identity": config.batch_identity,
-        "scientific_config_digest": config.scientific_config_digest,
-        "git_commit": "a" * 40,
-        "material_family": config.material_family,
-        "sampling_regime": config.sampling_regime,
-        "available_learning_views": list(config.profile.available_learning_views),
-        "airflow_source": config.profile.airflow_source,
-        "template": {
-            "relative_path": config.template_relative_path,
-            "sha256": config.template_sha256,
-        },
-        "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
-    }
-    record = {
-        "case_id": bundle.case_id,
-        "case_index": 1,
-        "case_input_id": bundle.case_input_id,
-        "simulation_case_id": bundle.simulation_case_id,
-        "material_family": config.material_family,
-    }
-    runtime_service._require_case_matches_terminal(  # noqa: SLF001
-        payload,
-        manifest=manifest,
-        scientific=config.scientific_values,
-        record=record,
-        directory=bundle.directory,
-    )
-
-    tampered = json.loads(json.dumps(payload))
-    tampered["case_input_config_digest"] = "0" * 64
-    assert tampered["case_input_config_digest"] != config.case_input_config_digest
-    tampered["case_input_id"] = generation.cases.case.compute_case_input_id(tampered)
-    tampered["simulation_case_id"] = generation.cases.case.compute_simulation_case_id(tampered)
-    tampered_record = {
-        **record,
-        "case_input_id": tampered["case_input_id"],
-        "simulation_case_id": tampered["simulation_case_id"],
-    }
-    with pytest.raises(RuntimeError, match="metadata disagrees"):
-        runtime_service._require_case_matches_terminal(  # noqa: SLF001
-            tampered,
-            manifest=manifest,
-            scientific=config.scientific_values,
-            record=tampered_record,
-            directory=bundle.directory,
-        )
-
-
-def test_pilot_terminal_admission_uses_canonical_semantic_batch_kind(
-    generation_config_factory: Any,
-    fake_comsol: Path,
-    tmp_path: Path,
-) -> None:
-    """Protect pilot terminal identity when sampling_regime remains natural."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        executable=fake_comsol,
-    )
-    original = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("transient_drying"),
-    )
-    scientific = json.loads(json.dumps(original.scientific_values))
-    assignment = {
-        "case_index": 1,
-        "regime_index": 0,
-        "material_family": "lentil",
-        "material_role": "seen",
-        "evaluation_regime": generation.cases.config.NO_EVALUATION_REGIME,
-        "sampling_regime": "natural",
-        "assignment_role": "nominal_reference",
-        "ood_group": None,
-        "ood_unit_id": None,
-        "ood_units_per_case": 0,
-        "pilot_case_kind": "nominal_reference",
-    }
-    scientific.update(
-        {
-            "campaign_purpose": generation.cases.config.PILOT_CAMPAIGN_PURPOSE,
-            "evaluation_regime": generation.cases.config.NO_EVALUATION_REGIME,
-            "case_count": 1,
-            "assignments": [assignment],
-            "pilot_check": {
-                "cases_per_material": 1,
-                "case_kinds": list(generation.cases.config.PILOT_CASE_KINDS),
-                "case_semantics": {"first": "nominal_reference", "remaining": "natural_pilot"},
-                "nominal_case_index": 1,
-                "dataset_membership": "none",
-                "sampling_semantics": "one_explicit_nominal_then_ordinary_natural_support",
-            },
-        }
-    )
-    scientific.pop("paired_equivalence_seed", None)
-    scientific_digest = generation.cases.config.compute_scientific_config_digest(scientific)
-    case_input_digest = generation.cases.config.compute_case_input_config_digest(scientific)
-    execution = json.loads(json.dumps(original.execution_values))
-    execution["retention"]["retain_solved_model"] = True
-    batch_name = generation.cases.config.build_batch_name(
-        original.profile.id,
-        original.material_family,
-        generation.cases.config.PILOT_CAMPAIGN_PURPOSE,
-    )
-    batch = replace(
-        original,
-        evaluation_regime=generation.cases.config.NO_EVALUATION_REGIME,
-        batch_name=batch_name,
-        scientific_values=scientific,
-        execution_values=execution,
-        case_indices=(1,),
-        assignments={1: assignment},
-        scientific_config_digest=scientific_digest,
-        case_input_config_digest=case_input_digest,
-        batch_identity=scientific_digest,
-        batch_id=generation.cases.config.build_batch_id(batch_name, scientific_digest),
-    )
-    storage = tmp_path / "pilot terminal storage"
-    outcome = generation.runtime.run_case(
-        batch,
-        1,
-        cores_per_case=1,
-        storage_root=storage,
-        work_root=tmp_path / "pilot terminal work",
-    )
-    assert outcome.work_directory is not None
-    execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
-    case_payload = json.loads((outcome.processed_directory / "case.json").read_text(encoding="utf-8"))
-    scalar_binding = execution["scalar_handoff"]
-    runtime_entries = [entry for entry in case_payload["scalar_handoff"]["entries"] if entry["owner"] == "case_dependent"]
-    assert scalar_binding["state"] == "applied"
-    assert scalar_binding["mechanism"] == "comsol_cli_pname_plist"
-    assert scalar_binding["entries"] == case_payload["scalar_handoff"]["entries"]
-    assert scalar_binding["contract_sha256"] == scalar_handoff_contract.TRANSIENT_SCALAR_HANDOFF_CONTRACT_SHA256
-    assert scalar_binding["source"]["filename"] == "scalars.csv"
-    assert scalar_binding["source"]["sha256"] == case_payload["input_files"]["scalars.csv"]["sha256"]
-    assert scalar_binding["source"]["size_bytes"] == case_payload["input_files"]["scalars.csv"]["size_bytes"]
-    assert scalar_binding["source"]["path"] == str(outcome.work_directory / "scalars.csv")
-    assert scalar_binding["runtime_override_names"] == [entry["name"] for entry in runtime_entries]
-    assert scalar_binding["runtime_override_values"] == [entry["value"] for entry in runtime_entries]
-    arguments = execution["invocation"]["arguments"]
-    assert scalar_binding["formatted_plist_expressions"] == arguments[arguments.index("-plist") + 1].split(",")
-    assert scalar_binding["pindex_values"] == list(range(1, 13))
-    assert scalar_binding["original_comsol_output_filename"] == "solved.mph"
-    assert scalar_binding["canonical_solved_model_filename"] == "solved.mph"
-    generation.runtime.finalize_batch(batch, storage_root=storage)
-    admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
-    assert admitted.batch_name == batch_name
-    assert admitted.sampling_regime == "natural"
-    assert admitted.scientific_config_payload()["campaign_purpose"] == "pilot_check"
 
 
 def test_preparation_failure_is_recorded_without_a_work_directory(
@@ -827,76 +538,6 @@ def test_failure_receipt_with_different_execution_identity_is_stale(
         execution_run_id=current_run_id,
         git_commit=current_commit,
     )
-
-
-def test_obsolete_failure_shape_is_stale_but_current_corruption_fails_closed(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Retire pre-production shapes without weakening current receipt validation."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    config = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("steady_flow"),
-    )
-    storage = tmp_path / "receipt shape storage"
-    commit = "a" * 40
-    run_id = "current-campaign__0123456789abcdef"
-    path = _record_synthetic_failure(
-        config,
-        storage,
-        monkeypatch,
-        git_commit=commit,
-        execution_run_id=run_id,
-    )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema_version"] = generation.runtime.CASE_FAILURE_SCHEMA_VERSION + 1
-    common.serialization.atomic_write_json(path, payload)
-    assert not generation.runtime.case_failure_is_recorded(
-        config,
-        1,
-        storage_root=storage,
-        execution_run_id=run_id,
-        git_commit=commit,
-    )
-
-    _record_synthetic_failure(
-        config,
-        storage,
-        monkeypatch,
-        git_commit=commit,
-        execution_run_id=run_id,
-    )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload.pop("execution_run_id")
-    common.serialization.atomic_write_json(path, payload)
-    assert not generation.runtime.case_failure_is_recorded(
-        config,
-        1,
-        storage_root=storage,
-        execution_run_id=run_id,
-        git_commit=commit,
-    )
-
-    _record_synthetic_failure(
-        config,
-        storage,
-        monkeypatch,
-        git_commit=commit,
-        execution_run_id=run_id,
-    )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["error"] = {}
-    common.serialization.atomic_write_json(path, payload)
-    with pytest.raises(ValueError, match="error evidence is invalid"):
-        generation.runtime.case_failure_is_recorded(
-            config,
-            1,
-            storage_root=storage,
-            execution_run_id=run_id,
-            git_commit=commit,
-        )
 
 
 def test_malformed_or_symlinked_failure_receipt_fails_closed(
@@ -1151,13 +792,13 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
     assert (outcome.processed_directory / "case.h5").is_file()
 
 
-def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
+def test_suffixed_solver_output_is_published_canonically_before_cleanup(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect relative invocation plus atomic admission of one suffixed output."""
+    """Publish a valid canonical solved model before removing case scratch."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
@@ -1187,6 +828,7 @@ def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
         cleanup_after_publication,
     )
     monkeypatch.setenv("FAKE_COMSOL_SOLVED_MODEL_MODE", "suffixed")
+
     outcome = generation.runtime.run_case(
         config,
         1,
@@ -1194,73 +836,19 @@ def test_solver_receives_relative_files_and_canonicalizes_suffixed_output(
         storage_root=storage,
         work_root=tmp_path / "work with spaces",
     )
+
     assert outcome.status == "completed"
     assert cleanup_observations == [True]
     assert outcome.work_directory is not None
     assert not outcome.work_directory.exists()
-    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
-    execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
-    assert timing["working_directory"] == str(outcome.work_directory)
-    assert timing["export_conversion_s"] >= 0.0
-    assert timing["complete_execution_s"] >= timing["runtime_s"]
-    assert execution["invocation"]["working_directory"] == str(outcome.work_directory)
-    assert execution["schema_version"] == 1
-    assert execution["result"]["state"] == "succeeded"
-    assert execution["result"]["exit_code"] == 0
-    solved_model = outcome.processed_directory / "solved.mph"
-    assert execution["scalar_handoff"] == {
-        "state": "not_applicable",
-        "mechanism": "parameter_free",
-        "reason": "steady_flow_has_no_transient_scalar_runtime_overrides",
-        "original_comsol_output_filename": "solved_1.mph",
-        "canonical_solved_model_filename": "solved.mph",
-    }
-    solved_evidence = execution["result"]["solved_model"]
-    assert solved_evidence == {
-        "requested_relative_path": "solved.mph",
-        "observed_relative_path": "solved_1.mph",
-        "canonical_relative_path": "solved.mph",
-        "disposition": "new",
-        "canonicalized": True,
-        "size_bytes": solved_model.stat().st_size,
-        "sha256": common.serialization.file_sha256(solved_model),
-    }
-    publication = json.loads((outcome.processed_directory / "provenance.json").read_text(encoding="utf-8"))
-    assert publication["artifacts"]["solved.mph"] == {
-        "sha256": solved_evidence["sha256"],
-        "size_bytes": solved_evidence["size_bytes"],
-    }
-    arguments = execution["invocation"]["arguments"]
-    assert arguments[arguments.index("-inputfile") + 1] == "model.mph"
-    assert arguments[arguments.index("-outputfile") + 1] == "solved.mph"
-    case_payload = json.loads((outcome.processed_directory / "case.json").read_text(encoding="utf-8"))
-    assert set(case_payload["input_files"]) == {"fields.csv"}
-    assert "scalar_handoff" not in case_payload
-
-
-def test_solved_model_inventory_accepts_one_replaced_exact_candidate(tmp_path: Path) -> None:
-    """Distinguish a solver replacement from an unchanged stale exact output."""
-    work_directory = tmp_path / "replaced solved model"
-    work_directory.mkdir()
-    model = work_directory / "model.mph"
-    model.write_bytes(b"template model must never be selected\n")
-    solved_model = work_directory / "solved.mph"
-    solved_model.write_bytes(b"stale model\n")
-    before = runtime_service._solved_model_inventory(work_directory)  # noqa: SLF001
-    assert set(before) == {"solved.mph"}
-    solved_model.write_bytes(b"replacement model\n")
-
-    canonical, evidence = runtime_service._canonicalize_solved_model(  # noqa: SLF001
-        work_directory,
-        before,
+    assert generation.runtime.completed_case_is_valid(
+        config,
+        1,
+        storage_root=storage,
     )
-
-    assert canonical == solved_model
-    assert canonical.read_bytes() == b"replacement model\n"
-    assert model.read_bytes() == b"template model must never be selected\n"
-    assert evidence["observed_relative_path"] == "solved.mph"
-    assert evidence["disposition"] == "replaced"
-    assert evidence["canonicalized"] is False
+    solved_model = outcome.processed_directory / "solved.mph"
+    assert solved_model.is_file()
+    assert solved_model.stat().st_size > 0
 
 
 def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(

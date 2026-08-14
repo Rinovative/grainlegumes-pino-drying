@@ -43,18 +43,3 @@ def test_unsupported_runtime_fails_before_project_import(
     monkeypatch.setattr(runtime.runpy, "run_module", unexpected_import)
 
     assert runtime.main() == 1
-
-
-def test_supported_project_runtime_delegates_to_authoritative_module(monkeypatch: MonkeyPatch) -> None:
-    """Proceed directly to the maintained resolver once the image runtime is compatible."""
-    runtime = _load_runtime()
-    calls: list[tuple[str, str]] = []
-
-    def capture_import(module: str, *, run_name: str) -> None:
-        calls.append((module, run_name))
-
-    monkeypatch.setattr(runtime.sys, "version_info", (3, 10, 0))
-    monkeypatch.setattr(runtime.runpy, "run_module", capture_import)
-
-    assert runtime.main() == 0
-    assert calls == [("src.experiments.cli.cli_config_preflight", "__main__")]

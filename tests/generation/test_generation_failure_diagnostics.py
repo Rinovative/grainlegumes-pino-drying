@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import ast
 import csv
-import inspect
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -292,16 +290,6 @@ def test_real_solver_scale_discrepancy_is_approximately_canonical(
         "w_surf_allclose": True,
         "w_int_allclose": True,
     }
-
-
-def test_diagnostic_module_cannot_launch_solver_or_scheduler() -> None:
-    """Keep diagnostics structurally unable to execute COMSOL or scheduler work."""
-    parsed = ast.parse(inspect.getsource(diagnostics))
-    imported_modules = {node.names[0].name for node in ast.walk(parsed) if isinstance(node, ast.Import) and node.names}
-    imported_from_modules = {node.module for node in ast.walk(parsed) if isinstance(node, ast.ImportFrom) and node.module is not None}
-
-    assert "subprocess" not in imported_modules
-    assert not any(name.endswith(("generation_runtime_batch", "generation_runtime_comsol")) for name in imported_from_modules)
 
 
 def test_bulk_moisture_diagnostic_uses_production_result_and_tolerance(

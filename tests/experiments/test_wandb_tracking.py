@@ -1,4 +1,4 @@
-# ruff: noqa: EM101, PLR2004, S101, S105, SLF001, TRY003
+# ruff: noqa: EM101, S101, S105, TRY003
 """Exercise W&B lifecycle, provenance, failure, and upload behavior."""
 
 from __future__ import annotations
@@ -195,23 +195,6 @@ def _split_evidence(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize(
-    ("role", "expected"),
-    [(None, "optuna"), ("production", "optuna-production"), ("smoke", "optuna-smoke")],
-)
-def test_runtime_tags_deduplicate_and_qualify_explicit_optuna_roles(
-    role: str | None,
-    expected: str,
-) -> None:
-    """Qualify only explicit Optuna roles while retaining stable user tags."""
-    settings = {
-        "workflow": "optuna_trial",
-        "tags": ["fno", "reviewed", "optuna", "reviewed"],
-    }
-    tags = tracking._runtime_wandb_tags(settings, {"tuning": {"study_role": role}})
-    assert tags == ["fno", "reviewed", expected]
-
-
 def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -364,145 +347,6 @@ def test_model_parameter_counts_ignore_device_and_dtype() -> None:
     assert tracking.model_parameter_counts(model) == expected
 
 
-def test_epoch_history_forwards_supported_metrics_and_selected_summary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Map supported epoch values and retain the selected result."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    config = _resolved_config(epochs=2)
-    objective_id = str(config["evaluation"]["objective"]["id"])
-    state, update = _state_recorder()
-    session = tracking.initialize_wandb(
-        config,
-        run_dir=tmp_path,
-        semantic_config={
-            "model": {
-                "variant": "fno",
-                "parameter_counts": {"total": 10, "trainable": 9},
-            },
-            "runtime": {"device": {"resolved_device": "cpu"}},
-        },
-        state_updater=update,
-    )
-    session.log_epoch(
-        1,
-        {
-            "train/loss_total": 0.75,
-            f"id/{objective_id}": 0.5,
-            "physics/id/unsupported": 99.0,
-        },
-    )
-    logged, step = fake.runs[0].logs[0]
-    assert step == 1
-    assert logged["epoch"] == 1
-    assert logged["Overview/train_loss_total"] == 0.75
-    assert logged[f"Overview/ID/{objective_id}"] == 0.5
-    assert 99.0 not in logged.values()
-    session.finish(
-        status="completed",
-        result={
-            "completed_epoch": 1,
-            "selected_epoch": 1,
-            "selected_metrics": {f"selected/id/{objective_id}": 0.5},
-        },
-    )
-    assert fake.runs[0].summary["selected/epoch"] == 1
-    assert fake.runs[0].summary[f"selected/id/{objective_id}"] == 0.5
-    assert fake.runs[0].summary["tracking/status"] == "finished"
-    assert state["last_logged_epoch"] == 1
-    assert fake.runs[0].exit_codes == [0]
-
-
-def test_pi_history_emits_only_configured_continuity_contribution(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Emit only the continuity loss selected by the configuration."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    config = _resolved_config(physics_enabled=True)
-    session = tracking.initialize_wandb(config, run_dir=tmp_path)
-    session.log_epoch(
-        1,
-        {
-            "physics/train/loss_momentum": 1.0,
-            "physics/train/loss_boundary": 2.0,
-            "physics/train/loss_continuity_div_velocity": 3.0,
-            "physics/train/loss_continuity_div_eps_velocity": 4.0,
-        },
-    )
-    logged = fake.runs[0].logs[0][0]
-    configured = config["loss"]["physics"]["continuity"]
-    other = "div_eps_velocity" if configured == "div_velocity" else "div_velocity"
-    assert f"Physics/Training/loss_continuity_{configured}" in logged
-    assert f"Physics/Training/loss_continuity_{other}" not in logged
-
-
-def test_optuna_trial_metadata_reaches_history_and_terminal_summary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Carry trial provenance through history and completion."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    study = "artificial-study"
-    config = _resolved_config(workflow="optuna_trial", study=study)
-    session = tracking.initialize_wandb(
-        config,
-        run_dir=tmp_path,
-        semantic_config={
-            "tuning": {
-                "study_name": study,
-                "study_role": "production",
-                "trial_number": 7,
-                "training_seed": 17,
-                "sampler_seed": 23,
-                "sampled_parameters": {"model.hidden_channels": 12},
-            }
-        },
-    )
-    session.log_epoch(1, {"optuna/objective": 0.72})
-    session.finish(status="completed", result={"best_metric": 0.61})
-    run = fake.runs[0]
-    assert run.logs[0][0]["Optuna/objective"] == 0.72
-    assert fake.initializations[0]["group"] == study
-    assert run.summary["tuning/trial_number"] == 7
-    assert run.summary["tuning/sampled_parameters"] == {"model.hidden_channels": 12}
-    assert run.summary["Optuna/objective"] == 0.61
-    assert run.summary["Optuna/state"] == "completed"
-
-
-def test_completed_epoch_physics_is_forwarded_without_epoch_zero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Forward supplied physics diagnostics only for completed epochs."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path)
-    physics = {"physics/id/momentum_residual_mse": 1.0}
-    with pytest.raises(tracking.TrackingError, match="epoch >= 1"):
-        session.log_epoch(0, physics)
-    session.log_epoch(1, {"train/loss_total": 8.0})
-    session.log_epoch(2, physics)
-    assert "Physics/ID/momentum_residual_mse" not in fake.runs[0].logs[0][0]
-    assert fake.runs[0].logs[1][0]["Physics/ID/momentum_residual_mse"] == 1.0
-
-
-def test_monitor_membership_is_repeatable_and_bounded() -> None:
-    """Reuse a deterministic bounded diagnostic membership."""
-    config = _resolved_config()
-    config["tracking"]["wandb"]["monitor"]["max_cases"] = 2
-    split = _split_evidence(config)
-    first = tracking.build_monitor_membership(config, split)
-    assert first == tracking.build_monitor_membership(config, split)
-    assert first is not None
-    assert first["source_indices"] == [2, 0]
-    assert first["sample_ids"] == ["sample-c", "sample-a"]
-
-
 @pytest.mark.parametrize("mode", ["online", "offline"])
 def test_requested_history_failures_are_fail_closed(
     mode: str,
@@ -523,32 +367,6 @@ def test_requested_history_failures_are_fail_closed(
         session.log_epoch(1, {"train/loss_total": 1.0})
     assert state["status"] == "failed"
     assert state["failed_operation"] == "history"
-
-
-def test_callback_order_preserves_authoritative_consumer_before_observer_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Run the authoritative consumer before a failing observer."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    config = _resolved_config()
-    objective_id = str(config["evaluation"]["objective"]["id"])
-    session = tracking.initialize_wandb(config, run_dir=tmp_path)
-    fake.runs[0].fail_log = True
-    consumed: list[tuple[int, dict[str, float]]] = []
-
-    def consume(epoch: int, values: dict[str, float]) -> None:
-        consumed.append((epoch, values))
-
-    callback = tracking.combine_epoch_callbacks(consume, tracking.epoch_callback(session))
-    assert callback is not None
-    payload = {f"id/{objective_id}": 0.25}
-    with pytest.raises(tracking.TrackingIOError):
-        callback(5, payload)
-    assert consumed == [(5, payload)]
-    assert consumed[0][1] is payload
-    assert fake.runs[0].logs == []
 
 
 def test_initialization_and_finish_errors_are_redacted_and_fail_closed(

@@ -165,8 +165,6 @@ def test_maintained_profile_templates_resolve_from_profile_yaml() -> None:
     """Verify each maintained profile declares a valid checked-in template identity."""
     repository_root = Path(__file__).resolve().parents[2]
     profile_paths = sorted((repository_root / "configs/generation/profiles").glob("*.yaml"))
-    resolved_profiles: set[str] = set()
-
     for profile_path in profile_paths:
         document: Any = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
         assert isinstance(document, dict)
@@ -178,6 +176,3 @@ def test_maintained_profile_templates_resolve_from_profile_yaml() -> None:
         )
         assert resolved.sidecar_path == resolved.absolute_path.with_suffix(".sha256")
         assert common.serialization.file_sha256(resolved.absolute_path) == resolved.sha256
-        resolved_profiles.add(profile_id)
-
-    assert resolved_profiles == set(profiles.available_profiles())

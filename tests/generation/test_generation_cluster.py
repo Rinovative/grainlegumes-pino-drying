@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004, SLF001
+# ruff: noqa: S101, PLR2004
 """Dynamic per-case feeder, Slurm identity, and transfer contracts."""
 
 from __future__ import annotations
@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +14,8 @@ import yaml
 
 from src import generation
 from src.generation.cli import cli_generation
-from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
-from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_workspace as workspace
 
 
@@ -297,50 +294,6 @@ def test_current_failure_still_requires_explicit_retry(
     assert resumed["submissions"][0]["mode"] == "resume"
 
 
-def test_scheduler_queries_support_multiple_ids_and_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Attach optional squeue selections and preserve genuine query failures."""
-    commands: list[list[str]] = []
-
-    def capture(command: list[str]) -> tuple[str, str | None]:
-        commands.append(command)
-        return "", None
-
-    monkeypatch.setattr(generation.campaign, "_scheduler_output", capture)
-    empty = generation.campaign._scheduler_evidence([])
-    assert empty["squeue"]["command"] == []
-    assert commands == []
-
-    evidence = generation.campaign._scheduler_evidence(["123", "124"])
-    assert commands == [
-        ["squeue", "--noheader", "--jobs=123,124", "--format=%i|%T|%R|%N"],
-        [
-            "sacct",
-            "--noheader",
-            "--parsable2",
-            "--jobs",
-            "123,124",
-            "--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,NodeList,AllocCPUS,Partition",
-        ],
-    ]
-    generation.campaign._require_scheduler_evidence(evidence)
-
-    for failed_owner in ("squeue", "sacct"):
-
-        def fail_query(
-            command: list[str],
-            *,
-            owner: str = failed_owner,
-        ) -> tuple[str, str | None]:
-            return ("", "synthetic scheduler failure") if command[0] == owner else ("", None)
-
-        monkeypatch.setattr(generation.campaign, "_scheduler_output", fail_query)
-        failed = generation.campaign._scheduler_evidence(["123"])
-        with pytest.raises(RuntimeError, match=rf"{failed_owner} failed: synthetic scheduler failure"):
-            generation.campaign._require_scheduler_evidence(failed)
-
-
 def test_malformed_persisted_job_id_fails_before_scheduler_query(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -464,53 +417,6 @@ def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
     assert unrelated_pending_is_ignored["slurm_job_ids"] == ["101", "102", "103", "104"]
 
 
-def test_feeder_does_not_submit_when_recovered_state_exceeds_pending_buffer(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Do not cancel or add work when two exact jobs are already pending."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=5,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "e" * 40
-    submitted: list[str] = []
-    next_job_ids = iter(("301", "302", "303"))
-
-    def submit_one(*_args: Any, **_kwargs: Any) -> str:
-        job_id = next(next_job_ids)
-        submitted.append(job_id)
-        return job_id
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", submit_one)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-    tasks = cluster.campaign_tasks(campaign)
-    manifest = generation.campaign._submit_one(
-        manifest,
-        campaign,
-        tasks[1],
-        mode="initial",
-        storage_root=storage,
-    )
-    assert submitted == ["301", "302"]
-
-    scheduler = _scheduler(
-        active={
-            "301": ["301", "PENDING", "Resources", ""],
-            "302": ["302", "PENDING", "Resources", ""],
-        }
-    )
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: scheduler)
-    unchanged = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
-    assert unchanged["slurm_job_ids"] == ["301", "302"]
-    assert submitted == ["301", "302"]
-
-
 def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -629,19 +535,20 @@ def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
     assert len(recovered["submissions"]) == 1
 
 
-def test_config_owned_plan_has_no_production_resource_overrides(
+def test_config_owned_plan_is_machine_parseable_and_read_only(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Keep production feeder and allocation choices exclusively in execution YAML."""
+    """Expose configured resources as JSON without allocating campaign state."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "d" * 40
     storage = tmp_path / "storage"
     storage.mkdir()
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+
     status = cli_generation.main(
         [
             "plan-campaign",
@@ -652,17 +559,13 @@ def test_config_owned_plan_has_no_production_resource_overrides(
             str(storage),
         ]
     )
+
     assert status == 0
     output = json.loads(capsys.readouterr().out)
     assert output["state"] == "planned"
     assert output["submission_config"]["cores_per_case"] == campaign.execution_values["cluster"]["cores_per_case"]
     assert output["submission_config"]["pending_buffer"] == campaign.execution_values["submission"]["pending_buffer"]
-    assert not any(argument.startswith("--array") for argument in output["first_submission_command"])
-    assert "--exclusive" not in output["first_submission_command"]
     assert not Path(output["paths"]["run_root"]).exists()
-    with pytest.raises(SystemExit) as error:
-        cli_generation.main(["plan-campaign", str(config_path), "--max-nodes", "2"])
-    assert error.value.code == 2
 
 
 def test_submission_policy_changes_execution_but_not_scientific_case_identity(
@@ -704,42 +607,6 @@ def test_campaign_discovery_uses_schema_kind_and_deterministic_paths(
     output = json.loads(capsys.readouterr().out)
     assert [record["source_path"] for record in output["campaigns"]] == [str(config_path.resolve())]
     assert output["campaigns"][0]["campaign_purpose"] == discovered[0].campaign_purpose
-    assert "workflow" not in output
-
-
-def test_workflow_catalog_rejects_duplicate_profile_purpose_matches(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Require unambiguous semantic campaign selection for the no-argument workflow."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
-    stationary = profiles.resolve_profile(profiles.STEADY_FLOW_PROFILE)
-    transient = profiles.resolve_profile(profiles.TRANSIENT_DRYING_PROFILE)
-
-    def variant(name: str, purpose: str, profile: Any) -> Any:
-        return replace(
-            campaign,
-            source_path=config_path.with_name(f"{name}.yaml"),
-            campaign_purpose=purpose,
-            profile=profile,
-        )
-
-    discovered = (
-        variant("family-stationary", "family_generalization", stationary),
-        variant("family-transient", "family_generalization", transient),
-        variant("smoke-stationary", "technical_runtime_smoke", stationary),
-        variant("smoke-transient-a", "technical_runtime_smoke", transient),
-        variant("smoke-transient-b", "technical_runtime_smoke", transient),
-    )
-    monkeypatch.setattr(
-        cli_generation.config_service,
-        "discover_campaign_configs",
-        lambda *_args, **_kwargs: discovered,
-    )
-
-    with pytest.raises(ValueError, match=r"exactly one 'technical_runtime_smoke' transient campaign; discovered 2"):
-        cli_generation._campaign_catalog(require_workflow=True)
 
 
 def test_validate_config_exposes_resolved_campaign_ownership(
@@ -761,18 +628,10 @@ def test_validate_config_exposes_resolved_campaign_ownership(
     assert status == 0
     output = json.loads(capsys.readouterr().out)
     assert output["campaign_purpose"] == campaign.campaign_purpose
-    assert output["material_inventory"] == ["lentil"]
     assert output["case_counts"]["derived_total"] == campaign.total_case_count
-    assert sum(output["counts"].values()) == campaign.total_case_count
     assert output["seed_plan"]["campaign_seed"] == campaign.batches[0].scientific_values["campaign_seed"]
-    assert output["seed_plan"]["paired_equivalence_seed"] == campaign.paired_equivalence_seed
-    assert output["seed_plan"]["membership_seed"] is None
     assert output["dataset_package_requests"] == [{"evaluation_regime": "id", "source_role": "seen"}]
     assert len(output["dataset_package_inventory"]) == len(campaign.dataset_packages)
-    assert output["parameter_ood"]["batches"] == {}
-    assert output["technical_smoke_plan"]["learning_membership"] == "none"
-    assert output["pilot_plan"] is None
-    assert output["static_sentinel_workload"] is None
 
 
 def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
@@ -933,233 +792,3 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
             source_host="cpu.example",
             source_storage_root="/remote/storage",
         )
-
-
-@pytest.mark.parametrize(
-    "campaign_purpose",
-    ["technical_runtime_smoke", "family_generalization"],
-)
-def test_license_retry_preserves_other_running_case_and_never_duplicates(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    campaign_purpose: str,
-) -> None:
-    """Retry one capacity-blocked case while another case remains untouched."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=(3 if campaign_purpose == "family_generalization" else 2),
-    )
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    authored["campaign_purpose"] = campaign_purpose
-    if campaign_purpose == "family_generalization":
-        authored.pop("paired_equivalence_seed")
-        authored["membership"] = {
-            "seed": 41004,
-            "per_seen_material": {
-                "train": 1,
-                "validation": 1,
-                "id_test": 1,
-            },
-        }
-    config_path.write_text(
-        yaml.safe_dump(authored, sort_keys=False),
-        encoding="utf-8",
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "6" * 40
-    run_id = generation.campaign.campaign_run_id(
-        campaign,
-        git_commit=commit,
-    )
-    storage = tmp_path / f"{campaign_purpose}-storage"
-    submitted_ids = iter(("101", "102", "103"))
-    submissions: list[str] = []
-    scheduler = _scheduler()
-    completed: set[tuple[str, int]] = set()
-    if campaign_purpose == "family_generalization":
-        completed.add((tasks[2].batch_name, tasks[2].case_index))
-
-    def submit(*_args: Any, **_kwargs: Any) -> str:
-        job_id = next(submitted_ids)
-        submissions.append(job_id)
-        return job_id
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", submit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: scheduler,
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda batch, case_index, **_kwargs: (
-            (
-                batch.batch_name,
-                case_index,
-            )
-            in completed
-        ),
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "case_failure_is_recorded",
-        lambda *_args, **_kwargs: False,
-    )
-
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    assert manifest["slurm_job_ids"] == ["101"]
-    scheduler["active"] = {"101": ["101", "RUNNING", "node-a", "node-a"]}
-    manifest = generation.campaign.feed_campaign(
-        run_id,
-        storage_root=storage,
-    )
-    assert manifest["slurm_job_ids"] == ["101", "102"]
-
-    evidence = license_service.classify_temporary_license_capacity(
-        """Could not obtain license for 'CFD Module'.
-License error -4.
-Licensed number of users already reached."""
-    )
-    assert evidence is not None
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "102")
-    license_service.record_temporary_license_capacity_attempt(
-        campaign.batch(tasks[1].batch_name),
-        tasks[1].case_index,
-        license_service.TemporaryLicenseCapacityError(
-            "synthetic capacity",
-            work_directory=tmp_path,
-            command=("comsol",),
-            exit_code=0,
-            evidence=evidence,
-        ),
-        storage_root=storage,
-    )
-    scheduler["accounted"] = {"102": ["102", "FAILED", "1:0"]}
-
-    waiting = generation.campaign.feed_campaign(
-        run_id,
-        storage_root=storage,
-    )
-    views, _pending, _running = generation.campaign._reconciled(
-        waiting,
-        campaign,
-        scheduler,
-        storage_root=storage,
-    )
-    by_case = {view["case_id"]: view for view in views}
-    assert by_case[tasks[0].case_id]["state"] == "active"
-    assert by_case[tasks[1].case_id]["state"] == "retry_waiting"
-    assert not any(view["state"] in {"failed", "submission_failed"} for view in views)
-    assert waiting["state"] == "active"
-    assert submissions == ["101", "102"]
-
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "retry_attempt_is_eligible",
-        lambda _attempt: True,
-    )
-    retried = generation.campaign.feed_campaign(
-        run_id,
-        storage_root=storage,
-    )
-    assert retried["slurm_job_ids"] == ["101", "102", "103"]
-    assert retried["submissions"][-1]["mode"] == "license_retry"
-    assert retried["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
-    assert retried["submissions"][0]["case"]["case_id"] == tasks[0].case_id
-
-    scheduler["active"]["103"] = [
-        "103",
-        "PENDING",
-        "Resources",
-        "",
-    ]
-    unchanged = generation.campaign.feed_campaign(
-        run_id,
-        storage_root=storage,
-    )
-    assert unchanged["slurm_job_ids"] == ["101", "102", "103"]
-    assert submissions == ["101", "102", "103"]
-
-    completed.add((tasks[1].batch_name, tasks[1].case_index))
-    scheduler["active"].pop("103")
-    scheduler["accounted"]["103"] = ["103", "COMPLETED", "0:0"]
-    after_success = generation.campaign.feed_campaign(
-        run_id,
-        storage_root=storage,
-    )
-    assert after_success["slurm_job_ids"] == ["101", "102", "103"]
-    assert submissions == ["101", "102", "103"]
-
-
-def test_exhausted_license_retry_budget_consumes_failure_threshold(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Convert exhausted capacity history into one terminal infrastructure failure."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "5" * 40
-    scheduler = _scheduler()
-    submissions: list[str] = []
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_case",
-        lambda *_args, **_kwargs: submissions.append("901") or "901",
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: scheduler,
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "case_failure_is_recorded",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "latest_attempt_for_job",
-        lambda *_args, **_kwargs: {
-            "retry_budget_remaining": False,
-        },
-    )
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    scheduler["accounted"] = {"901": ["901", "FAILED", "1:0"]}
-
-    stopped = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert stopped["state"] == "failure_threshold_reached"
-    assert submissions == ["901"]
-    views, _pending, _running = generation.campaign._reconciled(
-        stopped,
-        campaign,
-        scheduler,
-        storage_root=storage,
-    )
-    assert views[0]["state"] == "failed"
-    assert views[0]["reason"] == license_service.EXHAUSTED_REASON

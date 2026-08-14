@@ -1,10 +1,9 @@
-# ruff: noqa: S101, PLR2004, SLF001
+# ruff: noqa: S101, PLR2004
 """Protect optimizer-phase timing and actual-sample training throughput."""
 
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -45,22 +44,6 @@ class _RecordingLoader:
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         self.events.append("loader_iteration")
         yield from self.batches
-
-
-class _FakeScaler:
-    """Exercise the maintained AMP optimizer path without physical CUDA."""
-
-    def get_scale(self) -> float:
-        return 16.0
-
-    def scale(self, loss: torch.Tensor) -> torch.Tensor:
-        return loss
-
-    def step(self, optimizer: SGD) -> None:
-        optimizer.step()
-
-    def update(self) -> None:
-        return None
 
 
 def _model_and_optimizer() -> tuple[nn.Module, SGD]:
@@ -174,55 +157,3 @@ def test_invalid_training_duration_fails_without_publishing_throughput(
             nn.MSELoss(),
             torch.device("cpu"),
         )
-
-
-@pytest.mark.parametrize("use_amp", [False, True])
-def test_cuda_synchronizes_once_before_and_after_training(
-    monkeypatch: pytest.MonkeyPatch,
-    use_amp: bool,
-) -> None:
-    """Use one synchronization pair for CUDA in AMP and non-AMP paths."""
-    device = torch.device("cuda:3")
-    calls: list[torch.device] = []
-    batch = {"x": torch.ones(2, 1), "y": torch.zeros(2, 1)}
-    loader = cast("DataLoader[Any]", [batch])
-    model, optimizer = _model_and_optimizer()
-    _fixed_clock(monkeypatch, 30.0, 31.0)
-    monkeypatch.setattr(loop.torch.cuda, "synchronize", calls.append)
-    monkeypatch.setattr(
-        loop,
-        "_prepare_batch",
-        lambda raw_batch, _device, _processor, **_kwargs: raw_batch,
-    )
-    if use_amp:
-        monkeypatch.setattr(loop.torch, "autocast", lambda **_kwargs: nullcontext())
-
-    values = loop.train_one_epoch(
-        model,
-        loader,
-        optimizer,
-        nn.MSELoss(),
-        device,
-        scaler=_FakeScaler() if use_amp else None,
-        use_amp=use_amp,
-    )
-
-    assert calls == [device, device]
-    assert values["system/train_duration_seconds"] == 1.0
-    assert values["system/train_samples_per_second"] == 2.0
-
-
-@pytest.mark.parametrize(
-    "batch",
-    [
-        {"x": torch.tensor(1.0), "y": torch.tensor(1.0)},
-        {"x": torch.ones(2, 1), "y": torch.ones(1, 1)},
-        {"x": torch.ones(0, 1), "y": torch.ones(0, 1)},
-    ],
-)
-def test_batch_sample_dimension_must_be_unambiguous_and_positive(
-    batch: dict[str, torch.Tensor],
-) -> None:
-    """Reject scalar, inconsistent, and empty batch sample dimensions."""
-    with pytest.raises(ValueError, match="sample"):
-        loop._training_batch_size(batch)

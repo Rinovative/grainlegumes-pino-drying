@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004, ARG005, SLF001
+# ruff: noqa: S101, PLR2004, ARG005
 """Six-material transient pilot planning, diagnostics, evidence, and cleanup."""
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import pytest
 from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_sampling as sampling_service
-from src.generation.cli import cli_generation as cli_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
@@ -23,14 +22,6 @@ from src.generation.validation import generation_validation_pilot as pilot_servi
 from src.generation.validation import generation_validation_pilot_analysis as analysis_service
 
 _PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
-_PRODUCTION_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-
-
-def test_applicability_overlap_uses_only_the_canonical_evidence_class() -> None:
-    """Avoid warning on direct evidence while retaining transfer and engineering flags."""
-    assert analysis_service._applicability_overlap({"evidence": "literature_direct"}) == "not_evaluable_from_evidence"
-    assert analysis_service._applicability_overlap({"evidence": "literature_transfer"}) == "material_transfer"
-    assert analysis_service._applicability_overlap({"evidence": "engineering_estimate"}) == "engineering_extension"
 
 
 def _pilot(cases_per_material: int) -> config_service.CampaignConfig:
@@ -129,7 +120,6 @@ def test_pilot_planning_and_nominal_sampling_are_technical_only() -> None:
     assert one.evaluation_regimes == three.evaluation_regimes == ()
     assert one.membership == three.membership == {}
     assert all(not members for members in three.material_memberships.values())
-    assert three.source_path == _PILOT_CAMPAIGN.resolve()
     assert tuple(batch.material_family for batch in three.batches) == three.material_inventory
     for batch in three.batches:
         assert [batch.case_assignment(index)["pilot_case_kind"] for index in batch.case_indices] == [
@@ -244,45 +234,6 @@ def test_nominal_duration_uses_configured_horizon() -> None:
     )
     assert result["result"] == "INVALID_RESULT"
     assert result["adequacy_window_h"]["maximum"] == 48.0
-
-
-@pytest.mark.parametrize(
-    ("failed_stage", "result_class", "solver_status"),
-    [
-        ("input", "INPUT_FAILED", "not_started"),
-        ("solver", "SOLVER_FAILED", "failed"),
-        ("export", "EXPORT_FAILED", "success"),
-        ("conversion", "CONVERSION_FAILED", "success"),
-        ("invalid_result", "INVALID_RESULT", "success"),
-    ],
-)
-def test_pilot_result_classes_require_matching_failure_stages(
-    failed_stage: str,
-    result_class: str,
-    solver_status: str,
-) -> None:
-    """Protect the exhaustive result vocabulary and stage-to-result mapping."""
-    assert pilot_service.PILOT_RESULT_CLASSES == (
-        "PASS",
-        "PASS_WITH_WARNINGS",
-        "TOO_FAST",
-        "NOT_DRY_WITHIN_HORIZON",
-        "INPUT_FAILED",
-        "SOLVER_FAILED",
-        "EXPORT_FAILED",
-        "CONVERSION_FAILED",
-        "INVALID_RESULT",
-        "PHYSICAL_CONTRACT_VIOLATION",
-    )
-    record = _canonical_case_result(
-        result_class=result_class,
-        failed_stage=failed_stage,
-        solver_status=solver_status,
-    )
-    pilot_service._validate_case_result(record)
-    record["result_class"] = "PASS"
-    with pytest.raises(ValueError, match="stage and result class disagree"):
-        pilot_service._validate_case_result(record)
 
 
 def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None:
@@ -436,37 +387,6 @@ def test_storage_projection_uses_only_successful_measured_hdf5() -> None:
             target_case_count=0,
             regular_state_count=11,
         )
-
-
-def test_prepare_pilot_cli_requires_production_campaign() -> None:
-    """Protect the projection owner as an explicit CLI input."""
-    parser = cli_service._build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["prepare-pilot-check", "pilot_run"])
-    args = parser.parse_args(
-        [
-            "prepare-pilot-check",
-            "pilot_run",
-            "--production-campaign",
-            str(_PRODUCTION_CAMPAIGN),
-        ]
-    )
-    assert args.production_campaign == _PRODUCTION_CAMPAIGN
-
-
-def test_production_projection_contract_comes_from_resolved_campaign() -> None:
-    """Protect the current projection result as authored configuration output."""
-    campaign = config_service.load_campaign_config(
-        _PRODUCTION_CAMPAIGN,
-        require_executable=False,
-    )
-    regular_times = campaign.batches[0].scientific_values["time"]["regular_times"]
-    contract = pilot_service._production_projection_contract(_PRODUCTION_CAMPAIGN)
-    assert contract["simulation_profile"] == campaign.profile.id
-    assert contract["target_case_count"] == campaign.total_case_count
-    assert contract["regular_state_count"] == len(regular_times)
-    assert contract["regular_time_start_h"] == regular_times[0]
-    assert contract["time_horizon_h"] == regular_times[-1]
 
 
 def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(

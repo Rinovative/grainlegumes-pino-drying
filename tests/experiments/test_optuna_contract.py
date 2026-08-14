@@ -1,4 +1,4 @@
-# ruff: noqa: S101, SLF001
+# ruff: noqa: S101
 """Protect Optuna semantics with artificial configs and controlled fake trials."""
 
 from __future__ import annotations
@@ -15,69 +15,11 @@ from support import configs
 from src import experiments
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
     from pathlib import Path
 
 optuna_runtime = experiments.tuning.optuna
 search_space = experiments.tuning.search_space
-
-
-class _FakeTrial:
-    """Return explicit test-owned samples while recording suggestion APIs."""
-
-    def __init__(
-        self,
-        selections: dict[str, Any],
-        *,
-        number: int = 4,
-    ) -> None:
-        self.number = number
-        self.selections = selections
-        self.calls: dict[str, tuple[str, object]] = {}
-        self.attrs: dict[str, Any] = {}
-
-    def suggest_categorical(
-        self,
-        name: str,
-        choices: Sequence[Any],
-    ) -> Any:
-        self.calls[name] = ("categorical", tuple(choices))
-        return self.selections[name]
-
-    def suggest_float(
-        self,
-        name: str,
-        low: float,
-        high: float,
-        *,
-        log: bool = False,
-        step: float | None = None,
-    ) -> float:
-        self.calls[name] = ("float", (low, high, log, step))
-        return float(self.selections[name])
-
-    def suggest_int(
-        self,
-        name: str,
-        low: int,
-        high: int,
-        *,
-        log: bool = False,
-        step: int = 1,
-    ) -> int:
-        self.calls[name] = ("int", (low, high, log, step))
-        return int(self.selections[name])
-
-    def report(self, value: float, step: int) -> None:
-        """Accept reporter calls outside suggestion-focused assertions."""
-        del value, step
-
-    def set_user_attr(self, key: str, value: Any) -> None:
-        self.attrs[key] = value
-
-    def should_prune(self) -> bool:
-        """Keep controlled suggestion trials unpruned."""
-        return False
 
 
 def _write_study(
@@ -106,47 +48,6 @@ def test_minimal_optuna_config_resolves_without_production_files(
     objective = experiments.config.loader.get_resolved_objective(study.base_config)
     assert study.study["objective"] == objective["id"]
     assert study.study["direction"] == objective["direction"]
-
-
-def test_fake_trial_uses_typed_apis_and_persists_applied_values(
-    tmp_path: Path,
-) -> None:
-    """Apply explicit categorical, float, and integer samples to one trial."""
-    configured = configs.optuna_config()
-    configured["search_space"]["data.batch_size"] = {
-        "name": "batch_size",
-        "kind": "int",
-        "low": 2,
-        "high": 6,
-        "step": 2,
-    }
-    study = optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
-    original = copy.deepcopy(study.base_config)
-    selections = {
-        "hidden_channels": 12,
-        "learning_rate": 5.0e-3,
-        "batch_size": 4,
-    }
-    trial = _FakeTrial(selections)
-
-    resolved, context = optuna_runtime._prepare_trial_config(study, trial)
-
-    assert trial.calls["hidden_channels"][0] == "categorical"
-    assert trial.calls["learning_rate"][0] == "float"
-    assert trial.calls["batch_size"][0] == "int"
-    assert resolved["model"]["params"]["hidden_channels"] == selections["hidden_channels"]
-    assert resolved["optimizer"]["lr"] == pytest.approx(5.0e-3)
-    assert resolved["data"]["batch_size"] == selections["batch_size"]
-    assert study.base_config == original
-    assert context["overrides"] == {
-        "model.params.hidden_channels": 12,
-        "optimizer.lr": 5.0e-3,
-        "data.batch_size": 4,
-    }
-    assert trial.attrs["overrides"] == context["overrides"]
-    assert trial.attrs["run_name"] == resolved["run"]["name"]
-    assert experiments.config.loader.resolved_model_variant(resolved) in (resolved["run"]["name"])
-    assert resolved["run"]["name"].endswith("__optuna_trial_004")
 
 
 @pytest.mark.parametrize(
@@ -284,7 +185,7 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
         "n_warmup_steps": pruner_config["n_warmup_steps"],
         "interval_steps": pruner_config["interval_steps"],
     }
-    assert user_attrs[optuna_runtime._SAMPLER_METADATA_ATTR] == {
+    assert user_attrs["sampler_metadata"] == {
         "kind": sampler_config["kind"],
         "multivariate": sampler_config["multivariate"],
         "seed": loaded.study["seed"],

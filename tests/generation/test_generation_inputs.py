@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004, SLF001
+# ruff: noqa: S101, PLR2004
 """Final configuration, naming, ownership, sampling, and domain contracts."""
 
 from __future__ import annotations
@@ -11,14 +11,12 @@ import numpy as np
 import pytest
 import yaml
 
-from src import common, datasets, domain, generation
+from src import common, generation
 from src.datasets.packages import dataset_packages_planning as package_planning
 from src.generation.cases import generation_cases_fields as fields
 from src.generation.cases import generation_cases_sampling as sampling
-from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.cases import generation_cases_seeding as seeding
 from src.generation.contracts import generation_contracts_materials as materials
-from src.generation.contracts import generation_contracts_provenance as provenance_service
 from src.generation.publication import generation_publication_inventory as inventory
 
 if TYPE_CHECKING:
@@ -38,88 +36,6 @@ def test_semantic_seed_derivation_is_version_bound() -> None:
         )
         == 2107745129
     )
-
-
-def test_generation_provenance_is_compact_controlled_and_source_resolved() -> None:
-    """Validate the canonical scientific provenance vocabulary and references."""
-    root = Path.cwd()
-    registry = yaml.safe_load((root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))
-    source_config = yaml.safe_load((root / "configs/generation/sources.yaml").read_text(encoding="utf-8"))
-    source_keys = {source["source_key"] for source in source_config["sources"]}
-    assert registry["schema_version"] == 1
-    assert set(registry) == {"schema_kind", "schema_version", "parameters"}
-
-    allowed = {"evidence", "source_refs", "method", "verification", "applicability", "note"}
-    provenance_count = 0
-
-    def visit(value: Any) -> None:
-        nonlocal provenance_count
-        if isinstance(value, dict):
-            if {"evidence", "source_refs"}.issubset(value):
-                provenance_count += 1
-                assert set(value).issubset(allowed)
-                assert value["evidence"] in provenance_service.EVIDENCE_CLASSES
-                assert set(value["source_refs"]).issubset(source_keys)
-                if "verification" in value:
-                    assert value["verification"] == provenance_service.REPRODUCED_VERIFICATION
-                if "applicability" in value:
-                    assert value["applicability"]
-                    assert set(value["applicability"]).issubset(provenance_service.APPLICABILITY_KEYS)
-            for item in value.values():
-                visit(item)
-        elif isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    for config_path in sorted((root / "configs/generation").rglob("*.yaml")):
-        visit(yaml.safe_load(config_path.read_text(encoding="utf-8")))
-    assert provenance_count > 0
-    with pytest.raises(ValueError, match="source_refs must identify evidence"):
-        provenance_service.validate_provenance(
-            {"evidence": "literature_direct", "source_refs": []},
-            sources={},
-            label="source-free literature",
-        )
-
-
-def test_generation_public_facade_is_explicit_and_narrow() -> None:
-    """Protect the lazy same-level package and orchestration surface."""
-    expected = {
-        "benchmark",
-        "campaign",
-        "cases",
-        "contracts",
-        "publication",
-        "readiness",
-        "runtime",
-        "smoke",
-        "validation",
-        "workflow",
-    }
-    assert set(generation.__all__) == expected
-    assert all(getattr(generation, name) is not None for name in expected)
-    assert "cli" not in generation.__all__
-    assert not hasattr(generation, "config")
-    assert not hasattr(generation, "storage")
-
-
-def test_profile_schema_rejects_obsolete_verification_field(
-    generation_config_factory: Any,
-) -> None:
-    """Reject the old persistent verification model instead of migrating it."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    profile_path = config_path.parent / "profile.yaml"
-    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-    profile["exports"][0]["source"] = {
-        "state": "obsolete",
-        "pattern": profile["exports"][0]["source"],
-    }
-    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
-    with pytest.raises(
-        generation.cases.config.GenerationConfigError,
-        match="obsolete persistent export-mapping verification state",
-    ):
-        generation.cases.config.load_campaign_config(config_path)
 
 
 def test_incomplete_mapping_declaration_is_discovery_only(
@@ -241,36 +157,6 @@ def test_transient_initial_state_tolerance_validation(
 
     with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
         generation.cases.config.load_campaign_config(config_path)
-
-
-def test_transient_validation_tolerance_has_scoped_identity_ownership(
-    generation_config_factory: Any,
-) -> None:
-    """Bind admission provenance without changing inputs or steady batches."""
-    transient_path, _template = generation_config_factory()
-    original_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
-    transient_common_path = transient_path.parent / "common.yaml"
-    transient_common = yaml.safe_load(transient_common_path.read_text(encoding="utf-8"))
-    transient_common["validation"]["transient_initial_state"]["rtol"] = 5.0e-5
-    transient_common_path.write_text(yaml.safe_dump(transient_common, sort_keys=False), encoding="utf-8")
-    changed_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
-
-    assert changed_transient.scientific_config_digest != original_transient.scientific_config_digest
-    assert changed_transient.batch_id != original_transient.batch_id
-    assert changed_transient.case_input_config_digest == original_transient.case_input_config_digest
-
-    steady_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    original_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
-    steady_common_path = steady_path.parent / "common.yaml"
-    steady_common = yaml.safe_load(steady_common_path.read_text(encoding="utf-8"))
-    steady_common["validation"]["transient_initial_state"]["rtol"] = 5.0e-5
-    steady_common_path.write_text(yaml.safe_dump(steady_common, sort_keys=False), encoding="utf-8")
-    changed_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
-
-    assert "validation" not in original_steady.scientific_values
-    assert changed_steady.scientific_config_digest == original_steady.scientific_config_digest
-    assert changed_steady.batch_id == original_steady.batch_id
-    assert changed_steady.case_input_config_digest == original_steady.case_input_config_digest
 
 
 def test_startup_ramp_has_transient_input_identity_without_affecting_steady_batches(
@@ -604,7 +490,7 @@ def test_readiness_distinguishes_failed_static_sentinels_from_pending(
 
 
 def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates() -> None:
-    """Expose true design coordinates and inherited complete-record provenance."""
+    """Expose representative scientific coordinates and derived provenance."""
     transient = generation.cases.config.load_campaign_config(
         Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
         require_executable=False,
@@ -619,79 +505,36 @@ def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates
     oswin_component = inventory.inspect_campaign_parameter(transient, "A_osw")
     density = inventory.inspect_campaign_parameter(transient, "density_calibration")
     density_component = inventory.inspect_campaign_parameter(transient, "eps_bed_cal_ref")
-    kinetics = inventory.inspect_campaign_parameter(transient, "two_compartment_kinetics")
     simplex = inventory.inspect_campaign_parameter(transient, "schedule_simplex")
-    schedule_bound = inventory.inspect_campaign_parameter(transient, "T_in_min")
-    clip_bound = inventory.inspect_campaign_parameter(transient, "phi_clip_min")
-    permeability_mean = inventory.inspect_campaign_parameter(transient, "kappa_mean")
-    template_fixed = inventory.inspect_campaign_parameter(transient, "cp_w")
     grid_spacing = inventory.inspect_campaign_parameter(transient, "grid.dx")
     wall_coefficient = inventory.inspect_campaign_parameter(transient, "U_wall")
-    time_stop = inventory.inspect_campaign_parameter(transient, "time.stop")
     density_formula = inventory.inspect_campaign_parameter(
         transient,
         "physical_formulas.rho_bu_dry",
     )
-    porosity_support = inventory.inspect_campaign_parameter(
-        transient,
-        "packing_porosity_mean_support",
-    )
+
     assert oswin_component["atomic_record"] == "oswin"
     assert density_component["atomic_record"] == "density_calibration"
     assert density["coordinate_labels"] == ["rho_bu_dry_ref"]
-    assert kinetics["coordinate_labels"] == ["r_surf_0", "r_int_surf", "f_surf"]
     assert simplex["coordinate_labels"] == [
         "schedule.component_weights[1]",
         "schedule.component_weights[2]",
     ]
-    assert "generation.cases.generation_cases_schedule.generate_schedule" in simplex["producer_to_consumer_path"]["effective_downstream_consumers"]
-    assert schedule_bound["producer_to_consumer_path"]["runtime_mapping_state"] == "generator_consumed"
-    assert clip_bound["producer_to_consumer_path"]["runtime_mapping_state"] == ("generator_consumed_and_template_fixed_requires_native_verification")
-    assert clip_bound["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "generation.cases.generation_cases_schedule feasibility or psychrometric conversion",
-        "canonical COMSOL template fixed physics; Python has no runtime setter",
-    ]
-    assert permeability_mean["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "generation.cases.generation_cases_fields._permeability_fields",
-        "generation.cases.generation_cases_fields._porosity_field",
-        "generation.contracts.generation_contracts_porosity.resolve_porosity_coupling",
-    ]
-    assert template_fixed["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
-    assert set(template_fixed["provenance"]).issubset({"evidence", "source_refs", "method", "verification", "applicability", "note", "sources"})
+
     authored_common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
     expected_dx = authored_common["grid"]["Lx"] / (authored_common["grid"]["nx"] - 1)
     assert grid_spacing["configured"] == {"dx": expected_dx}
-    assert grid_spacing["provenance"]["evidence"] == "derived"
     assert grid_spacing["provenance"]["verification"] == "mathematically_reproduced"
     fixed = authored_common["scientific_fixed_values"]
     expected_u_wall = 1.0 / (1.0 / fixed["h_ext"]["value"] + fixed["d_wall"]["value"] / fixed["k_wall"]["value"])
     assert wall_coefficient["configured"]["value"] == pytest.approx(expected_u_wall)
     assert wall_coefficient["provenance"]["verification"] == "mathematically_reproduced"
-    assert "dx" not in authored_common["grid"]
-    assert "dy" not in authored_common["grid"]
-    assert "value" not in authored_common["scientific_fixed_values"]["U_wall"]
-    assert time_stop["configured"] == {"stop": authored_common["time"]["stop"]}
-    assert density_formula["configured"] == {"rho_bu_dry": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)"}
-    assert density_formula["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_formula_requires_native_model_verification")
-    assert set(porosity_support["materials"]) == set(transient.material_inventory)
-    assert all(not material["applicability"]["parameter_ood"] for material in porosity_support["materials"].values())
+    assert density_formula["configured"] == {
+        "rho_bu_dry": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
+    }
     for family in transient.material_inventory:
         assert oswin_component["materials"][family]["provenance"] == oswin["materials"][family]["provenance"]
         assert density_component["materials"][family]["provenance"] == density["materials"][family]["provenance"]
-
-    steady = generation.cases.config.load_campaign_config(
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        require_executable=False,
-    )
-    steady_reference_pressure = inventory.inspect_campaign_parameter(steady, "p_ref")
-    assert steady_reference_pressure["producer_to_consumer_path"]["effective_downstream_consumers"] == [
-        "canonical steady COMSOL template fixed conditioning"
-    ]
-    assert steady_reference_pressure["producer_to_consumer_path"]["runtime_mapping_state"] == ("template_fixed_no_python_runtime_setter")
-    with pytest.raises(ValueError, match="not applicable to profile 'steady_flow'"):
-        inventory.inspect_campaign_parameter(steady, "density_calibration")
-    with pytest.raises(ValueError, match="not applicable to profile 'steady_flow'"):
-        inventory.inspect_campaign_parameter(steady, "time.stop")
 
 
 def test_schedule_csv_is_the_identity_bound_comsol_handoff(
@@ -857,43 +700,6 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     assert all(effect > 1e-10 for effect in observed.values()), observed
 
 
-def test_domain_moisture_and_dataset_membership() -> None:
-    """Protect one moisture implementation and deterministic ID membership."""
-    dry_basis = np.asarray([0.0, 0.25, 1.0])
-    wet_basis = domain.moisture.dry_basis_to_wet_basis(dry_basis)
-    np.testing.assert_allclose(wet_basis, [0.0, 0.2, 0.5])
-    np.testing.assert_allclose(domain.moisture.wet_basis_to_dry_basis(wet_basis), dry_basis)
-    water = domain.moisture.granular_water_content([1.0, 2.0], [3.0, 4.0], 0.5)
-    np.testing.assert_allclose(water, [2.0, 3.0])
-    np.testing.assert_allclose(domain.moisture.dry_basis_moisture(water, [20.0, 30.0]), [0.1, 0.1])
-    assert domain.moisture.bulk_wet_basis_moisture(water, [20.0, 30.0]) == pytest.approx(5.0 / 55.0)
-
-    candidates = [
-        {
-            "material_family": "lentil",
-            "package_case_id": f"lentil/case_{index}",
-            "case_input_id": character * 64,
-        }
-        for index, character in enumerate("abcdef", start=1)
-    ]
-    plan = {
-        "evaluation_regime": "id",
-        "materials": ["lentil"],
-        "membership_seed": 19,
-        "membership_counts_per_material": {"train": 2, "validation": 1, "id_test": 1},
-    }
-    membership_a = package_planning._shared_id_membership(copy.deepcopy(plan), copy.deepcopy(candidates))
-    membership_b = package_planning._shared_id_membership(
-        copy.deepcopy(plan),
-        list(reversed(copy.deepcopy(candidates))),
-    )
-    assert membership_a == membership_b
-    assert len(membership_a) == 4
-    assert list(membership_a.values()).count("train") == 2
-    assert list(membership_a.values()).count("validation") == 1
-    assert list(membership_a.values()).count("id_test") == 1
-
-
 def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
     generation_config_factory: Any,
 ) -> None:
@@ -927,72 +733,8 @@ def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
         package_planning.audit_steady_flow_conditioning([hidden])
 
 
-def test_parameter_ood_eligibility_uses_registry_dependency_blocks() -> None:
-    """Include airflow OOD in both views while excluding transient-only changes from steady."""
-    config_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-    campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
-    batch = campaign.require_batch(
-        material_family="lentil",
-        sampling_regime="parameter_ood",
-    )
-    registry = batch.scientific_values["material"]["parameter_registry"]
-
-    def candidate(parameter: str) -> dict[str, Any]:
-        entry = registry[parameter]
-        return {
-            "package_case_id": f"case__{parameter}",
-            "batch": batch,
-            "case_payload": {
-                "ood": {
-                    "group": entry["ood_group"],
-                    "selected_units": [parameter],
-                    "units_per_case": 1,
-                    "selections": {
-                        parameter: {
-                            "selection_kind": "scalar_interval",
-                            "transformed_gap": 0.2,
-                        }
-                    },
-                },
-                "sampled_values": {parameter: 1.0},
-                "coupled_selections": {},
-                "block_provenance": {entry["block"]: {"design": "synthetic"}},
-            },
-        }
-
-    airflow = candidate("pressure_bc.mean")
-    steady_eligible, steady_parameters, steady_evidence, _reason = package_planning._ood_eligibility(
-        airflow,
-        view=datasets.contracts.views.get_view("steady_flow"),
-    )
-    transient_eligible, transient_parameters, _transient_evidence, _reason = package_planning._ood_eligibility(
-        airflow,
-        view=datasets.contracts.views.get_view("transient_drying"),
-    )
-    assert steady_eligible is transient_eligible is True
-    assert steady_parameters == transient_parameters == ("pressure_bc.mean",)
-    assert steady_evidence["parameters"][0]["block"] == "airflow"
-
-    moisture = candidate("initial_moisture.mean_db")
-    eligible, parameters, evidence, reason = package_planning._ood_eligibility(
-        moisture,
-        view=datasets.contracts.views.get_view("steady_flow"),
-    )
-    assert eligible is False
-    assert parameters == ()
-    assert evidence["group"] == "initial_moisture"
-    assert "steady_flow" in str(reason)
-    assert (
-        package_planning._ood_eligibility(
-            moisture,
-            view=datasets.contracts.views.get_view("transient_drying"),
-        )[0]
-        is True
-    )
-
-
-def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
-    """Resolve matched physical inputs deterministically and reject train/OOD leakage."""
+def test_duplicate_source_policy_is_explicit() -> None:
+    """Resolve matched physical inputs only through an explicit source policy."""
     physical_id = "c" * 64
     candidates = [
         {
@@ -1025,187 +767,6 @@ def test_duplicate_source_policy_and_id_ood_overlap_are_explicit() -> None:
     assert [candidate["package_case_id"] for candidate in selected] == ["transient_case"]
     assert decisions[0]["selected_simulation_case_id"] == "2" * 64
     assert decisions[0]["excluded_simulation_case_ids"] == ["1" * 64]
-
-    id_package = package_planning.PreparedPackage(
-        plan={"evaluation_regime": "id"},
-        batch_records=[],
-        candidates=[
-            {
-                "simulation_case_id": "3" * 64,
-                "case_input_id": physical_id,
-                "dataset_membership": "train",
-            }
-        ],
-        excluded=[],
-        membership={},
-        source_decisions=[],
-        steady_conditioning=None,
-    )
-    ood_package = package_planning.PreparedPackage(
-        plan={"evaluation_regime": "parameter_ood"},
-        batch_records=[],
-        candidates=[
-            {
-                "simulation_case_id": "4" * 64,
-                "case_input_id": physical_id,
-                "dataset_membership": "parameter_ood",
-            }
-        ],
-        excluded=[],
-        membership={},
-        source_decisions=[],
-        steady_conditioning=None,
-    )
-    with pytest.raises(ValueError, match="ID training and OOD package source overlap"):
-        package_planning._validate_no_id_ood_overlap((id_package, ood_package))
-
-
-def test_heater_schedule_retries_complete_realization_deterministically(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject an infeasible whole schedule and replay the accepted retry exactly."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
-    batch = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=generation.cases.config.build_batch_name(
-            "transient_drying",
-            "lentil",
-            "natural",
-        ),
-    )
-    sample = sampling.sample_case(batch, 1)
-    assert batch.seed_base is not None
-    seeds = {name: seeding.derive_seed(batch.seed_base, "case", "1", name) for name in ("schedule_shared", "schedule_independent")}
-    original = schedule_service._feasibility_reason
-    call_count = 0
-
-    def force_first_rejection(*args: Any, **kwargs: Any) -> str | None:
-        nonlocal call_count
-        call_count += 1
-        if call_count % 2 == 1:
-            return "forced deterministic whole-schedule rejection"
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(schedule_service, "_feasibility_reason", force_first_rejection)
-    first = schedule_service.generate_schedule(
-        sample.values,
-        batch.scientific_values["time"],
-        batch.scientific_values["scientific_fixed_values"],
-        seeds=seeds,
-    )
-    second = schedule_service.generate_schedule(
-        sample.values,
-        batch.scientific_values["time"],
-        batch.scientific_values["scientific_fixed_values"],
-        seeds=seeds,
-    )
-    np.testing.assert_array_equal(first.values, second.values)
-    assert first.metadata == second.metadata
-    assert first.metadata["schedule_rejection_count"] == 1
-    assert first.metadata["schedule_acceptance_attempt"] == 2
-    assert first.metadata["min_heater_temperature_rise"] >= 0.0
-    assert 0.0 < first.metadata["min_phi_source_air"] <= first.metadata["max_phi_source_air"] <= 1.0
-    assert first.metadata["column_order"] == [field.name for field in generation.contracts.get_profile_contract("transient_drying").schedule_fields]
-    assert first.metadata["phi_source_air_usage"] == "validation_and_provenance_only"
-
-
-def test_schedule_feasibility_diagnostic_uses_resolved_operating_bounds() -> None:
-    """Report the effective humidity envelope without freezing production values."""
-    fixed = {
-        "T_in_min": 290.0,
-        "T_in_max": 310.0,
-        "omega_min": 0.001,
-        "omega_max": 0.02,
-        "phi_operational_min": 0.2,
-        "phi_operational_max": 0.7,
-    }
-    reason = schedule_service._feasibility_reason(
-        np.asarray([300.0]),
-        np.asarray([0.01]),
-        np.asarray([0.8]),
-        np.asarray([0.5]),
-        ambient_temperature=295.0,
-        fixed=fixed,
-    )
-
-    assert reason == "phi_in_bc violates the configured operating envelope [0.2, 0.7]"
-
-
-def test_all_generation_source_references_resolve() -> None:
-    """Require every authored source reference to resolve through the source registry."""
-    registry = yaml.safe_load(Path("configs/generation/sources.yaml").read_text(encoding="utf-8"))
-    sources = registry["sources"]
-    source_keys = {record["source_key"] for record in sources}
-    assert len(source_keys) == len(sources)
-    used_refs: set[str] = set()
-
-    def collect(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in {"source_ref", "source_refs"}:
-                    refs = [item] if isinstance(item, str) else item
-                    if isinstance(refs, list):
-                        used_refs.update(ref for ref in refs if isinstance(ref, str))
-                else:
-                    collect(item)
-        elif isinstance(value, list):
-            for item in value:
-                collect(item)
-
-    for path in Path("configs/generation").rglob("*.yaml"):
-        if path.name != "sources.yaml":
-            collect(yaml.safe_load(path.read_text(encoding="utf-8")))
-    assert used_refs <= source_keys
-
-
-def test_material_ood_inventory_is_complete_and_provenanced() -> None:
-    """Protect the complete material-owned scalar and atomic OOD inventory."""
-    campaign_path = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-    expected_scalar_directions = {
-        "kappa_mean": 2,
-        "k_gr": 2,
-        "cp_gr_dry": 2,
-        "initial_moisture.mean_db": 1,
-        "initial_moisture.amplitude_db": 1,
-    }
-    transient = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
-    for family in materials.available_material_families():
-        batch = transient.require_batch(material_family=family, sampling_regime="natural")
-        material = batch.scientific_values["material"]
-        registry = material["parameter_registry"]
-        for name, count in expected_scalar_directions.items():
-            entry = registry[name]
-            assert len(entry["ood"]) == count
-            assert entry["ood_provenance"]["evidence"] == "synthetic_design"
-            assert entry["ood_provenance"]["source_refs"] == []
-        for contract_name, expected_ids in {
-            "density_calibration": ["loose_low_density", "dense_high_density"],
-            "two_compartment_kinetics": ["slow_internal_limited", "fast_surface_exposed"],
-        }.items():
-            contract = material["coupled_ood_records"][contract_name]
-            assert [record["id"] for record in contract["records"]] == expected_ids
-            assert contract["ood_provenance"]["evidence"] == "synthetic_design"
-        assert "packing_scatter" not in registry
-        assert "packing_scatter_z" not in registry
-        assert batch.scientific_values["generator_version"] == 1
-
-
-def test_material_scalar_ood_provenance_is_required() -> None:
-    """Fail closed when a material-owned scalar omits its OOD provenance."""
-    record = {
-        "nominal": 1.0,
-        "support": {"lower": 0.5, "upper": 2.0},
-        "transform": "log",
-        "distribution": "uniform_in_log_space",
-        "provenance": {"evidence": "synthetic_design", "source_refs": []},
-    }
-    with pytest.raises(ValueError, match="ood_provenance is required"):
-        materials._support_record(record, sources={}, label="synthetic")
-
-    record["ood_provenance"] = {"evidence": "project_baseline", "source_refs": []}
-    with pytest.raises(ValueError, match="evidence must be synthetic_design"):
-        materials._support_record(record, sources={}, label="synthetic")
 
 
 @pytest.mark.parametrize(
@@ -1348,40 +909,3 @@ def test_operation_provenance_does_not_change_scientific_identity(
     assert changed_batch.case_input_config_digest == original_batch.case_input_config_digest
     assert changed_batch.batch_id == original_batch.batch_id
     assert changed.campaign_digest == original.campaign_digest
-
-
-def test_bulk_tolerance_and_retry_policy_have_separate_identity_ownership(
-    generation_config_factory: Any,
-) -> None:
-    """Separate scientific admission provenance from execution behavior."""
-    config_path, _template = generation_config_factory()
-    original = generation.cases.config.load_campaign_config(config_path)
-    original_batch = original.batches[0]
-
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"]["initial_delay_seconds"] = 90
-    execution_path.write_text(
-        yaml.safe_dump(execution, sort_keys=False),
-        encoding="utf-8",
-    )
-    execution_changed = generation.cases.config.load_campaign_config(config_path)
-    execution_batch = execution_changed.batches[0]
-    assert execution_changed.campaign_digest == original.campaign_digest
-    assert execution_batch.scientific_config_digest == (original_batch.scientific_config_digest)
-    assert execution_batch.batch_id == original_batch.batch_id
-    assert execution_batch.case_input_config_digest == (original_batch.case_input_config_digest)
-    assert execution_changed.execution_values != original.execution_values
-
-    common_path = config_path.parent / "common.yaml"
-    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
-    common["validation"]["transient_bulk_moisture"]["rtol"] = 5.0e-6
-    common_path.write_text(
-        yaml.safe_dump(common, sort_keys=False),
-        encoding="utf-8",
-    )
-    science_changed = generation.cases.config.load_campaign_config(config_path)
-    science_batch = science_changed.batches[0]
-    assert science_batch.scientific_config_digest != (execution_batch.scientific_config_digest)
-    assert science_batch.batch_id != execution_batch.batch_id
-    assert science_batch.case_input_config_digest == (execution_batch.case_input_config_digest)

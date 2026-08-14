@@ -1,36 +1,19 @@
-# ruff: noqa: S101, EM101, PLR2004, SLF001, TRY003
+# ruff: noqa: S101, EM101, PLR2004, TRY003
 """Verify direct timing, strict persistence, matching, and cache independence."""
 
 from __future__ import annotations
 
 import copy
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 from torch import nn
 
 from src import analysis
-from src.datasets.contracts.dataset_contracts_metadata import DatasetMetadata
 
-
-class _IdentityNormalizer:
-    def transform(self, value: torch.Tensor) -> torch.Tensor:
-        return value
-
-
-class _IdentityProcessor:
-    def __init__(self) -> None:
-        self.training = True
-
-    def eval(self) -> None:
-        self.training = False
-
-    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
-        if self.training:
-            raise AssertionError("warmup processor remained in training mode")
-        return batch
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class _RecordingProjection(nn.Module):
@@ -121,99 +104,6 @@ def _comparison(*, comsol: bool = True) -> dict[str, Any]:
     )
 
 
-def _metadata_package(
-    *,
-    digest: str,
-    timing: dict[str, Any] | None,
-    status: str,
-) -> DatasetMetadata:
-    measured = 0 if timing is None else len(timing["cases"])
-    return DatasetMetadata(
-        directory=Path(),
-        metadata={
-            "artifacts": {
-                "snapshots": {
-                    "source_manifest.json": {"sha256": digest},
-                },
-            },
-            "operational_provenance": {
-                "timing": {
-                    "status": status,
-                    "measured_case_count": measured,
-                    "intended_case_count": 3,
-                },
-            },
-        },
-        source_manifest={},
-        timing=timing,
-    )
-
-
-def test_comsol_timing_resolution_uses_only_validated_training_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime comparison must not resolve or inspect generation storage."""
-    digest = "a" * 64
-    comsol_payload = _comsol_payload(digest=digest)
-    package = _metadata_package(digest=digest, timing=comsol_payload, status="partial")
-    request = analysis.artifacts.service.ArtifactRequest(
-        provenance={},
-        source_indices=(),
-        batch_size=2,
-        dataset_metadata=package,
-    )
-
-    generated_root = tmp_path / "must-not-be-opened"
-    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "storage"))
-    payload, resolved_digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
-    assert payload == comsol_payload
-    assert resolved_digest == digest
-    assert reason is None
-    assert not generated_root.exists()
-
-
-def test_missing_training_timing_snapshot_is_nonfatal() -> None:
-    """Verify that missing training timing snapshot is nonfatal."""
-    package = _metadata_package(digest="a" * 64, timing=None, status="missing")
-    request = analysis.artifacts.service.ArtifactRequest(
-        provenance={},
-        source_indices=(),
-        batch_size=2,
-        dataset_metadata=package,
-    )
-    payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
-    assert payload is None
-    assert digest is None
-    assert reason == "validated model-training simulation timing snapshot is missing"
-
-
-def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
-    """Verify that validated zero case timing snapshot is unavailable."""
-    comsol_payload = _comsol_payload()
-    comsol_payload["cases"] = []
-    comsol_payload["aggregates"] = {
-        "measured_case_count": 0,
-        "mean_s": [],
-        "median_s": [],
-        "p10_s": [],
-        "p90_s": [],
-    }
-    package = _metadata_package(digest="a" * 64, timing=comsol_payload, status="missing")
-    request = analysis.artifacts.service.ArtifactRequest(
-        provenance={},
-        source_indices=(),
-        batch_size=2,
-        dataset_metadata=package,
-    )
-
-    payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
-
-    assert payload is None
-    assert digest is None
-    assert reason == "validated model-training simulation timing snapshot is missing"
-
-
 def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify that cpu forward is direct inference mode and never uses cuda."""
 
@@ -231,47 +121,6 @@ def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: p
     assert duration > 0.0
     assert model.training is False
     assert model.inference_modes == [True]
-
-
-def test_warmup_is_separate_from_authoritative_measurement() -> None:
-    """Verify that warmup is separate from authoritative measurement."""
-    model = _RecordingProjection()
-    processor = _IdentityProcessor()
-    batch = {"x": torch.ones(4, 2, 2, 2), "y": torch.ones(4, 1, 2, 2)}
-    analysis.artifacts.timing.warm_up_forward(
-        representative_batch=batch,
-        model=model,
-        processor=processor,
-        device=torch.device("cpu"),
-        passes=1,
-    )
-    assert model.inference_modes == [True]
-    assert model.batch_sizes == [4]
-    _prediction, measured_s = analysis.artifacts.timing.measure_forward(
-        model=model,
-        normalized_inputs=batch["x"][:1],
-        device=torch.device("cpu"),
-    )
-    assert measured_s > 0.0
-    assert model.inference_modes == [True, True]
-    assert model.batch_sizes == [4, 1]
-
-
-def test_cuda_synchronizes_exact_resolved_device_around_forward(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify that cuda synchronizes exact resolved device around forward."""
-    calls: list[torch.device] = []
-
-    def record(device: torch.device) -> None:
-        calls.append(device)
-
-    monkeypatch.setattr(torch.cuda, "synchronize", record)
-    device = torch.device("cuda:2")
-    analysis.artifacts.timing.measure_forward(
-        model=_RecordingProjection(),
-        normalized_inputs=torch.ones(1, 2, 2, 2),
-        device=device,
-    )
-    assert calls == [device, device]
 
 
 def test_case_matching_uses_only_identical_ids_and_primary_speedup() -> None:

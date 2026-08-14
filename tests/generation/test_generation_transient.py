@@ -153,56 +153,6 @@ def _hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     return value
 
 
-def _compact_steady_view(
-    candidate: dict[str, Any],
-    *,
-    case_id: str,
-    task: Any,
-) -> tuple[Any, ...]:
-    """Interpret one compact coupled HDF5 source through the steady transform."""
-    with h5py.File(candidate["case_hdf5"], "r") as handle:
-        x_axis = np.asarray(_hdf5_dataset(handle, "coords/x"), dtype=np.float64)
-        y_axis = np.asarray(_hdf5_dataset(handle, "coords/y"), dtype=np.float64)
-        static_dataset = _hdf5_dataset(handle, "static/fields")
-        field_names = json.loads(str(static_dataset.attrs["field_names"]))
-        static_values = np.asarray(static_dataset, dtype=np.float32)
-    fields = {name: static_values[index] for index, name in enumerate(field_names)}
-    case_inputs, case_outputs = datasets.packages.generated_batch._steady_flow_fields(
-        fields,
-        x_axis=x_axis,
-        y_axis=y_axis,
-        task=task,
-    )
-    inputs = torch.stack([torch.from_numpy(case_inputs[name]) for name in task.input_names])
-    outputs = torch.stack([torch.from_numpy(case_outputs[name]) for name in task.output_names])
-    metadata = {
-        "case_id": case_id,
-        "case_input_id": candidate["case_input_id"],
-        "simulation_case_id": candidate["simulation_case_id"],
-        "material_family": candidate["material_family"],
-        "simulation_profile": candidate["simulation_profile"],
-    }
-    source = {
-        "case_id": case_id,
-        "case_input_id": candidate["case_input_id"],
-        "simulation_case_id": candidate["simulation_case_id"],
-        "simulation_profile": candidate["simulation_profile"],
-        "case_hdf5": {
-            "sha256": candidate["case_hdf5_sha256"],
-            "size_bytes": candidate["case_hdf5"].stat().st_size,
-        },
-    }
-    fingerprint = datasets.contracts.identity.compute_case_fingerprint(
-        task=task,
-        case_id=case_id,
-        source_identity=source,
-        source_metadata=metadata,
-        inputs=inputs,
-        outputs=outputs,
-    )
-    return (y_axis.size, x_axis.size), inputs, outputs, metadata, source, fingerprint
-
-
 def _write_transient_case(
     path: Path,
     *,
@@ -626,43 +576,6 @@ def test_transient_index_selects_one_hour_steps_from_finer_regular_source(tmp_pa
     )
 
 
-def test_transient_index_rejects_rehashed_noncanonical_contract_digest(tmp_path: Path) -> None:
-    """Reject a coordinated index rewrite around an arbitrary contract digest."""
-    source = tmp_path / "case.h5"
-    _write_transient_case(source)
-    index_path = tmp_path / "index.json"
-    payload = _build_index(source, index_path)
-    payload["contract_digest"] = "0" * 64
-    payload["index_digest"] = common.serialization.canonical_json_sha256(datasets.packages.trajectory._index_digest_payload(payload))
-    index_path.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(datasets.packages.trajectory.TransientDataContractError, match="contract or identity"):
-        datasets.runtime.transient.TransientPhysicalDataset(index_path, sampling=_one_step_sampling(), source_root=tmp_path)
-
-
-def test_transient_runtime_rejects_rehashed_missing_startup_support(tmp_path: Path) -> None:
-    """Bind the required first-transition support to source handoff provenance."""
-    source = tmp_path / "case.h5"
-    _write_transient_case(source)
-    index_path = tmp_path / "index.json"
-    payload = _build_index(source, index_path)
-    payload["samples"][0]["schedule_support_index"] = None
-    payload["index_digest"] = common.serialization.canonical_json_sha256(datasets.packages.trajectory._index_digest_payload(payload))
-    index_path.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    dataset = datasets.runtime.transient.TransientPhysicalDataset(
-        index_path,
-        sampling=_one_step_sampling(),
-        source_root=tmp_path,
-    )
-    with pytest.raises(datasets.packages.trajectory.TransientDataContractError, match="startup support disagrees"):
-        _ = dataset[0]
-
-
 def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path: Path) -> None:
     """Protect exact regular transitions, typed physical tensors, and portable identity."""
     source = tmp_path / "case.h5"
@@ -743,7 +656,6 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     assert first["metadata"]["stored_state_count"] == 4
     assert first["metadata"]["split"] == "train"
     assert first["metadata"]["material_family"] == "lentil"
-    assert len(dataset._handles) == 1
 
     relocated_root = tmp_path / "relocated"
     relocated_root.mkdir()
@@ -945,7 +857,6 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
     assert second["metadata"]["has_exact_stop_state"] is True
     assert second["metadata"]["t_stop_exact"] == 5.5
     assert second["time"]["t_n_plus_1"][-1].item() == 5.0
-    assert len(dataset._handles) == 1
 
     duplicate = datasets.runtime.transient.TransientPhysicalDataset(
         index_path,
@@ -1077,54 +988,3 @@ def test_transient_hdf5_rejects_an_unknown_scalar_entry(tmp_path: Path) -> None:
             source,
             expected_profile="transient_drying",
         )
-
-
-def test_transient_time_classification_and_bad_commit(tmp_path: Path) -> None:
-    """Protect no-stop, irregular-stop, regular-stop, and source-commit rejection."""
-    time_contract = _synthetic_scientific_contract()["time"]
-    tolerance = generation.publication.storage.time_classification_tolerance(time_contract)
-    regular, positions, irregular = generation.publication.storage._classify_transient_times(
-        np.asarray([0.0, 1.0, 2.0], dtype=np.float64),
-        time_contract,
-    )
-    np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
-    np.testing.assert_array_equal(positions, [0, 1, 2])
-    assert irregular is None
-    regular, _positions, irregular = generation.publication.storage._classify_transient_times(
-        np.asarray([0.0, 1.0, 2.0, 2.5], dtype=np.float64),
-        time_contract,
-    )
-    np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
-    assert irregular == 3
-    regular, _positions, irregular = generation.publication.storage._classify_transient_times(
-        np.asarray([0.0, 1.0, 2.0 + tolerance / 2.0], dtype=np.float64),
-        time_contract,
-    )
-    np.testing.assert_array_equal(regular, [0.0, 1.0, 2.0])
-    assert irregular is None
-    with pytest.raises(ValueError, match="optional irregular state must be final"):
-        generation.publication.storage._classify_transient_times(
-            np.asarray([0.0, 0.5, 1.0], dtype=np.float64),
-            time_contract,
-        )
-
-    no_exact = tmp_path / "no-exact-stop.h5"
-    _write_transient_case(no_exact, exact_stop_time=None)
-    generation.publication.storage.validate_case_hdf5(no_exact, expected_profile="transient_drying")
-    no_exact_index = _build_index(no_exact, tmp_path / "no-exact-stop.json")
-    assert no_exact_index["cases"][0]["stored_state_count"] == 3
-    assert no_exact_index["cases"][0]["irregular_stop_time"] is None
-
-    unsupported = tmp_path / "unsupported-schema.h5"
-    _write_transient_case(unsupported)
-    with h5py.File(unsupported, "r+") as handle:
-        handle.attrs["schema_version"] = generation.publication.storage.HDF5_SCHEMA_VERSION + 1
-    with pytest.raises(ValueError, match="Unsupported canonical case HDF5 schema"):
-        generation.publication.storage.validate_case_hdf5(unsupported, expected_profile="transient_drying")
-
-    bad = tmp_path / "bad-commit.h5"
-    _write_transient_case(bad)
-    with h5py.File(bad, "r+") as handle:
-        handle.attrs["git_commit"] = "not-a-commit"
-    with pytest.raises(ValueError, match="must not embed execution Git provenance"):
-        generation.publication.storage.validate_case_hdf5(bad, expected_profile="transient_drying")

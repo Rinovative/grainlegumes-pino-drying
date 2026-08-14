@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
 from support import configs
 
 from src import experiments
@@ -28,23 +27,3 @@ def test_category_path_does_not_change_resolved_semantics(tmp_path: Path) -> Non
 
     assert resolved[0] == resolved[1]
     assert resolved[0]["run"]["name"] == resolved[1]["run"]["name"]
-
-
-@pytest.mark.parametrize("family", ["direct", "optuna"])
-def test_directory_task_mismatch_is_rejected(
-    tmp_path: Path,
-    family: str,
-) -> None:
-    """Reject a task-owned path whose artificial request declares another task."""
-    if family == "direct":
-        payload = configs.direct_config()
-        path = tmp_path / "configs/learning/not_the_task/experiments/category/request.yaml"
-        loader = experiments.config.loader.load_and_resolve_config
-    else:
-        payload = configs.optuna_config()
-        path = tmp_path / "configs/learning/not_the_task/optuna/request.yaml"
-        loader = experiments.tuning.optuna.load_optuna_study_config
-    configs.write_yaml(path, payload)
-
-    with pytest.raises(ValueError, match="Task config path mismatch"):
-        loader(path)

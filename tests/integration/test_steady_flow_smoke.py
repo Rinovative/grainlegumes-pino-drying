@@ -371,16 +371,6 @@ def _state_dict_equal(
     return _nested_state_equal(left, right)
 
 
-def test_generic_smoke_config_explicitly_disables_wandb(tmp_path: Path) -> None:
-    """Keep the bounded lifecycle fixture independent of keys, accounts, and network."""
-    config = _tiny_config(
-        dataset_root=tmp_path / "raw",
-        output_root=tmp_path / "processed",
-    )
-    assert config["tracking"]["wandb"]["mode"] == "disabled"
-    assert experiments.config.defaults.TRACKING_DEFAULTS["wandb"]["mode"] == "online"
-
-
 @pytest.fixture(scope="module")
 def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     """

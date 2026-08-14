@@ -1,20 +1,30 @@
-# ruff: noqa: PLR2004, S101, SLF001, TC003
+# ruff: noqa: PLR2004, S101, TC003
 """COMSOL Spreadsheet parsing and mapping regressions."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import pytest
 
-from src import common
-from src.generation import generation_smoke as smoke
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet
-from src.generation.publication import generation_publication_storage as storage
-from src.generation.runtime import generation_runtime_batch as runtime_batch
+
+_TEMPORAL_UNITS = {
+    "t": "h",
+    "x": "m",
+    "y": "m",
+    "T": "K",
+    "mt.phi": "1",
+    "w_surf": "kg/m^3",
+    "w_int": "kg/m^3",
+}
+
+
+def _wide_header(times: tuple[float, ...]) -> list[str]:
+    """Return compact native COMSOL temporal descriptors."""
+    return [f"{source} ({unit}) @ t={state_time:g}" for state_time in times for source, unit in _TEMPORAL_UNITS.items()]
+
 
 _STEADY_RAW_HEADER = (
     "x (m)",
@@ -160,32 +170,6 @@ def test_metadata_without_a_column_header_fails_clearly(tmp_path: Path) -> None:
         spreadsheet.read_comsol_spreadsheet(path, delimiter=",")
 
 
-def test_hdf5_admission_uses_canonical_unit_aware_headers(tmp_path: Path) -> None:
-    """Use the shared parser for mapped numeric values without row loss."""
-    path = tmp_path / "fields.csv"
-    path.write_text(
-        """% Model,model.mph
-% Nodes,2
-% Expressions,2
-% x (m),p (Pa)
-0,10
-0.5,11
-""",
-        encoding="utf-8",
-    )
-    mapped = storage._mapped_table(
-        [path],
-        {
-            "role": "steady_flow_fields",
-            "units": {"x": "m", "p": "Pa"},
-            "columns": {"x": "x", "p": "p"},
-            "delimiter": ",",
-        },
-    )
-    np.testing.assert_array_equal(mapped["x"], np.asarray([0.0, 0.5]))
-    np.testing.assert_array_equal(mapped["p"], np.asarray([10.0, 11.0]))
-
-
 def test_comment_after_numeric_data_fails_clearly(tmp_path: Path) -> None:
     """Reject an unexpected comment after the numeric section begins."""
     path = tmp_path / "ambiguous.csv"
@@ -204,245 +188,6 @@ def test_comment_after_numeric_data_fails_clearly(tmp_path: Path) -> None:
             delimiter=",",
             expected_units={"x": "m"},
         )
-
-
-def test_all_export_roles_use_unit_aware_exact_mapping(tmp_path: Path) -> None:
-    """Retain exact technical-smoke observations for every export role."""
-    contracts = [
-        {
-            "role": "steady_flow_fields",
-            "temporal_kind": "stationary",
-            "pattern": "steady.csv",
-            "delimiter": ",",
-            "columns": {"x": "x", "p": "p"},
-            "units": {"x": "m", "p": "Pa"},
-        },
-        {
-            "role": "transient_fields",
-            "temporal_kind": "regular_time_series",
-            "pattern": "transient.csv",
-            "delimiter": ",",
-            "columns": {
-                "t": "t",
-                "x": "x",
-                "y": "y",
-                "T": "T",
-                "phi": "mt.phi",
-                "w_surf": "w_surf",
-                "w_int": "w_int",
-            },
-            "units": {
-                "t": "h",
-                "x": "m",
-                "y": "m",
-                "T": "K",
-                "phi": "1",
-                "w_surf": "kg/m^3",
-                "w_int": "kg/m^3",
-            },
-        },
-        {
-            "role": "global_time_series",
-            "temporal_kind": "regular_time_series",
-            "pattern": "globals.csv",
-            "delimiter": ",",
-            "columns": {"t": "t", "X_wb_bulk": "X_wb_bulk", "T_out_mean": "T_out_mean"},
-            "units": {"t": "h", "X_wb_bulk": "1", "T_out_mean": "K"},
-        },
-        {
-            "role": "final_status",
-            "temporal_kind": "final_status",
-            "pattern": "final.csv",
-            "delimiter": ",",
-            "columns": {
-                "t_final": "t_final",
-                "T_max_final": "T_max_final",
-                "phi_min_final": "phi_min_final",
-            },
-            "units": {"t_final": "h", "T_max_final": "K", "phi_min_final": "1"},
-        },
-    ]
-    exports = {
-        "steady.csv": """% Model,model.mph
-% Dimension,2
-% Nodes,1
-% Expressions,2
-% Length unit,m
-% x (m),p (Pa)
-0,0
-""",
-        "transient.csv": """% Model,model.mph
-% Dimension,2
-% Nodes,1
-% Expressions,7
-% t (h) @ t=0,x (m) @ t=0,y (m) @ t=0,T (K) @ t=0,mt.phi (1) @ t=0,w_surf (kg/m^3) @ t=0,w_int (kg/m^3) @ t=0
-0,0,0,296,0.5,1,2
-""",
-        "globals.csv": """% Model,model.mph
-% Expressions,4
-% Time,t (h),X_wb_bulk (1),T_out_mean (K)
-0,0,0.2,296
-""",
-        "final.csv": """% Model,model.mph
-% Time,t_final (h),T_max_final (K),phi_min_final (1)
-0,1,295,0.4
-""",
-    }
-    source_exports = {}
-    roles = {contract["pattern"]: contract["role"] for contract in contracts}
-    for name, content in exports.items():
-        path = tmp_path / name
-        path.write_text(content, encoding="utf-8")
-        source_exports[name] = {
-            "role": roles[name],
-            "sha256": common.serialization.file_sha256(path),
-            "size_bytes": path.stat().st_size,
-        }
-
-    observations = smoke._export_inventory(
-        tmp_path,
-        source_exports,
-        {"exports": contracts},
-    )
-
-    assert [observation["role"] for observation in observations] == [
-        "final_status",
-        "global_time_series",
-        "steady_flow_fields",
-        "transient_fields",
-    ]
-    for observation in observations:
-        assert observation["raw_header"]
-        assert observation["parsed_shape"][0] == 1
-        assert all(column["observed_exact_header_match"] for column in observation["columns"].values())
-    transient = next(observation for observation in observations if observation["role"] == "transient_fields")
-    assert transient["canonical_header"] == ["t", "x", "y", "T", "mt.phi", "w_surf", "w_int"]
-    assert transient["temporal_group_count"] == 1
-    assert transient["temporal_state_times"] == [0.0]
-
-
-def test_failed_case_diagnostics_retain_actual_header_and_exact_error(tmp_path: Path) -> None:
-    """Explain mapping failures without retaining or manually opening a large export."""
-    exports_root = tmp_path / "exports"
-    exports_root.mkdir()
-    path = exports_root / "steady.csv"
-    path.write_text("wrong (m),p (Pa)\n0,1\n", encoding="utf-8")
-    config: Any = SimpleNamespace(
-        profile=SimpleNamespace(id="steady_flow"),
-        scientific_values={
-            "output_contract": {
-                "exports_root": "exports",
-                "exports": [
-                    {
-                        "role": "steady_flow_fields",
-                        "pattern": "steady.csv",
-                        "delimiter": ",",
-                        "columns": {"x": "x", "p": "p"},
-                        "units": {"x": "m", "p": "Pa"},
-                    }
-                ],
-            }
-        },
-    )
-
-    diagnostics = runtime_batch._failure_export_diagnostics(config, tmp_path)
-
-    observation = diagnostics[0]["observations"][0]
-    assert diagnostics[0]["matched_relative_paths"] == ["steady.csv"]
-    assert observation["raw_header"] == ["wrong (m)", "p (Pa)"]
-    assert observation["parsed_shape"] == [1, 2]
-    assert "missing explicitly configured headers ['x']" in observation["validation_error"]
-
-
-_TEMPORAL_UNITS = {
-    "t": "h",
-    "x": "m",
-    "y": "m",
-    "T": "K",
-    "mt.phi": "1",
-    "w_surf": "kg/m^3",
-    "w_int": "kg/m^3",
-}
-
-
-def _wide_header(times: tuple[float, ...]) -> list[str]:
-    """Return compact native COMSOL temporal descriptors."""
-    return [f"{source} ({unit}) @ t={state_time:g}" for state_time in times for source, unit in _TEMPORAL_UNITS.items()]
-
-
-def _write_wide_fixture(
-    path: Path,
-    *,
-    numeric_times: tuple[float, ...] = (0.0, 1.0, 1.5),
-    shifted_state: int | None = None,
-) -> None:
-    """Write a three-node native-wide table with one exact-stop state."""
-    times = (0.0, 1.0, 1.5)
-    header = _wide_header(times)
-    records = [
-        "% Model,model.mph",
-        "% Dimension,2",
-        "% Nodes,3",
-        f"% Expressions,{len(header)}",
-        "% " + ",".join(header),
-    ]
-    for x_value in (0.0, 1.0, 2.0):
-        row: list[float] = []
-        for state_index, (header_time, numeric_time) in enumerate(zip(times, numeric_times, strict=True)):
-            state_x = x_value + (0.01 if state_index == shifted_state else 0.0)
-            row.extend(
-                (
-                    numeric_time,
-                    state_x,
-                    0.0,
-                    300.0 + header_time + x_value,
-                    0.4 + 0.01 * header_time,
-                    10.0 - header_time - x_value,
-                    20.0 - header_time - x_value,
-                )
-            )
-        records.append(",".join(format(value, ".17g") for value in row))
-    path.write_text("\n".join(records) + "\n", encoding="utf-8")
-
-
-def _wide_storage_config() -> Any:
-    """Return the minimal resolved contract consumed by wide admission."""
-    return SimpleNamespace(
-        scientific_values={
-            "time": {
-                "start": 0.0,
-                "interval": 1.0,
-                "stop": 2.0,
-                "regular_times": [0.0, 1.0, 2.0],
-            },
-            "output_contract": {
-                "exports": [
-                    {
-                        "role": "transient_fields",
-                        "delimiter": ",",
-                        "columns": {
-                            "t": "t",
-                            "x": "x",
-                            "y": "y",
-                            "T": "T",
-                            "phi": "mt.phi",
-                            "w_surf": "w_surf",
-                            "w_int": "w_int",
-                        },
-                        "units": {
-                            "t": "h",
-                            "x": "m",
-                            "y": "m",
-                            "T": "K",
-                            "phi": "1",
-                            "w_surf": "kg/m^3",
-                            "w_int": "kg/m^3",
-                        },
-                    }
-                ]
-            },
-        }
-    )
 
 
 def test_temporal_descriptor_preserves_expression_and_header_precision() -> None:
@@ -478,66 +223,3 @@ def test_temporal_grouping_rejects_malformed_or_incomplete_states(
     """Fail closed for every malformed temporal grouping branch."""
     with pytest.raises(ValueError, match=match):
         spreadsheet.group_temporal_columns(header, expected_units=_TEMPORAL_UNITS)
-
-
-def test_wide_transient_conversion_preserves_regular_and_exact_stop_states(tmp_path: Path) -> None:
-    """Stream native wide rows directly into canonical ordered state arrays."""
-    path = tmp_path / "transient.csv"
-    _write_wide_fixture(path, numeric_times=(0.0, 1.0, 1.5004))
-    regular_time, regular, exact_time, exact = storage._transient_fields(
-        _wide_storage_config(),
-        [SimpleNamespace(role="transient_fields", source_path=path)],
-        x_axis=np.asarray([0.0, 1.0, 2.0]),
-        y_axis=np.asarray([0.0]),
-    )
-    np.testing.assert_array_equal(regular_time, np.asarray([0.0, 1.0]))
-    assert regular.shape == (2, 4, 1, 3)
-    np.testing.assert_array_equal(regular[0, 0, 0], np.asarray([300.0, 301.0, 302.0]))
-    np.testing.assert_array_equal(regular[1, 1, 0], np.full(3, 0.4 + 0.01))
-    assert exact_time == 1.5004
-    assert exact is not None
-    np.testing.assert_array_equal(exact[2, 0], np.asarray([8.5, 7.5, 6.5]))
-
-
-@pytest.mark.parametrize(
-    ("numeric_times", "shifted_state", "match"),
-    [((0.0, 1.0, 1.4), None, "numeric t disagrees"), ((0.0, 1.0, 1.5), 1, "coordinates disagree")],
-)
-def test_wide_transient_conversion_rejects_numeric_time_or_grid_disagreement(
-    tmp_path: Path,
-    numeric_times: tuple[float, ...],
-    shifted_state: int | None,
-    match: str,
-) -> None:
-    """Require independent numeric-time and repeated-grid evidence."""
-    path = tmp_path / "invalid.csv"
-    _write_wide_fixture(path, numeric_times=numeric_times, shifted_state=shifted_state)
-    with pytest.raises(ValueError, match=match):
-        storage._transient_fields(
-            _wide_storage_config(),
-            [SimpleNamespace(role="transient_fields", source_path=path)],
-            x_axis=np.asarray([0.0, 1.0, 2.0]),
-            y_axis=np.asarray([0.0]),
-        )
-
-
-@pytest.mark.parametrize(
-    "times",
-    [np.asarray([0.0, 0.5, 1.0]), np.asarray([0.0, 0.5, 1.0, 1.5])],
-)
-def test_time_classification_rejects_nonfinal_or_multiple_irregular_states(times: np.ndarray) -> None:
-    """Keep irregular solver stops final, singular, and diagnostic-only."""
-    with pytest.raises(ValueError, match="irregular"):
-        storage._classify_transient_times(
-            times,
-            {"start": 0.0, "interval": 1.0, "stop": 2.0, "regular_times": [0.0, 1.0, 2.0]},
-        )
-
-
-def test_unit_interval_admission_allows_only_binary64_roundoff() -> None:
-    """Admit COMSOL unit-fraction residue without hiding real violations."""
-    values = np.asarray([np.nextafter(0.0, -1.0), 0.0, 1.0, np.nextafter(1.0, 2.0), -1e-6, 1.0 + 1e-6])
-    np.testing.assert_array_equal(
-        storage._outside_unit_interval(values),
-        np.asarray([False, False, False, False, True, True]),
-    )

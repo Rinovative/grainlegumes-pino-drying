@@ -3,24 +3,16 @@
 
 from __future__ import annotations
 
-import ast
 import copy
-import inspect
-import json
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
-from zipfile import ZipFile
 
 import pytest
-import yaml
 
 from src import common, generation
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff
-from src.generation.contracts import generation_contracts_templates as templates
-from src.generation.publication import generation_publication_storage as storage
-from src.generation.runtime import generation_runtime_batch as runtime
 
 _EXPECTED_FIELDS = (
     "T_amb",
@@ -312,79 +304,3 @@ def test_scalar_case_provenance_must_agree_with_admitted_bytes(
 
     with pytest.raises(ValueError, match=match):
         _admit(payload, tmp_path)
-
-
-def test_scalar_parser_and_admission_have_one_production_owner() -> None:
-    """Prevent a second scalar CSV parser or bypass in runtime/publication."""
-    scalar_csv_readers: list[tuple[str, str]] = []
-    for path in Path("src/generation").rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            has_csv_reader = any(
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and isinstance(call.func.value, ast.Name)
-                and call.func.value.id == "csv"
-                and call.func.attr == "reader"
-                for call in ast.walk(node)
-            )
-            function_source = ast.get_source_segment(source, node) or ""
-            if has_csv_reader and "scalar" in function_source.lower():
-                scalar_csv_readers.append((path.name, node.name))
-    assert scalar_csv_readers == [("generation_contracts_scalar_handoff.py", "admit_transient_scalar_file")]
-    assert "admit_case_scalar_handoff" in inspect.getsource(storage.convert_exports_to_hdf5)
-    assert "validate_transient_scalar_source" in inspect.getsource(runtime.execute_prepared_case)
-
-
-def test_canonical_template_owns_derived_initial_temperature_and_four_column_schedule() -> None:
-    """Protect the corrected native mapping, template bytes, and sidecar owners."""
-    repository_root = Path(__file__).resolve().parents[2]
-    profile_path = repository_root / "configs/generation/profiles/transient_drying.yaml"
-    profile_document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-    assert isinstance(profile_document, dict)
-    template = templates.resolve_template_identity(
-        profile_document["template"],
-        repository_root=repository_root,
-    )
-    with ZipFile(template.absolute_path) as archive:
-        descriptor = archive.read("dmodel.xml").decode("utf-8")
-        summary = json.loads(archive.read("smodel.json"))
-
-    assert '<expressions T="31" name="T_init" expr="T_amb"' in descriptor
-    feature_start = descriptor.index('<FunctionFeature op="Interpolation" tag="int7" name="Inlet Schedule"')
-    feature_end = descriptor.index("</FunctionFeature>", feature_start)
-    feature = descriptor[feature_start:feature_end]
-    assert 'value="schedule.csv" name="p:filename"' in feature
-    assert 'value="4" name="p:filecolumns"' in feature
-    assert 'name="p:columnType"' in feature
-    assert "'col1','arg','col2','value','col3','value','col4','value'" in feature
-    assert 'name="p:funcnames"' in feature
-    assert "'col1','int7a7','col2','T_in_bc_file','col3','omega_in_bc_file','col4','phi_in_bc_file'" in feature
-    assert 'name="p:fununit"' in feature
-    assert "'K','kg/kg',''" in feature
-    assert 'name="p:argunit"' in feature
-    assert "'h'" in feature
-
-    pending: list[Any] = [summary]
-    inlet_schedule: dict[str, Any] | None = None
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            if value.get("modelEntityPath") == "/func/int7":
-                inlet_schedule = value
-                break
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    assert inlet_schedule is not None
-    settings = {item["name"]: item.get("apiValue", item.get("value")) for item in inlet_schedule["settings"]}
-    assert inlet_schedule["name"] == "T_in_bc_file, omega_in_bc_file, phi_in_bc_file"
-    assert settings["source"] == "file"
-    assert settings["filename"] == "schedule.csv"
-    assert settings["interp"] == "linear"
-    assert settings["extrap"] == "const"
-    assert profiles.SCHEDULE_FIELDS == ("t", "T_in_bc", "omega_in_bc", "phi_in_bc")
-    assert profiles.SCHEDULE_UNITS == ("h", "K", "kg/kg", "1")

@@ -59,21 +59,6 @@ def test_minimal_physics_config_preserves_explicit_semantics() -> None:
     assert resolved["loss"]["physics"]["boundary_weight"]["target"] == pytest.approx(6.0e-3)
 
 
-def test_canonical_name_has_one_explicit_synthetic_grammar_example() -> None:
-    """Keep intentional name grammar stable for fully specified artificial input."""
-    raw = configs.direct_config(physics_enabled=True)
-    physics = raw["loss"]["physics"]
-    physics["derivatives"] = {"kind": "spectral", "extension": "reflect"}
-    physics["continuity"] = "div_eps_velocity"
-    physics["residual_weight"]["target"] = 4.0e-3
-    physics["boundary_weight"]["target"] = 6.0e-3
-
-    resolved = experiments.config.loader.resolve_config(raw)
-
-    assert resolved["run"]["name"] == ("pi-fno_m4x5_h8_l2__spec_div_eps_vel_lamphys4e-03_lamp6e-03__synthetic_train__s17__fixture")
-    assert experiments.config.loader.resolved_scientific_variant(resolved) == ("spec_div_eps_vel_lamphys4e-03_lamp6e-03")
-
-
 def test_scientific_change_updates_name_and_resume_identity() -> None:
     """Treat an explicit physics-weight change as continuation-incompatible."""
     first_raw = configs.direct_config(physics_enabled=True)

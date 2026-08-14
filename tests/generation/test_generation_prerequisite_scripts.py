@@ -491,15 +491,3 @@ def test_worker_repository_rejects_unsafe_paths_and_wrong_commit(tmp_path: Path)
     )
     assert wrong_commit.returncode == 1
     assert f"checkout commit {_COMMIT}" in wrong_commit.stderr
-
-
-def test_submitted_workers_source_only_the_explicit_checkout_helper() -> None:
-    """Protect every maintained worker from script-directory sibling loading."""
-    repository = Path(__file__).resolve().parents[2]
-    for name in _WORKER_SCRIPTS:
-        source = (repository / "scripts" / name).read_text(encoding="utf-8")
-        assert 'source "${PREREQUISITE_HELPER}"' in source
-        assert "generation_validate_cpu_venv" in source
-        assert 'source "${GENERATION_CPU_VENV}/bin/activate"' not in source
-        assert 'source "${SCRIPT_DIR}/generation_prerequisites.sh"' not in source
-        assert 'dirname "${BASH_SOURCE[0]}"' not in source

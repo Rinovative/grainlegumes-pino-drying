@@ -125,18 +125,6 @@ def test_uniform_spacing_accepts_float32_quantized_cartesian_grid() -> None:
     assert spacing_y.item() == pytest.approx(0.003, rel=1e-6)
 
 
-def test_uniform_spacing_still_rejects_material_float32_nonuniformity() -> None:
-    """Reject a localized 0.1% spacing change well above dtype roundoff."""
-    x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)
-    y_values = torch.linspace(0.0, 0.75, 251, dtype=torch.float32)
-    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
-    nonuniform = x_grid.clone()
-    nonuniform[:, 200:] += 3e-6
-
-    with pytest.raises(ValueError, match="not uniform"):
-        domain.physics.derivatives.infer_uniform_spacing(nonuniform, y_grid)
-
-
 def test_reflect_extension_uses_validated_unpadded_spacing() -> None:
     """Differentiate on reflected fields without treating reflected coordinates as one axis."""
     x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)

@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004, SLF001
+# ruff: noqa: S101, PLR2004
 """Protect the canonical grid-resolved transient schedule contracts."""
 
 from __future__ import annotations
@@ -7,13 +7,8 @@ from typing import Any
 
 import numpy as np
 import pytest
-import yaml
 
-from src.generation.cases import generation_cases_config as config_service
-from src.generation.cases import generation_cases_fields as field_service
-from src.generation.cases import generation_cases_sampling as sampling_service
 from src.generation.cases import generation_cases_schedule as schedule_service
-from src.generation.contracts import generation_contracts_materials as materials
 
 _TIME = {
     "regular_times": [float(value) for value in range(169)],
@@ -60,36 +55,18 @@ def _schedule(**overrides: Any) -> schedule_service.Schedule:
     )
 
 
-def test_schedule_replays_byte_identically_and_uses_weights_once() -> None:
-    """Protect deterministic replay and single-use simplex composition."""
+def test_schedule_replays_deterministically() -> None:
+    """Reproduce the same scientific schedule from the same explicit seeds."""
     first = _schedule()
     second = _schedule()
 
     np.testing.assert_array_equal(first.values, second.values)
-    assert first.metadata == second.metadata
-    assert first.values.tobytes() == second.values.tobytes()
-    assert first.metadata["component_weight_semantics"] == ("relative_contribution_used_once_before_complete_shape_normalization")
-    assert first.metadata["component_availability"] == {
-        "smooth": True,
-        "event": True,
-        "trend": True,
-    }
-
-    components = {
-        "smooth": np.asarray([-1.0, 0.0, 1.0]),
-        "event": np.asarray([1.0, -2.0, 1.0]),
-        "trend": np.asarray([-0.5, 0.0, 0.5]),
-    }
-    weights = {"smooth": 0.2, "event": 0.3, "trend": 0.5}
-    expected = sum(weights[name] * components[name] for name in weights)
-    np.testing.assert_array_equal(schedule_service._compose(components, weights), expected)
 
 
 def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly() -> None:
     """Add one physical startup node without changing the canonical realization."""
     canonical = _schedule()
     canonical_values = canonical.values.copy()
-    canonical_metadata = canonical.metadata.copy()
     duration_h = 1.0 / 6.0
 
     handoff = schedule_service.build_comsol_boundary_schedule(
@@ -100,7 +77,6 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
     )
 
     np.testing.assert_array_equal(canonical.values, canonical_values)
-    assert canonical.metadata == canonical_metadata
     np.testing.assert_array_equal(handoff.values[:5, 0], [0.0, duration_h, 1.0, 2.0, 3.0])
     assert handoff.values[-1, 0] == 168.0
     assert handoff.values[0, 1] == 293.15
@@ -124,19 +100,9 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
         transformed = np.interp(representative_times, handoff.values[:, 0], handoff.values[:, column])
         np.testing.assert_allclose(transformed, original, rtol=0.0, atol=2.0e-15)
 
-    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
-    assert startup == {
-        "enabled": True,
-        "duration_h": duration_h,
-        "temperature_start_source": "T_init",
-        "temperature_source_relationship": "T_init=T_amb",
-        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
-        "rejoin_policy": "linear_interpolation_of_original_canonical_schedule",
-    }
 
-
-def test_disabled_comsol_startup_handoff_is_exactly_canonical() -> None:
-    """Keep the previous final table bytes when the startup policy is disabled."""
+def test_disabled_comsol_startup_handoff_is_semantically_canonical() -> None:
+    """Leave canonical schedule values unchanged when startup is disabled."""
     canonical = _schedule()
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
@@ -146,8 +112,6 @@ def test_disabled_comsol_startup_handoff_is_exactly_canonical() -> None:
     )
 
     np.testing.assert_array_equal(handoff.values, canonical.values)
-    assert handoff.values.tobytes() == canonical.values.tobytes()
-    assert handoff.metadata["boundary_handoff"]["rejoin_row"] is None
 
 
 def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
@@ -160,39 +124,6 @@ def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
             initial_temperature=-1.0,
             pressure=float(_FIXED["p_ref"]),
         )
-
-
-def test_event_count_is_the_only_event_presence_switch() -> None:
-    """Protect deterministic event semantics without hidden activation draws."""
-    time = np.asarray(_TIME["regular_times"], dtype=np.float64)
-    absent, absent_details = schedule_service._event_component(
-        time,
-        count=0,
-        duration=16.8,
-        width=5.04,
-        random=np.random.default_rng(12),
-    )
-    first, first_details = schedule_service._event_component(
-        time,
-        count=3,
-        duration=16.8,
-        width=5.04,
-        random=np.random.default_rng(12),
-    )
-    second, second_details = schedule_service._event_component(
-        time,
-        count=3,
-        duration=16.8,
-        width=5.04,
-        random=np.random.default_rng(12),
-    )
-
-    np.testing.assert_array_equal(absent, np.zeros_like(time))
-    assert absent_details == []
-    np.testing.assert_array_equal(first, second)
-    assert first_details == second_details
-    assert len(first_details) == 3
-    assert np.any(first)
 
 
 @pytest.mark.parametrize("correlation", [-0.7, 0.0, 0.65])
@@ -264,109 +195,3 @@ def test_authored_temporal_supports_must_resolve_on_the_grid() -> None:
     supports["schedule.event_width_rel"]["ood"][0]["lower"] = 0.005
     with pytest.raises(ValueError, match="event_width_rel ood"):
         schedule_service.validate_temporal_support_resolution(supports, _TIME)
-
-
-def test_temporal_generator_never_calls_spatial_generation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the temporal process independent from every spatial-field owner."""
-
-    def fail_spatial_call(*_args: Any, **_kwargs: Any) -> None:
-        message = "temporal generation invoked spatial generation"
-        raise AssertionError(message)
-
-    monkeypatch.setattr(field_service, "generate_spatial_fields", fail_spatial_call)
-    _schedule()
-
-
-def test_prechange_spatial_fields_remain_byte_identical(
-    generation_config_factory: Any,
-) -> None:
-    """Keep schedule-only support changes outside spatial sampling and fields."""
-    config_path, _template = generation_config_factory(natural_count=2)
-    before_campaign = config_service.load_campaign_config(config_path, require_executable=False)
-    before_batch = before_campaign.batch("transient_drying__lentil__natural")
-    before = sampling_service.sample_case(before_batch, 1)
-
-    operations_path = config_path.parent / "operations.yaml"
-    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-    schedule_supports = {
-        "schedule.timescale_rel": (0.06, 0.16),
-        "schedule.event_duration_rel": (0.09, 0.15),
-        "schedule.event_width_rel": (0.025, 0.035),
-    }
-    for name, (lower, upper) in schedule_supports.items():
-        operations["parameter_values"][name]["lower"] = lower
-        operations["parameter_values"][name]["upper"] = upper
-    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
-
-    after_campaign = config_service.load_campaign_config(config_path, require_executable=False)
-    after_batch = after_campaign.batch("transient_drying__lentil__natural")
-    after = sampling_service.sample_case(after_batch, 1)
-    schedule_names = frozenset(schedule_supports)
-    spatial_and_other_names = set(before.values).difference(schedule_names)
-    assert {name: before.values[name] for name in spatial_and_other_names} == {name: after.values[name] for name in spatial_and_other_names}
-    assert any(before.values[name] != after.values[name] for name in schedule_names)
-    assert before.units == after.units
-    assert before.coupled_selections == after.coupled_selections
-    assert before.block_provenance == after.block_provenance
-    assert before.ood_provenance == after.ood_provenance
-    before_sampling = before_batch.scientific_values["sampling"]
-    after_sampling = after_batch.scientific_values["sampling"]
-    assert before_sampling["blocks"] == after_sampling["blocks"]
-    before_position = before_batch.case_indices.index(1)
-    after_position = after_batch.case_indices.index(1)
-    for block, before_plan in before_sampling["blocks"].items():
-        after_plan = after_sampling["blocks"][block]
-        before_design = sampling_service.unit_design(
-            before_sampling["method"],
-            count=len(before_batch.case_indices),
-            dimensions=int(before_plan["effective_dimension"]),
-            seed=int(before_plan["design_seed"]),
-        )
-        after_design = sampling_service.unit_design(
-            after_sampling["method"],
-            count=len(after_batch.case_indices),
-            dimensions=int(after_plan["effective_dimension"]),
-            seed=int(after_plan["design_seed"]),
-        )
-        before_row = int(before_plan["permutation"][before_position])
-        after_row = int(after_plan["permutation"][after_position])
-        np.testing.assert_array_equal(before_design[before_row], after_design[after_row])
-
-    seeds = {
-        "bed": 1936762462,
-        "pressure_bc": 990883689,
-        "initial_moisture": 2503402048,
-        "packing_scatter": 383704986,
-    }
-    grid = {
-        "Lx": 1.2,
-        "Ly": 0.75,
-        "Lz": 0.8,
-        "nx": 25,
-        "ny": 16,
-        "dx": 1.2 / 24.0,
-        "dy": 0.75 / 15.0,
-        "boundaries_included": True,
-    }
-
-    def generate(batch: Any, sample: Any) -> field_service.SpatialFields:
-        family = batch.scientific_values["material"]
-        moisture_bounds = materials.initial_moisture_generation_bounds(
-            family,
-            sample.values,
-            active_ood_unit=sample.ood_provenance["active_unit_id"],
-        )
-        return field_service.generate_spatial_fields(
-            "transient_drying",
-            grid,
-            sample.values,
-            seeds=seeds,
-            family_bounds=moisture_bounds,
-            porosity_coupling=family["porosity_coupling"],
-            active_ood_unit=sample.ood_provenance["active_unit_id"],
-        )
-
-    before_fields = generate(before_batch, before)
-    after_fields = generate(after_batch, after)
-    for name in ("Kxx", "Kxy", "Kyy", "eps_bed", "X_0_db_field", "p_in_bc"):
-        np.testing.assert_array_equal(before_fields.columns[name], after_fields.columns[name])

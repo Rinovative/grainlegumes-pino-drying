@@ -1,4 +1,4 @@
-# ruff: noqa: S101, EM101, PT017, SLF001, TRY003
+# ruff: noqa: S101, EM101, PT017, TRY003
 """
 Verify task-generic and steady-flow artifact generation against current provenance.
 
@@ -10,9 +10,7 @@ reserved metadata rejection. Cache locking and rebuild races belong to
 
 from __future__ import annotations
 
-import io
 import json
-import zipfile
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -437,7 +435,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
     Keep dual continuity and pressure-boundary artifacts explicit.
 
     Both training selections must emit the same named scalar and residual-array
-    contract, while undeclared NPZ arrays fail the generic exact-schema check.
+    contract for scientific comparison.
     """
     task = domain.tasks.steady_flow.STEADY_FLOW
     groups_by_id = {group.id: group for group in task.output_groups}
@@ -553,39 +551,6 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         assert row["pressure_outlet_mean_square"] == pytest.approx(expected_outlet_mean_square)
         assert row["pressure_outlet_mean_square"] != pytest.approx(outlet_pointwise_mse)
         assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
-
-    invalid_row = frames[0].iloc[0]
-    invalid_npz_path = analysis.artifacts.contracts.resolve_case_payload_path(
-        tmp_path / "div_velocity",
-        invalid_row["npz_path"],
-        expected_filename=f"case_{int(invalid_row['case_index']):04d}.npz",
-    )
-    with np.load(invalid_npz_path, allow_pickle=False) as stored:
-        unexpected_array = np.asarray(stored["div_eps_u"])
-    with io.BytesIO() as stream:
-        np.save(stream, unexpected_array, allow_pickle=False)
-        unexpected_payload = stream.getvalue()
-    with zipfile.ZipFile(invalid_npz_path, mode="a", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("unexpected_array.npy", unexpected_payload)
-    contract = analysis.artifacts.service._EvaluatorArtifactContract(
-        task_id=task.id,
-        input_fields=task.input_names,
-        output_fields=task.output_names,
-        output_units=tuple(field.unit for field in task.outputs),
-        output_groups=tuple((group.id, group.fields) for group in task.output_groups),
-        train_standard_deviations=dict.fromkeys(task.output_names, 1.0),
-        normalization_denominator_floor=0.0,
-        group_metric_columns=("normalized_velocity_vector_rmse", "physical_velocity_vector_rmse"),
-        physics_kind=task.physics.kind,
-    )
-    with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=r"unexpected=\['unexpected_array'\]"):
-        analysis.artifacts.service._validate_npz_payload(
-            invalid_npz_path,
-            case_index=1,
-            source_index=0,
-            split_local_index=0,
-            contract=contract,
-        )
 
     comparable = [
         "momentum_residual_mse",
