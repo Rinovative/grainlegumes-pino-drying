@@ -1418,9 +1418,99 @@ def test_schedule_plot_draws_wide_markerless_cases_and_common_mean_once(
         assert first.schedule is not None
         np.testing.assert_array_equal(
             first_axis.lines[0].get_xdata(),
-            first.schedule[:, 0],
+            generation_inputs.diagnostics.operating_schedule_rows(first)[:, 0],
         )
         startup_axis = figure.axes[1]
-        assert np.max(startup_axis.lines[0].get_xdata()) <= 1.0
+        np.testing.assert_array_equal(
+            startup_axis.lines[0].get_xdata(),
+            generation_inputs.diagnostics.startup_schedule_minutes(first)[:, 0],
+        )
     finally:
         plt.close(figure)
+
+
+def test_temperature_display_and_schedule_windows_preserve_source_evidence(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+) -> None:
+    """Display absolute temperatures in Celsius without altering persisted evidence."""
+    first, second = profile_records["transient_drying"]
+    assert first.startup is not None
+    summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
+    values = np.asarray((273.15, 293.15))
+    original_values = np.array(values, copy=True)
+    assert generation_inputs.diagnostics.display_unit("T_in_base", "K") == "°C"
+    assert generation_inputs.diagnostics.display_unit("T_in_amp", "K") == "K"
+    np.testing.assert_allclose(
+        generation_inputs.diagnostics.display_value("T_in_base", values, "K"),
+        (0.0, 20.0),
+    )
+    np.testing.assert_array_equal(values, original_values)
+
+    source_schedule = np.array(first.schedule, copy=True)
+    startup_rows = generation_inputs.diagnostics.startup_schedule_rows(first)
+    operating_rows = generation_inputs.diagnostics.operating_schedule_rows(first)
+    startup_minutes = generation_inputs.diagnostics.startup_schedule_minutes(first)
+    duration_h = generation_inputs.diagnostics.transient_evidence(first)[3].duration_h
+    assert startup_rows.flags.writeable is False
+    assert operating_rows.flags.writeable is False
+    assert startup_minutes.flags.writeable is False
+    assert np.all((startup_rows[:, 0] >= 0.0) & (startup_rows[:, 0] <= duration_h))
+    assert np.all(operating_rows[:, 0] >= duration_h)
+    assert operating_rows[0, 0] == duration_h
+    np.testing.assert_array_equal(first.startup.support_times_h, startup_rows[:, 0])
+    np.testing.assert_allclose(startup_minutes[:, 0], 60.0 * startup_rows[:, 0])
+    np.testing.assert_array_equal(first.schedule, source_schedule)
+
+    parameters = generation_inputs.diagnostics.parameter_comparison_table(
+        first,
+        summary,
+        second,
+        summary,
+    )
+    boundaries = generation_inputs.diagnostics.boundary_comparison_table(
+        first,
+        summary,
+        second,
+        summary,
+    )
+    baseline = parameters.loc[("Drying", "Inlet schedule", "Temperature baseline [°C]"), "Case A"]
+    amplitude = parameters.loc[("Drying", "Inlet schedule", "Temperature amplitude [K]"), "Case A"]
+    startup_temperature = boundaries.loc[("Drying", "Inlet temperature", "Start [°C]"), "Case A"]
+    startup_delta = boundaries.loc[("Drying", "Inlet temperature", "Startup change [K]"), "Case A"]
+    assert baseline == pytest.approx(first.case.payload["sampled_values"]["T_in_base"] - 273.15)
+    assert amplitude == first.case.payload["sampled_values"]["T_in_amp"]
+    assert startup_temperature == pytest.approx(first.startup.variables["T_in_bc"].start - 273.15)
+    assert startup_delta == first.startup.variables["T_in_bc"].delta
+
+
+def test_schedule_plot_rejects_mismatched_startup_durations(
+    profile_records: dict[
+        str,
+        tuple[
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+            generation_inputs.diagnostics.GenerationInputDiagnostics,
+        ],
+    ],
+) -> None:
+    """Reject comparisons whose persisted startup semantics disagree."""
+    first, second = profile_records["transient_drying"]
+    assert second.startup is not None
+    summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
+    changed_second = replace(
+        second,
+        startup=replace(second.startup, duration_h=second.startup.duration_h + 0.1),
+    )
+    with pytest.raises(ValueError, match="different persisted startup durations"):
+        generation_inputs.plots.boundaries.schedule_comparison(
+            first,
+            summary,
+            changed_second,
+            summary,
+            same_dataset=True,
+        )

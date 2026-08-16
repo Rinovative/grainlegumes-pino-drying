@@ -153,16 +153,18 @@ parameter_values:
       - ba
   T_in_amp:
     lower: 0.0
-    upper: 4.0
+    upper: 8.0
     ood:
-    - lower: 5.5
-      upper: 8.0
+    - lower: 9.25
+      upper: 10.0
+      hard_boundary: true
     nominal: 2.5
     distribution: uniform_in_registry_transform_space
     provenance:
       evidence: synthetic_design
       source_refs:
       - ba
+      note: Exact symmetric maximum deviation widened to create a random lower-temperature tail; complete infeasible schedules are rejected without clipping.
   omega_in_base:
     lower: 0.0045
     upper: 0.0115

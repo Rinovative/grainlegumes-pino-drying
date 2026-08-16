@@ -141,6 +141,12 @@ def _synthetic_scientific_contract() -> dict[str, Any]:
             "T_flow_ref": 300.65,
             "p_ref": 101325.0,
             "p_out": 0.0,
+            "T_in_min": 290.15,
+            "T_in_max": 313.15,
+            "omega_min": 0.0025,
+            "omega_max": 0.0145,
+            "phi_operational_min": 0.05,
+            "phi_operational_max": 0.85,
             "f_wet_dm_max": 0.05,
         },
     }
@@ -232,7 +238,21 @@ def _write_transient_case(
     boundary_schedule = schedule_service.build_comsol_boundary_schedule(
         schedule_service.Schedule(
             values=schedule,
-            metadata={"conversion_pressure": conversion_pressure},
+            metadata={
+                "conversion_pressure": conversion_pressure,
+                "temperature_operational_bounds": [
+                    float(scientific["scientific_fixed_values"]["T_in_min"]),
+                    float(scientific["scientific_fixed_values"]["T_in_max"]),
+                ],
+                "humidity_ratio_operational_bounds": [
+                    float(scientific["scientific_fixed_values"]["omega_min"]),
+                    float(scientific["scientific_fixed_values"]["omega_max"]),
+                ],
+                "relative_humidity_operational_bounds": [
+                    float(scientific["scientific_fixed_values"]["phi_operational_min"]),
+                    float(scientific["scientific_fixed_values"]["phi_operational_max"]),
+                ],
+            },
         ),
         scientific["boundary_schedule"]["startup_ramp"],
         initial_temperature=scalar_values["T_amb"],

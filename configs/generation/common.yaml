@@ -24,12 +24,13 @@ scientific_fixed_values:
       source_refs:
       - transient_comsol_model_report
   T_in_min:
-    value: 298.15
+    value: 290.15
     unit: K
     provenance:
       evidence: synthetic_design
       source_refs:
       - ba
+      note: Static inlet and handoff floor selected to admit stochastic lower-heating intervals while retaining heater-only and psychrometric rejection.
   T_in_max:
     value: 313.15
     unit: K

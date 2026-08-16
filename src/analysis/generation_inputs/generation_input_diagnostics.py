@@ -7,7 +7,7 @@ Responsibilities:
   - Preserve exact sampled, scalar, schedule, spatial, and provenance evidence
   - Derive shared permeability and transient moisture diagnostics canonically
   - Reconstruct transient schedule supports without interpolation or resampling
-  - Provide compact A/B comparison and empirical dataset summary tables
+  - Provide Celsius-aware A/B comparisons and empirical dataset summaries
 Design principles:
   - Generation, profile, and domain owners define every scientific semantic
   - Steady and transient inputs share one model with explicit optional content
@@ -89,6 +89,17 @@ STAT_NAMES: Final = ("min", "q05", "median", "mean", "q95", "max", "std")
 COMPARISON_COLUMNS: Final = ("Case A", "Mean A", "Case B", "Mean B")
 _SCHEDULE_NAMES: Final = profiles.SCHEDULE_FIELDS[1:]
 _SCHEDULE_UNITS: Final = profiles.SCHEDULE_UNITS[1:]
+_ABSOLUTE_TEMPERATURE_DISPLAY_NAMES: Final = frozenset(
+    (
+        "T_amb",
+        "T_flow_ref",
+        "T_in_base",
+        "T_init",
+        "T_in_bc",
+        "T_in_bc start",
+        "T_in_bc startup end",
+    )
+)
 _MINIMUM_SCHEDULE_NODES: Final = 2
 _SPATIAL_DIMENSIONS: Final = 2
 if set(FIELD_UNITS) != set(FIELD_LABELS):
@@ -141,7 +152,7 @@ class StartupDiagnostics:
     t_start_h, t_end_h : float
         Exact schedule support bounding the startup interval in hours.
     support_times_h : numpy.ndarray
-        Read-only final COMSOL schedule support through one hour.
+        Read-only final COMSOL schedule support through the persisted duration.
     variables : Mapping[str, StartupVariableDiagnostics]
         Exact endpoint diagnostics for every maintained boundary channel.
     phi_expected_start, phi_expected_end : float
@@ -439,7 +450,7 @@ def _startup_diagnostics(
         np.asarray((variables["T_in_bc"].start, variables["T_in_bc"].end)),
         pressure=pressure,
     )
-    support = _immutable(schedule[schedule[:, 0] <= 1.0, 0])
+    support = _immutable(schedule[schedule[:, 0] <= duration_h, 0])
     return StartupDiagnostics(
         enabled=enabled,
         duration_h=duration_h,
@@ -582,6 +593,37 @@ def transient_evidence(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, StartupDiagnostics]:
     """Return complete exact transient evidence through the public contract."""
     return _require_transient(record)
+
+
+def schedule_window_rows(
+    schedule: np.ndarray,
+    duration_h: float,
+    *,
+    startup_only: bool,
+) -> np.ndarray:
+    """Return immutable exact persisted rows for one semantic schedule window."""
+    times_h = schedule[:, 0]
+    mask = (times_h >= 0.0) & (times_h <= duration_h) if startup_only else times_h >= duration_h
+    return _immutable(np.array(schedule[mask], copy=True))
+
+
+def startup_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
+    """Return exact final-schedule rows from startup start through rejoin."""
+    schedule, _canonical, _output, startup = _require_transient(record)
+    return schedule_window_rows(schedule, startup.duration_h, startup_only=True)
+
+
+def operating_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
+    """Return exact final-schedule rows from startup rejoin through operation."""
+    schedule, _canonical, _output, startup = _require_transient(record)
+    return schedule_window_rows(schedule, startup.duration_h, startup_only=False)
+
+
+def startup_schedule_minutes(record: GenerationInputDiagnostics) -> np.ndarray:
+    """Return startup rows with only their time coordinate converted to minutes."""
+    rows = np.array(startup_schedule_rows(record), copy=True)
+    rows[:, 0] *= 60.0
+    return _immutable(rows)
 
 
 def field_statistics(record: GenerationInputDiagnostics) -> pd.DataFrame:
@@ -774,8 +816,20 @@ def build_dataset_diagnostics(
     )
 
 
+def display_unit(name: str, unit: str) -> str:
+    """Return the EDA display unit without changing persisted physical units."""
+    return "°C" if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES and unit == "K" else unit
+
+
+def display_value(name: str, value: Any, unit: str) -> Any:
+    """Return one EDA display value without mutating persisted source evidence."""
+    if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES and unit == "K":
+        return value - 273.15
+    return value
+
+
 def _unit_label(name: str, unit: str) -> str:
-    """Return one canonical row label with its unit included exactly once."""
+    """Return one canonical row label with its EDA display unit included once."""
     return f"{name} [{unit}]" if unit else name
 
 
@@ -876,9 +930,9 @@ def _parameter_mean(dataset: DatasetDiagnostics, name: str) -> float | str:
 
 
 def _parameter_row_index(name: str, unit: str) -> tuple[str, str, str]:
-    """Return one grouped and unit-bearing parameter index."""
+    """Return one grouped and EDA-display-unit-bearing parameter index."""
     spec = table_schema.parameter_row_spec(name)
-    return spec.section, spec.category, _unit_label(spec.label, unit)
+    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit))
 
 
 def _field_row_index(
@@ -895,9 +949,9 @@ def _field_row_index(
 
 
 def _boundary_row_index(name: str, unit: str) -> tuple[str, str, str]:
-    """Return one grouped and unit-bearing boundary-summary index."""
+    """Return one grouped and EDA-display-unit-bearing boundary-summary index."""
     spec = table_schema.boundary_row_spec(name)
-    return spec.section, spec.category, _unit_label(spec.label, unit)
+    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit))
 
 
 def case_context_table(
@@ -998,10 +1052,10 @@ def parameter_comparison_table(
         rows.append(
             (
                 _parameter_row_index(name, unit),
-                _parameter_value(first_values, name),
-                _parameter_mean(mean_a, name),
-                _parameter_value(second_values, name),
-                _parameter_mean(mean_b, name),
+                display_value(name, _parameter_value(first_values, name), unit),
+                display_value(name, _parameter_mean(mean_a, name), unit),
+                display_value(name, _parameter_value(second_values, name), unit),
+                display_value(name, _parameter_mean(mean_b, name), unit),
             )
         )
     frame = _comparison_frame(rows, index_name="Parameter")
@@ -1099,10 +1153,10 @@ def boundary_comparison_table(
     rows = [
         (
             _boundary_row_index(name, units[name]),
-            first_values[name],
-            mean_a.boundary_means[name],
-            second_values[name],
-            mean_b.boundary_means[name],
+            display_value(name, first_values[name], units[name]),
+            display_value(name, mean_a.boundary_means[name], units[name]),
+            display_value(name, second_values[name], units[name]),
+            display_value(name, mean_b.boundary_means[name], units[name]),
         )
         for name in first_values
     ]
@@ -1129,7 +1183,17 @@ def dataset_parameter_table(dataset: DatasetDiagnostics) -> pd.DataFrame:
         names=("Section", "Category", "Parameter"),
     )
     columns = tuple(f"Case {record.case.case_index}" for record in dataset.records)
-    values = tuple(tuple(_parameter_value(record.case.payload["sampled_values"], name) for record in dataset.records) for name in names)
+    values = tuple(
+        tuple(
+            display_value(
+                name,
+                _parameter_value(record.case.payload["sampled_values"], name),
+                dataset.parameter_units[_parameter_root(name)],
+            )
+            for record in dataset.records
+        )
+        for name in names
+    )
     return pd.DataFrame(values, index=index, columns=columns)
 
 

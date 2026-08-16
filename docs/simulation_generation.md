@@ -292,15 +292,34 @@ and CPU source are retained. A failed smoke never publishes Production
 evidence; inspect its retained case and export diagnostics rather than deleting
 or recreating evidence manually.
 
-Transient boundary input also separates the canonical hourly stochastic
-schedule from the final COMSOL interpolation table. The fixed-bed
+Transient boundary input separates the canonical hourly stochastic schedule
+from the final COMSOL interpolation table. The fixed-bed
 `boundary_schedule.startup_ramp` policy adds only the configured startup support
 node (10 minutes by default); it does not change `common.time.interval`, COMSOL
-output times, HDF5 state times, or Dataset transitions. The transformed
-`schedule.csv` is built before its case-input hash, and HDF5 retains it as source
-boundary evidence. Dataset state and target indices remain exactly regular; the
-optional startup support is attached to the first hourly transition as boundary
-conditioning rather than becoming another timestep.
+output times, HDF5 state times, or Dataset transitions. The startup node
+preserves canonical humidity ratio and raises `T_init` to the greater of the
+static inlet-temperature floor and the temperature required by
+`phi_operational_max`. It uses no bed-state or solver feedback. Every handoff
+support point is revalidated against the operational temperature,
+humidity-ratio, and RH envelopes, and the retained regular nodes remain exact.
+
+The transformed `schedule.csv` is built before its case-input hash, and HDF5
+retains it as source boundary evidence. Dataset state and target indices remain
+exactly regular; startup support is attached to the first hourly transition as
+boundary conditioning rather than becoming another timestep. Because the
+temperature support and cold-start handoff contract changed, existing transient
+input cases must be regenerated before execution with this revision. Ordinary
+admission does not rewrite them, and steady-flow inputs are unaffected.
+
+Validate configuration first, then use the exact Technical Runtime Smoke
+`generate-input-cases` workflow in
+[Canonical input-case generation and EDA](#canonical-input-case-generation-and-eda)
+before any native execution.
+
+Then inspect Generation-input EDA: absolute temperatures are displayed in
+degrees Celsius, while amplitudes, changes, and rates remain in K or K/h. The
+operating schedule column begins at the persisted startup end in hours; the
+startup-only column ends there and displays time in minutes.
 
 Transient admission uses distinct numerical contracts for initial-state
 consistency, bulk-moisture consistency, and float32 storage fidelity. Their

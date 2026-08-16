@@ -161,16 +161,23 @@ Schedule variability combines:
 - a horizon-scale trend;
 - deliberate correlation between temperature and humidity-ratio signals.
 
-The configured bases are temporal means and the amplitudes are maximum absolute
-deviations. Natural and parameter-OOD regimes retain the same process family.
-Exact supports and temporal-resolution checks are resolved from the operation
-and time configuration rather than duplicated here.
+The configured bases are exact temporal means and the amplitudes are exact
+maximum absolute deviations. The symmetric temperature-amplitude contract is
+retained: it does not prescribe equal positive and negative extrema, and it does
+not insert a deterministic low-temperature phase. The current natural
+`T_in_amp` support is `0-8 K`; its hard-boundary parameter-OOD tail is
+`9.25-10 K`. Together with the natural `T_in_base` support
+`303.15-309.15 K`, the authored natural support can reach about `295.15 K`
+before whole-schedule feasibility is applied. The canonical inlet-temperature
+envelope is `290.15-313.15 K`. Ambient temperature, the stochastic shape,
+humidity, and the static heater and psychrometric envelopes determine which
+complete candidates are accepted, so not every case realizes a low interval.
 
 A generated schedule must satisfy temperature, humidity-ratio, inlet-relative-
 humidity, source-air saturation, and heater-only constraints. An infeasible
-candidate is rejected as a whole rather than repaired by pointwise clipping.
-Schedule supports and composition are synthetic design assumptions, not
-literature measurements.
+candidate is rejected and deterministically resampled as a whole rather than
+repaired by pointwise clipping. Schedule supports and composition are synthetic
+design assumptions, not literature measurements or active control.
 
 The accepted stochastic schedule remains canonical on `common.time.regular_times`
 (`0 h, 1 h, ..., 168 h` for the current configuration). The fixed-bed operation
@@ -178,19 +185,37 @@ then applies a separate COMSOL handoff policy from
 `boundary_schedule.startup_ramp`: `enabled` selects the transformation and
 `duration_h` must lie strictly between zero and the regular interval. With the
 default `duration_h: 0.16666666666666666`, the final interpolation table begins
-at `0 h, 1/6 h, 1 h, ...`. At zero, `T_in_bc` uses the established
-`T_init = T_amb` source, `omega_in_bc` retains the canonical incoming-air
-composition, and `phi_in_bc` is recomputed by the central psychrometric
-conversion. The rejoin row is the original COMSOL-linear interpolation at
-`1/6 h`; all passed schedule functions are therefore identical to the original
-continuous schedule from that point onward.
+at `0 h, 1/6 h, 1 h, ...`.
+
+At zero, `omega_in_bc` remains exactly the canonical incoming-air humidity
+ratio. The schedule psychrometric owner solves the maintained Magnus conversion
+for the minimum temperature satisfying `phi_in_bc <= phi_operational_max`, then
+uses `T_start = max(T_init, T_in_min, T_required)`. This is a static configuration
+constraint: it uses no bed state, solver value, or runtime feedback. Generation
+fails closed when the humidity ratio is invalid, the configured maximum
+temperature cannot satisfy the RH limit, or the safe start is above the required
+heating-ramp rejoin state. Startup metadata records `T_init`, canonical
+`omega_in_bc(0)`, the RH limit, `T_required`, final `T_start`, whether preheating
+was required, startup RH, and the rejoin row.
+
+The rejoin temperature and humidity ratio are the original canonical linear
+interpolation at the configured startup duration; rejoin relative humidity is
+recomputed thermodynamically from those two values. Every physical handoff node
+must lie inside the persisted operational temperature, humidity-ratio, and RH
+envelopes, and every retained regular node remains unchanged.
 
 The extra row is boundary interpolation support, not a regular output state.
 COMSOL output, HDF5 state time, and Dataset transitions continue to use only
 `common.time.regular_times`. The final `schedule.csv` bytes are hashed before
 execution and are persisted with handoff version, policy, source, humidity, and
-rejoin provenance. Disabling the ramp retains the previous canonical table
-values and times exactly.
+rejoin provenance. Disabling the ramp retains the canonical table values and
+times exactly.
+
+Generation-input EDA converts absolute temperatures to degrees Celsius only at
+the presentation boundary. `T_amb`, `T_in_base`, `T_init`, and plotted or
+tabulated `T_in_bc` use `T_C = T_K - 273.15`; amplitudes, changes, differences,
+and rates remain in K or K/h. Persisted configuration, CSV, HDF5, COMSOL, hash,
+and identity values remain in kelvin.
 
 ### Moisture, heat, and equilibrium coupling
 
@@ -286,13 +311,16 @@ rejects stale or structurally incompatible artifacts. The maintained
 defines semantic, implementation, execution, and provenance dependencies without
 duplicating them here.
 
-The active Generation YAML, case, canonical HDF5, and transient-transition
-index schema contracts are version 1. The persisted boundary table carries
-startup-handoff support, and the first regular transition indexes that support
-explicitly. The schedule generator is a separately persisted algorithm contract
-at version 2; the COMSOL boundary handoff algorithm is version 1. These are distinct version domains:
-schema versions describe persisted structure, while algorithm versions describe how
-scientific values are constructed.
+The active Generation YAML, case, canonical HDF5, transient-transition,
+schedule-generator, and COMSOL boundary-handoff version values are all `1`.
+These remain distinct contract domains even though their numeric values match:
+schema versions describe persisted structure, while algorithm values describe
+how scientific values are constructed. The resolved temperature supports,
+startup metadata structure, and exact input hashes also participate in current
+transient identity. Transient input cases created under the previous schedule
+or cold-start handoff contract must therefore be regenerated before execution;
+ordinary reads never rewrite them. Steady-flow case identity excludes transient
+schedule and handoff dependencies.
 
 ## Source attribution
 
