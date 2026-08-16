@@ -25,7 +25,10 @@ An empty source list is valid for an explicit project or synthetic decision.
 Material OOD supports have separate OOD provenance, so literature support for a
 natural value is never presented as evidence for a synthetic stress interval.
 Technical Smoke and Pilot validate software and data flow; they do not upgrade
-scientific evidence.
+scientific evidence. Campaign purpose is explicit scientific provenance in every
+resolved batch. It contributes to the scientific digest and therefore to
+`batch_id`; the human-readable `batch_storage_name` additionally spells out that
+purpose without replacing or weakening the scientific identity.
 
 ## Authoritative owners
 
@@ -134,6 +137,9 @@ support; `validate-config` shows both authored and resolved intervals.
 Permeability-OOD tails are mapped through the same relation to consistent
 porosity-OOD regions.
 
+The input EDA reports exact principal permeabilities and their anisotropy ratio.
+It uses Generation's positive-definiteness check and does not alter the tensor.
+
 A small bounded case-level packing scatter represents unresolved morphology.
 It is a synthetic modelling assumption, not an experimentally calibrated
 parameter or an independent model input. Local porosity heterogeneity remains a
@@ -206,11 +212,25 @@ X_eq_db = 0.01 [A_osw + B_osw (T - 273.15 K)]
 w_eq = rho_bu_dry X_eq_db
 ```
 
-Dry bulk density follows the realized packing state:
+The input EDA derives the local initial equilibrium relative humidity by the
+exact algebraic inverse of that same relation:
+
+```text
+R_0 = [100 X_0_db_field /
+       (A_osw + B_osw (T_init - 273.15 K))]^(1/C_osw)
+phi_eq_0 = R_0 / (1 + R_0)
+```
+
+This diagnostic interprets the generated initial-moisture field at
+`T_init = T_amb`; it is neither a generated field nor an inlet boundary, and it
+does not apply the forward solver's numerical humidity clip.
+
+Dry bulk density and initial granular water follow the realized packing state:
 
 ```text
 rho_bu_dry =
   rho_bu_dry_ref (1 - eps_bed) / (1 - eps_bed_cal_ref)
+w_gr_0 = rho_bu_dry X_0_db_field
 ```
 
 Material heat capacity and conductivity provide effective storage and transport,

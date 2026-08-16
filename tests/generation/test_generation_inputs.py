@@ -552,7 +552,7 @@ def test_schedule_csv_is_the_identity_bound_comsol_handoff(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "startup_case")
-    schedule_path = bundle.directory / "schedule.csv"
+    schedule_path = bundle.directory / "inputs" / "schedule.csv"
     schedule = np.loadtxt(schedule_path, delimiter=";", skiprows=1)
     duration_h = config.scientific_values["boundary_schedule"]["startup_ramp"]["duration_h"]
 
@@ -587,7 +587,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case")
-    scalar_path = bundle.directory / "scalars.csv"
+    scalar_path = bundle.directory / "inputs" / "scalars.csv"
     content = scalar_path.read_text(encoding="utf-8")
     assert bundle.scalar_handoff is not None
     assert bundle.scalar_handoff.field_names == generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
@@ -612,7 +612,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
     with pytest.raises(ValueError, match="missing, duplicate, unknown"):
         generation.contracts.scalar_handoff.admit_case_scalar_handoff(
             payload,
-            bundle.directory,
+            bundle.directory / "inputs",
         )
 
 

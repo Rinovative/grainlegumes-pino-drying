@@ -385,7 +385,7 @@ def _case_evidence(
     publication = runtime_service.validate_completed_case(config, case_index, storage_root=storage)
     raw = runtime_service.raw_case_directory(config, case_index, storage_root=storage)
     processed = runtime_service.processed_case_directory(config, case_index, storage_root=storage)
-    case_payload = _json_object(processed / "case.json", label="smoke case provenance")
+    case_payload = _json_object(raw / "case.json", label="smoke canonical raw case")
     timing = _json_object(processed / "timing.json", label="smoke case timing")
     execution = _json_object(processed / "execution_provenance.json", label="smoke execution provenance")
     status = _json_object(processed / "status.json", label="smoke solver status")
@@ -409,13 +409,13 @@ def _case_evidence(
         hdf5_path,
         profile_id=config.profile.id,
     )
-    input_records = _input_inventory(raw / "raw_csv" / "inputs", case_payload)
+    input_records = _input_inventory(raw / "inputs", case_payload)
     expected_inputs = {"fields.csv"} if config.profile.id == profiles.STEADY_FLOW_PROFILE else {"fields.csv", "scalars.csv", "schedule.csv"}
     if {record["filename"] for record in input_records} != expected_inputs:
         message = f"Smoke input adapter membership is invalid for profile {config.profile.id!r}."
         raise ValueError(message)
     export_records = _export_inventory(
-        raw / "raw_csv" / "exports",
+        processed / "comsol_exports",
         exports,
         config.scientific_values["output_contract"],
     )

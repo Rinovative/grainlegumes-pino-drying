@@ -101,7 +101,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
     generation.runtime.finalize_batch(batch, storage_root=storage)
     generation.runtime.validate_terminal_batch(batch, storage_root=storage)
     bounded = datasets.packages.generated_batch.load_generated_batch(
-        batch.batch_id,
+        batch.batch_storage_name,
         storage_root=storage,
         max_cases=1,
     )

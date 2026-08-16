@@ -101,7 +101,7 @@ def _load_candidates(
     candidates: list[dict[str, Any]] = []
     for batch in _source_batches(campaign, plan):
         terminal = generation.runtime.admit_terminal_batch(
-            batch.batch_id,
+            batch.batch_storage_name,
             storage_root=storage,
         )
         manifest = terminal.manifest_payload()

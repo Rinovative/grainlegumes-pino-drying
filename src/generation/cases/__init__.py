@@ -5,6 +5,8 @@ Provides:
 - case: scientific case identities and input-bundle construction
 - config: resolved campaign and batch configuration
 - fields: deterministic spatial field generation
+- input_generation: canonical batch-oriented input-only generation
+- admission: fail-closed raw-input admission for inspection
 - sampling: case-level parameter sampling and OOD allocation
 - schedule: deterministic transient boundary schedules
 - seeding: stable seed derivation
@@ -16,9 +18,11 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from . import generation_cases_admission as admission
     from . import generation_cases_case as case
     from . import generation_cases_config as config
     from . import generation_cases_fields as fields
+    from . import generation_cases_input as input_generation
     from . import generation_cases_sampling as sampling
     from . import generation_cases_schedule as schedule
     from . import generation_cases_seeding as seeding
@@ -27,11 +31,22 @@ _MODULES = {
     "case": "generation_cases_case",
     "config": "generation_cases_config",
     "fields": "generation_cases_fields",
+    "input_generation": "generation_cases_input",
+    "admission": "generation_cases_admission",
     "sampling": "generation_cases_sampling",
     "schedule": "generation_cases_schedule",
     "seeding": "generation_cases_seeding",
 }
-__all__ = ["case", "config", "fields", "sampling", "schedule", "seeding"]
+__all__ = [
+    "admission",
+    "case",
+    "config",
+    "fields",
+    "input_generation",
+    "sampling",
+    "schedule",
+    "seeding",
+]
 
 
 def __getattr__(name: str) -> object:

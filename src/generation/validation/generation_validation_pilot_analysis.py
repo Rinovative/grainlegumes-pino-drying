@@ -324,6 +324,30 @@ def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float)
     return float(ordered_values[index])
 
 
+def _oswin_diagnostic_values(
+    relative_humidity: np.ndarray,
+    temperature: np.ndarray,
+    *,
+    a_osw: float,
+    b_osw: float,
+    c_osw: float,
+) -> np.ndarray:
+    """Evaluate valid pilot states while preserving invalid-state reporting."""
+    effective_humidity = np.clip(relative_humidity, 1.0e-6, 0.999)
+    result = np.full(relative_humidity.shape, np.nan, dtype=np.float64)
+    factor = a_osw + b_osw * (temperature - 273.15)
+    valid = np.isfinite(effective_humidity) & np.isfinite(temperature) & (temperature > 0.0) & np.isfinite(factor) & (factor > 0.0)
+    if np.any(valid):
+        result[valid] = domain.moisture.oswin_equilibrium_dry_basis_moisture(
+            effective_humidity[valid],
+            temperature[valid],
+            a_osw=a_osw,
+            b_osw=b_osw,
+            c_osw=c_osw,
+        )
+    return result
+
+
 def field_and_physical_diagnostics(
     *,
     static: Mapping[str, Any],
@@ -435,9 +459,14 @@ def field_and_physical_diagnostics(
         _violation(problems, quantity="X_db", rule="X_db>=0", values=x_db, mask=x_db < 0.0)
         _violation(problems, quantity="X_wb", rule="finite", values=x_wb, mask=~np.isfinite(x_wb))
         _violation(problems, quantity="X_wb", rule="0<=X_wb<1", values=x_wb, mask=(x_wb < 0.0) | (x_wb >= 1.0))
-        phi_effective = np.clip(phi, 1.0e-6, 0.999)
+        x_eq_db = _oswin_diagnostic_values(
+            phi,
+            temperature,
+            a_osw=a_osw,
+            b_osw=b_osw,
+            c_osw=c_osw,
+        )
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            x_eq_db = 0.01 * (a_osw + b_osw * (temperature - 273.15)) * np.power(phi_effective / (1.0 - phi_effective), c_osw)
             w_eq = rho * x_eq_db
             local_evaporation = f_surf * r_surf * np.maximum(w_surf - w_eq, 0.0)
         local_finite = np.isfinite(local_evaporation)

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 _SMOKE_CASE_COUNT = 2
+_MINIMUM_FAMILY_CASE_COUNT = 3
 _TEST_MATERIAL_FAMILY = "lentil"
 _TEST_STEADY_SEED = 41001
 _TEST_TRANSIENT_SEED = 41002
@@ -170,6 +171,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         parameter_ood_count: int = 0,
         max_running_cases: int | None = None,
         grid_overrides: Mapping[str, int | float] | None = None,
+        campaign_purpose: str = "technical_runtime_smoke",
     ) -> tuple[Path, Path]:
         tests_root = project_root / "configs/generation/campaigns/test_support"
         campaign_number = len(list(tests_root.glob("campaign_*"))) if tests_root.exists() else 0
@@ -249,18 +251,26 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         if parameter_ood_count != 0:
             message = "Synthetic runtime fixtures do not support parameter OOD."
             raise ValueError(message)
+        if campaign_purpose not in {
+            "family_generalization",
+            "technical_runtime_smoke",
+        }:
+            message = "Synthetic runtime fixtures support family or technical campaigns."
+            raise ValueError(message)
+        if campaign_purpose == "family_generalization" and natural_count < _MINIMUM_FAMILY_CASE_COUNT:
+            message = "Synthetic family campaigns require three natural members."
+            raise ValueError(message)
         campaign_seed = _TEST_STEADY_SEED if simulation_profile == "steady_flow" else _TEST_TRANSIENT_SEED
         campaign = {
             "schema_kind": "generation_campaign",
             "schema_version": 1,
-            "campaign_purpose": "technical_runtime_smoke",
+            "campaign_purpose": campaign_purpose,
             "sources_config": "sources.yaml",
             "registry_config": "registry.yaml",
             "common_config": "common.yaml",
             "operations_config": "operations.yaml",
             "profile_config": "profile.yaml",
             "execution_config": "execution.yaml",
-            "paired_equivalence_seed": _TEST_PAIRED_SEED,
             "material_roles": {
                 "seen": [_TEST_MATERIAL_FAMILY],
                 "near_family_ood": [],
@@ -276,6 +286,17 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 {"evaluation_regime": "id", "source_role": "seen"},
             ],
         }
+        if campaign_purpose == "technical_runtime_smoke":
+            campaign["paired_equivalence_seed"] = _TEST_PAIRED_SEED
+        else:
+            campaign["membership"] = {
+                "seed": _TEST_PAIRED_SEED,
+                "per_seen_material": {
+                    "train": 1,
+                    "validation": 1,
+                    "id_test": 1,
+                },
+            }
         config_path = directory / "campaign.yaml"
         config_path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
         return config_path, template_path

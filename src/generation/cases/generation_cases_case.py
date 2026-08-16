@@ -402,20 +402,22 @@ def generate_case_input_bundle(
         )
 
     input_contract = config.scientific_values["input_contract"]
-    spatial_path = _write_spatial_file(bundle_dir, fields, input_contract["spatial"])
+    input_directory = bundle_dir / "inputs"
+    input_directory.mkdir()
+    spatial_path = _write_spatial_file(input_directory, fields, input_contract["spatial"])
     input_paths_list = [spatial_path]
     scalar_path: Path | None = None
     scalar_entries: tuple[scalar_handoff_contract.ScalarHandoffEntry, ...] | None = None
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         scalar_path, scalar_entries = _write_scalar_file(
-            bundle_dir,
+            input_directory,
             input_contract["scalar"],
             values,
             units,
         )
         input_paths_list.append(scalar_path)
     if boundary_schedule is not None:
-        input_paths_list.append(_write_schedule_file(bundle_dir, input_contract["schedule"], boundary_schedule))
+        input_paths_list.append(_write_schedule_file(input_directory, input_contract["schedule"], boundary_schedule))
     input_paths = tuple(sorted(input_paths_list, key=lambda item: item.name))
     input_files = {
         path.name: {
@@ -513,7 +515,7 @@ def generate_case_input_bundle(
         if scalar_path is None
         else scalar_handoff_contract.admit_case_scalar_handoff(
             case_payload,
-            bundle_dir,
+            input_directory,
         )
     )
     case_payload["case_input_id"] = compute_case_input_id(case_payload)

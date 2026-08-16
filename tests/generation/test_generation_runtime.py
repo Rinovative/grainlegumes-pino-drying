@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004
+# ruff: noqa: S101, PLR2004, SLF001
 """Canonical conversion, provenance separation, failure, and locking contracts."""
 
 from __future__ import annotations
@@ -23,6 +23,40 @@ from src.generation.runtime import generation_runtime_workspace as workspace
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def test_processed_publication_layout_rejects_extra_declared_artifact(
+    tmp_path: Path,
+) -> None:
+    """Keep arbitrary retained payloads outside canonical processed cases."""
+    directory = tmp_path / "processed-case"
+    exports = directory / "comsol_exports"
+    exports.mkdir(parents=True)
+    required = {
+        "case.h5",
+        "solver.log",
+        "timing.json",
+        "status.json",
+        "execution_provenance.json",
+    }
+    for name in {"_SUCCESS", "provenance.json", *required}:
+        (directory / name).write_text("evidence\n", encoding="utf-8")
+    (exports / "fields.csv").write_text("export\n", encoding="utf-8")
+    artifact_names = {*required, "comsol_exports/fields.csv"}
+
+    runtime_service._require_processed_publication_layout(
+        directory,
+        artifact_names=artifact_names,
+        required=required,
+    )
+    (directory / "unexpected.bin").write_bytes(b"unexpected")
+    artifact_names.add("unexpected.bin")
+    with pytest.raises(RuntimeError, match="top-level membership"):
+        runtime_service._require_processed_publication_layout(
+            directory,
+            artifact_names=artifact_names,
+            required=required,
+        )
 
 
 def _natural_batch_name(simulation_profile: str) -> str:
@@ -968,7 +1002,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
             case_index,
             storage_root=storage,
         )
-        / "raw_csv/inputs/fields.csv"
+        / "inputs/fields.csv"
         for case_index in (1, 2)
     ]
     assert all(path.is_file() for path in retained_inputs)

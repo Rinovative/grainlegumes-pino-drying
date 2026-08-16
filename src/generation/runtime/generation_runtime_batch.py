@@ -39,8 +39,10 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 from src import common
+from src.generation.cases import generation_cases_admission as admission_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_contract
+from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
@@ -56,6 +58,7 @@ from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
 PUBLICATION_SCHEMA_VERSION = 1
+BATCH_MANIFEST_SCHEMA_VERSION = 1
 _BATCH_MANIFEST_SCHEMA_KIND: Final = "simulation_batch_manifest"
 _BATCH_SUCCESS_SCHEMA_KIND: Final = "simulation_batch_success"
 _CASE_PUBLICATION_SCHEMA_KIND: Final = "simulation_case_publication"
@@ -72,7 +75,9 @@ _BATCH_MANIFEST_KEYS: Final = frozenset(
         "airflow_source",
         "batch_name",
         "batch_id",
+        "batch_storage_name",
         "batch_identity",
+        "campaign_purpose",
         "material_family",
         "sampling_regime",
         "git_commit",
@@ -482,7 +487,9 @@ class TerminalBatchEvidence:
     airflow_source: str
     batch_name: str
     batch_id: str
+    batch_storage_name: str
     batch_identity: str
+    campaign_purpose: str
     material_family: str
     sampling_regime: str
     git_commit: str
@@ -513,14 +520,16 @@ class TerminalBatchEvidence:
         """Return the exact terminal-manifest payload represented by this evidence."""
         return {
             "schema_kind": _BATCH_MANIFEST_SCHEMA_KIND,
-            "schema_version": PUBLICATION_SCHEMA_VERSION,
+            "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
             "status": "complete",
             "simulation_profile": self.simulation_profile,
             "available_learning_views": list(self.available_learning_views),
             "airflow_source": self.airflow_source,
             "batch_name": self.batch_name,
             "batch_id": self.batch_id,
+            "batch_storage_name": self.batch_storage_name,
             "batch_identity": self.batch_identity,
+            "campaign_purpose": self.campaign_purpose,
             "material_family": self.material_family,
             "sampling_regime": self.sampling_regime,
             "git_commit": self.git_commit,
@@ -554,7 +563,10 @@ def _utc_now() -> str:
 
 def _state_batch_root(config: config_contract.GenerationConfig, *, storage_root: Path | str | None) -> Path:
     """Return the private state root for one profile-qualified batch."""
-    return common.paths.get_generation_state_root(storage_root=storage_root) / config.profile.id / config.batch_id
+    return common.paths.resolve_generation_state_batch_directory(
+        config.batch_storage_name,
+        storage_root=storage_root,
+    )
 
 
 def case_lock_path(
@@ -564,7 +576,11 @@ def case_lock_path(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return one persistent case-level advisory-lock anchor."""
-    return _state_batch_root(config, storage_root=storage_root) / "locks" / f"{config.case_id(case_index)}.lock"
+    return common.paths.resolve_generation_case_lock_path(
+        config.batch_storage_name,
+        config.case_id(case_index),
+        storage_root=storage_root,
+    )
 
 
 def raw_case_directory(
@@ -574,7 +590,11 @@ def raw_case_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return one permanent case-input provenance directory."""
-    return common.paths.resolve_generated_batch_dir(config.batch_id, stage="raw", storage_root=storage_root) / config.case_id(case_index)
+    return common.paths.resolve_generation_raw_case_directory(
+        config.batch_storage_name,
+        config.case_id(case_index),
+        storage_root=storage_root,
+    )
 
 
 def processed_case_directory(
@@ -584,7 +604,11 @@ def processed_case_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return one permanent canonical completed-case directory."""
-    return common.paths.resolve_generated_batch_dir(config.batch_id, stage="processed", storage_root=storage_root) / config.case_id(case_index)
+    return common.paths.resolve_generation_processed_case_directory(
+        config.batch_storage_name,
+        config.case_id(case_index),
+        storage_root=storage_root,
+    )
 
 
 def batch_meta_directory(
@@ -593,7 +617,10 @@ def batch_meta_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return one batch-owned metadata directory."""
-    return common.paths.get_generation_meta_root(storage_root=storage_root) / config.batch_id
+    return common.paths.resolve_generation_input_metadata_directory(
+        config.batch_storage_name,
+        storage_root=storage_root,
+    )
 
 
 def _immutable_json(path: Path, payload: dict[str, Any], *, label: str) -> Path:
@@ -612,27 +639,16 @@ def initialize_batch_metadata(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Publish the immutable scientific config and separate execution provenance."""
+    """Initialize the batch metadata shared with canonical input generation."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
-    directory = batch_meta_directory(config, storage_root=storage)
-    directory.mkdir(parents=True, exist_ok=True)
-    scientific_path = _immutable_json(
-        directory / "resolved_generation_config.json",
-        config.scientific_values,
-        label="resolved scientific generation configuration",
+    scientific_path = input_service.initialize_batch_metadata(
+        config,
+        storage_root=storage,
     )
     persisted_scientific = json.loads(scientific_path.read_text(encoding="utf-8"))
     if config_contract.compute_scientific_config_digest(persisted_scientific) != config.scientific_config_digest:
-        msg = "Persisted resolved_generation_config.json digest disagrees with scientific identity."
-        raise RuntimeError(msg)
-    execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
-    execution_directory = directory / "execution_configs"
-    execution_directory.mkdir(exist_ok=True)
-    _immutable_json(
-        execution_directory / f"{execution_digest}.json",
-        config.execution_values,
-        label="resolved execution provenance",
-    )
+        message = "Persisted resolved_generation_config.json digest disagrees with scientific identity."
+        raise RuntimeError(message)
     return scientific_path
 
 
@@ -1296,36 +1312,17 @@ def _complete_stage(
     common.serialization.atomic_write_json(directory / "_SUCCESS", success)
 
 
-def _copy_retained_csv(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
-    """Copy input and raw-export CSV only under the explicit retention policy."""
-    if not config.execution_values["retention"]["retain_raw_csv"]:
-        return
-    adapter_root = destination / "raw_csv" / "inputs"
-    adapter_root.mkdir(parents=True)
-    for path in result.prepared.bundle.input_paths:
-        shutil.copy2(path, adapter_root / path.name)
-    export_root = destination / "raw_csv" / "exports"
+def _stage_processed_case(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
+    """Stage canonical post-COMSOL payload and direct solver exports."""
+    destination.mkdir(parents=True)
+    export_root = destination / "comsol_exports"
     for export in result.exports:
         target = export_root / export.relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(export.source_path, target)
         if common.serialization.file_sha256(target) != export.sha256:
-            msg = f"Retained raw export digest changed during copy: {target}"
+            msg = f"COMSOL export digest changed during publication: {target}"
             raise RuntimeError(msg)
-
-
-def _stage_raw_case(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
-    """Stage compact case-input provenance and optional adapter CSV."""
-    destination.mkdir(parents=True)
-    shutil.copy2(result.prepared.work_directory / "case.json", destination / "case.json")
-    _copy_retained_csv(config, result, destination)
-    _complete_stage(destination, config=config, case_payload=result.prepared.bundle.case_payload, stage="raw")
-
-
-def _stage_processed_case(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
-    """Stage the sole canonical payload and retained runtime evidence."""
-    destination.mkdir(parents=True)
-    shutil.copy2(result.prepared.work_directory / "case.json", destination / "case.json")
     shutil.copy2(result.canonical_case.path, destination / "case.h5")
     shutil.copy2(result.solver_log, destination / "solver.log")
     shutil.copy2(result.prepared.runtime_directory / "timing.json", destination / "timing.json")
@@ -1335,10 +1332,7 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         if result.solved_model is None:
             message = "Retained execution completed without an admitted solved model."
             raise FileNotFoundError(message)
-        shutil.copy2(
-            result.solved_model,
-            destination / comsol_service.RETAINED_MODEL_FILENAME,
-        )
+        shutil.copy2(result.solved_model, destination / comsol_service.RETAINED_MODEL_FILENAME)
     elif result.solved_model is not None:
         message = "No-save execution unexpectedly returned a solved model for publication."
         raise RuntimeError(message)
@@ -1352,7 +1346,14 @@ def case_failure_path(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return the persistent private failure-evidence path for one case."""
-    return _state_batch_root(config, storage_root=storage_root) / "failures" / f"{config.case_id(case_index)}.json"
+    return (
+        common.paths.resolve_generation_failure_directory(
+            config.batch_storage_name,
+            config.case_id(case_index),
+            storage_root=storage_root,
+        )
+        / "failure.json"
+    )
 
 
 def case_failure_artifacts_directory(
@@ -1362,7 +1363,14 @@ def case_failure_artifacts_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return the private compact failure-artifact directory for one case."""
-    return _state_batch_root(config, storage_root=storage_root) / "failure_artifacts" / config.case_id(case_index)
+    return (
+        common.paths.resolve_generation_failure_directory(
+            config.batch_storage_name,
+            config.case_id(case_index),
+            storage_root=storage_root,
+        )
+        / "artifacts"
+    )
 
 
 def _case_failure_identity(
@@ -2518,7 +2526,7 @@ def _case_failure_evidence_state(
     execution_run_id: str | None = None,
     git_commit: str | None = None,
 ) -> _FailureEvidenceState:
-    """Classify absent, current, and stale failure evidence without legacy parsing."""
+    """Classify absent, current, and stale failure evidence from the canonical contract."""
     path, artifacts_root = _validate_case_failure_path_safety(
         config,
         case_index,
@@ -2842,6 +2850,70 @@ def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
     )
 
 
+def _admit_raw_publication_directory(directory: Path) -> _PublicationEvidence:
+    """Admit one canonical raw case solely through its batch input manifest."""
+    generation_root = directory.parents[2]
+    metadata_directory = generation_root / "meta" / directory.parent.name
+    source = admission_service.admit_input_batch_source(
+        metadata_directory,
+        raw_directory=directory.parent,
+    )
+    matches = tuple(reference for reference in source.cases if reference.case_id == directory.name)
+    if len(matches) != 1:
+        message = f"Input manifest does not declare exactly one raw case {directory.name!r}."
+        raise RuntimeError(message)
+    reference = matches[0]
+    case_payload = _load_json_object(reference.case_directory / "case.json", label="canonical raw case definition")
+    case_service.validate_case_payload_schema(case_payload)
+    raw_artifacts = [
+        ArtifactEvidence(
+            relative_path="case.json",
+            path=(reference.case_directory / "case.json").resolve(),
+            sha256=_safe_file_sha256(reference.case_directory / "case.json", label="canonical raw case definition"),
+            size_bytes=(reference.case_directory / "case.json").stat().st_size,
+        )
+    ]
+    for filename, identity in sorted(case_payload["input_files"].items()):
+        input_path = reference.input_directory / filename
+        raw_artifacts.append(
+            ArtifactEvidence(
+                relative_path=f"inputs/{filename}",
+                path=input_path.resolve(),
+                sha256=str(identity["sha256"]),
+                size_bytes=int(identity["size_bytes"]),
+            )
+        )
+    return _PublicationEvidence(
+        directory.resolve(),
+        "raw",
+        case_payload,
+        {},
+        tuple(raw_artifacts),
+        None,
+    )
+
+
+def _require_processed_publication_layout(
+    directory: Path,
+    *,
+    artifact_names: set[str],
+    required: set[str],
+) -> None:
+    """Require the fixed processed ownership boundary and optional solved model."""
+    expected_top_level = {
+        "_SUCCESS",
+        "provenance.json",
+        "comsol_exports",
+        *required,
+    }
+    if "solved.mph" in artifact_names:
+        expected_top_level.add("solved.mph")
+    exports = directory / "comsol_exports"
+    if {entry.name for entry in directory.iterdir()} != expected_top_level or not exports.is_dir() or exports.is_symlink():
+        message = f"Processed publication top-level membership is not canonical: {directory}"
+        raise RuntimeError(message)
+
+
 def _admit_publication_directory(directory: Path, *, stage: str) -> _PublicationEvidence:
     """Admit one raw or processed case publication by producer-owned contracts."""
     if stage not in {"raw", "processed"}:
@@ -2850,11 +2922,14 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
     if not directory.is_dir() or directory.is_symlink():
         msg = f"Case publication directory is missing or unsafe: {directory}"
         raise FileNotFoundError(msg)
+    if stage == "raw":
+        return _admit_raw_publication_directory(directory)
     success_path = directory / "_SUCCESS"
     provenance_path = directory / "provenance.json"
     success = _load_json_object(success_path, label=f"{stage} case success marker")
     provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
-    case_payload = _load_json_object(directory / "case.json", label=f"{stage} canonical case provenance")
+    raw_case = directory.parents[2] / "raw" / directory.parent.name / directory.name
+    case_payload = _load_json_object(raw_case / "case.json", label="canonical raw case definition")
     try:
         case_service.validate_case_payload_schema(case_payload)
     except (KeyError, TypeError, ValueError) as error:
@@ -2964,39 +3039,45 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         msg = f"Case provenance digest mismatch in {directory}."
         raise RuntimeError(msg)
     artifacts = _admit_artifacts(directory, provenance)
-    hdf5_identity: HDF5IdentityEvidence | None = None
-    if stage == "processed":
-        required = {"case.h5", "solver.log", "timing.json", "status.json", "execution_provenance.json", "case.json"}
-        artifact_names = {artifact.relative_path for artifact in artifacts}
-        if not required.issubset(artifact_names):
-            msg = f"Processed publication lacks canonical payload or runtime evidence: {directory}"
-            raise RuntimeError(msg)
-        timing = _load_json_object(directory / "timing.json", label="case timing")
-        execution = _load_json_object(directory / "execution_provenance.json", label="case execution provenance")
-        if timing.get("git_commit") != git_commit or execution.get("git_commit") != git_commit:
-            msg = f"Processed runtime Git-commit evidence disagrees in {directory}."
-            raise RuntimeError(msg)
-        hdf5_identity = _hdf5_evidence(
-            storage_service.validate_case_hdf5(
-                directory / "case.h5",
-                expected_profile=profile.id,
-            )
+    required = {"case.h5", "solver.log", "timing.json", "status.json", "execution_provenance.json"}
+    artifact_names = {artifact.relative_path for artifact in artifacts}
+    _require_processed_publication_layout(
+        directory,
+        artifact_names=artifact_names,
+        required=required,
+    )
+    if not any(name.startswith("comsol_exports/") for name in artifact_names):
+        message = f"Processed publication lacks direct COMSOL exports: {directory}"
+        raise RuntimeError(message)
+    if not required.issubset(artifact_names):
+        msg = f"Processed publication lacks canonical payload or runtime evidence: {directory}"
+        raise RuntimeError(msg)
+    timing = _load_json_object(directory / "timing.json", label="case timing")
+    execution = _load_json_object(directory / "execution_provenance.json", label="case execution provenance")
+    if timing.get("git_commit") != git_commit or execution.get("git_commit") != git_commit:
+        msg = f"Processed runtime Git-commit evidence disagrees in {directory}."
+        raise RuntimeError(msg)
+    hdf5_identity = _hdf5_evidence(
+        storage_service.validate_case_hdf5(
+            directory / "case.h5",
+            expected_profile=profile.id,
         )
-        expected_hdf5 = HDF5IdentityEvidence(
-            simulation_profile=profile.id,
-            git_commit=(None if hdf5_identity.git_commit is None else git_commit),
-            template_relative_path=(None if hdf5_identity.template_relative_path is None else template_relative_path),
-            template_sha256=template_sha256,
-            case_input_id=case_input_id,
-            simulation_case_id=simulation_case_id,
-            scientific_config_digest=scientific_digest,
-            export_contract_sha256=export_contract_sha256,
-            available_learning_views=profile.available_learning_views,
-            airflow_source=profile.airflow_source,
-        )
-        if hdf5_identity != expected_hdf5:
-            msg = f"Canonical HDF5 identities disagree with case publication in {directory}."
-            raise RuntimeError(msg)
+    )
+    expected_hdf5 = HDF5IdentityEvidence(
+        simulation_profile=profile.id,
+        git_commit=(None if hdf5_identity.git_commit is None else git_commit),
+        template_relative_path=(None if hdf5_identity.template_relative_path is None else template_relative_path),
+        template_sha256=template_sha256,
+        case_input_id=case_input_id,
+        simulation_case_id=simulation_case_id,
+        scientific_config_digest=scientific_digest,
+        export_contract_sha256=export_contract_sha256,
+        available_learning_views=profile.available_learning_views,
+        airflow_source=profile.airflow_source,
+    )
+    if hdf5_identity != expected_hdf5:
+        msg = f"Canonical HDF5 identities disagree with case publication in {directory}."
+        raise RuntimeError(msg)
     return _PublicationEvidence(
         directory=directory.resolve(),
         stage=stage,
@@ -3063,19 +3144,10 @@ def validate_completed_case(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Validate one completed case and layer exact authored-config comparison."""
-    raw = _admit_publication_directory(
-        raw_case_directory(config, case_index, storage_root=storage_root),
-        stage="raw",
-    )
-    processed = _admit_publication_directory(
-        processed_case_directory(config, case_index, storage_root=storage_root),
-        stage="processed",
-    )
+    raw = _admit_publication_directory(raw_case_directory(config, case_index, storage_root=storage_root), stage="raw")
+    processed = _admit_publication_directory(processed_case_directory(config, case_index, storage_root=storage_root), stage="processed")
     _require_publication_matches_config(raw, config=config, case_index=case_index)
     _require_publication_matches_config(processed, config=config, case_index=case_index)
-    if raw.case_payload != processed.case_payload:
-        msg = f"Raw and processed canonical metadata disagree for {config.case_id(case_index)}."
-        raise RuntimeError(msg)
     return dict(processed.provenance)
 
 
@@ -3085,19 +3157,16 @@ def completed_case_is_valid(
     *,
     storage_root: Path | str | None = None,
 ) -> bool:
-    """Return false only when completion is absent; corruption fails closed."""
+    """Return false only when processed completion is absent; corruption fails closed."""
     raw = raw_case_directory(config, case_index, storage_root=storage_root)
     processed = processed_case_directory(config, case_index, storage_root=storage_root)
-    raw_success = (raw / "_SUCCESS").exists()
-    processed_success = (processed / "_SUCCESS").exists()
-    if not processed_success:
-        if raw_success:
-            evidence = _admit_publication_directory(raw, stage="raw")
-            _require_publication_matches_config(evidence, config=config, case_index=case_index)
+    if not (processed / "_SUCCESS").exists():
+        if raw.exists():
+            _require_publication_matches_config(_admit_publication_directory(raw, stage="raw"), config=config, case_index=case_index)
         return False
-    if not raw_success:
-        msg = f"Processed completion exists without input provenance: {processed}"
-        raise RuntimeError(msg)
+    if not raw.exists():
+        message = f"Processed completion exists without canonical raw inputs: {processed}"
+        raise RuntimeError(message)
     validate_completed_case(config, case_index, storage_root=storage_root)
     return True
 
@@ -3126,7 +3195,10 @@ def publish_completed_case(
     case_index = int(result.prepared.bundle.case_payload["case_index"])
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
     state_root = _state_batch_root(config, storage_root=storage)
-    publication_root = state_root / "publications"
+    publication_root = common.paths.resolve_generation_case_publications_directory(
+        config.batch_storage_name,
+        storage_root=storage,
+    )
     publication_root.mkdir(parents=True, exist_ok=True)
     staging = workspace_service.create_publication_staging(
         storage_root=storage,
@@ -3134,7 +3206,6 @@ def publish_completed_case(
         run_id=result.prepared.workspace_run_id,
         case_id=result.prepared.bundle.case_id,
     )
-    raw_stage = staging / "raw"
     processed_stage = staging / "processed"
     raw_destination = raw_case_directory(config, case_index, storage_root=storage)
     processed_destination = processed_case_directory(
@@ -3143,19 +3214,12 @@ def publish_completed_case(
         storage_root=storage,
     )
     try:
-        _stage_raw_case(config, result, raw_stage)
         _stage_processed_case(config, result, processed_stage)
-        if raw_destination.exists() and (raw_destination / "_SUCCESS").exists():
-            existing = _admit_publication_directory(raw_destination, stage="raw")
-            _require_publication_matches_config(existing, config=config, case_index=case_index)
-            if existing.provenance["simulation_case_id"] != result.prepared.bundle.simulation_case_id:
-                msg = f"Existing raw case belongs to another simulation identity: {raw_destination}"
-                raise RuntimeError(msg)
-            # The marked publication root owns this redundant stage until cleanup.
-        else:
-            _quarantine_incomplete(raw_destination, state_root=state_root)
-            raw_destination.parent.mkdir(parents=True, exist_ok=True)
-            raw_stage.replace(raw_destination)
+        existing = _admit_publication_directory(raw_destination, stage="raw")
+        _require_publication_matches_config(existing, config=config, case_index=case_index)
+        if existing.case_payload["simulation_case_id"] != result.prepared.bundle.simulation_case_id:
+            message = f"Canonical raw case belongs to another simulation identity: {raw_destination}"
+            raise RuntimeError(message)
         if processed_destination.exists() and (processed_destination / "_SUCCESS").exists():
             msg = f"Refusing to overwrite existing completed case: {processed_destination}"
             raise FileExistsError(msg)
@@ -3474,7 +3538,7 @@ def run_case(
 
 
 def _validate_exact_batch_directory_membership(
-    batch_id: str,
+    batch_storage_name: str,
     case_ids: tuple[str, ...],
     *,
     storage_root: Path | str | None,
@@ -3483,7 +3547,7 @@ def _validate_exact_batch_directory_membership(
     expected = set(case_ids)
     roots: list[Path] = []
     for stage in ("raw", "processed"):
-        root = common.paths.resolve_generated_batch_dir(batch_id, stage=stage, storage_root=storage_root)
+        root = common.paths.resolve_generated_batch_dir(batch_storage_name, stage=stage, storage_root=storage_root)
         entries = tuple(root.iterdir()) if root.is_dir() and not root.is_symlink() else ()
         actual = {entry.name for entry in entries}
         unsafe = sorted(entry.name for entry in entries if not entry.is_dir() or entry.is_symlink())
@@ -3523,7 +3587,7 @@ def finalize_batch(
             }
         )
     _validate_exact_batch_directory_membership(
-        config.batch_id,
+        config.batch_storage_name,
         tuple(config.case_id(case_index) for case_index in config.case_indices),
         storage_root=storage_root,
     )
@@ -3533,14 +3597,16 @@ def finalize_batch(
     git_commit = next(iter(git_commits))
     manifest = {
         "schema_kind": "simulation_batch_manifest",
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "status": "complete",
         "simulation_profile": config.profile.id,
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
         "batch_name": config.batch_name,
         "batch_id": config.batch_id,
+        "batch_storage_name": config.batch_storage_name,
         "batch_identity": config.batch_identity,
+        "campaign_purpose": config.scientific_values["campaign_purpose"],
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "git_commit": git_commit,
@@ -3554,7 +3620,7 @@ def finalize_batch(
     manifest_path = _immutable_json(meta_directory / "batch_manifest.json", manifest, label="terminal batch manifest")
     success = {
         "schema_kind": "simulation_batch_success",
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -3593,6 +3659,7 @@ def _validate_terminal_scientific_config(
         or scientific.get("schema_kind") != "resolved_generation_batch"
         or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
         or scientific.get("simulation_profile") != manifest["simulation_profile"]
+        or scientific.get("campaign_purpose") != manifest["campaign_purpose"]
         or scientific.get("sampling_regime") != manifest["sampling_regime"]
         or scientific.get("case_count") != case_count
         or not isinstance(material, Mapping)
@@ -3676,7 +3743,7 @@ def _require_case_matches_terminal(
 
 
 def admit_terminal_batch(
-    batch_id: str,
+    batch_storage_name: str,
     *,
     storage_root: Path | str | None = None,
 ) -> TerminalBatchEvidence:
@@ -3685,8 +3752,8 @@ def admit_terminal_batch(
 
     Parameters
     ----------
-    batch_id : str
-        Immutable generated-batch identifier.
+    batch_storage_name : str
+        Flat semantic locator for the generated batch publication.
     storage_root : Path | str | None, optional
         Storage root containing the Generation publication.
 
@@ -3706,9 +3773,23 @@ def admit_terminal_batch(
         If independently valid evidence disagrees across publication layers.
 
     """
-    safe_batch_id = common.paths.validate_logical_name(batch_id, label="batch_id")
-    generation_root = common.paths.get_generation_root(storage_root=storage_root).expanduser().resolve()
-    meta_candidate = common.paths.get_generation_meta_root(storage_root=storage_root) / safe_batch_id
+    safe_storage_name = common.paths.validate_logical_name(
+        batch_storage_name,
+        label="batch_storage_name",
+    )
+    generation_root = (
+        common.paths.get_generation_root(
+            storage_root=storage_root,
+        )
+        .expanduser()
+        .resolve()
+    )
+    meta_candidate = (
+        common.paths.get_generation_meta_root(
+            storage_root=storage_root,
+        )
+        / safe_storage_name
+    )
     if not meta_candidate.is_dir() or meta_candidate.is_symlink():
         msg = f"Terminal batch metadata directory is missing or unsafe: {meta_candidate}"
         raise FileNotFoundError(msg)
@@ -3718,17 +3799,28 @@ def admit_terminal_batch(
     scientific_path = meta_directory / "resolved_generation_config.json"
     manifest = _load_json_object(manifest_path, label="terminal batch manifest")
     success = _load_json_object(success_path, label="terminal batch success marker")
-    scientific = _load_json_object(scientific_path, label="resolved scientific generation configuration")
-    manifest_sha256 = _safe_file_sha256(manifest_path, label="terminal batch manifest")
+    scientific = _load_json_object(
+        scientific_path,
+        label="resolved scientific generation configuration",
+    )
+    manifest_sha256 = _safe_file_sha256(
+        manifest_path,
+        label="terminal batch manifest",
+    )
     if (
         set(manifest) != _BATCH_MANIFEST_KEYS
         or manifest.get("schema_kind") != _BATCH_MANIFEST_SCHEMA_KIND
-        or manifest.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or manifest.get("schema_version") != BATCH_MANIFEST_SCHEMA_VERSION
         or manifest.get("status") != "complete"
-        or manifest.get("batch_id") != safe_batch_id
+        or manifest.get("batch_storage_name") != safe_storage_name
     ):
-        msg = f"Terminal batch manifest schema or completion state is invalid: {manifest_path}"
+        msg = f"Terminal batch manifest schema, locator, or completion state is invalid: {manifest_path}"
         raise RuntimeError(msg)
+    batch_id = manifest.get("batch_id")
+    if not isinstance(batch_id, str):
+        msg = f"Terminal batch_id is malformed: {manifest_path}"
+        raise TypeError(msg)
+    safe_batch_id = common.paths.validate_logical_name(batch_id, label="batch_id")
     batch_identity = _require_sha256(manifest.get("batch_identity"), label="terminal batch_identity")
     scientific_digest = _require_sha256(
         manifest.get("scientific_config_digest"),
@@ -3760,21 +3852,42 @@ def admit_terminal_batch(
         raise RuntimeError(msg)
     material_family = materials.validate_material_family(manifest.get("material_family"))
     sampling_regime = manifest.get("sampling_regime")
+    campaign_purpose = manifest.get("campaign_purpose")
     batch_name = manifest.get("batch_name")
-    batch_kind = (
-        config_contract.PILOT_CAMPAIGN_PURPOSE if scientific.get("campaign_purpose") == config_contract.PILOT_CAMPAIGN_PURPOSE else sampling_regime
-    )
+    batch_kind = config_contract.PILOT_CAMPAIGN_PURPOSE if campaign_purpose == config_contract.PILOT_CAMPAIGN_PURPOSE else sampling_regime
     identity_is_valid = False
-    if isinstance(material_family, str) and isinstance(sampling_regime, str) and isinstance(batch_name, str) and isinstance(batch_kind, str):
-        expected_name = config_contract.build_batch_name(profile.id, material_family, batch_kind)
-        identity_is_valid = batch_name == expected_name and safe_batch_id == config_contract.build_batch_id(expected_name, scientific_digest)
+    if (
+        isinstance(material_family, str)
+        and isinstance(sampling_regime, str)
+        and isinstance(campaign_purpose, str)
+        and isinstance(batch_name, str)
+        and isinstance(batch_kind, str)
+    ):
+        expected_name = config_contract.build_batch_name(
+            profile.id,
+            material_family,
+            batch_kind,
+        )
+        expected_storage_name = config_contract.build_batch_storage_name(
+            profile.id,
+            material_family,
+            sampling_regime,
+            campaign_purpose,
+            scientific_digest,
+        )
+        identity_is_valid = (
+            batch_name == expected_name
+            and safe_batch_id == config_contract.build_batch_id(expected_name, scientific_digest)
+            and safe_storage_name == expected_storage_name
+            and scientific.get("campaign_purpose") == campaign_purpose
+        )
     if not sampling_regime or not identity_is_valid:
-        msg = f"Terminal batch name, material, sampling regime, or immutable identifier is invalid: {manifest_path}"
+        msg = f"Terminal batch name, purpose, storage locator, or immutable identifier is invalid: {manifest_path}"
         raise RuntimeError(msg)
     git_commit = source_service.validate_git_commit(manifest.get("git_commit"))
     if set(success) != _BATCH_SUCCESS_KEYS or success != {
         "schema_kind": _BATCH_SUCCESS_SCHEMA_KIND,
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "simulation_profile": profile.id,
         "batch_id": safe_batch_id,
         "batch_identity": batch_identity,
@@ -3802,7 +3915,7 @@ def admit_terminal_batch(
     )
     case_ids = tuple(f"case_{index:04d}" for index in indices)
     raw_root, processed_root = _validate_exact_batch_directory_membership(
-        safe_batch_id,
+        safe_storage_name,
         case_ids,
         storage_root=storage_root,
     )
@@ -3891,7 +4004,9 @@ def admit_terminal_batch(
         airflow_source=profile.airflow_source,
         batch_name=str(batch_name),
         batch_id=safe_batch_id,
+        batch_storage_name=safe_storage_name,
         batch_identity=batch_identity,
+        campaign_purpose=str(campaign_purpose),
         material_family=str(material_family),
         sampling_regime=str(sampling_regime),
         git_commit=git_commit,
@@ -3914,13 +4029,16 @@ def validate_terminal_batch(
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Admit a terminal batch and require exact authored-config agreement."""
-    evidence = admit_terminal_batch(config.batch_id, storage_root=storage_root)
+    evidence = admit_terminal_batch(config.batch_storage_name, storage_root=storage_root)
     expected = {
         "simulation_profile": config.profile.id,
         "available_learning_views": config.profile.available_learning_views,
         "airflow_source": config.profile.airflow_source,
         "batch_name": config.batch_name,
+        "batch_id": config.batch_id,
+        "batch_storage_name": config.batch_storage_name,
         "batch_identity": config.batch_identity,
+        "campaign_purpose": config.scientific_values["campaign_purpose"],
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "scientific_config_digest": config.scientific_config_digest,
@@ -3934,7 +4052,10 @@ def validate_terminal_batch(
         "available_learning_views": evidence.available_learning_views,
         "airflow_source": evidence.airflow_source,
         "batch_name": evidence.batch_name,
+        "batch_id": evidence.batch_id,
+        "batch_storage_name": evidence.batch_storage_name,
         "batch_identity": evidence.batch_identity,
+        "campaign_purpose": evidence.campaign_purpose,
         "material_family": evidence.material_family,
         "sampling_regime": evidence.sampling_regime,
         "scientific_config_digest": evidence.scientific_config_digest,

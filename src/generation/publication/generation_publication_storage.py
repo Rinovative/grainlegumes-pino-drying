@@ -19,7 +19,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import tempfile
@@ -33,6 +32,7 @@ import h5py
 import numpy as np
 
 from src import common, domain
+from src.generation.cases import generation_cases_admission as input_admission
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_fields as fields_service
 from src.generation.cases import generation_cases_schedule as schedule_service
@@ -48,7 +48,6 @@ if TYPE_CHECKING:
 HDF5_SCHEMA_KIND = "vp2_canonical_case"
 HDF5_SCHEMA_VERSION = config_contract.CANONICAL_HDF5_SCHEMA_VERSION
 HDF5_CONVERTER_VERSION = config_contract.CANONICAL_HDF5_CONVERTER_VERSION
-_MINIMUM_ADAPTER_ROWS = 2
 _MINIMUM_AXIS_POINTS = 2
 _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
@@ -110,32 +109,6 @@ def _compression_matches(dataset: h5py.Dataset, storage: Mapping[str, Any]) -> b
         and dataset.compression_opts == int(storage["compression_level"])
         and dataset.shuffle is bool(storage["shuffle"])
     )
-
-
-def _read_input_adapter_table(path: Path, *, delimiter: str) -> tuple[list[str], np.ndarray]:
-    """Read one Generation-owned finite numeric input adapter."""
-    try:
-        lines = [line for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
-    except (OSError, UnicodeDecodeError) as error:
-        message = f"Generation input adapter is not readable text: {path}"
-        raise ValueError(message) from error
-    rows = list(csv.reader(lines, delimiter=delimiter))
-    if len(rows) < _MINIMUM_ADAPTER_ROWS:
-        message = f"Generation input adapter must contain a header and data: {path}"
-        raise ValueError(message)
-    header = [item.strip() for item in rows[0]]
-    if not header or len(header) != len(set(header)) or any(len(row) != len(header) for row in rows[1:]):
-        message = f"Generation input adapter has duplicate headers or inconsistent row widths: {path}"
-        raise ValueError(message)
-    try:
-        values = np.asarray([[float(item.strip()) for item in row] for row in rows[1:]], dtype=np.float64)
-    except ValueError as error:
-        message = f"Generation input adapter contains malformed values: {path}"
-        raise ValueError(message) from error
-    if not np.isfinite(values).all():
-        message = f"Generation input adapter contains NaN or infinity: {path}"
-        raise ValueError(message)
-    return header, values
 
 
 def _contract(config: GenerationConfig, role: str) -> dict[str, Any]:
@@ -634,7 +607,7 @@ def _schedule_values(
     if common.serialization.file_sha256(path) != identity["sha256"] or path.stat().st_size != identity["size_bytes"]:
         msg = "Schedule adapter bytes changed after case-input identity was computed."
         raise RuntimeError(msg)
-    header, values = _read_input_adapter_table(path, delimiter=spec["delimiter"])
+    header, values = input_admission.read_input_adapter_table(path, delimiter=spec["delimiter"])
     if header != list(profiles.SCHEDULE_FIELDS):
         msg = "Schedule adapter does not match the configured four-column contract."
         raise ValueError(msg)

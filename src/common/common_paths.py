@@ -140,6 +140,16 @@ def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path
     return get_generation_root(storage_root=storage_root) / ".state"
 
 
+def get_generation_input_locks_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return canonical raw-input batch lock anchors."""
+    return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "locks"
+
+
+def get_generation_input_transactions_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return canonical raw-input batch publication transactions."""
+    return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "transactions"
+
+
 def get_generation_performance_benchmark_root(
     *,
     storage_root: Path | str | None = None,
@@ -191,6 +201,162 @@ def resolve_queue_log_dir(
     """Return one validated experiment scope's host-visible queue-log directory."""
     scope = validate_logical_name(scope, label="queue log scope")
     return get_experiments_root(storage_root=storage_root) / scope / "logs" / "queue"
+
+
+def resolve_generation_input_metadata_directory(
+    batch_storage_name: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one canonical input-batch metadata directory."""
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    return get_generation_meta_root(storage_root=storage_root) / name
+
+
+def resolve_generation_input_raw_batch_directory(
+    batch_storage_name: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one canonical pre-execution raw input-batch directory."""
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    return get_generation_raw_root(storage_root=storage_root) / name
+
+
+def resolve_generation_raw_case_directory(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one immutable canonical raw case directory."""
+    return resolve_generation_input_raw_batch_directory(
+        batch_storage_name,
+        storage_root=storage_root,
+    ) / validate_logical_name(case_id, label="case_id")
+
+
+def resolve_generation_raw_case_inputs_directory(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve the pre-COMSOL adapters for one canonical raw case."""
+    return (
+        resolve_generation_raw_case_directory(
+            batch_storage_name,
+            case_id,
+            storage_root=storage_root,
+        )
+        / "inputs"
+    )
+
+
+def resolve_generation_processed_case_directory(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one canonical post-COMSOL case directory."""
+    return resolve_generated_batch_dir(
+        batch_storage_name,
+        stage="processed",
+        storage_root=storage_root,
+    ) / validate_logical_name(case_id, label="case_id")
+
+
+def resolve_generation_comsol_exports_directory(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve direct COMSOL export storage for one completed case."""
+    return (
+        resolve_generation_processed_case_directory(
+            batch_storage_name,
+            case_id,
+            storage_root=storage_root,
+        )
+        / "comsol_exports"
+    )
+
+
+def resolve_generation_failure_directory(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve batch-owned failed-execution evidence for one case."""
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    case_id = validate_logical_name(case_id, label="case_id")
+    return get_generation_meta_root(storage_root=storage_root) / name / "failures" / case_id
+
+
+def resolve_generation_state_batch_directory(
+    batch_storage_name: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve flat private runtime coordination state for one generation batch."""
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    return get_generation_state_root(storage_root=storage_root) / name
+
+
+def resolve_generation_case_lock_path(
+    batch_storage_name: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one persistent case-level execution lock anchor."""
+    state = resolve_generation_state_batch_directory(
+        batch_storage_name,
+        storage_root=storage_root,
+    )
+    case_id = validate_logical_name(case_id, label="case_id")
+    return state / "locks" / f"{case_id}.lock"
+
+
+def resolve_generation_case_publications_directory(
+    batch_storage_name: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve atomic processed-case publication staging for one batch."""
+    return (
+        resolve_generation_state_batch_directory(
+            batch_storage_name,
+            storage_root=storage_root,
+        )
+        / "publications"
+    )
+
+
+def resolve_generation_input_lock_path(
+    batch_storage_name: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve the sole publisher lock for one canonical input batch."""
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    return get_generation_input_locks_root(storage_root=storage_root) / f"{name}.lock"
+
+
+def resolve_generation_input_transaction_directory(
+    input_generation_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one deterministic canonical input-generation transaction."""
+    input_generation_id = validate_logical_name(
+        input_generation_id,
+        label="input_generation_id",
+    )
+    return get_generation_input_transactions_root(storage_root=storage_root) / input_generation_id
 
 
 def resolve_dataset_build_lock_path(
@@ -336,7 +502,7 @@ def resolve_dataset_path(dataset_id: str, *, dataset_root: Path | str | None = N
 
 
 def resolve_generated_batch_dir(
-    dataset_id: str,
+    batch_storage_name: str,
     *,
     stage: str,
     storage_root: Path | str | None = None,
@@ -346,31 +512,30 @@ def resolve_generated_batch_dir(
 
     Parameters
     ----------
-    dataset_id : str
-        Non-empty logical dataset identifier.
+    batch_storage_name : str
+        Flat semantic batch storage locator.
     stage : str
-        Exact generated-data stage: ``raw`` or ``processed``.
+        Exact generated-data stage: raw or processed.
     storage_root : Path | str | None, optional
         Explicit unified storage root.
 
     Returns
     -------
     Path
-        ``<storage_root>/01_generation/<stage>/<dataset_id>``.
+        Batch directory below the selected Generation stage.
 
     Raises
     ------
     ValueError
-        If ``dataset_id`` is unsafe or ``stage`` is not exactly ``"raw"`` or
-        ``"processed"``.
+        If batch_storage_name is unsafe or stage is unsupported.
 
     """
-    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
+    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
     if stage not in {"raw", "processed"}:
         msg = f"stage must be 'raw' or 'processed', got {stage!r}."
         raise ValueError(msg)
     root = get_generation_root(storage_root=storage_root)
-    return root / stage / dataset_id
+    return root / stage / name
 
 
 def resolve_run_output_dir(

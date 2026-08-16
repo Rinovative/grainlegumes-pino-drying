@@ -29,6 +29,7 @@ from typing import Any, Final
 import numpy as np
 from scipy import signal
 
+from src import domain
 from src.generation.contracts import generation_contracts_porosity as porosity_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 
@@ -333,10 +334,7 @@ def _permeability_fields(
     kxx = k1 * cosine**2 + k2 * sine**2
     kyy = k1 * sine**2 + k2 * cosine**2
     kxy = (k1 - k2) * sine * cosine
-    determinant = kxx * kyy - kxy**2
-    if not np.isfinite(np.stack((kxx, kxy, kyy))).all() or np.any(determinant <= 0):
-        msg = "Generated permeability tensor is non-finite or not positive definite."
-        raise ValueError(msg)
+    diagnostics = domain.permeability.symmetric_tensor_diagnostics(kxx, kxy, kyy)
     return (
         kappa,
         kxx,
@@ -346,7 +344,7 @@ def _permeability_fields(
             "kappa_mean": mean,
             "kappa_cv": relative_variation,
             "log_standard_deviation": log_standard_deviation,
-            "determinant_min": float(np.min(determinant)),
+            "determinant_min": float(np.min(diagnostics.determinant)),
             "units": {
                 "kappa_mean": "m^2",
                 "kappa_cv": "1",

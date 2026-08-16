@@ -96,6 +96,33 @@ def _assert_provenance_and_relocation_preserve_hdf5(
             np.testing.assert_array_equal(original[dataset_name], relocated[dataset_name])
 
 
+def _assert_terminal_purpose_corruption_rejected(*, batch: Any, storage: Path) -> None:
+    """Reject a terminal manifest whose purpose contradicts persisted science."""
+    metadata = common.paths.resolve_generation_input_metadata_directory(
+        batch.batch_storage_name,
+        storage_root=storage,
+    )
+    manifest_path = metadata / "batch_manifest.json"
+    success_path = metadata / "_SUCCESS"
+    original_manifest = manifest_path.read_bytes()
+    original_success = success_path.read_bytes()
+    false_manifest = json.loads(original_manifest)
+    false_manifest["campaign_purpose"] = "family_generalization"
+    common.serialization.atomic_write_json(manifest_path, false_manifest)
+    false_success = json.loads(original_success)
+    false_success["manifest_sha256"] = common.serialization.file_sha256(manifest_path)
+    common.serialization.atomic_write_json(success_path, false_success)
+    try:
+        with pytest.raises(RuntimeError, match="purpose, storage locator"):
+            generation.runtime.admit_terminal_batch(
+                batch.batch_storage_name,
+                storage_root=storage,
+            )
+    finally:
+        manifest_path.write_bytes(original_manifest)
+        success_path.write_bytes(original_success)
+
+
 def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -139,17 +166,17 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     assert {
         "_SUCCESS",
         "case.h5",
-        "case.json",
+        "comsol_exports",
         "execution_provenance.json",
         "provenance.json",
         "status.json",
     }.issubset(completed_files)
+    assert "case.json" not in completed_files
     raw = generation.runtime.raw_case_directory(batch, 1, storage_root=storage)
-    raw_csv_files = {path.relative_to(raw).as_posix() for path in raw.rglob("*.csv")}
-    assert {
-        "raw_csv/exports/airflow.csv",
-        "raw_csv/inputs/fields.csv",
-    }.issubset(raw_csv_files)
+    assert {entry.name for entry in raw.iterdir()} == {"case.json", "inputs"}
+    assert (raw / "inputs/fields.csv").is_file()
+    assert (completed / "comsol_exports/airflow.csv").is_file()
+    assert not (raw / "_SUCCESS").exists()
     identity = generation.publication.storage.validate_case_hdf5(completed / "case.h5", expected_profile="steady_flow")
     assert identity["git_commit"] is None
     with h5py.File(completed / "case.h5", "r") as handle:
@@ -163,7 +190,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         fixed = _dataset(handle, "stationary_fixed/values")
         assert fixed.shape == (len(profile_contract.stationary_fixed_fields),)
         assert fixed.attrs["runtime_source"] == "canonical_template"
-    case = json.loads((completed / "case.json").read_text(encoding="utf-8"))
+    case = json.loads((raw / "case.json").read_text(encoding="utf-8"))
     assert identity["case_input_id"] == case["case_input_id"]
     assert identity["simulation_case_id"] == case["simulation_case_id"]
 
@@ -194,13 +221,15 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     missing_project.mkdir()
     monkeypatch.setenv("PROJECT_ROOT", str(missing_project))
     assert not (missing_project / batch.template_relative_path).exists()
-    admitted = generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
+    admitted = generation.runtime.admit_terminal_batch(batch.batch_storage_name, storage_root=storage)
     assert admitted.case("case_0001").hdf5_identity.git_commit is None
     unexpected = admitted.processed_directory / "unexpected_case"
     unexpected.mkdir()
     with pytest.raises(RuntimeError, match="membership mismatch"):
-        generation.runtime.admit_terminal_batch(batch.batch_id, storage_root=storage)
+        generation.runtime.admit_terminal_batch(batch.batch_storage_name, storage_root=storage)
     unexpected.rmdir()
+
+    _assert_terminal_purpose_corruption_rejected(batch=batch, storage=storage)
 
     result = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert result["dataset_name"] == "steady_flow__lentil__id"

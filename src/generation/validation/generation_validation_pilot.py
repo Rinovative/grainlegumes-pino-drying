@@ -472,12 +472,12 @@ def finalize_pilot_campaign(
     batch_records: list[dict[str, Any]] = []
     for batch in campaign.batches:
         raw_root = common.paths.resolve_generated_batch_dir(
-            batch.batch_id,
+            batch.batch_storage_name,
             stage="raw",
             storage_root=storage,
         )
         processed_root = common.paths.resolve_generated_batch_dir(
-            batch.batch_id,
+            batch.batch_storage_name,
             stage="processed",
             storage_root=storage,
         )
@@ -734,14 +734,14 @@ def pilot_transfer_plan(
                 "meta_directory": relative(runtime_service.batch_meta_directory(batch, storage_root=storage)),
                 "raw_directory": relative(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="raw",
                         storage_root=storage,
                     )
                 ),
                 "processed_directory": relative(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="processed",
                         storage_root=storage,
                     )

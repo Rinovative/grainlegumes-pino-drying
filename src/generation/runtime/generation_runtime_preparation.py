@@ -17,6 +17,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -24,6 +25,9 @@ from typing import TYPE_CHECKING
 from src import common
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_contract
+from src.generation.cases import generation_cases_input as input_service
+from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 
 from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_workspace as workspace_service
@@ -70,6 +74,74 @@ def _require_template_digest(path: Path, expected_sha256: str, *, message: str) 
         raise RuntimeError(message)
 
 
+def _materialize_canonical_raw_bundle(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    work_directory: Path,
+    *,
+    storage_root: Path,
+) -> case_service.CaseBundle:
+    """Copy an exactly admitted persisted raw case into isolated scratch."""
+    case_id = config.case_id(case_index)
+    raw_case = common.paths.resolve_generation_raw_case_directory(
+        config.batch_storage_name,
+        case_id,
+        storage_root=storage_root,
+    )
+    metadata = common.paths.resolve_generation_input_metadata_directory(
+        config.batch_storage_name,
+        storage_root=storage_root,
+    )
+    if not raw_case.exists() or not (metadata / "input_generation_manifest.json").is_file():
+        input_service.generate_input_cases(
+            config,
+            1,
+            case_start=case_index,
+            storage_root=storage_root,
+        )
+    reference = input_service.admit_configured_input_case(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
+    source_case_json = reference.case_directory / "case.json"
+    payload = json.loads(source_case_json.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        message = f"Canonical raw case payload is invalid: {reference.case_directory}"
+        raise TypeError(message)
+    case_service.validate_case_payload_schema(payload)
+    target_case_json = work_directory / "case.json"
+    shutil.copy2(source_case_json, target_case_json)
+    if source_case_json.read_bytes() != target_case_json.read_bytes():
+        message = f"Canonical raw case.json changed during scratch materialization: {source_case_json}"
+        raise RuntimeError(message)
+    input_paths: list[Path] = []
+    for filename, identity in sorted(payload["input_files"].items()):
+        source_path = reference.input_directory / filename
+        target_path = work_directory / filename
+        shutil.copy2(source_path, target_path)
+        if (
+            target_path.stat().st_size != identity["size_bytes"]
+            or common.serialization.file_sha256(target_path) != identity["sha256"]
+            or target_path.read_bytes() != source_path.read_bytes()
+        ):
+            message = f"Canonical raw input changed during scratch materialization: {source_path}"
+            raise RuntimeError(message)
+        input_paths.append(target_path)
+    scalar_handoff = (
+        None if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE else scalar_handoff_contract.admit_case_scalar_handoff(payload, work_directory)
+    )
+    return case_service.CaseBundle(
+        directory=work_directory,
+        case_id=case_id,
+        case_input_id=str(payload["case_input_id"]),
+        simulation_case_id=str(payload["simulation_case_id"]),
+        case_payload=payload,
+        input_paths=tuple(input_paths),
+        scalar_handoff=scalar_handoff,
+    )
+
+
 def prepare_case_work_directory(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -94,11 +166,11 @@ def prepare_case_work_directory(
     run_id = workspace_service.workspace_run_id(config)
     model_path = work_directory / comsol_service.WORK_MODEL_FILENAME
     try:
-        bundle = case_service.generate_case_input_bundle(
+        bundle = _materialize_canonical_raw_bundle(
             config,
             case_index,
             work_directory,
-            _allow_workspace_marker=True,
+            storage_root=storage,
         )
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(

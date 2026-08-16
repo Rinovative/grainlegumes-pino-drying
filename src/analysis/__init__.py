@@ -5,6 +5,7 @@ Provides:
 - artifacts: artifact schemas, generation, lifecycle, and runtime evidence
 - eda: exploratory generated-data analysis and visualization
 - evaluation: persisted prediction evaluation and scientific plots
+- generation_inputs: production generation-input discovery and EDA
 - presentation: ordered and curated scientific presentation services
 - ui: reusable notebook controls, panels, and viewers
 """
@@ -15,10 +16,24 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import artifacts, eda, evaluation, presentation, ui
+    from . import artifacts, eda, evaluation, generation_inputs, presentation, ui
 
-_MODULES = {"artifacts": "artifacts", "eda": "eda", "evaluation": "evaluation", "presentation": "presentation", "ui": "ui"}
-__all__ = ["artifacts", "eda", "evaluation", "presentation", "ui"]
+_MODULES = {
+    "artifacts": "artifacts",
+    "eda": "eda",
+    "evaluation": "evaluation",
+    "generation_inputs": "generation_inputs",
+    "presentation": "presentation",
+    "ui": "ui",
+}
+__all__ = [
+    "artifacts",
+    "eda",
+    "evaluation",
+    "generation_inputs",
+    "presentation",
+    "ui",
+]
 
 
 def __getattr__(name: str) -> object:

@@ -32,6 +32,9 @@ import pandas as pd
 from IPython.display import clear_output, display
 from matplotlib.figure import Figure
 
+COMPACT_VIEW_SELECTOR_WIDTH_PX = 230
+STANDARD_VIEW_SELECTOR_WIDTH_PX = 360
+
 
 def _sanitize_name(name: str) -> str:
     """
@@ -120,7 +123,7 @@ def make_dropdown_section(
         value=None if select_first else -1,
         description="" if select_first else "View:",
         style={"description_width": "initial"},
-        layout=widgets.Layout(width="230px" if select_first else "360px"),
+        layout=widgets.Layout(width=(f"{COMPACT_VIEW_SELECTOR_WIDTH_PX}px" if select_first else f"{STANDARD_VIEW_SELECTOR_WIDTH_PX}px")),
     )
     output = widgets.Output()
     last_idx: dict[str, int | None] = {"idx": None}

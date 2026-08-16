@@ -360,8 +360,15 @@ def _realization_evidence(
     if not np.isfinite(dry_density).all() or np.any(dry_density <= 0):
         message = "Static density formula produced nonpositive or non-finite values."
         raise ValueError(message)
-    oswin_ratio = float(sample.values["A_osw"]) + float(sample.values["B_osw"]) * (float(sample.values["T_init"]) - 273.15)
-    oswin_value = 0.01 * oswin_ratio * (0.5 / (1.0 - 0.5)) ** float(sample.values["C_osw"])
+    oswin_value = float(
+        domain.moisture.oswin_equilibrium_dry_basis_moisture(
+            0.5,
+            float(sample.values["T_init"]),
+            a_osw=float(sample.values["A_osw"]),
+            b_osw=float(sample.values["B_osw"]),
+            c_osw=float(sample.values["C_osw"]),
+        )
+    )
     if not math.isfinite(oswin_value) or oswin_value <= 0:
         message = "Static Oswin equilibrium sentinel is nonpositive or non-finite."
         raise ValueError(message)

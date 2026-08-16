@@ -179,8 +179,11 @@ def _state_batch_root_for_plan(
     *,
     storage_root: Path,
 ) -> Path:
-    """Return a batch state path without creating it."""
-    return common.paths.get_generation_state_root(storage_root=storage_root) / batch.profile.id / batch.batch_id
+    """Return a flat batch state path without creating it."""
+    return common.paths.resolve_generation_state_batch_directory(
+        batch.batch_storage_name,
+        storage_root=storage_root,
+    )
 
 
 def _new_campaign_manifest(
@@ -224,14 +227,14 @@ def _new_campaign_manifest(
                 "meta_directory": str(batch_runtime.batch_meta_directory(batch, storage_root=storage)),
                 "raw_directory": str(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="raw",
                         storage_root=storage,
                     )
                 ),
                 "processed_directory": str(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="processed",
                         storage_root=storage,
                     )
@@ -291,8 +294,8 @@ def plan_campaign(
             "publications": [
                 {
                     "batch_id": batch.batch_id,
-                    "raw": str(common.paths.resolve_generated_batch_dir(batch.batch_id, stage="raw", storage_root=storage)),
-                    "processed": str(common.paths.resolve_generated_batch_dir(batch.batch_id, stage="processed", storage_root=storage)),
+                    "raw": str(common.paths.resolve_generated_batch_dir(batch.batch_storage_name, stage="raw", storage_root=storage)),
+                    "processed": str(common.paths.resolve_generated_batch_dir(batch.batch_storage_name, stage="processed", storage_root=storage)),
                 }
                 for batch in campaign.batches
             ],
@@ -1212,14 +1215,14 @@ def campaign_transfer_plan(
                 "meta_directory": relative_directory(batch_runtime.batch_meta_directory(batch, storage_root=storage_root)),
                 "raw_directory": relative_directory(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="raw",
                         storage_root=storage_root,
                     )
                 ),
                 "processed_directory": relative_directory(
                     common.paths.resolve_generated_batch_dir(
-                        batch.batch_id,
+                        batch.batch_storage_name,
                         stage="processed",
                         storage_root=storage_root,
                     )

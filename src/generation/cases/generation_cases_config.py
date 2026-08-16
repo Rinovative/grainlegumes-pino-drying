@@ -58,6 +58,7 @@ _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL = 1.0e-4
 _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL = 1.0e-10
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_RTOL = 1.0e-5
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_ATOL = 1.0e-9
+_STORAGE_COMPONENT_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
 PILOT_CASE_KINDS = ("nominal_reference", "natural_pilot")
 _FINAL_PHYSICAL_FORMULAS = {
     "w_surf_balance": "f_surf*d(w_surf)/dt = j_int - m_evap",
@@ -152,6 +153,31 @@ def build_batch_id(batch_name: str, scientific_config_digest: str) -> str:
     return f"{name}__{scientific_config_digest[:16]}"
 
 
+def build_batch_storage_name(
+    simulation_profile: str,
+    material_family: str,
+    sampling_regime: str,
+    campaign_purpose: str,
+    scientific_config_digest: str,
+) -> str:
+    """Build the flat semantic storage locator for one scientific batch."""
+    components = {
+        "simulation_profile": simulation_profile,
+        "material_family": material_family,
+        "sampling_regime": sampling_regime,
+        "campaign_purpose": campaign_purpose,
+    }
+    for label, value in components.items():
+        common.paths.validate_logical_name(value, label=label)
+        if _STORAGE_COMPONENT_PATTERN.fullmatch(value) is None:
+            message = f"{label} must be one canonical lowercase underscore-separated token."
+            raise ValueError(message)
+    if _SHA256_PATTERN.fullmatch(scientific_config_digest) is None:
+        message = "scientific_config_digest must be one lowercase SHA-256 digest."
+        raise ValueError(message)
+    return "__".join((*components.values(), scientific_config_digest[:16]))
+
+
 def scientific_config_identity_payload(scientific: Mapping[str, Any]) -> dict[str, Any]:
     """Return the current semantic configuration identity payload."""
     return _scientific_identity_config(scientific)
@@ -188,6 +214,7 @@ class GenerationConfig:
     case_input_config_digest: str
     batch_identity: str
     batch_id: str
+    batch_storage_name: str
 
     @property
     def template_path(self) -> Path:
@@ -2532,6 +2559,13 @@ def _build_batch(
     scientific_digest = compute_scientific_config_digest(scientific)
     case_input_digest = compute_case_input_config_digest(scientific)
     batch_id = build_batch_id(batch_name, scientific_digest)
+    batch_storage_name = build_batch_storage_name(
+        profile.id,
+        material_family,
+        sampling_regime,
+        campaign_purpose,
+        scientific_digest,
+    )
     return GenerationConfig(
         source_path=source_path,
         profile=profile,
@@ -2550,6 +2584,7 @@ def _build_batch(
         case_input_config_digest=case_input_digest,
         batch_identity=scientific_digest,
         batch_id=batch_id,
+        batch_storage_name=batch_storage_name,
     )
 
 

@@ -220,6 +220,65 @@ Preflight checks the login environment and then submits one environment-only
 Slurm job to verify modules, executables, project imports, templates, scratch,
 and durable storage. It performs no COMSOL solve.
 
+### Canonical input-case generation and EDA
+
+`generate-input-cases` publishes or exactly reuses canonical input cases without
+calling COMSOL or Slurm. Generate one exact batch and bounded case range with:
+
+```bash
+./scripts/docker_python.sh -m src.generation.cli.cli_generation generate-input-cases \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --only-batch transient_drying__lentil__natural \
+  --case-start 1 --case-count 10 \
+  --git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"
+```
+
+For Technical Runtime Smoke inputs, select the maintained smoke campaign:
+
+```bash
+./scripts/docker_python.sh -m src.generation.cli.cli_generation generate-input-cases \
+  configs/generation/campaigns/transient_drying/technical_smoke.yaml \
+  --all-batches --all-cases \
+  --git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"
+```
+
+To generate all natural batches selected by the family campaign, use:
+
+```bash
+./scripts/docker_python.sh -m src.generation.cli.cli_generation generate-input-cases \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --all-batches --only-regime natural --all-cases \
+  --git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"
+```
+
+Add `--dry-run` to any selection to validate and report it without changing
+canonical storage. For example:
+
+```bash
+./scripts/docker_python.sh -m src.generation.cli.cli_generation generate-input-cases \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --only-batch transient_drying__lentil__natural \
+  --case-start 1 --case-count 10 --dry-run \
+  --git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"
+```
+
+[`generation_input_eda.ipynb`](../notebooks/generation_input_eda.ipynb) is a
+strictly read-only view of manifest-admitted canonical input cases. Generate
+additional cases through `generate-input-cases`, then rerun the notebook. It
+does not plan generation, acquire generation locks, publish storage, or inspect
+completed solver output.
+
+A new workspace selects the first dataset in canonical catalog order, its first
+admitted case as Case A, and its next admitted case as Case B; a one-case dataset
+uses that case for both. Dataset A/B and Case A/B remain synchronized across
+views for the current kernel session, while view-specific controls remain local.
+Closing and reopening the same panel preserves session state. Restarting the
+kernel reconstructs deterministic catalog defaults.
+
+Dataset labels have the form `<profile> · <material> · <regime> · <purpose>`.
+The workspace derives and explains profile labels and campaign-purpose
+abbreviations from admitted canonical metadata.
+
 ### Technical Smoke
 
 `smoke` runs both maintained profile campaigns with real COMSOL. It validates

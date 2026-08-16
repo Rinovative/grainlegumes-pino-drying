@@ -37,6 +37,7 @@ from src.generation import generation_smoke as smoke_service
 from src.generation import generation_workflow as workflow_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_descriptors as contracts_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
@@ -306,6 +307,23 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     _add_batch_selection(generate, required=True)
     generate.add_argument("case_index", type=int)
     generate.add_argument("destination", type=Path)
+
+    input_cases = subparsers.add_parser(
+        "generate-input-cases",
+        help="generate canonical batch-oriented input-only cases",
+    )
+    input_cases.add_argument("config", type=Path)
+    input_batch_selection = input_cases.add_mutually_exclusive_group(required=True)
+    input_batch_selection.add_argument("--only-batch")
+    input_batch_selection.add_argument("--all-batches", action="store_true")
+    input_cases.add_argument("--only-regime", choices=("natural",))
+    input_case_selection = input_cases.add_mutually_exclusive_group(required=True)
+    input_case_selection.add_argument("--case-count", type=int)
+    input_case_selection.add_argument("--all-cases", action="store_true")
+    input_cases.add_argument("--case-start", type=int)
+    input_cases.add_argument("--dry-run", action="store_true")
+    input_cases.add_argument("--git-commit", required=True)
+    input_cases.add_argument("--storage-root", type=Path, required=True)
 
     prepare = subparsers.add_parser("prepare-case", help="prepare one isolated case work directory")
     prepare.add_argument("config", type=Path)
@@ -654,6 +672,7 @@ def _summary(config: config_service.GenerationConfig) -> dict[str, Any]:
         "sampling_regime": config.sampling_regime,
         "batch_name": config.batch_name,
         "batch_id": config.batch_id,
+        "batch_storage_name": config.batch_storage_name,
         "batch_identity": config.batch_identity,
         "case_count": config.scientific_values["case_count"],
         "seed_base": config.seed_base,
@@ -1549,6 +1568,24 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0
+    if args.command == "generate-input-cases":
+        action = "dry_run" if args.dry_run else "execute"
+        response = input_service.run_campaign_input_generation(
+            input_service.CampaignInputGenerationRequest(
+                campaign_config=args.config,
+                storage_root=args.storage_root,
+                action=action,
+                only_batch=args.only_batch,
+                all_batches=args.all_batches,
+                only_regime=args.only_regime,
+                case_start=args.case_start,
+                case_count=args.case_count,
+                all_cases=args.all_cases,
+                git_commit=args.git_commit,
+            )
+        )
+        print(json.dumps(response, sort_keys=True))
+        return 0
     config = _load(args)
     if args.command == "validate-config":
         print(json.dumps(_summary(config), sort_keys=True))
@@ -1643,7 +1680,17 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         return 0
     if args.command == "validate-transfer":
         manifest = runtime_service.validate_terminal_batch(config, storage_root=args.storage_root)
-        print(json.dumps({"status": "valid", "batch_id": manifest["batch_id"], "case_count": len(manifest["cases"])}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "status": "valid",
+                    "batch_id": manifest["batch_id"],
+                    "batch_storage_name": manifest["batch_storage_name"],
+                    "case_count": len(manifest["cases"]),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     message = f"Unsupported generation command: {args.command!r}."
     raise ValueError(message)
