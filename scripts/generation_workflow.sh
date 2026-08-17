@@ -811,6 +811,11 @@ REMOTE
 }
 
 
+remote_prepare_campaign_inputs() {
+  remote_plan_submit prepare-campaign-inputs
+}
+
+
 preflight_cpu() {
   HUMAN_WORKFLOW_MODE=true
   generation_console_stage 1 3 "Local preflight" RUNNING
@@ -1566,23 +1571,23 @@ continue_pilot_workflow() {
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
     local_cli validate-pilot-check "${RUN_ID}" --format summary \
       --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
-    generation_console_stage 7 11 "Generation" REUSED "campaign_run_id=${RUN_ID}"
-    generation_console_stage 8 11 "GPU publication" REUSED "validated destination=${LOCAL_STORAGE_ROOT}"
-    generation_console_stage 9 11 "Pilot analysis" REUSED "Dataset and physical checks validated"
-    generation_console_stage 10 11 "Cleanup" REUSED "completed cleanup receipts validated"
-    generation_console_stage 11 11 "Final validation" REUSED "pilot receipt already complete"
+    generation_console_stage 8 12 "Generation" REUSED "campaign_run_id=${RUN_ID}"
+    generation_console_stage 9 12 "GPU publication" REUSED "validated destination=${LOCAL_STORAGE_ROOT}"
+    generation_console_stage 10 12 "Pilot analysis" REUSED "Dataset and physical checks validated"
+    generation_console_stage 11 12 "Cleanup" REUSED "completed cleanup receipts validated"
+    generation_console_stage 12 12 "Final validation" REUSED "pilot receipt already complete"
     generation_console_final "campaign_run_id=${RUN_ID} pilot receipt validated"
     ALL_WORKFLOW_ACTIVE=false
     return
   fi
 
   ALL_STAGE="remote pilot terminal monitoring"
-  wait_for_terminal_publication 7 11 "Generation"
-  generation_console_stage 7 11 "Generation" OK \
+  wait_for_terminal_publication 8 12 "Generation"
+  generation_console_stage 8 12 "Generation" OK \
     "campaign_run_id=${RUN_ID} state=publication_complete"
 
   ALL_STAGE="pilot source inventory, transfer, and hash validation"
-  generation_console_stage 8 11 "GPU publication" RUNNING
+  generation_console_stage 9 12 "GPU publication" RUNNING
   local transfer_status=REUSED
   if ! gpu_publication_is_valid; then
     [[ "${REMOTE_SOURCE_STATE}" != source_cleanup_complete ]] ||
@@ -1590,11 +1595,11 @@ continue_pilot_workflow() {
     collect_campaign >/dev/null
     transfer_status=OK
   fi
-  generation_console_stage 8 11 "GPU publication" "${transfer_status}" \
+  generation_console_stage 9 12 "GPU publication" "${transfer_status}" \
     "campaign_run_id=${RUN_ID} destination=${LOCAL_STORAGE_ROOT} retained_bytes=${CPU_BYTES_RETAINED}"
 
   ALL_STAGE="canonical HDF5 and physical/runtime pilot analysis"
-  generation_console_stage 9 11 "Pilot analysis" RUNNING
+  generation_console_stage 10 12 "Pilot analysis" RUNNING
   prepare_pilot_check_receipt >/dev/null
   ALL_STAGE="empty production-dataset gate bound to pilot evidence"
   local dataset_output dataset_id=unavailable
@@ -1603,11 +1608,11 @@ continue_pilot_workflow() {
   if [[ ${dataset_output} =~ ${dataset_pattern} ]]; then
     dataset_id="${BASH_REMATCH[1]}"
   fi
-  generation_console_stage 9 11 "Pilot analysis" OK \
+  generation_console_stage 10 12 "Pilot analysis" OK \
     "campaign_run_id=${RUN_ID} dataset_id=${dataset_id}"
 
   ALL_STAGE="terminal pre-cleanup workflow receipt"
-  generation_console_stage 10 11 "Cleanup" RUNNING
+  generation_console_stage 11 12 "Cleanup" RUNNING
   prepare_all_receipt >/dev/null
   read_remote_source_status
   [[ "${REMOTE_SOURCE_ACTIVE}" == False ]] ||
@@ -1626,14 +1631,14 @@ continue_pilot_workflow() {
   cleanup_pilot_staging >/dev/null
   ALL_STAGE="canonical final pilot cleanup receipt"
   record_pilot_cleanup_result
-  generation_console_stage 10 11 "Cleanup" OK "${cleanup_detail}; pilot staging reclaimed"
+  generation_console_stage 11 12 "Cleanup" OK "${cleanup_detail}; pilot staging reclaimed"
 
   ALL_STAGE="terminal pilot and workflow receipt validation"
-  generation_console_stage 11 11 "Final validation" RUNNING
+  generation_console_stage 12 12 "Final validation" RUNNING
   local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
   local_cli validate-pilot-check "${RUN_ID}" --require-cleanup-complete --format summary \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
-  generation_console_stage 11 11 "Final validation" OK \
+  generation_console_stage 12 12 "Final validation" OK \
     "campaign_run_id=${RUN_ID} pilot and workflow receipts validated"
   generation_console_final "campaign_run_id=${RUN_ID} pilot receipt validated"
   ALL_WORKFLOW_ACTIVE=false
@@ -1646,53 +1651,66 @@ run_pilot_check() {
   trap 'workflow_exit_handler $?' EXIT
 
   ALL_STAGE="local exact-commit and campaign validation"
-  generation_console_stage 1 11 "Local preflight" RUNNING
+  generation_console_stage 1 12 "Local preflight" RUNNING
   resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_pilot_contract
   resolve_local_storage
   resolve_configured_resources
   validate_resources
-  generation_console_stage 1 11 "Local preflight" OK \
+  generation_console_stage 1 12 "Local preflight" OK \
     "commit=${REQUESTED_COMMIT:0:12} campaign=${CAMPAIGN_RELATIVE_PATH} cases=${PILOT_TOTAL_CASES}"
 
   ALL_STAGE="CPU setup and readiness"
-  generation_console_stage 2 11 "CPU readiness" RUNNING
+  generation_console_stage 2 12 "CPU readiness" RUNNING
   EXECUTE_SETUP=true
   setup_cpu >/dev/null
   preflight_cpu >/dev/null
-  generation_console_stage 2 11 "CPU readiness" OK \
+  generation_console_stage 2 12 "CPU readiness" OK \
     "host=${CPU_HOST} scheduler=${SCHEDULER_KIND} partition=${PARTITION}"
 
   ALL_STAGE="profile technical-smoke evidence"
-  generation_console_stage 3 11 "Runtime-smoke evidence" RUNNING
+  generation_console_stage 3 12 "Runtime-smoke evidence" RUNNING
   local comsol_version pilot_campaign_path
   comsol_version="$(remote_comsol_version)"
   pilot_campaign_path="${CAMPAIGN_CONFIG_PATH}"
   technical_smoke_evidence_status_cpu "${pilot_campaign_path}" "${comsol_version}" >/dev/null ||
     fail 2 "Current successful transient technical-smoke evidence is required before pilot launch; run the technical smoke first."
-  generation_console_stage 3 11 "Runtime-smoke evidence" OK "COMSOL=${comsol_version}"
+  generation_console_stage 3 12 "Runtime-smoke evidence" OK "COMSOL=${comsol_version}"
 
   resolve_campaign "${pilot_campaign_path}"
   resolve_configured_resources
   ALL_STAGE="configured-material static scientific sentinels"
-  generation_console_stage 4 11 "Scientific sentinels" RUNNING
+  generation_console_stage 4 12 "Scientific sentinels" RUNNING
   local_cli static-sentinels "${STATIONARY_PRIMARY_CAMPAIGN_HOST_PATH}" \
     "${TRANSIENT_PRIMARY_CAMPAIGN_HOST_PATH}" >/dev/null ||
     fail 2 "Static scientific sentinels block pilot launch; inspect the sentinel report before rerunning."
-  generation_console_stage 4 11 "Scientific sentinels" OK "configured-material checks passed"
+  generation_console_stage 4 12 "Scientific sentinels" OK "configured-material checks passed"
   print_layout >/dev/null
 
+  ALL_STAGE="canonical pilot input preparation and admission"
+  generation_console_stage 5 12 "Canonical inputs" RUNNING
+  local input_record input_kind input_generated input_reused input_extra
+  input_record="$(remote_prepare_campaign_inputs)" ||
+    fail 1 "Canonical pilot input preparation failed before campaign planning or launch."
+  IFS=$'\t' read -r input_kind input_generated input_reused input_extra <<< "${input_record}"
+  [[ "${input_kind}" == canonical-inputs && -z "${input_extra:-}" ]] ||
+    fail 1 "Malformed canonical pilot input readiness result."
+  validate_nonnegative "generated canonical input count" "${input_generated}"
+  validate_nonnegative "reused canonical input count" "${input_reused}"
+  generation_console_stage 5 12 "Canonical inputs" OK \
+    "reused=${input_reused} generated=${input_generated}"
+
   ALL_STAGE="resolved pilot campaign plan"
-  generation_console_stage 5 11 "Campaign plan" RUNNING
+  generation_console_stage 6 12 "Campaign plan" RUNNING
   remote_plan_submit plan-campaign >/dev/null
-  generation_console_stage 5 11 "Campaign plan" OK \
+  generation_console_stage 6 12 "Campaign plan" OK \
     "materials=${PILOT_MATERIAL_COUNT} cases_per_material=${PILOT_CASES_PER_MATERIAL} total=${PILOT_TOTAL_CASES}"
 
   ALL_STAGE="pilot campaign launch"
-  generation_console_stage 6 11 "Campaign launch" RUNNING
+  generation_console_stage 7 12 "Campaign launch" RUNNING
   launch_campaign >/dev/null
-  generation_console_stage 6 11 "Campaign launch" OK "campaign_run_id=${RUN_ID}"
+  generation_console_stage 7 12 "Campaign launch" OK "campaign_run_id=${RUN_ID}"
   ALLOW_REMOTE_RESUME=false
   continue_pilot_workflow
 }
@@ -1704,10 +1722,10 @@ continue_all_workflow() {
   resolve_remote_layout
   ALL_STAGE="existing terminal receipt validation"
   if local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
-    generation_console_stage 5 8 "Generation" REUSED "campaign_run_id=${RUN_ID}"
-    generation_console_stage 6 8 "GPU publication" REUSED "validated destination=${LOCAL_STORAGE_ROOT}"
-    generation_console_stage 7 8 "Dataset packages" REUSED "validated campaign_run_id=${RUN_ID}"
-    generation_console_stage 8 8 "Workflow receipt" REUSED \
+    generation_console_stage 6 9 "Generation" REUSED "campaign_run_id=${RUN_ID}"
+    generation_console_stage 7 9 "GPU publication" REUSED "validated destination=${LOCAL_STORAGE_ROOT}"
+    generation_console_stage 8 9 "Dataset packages" REUSED "validated campaign_run_id=${RUN_ID}"
+    generation_console_stage 9 9 "Workflow receipt" REUSED \
       "campaign_run_id=${RUN_ID} already complete and validated"
     generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
     ALL_WORKFLOW_ACTIVE=false
@@ -1715,12 +1733,12 @@ continue_all_workflow() {
   fi
 
   ALL_STAGE="remote generation completion"
-  wait_for_terminal_publication 5 8 "Generation"
-  generation_console_stage 5 8 "Generation" OK \
+  wait_for_terminal_publication 6 9 "Generation"
+  generation_console_stage 6 9 "Generation" OK \
     "campaign_run_id=${RUN_ID} state=publication_complete"
 
   ALL_STAGE="GPU collection and atomic publication"
-  generation_console_stage 6 8 "GPU publication" RUNNING
+  generation_console_stage 7 9 "GPU publication" RUNNING
   local transfer_status=REUSED
   if ! gpu_publication_is_valid; then
     [[ "${REMOTE_SOURCE_STATE}" != source_cleanup_complete ]] ||
@@ -1728,22 +1746,22 @@ continue_all_workflow() {
     collect_campaign >/dev/null
     transfer_status=OK
   fi
-  generation_console_stage 6 8 "GPU publication" "${transfer_status}" \
+  generation_console_stage 7 9 "GPU publication" "${transfer_status}" \
     "campaign_run_id=${RUN_ID} destination=${LOCAL_STORAGE_ROOT} retained_bytes=${CPU_BYTES_RETAINED}"
 
   ALL_STAGE="dataset build, inspection, and loader smokes"
-  generation_console_stage 7 8 "Dataset packages" RUNNING
+  generation_console_stage 8 9 "Dataset packages" RUNNING
   local dataset_output dataset_id=unavailable
   local dataset_pattern='"dataset_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9._:-]+)"'
   dataset_output="$(build_datasets)"
   if [[ ${dataset_output} =~ ${dataset_pattern} ]]; then
     dataset_id="${BASH_REMATCH[1]}"
   fi
-  generation_console_stage 7 8 "Dataset packages" OK \
+  generation_console_stage 8 9 "Dataset packages" OK \
     "campaign_run_id=${RUN_ID} dataset_id=${dataset_id}"
 
   ALL_STAGE="terminal pre-cleanup receipt"
-  generation_console_stage 8 8 "Workflow receipt" RUNNING
+  generation_console_stage 9 9 "Workflow receipt" RUNNING
   prepare_all_receipt >/dev/null
   local cleanup_detail
   if [[ "${KEEP_CPU_SOURCE}" == true ]]; then
@@ -1755,7 +1773,7 @@ continue_all_workflow() {
   fi
   ALL_STAGE="terminal receipt validation"
   local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
-  generation_console_stage 8 8 "Workflow receipt" OK \
+  generation_console_stage 9 9 "Workflow receipt" OK \
     "campaign_run_id=${RUN_ID} ${cleanup_detail}"
   generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
   ALL_WORKFLOW_ACTIVE=false
@@ -1765,7 +1783,7 @@ run_all() {
   ALL_WORKFLOW_ACTIVE=true
   trap 'workflow_exit_handler $?' EXIT
   ALL_STAGE="local repository, campaign, and resource validation"
-  generation_console_stage 1 8 "Local preflight" RUNNING
+  generation_console_stage 1 9 "Local preflight" RUNNING
   resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
@@ -1774,26 +1792,39 @@ run_all() {
   resolve_local_storage
   resolve_local_python
   validate_local_launch_gates
-  generation_console_stage 1 8 "Local preflight" OK \
+  generation_console_stage 1 9 "Local preflight" OK \
     "commit=${REQUESTED_COMMIT:0:12} campaign=${CAMPAIGN_RELATIVE_PATH}"
-  ALL_STAGE="CPU setup and resolved campaign plan"
-  generation_console_stage 2 8 "CPU login preflight" RUNNING
+  ALL_STAGE="CPU setup and canonical input readiness"
+  generation_console_stage 2 9 "CPU login preflight" RUNNING
   verify_remote_setup >/dev/null
-  generation_console_stage 2 8 "CPU login preflight" OK \
+  generation_console_stage 2 9 "CPU login preflight" OK \
     "host=${CPU_HOST} scheduler=${SCHEDULER_KIND} partition=${PARTITION}"
-  generation_console_stage 3 8 "Campaign plan" RUNNING
+  ALL_STAGE="canonical input preparation and admission"
+  generation_console_stage 3 9 "Canonical inputs" RUNNING
+  local input_record input_kind input_generated input_reused input_extra
+  input_record="$(remote_prepare_campaign_inputs)" ||
+    fail 1 "Canonical input preparation failed before campaign planning or launch."
+  IFS=$'\t' read -r input_kind input_generated input_reused input_extra <<< "${input_record}"
+  [[ "${input_kind}" == canonical-inputs && -z "${input_extra:-}" ]] ||
+    fail 1 "Malformed canonical input readiness result."
+  validate_nonnegative "generated canonical input count" "${input_generated}"
+  validate_nonnegative "reused canonical input count" "${input_reused}"
+  generation_console_stage 3 9 "Canonical inputs" OK \
+    "reused=${input_reused} generated=${input_generated}"
+  ALL_STAGE="resolved campaign plan"
+  generation_console_stage 4 9 "Campaign plan" RUNNING
   remote_plan_submit plan-campaign >/dev/null
-  generation_console_stage 3 8 "Campaign plan" OK \
+  generation_console_stage 4 9 "Campaign plan" OK \
     "purpose=${CAMPAIGN_PURPOSE} cleanup=$([[ "${KEEP_CPU_SOURCE}" == true ]] && printf retain || printf verified-delete)"
   ALL_STAGE="campaign launch"
-  generation_console_stage 4 8 "Campaign launch" RUNNING
+  generation_console_stage 5 9 "Campaign launch" RUNNING
   launch_campaign >/dev/null
-  generation_console_stage 4 8 "Campaign launch" OK "campaign_run_id=${RUN_ID}"
+  generation_console_stage 5 9 "Campaign launch" OK "campaign_run_id=${RUN_ID}"
   if [[ "${DETACH}" == true ]]; then
-    generation_console_stage 5 8 "Generation" SKIPPED "detached after launch"
-    generation_console_stage 6 8 "GPU publication" SKIPPED "resume required"
-    generation_console_stage 7 8 "Dataset packages" SKIPPED "resume required"
-    generation_console_stage 8 8 "Workflow receipt" SKIPPED "resume required"
+    generation_console_stage 6 9 "Generation" SKIPPED "detached after launch"
+    generation_console_stage 7 9 "GPU publication" SKIPPED "resume required"
+    generation_console_stage 8 9 "Dataset packages" SKIPPED "resume required"
+    generation_console_stage 9 9 "Workflow receipt" SKIPPED "resume required"
     generation_console_final "campaign_run_id=${RUN_ID} detached; resume required"
     printf 'Resume-all command: %s\n' "$(resume_command_text)"
     ALL_WORKFLOW_ACTIVE=false
@@ -1811,19 +1842,21 @@ resume_all() {
   verify_remote_setup >/dev/null
   read_remote_campaign_identity
   if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
-    generation_console_stage 1 11 "Local preflight" OK \
+    generation_console_stage 1 12 "Local preflight" OK \
       "commit=${REQUESTED_COMMIT:0:12} campaign_run_id=${RUN_ID}"
-    generation_console_stage 2 11 "CPU readiness" OK "host=${CPU_HOST}"
-    generation_console_stage 3 11 "Runtime-smoke evidence" REUSED "persisted campaign evidence"
-    generation_console_stage 4 11 "Scientific sentinels" REUSED "persisted campaign contract"
-    generation_console_stage 5 11 "Campaign plan" REUSED "persisted campaign identity"
-    generation_console_stage 6 11 "Campaign launch" REUSED "campaign_run_id=${RUN_ID}"
+    generation_console_stage 2 12 "CPU readiness" OK "host=${CPU_HOST}"
+    generation_console_stage 3 12 "Runtime-smoke evidence" REUSED "persisted campaign evidence"
+    generation_console_stage 4 12 "Scientific sentinels" REUSED "persisted campaign contract"
+    generation_console_stage 5 12 "Canonical inputs" REUSED "persisted campaign identity"
+    generation_console_stage 6 12 "Campaign plan" REUSED "persisted campaign identity"
+    generation_console_stage 7 12 "Campaign launch" REUSED "campaign_run_id=${RUN_ID}"
   else
-    generation_console_stage 1 8 "Local preflight" OK \
+    generation_console_stage 1 9 "Local preflight" OK \
       "commit=${REQUESTED_COMMIT:0:12} campaign_run_id=${RUN_ID}"
-    generation_console_stage 2 8 "CPU login preflight" OK "host=${CPU_HOST}"
-    generation_console_stage 3 8 "Campaign plan" REUSED "persisted campaign identity"
-    generation_console_stage 4 8 "Campaign launch" REUSED "campaign_run_id=${RUN_ID}"
+    generation_console_stage 2 9 "CPU login preflight" OK "host=${CPU_HOST}"
+    generation_console_stage 3 9 "Canonical inputs" REUSED "persisted campaign identity"
+    generation_console_stage 4 9 "Campaign plan" REUSED "persisted campaign identity"
+    generation_console_stage 5 9 "Campaign launch" REUSED "campaign_run_id=${RUN_ID}"
   fi
   ALLOW_REMOTE_RESUME=true
   if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then

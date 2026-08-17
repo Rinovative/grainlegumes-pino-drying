@@ -102,6 +102,9 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         arguments = list(command)
         calls.append(arguments)
         if arguments[0] == "sbatch":
+            discovery = generation.cases.admission.discover_input_batches(storage)
+            assert not discovery.issues
+            assert sum(len(source.cases) for source in discovery.sources) == campaign.total_case_count
             return subprocess.CompletedProcess(
                 arguments,
                 0,
@@ -146,11 +149,18 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     )
     assert persisted["submissions"][0]["job_id"] == "12345"
 
-    active = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
+    blocked = AssertionError("Current canonical inputs were regenerated before resubmission.")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            generation.cases.input_generation.case_service,
+            "generate_case_input_bundle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(blocked),
+        )
+        active = generation.campaign.submit_campaign(
+            campaign,
+            git_commit=commit,
+            storage_root=storage,
+        )
     assert active["slurm_job_ids"] == ["12345"]
     assert [command[0] for command in calls].count("sbatch") == 1
 
@@ -168,6 +178,55 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     )
     assert advanced["slurm_job_ids"] == ["12345", "12346"]
     assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
+
+
+def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject invalid current evidence before any scientific job is submitted."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    commit = "7" * 40
+    storage = tmp_path / "storage"
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
+    generated = generation.cases.input_generation.generate_input_cases(
+        batch,
+        1,
+        storage_root=storage,
+    )
+    manifest_path = generated.metadata_directory / "input_generation_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "publishing"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    scheduler_calls: list[list[str]] = []
+
+    def reject_scheduler(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        scheduler_calls.append(command)
+        message = "Invalid canonical inputs reached scheduler submission."
+        raise AssertionError(message)
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", reject_scheduler)
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
+
+    with pytest.raises(FileExistsError, match="incomplete or invalid"):
+        generation.campaign.submit_campaign(
+            campaign,
+            git_commit=commit,
+            storage_root=storage,
+        )
+
+    assert scheduler_calls == []
+    assert not campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    ).exists()
 
 
 def test_license_retry_waits_then_resubmits_the_same_case_once(

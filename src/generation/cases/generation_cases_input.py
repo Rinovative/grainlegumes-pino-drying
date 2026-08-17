@@ -40,8 +40,6 @@ from . import generation_cases_admission as admission_service
 from . import generation_cases_case as case_service
 from . import generation_cases_config as config_service
 
-INPUT_BATCH_SCHEMA_KIND = "generation_input_batch"
-INPUT_BATCH_SCHEMA_VERSION = 1
 INPUT_TRANSACTION_SCHEMA_VERSION = 1
 INPUT_GENERATION_ACTIONS: Final = ("dry_run", "execute")
 
@@ -102,8 +100,8 @@ def _manifest_base(
     """Build source identity that remains stable while case membership grows."""
     scientific = config.scientific_values
     base = {
-        "schema_kind": INPUT_BATCH_SCHEMA_KIND,
-        "schema_version": INPUT_BATCH_SCHEMA_VERSION,
+        "schema_kind": admission_service.INPUT_BATCH_SCHEMA_KIND,
+        "schema_version": admission_service.INPUT_BATCH_SCHEMA_VERSION,
         "campaign_id": scientific["campaign_id"],
         "campaign_purpose": scientific["campaign_purpose"],
         "batch_name": config.batch_name,
@@ -128,6 +126,26 @@ def _manifest_base(
         "input_generation_id": admission_service.compute_input_generation_id(base),
         "status": "ready",
     }
+
+
+def configured_input_generation_id(
+    config: config_service.GenerationConfig,
+) -> str:
+    """
+    Return the exact current input-generation identity for one batch.
+
+    Parameters
+    ----------
+    config : GenerationConfig
+        Fully resolved batch configuration bound to the active source commit.
+
+    Returns
+    -------
+    str
+        Logical identity of the sole current schema-v1 input generation.
+
+    """
+    return str(_manifest_base(config, _resolved_config(config))["input_generation_id"])
 
 
 def select_case_indices(
@@ -197,31 +215,25 @@ def _immutable_json(path: Path, payload: Mapping[str, Any], *, label: str) -> Pa
     return common.serialization.atomic_write_text(path, serialized)
 
 
-def initialize_batch_metadata(
+def _initialize_input_generation_metadata(
     config: config_service.GenerationConfig,
+    resolved_config: Mapping[str, Any],
+    input_generation_id: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Initialize shared immutable science and execution metadata for one batch."""
-    directory = common.paths.resolve_generation_input_metadata_directory(
+    """Initialize immutable metadata for one exact input generation."""
+    directory = common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name,
+        input_generation_id,
         storage_root=storage_root,
     )
     directory.mkdir(parents=True, exist_ok=True)
-    scientific_path = _immutable_json(
+    return _immutable_json(
         directory / "resolved_generation_config.json",
-        _resolved_config(config),
-        label="resolved scientific generation configuration",
+        resolved_config,
+        label="resolved scientific input-generation configuration",
     )
-    execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
-    execution_directory = directory / "execution_configs"
-    execution_directory.mkdir(exist_ok=True)
-    _immutable_json(
-        execution_directory / f"{execution_digest}.json",
-        config.execution_values,
-        label="resolved execution provenance",
-    )
-    return scientific_path
 
 
 def _load_existing(
@@ -260,8 +272,13 @@ def admit_configured_input_case(
     config.case_id(case_index)
     resolved_config = _resolved_config(config)
     base = _manifest_base(config, resolved_config)
-    metadata_directory = common.paths.resolve_generation_input_metadata_directory(config.batch_storage_name, storage_root=storage_root)
-    raw_directory = common.paths.resolve_generation_input_raw_batch_directory(config.batch_storage_name, storage_root=storage_root)
+    input_generation_id = str(base["input_generation_id"])
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
     _records, source = _load_existing(
         metadata_directory,
         raw_directory,
@@ -294,8 +311,13 @@ def plan_input_cases(
     requested = select_case_indices(config, case_count, case_start)
     resolved_config = _resolved_config(config)
     base = _manifest_base(config, resolved_config)
-    metadata_directory = common.paths.resolve_generation_input_metadata_directory(config.batch_storage_name, storage_root=storage_root)
-    raw_directory = common.paths.resolve_generation_input_raw_batch_directory(config.batch_storage_name, storage_root=storage_root)
+    input_generation_id = str(base["input_generation_id"])
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
     manifest_exists = (metadata_directory / "input_generation_manifest.json").is_file()
     raw_exists = raw_directory.is_dir()
     records: dict[int, Mapping[str, Any]] = {}
@@ -382,8 +404,8 @@ def _recover_input_transaction(
         shutil.rmtree(transaction)
         return
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    staged_metadata = transaction / "meta" / batch_storage_name
-    staged_raw = transaction / "raw" / batch_storage_name
+    staged_metadata = transaction / "meta" / batch_storage_name / "input_generations" / str(base["input_generation_id"])
+    staged_raw = transaction / "raw" / batch_storage_name / "input_generations" / str(base["input_generation_id"])
     manifest_path = staged_metadata / "input_generation_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     new_case_ids = journal.get("new_case_ids") if isinstance(journal, dict) else None
@@ -473,12 +495,21 @@ def generate_input_cases(
     resolved_config = _resolved_config(config)
     base = _manifest_base(config, resolved_config)
     input_generation_id = str(base["input_generation_id"])
-    metadata_directory = common.paths.resolve_generation_input_metadata_directory(config.batch_storage_name, storage_root=storage_root)
-    raw_directory = common.paths.resolve_generation_input_raw_batch_directory(config.batch_storage_name, storage_root=storage_root)
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
     lock_path = common.paths.resolve_generation_input_lock_path(config.batch_storage_name, storage_root=storage_root)
     transaction = common.paths.resolve_generation_input_transaction_directory(input_generation_id, storage_root=storage_root)
     with common.locking.exclusive_file_lock(lock_path, blocking=True):
-        initialize_batch_metadata(config, storage_root=storage_root)
+        _initialize_input_generation_metadata(
+            config,
+            resolved_config,
+            input_generation_id,
+            storage_root=storage_root,
+        )
         if transaction.exists():
             _recover_input_transaction(
                 transaction,
@@ -510,8 +541,8 @@ def generate_input_cases(
         if generated_indices:
             transaction.parent.mkdir(parents=True, exist_ok=True)
             transaction.mkdir()
-            staged_raw = transaction / "raw" / config.batch_storage_name
-            staged_metadata = transaction / "meta" / config.batch_storage_name
+            staged_raw = transaction / "raw" / config.batch_storage_name / "input_generations" / input_generation_id
+            staged_metadata = transaction / "meta" / config.batch_storage_name / "input_generations" / input_generation_id
             try:
                 for case_index in generated_indices:
                     case_id = config.case_id(case_index)
@@ -679,6 +710,67 @@ def _equivalent_cli_command(
     return shlex.join(command)
 
 
+def prepare_campaign_inputs(
+    campaign: config_service.CampaignConfig,
+    *,
+    git_commit: str,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """
+    Materialize or admit every selected campaign case before submission.
+
+    Parameters
+    ----------
+    campaign : CampaignConfig
+        Exact campaign selection whose configured case membership is required.
+    git_commit : str
+        Lowercase source commit used in every input-generation identity.
+    storage_root : Path | str | None, optional
+        Canonical storage root, or the configured default when omitted.
+
+    Returns
+    -------
+    dict[str, Any]
+        Per-batch identities and aggregate generated and reused case counts.
+
+    Raises
+    ------
+    ValueError
+        If the source commit or selected case membership is invalid.
+    FileExistsError
+        If current identity evidence exists but is incomplete or invalid.
+
+    """
+    commit = source_service.validate_git_commit(git_commit)
+    storage = Path(storage_root).expanduser() if storage_root is not None else None
+    batches: list[dict[str, Any]] = []
+    with _generation_git_commit(commit):
+        for batch in campaign.batches:
+            generated = generate_input_cases(
+                batch,
+                len(batch.case_indices),
+                case_start=batch.case_indices[0],
+                storage_root=storage,
+            )
+            batches.append(
+                {
+                    "batch_id": batch.batch_id,
+                    "batch_storage_name": batch.batch_storage_name,
+                    "input_generation_id": generated.input_generation_id,
+                    "generated_case_count": generated.generated_case_count,
+                    "reused_case_count": generated.reused_case_count,
+                    "requested_case_count": len(generated.requested_case_indices),
+                }
+            )
+    return {
+        "git_commit": commit,
+        "selected_batch_count": len(batches),
+        "generated_case_count": sum(item["generated_case_count"] for item in batches),
+        "reused_case_count": sum(item["reused_case_count"] for item in batches),
+        "batches": batches,
+    }
+
+
 def run_campaign_input_generation(
     request: CampaignInputGenerationRequest,
 ) -> dict[str, Any]:
@@ -725,7 +817,7 @@ def run_campaign_input_generation(
                         "requested_case_indices": list(indices),
                         "requested_case_range": [indices[0], indices[-1]],
                         "raw_batch_root": str(
-                            common.paths.resolve_generation_input_raw_batch_directory(
+                            common.paths.resolve_generation_raw_batch_directory(
                                 batch.batch_storage_name,
                                 storage_root=storage_root,
                             )

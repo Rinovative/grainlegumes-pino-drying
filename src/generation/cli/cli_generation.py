@@ -76,6 +76,20 @@ def _add_local_resources(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-parallel-cases", type=int, required=True)
 
 
+def _add_campaign_execution_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add exact campaign selection and source-identity arguments."""
+    parser.add_argument("config", type=Path)
+    _add_batch_selection(parser, required=False)
+    parser.add_argument(
+        "--skip-extreme-family-ood",
+        action="store_true",
+        help="skip the canonical extreme-family batches for this execution only",
+    )
+    parser.add_argument("--pilot-cases-per-material", type=int)
+    parser.add_argument("--git-commit", required=True)
+    _add_storage_arguments(parser)
+
+
 def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centralized thin CLI parser
     """Build the complete generation command parser."""
     parser = argparse.ArgumentParser(description="Generate and run isolated profile-qualified COMSOL cases")
@@ -383,28 +397,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         "plan-campaign",
         help="resolve paths and Slurm arguments without mutation",
     )
-    campaign_plan.add_argument("config", type=Path)
-    _add_batch_selection(campaign_plan, required=False)
-    campaign_plan.add_argument(
-        "--skip-extreme-family-ood",
-        action="store_true",
-        help="skip the canonical extreme-family batches for this execution only",
-    )
-    campaign_plan.add_argument("--pilot-cases-per-material", type=int)
-    campaign_plan.add_argument("--git-commit", required=True)
-    _add_storage_arguments(campaign_plan)
+    _add_campaign_execution_arguments(campaign_plan)
 
-    submit_campaign = subparsers.add_parser("submit-campaign", help="submit and persist one exact-commit campaign run")
-    submit_campaign.add_argument("config", type=Path)
-    _add_batch_selection(submit_campaign, required=False)
-    submit_campaign.add_argument(
-        "--skip-extreme-family-ood",
-        action="store_true",
-        help="skip the canonical extreme-family batches for this execution only",
+    prepare_campaign_inputs = subparsers.add_parser(
+        "prepare-campaign-inputs",
+        help="prepare or reuse exact canonical inputs before submission",
     )
-    submit_campaign.add_argument("--pilot-cases-per-material", type=int)
-    submit_campaign.add_argument("--git-commit", required=True)
-    _add_storage_arguments(submit_campaign)
+    _add_campaign_execution_arguments(prepare_campaign_inputs)
+
+    submit_campaign = subparsers.add_parser(
+        "submit-campaign",
+        help="submit and persist one exact-commit campaign run",
+    )
+    _add_campaign_execution_arguments(submit_campaign)
 
     campaign_status = subparsers.add_parser("campaign-status", help="reconstruct persistent campaign and scheduler status")
     campaign_status.add_argument("campaign_run_id")
@@ -1553,7 +1558,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             )
         )
         return 0
-    if args.command in {"plan-campaign", "submit-campaign"}:
+    if args.command in {"plan-campaign", "prepare-campaign-inputs", "submit-campaign"}:
         if args.skip_extreme_family_ood and args.only_batch is not None:
             message = "--skip-extreme-family-ood cannot be combined with --only-batch."
             raise ValueError(message)
@@ -1579,6 +1584,14 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 storage_root=args.storage_root,
             )
             print(json.dumps(plan, sort_keys=True))
+            return 0
+        if args.command == "prepare-campaign-inputs":
+            readiness = input_service.prepare_campaign_inputs(
+                campaign,
+                git_commit=args.git_commit,
+                storage_root=args.storage_root,
+            )
+            print(f"canonical-inputs\t{readiness['generated_case_count']}\t{readiness['reused_case_count']}")
             return 0
         manifest = campaign_runtime.submit_campaign(
             campaign,

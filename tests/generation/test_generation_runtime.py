@@ -68,6 +68,20 @@ def _natural_batch_name(simulation_profile: str) -> str:
     )
 
 
+def _prepare_canonical_inputs(
+    config: Any,
+    storage: Path,
+    *,
+    case_count: int = 1,
+) -> None:
+    """Publish exact canonical inputs before exercising worker runtime."""
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        case_count,
+        storage_root=storage,
+    )
+
+
 def _record_synthetic_failure(
     config: Any,
     storage: Path,
@@ -450,10 +464,12 @@ def test_scalar_source_validation_precedes_evidence_and_process_start(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),
     )
+    storage = tmp_path / "scalar validation storage"
+    _prepare_canonical_inputs(config, storage)
     prepared = runtime_service.prepare_case_work_directory(
         config,
         1,
-        storage_root=tmp_path / "scalar validation storage",
+        storage_root=storage,
         work_root=tmp_path / "scalar validation work",
     )
     admission = prepared.bundle.scalar_handoff
@@ -477,6 +493,46 @@ def test_scalar_source_validation_precedes_evidence_and_process_start(
         )
     assert process_started is False
     assert not (prepared.runtime_directory / "execution_provenance.json").exists()
+
+
+def test_missing_canonical_inputs_never_trigger_worker_generation(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail worker preparation without generating absent canonical inputs."""
+    config_path, _template = generation_config_factory()
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    storage = tmp_path / "missing canonical inputs"
+    generation_called = False
+
+    def reject_generation(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal generation_called
+        generation_called = True
+        message = "worker attempted input generation"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        generation.cases.input_generation,
+        "generate_input_cases",
+        reject_generation,
+    )
+    with pytest.raises(
+        generation.runtime.CasePreparationError,
+        match="Canonical input readiness is required",
+    ):
+        runtime_service.prepare_case_work_directory(
+            config,
+            1,
+            storage_root=storage,
+            work_root=tmp_path / "missing canonical work",
+        )
+
+    assert generation_called is False
+    assert not tuple(storage.rglob("input_generation_manifest.json"))
 
 
 def test_steady_command_is_parameter_free(
@@ -687,6 +743,7 @@ def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
     )
     monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
+    _prepare_canonical_inputs(config, success_storage)
     outcome = generation.runtime.run_case(
         config,
         1,
@@ -723,6 +780,8 @@ def test_failure_timeout_missing_export_and_case_lock(
     )
     storage = tmp_path / "storage"
     work = tmp_path / "work"
+    _prepare_canonical_inputs(config, storage)
+    _prepare_canonical_inputs(config, tmp_path / "timeout-storage")
 
     monkeypatch.setenv("FAKE_COMSOL_MODE", "failure")
     with pytest.raises(generation.runtime.CaseExecutionError) as failed:
@@ -797,11 +856,13 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
+    storage = tmp_path / "no-save storage"
+    _prepare_canonical_inputs(config, storage)
     outcome = generation.runtime.run_case(
         config,
         1,
         cores_per_case=16,
-        storage_root=tmp_path / "no-save storage",
+        storage_root=storage,
         work_root=tmp_path / "no-save work",
     )
 
@@ -809,7 +870,7 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
     assert generation.runtime.completed_case_is_valid(
         config,
         1,
-        storage_root=tmp_path / "no-save storage",
+        storage_root=storage,
     )
     assert not (outcome.processed_directory / "solved.mph").exists()
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
@@ -848,6 +909,7 @@ def test_suffixed_solver_output_is_published_canonically_before_cleanup(
         only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "storage with spaces"
+    _prepare_canonical_inputs(config, storage)
     cleanup_observations: list[bool] = []
     original_cleanup = workspace.cleanup_case_workspace
 
@@ -909,6 +971,7 @@ def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
     )
     storage_root = tmp_path / "invalid solved storage"
     work_root = tmp_path / "invalid solved work"
+    _prepare_canonical_inputs(config, storage_root, case_count=len(config.case_indices))
     scenarios = (
         ("missing", True, "observed none", ("solved*.mph",)),
         ("multiple", False, "solved_1.mph, solved_2.mph", ("solved_1.mph", "solved_2.mph")),
@@ -975,6 +1038,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
     )
     storage = tmp_path / "concurrent storage"
     work = tmp_path / "concurrent work"
+    _prepare_canonical_inputs(config, storage, case_count=2)
     tracker = tmp_path / "fake-comsol-tracker.json"
     monkeypatch.setenv("FAKE_COMSOL_TRACKER", str(tracker))
     monkeypatch.setenv("FAKE_COMSOL_EXPECT_STARTS", "2")
@@ -1035,6 +1099,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "publication failure storage"
+    _prepare_canonical_inputs(config, storage)
     original_cleanup = workspace.cleanup_case_workspace
     observed = {"publication_called": False, "failure_before_cleanup": False}
 
@@ -1108,6 +1173,7 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
         only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "cancelled storage"
+    _prepare_canonical_inputs(config, storage)
     tracker = tmp_path / "cancelled tracker.json"
     monkeypatch.setenv("FAKE_COMSOL_MODE", "timeout")
     monkeypatch.setenv("FAKE_COMSOL_TRACKER", str(tracker))

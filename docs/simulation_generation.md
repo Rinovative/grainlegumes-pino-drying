@@ -180,10 +180,12 @@ Scientific startup and schedule semantics are owned by the
 ### Technical Smoke
 
 <code>smoke</code> runs maintained steady and transient technical cases with real
-COMSOL. It proves the configured technical path through validated inputs,
-exports, canonical HDF5, immutable packages, and loader access; it does not
-establish experimental or scientific validity. Its retained receipt and case
-evidence support diagnosis and are required by broader workflow gates.
+COMSOL. Before either profile is planned or launched, it prepares or reuses
+the exact commit-bound canonical inputs and requires their complete admission.
+It proves the configured technical path through validated inputs, exports,
+canonical HDF5, immutable packages, and loader access; it does not establish
+experimental or scientific validity. Its retained receipt and case evidence
+support diagnosis and are required by broader workflow gates.
 
 ### Core benchmark
 

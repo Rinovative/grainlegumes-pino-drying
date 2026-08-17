@@ -54,6 +54,11 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
         simulation_profile=simulation_profile,
     )
     storage = tmp_path / f"{simulation_profile} storage"
+    generation.cases.input_generation.generate_input_cases(
+        batch,
+        len(batch.case_indices),
+        storage_root=storage,
+    )
     outcomes = [
         generation.runtime.run_case(
             batch,

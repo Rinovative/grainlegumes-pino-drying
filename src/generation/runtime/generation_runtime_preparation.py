@@ -83,27 +83,18 @@ def _materialize_canonical_raw_bundle(
 ) -> case_service.CaseBundle:
     """Copy an exactly admitted persisted raw case into isolated scratch."""
     case_id = config.case_id(case_index)
-    raw_case = common.paths.resolve_generation_raw_case_directory(
-        config.batch_storage_name,
-        case_id,
-        storage_root=storage_root,
-    )
-    metadata = common.paths.resolve_generation_input_metadata_directory(
-        config.batch_storage_name,
-        storage_root=storage_root,
-    )
-    if not raw_case.exists() or not (metadata / "input_generation_manifest.json").is_file():
-        input_service.generate_input_cases(
+    try:
+        reference = input_service.admit_configured_input_case(
             config,
-            1,
-            case_start=case_index,
+            case_index,
             storage_root=storage_root,
         )
-    reference = input_service.admit_configured_input_case(
-        config,
-        case_index,
-        storage_root=storage_root,
-    )
+    except (FileNotFoundError, FileExistsError, OSError, RuntimeError, TypeError, ValueError) as error:
+        message = (
+            f"Canonical input readiness is required before worker execution for {case_id}; "
+            "run submit-campaign or generate-input-cases on the CPU login node first."
+        )
+        raise RuntimeError(message) from error
     source_case_json = reference.case_directory / "case.json"
     payload = json.loads(source_case_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):

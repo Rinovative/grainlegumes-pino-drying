@@ -332,7 +332,7 @@ def _plain_json(value: Any) -> Any:
 
 def _finite_real_scalar(value: object, *, label: str) -> float:
     """Return one finite Python or NumPy real scalar."""
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         msg = f"{label} must be a finite real scalar."
         raise TypeError(msg)
     number = float(value)

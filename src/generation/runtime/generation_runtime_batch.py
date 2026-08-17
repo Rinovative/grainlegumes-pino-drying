@@ -83,6 +83,7 @@ _BATCH_MANIFEST_KEYS: Final = frozenset(
         "material_family",
         "sampling_regime",
         "git_commit",
+        "input_generation_id",
         "scientific_config_digest",
         "template",
         "export_contract_sha256",
@@ -125,6 +126,7 @@ _CASE_PUBLICATION_KEYS: Final = frozenset(
         "simulation_case_id",
         "material_family",
         "git_commit",
+        "input_generation_id",
         "template_sha256",
         "scientific_config_digest",
         "export_contract_sha256",
@@ -573,6 +575,7 @@ class TerminalBatchEvidence:
     material_family: str
     sampling_regime: str
     git_commit: str
+    input_generation_id: str
     scientific_config_digest: str
     template_relative_path: str
     template_sha256: str
@@ -613,6 +616,7 @@ class TerminalBatchEvidence:
             "material_family": self.material_family,
             "sampling_regime": self.sampling_regime,
             "git_commit": self.git_commit,
+            "input_generation_id": self.input_generation_id,
             "scientific_config_digest": self.scientific_config_digest,
             "template": {
                 "relative_path": self.template_relative_path,
@@ -669,12 +673,13 @@ def raw_case_directory(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Return one permanent case-input provenance directory."""
-    return common.paths.resolve_generation_raw_case_directory(
+    """Return one exact input-generation case provenance directory."""
+    input_generation_id = input_service.configured_input_generation_id(config)
+    return common.paths.resolve_generation_input_generation_raw_directory(
         config.batch_storage_name,
-        config.case_id(case_index),
+        input_generation_id,
         storage_root=storage_root,
-    )
+    ) / config.case_id(case_index)
 
 
 def processed_case_directory(
@@ -697,7 +702,7 @@ def batch_meta_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return one batch-owned metadata directory."""
-    return common.paths.resolve_generation_input_metadata_directory(
+    return common.paths.resolve_generation_batch_metadata_directory(
         config.batch_storage_name,
         storage_root=storage_root,
     )
@@ -719,11 +724,24 @@ def initialize_batch_metadata(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Initialize the batch metadata shared with canonical input generation."""
+    """Initialize immutable batch science and execution metadata."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
-    scientific_path = input_service.initialize_batch_metadata(
-        config,
-        storage_root=storage,
+    directory = batch_meta_directory(config, storage_root=storage)
+    directory.mkdir(parents=True, exist_ok=True)
+    scientific_path = _immutable_json(
+        directory / "resolved_generation_config.json",
+        config.scientific_values,
+        label="resolved scientific generation configuration",
+    )
+    execution_digest = common.serialization.canonical_json_sha256(
+        config.execution_values,
+    )
+    execution_directory = directory / "execution_configs"
+    execution_directory.mkdir(exist_ok=True)
+    _immutable_json(
+        execution_directory / f"{execution_digest}.json",
+        config.execution_values,
+        label="resolved execution provenance",
     )
     persisted_scientific = json.loads(scientific_path.read_text(encoding="utf-8"))
     if config_contract.compute_scientific_config_digest(persisted_scientific) != config.scientific_config_digest:
@@ -1376,6 +1394,7 @@ def _complete_stage(
         "simulation_case_id": case_payload["simulation_case_id"],
         "material_family": case_payload["material_family"],
         "git_commit": case_payload["git_commit"],
+        "input_generation_id": input_service.configured_input_generation_id(config),
         "template_sha256": config.template_sha256,
         "scientific_config_digest": config.scientific_config_digest,
         "export_contract_sha256": case_payload["export_contract_sha256"],
@@ -2936,12 +2955,24 @@ def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
 
 
 def _admit_raw_publication_directory(directory: Path) -> _PublicationEvidence:
-    """Admit one canonical raw case solely through its batch input manifest."""
-    generation_root = directory.parents[2]
-    metadata_directory = generation_root / "meta" / directory.parent.name
+    """Admit one exact canonical raw case solely through its input manifest."""
+    if directory.parent.parent.name != "input_generations":
+        message = f"Canonical raw case is not scoped by input-generation identity: {directory}"
+        raise RuntimeError(message)
+    input_generation_id = common.paths.validate_logical_name(
+        directory.parent.name,
+        label="input_generation_id",
+    )
+    batch_storage_name = common.paths.validate_logical_name(
+        directory.parents[2].name,
+        label="batch_storage_name",
+    )
+    generation_root = directory.parents[4]
+    metadata_directory = generation_root / "meta" / batch_storage_name / "input_generations" / input_generation_id
     source = admission_service.admit_input_batch_source(
         metadata_directory,
         raw_directory=directory.parent,
+        expected_input_generation_id=input_generation_id,
     )
     matches = tuple(reference for reference in source.cases if reference.case_id == directory.name)
     if len(matches) != 1:
@@ -2999,6 +3030,26 @@ def _require_processed_publication_layout(
         raise RuntimeError(message)
 
 
+def _admit_processed_raw_publication(
+    directory: Path,
+    provenance: Mapping[str, Any],
+) -> tuple[str, _PublicationEvidence]:
+    """Resolve and admit the exact raw input named by processed evidence."""
+    if (
+        set(provenance) != _CASE_PUBLICATION_KEYS
+        or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
+        or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+    ):
+        message = f"Case publication schema is not current: {directory}"
+        raise RuntimeError(message)
+    input_generation_id = common.paths.validate_logical_name(
+        provenance.get("input_generation_id"),
+        label="input_generation_id",
+    )
+    raw_case = directory.parents[2] / "raw" / directory.parent.name / "input_generations" / input_generation_id / directory.name
+    return input_generation_id, _admit_raw_publication_directory(raw_case)
+
+
 def _admit_publication_directory(directory: Path, *, stage: str) -> _PublicationEvidence:
     """Admit one raw or processed case publication by producer-owned contracts."""
     if stage not in {"raw", "processed"}:
@@ -3013,8 +3064,11 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
     provenance_path = directory / "provenance.json"
     success = _load_json_object(success_path, label=f"{stage} case success marker")
     provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
-    raw_case = directory.parents[2] / "raw" / directory.parent.name / directory.name
-    case_payload = _load_json_object(raw_case / "case.json", label="canonical raw case definition")
+    input_generation_id, raw_evidence = _admit_processed_raw_publication(
+        directory,
+        provenance,
+    )
+    case_payload = raw_evidence.case_payload
     try:
         case_service.validate_case_payload_schema(case_payload)
     except (KeyError, TypeError, ValueError) as error:
@@ -3024,9 +3078,6 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         set(success) != _CASE_SUCCESS_KEYS
         or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
         or success.get("schema_version") != PUBLICATION_SCHEMA_VERSION
-        or set(provenance) != _CASE_PUBLICATION_KEYS
-        or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
-        or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
         or case_payload.get("schema_kind") != case_service.CASE_SCHEMA_KIND
         or case_payload.get("schema_version") != case_service.CASE_SCHEMA_VERSION
     ):
@@ -3100,6 +3151,7 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         "simulation_case_id": simulation_case_id,
         "material_family": material_family,
         "git_commit": git_commit,
+        "input_generation_id": input_generation_id,
         "template_sha256": template_sha256,
         "scientific_config_digest": scientific_digest,
         "export_contract_sha256": export_contract_sha256,
@@ -3640,15 +3692,24 @@ def run_case(
 
 def _validate_exact_batch_directory_membership(
     batch_storage_name: str,
+    input_generation_id: str,
     case_ids: tuple[str, ...],
     *,
     storage_root: Path | str | None,
 ) -> tuple[Path, Path]:
-    """Require raw and processed roots to contain exactly intended cases."""
+    """Require the exact input generation and processed batch membership."""
     expected = set(case_ids)
-    roots: list[Path] = []
-    for stage in ("raw", "processed"):
-        root = common.paths.resolve_generated_batch_dir(batch_storage_name, stage=stage, storage_root=storage_root)
+    raw_root = common.paths.resolve_generation_input_generation_raw_directory(
+        batch_storage_name,
+        input_generation_id,
+        storage_root=storage_root,
+    )
+    processed_root = common.paths.resolve_generated_batch_dir(
+        batch_storage_name,
+        stage="processed",
+        storage_root=storage_root,
+    )
+    for stage, root in (("raw", raw_root), ("processed", processed_root)):
         entries = tuple(root.iterdir()) if root.is_dir() and not root.is_symlink() else ()
         actual = {entry.name for entry in entries}
         unsafe = sorted(entry.name for entry in entries if not entry.is_dir() or entry.is_symlink())
@@ -3658,8 +3719,7 @@ def _validate_exact_batch_directory_membership(
                 f"extra={sorted(actual - expected)}, unsafe={unsafe}."
             )
             raise RuntimeError(msg)
-        roots.append(root.resolve())
-    return roots[0], roots[1]
+    return raw_root.resolve(), processed_root.resolve()
 
 
 def finalize_batch(
@@ -3687,8 +3747,10 @@ def finalize_batch(
                 "case_hdf5_sha256": common.serialization.file_sha256(success_path.parent / "case.h5"),
             }
         )
+    input_generation_id = input_service.configured_input_generation_id(config)
     _validate_exact_batch_directory_membership(
         config.batch_storage_name,
+        input_generation_id,
         tuple(config.case_id(case_index) for case_index in config.case_indices),
         storage_root=storage_root,
     )
@@ -3711,6 +3773,7 @@ def finalize_batch(
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "git_commit": git_commit,
+        "input_generation_id": input_generation_id,
         "scientific_config_digest": config.scientific_config_digest,
         "template": {"relative_path": config.template_relative_path, "sha256": config.template_sha256},
         "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
@@ -3986,6 +4049,10 @@ def admit_terminal_batch(
         msg = f"Terminal batch name, purpose, storage locator, or immutable identifier is invalid: {manifest_path}"
         raise RuntimeError(msg)
     git_commit = source_service.validate_git_commit(manifest.get("git_commit"))
+    input_generation_id = common.paths.validate_logical_name(
+        manifest.get("input_generation_id"),
+        label="input_generation_id",
+    )
     if set(success) != _BATCH_SUCCESS_KEYS or success != {
         "schema_kind": _BATCH_SUCCESS_SCHEMA_KIND,
         "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
@@ -4017,6 +4084,7 @@ def admit_terminal_batch(
     case_ids = tuple(f"case_{index:04d}" for index in indices)
     raw_root, processed_root = _validate_exact_batch_directory_membership(
         safe_storage_name,
+        input_generation_id,
         case_ids,
         storage_root=storage_root,
     )
@@ -4111,6 +4179,7 @@ def admit_terminal_batch(
         material_family=str(material_family),
         sampling_regime=str(sampling_regime),
         git_commit=git_commit,
+        input_generation_id=input_generation_id,
         scientific_config_digest=scientific_digest,
         template_relative_path=template_relative_path,
         template_sha256=template_sha256,

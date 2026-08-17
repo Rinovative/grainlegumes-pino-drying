@@ -203,53 +203,61 @@ def resolve_queue_log_dir(
     return get_experiments_root(storage_root=storage_root) / scope / "logs" / "queue"
 
 
-def resolve_generation_input_metadata_directory(
+def resolve_generation_batch_metadata_directory(
     batch_storage_name: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve one canonical input-batch metadata directory."""
+    """Resolve one canonical batch-owned Generation metadata directory."""
     name = validate_logical_name(batch_storage_name, label="batch_storage_name")
     return get_generation_meta_root(storage_root=storage_root) / name
 
 
-def resolve_generation_input_raw_batch_directory(
+def resolve_generation_raw_batch_directory(
     batch_storage_name: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve one canonical pre-execution raw input-batch directory."""
+    """Resolve one canonical batch-owned raw Generation directory."""
     name = validate_logical_name(batch_storage_name, label="batch_storage_name")
     return get_generation_raw_root(storage_root=storage_root) / name
 
 
-def resolve_generation_raw_case_directory(
+def resolve_generation_input_generation_metadata_directory(
     batch_storage_name: str,
-    case_id: str,
+    input_generation_id: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve one immutable canonical raw case directory."""
-    return resolve_generation_input_raw_batch_directory(
-        batch_storage_name,
-        storage_root=storage_root,
-    ) / validate_logical_name(case_id, label="case_id")
-
-
-def resolve_generation_raw_case_inputs_directory(
-    batch_storage_name: str,
-    case_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Resolve the pre-COMSOL adapters for one canonical raw case."""
+    """Resolve metadata for one exact canonical input generation."""
+    batch = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    generation = validate_logical_name(input_generation_id, label="input_generation_id")
     return (
-        resolve_generation_raw_case_directory(
-            batch_storage_name,
-            case_id,
+        resolve_generation_batch_metadata_directory(
+            batch,
             storage_root=storage_root,
         )
-        / "inputs"
+        / "input_generations"
+        / generation
+    )
+
+
+def resolve_generation_input_generation_raw_directory(
+    batch_storage_name: str,
+    input_generation_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve raw evidence for one exact canonical input generation."""
+    batch = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    generation = validate_logical_name(input_generation_id, label="input_generation_id")
+    return (
+        resolve_generation_raw_batch_directory(
+            batch,
+            storage_root=storage_root,
+        )
+        / "input_generations"
+        / generation
     )
 
 

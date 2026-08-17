@@ -95,31 +95,47 @@ def test_batch_storage_name_is_flat_explicit_and_separate_from_identity() -> Non
             )
 
 
-def test_generation_stages_share_one_flat_batch_storage_leaf(
+def test_input_generation_paths_are_scoped_below_batch_storage(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Resolve raw, meta, and processed directly under their stage roots."""
+    """Keep exact input generations distinct from batch runtime evidence."""
     config = _load_config(generation_config_factory, "transient_drying")
     storage = tmp_path / "storage"
-    paths = (
-        common.paths.resolve_generation_input_raw_batch_directory(
-            config.batch_storage_name,
-            storage_root=storage,
-        ),
-        common.paths.resolve_generation_input_metadata_directory(
-            config.batch_storage_name,
-            storage_root=storage,
-        ),
+    service = generation.cases.input_generation
+    base = service._manifest_base(config, service._resolved_config(config))
+    input_generation_id = str(base["input_generation_id"])
+    batch_meta = common.paths.resolve_generation_batch_metadata_directory(
+        config.batch_storage_name,
+        storage_root=storage,
+    )
+    batch_raw = common.paths.resolve_generation_raw_batch_directory(
+        config.batch_storage_name,
+        storage_root=storage,
+    )
+    input_meta = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name,
+        input_generation_id,
+        storage_root=storage,
+    )
+    input_raw = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name,
+        input_generation_id,
+        storage_root=storage,
+    )
+
+    assert input_meta.parent == batch_meta / "input_generations"
+    assert input_raw.parent == batch_raw / "input_generations"
+    assert input_meta.name == input_generation_id
+    assert input_raw.name == input_generation_id
+    assert (
         common.paths.resolve_generated_batch_dir(
             config.batch_storage_name,
             stage="processed",
             storage_root=storage,
-        ),
+        ).name
+        == config.batch_storage_name
     )
-
-    assert tuple(path.name for path in paths) == (config.batch_storage_name,) * 3
-    assert tuple(path.parent.name for path in paths) == ("raw", "meta", "processed")
 
 
 @pytest.mark.parametrize("profile_id", ["steady_flow", "transient_drying"])
@@ -146,16 +162,20 @@ def test_input_cases_use_canonical_batch_storage_and_never_execute(
     resolved_path = generated.metadata_directory / "resolved_generation_config.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
-    assert generated.metadata_directory == common.paths.resolve_generation_input_metadata_directory(
+    assert generated.metadata_directory == common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name,
+        generated.input_generation_id,
         storage_root=storage,
     )
-    assert generated.raw_directory == common.paths.resolve_generation_input_raw_batch_directory(
+    assert generated.raw_directory == common.paths.resolve_generation_input_generation_raw_directory(
         config.batch_storage_name,
+        generated.input_generation_id,
         storage_root=storage,
     )
-    assert manifest["schema_kind"] == "generation_input_batch"
-    assert manifest["schema_version"] == 1
+    assert set(manifest) == generation.cases.admission.INPUT_MANIFEST_KEYS
+    assert all(set(record) == generation.cases.admission.INPUT_CASE_RECORD_KEYS for record in manifest["cases"])
+    assert manifest["schema_kind"] == generation.cases.admission.INPUT_BATCH_SCHEMA_KIND
+    assert manifest["schema_version"] == generation.cases.admission.INPUT_BATCH_SCHEMA_VERSION == 1
     assert manifest["status"] == "ready"
     assert "execution_status" not in manifest
     assert "executed" not in manifest
@@ -163,14 +183,13 @@ def test_input_cases_use_canonical_batch_storage_and_never_execute(
     assert manifest["batch_id"] == config.batch_id
     assert manifest["batch_storage_name"] == config.batch_storage_name
     assert manifest["campaign_purpose"] == "technical_runtime_smoke"
-    assert generated.raw_directory.name == config.batch_storage_name
+    assert generated.raw_directory.name == generated.input_generation_id
     assert config.batch_storage_name == (f"{profile_id}__lentil__natural__technical_runtime_smoke__{config.scientific_config_digest[:16]}")
     assert manifest["case_indices"] == [1]
     assert manifest["resolved_config_sha256"] == (common.serialization.canonical_json_sha256(resolved))
     assert generated.generated_case_count == 1
     assert generated.reused_case_count == 0
     assert {entry.name for entry in generated.metadata_directory.iterdir()} == {
-        "execution_configs",
         manifest_path.name,
         resolved_path.name,
     }
@@ -205,6 +224,53 @@ def test_input_cases_use_canonical_batch_storage_and_never_execute(
         admitted.payload["stationary_fixed_values"][0]["value"] = 0.0
     with pytest.raises(TypeError):
         cast("dict[str, str]", admitted.parameter_metadata[metadata_name])["description"] = "changed"
+
+
+def test_commit_bound_input_generations_never_alias_one_batch_locator(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Keep incompatible immutable generations distinct and ignore direct evidence."""
+    service = generation.cases.input_generation
+    config = _load_config(generation_config_factory, "steady_flow")
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        first = service.generate_input_cases(config, 1, storage_root=storage)
+
+    batch_meta = common.paths.resolve_generation_batch_metadata_directory(
+        config.batch_storage_name,
+        storage_root=storage,
+    )
+    batch_raw = common.paths.resolve_generation_raw_batch_directory(
+        config.batch_storage_name,
+        storage_root=storage,
+    )
+    direct_manifest = batch_meta / "input_generation_manifest.json"
+    direct_config = batch_meta / "resolved_generation_config.json"
+    shutil.copy2(first.metadata_directory / direct_manifest.name, direct_manifest)
+    shutil.copy2(first.metadata_directory / direct_config.name, direct_config)
+    direct_case = batch_raw / config.case_id(1)
+    shutil.copytree(first.raw_directory / config.case_id(1), direct_case)
+    direct_manifest_bytes = direct_manifest.read_bytes()
+    direct_case_bytes = (direct_case / "case.json").read_bytes()
+
+    with service._generation_git_commit(_OTHER_GIT_COMMIT):
+        second = service.generate_input_cases(config, 1, storage_root=storage)
+        admitted = service.admit_configured_input_case(config, 1, storage_root=storage)
+
+    assert first.input_generation_id != second.input_generation_id
+    assert first.metadata_directory != second.metadata_directory
+    assert first.raw_directory != second.raw_directory
+    assert first.metadata_directory.is_dir()
+    assert second.metadata_directory.is_dir()
+    assert admitted.source_id == second.input_generation_id
+    assert direct_manifest.read_bytes() == direct_manifest_bytes
+    assert (direct_case / "case.json").read_bytes() == direct_case_bytes
+    discovery = generation.cases.admission.discover_input_batches(storage)
+    assert {source.source_id for source in discovery.sources} == {
+        first.input_generation_id,
+        second.input_generation_id,
+    }
 
 
 def test_bounded_requests_merge_membership_and_reuse_exact_cases(
@@ -269,11 +335,11 @@ def test_journaled_input_publication_recovers_after_case_move(
         str(base["input_generation_id"]),
         storage_root=storage,
     )
-    staged_case = transaction / "raw" / config.batch_storage_name / config.case_id(2)
+    staged_case = transaction / "raw" / config.batch_storage_name / "input_generations" / first.input_generation_id / config.case_id(2)
     service.case_service.generate_case_input_bundle(config, 2, staged_case)
     records[2] = service._case_record(staged_case)
     candidate = service._complete_manifest(base, records)
-    staged_metadata = transaction / "meta" / config.batch_storage_name
+    staged_metadata = transaction / "meta" / config.batch_storage_name / "input_generations" / first.input_generation_id
     service._write_staged_metadata(
         staged_metadata,
         resolved_config=resolved,
@@ -352,7 +418,7 @@ def test_discovery_ignores_unmanifested_raw_directories(
     [
         ("missing_purpose", "manifest schema"),
         ("contradictory_purpose", "configuration does not bind"),
-        ("duplicated_purpose_leaf", "identities do not bind"),
+        ("false_batch_locator", "identities do not bind"),
     ],
 )
 def test_input_admission_rejects_incomplete_or_false_storage_provenance(
@@ -361,7 +427,7 @@ def test_input_admission_rejects_incomplete_or_false_storage_provenance(
     corruption: str,
     error_match: str,
 ) -> None:
-    """Reject missing, contradictory, or duplicated purpose provenance."""
+    """Reject missing, contradictory, or falsely located provenance."""
     config = _load_config(generation_config_factory, "transient_drying")
     storage = tmp_path / "storage"
     generated = generation.cases.input_generation.generate_input_cases(
@@ -379,19 +445,31 @@ def test_input_admission_rejects_incomplete_or_false_storage_provenance(
     elif corruption == "contradictory_purpose":
         manifest["campaign_purpose"] = "family_generalization"
         manifest["input_generation_id"] = generation.cases.admission.compute_input_generation_id(manifest)
+        metadata_directory = metadata_directory.rename(
+            metadata_directory.with_name(manifest["input_generation_id"]),
+        )
+        raw_directory.rename(raw_directory.with_name(manifest["input_generation_id"]))
+        manifest_path = metadata_directory / manifest_path.name
     else:
         false_name = config.batch_storage_name.replace(
             "__technical_runtime_smoke__",
             "__technical_runtime_smoke__technical_runtime_smoke__",
         )
-        metadata_directory = metadata_directory.rename(metadata_directory.with_name(false_name))
-        raw_directory.rename(raw_directory.with_name(false_name))
+        metadata_batch = metadata_directory.parents[1]
+        raw_batch = raw_directory.parents[1]
+        moved_metadata_batch = metadata_batch.rename(metadata_batch.with_name(false_name))
+        moved_raw_batch = raw_batch.rename(raw_batch.with_name(false_name))
+        metadata_directory = moved_metadata_batch / "input_generations" / generated.input_generation_id
+        raw_directory = moved_raw_batch / "input_generations" / generated.input_generation_id
         manifest_path = metadata_directory / manifest_path.name
         manifest["batch_storage_name"] = false_name
     common.serialization.atomic_write_json(manifest_path, manifest)
 
     with pytest.raises(ValueError, match=error_match):
-        generation.cases.admission.admit_input_batch(metadata_directory)
+        generation.cases.admission.admit_input_batch(
+            metadata_directory,
+            raw_directory=raw_directory,
+        )
 
 
 def test_adapter_corruption_and_execution_artifacts_fail_closed(
@@ -458,12 +536,19 @@ def test_metadata_publication_failure_preserves_journal_and_recovers(
     """Retain post-move evidence and complete it on the next invocation."""
     config = _load_config(generation_config_factory, "steady_flow")
     storage = tmp_path / "storage"
-    metadata_directory = common.paths.resolve_generation_input_metadata_directory(
+    base = generation.cases.input_generation._manifest_base(
+        config,
+        generation.cases.input_generation._resolved_config(config),
+    )
+    input_generation_id = str(base["input_generation_id"])
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name,
+        input_generation_id,
         storage_root=storage,
     )
-    raw_directory = common.paths.resolve_generation_input_raw_batch_directory(
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
         config.batch_storage_name,
+        input_generation_id,
         storage_root=storage,
     )
     manifest_path = metadata_directory / "input_generation_manifest.json"

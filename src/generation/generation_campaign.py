@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Final
 from src import common
 
 from .cases import generation_cases_config as config_service
+from .cases import generation_cases_input as input_service
 from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .runtime import generation_runtime_batch as batch_runtime
@@ -873,6 +874,11 @@ def submit_campaign(
     if current_commit != requested_commit:
         message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
+    input_service.prepare_campaign_inputs(
+        campaign,
+        git_commit=requested_commit,
+        storage_root=storage_root,
+    )
     run_id = campaign_run_id(campaign, git_commit=requested_commit)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root)
     run_directory.mkdir(parents=True, exist_ok=True)

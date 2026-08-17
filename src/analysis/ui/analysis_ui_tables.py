@@ -111,12 +111,7 @@ def row_local_color_matrix(
     fill. Numerically equal rows use one common neutral fill when requested.
     The caller-owned values are never modified.
     """
-    colors = pd.DataFrame(
-        [[None] * len(table.columns) for _row in table.index],
-        index=table.index,
-        columns=table.columns,
-        dtype=object,
-    )
+    colors: list[list[TableCellColors | None]] = [[None for _column in table.columns] for _row in table.index]
     colormap = plt.get_cmap("Blues")
     for row_position, (_index, row) in enumerate(table.iterrows()):
         numeric = tuple(_finite_number(value) for value in row)
@@ -132,17 +127,22 @@ def row_local_color_matrix(
         )
         if upper - lower <= tolerance:
             if shade_constant:
-                colors.iloc[row_position, :] = _NEUTRAL_CELL_COLORS
+                colors[row_position] = [_NEUTRAL_CELL_COLORS for _column in table.columns]
             continue
         for column_position, value in enumerate(values):
             fraction = float((value - lower) / (upper - lower))
             red, green, blue, _alpha = colormap(0.12 + 0.78 * fraction)
-            colors.iloc[row_position, column_position] = _cell_colors(
+            colors[row_position][column_position] = _cell_colors(
                 red,
                 green,
                 blue,
             )
-    return colors
+    return pd.DataFrame(
+        colors,
+        index=table.index,
+        columns=table.columns,
+        dtype=object,
+    )
 
 
 def row_local_style_matrix(

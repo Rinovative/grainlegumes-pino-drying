@@ -38,7 +38,8 @@ from . import generation_cases_schedule as schedule_service
 
 _MINIMUM_ROWS = 2
 _SCALAR_COLUMNS = 3
-_INPUT_BATCH_SCHEMA_VERSION = 1
+INPUT_BATCH_SCHEMA_KIND = "generation_input_batch"
+INPUT_BATCH_SCHEMA_VERSION = 1
 _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
     {
         "_SUCCESS",
@@ -51,7 +52,7 @@ _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
         "timing.json",
     }
 )
-_INPUT_GENERATION_IDENTITY_FIELDS = (
+INPUT_GENERATION_IDENTITY_FIELDS = (
     "schema_kind",
     "schema_version",
     "campaign_id",
@@ -72,9 +73,9 @@ _INPUT_GENERATION_IDENTITY_FIELDS = (
     "template_sha256",
     "resolved_config_sha256",
 )
-_INPUT_MANIFEST_KEYS = frozenset(
+INPUT_MANIFEST_KEYS = frozenset(
     {
-        *_INPUT_GENERATION_IDENTITY_FIELDS,
+        *INPUT_GENERATION_IDENTITY_FIELDS,
         "batch_storage_name",
         "input_generation_id",
         "status",
@@ -82,7 +83,7 @@ _INPUT_MANIFEST_KEYS = frozenset(
         "cases",
     }
 )
-_INPUT_CASE_RECORD_KEYS = frozenset(
+INPUT_CASE_RECORD_KEYS = frozenset(
     {
         "case_index",
         "case_id",
@@ -118,7 +119,7 @@ def compute_input_generation_id(evidence: Mapping[str, Any]) -> str:
 
     """
     try:
-        identity = {field: evidence[field] for field in _INPUT_GENERATION_IDENTITY_FIELDS}
+        identity = {field: evidence[field] for field in INPUT_GENERATION_IDENTITY_FIELDS}
     except KeyError as error:
         message = "Input-generation identity evidence is incomplete."
         raise ValueError(message) from error
@@ -549,9 +550,9 @@ def _validate_input_manifest_shape(
     indices = manifest.get("case_indices")
     generation_id = manifest.get("input_generation_id")
     if (
-        set(manifest) != _INPUT_MANIFEST_KEYS
-        or manifest.get("schema_kind") != "generation_input_batch"
-        or manifest.get("schema_version") != _INPUT_BATCH_SCHEMA_VERSION
+        set(manifest) != INPUT_MANIFEST_KEYS
+        or manifest.get("schema_kind") != INPUT_BATCH_SCHEMA_KIND
+        or manifest.get("schema_version") != INPUT_BATCH_SCHEMA_VERSION
         or manifest.get("status") != "ready"
         or not isinstance(generation_id, str)
         or (expected_input_generation_id is not None and generation_id != expected_input_generation_id)
@@ -584,8 +585,13 @@ def _validated_batch_locators(
         batch_storage_name,
         label="batch_storage_name",
     )
-    if directory.name != batch_storage_name:
-        message = "Input-generation metadata directory must use batch_storage_name."
+    generation_id = manifest.get("input_generation_id")
+    if not isinstance(generation_id, str):
+        message = "Input-generation manifest input_generation_id must be text."
+        raise TypeError(message)
+    common.paths.validate_logical_name(generation_id, label="input_generation_id")
+    if directory.name != generation_id or directory.parent.name != "input_generations" or directory.parent.parent.name != batch_storage_name:
+        message = "Input-generation metadata directory must use its exact current generation identity."
         raise ValueError(message)
     return batch_id, batch_storage_name
 
@@ -680,16 +686,17 @@ def _load_input_batch_metadata(
         message = "Resolved generation identities do not bind the input manifest."
         raise ValueError(message)
     if raw_directory is None:
-        raw_directory = common.paths.resolve_generation_input_raw_batch_directory(
+        raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
             batch_storage_name,
-            storage_root=directory.parents[2],
+            str(generation_id),
+            storage_root=directory.parents[4],
         )
     raw = Path(raw_directory).expanduser().resolve()
     if not raw.is_dir():
         message = f"Canonical input raw batch is missing: {raw}"
         raise ValueError(message)
-    if raw.name != batch_storage_name:
-        message = "Input-generation raw directory must use batch_storage_name."
+    if raw.name != generation_id or raw.parent.name != "input_generations" or raw.parent.parent.name != batch_storage_name:
+        message = "Input-generation raw directory must use its exact current generation identity."
         raise ValueError(message)
     _assert_input_only_trees(raw)
     expected_names: set[str] = set()
@@ -697,7 +704,7 @@ def _load_input_batch_metadata(
     for record, index in zip(records, indices, strict=True):
         if (
             not isinstance(record, Mapping)
-            or set(record) != _INPUT_CASE_RECORD_KEYS
+            or set(record) != INPUT_CASE_RECORD_KEYS
             or record.get("case_index") != index
             or not isinstance(record.get("case_id"), str)
             or not isinstance(record.get("case_input_id"), str)
@@ -992,7 +999,7 @@ def discover_input_batches(
         for path in sorted(
             common.paths.get_generation_meta_root(
                 storage_root=storage_root,
-            ).glob("*")
+            ).glob("*/input_generations/*")
         )
         if path.is_dir() and (path / "input_generation_manifest.json").is_file()
     )

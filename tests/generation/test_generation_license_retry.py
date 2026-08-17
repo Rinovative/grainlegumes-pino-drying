@@ -106,6 +106,11 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     )
     storage = tmp_path / "storage"
     work = tmp_path / "work"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
     run_id = "license-retry__0123456789abcdef"
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "701")
@@ -232,6 +237,11 @@ def test_license_retry_cleanup_failure_becomes_terminal(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
     run_id = "license-cleanup__0123456789abcdef"
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "991")

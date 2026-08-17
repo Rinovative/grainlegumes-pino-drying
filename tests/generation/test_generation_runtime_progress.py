@@ -293,10 +293,16 @@ def test_monitoring_failure_does_not_change_the_simulated_case_path(
     config_path, _template = generation_config_factory(executable=fake_comsol)
     campaign = generation.cases.config.load_campaign_config(config_path)
     config = campaign.batches[0]
+    storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
     prepared = generation.runtime.prepare_case_work_directory(
         config,
         config.case_indices[0],
-        storage_root=tmp_path / "storage",
+        storage_root=storage,
         work_root=tmp_path / "work",
     )
 

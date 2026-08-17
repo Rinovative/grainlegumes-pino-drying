@@ -360,6 +360,13 @@ elif [[ " $* " == *' campaign-accounting '* ]]; then
   printf '%s\n' '{"squeue":{"output":"12345_0|RUNNING|node-a"}}'
 elif [[ " $* " == *' cancel-campaign '* ]]; then
   printf '%s\n' '{"status":"cancel_requested"}'
+elif [[ " $* " == *' prepare-campaign-inputs'* ]]; then
+  if [[ "${FAKE_INPUT_PREPARATION_FAIL:-false}" == true ]]; then
+    printf '%s\n' 'Canonical inputs invalid for synthetic batch.' >&2
+    exit 73
+  fi
+  printf 'canonical-inputs\t%s\t%s\n' \
+    "${FAKE_INPUT_GENERATED_COUNT:-1}" "${FAKE_INPUT_REUSED_COUNT:-0}"
 elif [[ " $* " == *' submit-campaign'* ]]; then
   if [[ "${FAKE_TRACK_SINGLE_SUBMISSION:-false}" == true ]]; then
     [[ ! -e "${FAKE_SUBMISSION_FILE}" ]] || {
@@ -847,8 +854,76 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     assert "dataset_id=synthetic" in result.stdout
     assert not any(line.lstrip().startswith("{") and line.rstrip().endswith("}") for line in result.stdout.splitlines())
     assert Path(environment["FAKE_SUBMISSION_FILE"]).read_text(encoding="utf-8") == "591776\n"
+    assert "reused=0 generated=1" in result.stdout
     log_text = log.read_text(encoding="utf-8")
-    assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
+    command_lines = log_text.splitlines()
+    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
+    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
+    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
+    assert prepare_index < plan_index < submit_index
+    assert sum("submit-campaign" in line for line in command_lines) == 1
+
+
+def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: Path) -> None:
+    """Admit valid exact inputs without regenerating them before launch."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_INPUT_GENERATED_COUNT"] = "0"
+    environment["FAKE_INPUT_REUSED_COUNT"] = "1"
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+
+    result = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source", "--detach"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "reused=1 generated=0" in result.stdout
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
+    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
+    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
+    assert prepare_index < plan_index < submit_index
+
+
+def test_invalid_canonical_inputs_abort_before_plan_or_submission(tmp_path: Path) -> None:
+    """Stop an invalid exact input generation before campaign side effects."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_INPUT_PREPARATION_FAIL"] = "true"
+
+    result = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "Canonical input preparation failed before campaign planning or launch." in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "prepare-campaign-inputs" in log_text
+    assert "plan-campaign" not in log_text
+    assert "submit-campaign" not in log_text
+
+
+def test_pilot_prepares_canonical_inputs_before_plan_and_submission(tmp_path: Path) -> None:
+    """Keep pilot input readiness ahead of every planning or launch side effect."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    campaign = workflow.parent.parent / "configs/generation/campaigns/transient_drying/pilot_check.yaml"
+
+    result = _run(
+        workflow,
+        ["pilot-check", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "reused=0 generated=1" in result.stdout
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
+    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
+    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
+    assert prepare_index < plan_index < submit_index
 
 
 def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evidence(tmp_path: Path) -> None:
@@ -993,10 +1068,20 @@ def test_combined_smoke_records_and_checks_both_profile_evidence(tmp_path: Path)
     result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
 
     assert result.returncode == 0, result.stderr
-    evidence_lines = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("technical-smoke-evidence-profile")]
+    log_lines = log.read_text(encoding="utf-8").splitlines()
+    evidence_lines = [line for line in log_lines if line.startswith("technical-smoke-evidence-profile")]
     assert evidence_lines == [
         "technical-smoke-evidence-profile <steady_flow>",
         "technical-smoke-evidence-profile <transient_drying>",
+    ]
+    lifecycle = [command for line in log_lines for command in ("prepare-campaign-inputs", "plan-campaign", "submit-campaign") if command in line]
+    assert lifecycle == [
+        "prepare-campaign-inputs",
+        "plan-campaign",
+        "submit-campaign",
+        "prepare-campaign-inputs",
+        "plan-campaign",
+        "submit-campaign",
     ]
 
 

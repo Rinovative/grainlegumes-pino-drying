@@ -82,6 +82,15 @@ def _force_conversion_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _prepare_canonical_input(config: Any, storage: Path) -> None:
+    """Publish the exact input required by a direct worker test."""
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
+
+
 def test_technical_smoke_conversion_failure_retains_and_diagnoses_before_cleanup(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -91,6 +100,7 @@ def test_technical_smoke_conversion_failure_retains_and_diagnoses_before_cleanup
     """Retain configured bytes and raw-output diagnostics before scratch cleanup."""
     config = _transient_config(generation_config_factory, fake_comsol)
     storage = tmp_path / "storage"
+    _prepare_canonical_input(config, storage)
     _force_conversion_failure(monkeypatch)
 
     with pytest.raises(
@@ -165,6 +175,7 @@ def test_technical_smoke_failure_before_exports_records_no_fabricated_diagnostic
     """Keep the original solver failure and mark unavailable diagnostic inputs."""
     config = _transient_config(generation_config_factory, fake_comsol)
     storage = tmp_path / "storage"
+    _prepare_canonical_input(config, storage)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "failure")
 
     with pytest.raises(generation.runtime.CaseExecutionError) as raised:
@@ -274,6 +285,7 @@ def test_diagnostic_failure_cannot_mask_original_case_failure(
     """Persist secondary diagnostic failure while re-raising conversion failure."""
     config = _transient_config(generation_config_factory, fake_comsol)
     storage = tmp_path / "storage"
+    _prepare_canonical_input(config, storage)
     _force_conversion_failure(monkeypatch)
 
     def fail_diagnostic(
@@ -348,6 +360,7 @@ def test_retention_failure_is_secondary_and_scratch_still_cleans(
     """Preserve the original case error when durable raw staging itself fails."""
     config = _transient_config(generation_config_factory, fake_comsol)
     storage = tmp_path / "storage"
+    _prepare_canonical_input(config, storage)
     _force_conversion_failure(monkeypatch)
 
     def fail_copy(*_args: Any, **_kwargs: Any) -> None:
@@ -832,6 +845,7 @@ def test_partial_staging_is_never_accepted_and_success_clears_failure_artifacts(
     """Ignore partial siblings and clear canonical failure state after recovery."""
     config = _transient_config(generation_config_factory, fake_comsol)
     storage = tmp_path / "storage"
+    _prepare_canonical_input(config, storage)
     artifact_target = generation.runtime.case_failure_artifacts_directory(
         config,
         1,

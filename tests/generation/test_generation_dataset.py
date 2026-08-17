@@ -64,12 +64,18 @@ def _assert_provenance_and_relocation_preserve_hdf5(
     assert relocated_batch.scientific_values != original_batch.scientific_values
     assert relocated_batch.batch_id == original_batch.batch_id
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "b" * 40)
+    relocated_storage = tmp_path / "relocated-storage"
     try:
+        generation.cases.input_generation.generate_input_cases(
+            relocated_batch,
+            1,
+            storage_root=relocated_storage,
+        )
         relocated_outcome = generation.runtime.run_case(
             relocated_batch,
             1,
             cores_per_case=1,
-            storage_root=tmp_path / "relocated-storage",
+            storage_root=relocated_storage,
             work_root=tmp_path / "relocated-work",
         )
     finally:
@@ -98,7 +104,7 @@ def _assert_provenance_and_relocation_preserve_hdf5(
 
 def _assert_terminal_purpose_corruption_rejected(*, batch: Any, storage: Path) -> None:
     """Reject a terminal manifest whose purpose contradicts persisted science."""
-    metadata = common.paths.resolve_generation_input_metadata_directory(
+    metadata = common.paths.resolve_generation_batch_metadata_directory(
         batch.batch_storage_name,
         storage_root=storage,
     )
@@ -148,6 +154,11 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     ny = int(grid["ny"])
     storage = tmp_path / "storage"
     template_bytes = template.read_bytes()
+    generation.cases.input_generation.generate_input_cases(
+        batch,
+        len(batch.case_indices),
+        storage_root=storage,
+    )
     outcomes = [
         generation.runtime.run_case(
             batch,

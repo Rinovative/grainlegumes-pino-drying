@@ -56,6 +56,11 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
     )
     storage = tmp_path / "storage root"
     work = tmp_path / "scratch root with spaces"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        2,
+        storage_root=storage,
+    )
     first = runtime_service.prepare_case_work_directory(
         config,
         1,
@@ -105,6 +110,11 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     )
     storage = (tmp_path / "storage").resolve()
     work = (tmp_path / "work").resolve()
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
     prepared = runtime_service.prepare_case_work_directory(
         config,
         1,
@@ -201,6 +211,11 @@ def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
         only_batch=_steady_natural_batch_name(),
     )
     storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
     observed: dict[str, Path] = {}
 
     def interrupt(
