@@ -26,9 +26,7 @@ Material OOD supports have separate OOD provenance, so literature support for a
 natural value is never presented as evidence for a synthetic stress interval.
 Technical Smoke and Pilot validate software and data flow; they do not upgrade
 scientific evidence. Campaign purpose is explicit scientific provenance in every
-resolved batch. It contributes to the scientific digest and therefore to
-`batch_id`; the human-readable `batch_storage_name` additionally spells out that
-purpose without replacing or weakening the scientific identity.
+resolved batch and contributes to its scientific identity.
 
 ## Authoritative owners
 
@@ -40,20 +38,10 @@ purpose without replacing or weakening the scientific identity.
 | Operation and inlet-schedule supports and constraints | `configs/generation/operations/fixed_bed.yaml` |
 | Family roles, sampling counts, membership, seeds | Selected campaign YAML |
 | Bibliographic metadata and locators | `configs/generation/sources.yaml` |
-| Resolved supports, identities, and generated diagnostics | `validate-config`, `readiness-report`, `plan`, and generated receipts |
-| Exact algorithms and invariants | `src/generation` and focused tests |
 
-Inspect the effective scientific contract instead of copying resolved values into
-prose:
-
-```bash
-./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
-  configs/generation/campaigns/transient_drying/family_generalization.yaml \
-  --allow-incomplete
-```
-
-The optional `--inspect-parameter <name>` argument follows authored, inherited,
-selected, and derived provenance for a parameter or complete atomic record.
+Inspect the validated effective configuration rather than treating mutable prose
+as the owner of resolved values. The operator workflow explains how to validate
+and inspect a campaign.
 
 ## Parameter families
 
@@ -137,9 +125,6 @@ support; `validate-config` shows both authored and resolved intervals.
 Permeability-OOD tails are mapped through the same relation to consistent
 porosity-OOD regions.
 
-The input EDA reports exact principal permeabilities and their anisotropy ratio.
-It uses Generation's positive-definiteness check and does not alter the tensor.
-
 A small bounded case-level packing scatter represents unresolved morphology.
 It is a synthetic modelling assumption, not an experimentally calibrated
 parameter or an independent model input. Local porosity heterogeneity remains a
@@ -179,13 +164,13 @@ candidate is rejected and deterministically resampled as a whole rather than
 repaired by pointwise clipping. Schedule supports and composition are synthetic
 design assumptions, not literature measurements or active control.
 
-The accepted stochastic schedule remains canonical on `common.time.regular_times`
-(`0 h, 1 h, ..., 168 h` for the current configuration). The fixed-bed operation
-then applies a separate COMSOL handoff policy from
-`boundary_schedule.startup_ramp`: `enabled` selects the transformation and
-`duration_h` must lie strictly between zero and the regular interval. With the
-default `duration_h: 0.16666666666666666`, the final interpolation table begins
-at `0 h, 1/6 h, 1 h, ...`.
+The accepted stochastic schedule remains canonical on
+`common.time.regular_times`. The fixed-bed operation applies a separate COMSOL
+handoff policy from `boundary_schedule.startup_ramp`: `enabled` selects the
+transformation, and `duration_h` is the physical boundary-startup duration in
+hours. It must lie strictly between zero and the first regular interval. The
+policy uses no bed-state or solver feedback and does not change regular COMSOL
+output, HDF5, or Dataset state times.
 
 At zero, `omega_in_bc` remains exactly the canonical incoming-air humidity
 ratio. The schedule psychrometric owner solves the maintained Magnus conversion
@@ -194,9 +179,8 @@ uses `T_start = max(T_init, T_in_min, T_required)`. This is a static configurati
 constraint: it uses no bed state, solver value, or runtime feedback. Generation
 fails closed when the humidity ratio is invalid, the configured maximum
 temperature cannot satisfy the RH limit, or the safe start is above the required
-heating-ramp rejoin state. Startup metadata records `T_init`, canonical
-`omega_in_bc(0)`, the RH limit, `T_required`, final `T_start`, whether preheating
-was required, startup RH, and the rejoin row.
+heating-ramp rejoin state. Persisted startup evidence records the quantities
+needed to reproduce and verify this boundary condition.
 
 The rejoin temperature and humidity ratio are the original canonical linear
 interpolation at the configured startup duration; rejoin relative humidity is
@@ -206,16 +190,12 @@ envelopes, and every retained regular node remains unchanged.
 
 The extra row is boundary interpolation support, not a regular output state.
 COMSOL output, HDF5 state time, and Dataset transitions continue to use only
-`common.time.regular_times`. The final `schedule.csv` bytes are hashed before
-execution and are persisted with handoff version, policy, source, humidity, and
-rejoin provenance. Disabling the ramp retains the canonical table values and
-times exactly.
-
-Generation-input EDA converts absolute temperatures to degrees Celsius only at
-the presentation boundary. `T_amb`, `T_in_base`, `T_init`, and plotted or
-tabulated `T_in_bc` use `T_C = T_K - 273.15`; amplitudes, changes, differences,
-and rates remain in K or K/h. Persisted configuration, CSV, HDF5, COMSOL, hash,
-and identity values remain in kelvin.
+`common.time.regular_times`. The final schedule bytes and handoff provenance
+participate in exact input identity. Disabling the ramp retains the canonical
+table values and times exactly. Absolute temperatures are persisted in kelvin;
+Celsius conversion is a
+presentation concern, while amplitudes, changes, differences, and rates remain
+in K or K/h.
 
 ### Moisture, heat, and equilibrium coupling
 
@@ -237,8 +217,8 @@ X_eq_db = 0.01 [A_osw + B_osw (T - 273.15 K)]
 w_eq = rho_bu_dry X_eq_db
 ```
 
-The input EDA derives the local initial equilibrium relative humidity by the
-exact algebraic inverse of that same relation:
+The local initial equilibrium relative humidity follows from the exact
+algebraic inverse of that same relation:
 
 ```text
 R_0 = [100 X_0_db_field /
@@ -246,7 +226,7 @@ R_0 = [100 X_0_db_field /
 phi_eq_0 = R_0 / (1 + R_0)
 ```
 
-This diagnostic interprets the generated initial-moisture field at
+This derived quantity interprets the initial-moisture field at
 `T_init = T_amb`; it is neither a generated field nor an inlet boundary, and it
 does not apply the forward solver's numerical humidity clip.
 
@@ -301,52 +281,24 @@ silently weakening a physical consistency check, or vice versa. Schedule
 correlation and temporal-resolution checks are generator invariants and remain
 implementation-owned.
 
-## Provenance, persistence, and versions
+## Provenance and persistence
 
 Resolved configuration and generated artifacts preserve material family and
 role, natural or OOD selection, selected values or complete records, scientific
 configuration, relevant diagnostics, and content identities. Exact admission
-rejects stale or structurally incompatible artifacts. The maintained
-[identity and provenance policy](simulation_generation.md#identity-and-provenance-policy)
-defines semantic, implementation, execution, and provenance dependencies without
-duplicating them here.
-
-The active Generation YAML, case, canonical HDF5, transient-transition,
-schedule-generator, and COMSOL boundary-handoff version values are all `1`.
-These remain distinct contract domains even though their numeric values match:
-schema versions describe persisted structure, while algorithm values describe
-how scientific values are constructed. The resolved temperature supports,
-startup metadata structure, and exact input hashes also participate in current
-transient identity. Transient input cases created under the previous schedule
-or cold-start handoff contract must therefore be regenerated before execution;
-ordinary reads never rewrite them. Steady-flow case identity excludes transient
-schedule and handoff dependencies.
+rejects stale or structurally incompatible artifacts, and ordinary reads never
+rewrite them. Transient input identity includes resolved schedule and startup
+semantics; steady-flow identity excludes those transient dependencies.
 
 ## Source attribution
 
 `configs/generation/sources.yaml` is the sole machine-readable bibliography and
-locator owner. The following keys preserve the reference grouping used by the
-current material and model records; inspect resolved `source_refs` for the
-exact value-to-source chain.
-
-| Context | Source keys |
-| --- | --- |
-| Project and model baselines | `ba`, `pino_airflow_project`, `transient_comsol_model_report`, `vm2_project` |
-| Shared thermal evidence | `matouk_thermal` |
-| Chickpea | `chickpea_physical`, `chickpea_oswin_source`, `chickpea_drying` |
-| Field pea | `pea_physical`, `pea_sorption`, `pea_drying`, `manitoba_field_beans`, `swiss_crops` |
-| Kidney bean | `kidney_physical`, `kidney_oswin_source`, `kidney_drying`, `manitoba_field_beans` |
-| Lentil | `lentil_oswin_source`, `lentil_sorption_menkov`, `lentil_drying` |
-| Rapeseed/canola | `canola_thermal`, `canola_airflow`, `canola_oswin`, `canola_drying`, `canola_drying_gazor`, `swiss_oil`, `swiss_oil_2026` |
-| Sunflower seed | `sunflower_sorption_drying_munder_2019`, `sunflower_density_isik_izli_2007`, `sunflower_physical_gupta_das_1997`, `sunflower_thermal_ince_2008`, `sunflower_airflow_canada_1990`, `sunflower_class_munder_2017` |
-
-This grouping is not a claim that every source supports every parameter for the
-listed material. The material YAML and resolved provenance provide that
-specific attribution.
+locator owner. Material YAML and resolved `source_refs` provide the exact
+value-to-source chain; a material-level citation must not be interpreted as
+support for every parameter of that material.
 
 ## Operational cross-reference
 
-See the [Generation workflow](simulation_generation.md) for configuration
-inspection, CPU setup, preflight, Technical Smoke, benchmark, Pilot, Production,
-publication, resume, cancellation, retention, cleanup, and troubleshooting. The
-project-level entry point is the [README](../README.md).
+See the [Generation workflow](simulation_generation.md) for all operator
+commands, execution stages, monitoring, recovery, and cleanup. The project-level
+entry point is the [README](../README.md).

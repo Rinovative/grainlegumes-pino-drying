@@ -207,6 +207,24 @@ def test_startup_ramp_has_transient_input_identity_without_affecting_steady_batc
     assert changed_steady.batch_id == original_steady.batch_id
 
 
+def test_startup_ramp_half_hour_duration_resolves(
+    generation_config_factory: Any,
+) -> None:
+    """Resolve the maintained half-hour startup duration as transient science."""
+    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.5
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+
+    batch = generation.cases.config.load_campaign_config(config_path).batches[0]
+
+    assert batch.scientific_values["boundary_schedule"] == {
+        "startup_ramp": {"enabled": True, "duration_h": 0.5},
+    }
+    assert batch.scientific_values["time"]["interval"] == 1.0
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
@@ -244,6 +262,8 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
     common_path = campaign_path.parent / "common.yaml"
     common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    operations_path = campaign_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
     execution_path = campaign_path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
 
@@ -251,6 +271,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     campaign["membership"]["seed"] = 12346
     common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0})
     common["time"].update({"start": 0.0, "stop": 84.0, "interval": 0.5})
+    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
     common["scientific_fixed_values"]["T_flow_ref"]["value"] = 301.15
     common["scientific_fixed_values"]["p_ref"]["value"] = 100000.0
     common["storage"]["compression_level"] = 6
@@ -273,6 +294,10 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
         yaml.safe_dump(common, sort_keys=False),
         encoding="utf-8",
     )
+    operations_path.write_text(
+        yaml.safe_dump(operations, sort_keys=False),
+        encoding="utf-8",
+    )
     execution_path.write_text(
         yaml.safe_dump(execution, sort_keys=False),
         encoding="utf-8",
@@ -287,6 +312,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert scientific["grid"]["dx"] == pytest.approx(0.1)
     assert scientific["grid"]["dy"] == pytest.approx(0.1)
     assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(169)]
+    assert scientific["boundary_schedule"]["startup_ramp"]["duration_h"] == 0.25
     assert scientific["scientific_fixed_values"]["T_flow_ref"] == 301.15
     assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
     assert scientific["storage"]["compression_level"] == 6
@@ -462,9 +488,11 @@ def test_schedule_csv_is_the_identity_bound_comsol_handoff(
         config.scientific_values["time"]["regular_times"],
         dtype=np.float64,
     )
-    assert schedule_times[0] == 0.0
+    assert duration_h == 0.5
+    np.testing.assert_array_equal(schedule_times[:3], (0.0, 0.5, 1.0))
     assert schedule_times[-1] == regular_times[-1]
     assert duration_h in schedule_times
+    assert 1.0 / 6.0 not in schedule_times
     assert duration_h not in regular_times
     assert np.all(np.diff(schedule_times) > 0.0)
     assert all(time in schedule_times for time in regular_times)

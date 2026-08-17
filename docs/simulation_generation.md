@@ -130,33 +130,15 @@ Validation and execution never accept or rewrite a new digest automatically.
 
 ## Identity and execution safety
 
-Scientific identity is not a storage path, display label, or configuration
-filename.
+Generation distinguishes case inputs, simulation batches, campaign science,
+campaign runs, Dataset packages, and operational provenance. Scientific identity
+is separate from storage paths, directory names, display labels, and
+configuration filenames.
 
-| Layer | What it identifies |
-| --- | --- |
-| Case input | Exact generated inputs, values, seeds, and input contracts |
-| Simulation case/batch | Case inputs plus template bytes, scientific configuration, mappings, and simulation contracts |
-| Campaign science | Ordered batches, membership, sampling policy, campaign seed, and requested Dataset semantics |
-| Campaign run | One campaign science identity executed by an exact Git commit and resolved runtime configuration |
-| Dataset package | Ordered admitted simulation bytes, conversion/view contracts, channels, and membership |
-| Operational provenance | Hosts, Slurm jobs, timestamps, paths, logs, and transfer/runtime evidence |
-
-Active planning, launch, feeding, and resume remain bound to the pinned commit.
-Completed readers verify persisted contracts and artifact bytes; moving identical
-bytes or renaming a display label does not create scientific meaning.
-
-Execution spans four domains:
-
-| Domain | Responsibility |
-| --- | --- |
-| Bare <code>hpc115</code> | Shell control plane, pinned Git source, Docker, SSH, rsync, <code>STORAGE_ROOT</code> |
-| <code>hpc115</code> Docker | Configuration resolution, local evidence admission, Dataset publication |
-| <code>sricehpc01</code> login | Native environment, durable CPU storage, Slurm control |
-| CPU compute node | Case scratch, COMSOL, conversion, validation, publication |
-
-Node-local scratch is temporary. Do not manually delete CPU source or transfer
-evidence; use the gated cleanup command.
+Planning, launch, feeding, and resume remain bound to the pinned commit.
+Completed readers verify persisted contracts and artifact bytes. Node-local
+scratch is temporary; do not manually delete CPU source or transfer evidence;
+use the gated cleanup command.
 
 ## Generate and inspect canonical inputs
 
@@ -179,46 +161,32 @@ Change only the selection arguments for common alternatives:
 is read-only. It admits persisted canonical input manifests and never plans,
 generates, locks, publishes, or inspects completed solver output.
 
-For transient schedules:
-
-- additional startup support conditions the COMSOL boundary;
-- regular state/output times remain unchanged;
-- inlet humidity ratio is preserved;
-- startup temperature obeys the configured static limits;
-- transient inputs created under an older boundary-handoff contract must be
-  regenerated before use.
-
-Generation-input EDA shows the operating schedule from the persisted startup end
-onward in hours on the left. The right column shows startup and early operation
-from <code>0</code> to <code>60 min</code> in minutes. Both views preserve exact
-persisted support and perform no resampling. See the
-[scientific parameter reference](generation_parameter_reference.md) for the
-schedule and numerical-validation definitions.
+Generate cases first, then rerun the notebook. Completed solver output belongs
+to completed-output EDA. Transient startup and schedule semantics are owned by
+the [scientific parameter reference](generation_parameter_reference.md#inlet-schedule).
 
 ## Operational stages
 
 ### Technical Smoke
 
-<code>smoke</code> runs the maintained steady and transient technical cases with
-real COMSOL. It validates inputs, exports, canonical HDF5, immutable packages,
-and loader access. Its evidence proves the technical path, not experimental
-validity. Raw exports, solved models, logs, packages, receipts, and CPU source
-are retained for diagnosis.
+<code>smoke</code> runs maintained steady and transient technical cases with real
+COMSOL. It proves the configured technical path through validated inputs,
+exports, canonical HDF5, immutable packages, and loader access; it does not
+establish experimental or scientific validity. Its retained receipt and case
+evidence support diagnosis and are required by broader workflow gates.
 
 ### Core benchmark
 
-<code>benchmark-cores</code> runs one nominal transient case across configured
-core variants and repetitions. Review single-case time, parallel efficiency, and
-COMSOL core-hours. Retry one failed variant with
+<code>benchmark-cores</code> compares configured core variants and reports the
+evidence needed to select <code>cluster.cores_per_case</code>; it does not edit
+configuration. Retry one failed variant with
 <code>benchmark-cores --variant &lt;variant-id&gt;</code>.
 
 ### Pilot
 
-<code>pilot-check</code> exercises natural-support cases for every configured
-material. Its receipt summarizes solver/conversion success, drying duration,
-physical bounds, balances, extrema, schedule behavior, and observed storage.
-Accepted pilot CPU source and transfer staging are cleaned by default;
-incomplete or invalid evidence is not cleanup-eligible.
+<code>pilot-check</code> exercises natural-support cases across configured
+materials and retains a diagnostic receipt. Accepted work follows the configured
+gated cleanup policy; incomplete or invalid evidence is not cleanup-eligible.
 
 ### Production and license retry
 
@@ -240,19 +208,9 @@ GENERATION_RUN_ID="<campaign_run_id>"
 ./scripts/generation_workflow.sh status "$GENERATION_RUN_ID"
 ~~~
 
-At the configured CPU checkout, the direct status surface uses the CPU-side
-root (the default is shown; substitute the configured <code>--cpu-root</code>):
-
-~~~bash
-CPU_GENERATION_ROOT="$HOME/grainlegumes-generation"
-"$CPU_GENERATION_ROOT/venv/bin/python" -m src.generation.cli.cli_generation   campaign-status "$GENERATION_RUN_ID"   --storage-root "$CPU_GENERATION_ROOT/storage" --format summary
-~~~
-
-The summary reports the active case, Slurm job, node, phase, simulated time,
-adaptive step, <code>Tfail</code>, and <code>NLfail</code> when available.
-These values are observational progress, not a convergence or completion
-verdict. Missing, malformed, stale, or unwritable progress never changes
-campaign success, retry, resume, publication, collection, or cleanup decisions.
+The summary may report the active case, Slurm job, node, phase, simulated time,
+adaptive step, <code>Tfail</code>, and <code>NLfail</code>. These are observational
+progress indicators, not a convergence, completion, retry, or cleanup verdict.
 
 Useful durable locations are:
 
@@ -274,16 +232,11 @@ case inventory.
 only when resolved campaigns, static checks, and current profile-specific
 Technical-Smoke evidence pass.
 
-| Purpose | Retained evidence and normal cleanup |
-| --- | --- |
-| Technical Smoke | Retains raw exports, solved models, logs, packages, receipts, CPU source |
-| Pilot | Retains accepted receipt and GPU publication; cleans verified CPU source/staging by default |
-| Production | Retains canonical <code>01_generation</code>, requested <code>02_datasets</code>, and receipts; cleans verified CPU source by default |
-| Failed/incomplete | Follows configured retention; cleanup remains fail-closed |
-
-<code>01_generation</code> is the canonical simulation archive.
-<code>02_datasets</code> contains immutable learning packages. Dataset
-publication never removes canonical Generation source.
+Technical Smoke retains diagnostic evidence. Accepted Pilot and Production
+work follows the configured gated cleanup policy; incomplete or invalid evidence
+remains ineligible for cleanup. <code>01_generation</code> is the canonical
+simulation archive, while <code>02_datasets</code> contains immutable learning
+packages. Dataset publication never removes canonical Generation source.
 
 ## Resume, cancel, collect, and cleanup
 

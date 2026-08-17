@@ -67,7 +67,7 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
     """Add one physical startup node without changing the canonical realization."""
     canonical = _schedule()
     canonical_values = canonical.values.copy()
-    duration_h = 1.0 / 6.0
+    duration_h = 0.5
 
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
@@ -99,11 +99,75 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
     np.testing.assert_array_equal(handoff.values[1], expected_rejoin)
     np.testing.assert_array_equal(handoff.values[2:], canonical.values[1:])
 
-    representative_times = np.asarray([duration_h, 0.25, 0.5, 1.0, 1.5, 17.25, 167.5])
+    representative_times = np.asarray([duration_h, 1.0, 1.5, 17.25, 167.5])
     for column in (1, 2):
         original = np.interp(representative_times, canonical.values[:, 0], canonical.values[:, column])
         transformed = np.interp(representative_times, handoff.values[:, 0], handoff.values[:, column])
         np.testing.assert_allclose(transformed, original, rtol=0.0, atol=2.0e-15)
+
+
+def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearly() -> None:
+    """Derive the thermodynamic midpoint of one analytically simple ramp."""
+    canonical_values = np.asarray(
+        (
+            (0.0, 302.0, 0.008, 0.0),
+            (1.0, 310.0, 0.010, 0.0),
+            (2.0, 308.0, 0.009, 0.0),
+        ),
+        dtype=np.float64,
+    )
+    canonical_values[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
+        canonical_values[:, 2],
+        canonical_values[:, 1],
+        pressure=float(_FIXED["p_ref"]),
+    )
+    canonical = schedule_service.Schedule(
+        values=canonical_values,
+        metadata={
+            "temperature_operational_bounds": [_FIXED["T_in_min"], _FIXED["T_in_max"]],
+            "humidity_ratio_operational_bounds": [_FIXED["omega_min"], _FIXED["omega_max"]],
+            "relative_humidity_operational_bounds": [
+                _FIXED["phi_operational_min"],
+                _FIXED["phi_operational_max"],
+            ],
+        },
+    )
+    handoff = schedule_service.build_comsol_boundary_schedule(
+        canonical,
+        {"enabled": True, "duration_h": 0.5},
+        initial_temperature=298.0,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+    np.testing.assert_array_equal(handoff.values[:, 0], (0.0, 0.5, 1.0, 2.0))
+    ramp_start = handoff.values[0]
+    ramp_end = handoff.values[1]
+    midpoint_temperature = np.interp(0.25, handoff.values[:, 0], handoff.values[:, 1])
+    midpoint_humidity_ratio = np.interp(0.25, handoff.values[:, 0], handoff.values[:, 2])
+    assert midpoint_temperature == ramp_start[1] + 0.5 * (ramp_end[1] - ramp_start[1])
+    assert midpoint_humidity_ratio == ramp_start[2] + 0.5 * (ramp_end[2] - ramp_start[2])
+    assert midpoint_temperature == 302.0
+    assert midpoint_humidity_ratio == 0.0085
+    assert ramp_end[1] == 306.0
+    assert ramp_end[2] == canonical_values[0, 2] + 0.5 * (canonical_values[1, 2] - canonical_values[0, 2])
+
+    midpoint_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        np.asarray([midpoint_humidity_ratio]),
+        np.asarray([midpoint_temperature]),
+        pressure=float(_FIXED["p_ref"]),
+    )[0]
+    independently_interpolated_phi = ramp_start[3] + 0.5 * (ramp_end[3] - ramp_start[3])
+    assert midpoint_phi != independently_interpolated_phi
+    np.testing.assert_allclose(
+        handoff.values[:, 3],
+        schedule_service.humidity_ratio_to_relative_humidity(
+            handoff.values[:, 2],
+            handoff.values[:, 1],
+            pressure=float(_FIXED["p_ref"]),
+        ),
+        rtol=64.0 * np.finfo(np.float64).eps,
+        atol=64.0 * np.finfo(np.float64).eps,
+    )
 
 
 def test_disabled_comsol_startup_handoff_is_semantically_canonical() -> None:
@@ -111,7 +175,7 @@ def test_disabled_comsol_startup_handoff_is_semantically_canonical() -> None:
     canonical = _schedule()
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
-        {"enabled": False, "duration_h": 1.0 / 6.0},
+        {"enabled": False, "duration_h": 0.5},
         initial_temperature=293.15,
         pressure=float(_FIXED["p_ref"]),
     )
@@ -125,7 +189,7 @@ def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
     with pytest.raises(ValueError, match="physically positive"):
         schedule_service.build_comsol_boundary_schedule(
             canonical,
-            {"enabled": True, "duration_h": 1.0 / 6.0},
+            {"enabled": True, "duration_h": 0.5},
             initial_temperature=-1.0,
             pressure=float(_FIXED["p_ref"]),
         )
@@ -142,7 +206,7 @@ def test_comsol_startup_handoff_preheats_only_to_static_rh_limit() -> None:
     )
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
-        {"enabled": True, "duration_h": 1.0 / 6.0},
+        {"enabled": True, "duration_h": 0.5},
         initial_temperature=288.7,
         pressure=float(_FIXED["p_ref"]),
     )
@@ -166,7 +230,7 @@ def test_comsol_startup_handoff_enforces_static_temperature_floor() -> None:
     )
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
-        {"enabled": True, "duration_h": 1.0 / 6.0},
+        {"enabled": True, "duration_h": 0.5},
         initial_temperature=288.15,
         pressure=float(_FIXED["p_ref"]),
     )
@@ -195,7 +259,7 @@ def test_comsol_handoff_rejects_operational_envelope_violation(
     canonical = _schedule()
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
-        {"enabled": True, "duration_h": 1.0 / 6.0},
+        {"enabled": True, "duration_h": 0.5},
         initial_temperature=293.15,
         pressure=float(_FIXED["p_ref"]),
     )
@@ -206,7 +270,7 @@ def test_comsol_handoff_rejects_operational_envelope_violation(
         schedule_service.validate_comsol_boundary_schedule(
             invalid,
             regular_times=np.asarray(_TIME["regular_times"], dtype=np.float64),
-            startup_ramp={"enabled": True, "duration_h": 1.0 / 6.0},
+            startup_ramp={"enabled": True, "duration_h": 0.5},
             initial_temperature=293.15,
             pressure=float(_FIXED["p_ref"]),
             metadata=handoff.metadata,

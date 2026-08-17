@@ -11,7 +11,7 @@ constraints:
 boundary_schedule:
   startup_ramp:
     enabled: true
-    duration_h: 0.16666666666666666
+    duration_h: 0.5
 parameter_values:
   pressure_bc.mean:
     lower: 250.0

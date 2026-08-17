@@ -336,10 +336,10 @@ def test_case_diagnostics_preserve_canonical_permeability_and_sorption(
     schedule, canonical, output, startup = generation_inputs.diagnostics.transient_evidence(transient)
     np.testing.assert_array_equal(
         schedule[:3, 0],
-        (0.0, 1.0 / 6.0, 1.0),
+        (0.0, 0.5, 1.0),
     )
     np.testing.assert_array_equal(canonical, output)
-    assert startup.duration_h == 1.0 / 6.0
+    assert startup.duration_h == 0.5
     expected_phi = domain.moisture.oswin_equilibrium_relative_humidity(
         transient.fields["X_0_db_field"],
         transient.case.payload["sampled_values"]["T_init"],
