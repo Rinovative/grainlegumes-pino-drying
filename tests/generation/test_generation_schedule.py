@@ -195,8 +195,49 @@ def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
         )
 
 
-def test_comsol_startup_handoff_preheats_only_to_static_rh_limit() -> None:
-    """Raise a cold humid inlet while preserving its canonical humidity ratio."""
+def test_comsol_startup_handoff_uses_cold_initial_state_without_preheating() -> None:
+    """Begin exactly at the physical initial state outside regular T and RH bounds."""
+    initial_temperature = 288.7
+    canonical = _schedule(
+        T_in_base=308.15,
+        T_in_amp=0.0,
+        omega_in_base=0.010625,
+        omega_in_amp=0.0,
+        T_amb=initial_temperature,
+    )
+    handoff = schedule_service.build_comsol_boundary_schedule(
+        canonical,
+        {"enabled": True, "duration_h": 0.5},
+        initial_temperature=initial_temperature,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        canonical.values[:1, 2],
+        np.asarray([initial_temperature], dtype=np.float64),
+        pressure=float(_FIXED["p_ref"]),
+    )[0]
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+    assert initial_temperature < _FIXED["T_in_min"]
+    assert _FIXED["phi_operational_max"] < expected_phi < 1.0
+    assert handoff.values[0, 1] == initial_temperature
+    assert handoff.values[0, 2] == canonical.values[0, 2]
+    assert handoff.values[0, 3] == expected_phi
+    assert startup == {
+        "enabled": True,
+        "duration_h": 0.5,
+        "temperature_start_policy": "use_initial_temperature_exactly",
+        "initial_temperature_K": initial_temperature,
+        "canonical_start_humidity_ratio_kg_per_kg": canonical.values[0, 2],
+        "startup_relative_humidity": expected_phi,
+        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
+        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_recompute_phi_in_bc",
+    }
+    assert handoff.metadata["boundary_handoff"]["handoff_version"] == 2
+
+
+def test_comsol_startup_handoff_rejects_supersaturated_initial_state() -> None:
+    """Fail closed instead of repairing a supersaturated physical startup state."""
     canonical = _schedule(
         T_in_base=308.15,
         T_in_amp=0.0,
@@ -204,122 +245,47 @@ def test_comsol_startup_handoff_preheats_only_to_static_rh_limit() -> None:
         omega_in_amp=0.0,
         T_amb=288.7,
     )
-    handoff = schedule_service.build_comsol_boundary_schedule(
-        canonical,
-        {"enabled": True, "duration_h": 0.5},
-        initial_temperature=288.7,
-        pressure=float(_FIXED["p_ref"]),
-    )
 
-    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
-    assert handoff.values[0, 1] > 288.7
-    assert handoff.values[0, 1] == startup["psychrometric_required_temperature_K"]
-    assert handoff.values[0, 2] == canonical.values[0, 2]
-    assert handoff.values[0, 3] <= _FIXED["phi_operational_max"]
-    assert startup["preheating_above_initial_required"] is True
+    with pytest.raises(ValueError, match="physically invalid"):
+        schedule_service.build_comsol_boundary_schedule(
+            canonical,
+            {"enabled": True, "duration_h": 0.5},
+            initial_temperature=280.0,
+            pressure=float(_FIXED["p_ref"]),
+        )
 
 
-def test_comsol_startup_handoff_enforces_static_temperature_floor() -> None:
-    """Raise a cold low-humidity inlet to the static temperature floor."""
-    canonical = _schedule(
-        T_in_base=303.15,
-        T_in_amp=0.0,
-        omega_in_base=0.0025,
-        omega_in_amp=0.0,
-        T_amb=288.15,
-    )
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        (1, 289.15),
+        (2, 0.015),
+        (3, 0.9),
+    ],
+)
+def test_comsol_handoff_rejects_operational_rejoin_violation(
+    column: int,
+    invalid_value: float,
+) -> None:
+    """Keep authored operational envelopes on the rejoin and regular nodes."""
+    canonical = _schedule()
     handoff = schedule_service.build_comsol_boundary_schedule(
         canonical,
         {"enabled": True, "duration_h": 0.5},
         initial_temperature=288.15,
         pressure=float(_FIXED["p_ref"]),
     )
-
-    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
-    assert handoff.values[0, 1] == _FIXED["T_in_min"]
-    assert startup["configured_temperature_minimum_K"] == _FIXED["T_in_min"]
-    assert startup["psychrometric_required_temperature_K"] < _FIXED["T_in_min"]
-    assert np.all(handoff.values[:, 1] >= _FIXED["T_in_min"])
-
-
-@pytest.mark.parametrize(
-    ("column", "invalid_value", "message"),
-    [
-        (1, 289.15, "operational temperature"),
-        (2, 0.015, "operational humidity-ratio"),
-        (3, 0.9, "operational relative-humidity"),
-    ],
-)
-def test_comsol_handoff_rejects_operational_envelope_violation(
-    column: int,
-    invalid_value: float,
-    message: str,
-) -> None:
-    """Reject physical-looking handoff nodes outside any static envelope."""
-    canonical = _schedule()
-    handoff = schedule_service.build_comsol_boundary_schedule(
-        canonical,
-        {"enabled": True, "duration_h": 0.5},
-        initial_temperature=293.15,
-        pressure=float(_FIXED["p_ref"]),
-    )
     invalid = handoff.values.copy()
-    invalid[0, column] = invalid_value
+    invalid[1, column] = invalid_value
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="rejoin or canonical regular schedule nodes"):
         schedule_service.validate_comsol_boundary_schedule(
             invalid,
             regular_times=np.asarray(_TIME["regular_times"], dtype=np.float64),
             startup_ramp={"enabled": True, "duration_h": 0.5},
-            initial_temperature=293.15,
+            initial_temperature=288.15,
             pressure=float(_FIXED["p_ref"]),
             metadata=handoff.metadata,
-        )
-
-
-def test_psychrometric_inverse_fails_when_temperature_maximum_is_insufficient() -> None:
-    """Fail closed when no configured startup temperature can satisfy the RH limit."""
-    with pytest.raises(ValueError, match="Configured maximum inlet temperature"):
-        schedule_service.minimum_temperature_for_relative_humidity(
-            0.02,
-            relative_humidity_maximum=0.4,
-            pressure=float(_FIXED["p_ref"]),
-            temperature_maximum=295.0,
-        )
-
-
-def test_comsol_startup_handoff_fails_when_safe_start_exceeds_rejoin() -> None:
-    """Reject a safe static start that cannot form the configured heating ramp."""
-    canonical_values = np.asarray(
-        (
-            (0.0, 300.0, 0.014, 0.0),
-            (1.0, 294.15, 0.0045, 0.0),
-        ),
-        dtype=np.float64,
-    )
-    canonical_values[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
-        canonical_values[:, 2],
-        canonical_values[:, 1],
-        pressure=float(_FIXED["p_ref"]),
-    )
-    canonical = schedule_service.Schedule(
-        values=canonical_values,
-        metadata={
-            "temperature_operational_bounds": [_FIXED["T_in_min"], _FIXED["T_in_max"]],
-            "humidity_ratio_operational_bounds": [_FIXED["omega_min"], _FIXED["omega_max"]],
-            "relative_humidity_operational_bounds": [
-                _FIXED["phi_operational_min"],
-                _FIXED["phi_operational_max"],
-            ],
-        },
-    )
-
-    with pytest.raises(ValueError, match="exceeds the required heating-ramp rejoin"):
-        schedule_service.build_comsol_boundary_schedule(
-            canonical,
-            {"enabled": True, "duration_h": 0.99},
-            initial_temperature=294.15,
-            pressure=float(_FIXED["p_ref"]),
         )
 
 

@@ -172,21 +172,19 @@ hours. It must lie strictly between zero and the first regular interval. The
 policy uses no bed-state or solver feedback and does not change regular COMSOL
 output, HDF5, or Dataset state times.
 
-At zero, `omega_in_bc` remains exactly the canonical incoming-air humidity
-ratio. The schedule psychrometric owner solves the maintained Magnus conversion
-for the minimum temperature satisfying `phi_in_bc <= phi_operational_max`, then
-uses `T_start = max(T_init, T_in_min, T_required)`. This is a static configuration
-constraint: it uses no bed state, solver value, or runtime feedback. Generation
-fails closed when the humidity ratio is invalid, the configured maximum
-temperature cannot satisfy the RH limit, or the safe start is above the required
-heating-ramp rejoin state. Persisted startup evidence records the quantities
-needed to reproduce and verify this boundary condition.
+At zero, the startup boundary begins exactly at the case initial temperature
+`T_init` and preserves the canonical initial `omega_in_bc`. Its `phi_in_bc` is
+derived thermodynamically from that temperature, humidity ratio, and `p_ref`.
+The initial startup state may therefore lie outside the regular operating
+temperature and relative-humidity envelopes, but it must remain physically valid;
+a supersaturated state fails closed rather than being repaired.
 
-The rejoin temperature and humidity ratio are the original canonical linear
-interpolation at the configured startup duration; rejoin relative humidity is
-recomputed thermodynamically from those two values. Every physical handoff node
-must lie inside the persisted operational temperature, humidity-ratio, and RH
-envelopes, and every retained regular node remains unchanged.
+The configured linear startup ramp rejoins the canonical schedule at
+`boundary_schedule.startup_ramp.duration_h`. Rejoin temperature and humidity
+ratio are the exact canonical linear interpolation at that time, and rejoin
+relative humidity is recomputed thermodynamically. Regular operating envelopes
+apply to the rejoin and canonical operating schedule, while every retained
+regular node remains unchanged.
 
 The extra row is boundary interpolation support, not a regular output state.
 COMSOL output, HDF5 state time, and Dataset transitions continue to use only

@@ -162,8 +162,10 @@ is read-only. It admits persisted canonical input manifests and never plans,
 generates, locks, publishes, or inspects completed solver output.
 
 Generate cases first, then rerun the notebook. Completed solver output belongs
-to completed-output EDA. Transient startup and schedule semantics are owned by
-the [scientific parameter reference](generation_parameter_reference.md#inlet-schedule).
+to completed-output EDA. The transient boundary ramp begins from the case
+initial state and rejoins the regular schedule at the configured startup
+duration. Scientific startup and schedule semantics are owned by the
+[scientific parameter reference](generation_parameter_reference.md#inlet-schedule).
 
 ## Operational stages
 

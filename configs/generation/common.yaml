@@ -30,7 +30,7 @@ scientific_fixed_values:
       evidence: synthetic_design
       source_refs:
       - ba
-      note: Static inlet and handoff floor selected to admit stochastic lower-heating intervals while retaining heater-only and psychrometric rejection.
+      note: Regular inlet lower bound selected to admit stochastic lower-heating intervals while retaining heater-only and psychrometric rejection.
   T_in_max:
     value: 313.15
     unit: K

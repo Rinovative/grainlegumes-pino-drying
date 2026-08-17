@@ -7,7 +7,7 @@ Responsibilities:
   - Compose dedicated smooth, event, and trend processes on the regular time grid
   - Realize exact temperature and humidity-ratio amplitude and correlation contracts
   - Derive relative humidity thermodynamically and report schedule-quality evidence
-  - Build statically RH-safe COMSOL startup and boundary interpolation tables
+  - Build physical COMSOL startup and boundary interpolation tables
 Design principles:
   - One temporal process family serves natural, parameter-OOD, and stress supports
   - Simplex weights mean relative component contribution exactly once
@@ -41,9 +41,8 @@ _RANDOM_BINARY_THRESHOLD = 0.5
 _MINIMUM_LAG1_NODES = 3
 _INTERVAL_BOUND_COUNT = 2
 SCHEDULE_GENERATOR_VERSION: Final = 1
-COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
+COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 2
 CORRELATION_TOLERANCE: Final = 2.0e-12
-_PSYCHROMETRIC_INVERSE_ITERATIONS: Final = 80
 MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
 MINIMUM_EVENT_WIDTH_INTERVALS: Final = 2.0
 MINIMUM_EVENT_DURATION_INTERVALS: Final = 4.0
@@ -157,78 +156,40 @@ def _operational_bounds(metadata: Mapping[str, Any], name: str) -> tuple[float, 
     return lower, upper
 
 
-def _startup_temperature_metadata(
+def _startup_ramp_metadata(
     canonical_start: np.ndarray,
     *,
     enabled: bool,
     duration_h: float,
     initial_temperature: float,
-    rejoin_temperature: float | None,
     pressure: float,
-    phi_operational_max: float,
-    temperature_minimum: float,
-    temperature_maximum: float,
 ) -> dict[str, Any]:
-    """Return truthful static startup-temperature policy evidence."""
+    """Return truthful startup-ramp policy evidence."""
     canonical_humidity_ratio = float(canonical_start[2])
     if not enabled:
         return {
             "enabled": False,
             "duration_h": duration_h,
             "temperature_start_policy": "disabled_retain_canonical_schedule",
-            "original_initial_temperature_K": initial_temperature,
-            "configured_temperature_minimum_K": temperature_minimum,
+            "initial_temperature_K": initial_temperature,
             "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
-            "configured_phi_operational_max": phi_operational_max,
-            "psychrometric_required_temperature_K": None,
-            "final_start_temperature_K": float(canonical_start[1]),
-            "preheating_above_initial_required": None,
             "startup_relative_humidity": float(canonical_start[3]),
             "humidity_start_policy": "disabled_retain_canonical_schedule",
             "rejoin_policy": "not_applicable",
         }
-    if rejoin_temperature is None:
-        msg = "Enabled COMSOL startup handoff requires one rejoin temperature."
-        raise ValueError(msg)
-    required_temperature = minimum_temperature_for_relative_humidity(
-        canonical_humidity_ratio,
-        relative_humidity_maximum=phi_operational_max,
-        pressure=pressure,
-        temperature_maximum=temperature_maximum,
-    )
-    start_temperature = max(initial_temperature, temperature_minimum, required_temperature)
-    tolerance = _numeric_tolerance(
-        initial_temperature,
-        temperature_minimum,
-        required_temperature,
-        start_temperature,
-        rejoin_temperature,
-        temperature_maximum,
-    )
-    if start_temperature > temperature_maximum + tolerance:
-        msg = "COMSOL startup temperature exceeds the configured maximum inlet temperature."
-        raise ValueError(msg)
-    if start_temperature > rejoin_temperature + tolerance:
-        msg = "Psychrometrically safe COMSOL startup temperature exceeds the required heating-ramp rejoin state."
-        raise ValueError(msg)
     startup_phi = float(
         humidity_ratio_to_relative_humidity(
             np.asarray([canonical_humidity_ratio], dtype=np.float64),
-            np.asarray([start_temperature], dtype=np.float64),
+            np.asarray([initial_temperature], dtype=np.float64),
             pressure=pressure,
         )[0]
     )
     return {
         "enabled": True,
         "duration_h": duration_h,
-        "temperature_start_policy": "max_of_T_init_T_in_min_and_static_phi_operational_max_requirement",
-        "original_initial_temperature_K": initial_temperature,
-        "configured_temperature_minimum_K": temperature_minimum,
+        "temperature_start_policy": "use_initial_temperature_exactly",
+        "initial_temperature_K": initial_temperature,
         "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
-        "configured_phi_operational_max": phi_operational_max,
-        "psychrometric_required_temperature_K": required_temperature,
-        "final_start_temperature_K": start_temperature,
-        "preheating_above_initial_required": start_temperature > initial_temperature,
         "startup_relative_humidity": startup_phi,
         "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
         "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_recompute_phi_in_bc",
@@ -303,7 +264,7 @@ def validate_comsol_boundary_schedule(
     if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
         msg = "COMSOL startup temperature source must be finite and physically positive."
         raise ValueError(msg)
-    if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0) or np.any((values[:, 3] < 0.0) | (values[:, 3] > 1.0)):
+    if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0) or np.any((values[:, 3] <= 0.0) | (values[:, 3] > 1.0)):
         msg = "COMSOL boundary temperature, humidity ratio, or relative humidity is physically invalid."
         raise ValueError(msg)
     temperature_minimum, temperature_maximum = _operational_bounds(
@@ -318,24 +279,6 @@ def validate_comsol_boundary_schedule(
         metadata,
         "relative_humidity_operational_bounds",
     )
-    if np.any((values[:, 1] < temperature_minimum) | (values[:, 1] > temperature_maximum)):
-        msg = "COMSOL boundary schedule violates the operational temperature envelope."
-        raise ValueError(msg)
-    if np.any((values[:, 2] < humidity_minimum) | (values[:, 2] > humidity_maximum)):
-        msg = "COMSOL boundary schedule violates the operational humidity-ratio envelope."
-        raise ValueError(msg)
-    if np.any((values[:, 3] < phi_minimum) | (values[:, 3] > phi_maximum)):
-        msg = "COMSOL boundary schedule violates the operational relative-humidity envelope."
-        raise ValueError(msg)
-    source_phi = humidity_ratio_to_relative_humidity(
-        values[:, 2],
-        np.full(values.shape[0], initial_temperature, dtype=np.float64),
-        pressure=pressure,
-    )
-    if np.any((source_phi <= 0.0) | (source_phi > 1.0)) or np.any(values[:, 1] < initial_temperature):
-        msg = "COMSOL boundary schedule violates heater-only source-air physics."
-        raise ValueError(msg)
-
     handoff = metadata.get("boundary_handoff")
     if not isinstance(handoff, Mapping):
         msg = "COMSOL boundary schedule lacks handoff provenance."
@@ -372,17 +315,26 @@ def validate_comsol_boundary_schedule(
         raise ValueError(msg)
 
     thermodynamic_tolerance = 64.0 * np.finfo(np.float64).eps
-    canonical_operating_rows = np.concatenate(
-        (canonical_start[np.newaxis, :], values[2:] if enabled else values[1:]),
+    operating_rows = np.concatenate(
+        (canonical_start[np.newaxis, :], values[1:]),
         axis=0,
     )
     if (
-        np.any((canonical_operating_rows[:, 1] < temperature_minimum) | (canonical_operating_rows[:, 1] > temperature_maximum))
-        or np.any((canonical_operating_rows[:, 2] < humidity_minimum) | (canonical_operating_rows[:, 2] > humidity_maximum))
-        or np.any((canonical_operating_rows[:, 3] < phi_minimum) | (canonical_operating_rows[:, 3] > phi_maximum))
+        np.any((operating_rows[:, 1] < temperature_minimum) | (operating_rows[:, 1] > temperature_maximum))
+        or np.any((operating_rows[:, 2] < humidity_minimum) | (operating_rows[:, 2] > humidity_maximum))
+        or np.any((operating_rows[:, 3] < phi_minimum) | (operating_rows[:, 3] > phi_maximum))
     ):
-        msg = "Canonical regular schedule nodes violate persisted operational bounds."
+        msg = "COMSOL rejoin or canonical regular schedule nodes violate persisted operational bounds."
         raise ValueError(msg)
+    source_phi = humidity_ratio_to_relative_humidity(
+        values[:, 2],
+        np.full(values.shape[0], initial_temperature, dtype=np.float64),
+        pressure=pressure,
+    )
+    if np.any((source_phi <= 0.0) | (source_phi > 1.0)) or np.any(values[:, 1] < initial_temperature):
+        msg = "COMSOL boundary schedule violates heater-only source-air physics."
+        raise ValueError(msg)
+
     if enabled:
         fraction = duration_h / regular_interval
         expected_rejoin = canonical_start + fraction * (values[2] - canonical_start)
@@ -398,20 +350,16 @@ def validate_comsol_boundary_schedule(
             values[:1, 1],
             pressure=pressure,
         )[0]
-        expected_startup_metadata = _startup_temperature_metadata(
+        expected_startup_metadata = _startup_ramp_metadata(
             canonical_start,
             enabled=True,
             duration_h=duration_h,
             initial_temperature=initial_temperature,
-            rejoin_temperature=float(expected_rejoin[1]),
             pressure=pressure,
-            phi_operational_max=phi_maximum,
-            temperature_minimum=temperature_minimum,
-            temperature_maximum=temperature_maximum,
         )
         if (
             handoff["startup_ramp"] != expected_startup_metadata
-            or values[0, 1] != expected_startup_metadata["final_start_temperature_K"]
+            or values[0, 1] != initial_temperature
             or values[0, 2] != canonical_start[2]
             or not math.isclose(values[0, 3], expected_start_phi, rel_tol=thermodynamic_tolerance, abs_tol=thermodynamic_tolerance)
             or rejoin_row.shape != (len(profiles.SCHEDULE_FIELDS),)
@@ -426,16 +374,12 @@ def validate_comsol_boundary_schedule(
             axis=0,
         )
     else:
-        expected_startup_metadata = _startup_temperature_metadata(
+        expected_startup_metadata = _startup_ramp_metadata(
             canonical_start,
             enabled=False,
             duration_h=duration_h,
             initial_temperature=initial_temperature,
-            rejoin_temperature=None,
             pressure=pressure,
-            phi_operational_max=phi_maximum,
-            temperature_minimum=temperature_minimum,
-            temperature_maximum=temperature_maximum,
         )
         if (
             handoff["startup_ramp"] != expected_startup_metadata
@@ -483,18 +427,6 @@ def build_comsol_boundary_schedule(
     if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
         msg = "COMSOL startup temperature source must be finite and physically positive."
         raise ValueError(msg)
-    temperature_minimum, temperature_maximum = _operational_bounds(
-        canonical.metadata,
-        "temperature_operational_bounds",
-    )
-    _humidity_minimum, _humidity_maximum = _operational_bounds(
-        canonical.metadata,
-        "humidity_ratio_operational_bounds",
-    )
-    _phi_minimum, phi_maximum = _operational_bounds(
-        canonical.metadata,
-        "relative_humidity_operational_bounds",
-    )
     rejoin_row: np.ndarray | None = None
     startup_metadata: dict[str, Any]
     if enabled:
@@ -506,19 +438,15 @@ def build_comsol_boundary_schedule(
             constructed_rejoin[1:2],
             pressure=pressure,
         )[0]
-        startup_metadata = _startup_temperature_metadata(
+        startup_metadata = _startup_ramp_metadata(
             canonical_values[0],
             enabled=True,
             duration_h=duration_h,
             initial_temperature=initial_temperature,
-            rejoin_temperature=float(constructed_rejoin[1]),
             pressure=pressure,
-            phi_operational_max=phi_maximum,
-            temperature_minimum=temperature_minimum,
-            temperature_maximum=temperature_maximum,
         )
         start_row = canonical_values[0].copy()
-        start_row[1] = float(startup_metadata["final_start_temperature_K"])
+        start_row[1] = initial_temperature
         start_row[3] = float(startup_metadata["startup_relative_humidity"])
         handoff_values = np.concatenate(
             (start_row[np.newaxis, :], constructed_rejoin[np.newaxis, :], canonical_values[1:]),
@@ -530,16 +458,12 @@ def build_comsol_boundary_schedule(
             raise RuntimeError(msg)
     else:
         handoff_values = canonical_values.copy()
-        startup_metadata = _startup_temperature_metadata(
+        startup_metadata = _startup_ramp_metadata(
             canonical_values[0],
             enabled=False,
             duration_h=duration_h,
             initial_temperature=initial_temperature,
-            rejoin_temperature=None,
             pressure=pressure,
-            phi_operational_max=phi_maximum,
-            temperature_minimum=temperature_minimum,
-            temperature_maximum=temperature_maximum,
         )
     metadata = copy.deepcopy(canonical.metadata)
     metadata["boundary_handoff"] = _boundary_handoff_metadata(
@@ -642,88 +566,6 @@ def humidity_ratio_dew_point_temperature(
         msg = "Humidity ratio lies outside the maintained Magnus inverse domain."
         raise ValueError(msg)
     return 273.15 + 243.04 * logarithm / denominator
-
-
-def minimum_temperature_for_relative_humidity(
-    humidity_ratio: float,
-    *,
-    relative_humidity_maximum: float,
-    pressure: float,
-    temperature_maximum: float,
-) -> float:
-    """
-    Return the minimum temperature satisfying one static relative-humidity limit.
-
-    Parameters
-    ----------
-    humidity_ratio : float
-        Preserved inlet humidity ratio in kg/kg.
-    relative_humidity_maximum : float
-        Inclusive static relative-humidity upper bound.
-    pressure : float
-        Reference pressure in Pa.
-    temperature_maximum : float
-        Inclusive configured maximum inlet temperature in K.
-
-    Returns
-    -------
-    float
-        Smallest numerically safe temperature in K within the configured bound.
-
-    Raises
-    ------
-    ValueError
-        If inputs are invalid or the configured maximum cannot satisfy the
-        relative-humidity limit.
-
-    """
-    if isinstance(humidity_ratio, bool) or not math.isfinite(humidity_ratio) or humidity_ratio <= 0.0:
-        msg = "Psychrometric temperature inversion requires finite strictly positive humidity ratio."
-        raise ValueError(msg)
-    if isinstance(relative_humidity_maximum, bool) or not math.isfinite(relative_humidity_maximum) or not 0.0 < relative_humidity_maximum <= 1.0:
-        msg = "Psychrometric temperature inversion requires phi maximum in (0, 1]."
-        raise ValueError(msg)
-    if isinstance(temperature_maximum, bool) or not math.isfinite(temperature_maximum) or temperature_maximum <= 0.0:
-        msg = "Psychrometric temperature inversion requires a finite positive maximum temperature."
-        raise ValueError(msg)
-    dew_point = float(
-        humidity_ratio_dew_point_temperature(
-            np.asarray([humidity_ratio], dtype=np.float64),
-            pressure=pressure,
-        )[0]
-    )
-    if dew_point > temperature_maximum:
-        msg = "Configured maximum inlet temperature lies below the humidity-ratio dew point."
-        raise ValueError(msg)
-    upper_phi = float(
-        humidity_ratio_to_relative_humidity(
-            np.asarray([humidity_ratio], dtype=np.float64),
-            np.asarray([temperature_maximum], dtype=np.float64),
-            pressure=pressure,
-        )[0]
-    )
-    if upper_phi > relative_humidity_maximum:
-        msg = "Configured maximum inlet temperature cannot satisfy the startup relative-humidity limit."
-        raise ValueError(msg)
-    if relative_humidity_maximum == 1.0:
-        return dew_point
-
-    lower = dew_point
-    upper = temperature_maximum
-    for _iteration in range(_PSYCHROMETRIC_INVERSE_ITERATIONS):
-        midpoint = lower + 0.5 * (upper - lower)
-        midpoint_phi = float(
-            humidity_ratio_to_relative_humidity(
-                np.asarray([humidity_ratio], dtype=np.float64),
-                np.asarray([midpoint], dtype=np.float64),
-                pressure=pressure,
-            )[0]
-        )
-        if midpoint_phi > relative_humidity_maximum:
-            lower = midpoint
-        else:
-            upper = midpoint
-    return upper
 
 
 def _regular_time(
