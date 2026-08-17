@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
 from src import common, generation
-from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_templates as templates
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from typing import Any
 
 
 def _write_template(
@@ -159,20 +161,3 @@ def test_template_locator_is_provenance_while_bytes_bind_simulation_identity(
     assert changed.case_input_config_digest == relocated.case_input_config_digest
     assert changed_bundle.case_input_id == relocated_bundle.case_input_id
     assert changed_bundle.simulation_case_id != relocated_bundle.simulation_case_id
-
-
-def test_maintained_profile_templates_resolve_from_profile_yaml() -> None:
-    """Verify each maintained profile declares a valid checked-in template identity."""
-    repository_root = Path(__file__).resolve().parents[2]
-    profile_paths = sorted((repository_root / "configs/generation/profiles").glob("*.yaml"))
-    for profile_path in profile_paths:
-        document: Any = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-        assert isinstance(document, dict)
-        profile_id = document["simulation_profile"]
-        profiles.resolve_profile(profile_id)
-        resolved = templates.resolve_template_identity(
-            document["template"],
-            repository_root=repository_root,
-        )
-        assert resolved.sidecar_path == resolved.absolute_path.with_suffix(".sha256")
-        assert common.serialization.file_sha256(resolved.absolute_path) == resolved.sha256

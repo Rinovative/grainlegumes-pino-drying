@@ -36,6 +36,13 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 2
 fi
 
+printf -v CASE_ID 'case_%04d' "${CASE_INDEX}"
+CASE_NODE="${SLURMD_NODENAME:-${HOSTNAME:-unavailable}}"
+CASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unavailable)"
+printf 'CASE START campaign_run_id=%s batch=%s case=%s case_index=%s job=%s node=%s cores=%s started_at=%s\n' \
+  "${CAMPAIGN_RUN_ID}" "${BATCH_NAME}" "${CASE_ID}" "${CASE_INDEX}" \
+  "${SLURM_JOB_ID}" "${CASE_NODE}" "${CORES_PER_CASE}" "${CASE_STARTED_AT}"
+
 REPOSITORY_ROOT="$1"
 PREREQUISITE_HELPER="${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
 if [[ "${REPOSITORY_ROOT}" != /* || "${REPOSITORY_ROOT}" == / ]]; then

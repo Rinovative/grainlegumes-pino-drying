@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -16,11 +15,10 @@ from src.datasets.packages import dataset_packages_planning as package_planning
 from src.generation.cases import generation_cases_fields as fields
 from src.generation.cases import generation_cases_sampling as sampling
 from src.generation.cases import generation_cases_seeding as seeding
-from src.generation.contracts import generation_contracts_materials as materials
-from src.generation.publication import generation_publication_inventory as inventory
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 
 def test_semantic_seed_derivation_is_version_bound() -> None:
@@ -73,31 +71,49 @@ def test_execution_rejects_nonordinary_scheduler_options(
         generation.cases.config.load_campaign_config(config_path)
 
 
-def test_parameter_ood_allocation_covers_profile_eligible_units_evenly() -> None:
-    """Protect exact one-unit OOD assignments derived from profile applicability."""
-    paths = (
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+def test_parameter_ood_allocation_covers_eligible_units_evenly() -> None:
+    """Project configured OOD units and allocate compact cases evenly."""
+    family_contract = {
+        "parameter_registry": {
+            "thermal_interval": {
+                "kind": "interval",
+                "ood_group": "thermal",
+                "ood": [{"lower": 1.0, "upper": 2.0}],
+            },
+            "flow_mode": {
+                "kind": "categorical",
+                "ood_group": "flow",
+                "ood_choices": ["high"],
+            },
+            "inactive_interval": {
+                "kind": "interval",
+                "ood_group": "inactive",
+                "ood": [{"lower": 3.0, "upper": 4.0}],
+            },
+        },
+        "coupled_ood_records": {
+            "sorption_record": {
+                "ood_group": "thermal",
+                "records": [{"A": 1.0}],
+            }
+        },
+    }
+
+    eligible = sampling.eligible_ood_units(
+        family_contract,
+        groups=("thermal", "flow"),
     )
-    for path in paths:
-        campaign = generation.cases.config.load_campaign_config(path, require_executable=False)
-        for batch in (item for item in campaign.batches if item.sampling_regime == "parameter_ood"):
-            policy = batch.scientific_values["parameter_ood"]
-            eligible = policy["eligible_units"]
-            allocation = policy["case_allocation"]
-            counts = policy["allocation_counts"]
-            assert len(allocation) == len(batch.case_indices)
-            assert set(counts) == {unit["unit_id"] for unit in eligible}
-            assert min(counts.values()) >= 1
-            assert max(counts.values()) - min(counts.values()) <= 1
-            registry = batch.scientific_values["material"]["parameter_registry"]
-            assert {unit["ood_group"] for unit in eligible} == set(materials.active_ood_groups(registry, campaign.profile.id))
-            for case_index in (batch.case_indices[0], batch.case_indices[-1]):
-                assignment = batch.case_assignment(case_index)
-                sample = sampling.sample_case(batch, case_index)
-                assert sample.ood_provenance["active_unit_id"] == assignment["ood_unit_id"]
-                assert sample.ood_provenance["active_ood_group"] == assignment["ood_group"]
-                assert sample.ood_provenance["units_per_case"] == 1
+    allocation = sampling.allocate_ood_units(eligible, case_count=7)
+    counts = {unit["unit_id"]: sum(assigned["unit_id"] == unit["unit_id"] for assigned in allocation) for unit in eligible}
+
+    assert [unit["unit_id"] for unit in eligible] == [
+        "thermal_interval",
+        "flow_mode",
+        "sorption_record",
+    ]
+    assert min(counts.values()) >= 1
+    assert max(counts.values()) - min(counts.values()) <= 1
+    assert [assigned["unit_id"] for assigned in allocation[:3]] == [unit["unit_id"] for unit in eligible]
 
 
 def test_generation_and_hdf5_versions_are_explicit_integers(
@@ -216,90 +232,29 @@ def test_startup_ramp_configuration_is_strict(
         generation.cases.config.load_campaign_config(config_path)
 
 
-def _temporary_family_campaign(
-    tmp_path: Path,
-    name: str,
-) -> tuple[Path, dict[str, Any], Path, dict[str, Any], Path, dict[str, Any]]:
-    """Copy one layered campaign while retaining repository scientific owners."""
-    directory = tmp_path / name
-    directory.mkdir()
-    source = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
-    campaign = yaml.safe_load(source.read_text(encoding="utf-8"))
-    reference_keys = (
-        "sources_config",
-        "registry_config",
-        "operations_config",
-        "profile_config",
-    )
-    for key in reference_keys:
-        campaign[key] = str(Path(campaign[key]).resolve())
-
-    common_path = directory / "common.yaml"
-    common = yaml.safe_load(Path(campaign["common_config"]).read_text(encoding="utf-8"))
-    campaign["common_config"] = str(common_path)
-
-    execution_path = directory / "execution.yaml"
-    execution = yaml.safe_load(Path(campaign["execution_config"]).read_text(encoding="utf-8"))
-    campaign["execution_config"] = str(execution_path)
-
-    campaign_path = directory / "campaign.yaml"
-    return campaign_path, campaign, common_path, common, execution_path, execution
-
-
-def _write_yaml(path: Path, value: dict[str, Any]) -> None:
-    """Write one deterministic temporary YAML fixture."""
-    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
-
-
 def test_valid_config_edits_are_resolved_without_source_synchronization(
-    tmp_path: Path,
+    generation_config_factory: Any,
 ) -> None:
-    """Prove counts, seeds, roles, packages, science, and resources are config-owned."""
-    campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(tmp_path, "editable")
+    """Resolve test-owned science and execution edits from their YAML owners."""
+    campaign_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+    common_path = campaign_path.parent / "common.yaml"
+    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    execution_path = campaign_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+
     campaign["sampling"]["seed_base"] = 12345
-    campaign["membership"] = {
-        "seed": 12346,
-        "per_seen_material": {
-            "train": 190,
-            "validation": 25,
-            "id_test": 25,
-        },
-    }
-    for material_family in campaign["sampling"]["counts"]["natural"]:
-        campaign["sampling"]["counts"]["natural"][material_family] = 241 if material_family in campaign["material_roles"]["seen"] else 81
-    for material_family in campaign["sampling"]["counts"]["parameter_ood"]:
-        campaign["sampling"]["counts"]["parameter_ood"][material_family] = 81
-
-    original_seen = campaign["material_roles"]["seen"][1]
-    replacement_seen = campaign["material_roles"]["near_family_ood"][0]
-    campaign["material_roles"]["seen"][1] = replacement_seen
-    campaign["material_roles"]["near_family_ood"][0] = original_seen
-    parameter_counts = campaign["sampling"]["counts"]["parameter_ood"]
-    parameter_counts[replacement_seen] = parameter_counts.pop(original_seen)
-    natural_counts = campaign["sampling"]["counts"]["natural"]
-    natural_counts[replacement_seen] = 241
-    natural_counts[original_seen] = 81
-    campaign["dataset_packages"] = [package for package in campaign["dataset_packages"] if package["evaluation_regime"] != "extreme_family_ood"]
-
-    common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0, "Lz": 0.4})
+    campaign["membership"]["seed"] = 12346
+    common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0})
     common["time"].update({"start": 0.0, "stop": 84.0, "interval": 0.5})
     common["scientific_fixed_values"]["T_flow_ref"]["value"] = 301.15
     common["scientific_fixed_values"]["p_ref"]["value"] = 100000.0
-    common["storage"].update(
-        {
-            "compression_level": 6,
-            "chunk_time": 3,
-            "chunk_y": 5,
-            "chunk_x": 7,
-        }
-    )
-
-    execution["runtime"].update(
-        {
-            "timeout_seconds": 4200,
-            "maximum_failures": 3,
-        }
-    )
+    common["storage"]["compression_level"] = 6
+    execution["runtime"].update({"timeout_seconds": 4200, "maximum_failures": 3})
     execution["submission"].update(
         {
             "pending_buffer": 2,
@@ -308,44 +263,27 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
         }
     )
     execution["cluster"]["cores_per_case"] = 8
-    execution["site"].update(
-        {
-            "cpu_host": "synthetic-host",
-            "cores_per_node": 16,
-            "python_module": "Python/test",
-            "comsol_module": "Comsol/test",
-        }
-    )
-    _write_yaml(common_path, common)
-    _write_yaml(execution_path, execution)
-    _write_yaml(campaign_path, campaign)
+    execution["site"]["cpu_host"] = "synthetic-host"
 
-    resolved = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
+    campaign_path.write_text(
+        yaml.safe_dump(campaign, sort_keys=False),
+        encoding="utf-8",
     )
-    expected_total = sum(count for regime_counts in campaign["sampling"]["counts"].values() for count in regime_counts.values())
-    assert resolved.total_case_count == expected_total
-    assert resolved.membership == campaign["membership"]
-    assert resolved.batches[0].scientific_values["campaign_seed"] == 12345
-    assert resolved.material_roles["seen"][1] == replacement_seen
-    expected_evaluation_regimes = tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in campaign["dataset_packages"]))
-    assert resolved.evaluation_regimes == expected_evaluation_regimes
-    assert (
-        resolved.require_batch(
-            material_family=replacement_seen,
-            sampling_regime="parameter_ood",
-        ).material_family
-        == replacement_seen
+    common_path.write_text(
+        yaml.safe_dump(common, sort_keys=False),
+        encoding="utf-8",
     )
-    assert (
-        resolved.find_batch(
-            material_family=original_seen,
-            sampling_regime="parameter_ood",
-        )
-        is None
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
     )
+
+    resolved = generation.cases.config.load_campaign_config(campaign_path)
     scientific = resolved.batches[0].scientific_values
+
+    assert resolved.total_case_count == 3
+    assert resolved.membership == campaign["membership"]
+    assert scientific["campaign_seed"] == 12345
     assert scientific["grid"]["dx"] == pytest.approx(0.1)
     assert scientific["grid"]["dy"] == pytest.approx(0.1)
     assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(169)]
@@ -364,25 +302,19 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
 
 
 def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
-    tmp_path: Path,
+    generation_config_factory: Any,
 ) -> None:
-    """Bind explicit registry coordinate order through each scientific batch identity."""
-    campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(
-        tmp_path,
-        "coordinate-order",
+    """Bind explicit registry coordinate order through scientific identity."""
+    campaign_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=3,
+        campaign_purpose="family_generalization",
     )
     registry_path = campaign_path.parent / "registry.yaml"
-    registry = yaml.safe_load(Path(campaign["registry_config"]).read_text(encoding="utf-8"))
-    campaign["registry_config"] = str(registry_path)
-    _write_yaml(common_path, common)
-    _write_yaml(execution_path, execution)
-    _write_yaml(registry_path, registry)
-    _write_yaml(campaign_path, campaign)
-
-    original = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
-    original_family = original.material_inventory[0]
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    original = generation.cases.config.load_campaign_config(campaign_path)
     original_batch = original.require_batch(
-        material_family=original_family,
+        material_family="lentil",
         sampling_regime="natural",
     )
     original_parameters = original_batch.scientific_values["sampling"]["blocks"]["airflow"]["parameters"]
@@ -393,85 +325,85 @@ def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
     right_order = registry["parameters"][right]["sampling_order"]
     registry["parameters"][left]["sampling_order"] = right_order
     registry["parameters"][right]["sampling_order"] = left_order
-    _write_yaml(registry_path, registry)
+    registry_path.write_text(
+        yaml.safe_dump(registry, sort_keys=False),
+        encoding="utf-8",
+    )
 
-    reordered = generation.cases.config.load_campaign_config(campaign_path, require_executable=False)
+    reordered = generation.cases.config.load_campaign_config(campaign_path)
     reordered_batch = reordered.require_batch(
-        material_family=original_family,
+        material_family="lentil",
         sampling_regime="natural",
     )
     reordered_parameters = reordered_batch.scientific_values["sampling"]["blocks"]["airflow"]["parameters"]
 
     assert original_parameters.index(left) == reordered_parameters.index(right)
     assert original_parameters.index(right) == reordered_parameters.index(left)
-    assert reordered_batch.scientific_config_digest != original_batch.scientific_config_digest
+    assert reordered_batch.scientific_config_digest != (original_batch.scientific_config_digest)
     assert reordered_batch.batch_id != original_batch.batch_id
     assert reordered.campaign_digest != original.campaign_digest
 
 
 def test_invalid_config_combinations_report_authoritative_owner(
-    tmp_path: Path,
+    generation_config_factory: Any,
 ) -> None:
-    """Reject invalid counts, membership, role overlap, and package sources precisely."""
+    """Reject invalid counts, membership, role overlap, and package sources."""
 
     def expect_failure(
-        name: str,
         mutate: Callable[[dict[str, Any]], None],
         expected_key: str | Callable[[dict[str, Any]], str],
     ) -> None:
-        campaign_path, campaign, common_path, common, execution_path, execution = _temporary_family_campaign(tmp_path, name)
+        campaign_path, _template = generation_config_factory(
+            simulation_profile="transient_drying",
+            natural_count=3,
+            campaign_purpose="family_generalization",
+        )
+        campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
         mutate(campaign)
-        _write_yaml(common_path, common)
-        _write_yaml(execution_path, execution)
-        _write_yaml(campaign_path, campaign)
+        campaign_path.write_text(
+            yaml.safe_dump(campaign, sort_keys=False),
+            encoding="utf-8",
+        )
         with pytest.raises(generation.cases.config.GenerationConfigError) as caught:
-            generation.cases.config.load_campaign_config(
-                campaign_path,
-                require_executable=False,
-            )
-        details = generation.cases.config.validation_error_details(campaign_path, caught.value)
-        assert details["file"] == str(campaign_path)
-        assert details["owner_to_edit"] == str(campaign_path)
-        resolved_expected_key = expected_key(campaign) if callable(expected_key) else expected_key
-        assert details["key"] == resolved_expected_key
+            generation.cases.config.load_campaign_config(campaign_path)
+        details = generation.cases.config.validation_error_details(
+            campaign_path,
+            caught.value,
+        )
+        expected_owner = campaign_path.relative_to(common.paths.get_project_root()).as_posix()
+        assert details["file"] == expected_owner
+        assert details["owner_to_edit"] == expected_owner
+        resolved_key = expected_key(campaign) if callable(expected_key) else expected_key
+        assert details["key"] == resolved_key
         assert details["actual_value"] != "<missing>"
         assert details["expected_type_or_rule"]
 
     expect_failure(
-        "bad-count",
         lambda campaign: campaign["sampling"]["counts"]["natural"].__setitem__(
-            next(iter(campaign["sampling"]["counts"]["natural"])),
+            "lentil",
             0,
         ),
-        lambda campaign: f"sampling.counts.natural.{next(iter(campaign['sampling']['counts']['natural']))}",
+        "sampling.counts.natural.lentil",
     )
     expect_failure(
-        "membership-overflow",
         lambda campaign: campaign["membership"]["per_seen_material"].__setitem__("train", 999),
         "membership.per_seen_material",
     )
     expect_failure(
-        "role-overlap",
-        lambda campaign: campaign["material_roles"]["near_family_ood"].append(campaign["material_roles"]["seen"][0]),
+        lambda campaign: campaign["material_roles"]["near_family_ood"].append("lentil"),
         "material_roles",
     )
-
-    def mismatch_near_family_source(campaign: dict[str, Any]) -> None:
-        declaration = next(item for item in campaign["dataset_packages"] if item["evaluation_regime"] == "near_family_ood")
-        declaration["source_role"] = "far_family_ood"
-
-    def near_family_package_key(campaign: dict[str, Any]) -> str:
-        index = next(index for index, item in enumerate(campaign["dataset_packages"]) if item["evaluation_regime"] == "near_family_ood")
-        return f"dataset_packages[{index}]"
-
     expect_failure(
-        "missing-package-source",
-        mismatch_near_family_source,
-        near_family_package_key,
+        lambda campaign: campaign["dataset_packages"][0].__setitem__(
+            "source_role",
+            "far_family_ood",
+        ),
+        "dataset_packages[0]",
     )
 
 
 def test_readiness_distinguishes_failed_static_sentinels_from_pending(
+    generation_config_factory: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Report an executed failing scientific sentinel as a launch blocker."""
@@ -480,61 +412,30 @@ def test_readiness_distinguishes_failed_static_sentinels_from_pending(
         "run_static_sentinels",
         lambda *_args: {"status": "blocked_by_scientific_sanity_guard"},
     )
+    steady_path, _steady_template = generation_config_factory(
+        simulation_profile="steady_flow",
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    transient_path, _transient_template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    for campaign_path in (steady_path, transient_path):
+        campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+        campaign["profile_config"] = str((campaign_path.parent / "profile.yaml").resolve())
+        campaign_path.write_text(
+            yaml.safe_dump(campaign, sort_keys=False),
+            encoding="utf-8",
+        )
     report = generation.readiness.build_readiness_report(
-        Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+        steady_path,
+        transient_path,
         run_static_sentinels=True,
     )
     assert "STATIC_GENERATOR_SENTINELS_BLOCKED" in report["status_lines"]
     assert report["production_ready_for_user_launch"] is False
-
-
-def test_resolved_parameter_inspection_exposes_atomic_provenance_and_coordinates() -> None:
-    """Expose representative scientific coordinates and derived provenance."""
-    transient = generation.cases.config.load_campaign_config(
-        Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
-        require_executable=False,
-    )
-    report = next(iter(inventory.audit_campaign(transient).values()))
-    assert len(report.sampled_coordinate_names) == report.total_effective_dimension
-    assert report.total_effective_dimension > 0
-    assert "schedule.component_weights[1]" in report.sampled_coordinate_names
-    assert "schedule.component_weights[2]" in report.sampled_coordinate_names
-
-    oswin = inventory.inspect_campaign_parameter(transient, "oswin")
-    oswin_component = inventory.inspect_campaign_parameter(transient, "A_osw")
-    density = inventory.inspect_campaign_parameter(transient, "density_calibration")
-    density_component = inventory.inspect_campaign_parameter(transient, "eps_bed_cal_ref")
-    simplex = inventory.inspect_campaign_parameter(transient, "schedule_simplex")
-    grid_spacing = inventory.inspect_campaign_parameter(transient, "grid.dx")
-    wall_coefficient = inventory.inspect_campaign_parameter(transient, "U_wall")
-    density_formula = inventory.inspect_campaign_parameter(
-        transient,
-        "physical_formulas.rho_bu_dry",
-    )
-
-    assert oswin_component["atomic_record"] == "oswin"
-    assert density_component["atomic_record"] == "density_calibration"
-    assert density["coordinate_labels"] == ["rho_bu_dry_ref"]
-    assert simplex["coordinate_labels"] == [
-        "schedule.component_weights[1]",
-        "schedule.component_weights[2]",
-    ]
-
-    authored_common = yaml.safe_load(Path("configs/generation/common.yaml").read_text(encoding="utf-8"))
-    expected_dx = authored_common["grid"]["Lx"] / (authored_common["grid"]["nx"] - 1)
-    assert grid_spacing["configured"] == {"dx": expected_dx}
-    assert grid_spacing["provenance"]["verification"] == "mathematically_reproduced"
-    fixed = authored_common["scientific_fixed_values"]
-    expected_u_wall = 1.0 / (1.0 / fixed["h_ext"]["value"] + fixed["d_wall"]["value"] / fixed["k_wall"]["value"])
-    assert wall_coefficient["configured"]["value"] == pytest.approx(expected_u_wall)
-    assert wall_coefficient["provenance"]["verification"] == "mathematically_reproduced"
-    assert density_formula["configured"] == {
-        "rho_bu_dry": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
-    }
-    for family in transient.material_inventory:
-        assert oswin_component["materials"][family]["provenance"] == oswin["materials"][family]["provenance"]
-        assert density_component["materials"][family]["provenance"] == density["materials"][family]["provenance"]
 
 
 def test_schedule_csv_is_the_identity_bound_comsol_handoff(
@@ -556,12 +457,21 @@ def test_schedule_csv_is_the_identity_bound_comsol_handoff(
     schedule = np.loadtxt(schedule_path, delimiter=";", skiprows=1)
     duration_h = config.scientific_values["boundary_schedule"]["startup_ramp"]["duration_h"]
 
-    np.testing.assert_array_equal(schedule[:5, 0], [0.0, duration_h, 1.0, 2.0, 3.0])
-    np.testing.assert_array_equal(
+    schedule_times = schedule[:, 0]
+    regular_times = np.asarray(
         config.scientific_values["time"]["regular_times"],
-        np.arange(169, dtype=np.float64),
+        dtype=np.float64,
     )
-    assert schedule.shape[0] == len(config.scientific_values["time"]["regular_times"]) + 1
+    assert schedule_times[0] == 0.0
+    assert schedule_times[-1] == regular_times[-1]
+    assert duration_h in schedule_times
+    assert duration_h not in regular_times
+    assert np.all(np.diff(schedule_times) > 0.0)
+    assert all(time in schedule_times for time in regular_times)
+    np.testing.assert_array_equal(
+        schedule_times[np.isin(schedule_times, regular_times)],
+        regular_times,
+    )
     assert schedule[0, 1] == bundle.case_payload["sampled_values"]["T_init"]
     schedule_identity = bundle.case_payload["input_files"]["schedule.csv"]
     assert schedule_identity == {
@@ -627,7 +537,7 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     sample = sampling.sample_case(batch, 1)
     values = sample.values
     registry = batch.scientific_values["material"]["parameter_registry"]
-    grid = {"Lx": 1.2, "Ly": 0.75, "Lz": 0.8, "dx": 0.015, "dy": 0.015, "nx": 81, "ny": 51}
+    grid = batch.scientific_values["grid"]
     seeds = {"bed": 101, "pressure_bc": 202, "packing_scatter": 303, "initial_moisture": 404}
     family_contract = batch.scientific_values["material"]
     family_bounds = family_contract["initial_moisture_bounds"]

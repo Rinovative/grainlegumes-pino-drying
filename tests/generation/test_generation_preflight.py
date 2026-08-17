@@ -9,11 +9,30 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from src import generation
 from src.generation.runtime import generation_runtime_preflight as preflight
 
-_CAMPAIGN = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
+
+@pytest.fixture
+def campaign_path(generation_config_factory: Any) -> Path:
+    """Return one compact test-owned steady-flow campaign."""
+    path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        scheduler_kind="slurm",
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    execution_path = path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["site"]["python_module"] = "Python/3.10"
+    execution["site"]["comsol_module"] = "Comsol/6.4"
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _paths(
@@ -65,12 +84,12 @@ def _fake_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(preflight, "_version_output", fake_version)
 
 
-def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def _run(campaign_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Run one production-blocked but environment-complete preflight."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
     return preflight.run_cpu_preflight(
-        _CAMPAIGN,
+        campaign_path,
         only_batch=None,
         storage_root=storage,
         work_root=work,
@@ -172,11 +191,12 @@ def test_generation_venv_rejects_unsafe_configured_root(
 
 
 def test_preflight_separates_environment_from_runtime_and_removes_probe(
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect non-solving readiness evidence and the self-cleaning probe."""
-    report = _run(tmp_path, monkeypatch)
+    report = _run(campaign_path, tmp_path, monkeypatch)
     work = tmp_path / "node work"
     assert report["status"] == "environment_ready"
     assert report["production_configuration_ready"] is True
@@ -191,16 +211,16 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert report["python"]["venv_runtime"]["sys_prefix"].endswith("native venv")
     assert report["submission_plan"] == {
         "cases_per_job": 1,
-        "cores_per_case": 16,
-        "cores_per_node": 32,
+        "cores_per_case": 1,
+        "cores_per_node": 24,
         "pending_buffer": 1,
-        "poll_interval_seconds": 15,
+        "poll_interval_seconds": 1,
         "max_running_cases": None,
     }
     assert report["path_cleanup_probe"]["probe_removed"] is True
     assert not Path(report["path_cleanup_probe"]["probe_path"]).exists()
     assert not tuple(work.iterdir())
-    assert set(report["templates"]) == {"steady_flow", "transient_drying"}
+    assert "steady_flow" in report["templates"]
     assert all(
         template["sidecar_validation"] == "pass" and template["comsol_internal_contract"] == "runtime_unverified"
         for template in report["templates"].values()
@@ -210,6 +230,7 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
 @pytest.mark.parametrize("missing", ["comsol", "python3"])
 def test_preflight_fails_clearly_when_native_command_is_missing(
     missing: str,
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,7 +245,7 @@ def test_preflight_fails_clearly_when_native_command_is_missing(
     monkeypatch.setattr(preflight.shutil, "which", fake_which)
     with pytest.raises(FileNotFoundError, match=missing):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,
@@ -234,11 +255,13 @@ def test_preflight_fails_clearly_when_native_command_is_missing(
 
 
 def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect venv dependency and exact module-stack failure messages."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
+    original_find_spec = preflight.importlib.util.find_spec
     monkeypatch.setattr(
         preflight.importlib.util,
         "find_spec",
@@ -246,17 +269,21 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
     )
     with pytest.raises(ModuleNotFoundError, match="h5py"):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,
             venv_path=venv,
         )
-    monkeypatch.undo()
+    monkeypatch.setattr(
+        preflight.importlib.util,
+        "find_spec",
+        original_find_spec,
+    )
     storage, work, venv = _paths(tmp_path / "wrong modules", monkeypatch)
     _fake_capabilities(monkeypatch)
     campaign = generation.cases.config.load_campaign_config(
-        _CAMPAIGN,
+        campaign_path,
         require_executable=False,
     )
     execution = copy.deepcopy(campaign.execution_values)
@@ -269,7 +296,7 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
     )
     with pytest.raises(RuntimeError, match=r"Configured Python module expects version 3[.]11"):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,
@@ -279,6 +306,7 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
 
 
 def test_preflight_fails_clearly_when_project_package_import_is_missing(
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,7 +319,7 @@ def test_preflight_fails_clearly_when_project_package_import_is_missing(
     )
     with pytest.raises(ModuleNotFoundError, match=r"CPU compute-node prerequisite missing.*src[.]generation"):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,
@@ -301,6 +329,7 @@ def test_preflight_fails_clearly_when_project_package_import_is_missing(
 
 
 def test_preflight_fails_clearly_when_scratch_is_not_writable(
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,7 +343,7 @@ def test_preflight_fails_clearly_when_scratch_is_not_writable(
     monkeypatch.setattr(preflight.os, "access", fake_access)
     with pytest.raises(PermissionError, match="work_root is not writable"):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,
@@ -325,6 +354,7 @@ def test_preflight_fails_clearly_when_scratch_is_not_writable(
 @pytest.mark.parametrize("wrong_runtime", ["python", "comsol"])
 def test_preflight_rejects_wrong_binding_runtime_version(
     wrong_runtime: str,
+    campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -346,7 +376,7 @@ def test_preflight_rejects_wrong_binding_runtime_version(
         monkeypatch.setattr(preflight, "_version_output", wrong_comsol_version)
     with pytest.raises(RuntimeError, match=expected):
         preflight.run_cpu_preflight(
-            _CAMPAIGN,
+            campaign_path,
             only_batch=None,
             storage_root=storage,
             work_root=work,

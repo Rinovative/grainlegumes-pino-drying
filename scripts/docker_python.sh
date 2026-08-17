@@ -40,6 +40,11 @@ for argument in "$@"; do
   PYTHON_ARGUMENTS+=("$(translate_argument "${argument}")")
 done
 
+COMMIT_ENVIRONMENT=()
+if [[ -n "${GENERATION_GIT_COMMIT:-}" ]]; then
+  COMMIT_ENVIRONMENT+=(--env "GENERATION_GIT_COMMIT=${GENERATION_GIT_COMMIT}")
+fi
+
 exec docker run --rm -i \
   --network none \
   --user "$(id -u):$(id -g)" \
@@ -50,6 +55,7 @@ exec docker run --rm -i \
   -e STORAGE_ROOT=/workspace/storage \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -e PYTHONNOUSERSITE=1 \
+  "${COMMIT_ENVIRONMENT[@]}" \
   --mount "type=bind,source=${HOST_REPO_ROOT},target=/workspace/repo,readonly" \
   --mount "type=bind,source=${STORAGE_DIR},target=/workspace/storage" \
   "${IMAGE_NAME}" \

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from src import generation
 from src.generation.contracts import generation_contracts_mapping as mapping_contract
@@ -300,15 +301,51 @@ def test_finalizer_publishes_nothing_for_an_incomplete_required_smoke(
 
 
 def test_readiness_accepts_complete_profiles_with_matching_smoke_evidence(
+    generation_config_factory: Any,
+    fake_comsol: Path,
     tmp_path: Path,
 ) -> None:
     """Require completed technical-smoke evidence without static verification state."""
     storage = tmp_path / "readiness storage"
     storage.mkdir()
     version_output = "COMSOL Multiphysics 6.4.0.293"
+    steady_path, _steady_template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    transient_path, _transient_template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    steady_smoke_path, _steady_smoke_template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        campaign_purpose="technical_runtime_smoke",
+    )
+    transient_smoke_path, _transient_smoke_template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+        campaign_purpose="technical_runtime_smoke",
+    )
+    for family_path, smoke_path in (
+        (steady_path, steady_smoke_path),
+        (transient_path, transient_smoke_path),
+    ):
+        shared_profile = (family_path.parent / "profile.yaml").resolve()
+        for campaign_path in (family_path, smoke_path):
+            campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+            campaign["profile_config"] = str(shared_profile)
+            campaign_path.write_text(
+                yaml.safe_dump(campaign, sort_keys=False),
+                encoding="utf-8",
+            )
     campaigns = {
-        "steady_flow": Path("configs/generation/campaigns/steady_flow/family_generalization.yaml"),
-        "transient_drying": Path("configs/generation/campaigns/transient_drying/family_generalization.yaml"),
+        "steady_flow": steady_path,
+        "transient_drying": transient_path,
     }
     for index, campaign_path in enumerate(campaigns.values()):
         expected = generation.smoke.build_technical_smoke_evidence_context(
@@ -368,9 +405,14 @@ def test_mapping_contract_fingerprint_tracks_only_mapping_semantics(
     assert mapping_contract.mapping_contract_sha256("transient_drying", unrelated) == original
 
 
-def test_smoke_evidence_validity_tuple_excludes_git_commit() -> None:
+def test_smoke_evidence_validity_tuple_excludes_git_commit(
+    generation_config_factory: Any,
+) -> None:
     """Bind evidence to semantics, template, COMSOL, verifier, and smoke contract."""
-    campaign = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
+    campaign, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        campaign_purpose="technical_runtime_smoke",
+    )
     expected = generation.smoke.build_technical_smoke_evidence_context(
         campaign,
         comsol_version_output="COMSOL Multiphysics 6.4.0.293",
@@ -399,13 +441,22 @@ def test_smoke_evidence_validity_tuple_excludes_git_commit() -> None:
         assert reason in result["reasons"]
 
 
-def test_smoke_evidence_requires_complete_success_and_is_profile_scoped(tmp_path: Path) -> None:
+def test_smoke_evidence_requires_complete_success_and_is_profile_scoped(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
     """Reject missing, failed, and partial evidence without coupling profiles."""
     storage = tmp_path / "evidence storage"
     storage.mkdir()
     version_output = "COMSOL Multiphysics 6.4.0.293"
-    steady_campaign = Path("configs/generation/campaigns/steady_flow/family_generalization.yaml")
-    transient_campaign = Path("configs/generation/campaigns/transient_drying/family_generalization.yaml")
+    steady_campaign, _steady_template = generation_config_factory(
+        simulation_profile="steady_flow",
+        campaign_purpose="technical_runtime_smoke",
+    )
+    transient_campaign, _transient_template = generation_config_factory(
+        simulation_profile="transient_drying",
+        campaign_purpose="technical_runtime_smoke",
+    )
     expected = generation.smoke.build_technical_smoke_evidence_context(
         steady_campaign,
         comsol_version_output=version_output,

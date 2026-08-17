@@ -6,11 +6,11 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import replace
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
+import yaml
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
@@ -21,13 +21,44 @@ from src.generation.runtime import generation_runtime_workspace as workspace_ser
 from src.generation.validation import generation_validation_pilot as pilot_service
 from src.generation.validation import generation_validation_pilot_analysis as analysis_service
 
-_PILOT_CAMPAIGN = Path("configs/generation/campaigns/transient_drying/pilot_check.yaml")
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
-def _pilot(cases_per_material: int) -> config_service.CampaignConfig:
+@pytest.fixture
+def pilot_campaign_path(generation_config_factory: Any) -> Path:
+    """Return one compact test-owned transient pilot campaign."""
+    path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=3,
+        campaign_purpose="family_generalization",
+    )
+    campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
+    campaign["campaign_purpose"] = "pilot_check"
+    campaign.pop("membership")
+    campaign["sampling"] = {
+        "method": "lhs",
+        "seed_base": 9940,
+        "cases_per_material": 3,
+        "case_semantics": {
+            "first": "nominal_reference",
+            "remaining": "natural_pilot",
+        },
+    }
+    campaign["dataset_packages"] = []
+    path.write_text(
+        yaml.safe_dump(campaign, sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _pilot(
+    campaign_path: Path,
+    cases_per_material: int,
+) -> config_service.CampaignConfig:
     return config_service.load_campaign_config(
-        _PILOT_CAMPAIGN,
-        require_executable=False,
+        campaign_path,
         pilot_cases_per_material=cases_per_material,
     )
 
@@ -109,10 +140,12 @@ def _physical_inputs() -> tuple[dict[str, np.ndarray], list[dict[str, np.ndarray
     return static, states, globals_by_name, scalars
 
 
-def test_pilot_planning_and_nominal_sampling_are_technical_only() -> None:
+def test_pilot_planning_and_nominal_sampling_are_technical_only(
+    pilot_campaign_path: Path,
+) -> None:
     """Protect configured-family counts, technical-only membership, and explicit nominals."""
-    one = _pilot(1)
-    three = _pilot(3)
+    one = _pilot(pilot_campaign_path, 1)
+    three = _pilot(pilot_campaign_path, 3)
     assert one.total_case_count == len(one.material_inventory)
     assert three.total_case_count == 3 * len(three.material_inventory)
     assert one.dataset_packages == three.dataset_packages == ()
@@ -139,9 +172,11 @@ def test_pilot_planning_and_nominal_sampling_are_technical_only() -> None:
     assert "sampling_kind" not in next(iter(natural.block_provenance.values()))
 
 
-def test_pilot_nominal_fails_closed_without_an_explicit_value() -> None:
+def test_pilot_nominal_fails_closed_without_an_explicit_value(
+    pilot_campaign_path: Path,
+) -> None:
     """Protect fail-closed nominal construction without hidden midpoints."""
-    batch = _pilot(1).batches[0]
+    batch = _pilot(pilot_campaign_path, 1).batches[0]
     scientific = json.loads(json.dumps(batch.scientific_values))
     scientific["material"]["parameter_registry"]["T_in_base"].pop("nominal")
     malformed = replace(batch, scientific_values=scientific)
@@ -486,11 +521,12 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
 
 
 def test_failed_pilot_retains_compact_artifacts_before_scratch_disappears(
+    pilot_campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect compact failed evidence before marked scratch disappears."""
-    batch = _pilot(1).batches[0]
+    batch = _pilot(pilot_campaign_path, 1).batches[0]
     storage = tmp_path / "storage"
     work = tmp_path / "case-work"
     (work / "runtime").mkdir(parents=True)

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+ORIGINAL_ARGUMENTS=("$@")
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DEVELOPMENT_REPO_ROOT=""
 HOST_REPO_ROOT=""
 HOST_STORAGE_ROOT=""
 DOCKER_PYTHON=""
+PINNED_SOURCE_CONTAINER=""
+PINNED_SOURCE_PARENT=""
+PINNED_SOURCE_COMMIT=""
 CPU_BOOTSTRAP_REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
 GENERATION_MODULE="src.generation.cli.cli_generation"
 BENCHMARK_SUITE_RELATIVE_PATH="configs/generation/benchmarks/transient_core_scaling/suite.yaml"
@@ -42,7 +47,12 @@ REMOTE_SETUP_IDENTITY=""
 HUMAN_WORKFLOW_MODE=false
 CONSOLE_PROGRESS_KEY=""
 CONSOLE_PROGRESS_SIGNATURE=""
+CONSOLE_PROGRESS_DETAIL_SIGNATURE=""
 CONSOLE_PROGRESS_RENDERED_AT=0
+REMOTE_CAMPAIGN_STATE=""
+REMOTE_CAMPAIGN_STATE_SIGNATURE=""
+REMOTE_CAMPAIGN_PROGRESS_SIGNATURE=""
+REMOTE_CAMPAIGN_SUMMARY=""
 TRANSFER_SUMMARY=""
 DATASET_SUMMARY=""
 WORKFLOW_FAILURE_EVIDENCE=""
@@ -94,23 +104,33 @@ generation_console_stage() {
   local decorated="${label} "
   while (( ${#decorated} < 30 )); do decorated+=.; done
   printf '[%s/%s] %s %s\n' "${index}" "${total}" "${decorated}" "${status}"
-  [[ -z "${detail}" ]] || printf '      %s\n' "${detail}"
+  if [[ -n "${detail}" ]]; then
+    local detail_line
+    while IFS= read -r detail_line; do
+      printf '      %s\n' "${detail_line}"
+    done <<< "${detail}"
+  fi
 }
 
 generation_console_progress() {
   local key="$1" index="$2" total="$3" label="$4" status="$5"
-  local signature="$6" detail="${7:-}" now
-  local heartbeat_seconds=300
+  local signature="$6" detail="${7:-}" detail_signature="${8:-$6}" now
+  local changed_progress_seconds=60 heartbeat_seconds=300
   now="$(date +%s)"
   if [[ "${CONSOLE_PROGRESS_KEY}" == "${key}" && "${CONSOLE_PROGRESS_SIGNATURE}" == "${signature}" ]]; then
-    if (( now - CONSOLE_PROGRESS_RENDERED_AT < heartbeat_seconds )); then
+    if [[ "${CONSOLE_PROGRESS_DETAIL_SIGNATURE}" == "${detail_signature}" ]]; then
+      if (( now - CONSOLE_PROGRESS_RENDERED_AT < heartbeat_seconds )); then
+        return
+      fi
+      detail="${detail}${detail:+$'\n'}heartbeat=unchanged"
+    elif (( now - CONSOLE_PROGRESS_RENDERED_AT < changed_progress_seconds )); then
       return
     fi
-    detail="${detail}${detail:+ }heartbeat=unchanged"
   fi
   generation_console_stage "${index}" "${total}" "${label}" "${status}" "${detail}"
   CONSOLE_PROGRESS_KEY="${key}"
   CONSOLE_PROGRESS_SIGNATURE="${signature}"
+  CONSOLE_PROGRESS_DETAIL_SIGNATURE="${detail_signature}"
   CONSOLE_PROGRESS_RENDERED_AT="${now}"
 }
 
@@ -184,7 +204,24 @@ resolve_host_layout() {
     fail 1 "Could not locate the workflow script inside the repository."
   [[ "${script_relative}" != .. && "${script_relative}" != ../* ]] ||
     fail 1 "Generation workflow script is outside the resolved repository."
-  HOST_STORAGE_ROOT="${STORAGE_ROOT:-${HOST_REPO_ROOT}/../storage}"
+  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1 ]]; then
+    local development_root storage_root
+    development_root="$(realpath -e -- "${GENERATION_WORKFLOW_DEVELOPMENT_REPO_ROOT:-}")" ||
+      fail 1 "Could not recover the development checkout from the pinned-source handoff."
+    [[ -d "${development_root}" && ! -L "${development_root}" ]] ||
+      fail 1 "Pinned-source handoff development checkout is not a safe directory."
+    validate_path "development repository" "${development_root}"
+    DEVELOPMENT_REPO_ROOT="${development_root}"
+    storage_root="$(realpath -m -- "${GENERATION_WORKFLOW_STORAGE_ROOT:-}")" ||
+      fail 1 "Could not recover local storage from the pinned-source handoff."
+    validate_path "pinned-source local storage" "${storage_root}"
+    HOST_STORAGE_ROOT="${storage_root}"
+  else
+    DEVELOPMENT_REPO_ROOT="${HOST_REPO_ROOT}"
+    HOST_STORAGE_ROOT="$(realpath -m -- "${STORAGE_ROOT:-${DEVELOPMENT_REPO_ROOT}/../storage}")" ||
+      fail 1 "Could not resolve canonical local storage."
+    validate_path "local storage" "${HOST_STORAGE_ROOT}"
+  fi
   DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
 }
 
@@ -193,7 +230,17 @@ admit_repository_file() {
   local label="$2"
   local candidate lexical resolved relative
   if [[ "${value}" == /* ]]; then
-    candidate="${value}"
+    lexical="$(realpath -ms -- "${value}")" ||
+      fail 2 "Could not normalize ${label}."
+    if [[ "${lexical}" == "${HOST_REPO_ROOT}/"* ]]; then
+      relative="${lexical#"${HOST_REPO_ROOT}/"}"
+    elif [[ "${lexical}" == "${DEVELOPMENT_REPO_ROOT}/"* ]]; then
+      relative="${lexical#"${DEVELOPMENT_REPO_ROOT}/"}"
+    else
+      fail 2 "${label} must remain inside the repository."
+    fi
+    validate_logical_path "${label}" "${relative}"
+    candidate="${HOST_REPO_ROOT}/${relative}"
   else
     validate_logical_path "${label}" "${value}"
     candidate="${HOST_REPO_ROOT}/${value}"
@@ -201,7 +248,7 @@ admit_repository_file() {
   lexical="$(realpath -ms -- "${candidate}")" ||
     fail 2 "Could not normalize ${label}."
   resolved="$(realpath -e -- "${candidate}")" ||
-    fail 2 "${label} does not exist."
+    fail 2 "${label} does not exist in pinned commit ${REQUESTED_COMMIT}."
   [[ "${lexical}" == "${resolved}" ]] ||
     fail 2 "${label} must not traverse a symbolic link."
   [[ -f "${resolved}" && ! -L "${resolved}" ]] ||
@@ -285,18 +332,176 @@ resolve_remote_layout() {
   validate_path "remote venv" "${REMOTE_VENV}"
 }
 
-resolve_local_commit() {
-  local clean="$1"
-  require_command git
-  local head status
-  head="$(git -C "${HOST_REPO_ROOT}" rev-parse HEAD)" || fail 1 "Could not resolve Git HEAD."
-  validate_commit "${head}"
-  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]]     || fail 1 "Requested commit differs from local HEAD."
-  REQUESTED_COMMIT="${head}"
-  if [[ "${clean}" == true ]]; then
-    status="$(git -C "${HOST_REPO_ROOT}" status --porcelain)"
-    [[ -z "${status}" ]] || fail 1 "This operation requires a clean local worktree."
+cleanup_pinned_source() {
+  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1
+    && "${GENERATION_WORKFLOW_PINNED_CLEANUP_OWNER:-}" == bootstrap ]]; then
+    return 0
   fi
+  local container="${PINNED_SOURCE_CONTAINER}"
+  [[ -n "${container}" ]] || return 0
+  PINNED_SOURCE_CONTAINER=""
+  local marker="${container}/.generation-workflow-source"
+  if [[ ! -d "${container}" || -L "${container}" || ! -f "${marker}" || -L "${marker}" \
+    || -z "${PINNED_SOURCE_PARENT}" \
+    || "${container}" != "${PINNED_SOURCE_PARENT}/generation-workflow-source."* ]]; then
+    generation_console_warning "refusing to remove an unverified pinned-source directory: ${container}"
+    return 1
+  fi
+  rm -rf -- "${container}"
+  if [[ -e "${container}" ]]; then
+    generation_console_warning "could not remove pinned-source directory: ${container}"
+    return 1
+  fi
+}
+
+adopt_pinned_source() {
+  local source container commit marker marker_kind marker_commit marker_development extra
+  source="$(realpath -e -- "${GENERATION_WORKFLOW_PINNED_SOURCE_ROOT:-}")" ||
+    fail 1 "Could not recover the exact pinned source checkout."
+  container="$(realpath -e -- "${GENERATION_WORKFLOW_PINNED_SOURCE_CONTAINER:-}")" ||
+    fail 1 "Could not recover the pinned source container."
+  commit="${GENERATION_WORKFLOW_PINNED_COMMIT:-}"
+  validate_commit "${commit}"
+  [[ "${source}" == "${HOST_REPO_ROOT}" && "${source}" == "${container}/repo" \
+    && -d "${source}/.git" && ! -L "${source}" && ! -L "${container}" ]] ||
+    fail 1 "Pinned-source handoff does not identify the executing clean checkout."
+  marker="${container}/.generation-workflow-source"
+  [[ -f "${marker}" && ! -L "${marker}" ]] ||
+    fail 1 "Pinned-source handoff marker is missing or unsafe."
+  IFS=$'\t' read -r marker_kind marker_commit marker_development extra < "${marker}"
+  [[ "${marker_kind}" == generation-workflow-source && "${marker_commit}" == "${commit}" \
+    && "${marker_development}" == "${DEVELOPMENT_REPO_ROOT}" && -z "${extra:-}" ]] ||
+    fail 1 "Pinned-source handoff marker is malformed or inconsistent."
+  PINNED_SOURCE_CONTAINER="${container}"
+  PINNED_SOURCE_PARENT="${container%/*}"
+  local head status
+  head="$(git -C "${source}" rev-parse HEAD)" ||
+    fail 1 "Could not verify the pinned source commit."
+  status="$(git --no-optional-locks -C "${source}" status --porcelain=v1 --untracked-files=all)" ||
+    fail 1 "Could not verify the pinned source worktree."
+  [[ "${head}" == "${commit}" && -z "${status}" ]] ||
+    fail 1 "Pinned source is not the exact clean committed checkout."
+  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${commit}" ]] ||
+    fail 1 "Requested commit differs from the pinned workflow source."
+  PINNED_SOURCE_COMMIT="${commit}"
+  REQUESTED_COMMIT="${commit}"
+  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
+}
+
+materialize_pinned_source() {
+  require_command git
+  require_command mktemp
+  require_command rm
+  local head status temporary_parent container source snapshot_head snapshot_status
+  head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
+    fail 1 "Could not resolve Git HEAD."
+  validate_commit "${head}"
+  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]] ||
+    fail 1 "Requested commit differs from local HEAD."
+  status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ||
+    fail 1 "Could not inspect the local worktree for committed HEAD ${head}."
+  REQUESTED_COMMIT="${head}"
+  printf 'Source: committed HEAD %s\n' "${head}" >&2
+  if [[ -n "${status}" ]]; then
+    printf 'Local worktree: dirty; uncommitted changes ignored\n' >&2
+  else
+    printf 'Local worktree: clean\n' >&2
+  fi
+  temporary_parent="$(realpath -e -- "${TMPDIR:-/tmp}")" ||
+    fail 1 "Could not resolve the temporary source parent."
+  case "${temporary_parent}/" in
+    "${DEVELOPMENT_REPO_ROOT}/"*|"${HOST_STORAGE_ROOT}/"*)
+      temporary_parent="$(realpath -e -- /tmp)" ||
+        fail 1 "Could not resolve the fallback temporary source parent."
+      ;;
+  esac
+  validate_path "temporary source parent" "${temporary_parent}"
+  [[ "${temporary_parent}/" != "${DEVELOPMENT_REPO_ROOT}/"* \
+    && "${temporary_parent}/" != "${HOST_STORAGE_ROOT}/"* ]] ||
+    fail 1 "Temporary source infrastructure must remain outside the repository and canonical storage."
+  [[ -d "${temporary_parent}" && ! -L "${temporary_parent}" && -w "${temporary_parent}" ]] ||
+    fail 1 "Temporary source parent is not a safe writable directory: ${temporary_parent}"
+  container="$(mktemp -d "${temporary_parent%/}/generation-workflow-source.XXXXXXXX")" ||
+    fail 1 "Could not create the pinned source container."
+  PINNED_SOURCE_CONTAINER="${container}"
+  PINNED_SOURCE_PARENT="${temporary_parent}"
+  printf 'generation-workflow-source\t%s\t%s\n' \
+    "${head}" "${DEVELOPMENT_REPO_ROOT}" > "${container}/.generation-workflow-source"
+  source="${container}/repo"
+  if ! git init --quiet "${source}" \
+    || ! git -C "${source}" fetch --quiet --depth=1 --no-tags \
+      "${DEVELOPMENT_REPO_ROOT}" "${head}" \
+    || ! git -C "${source}" -c advice.detachedHead=false checkout --quiet --detach "${head}"; then
+    cleanup_pinned_source || true
+    fail 1 "Could not materialize the exact committed Generation source."
+  fi
+  snapshot_head="$(git -C "${source}" rev-parse HEAD)" || {
+    cleanup_pinned_source || true
+    fail 1 "Could not verify the materialized source commit."
+  }
+  snapshot_status="$(git --no-optional-locks -C "${source}" status --porcelain=v1 --untracked-files=all)" || {
+    cleanup_pinned_source || true
+    fail 1 "Could not verify the materialized source worktree."
+  }
+  [[ "${snapshot_head}" == "${head}" && -z "${snapshot_status}" ]] || {
+    cleanup_pinned_source || true
+    fail 1 "Materialized Generation source is not the exact clean pinned commit."
+  }
+  HOST_REPO_ROOT="$(realpath -e -- "${source}")"
+  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
+  PINNED_SOURCE_COMMIT="${head}"
+}
+
+resolve_local_commit() {
+  if [[ -n "${PINNED_SOURCE_COMMIT}" ]]; then
+    [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${PINNED_SOURCE_COMMIT}" ]] ||
+      fail 1 "Requested commit differs from the pinned workflow source."
+    REQUESTED_COMMIT="${PINNED_SOURCE_COMMIT}"
+    return
+  fi
+  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1 ]]; then
+    adopt_pinned_source
+  else
+    materialize_pinned_source
+  fi
+}
+
+resolve_bootstrap_requested_commit() {
+  REQUESTED_COMMIT=""
+  local index
+  for ((index=0; index<${#ORIGINAL_ARGUMENTS[@]}; index++)); do
+    if [[ "${ORIGINAL_ARGUMENTS[index]}" == --git-commit ]]; then
+      (( index + 1 < ${#ORIGINAL_ARGUMENTS[@]} )) ||
+        fail 2 "--git-commit requires a value."
+      REQUESTED_COMMIT="${ORIGINAL_ARGUMENTS[index+1]}"
+      ((index += 1))
+    fi
+  done
+  [[ -z "${REQUESTED_COMMIT}" ]] || validate_commit "${REQUESTED_COMMIT}"
+}
+
+handoff_to_pinned_workflow() {
+  [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" != 1 ]] || return 0
+  local workflow="${HOST_REPO_ROOT}/scripts/generation_workflow.sh"
+  [[ -x "${workflow}" && ! -L "${workflow}" ]] ||
+    fail 1 "Pinned Generation workflow is missing or unsafe: ${workflow}"
+  local workflow_status
+  if env \
+    GENERATION_WORKFLOW_PINNED_HANDOFF=1 \
+    GENERATION_WORKFLOW_PINNED_CLEANUP_OWNER=bootstrap \
+    GENERATION_WORKFLOW_PINNED_SOURCE_ROOT="${HOST_REPO_ROOT}" \
+    GENERATION_WORKFLOW_PINNED_SOURCE_CONTAINER="${PINNED_SOURCE_CONTAINER}" \
+    GENERATION_WORKFLOW_PINNED_COMMIT="${PINNED_SOURCE_COMMIT}" \
+    GENERATION_WORKFLOW_DEVELOPMENT_REPO_ROOT="${DEVELOPMENT_REPO_ROOT}" \
+    GENERATION_WORKFLOW_STORAGE_ROOT="${HOST_STORAGE_ROOT}" \
+    "${workflow}" "${ORIGINAL_ARGUMENTS[@]}"; then
+    workflow_status=0
+  else
+    workflow_status=$?
+  fi
+  cleanup_pinned_source || true
+  trap - EXIT
+  exit "${workflow_status}"
 }
 
 resolve_workflow_campaigns() {
@@ -510,7 +715,7 @@ verify_remote_setup_for_output() {
 
 
 setup_cpu() {
-  resolve_local_commit false
+  resolve_local_commit
   resolve_remote_layout
   print_layout
   printf 'Mode: %s\n' "$([[ "${EXECUTE_SETUP}" == true ]] && printf execute || printf dry-run)"
@@ -609,7 +814,7 @@ REMOTE
 preflight_cpu() {
   HUMAN_WORKFLOW_MODE=true
   generation_console_stage 1 3 "Local preflight" RUNNING
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
   validate_resources
@@ -772,7 +977,7 @@ REMOTE
 run_smoke() {
   [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
     fail 2 "smoke does not support --detach, --confirm, or --only-batch."
-  resolve_local_commit true
+  resolve_local_commit
   resolve_workflow_campaigns
   KEEP_CPU_SOURCE=true
   CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
@@ -808,7 +1013,7 @@ run_smoke() {
 
 
 plan_campaign() {
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
   validate_resources
@@ -821,7 +1026,7 @@ plan_campaign() {
 }
 
 launch_requested_campaign() {
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
   validate_resources
@@ -833,7 +1038,7 @@ launch_requested_campaign() {
 }
 
 launch_campaign() {
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
   validate_resources
@@ -842,10 +1047,14 @@ launch_campaign() {
   verify_remote_setup_for_output
   local output
   output="$(remote_plan_submit submit-campaign)" || fail 1 "Remote launch failed."
-  printf '%s\n' "${output}"
+  if [[ "${HUMAN_WORKFLOW_MODE}" != true ]]; then
+    printf '%s\n' "${output}"
+  fi
   if [[ ${output} =~ \"campaign_run_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]+__[0-9a-f]{16})\" ]]; then
     RUN_ID="${BASH_REMATCH[1]}"
     printf 'Campaign run ID: %s\n' "${RUN_ID}"
+    remote_cli campaign-status "${RUN_ID}" --format summary --max-active-cases 8 \
+      --storage-root "${REMOTE_STORAGE_ROOT}"
   else
     fail 1 "Launch returned no campaign-run ID."
   fi
@@ -883,7 +1092,9 @@ resolve_local_python() {
 }
 
 local_python() {
-  env STORAGE_ROOT="${LOCAL_STORAGE_ROOT:-${HOST_STORAGE_ROOT}}" "${DOCKER_PYTHON}" "$@"
+  env GENERATION_GIT_COMMIT="${PINNED_SOURCE_COMMIT}" \
+    STORAGE_ROOT="${LOCAL_STORAGE_ROOT:-${HOST_STORAGE_ROOT}}" \
+    "${DOCKER_PYTHON}" "$@"
 }
 
 local_cli() {
@@ -994,8 +1205,24 @@ build_datasets() {
   local_cli build-campaign-datasets "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}"
 }
 
-remote_campaign_state() {
-  remote_cli campaign-status "${RUN_ID}" --format state --storage-root "${REMOTE_STORAGE_ROOT}"
+remote_campaign_monitor() {
+  remote_cli campaign-status "${RUN_ID}" --format monitor --max-active-cases 8 \
+    --storage-root "${REMOTE_STORAGE_ROOT}"
+}
+
+read_remote_campaign_monitor() {
+  local output header kind state state_signature progress_signature extra
+  output="$(remote_campaign_monitor)" || fail 1 "Could not reconstruct campaign case status."
+  [[ "${output}" == *$'\n'* ]] || fail 1 "Malformed campaign monitor output."
+  header="${output%%$'\n'*}"
+  IFS=$'\t' read -r kind state state_signature progress_signature extra <<< "${header}"
+  [[ "${kind}" == campaign-monitor && "${state_signature}" =~ ^[0-9a-f]{64}$ \
+    && "${progress_signature}" =~ ^[0-9a-f]{64}$ && -z "${extra:-}" ]] ||
+    fail 1 "Malformed campaign monitor header."
+  REMOTE_CAMPAIGN_STATE="${state}"
+  REMOTE_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
+  REMOTE_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
+  REMOTE_CAMPAIGN_SUMMARY="${output#*$'\n'}"
 }
 
 remote_source_status_tsv() {
@@ -1036,11 +1263,14 @@ wait_for_terminal_publication() {
       remote_cli feed-campaign "${RUN_ID}" \
         --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
     fi
-    local state
-    state="$(remote_campaign_state)"
+    read_remote_campaign_monitor
+    local state detail
+    state="${REMOTE_CAMPAIGN_STATE}"
+    detail="${REMOTE_CAMPAIGN_SUMMARY}"$'\n'"Source storage: state=${REMOTE_SOURCE_STATE} retained_bytes=${CPU_BYTES_RETAINED}"
     generation_console_progress campaign "${console_index}" "${console_total}" "${console_label}" RUNNING \
-      "${state}|${REMOTE_SOURCE_STATE}|${CPU_BYTES_RETAINED}|${REMOTE_SOURCE_ACTIVE}" \
-      "state=${state} source=${REMOTE_SOURCE_STATE} retained_bytes=${CPU_BYTES_RETAINED}"
+      "${REMOTE_CAMPAIGN_STATE_SIGNATURE}|${REMOTE_SOURCE_STATE}|${REMOTE_SOURCE_ACTIVE}" \
+      "${detail}" \
+      "${REMOTE_CAMPAIGN_PROGRESS_SIGNATURE}|${CPU_BYTES_RETAINED}"
     case "${state}" in
       publication_complete)
         remote_cli validate-campaign-terminal "${RUN_ID}" \
@@ -1156,6 +1386,11 @@ storage_status_report() {
     local_arguments+=(--campaign-run-id "${RUN_ID}")
     remote_arguments+=(--campaign-run-id "${RUN_ID}")
   fi
+  if [[ -n "${RUN_ID}" ]]; then
+    printf 'Campaign status:\n'
+    remote_cli campaign-status "${RUN_ID}" --format summary \
+      --storage-root "${REMOTE_STORAGE_ROOT}"
+  fi
   printf 'GPU storage status:\n'
   local_cli "${local_arguments[@]}"
   printf 'CPU storage status:\n'
@@ -1244,6 +1479,7 @@ workflow_exit_handler() {
   if [[ "${ALL_WORKFLOW_ACTIVE}" == true && "${status}" -ne 0 ]]; then
     workflow_failure_report "${status}" || true
   fi
+  cleanup_pinned_source || true
 }
 
 read_remote_campaign_identity() {
@@ -1337,7 +1573,6 @@ continue_pilot_workflow() {
     generation_console_stage 11 11 "Final validation" REUSED "pilot receipt already complete"
     generation_console_final "campaign_run_id=${RUN_ID} pilot receipt validated"
     ALL_WORKFLOW_ACTIVE=false
-    trap - EXIT
     return
   fi
 
@@ -1402,7 +1637,6 @@ continue_pilot_workflow() {
     "campaign_run_id=${RUN_ID} pilot and workflow receipts validated"
   generation_console_final "campaign_run_id=${RUN_ID} pilot receipt validated"
   ALL_WORKFLOW_ACTIVE=false
-  trap - EXIT
 }
 run_pilot_check() {
   [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
@@ -1413,7 +1647,7 @@ run_pilot_check() {
 
   ALL_STAGE="local exact-commit and campaign validation"
   generation_console_stage 1 11 "Local preflight" RUNNING
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_pilot_contract
   resolve_local_storage
@@ -1477,7 +1711,6 @@ continue_all_workflow() {
       "campaign_run_id=${RUN_ID} already complete and validated"
     generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
     ALL_WORKFLOW_ACTIVE=false
-    trap - EXIT
     return
   fi
 
@@ -1526,7 +1759,6 @@ continue_all_workflow() {
     "campaign_run_id=${RUN_ID} ${cleanup_detail}"
   generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
   ALL_WORKFLOW_ACTIVE=false
-  trap - EXIT
 }
 run_all() {
   HUMAN_WORKFLOW_MODE=true
@@ -1534,7 +1766,7 @@ run_all() {
   trap 'workflow_exit_handler $?' EXIT
   ALL_STAGE="local repository, campaign, and resource validation"
   generation_console_stage 1 8 "Local preflight" RUNNING
-  resolve_local_commit true
+  resolve_local_commit
   resolve_campaign "${CAMPAIGN_ARGUMENT}"
   resolve_configured_resources
   validate_resources
@@ -1565,7 +1797,6 @@ run_all() {
     generation_console_final "campaign_run_id=${RUN_ID} detached; resume required"
     printf 'Resume-all command: %s\n' "$(resume_command_text)"
     ALL_WORKFLOW_ACTIVE=false
-    trap - EXIT
     return
   fi
   ALLOW_REMOTE_RESUME=false
@@ -1574,7 +1805,7 @@ run_all() {
 
 resume_all() {
   HUMAN_WORKFLOW_MODE=true
-  resolve_local_commit false
+  resolve_local_commit
   resolve_remote_layout
   resolve_local_storage
   verify_remote_setup >/dev/null
@@ -1803,7 +2034,7 @@ run_core_benchmark() {
   HUMAN_WORKFLOW_MODE=true
 
   generation_console_stage 1 6 "Local preflight" RUNNING
-  resolve_local_commit true
+  resolve_local_commit
   resolve_local_storage
   resolve_local_python
   resolve_benchmark_contract >/dev/null
@@ -1876,6 +2107,14 @@ run_core_benchmark() {
 
 (( $# > 0 )) || { usage; exit 2; }
 [[ "$1" != -h && "$1" != --help ]] || { usage; exit 0; }
+if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" != 1 ]]; then
+  resolve_bootstrap_requested_commit
+  resolve_host_layout
+  trap 'workflow_exit_handler $?' EXIT
+  resolve_local_commit
+  handoff_to_pinned_workflow
+fi
+
 SUBCOMMAND="$1"
 shift
 CPU_HOST="${GENERATION_CPU_HOST:-}"
@@ -1931,6 +2170,9 @@ if [[ "${SKIP_EXTREME_FAMILY_OOD}" == true ]]; then
 fi
 
 resolve_host_layout
+trap 'workflow_exit_handler $?' EXIT
+resolve_local_commit
+handoff_to_pinned_workflow
 
 case "${SUBCOMMAND}" in
   setup-cpu)
@@ -1974,14 +2216,14 @@ case "${SUBCOMMAND}" in
     (( ${#POSITIONAL[@]} <= 1 )) || fail 2 "status accepts at most one campaign-run ID."
     RUN_ID="${POSITIONAL[0]:-}"
     [[ -z "${RUN_ID}" ]] || validate_run_id "${RUN_ID}"
-    resolve_local_commit false
+    resolve_local_commit
     storage_status_report
     ;;
   collect|build-datasets|resume|cleanup|accounting|cancel|validate)
     (( ${#POSITIONAL[@]} == 1 )) || fail 2 "${SUBCOMMAND} requires one campaign-run ID."
     RUN_ID="${POSITIONAL[0]}"
     validate_run_id "${RUN_ID}"
-    resolve_local_commit false
+    resolve_local_commit
     case "${SUBCOMMAND}" in
       collect)
         [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]]           || fail 2 "collect is always non-destructive."

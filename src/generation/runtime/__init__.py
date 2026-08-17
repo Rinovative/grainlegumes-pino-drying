@@ -8,6 +8,7 @@ Provides:
 - comsol: fixed COMSOL command and workspace-name conventions
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
+- progress: non-authoritative case runtime progress parsing and persistence
 - workspace: bounded scratch and publication staging
 - PUBLICATION_SCHEMA_VERSION: canonical case-publication schema version
 - CASE_FAILURE_SCHEMA_KIND: canonical persisted case-failure schema kind
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_license as license  # noqa: A004 -- public service name
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
+    from . import generation_runtime_progress as progress
     from . import generation_runtime_workspace as workspace
     from .generation_runtime_batch import (
         CASE_FAILURE_SCHEMA_KIND,
@@ -115,6 +117,7 @@ _MODULES = {
     "license": "generation_runtime_license",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
+    "progress": "generation_runtime_progress",
     "workspace": "generation_runtime_workspace",
 }
 _BATCH_EXPORTS = frozenset(
@@ -201,6 +204,7 @@ __all__ = [
     "preparation",
     "prepare_case_work_directory",
     "processed_case_directory",
+    "progress",
     "publish_completed_case",
     "raw_case_directory",
     "record_case_failure",

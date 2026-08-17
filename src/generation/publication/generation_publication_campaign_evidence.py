@@ -42,6 +42,7 @@ _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
 )
 _RUN_MANIFEST_SCHEMA_VERSION: Final = 1
 TECHNICAL_SMOKE_EVIDENCE_FILENAME: Final = "technical_smoke_evidence.json"
+RUNTIME_PROGRESS_DIRECTORY_NAME: Final = "progress"
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -76,6 +77,7 @@ POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
         "dataset_packages_complete.lock",
         "transfer_complete.json",
         TECHNICAL_SMOKE_EVIDENCE_FILENAME,
+        RUNTIME_PROGRESS_DIRECTORY_NAME,
     }
 )
 
@@ -448,13 +450,23 @@ def directory_identity(
             message = f"Transfer directory contains a symbolic link: {path}"
             raise ValueError(message)
         relative = path.relative_to(directory).as_posix()
-        if not path.is_file() or relative in ignored_relative_paths:
+        if not path.is_file() or _relative_path_is_ignored(relative, ignored_relative_paths):
             continue
         records[relative] = {
             "sha256": common.serialization.file_sha256(path),
             "size_bytes": path.stat().st_size,
         }
     return common.serialization.canonical_json_sha256(records)
+
+
+def _relative_path_is_ignored(
+    relative_path: str,
+    ignored_relative_paths: frozenset[str],
+) -> bool:
+    """Return whether one file is an ignored operational path."""
+    if relative_path in ignored_relative_paths:
+        return True
+    return RUNTIME_PROGRESS_DIRECTORY_NAME in ignored_relative_paths and relative_path.startswith(f"{RUNTIME_PROGRESS_DIRECTORY_NAME}/")
 
 
 def transfer_inventory_from_plan(
@@ -490,7 +502,7 @@ def transfer_inventory_from_plan(
                 message = f"Transfer source contains a symbolic link: {path}"
                 raise ValueError(message)
             relative_to_directory = path.relative_to(directory).as_posix()
-            if not path.is_file() or relative_to_directory in ignored_relative_paths:
+            if not path.is_file() or _relative_path_is_ignored(relative_to_directory, ignored_relative_paths):
                 continue
             relative_path = path.relative_to(storage_root).as_posix()
             if relative_path in seen:

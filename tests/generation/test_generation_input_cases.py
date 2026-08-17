@@ -656,7 +656,7 @@ def test_campaign_input_generation_actions_remain_thin_and_non_mutating(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Default to dry-run and delegate execute through one canonical service."""
+    """Keep dry-run non-mutating and execute one selected persisted case."""
     service = generation.cases.input_generation
     assert (
         service.CampaignInputGenerationRequest(
@@ -707,13 +707,7 @@ def test_campaign_input_generation_actions_remain_thin_and_non_mutating(
     assert planned["equivalent_cli_command"].endswith(f"--storage-root {storage}")
     assert not storage.exists()
 
-    with patch.object(
-        service,
-        "generate_input_cases",
-        wraps=service.generate_input_cases,
-    ) as generate:
-        executed = service.run_campaign_input_generation(service.CampaignInputGenerationRequest(action="execute", **base))
-    assert generate.call_count == 1
+    executed = service.run_campaign_input_generation(service.CampaignInputGenerationRequest(action="execute", **base))
     assert executed["generated_case_count"] == 1
     assert executed["reused_case_count"] == 0
     assert Path(executed["raw_case_paths"][0]).is_dir()

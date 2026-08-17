@@ -32,6 +32,7 @@ from typing import Any
 from src import common
 from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_runtime
+from src.generation import generation_campaign_status as campaign_status_service
 from src.generation import generation_readiness as readiness_service
 from src.generation import generation_smoke as smoke_service
 from src.generation import generation_workflow as workflow_service
@@ -408,7 +409,8 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     campaign_status = subparsers.add_parser("campaign-status", help="reconstruct persistent campaign and scheduler status")
     campaign_status.add_argument("campaign_run_id")
     campaign_status.add_argument("--no-scheduler", action="store_true")
-    campaign_status.add_argument("--format", choices=("json", "state"), default="json")
+    campaign_status.add_argument("--format", choices=("json", "state", "summary", "monitor"), default="json")
+    campaign_status.add_argument("--max-active-cases", type=int)
     _add_storage_arguments(campaign_status)
 
     accounting = subparsers.add_parser(
@@ -1175,8 +1177,25 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
             query_scheduler=not args.no_scheduler,
         )
+        if args.max_active_cases is not None and args.format not in {"summary", "monitor"}:
+            message = "--max-active-cases requires --format summary or monitor."
+            raise ValueError(message)
         if args.format == "state":
             print(status["campaign_state"])
+        elif args.format == "summary":
+            print(
+                campaign_status_service.format_campaign_status_summary(
+                    status,
+                    max_active_cases=args.max_active_cases,
+                )
+            )
+        elif args.format == "monitor":
+            print(
+                campaign_status_service.format_campaign_monitor(
+                    status,
+                    max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
+                )
+            )
         else:
             print(json.dumps(status, sort_keys=True))
         return 0

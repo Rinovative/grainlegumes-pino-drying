@@ -119,7 +119,7 @@ def _mock_local_gates(
 
 
 def test_post_transfer_operational_paths_do_not_change_campaign_transfer_identity(tmp_path: Path) -> None:
-    """Exclude only exact campaign-local post-transfer paths from transfer identity."""
+    """Exclude declared operational files and progress descendants from identity."""
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     (campaign / "campaign_terminal.json").write_text("{}\n", encoding="utf-8")
@@ -132,6 +132,9 @@ def test_post_transfer_operational_paths_do_not_change_campaign_transfer_identit
         "{}\n",
         encoding="utf-8",
     )
+    progress_directory = campaign / campaign_evidence.RUNTIME_PROGRESS_DIRECTORY_NAME
+    progress_directory.mkdir()
+    (progress_directory / "123.json").write_text("{}\n", encoding="utf-8")
 
     assert (
         campaign_evidence.directory_identity(

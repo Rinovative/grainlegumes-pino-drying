@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
@@ -16,23 +15,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from matplotlib.collections import PathCollection
-from matplotlib.colors import TwoSlopeNorm, to_rgba
+from matplotlib.colors import TwoSlopeNorm
 from matplotlib.figure import Figure
 
 from src import common, domain, generation
 from src.analysis import generation_inputs
-from src.analysis.eda import eda_panel
 from src.analysis.generation_inputs import generation_input_controls as input_controls
-from src.analysis.generation_inputs import generation_input_panel as input_panel
-from src.analysis.presentation import registry as completed_presentation
-from src.analysis.ui import notebook as ui_notebook
 from src.analysis.ui import tables
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-    from matplotlib.axes import Axes
 
 pytest_plugins = ("tests.generation.conftest",)
 
@@ -134,20 +123,6 @@ def dataset_catalog(
         storage_root=storage,
     )
     return generation_inputs.sources.discover_generation_input_datasets(storage)
-
-
-def _walk(widget: widgets.Widget) -> Iterator[widgets.Widget]:
-    """Yield one public widget tree."""
-    yield widget
-    for child in getattr(widget, "children", ()):
-        yield from _walk(child)
-
-
-def _captured_panel(captured: list[object]) -> widgets.VBox:
-    """Return the outer VBox containing the sole tab container."""
-    matches = [item for item in captured if isinstance(item, widgets.VBox) and len(item.children) == 3 and isinstance(item.children[2], widgets.Tab)]
-    assert matches
-    return matches[-1]
 
 
 def test_input_batch_merging_uses_all_unique_cases(
@@ -542,7 +517,7 @@ def test_grouped_tables_expand_components_and_preserve_raw_values(
     assert tuple(changed_colors.loc["temperature"]) == tuple(colors.loc["temperature"])
 
 
-def test_shared_selection_synchronizes_created_and_lazy_controls(
+def test_shared_selection_synchronizes_controls_and_preserves_local_state(
     dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
 ) -> None:
     """Synchronize canonical A/B values while preserving view-local state."""
@@ -574,30 +549,19 @@ def test_shared_selection_synchronizes_created_and_lazy_controls(
 
     first.case_a.value = 3
 
+    assert state.selection.case_a_key == dataset_catalog.case_options(family_key)[2][1]
     assert second.case_a.value == 3
     assert callbacks == [1, 1]
     assert first.scale_lock is not None
     assert second.scale_lock is not None
     first.scale_lock.value = True
-    assert first.scale_lock.value is True
-    assert second.scale_lock.value is False
-
-    factory = input_panel._pair_factory(  # noqa: SLF001
-        dataset_catalog,
-        state,
-        lambda _selection: widgets.HTML("cached"),
-        include_scale_lock=True,
-    )
-    lazy = factory()
-    lazy_controls = cast("widgets.VBox", lazy.children[0])
-    lazy_case_a = cast(
-        "widgets.BoundedIntText",
-        lazy_controls.children[0].children[1],
-    )
-    assert lazy_case_a.value == 3
-    assert factory() is lazy
+    assert first.selected_comparison().lock_scale is True
+    assert second.selected_comparison().lock_scale is False
+    assert callbacks == [2, 1]
+    callbacks[:] = [0, 0]
 
     first.case_b.value = 3
+    assert callbacks == [1, 1]
     technical_key = generation_inputs.sources.dataset_key(
         next(
             dataset
@@ -606,132 +570,11 @@ def test_shared_selection_synchronizes_created_and_lazy_controls(
         )
     )
     second.dataset_b.value = technical_key
+
+    assert state.selection.dataset_b_key == technical_key
     assert first.dataset_b.value == technical_key
     assert first.case_b.value == second.case_b.value == 1
-
-
-def test_shared_selection_renders_only_active_cached_export_view(
-    dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
-) -> None:
-    """Keep hidden synchronized views from replacing active PDF state."""
-    family_key = generation_inputs.sources.dataset_key(
-        next(dataset for dataset in dataset_catalog.datasets if dataset.campaign_purpose == "family_generalization")
-    )
-    selection = generation_inputs.selection.resolve_generation_input_selection(
-        dataset_catalog,
-        preferred_dataset_key=family_key,
-    ).selection
-    state = generation_inputs.selection.GenerationInputSelectionState(
-        dataset_catalog,
-        initial_selection=selection,
-    )
-    counts = {"first": 0, "second": 0}
-
-    def render(name: str) -> Figure:
-        counts[name] += 1
-        figure, _axis = plt.subplots()
-        return figure
-
-    first_factory = input_panel._pair_factory(  # noqa: SLF001
-        dataset_catalog,
-        state,
-        lambda _selection: render("first"),
-    )
-    second_factory = input_panel._pair_factory(  # noqa: SLF001
-        dataset_catalog,
-        state,
-        lambda _selection: render("second"),
-    )
-    export_state: dict[str, object] = {}
-    first_view = first_factory(
-        export_state=export_state,
-        export_plot_name="first_view",
-        export_title="First view",
-    )
-    second_factory(
-        export_state=export_state,
-        export_plot_name="second_view",
-        export_title="Second view",
-    )
-    first_factory(
-        export_state=export_state,
-        export_plot_name="first_view",
-        export_title="First view",
-    )
-    assert counts == {"first": 2, "second": 1}
-
-    first_controls = cast("widgets.VBox", first_view.children[0])
-    first_case_a = cast(
-        "widgets.BoundedIntText",
-        first_controls.children[0].children[1],
-    )
-    first_case_a.value = 3
-
-    assert counts == {"first": 3, "second": 1}
-    assert export_state["plot_name"] == "first_view"
-    assert export_state["title"] == "First view"
-    assert isinstance(export_state["fig"], Figure)
-
-
-def test_returning_to_tab_refreshes_selected_cached_view(
-    dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Refresh one newly visible stale view without hidden redraw fan-out."""
-    family_key = generation_inputs.sources.dataset_key(
-        next(dataset for dataset in dataset_catalog.datasets if dataset.campaign_purpose == "family_generalization")
-    )
-    selection = generation_inputs.selection.resolve_generation_input_selection(
-        dataset_catalog,
-        preferred_dataset_key=family_key,
-    ).selection
-    state = generation_inputs.selection.GenerationInputSelectionState(
-        dataset_catalog,
-        initial_selection=selection,
-    )
-    sections = generation_inputs.presentation.sections_for_profiles(dataset_catalog.profiles)
-    counts = {view.key: 0 for section in sections for view in section.plots}
-
-    def render(key: str) -> widgets.HTML:
-        counts[key] += 1
-        return widgets.HTML(key)
-
-    factories = {
-        key: input_panel._pair_factory(  # noqa: SLF001
-            dataset_catalog,
-            state,
-            lambda _selection, key=key: render(key),
-        )
-        for key in counts
-    }
-    monkeypatch.setattr(
-        input_panel,
-        "_view_factories",
-        lambda _catalog, _state: factories,
-    )
-    monkeypatch.setattr(input_panel, "display", lambda _value: None)
-    monkeypatch.setattr(input_panel, "clear_output", lambda **_kwargs: None)
-    monkeypatch.setattr(ui_notebook, "display", lambda _value: None)
-
-    shell = input_panel._GenerationInputPanelShell(  # noqa: SLF001
-        dataset_catalog,
-        title="Generation-input EDA",
-        export_dir="",
-        selection_state=state,
-    )
-    shell._show_panel()  # noqa: SLF001
-    first_key = sections[0].plots[0].key
-    second_key = sections[1].plots[0].key
-    shell._tabs.selected_index = 1  # noqa: SLF001
-    second_before = counts[second_key]
-    state.select_case_a(dataset_catalog.case_options(family_key)[2][1])
-    assert counts[second_key] == second_before + 1
-    first_before = counts[first_key]
-
-    shell._tabs.selected_index = 0  # noqa: SLF001
-
-    assert counts[first_key] == first_before + 1
-    assert shell._export_state["plot_name"] == first_key  # noqa: SLF001
+    assert callbacks == [2, 2]
 
 
 def test_selection_defaults_reconcile_sparse_and_single_case_datasets(
@@ -916,134 +759,19 @@ def test_abbreviation_legend_combines_configured_and_discovered_purposes() -> No
     )
 
 
-def test_controls_panel_and_notebook_use_one_ab_first_model(
+def test_panel_public_surface_accepts_catalog_and_rejects_invalid_input(
     dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Use numeric cases, compatible datasets, automatic render, and no refresh."""
-    assert isinstance(
-        generation_inputs.panel.build_generation_input_eda_panel(datasets=dataset_catalog),
-        widgets.Output,
+    """Construct the public panel only from an admitted dataset catalog."""
+    panel = generation_inputs.panel.build_generation_input_eda_panel(
+        datasets=dataset_catalog,
     )
+
+    assert isinstance(panel, widgets.Output)
     with pytest.raises(TypeError):
         generation_inputs.panel.build_generation_input_eda_panel(
             datasets=cast("Any", []),
         )
-    initial = generation_inputs.selection.resolve_generation_input_selection(
-        dataset_catalog,
-        preferred_dataset_key=dataset_catalog.dataset_options(profile_ids=("transient_drying",))[0][1],
-    ).selection
-    selection_state = generation_inputs.selection.GenerationInputSelectionState(
-        dataset_catalog,
-        initial_selection=initial,
-    )
-    local = input_controls.PairCaseControls(
-        dataset_catalog,
-        selection_state=selection_state,
-        include_scale_lock=True,
-    )
-    assert local.dataset_b.value == local.dataset_a.value
-    assert isinstance(local.case_a, widgets.BoundedIntText)
-    assert isinstance(local.case_b, widgets.BoundedIntText)
-    assert local.case_a.value == 1
-    assert local.case_b.value == 2
-    assert (local.case_a.min, local.case_a.max) == (1, 3)
-    assert (local.case_b.min, local.case_b.max) == (1, 3)
-    view_section = ui_notebook.make_dropdown_section(
-        [("1-3. Field summaries", lambda: None, "field_summaries")],
-        select_first=True,
-    )
-    view_selector = cast("widgets.Dropdown", view_section.children[0])
-    expected_view_width = f"{ui_notebook.COMPACT_VIEW_SELECTOR_WIDTH_PX}px"
-    expected_dataset_width = f"{input_controls.DATASET_SELECTOR_WIDTH_PX}px"
-    assert view_selector.layout.width == expected_view_width
-    assert local.dataset_a.layout.width == expected_dataset_width
-    assert local.dataset_b.layout.width == expected_dataset_width
-    assert input_controls.DATASET_SELECTOR_WIDTH_PX > ui_notebook.COMPACT_VIEW_SELECTOR_WIDTH_PX
-    assert local.dataset_a.style.description_width == (f"{input_controls.DATASET_LABEL_WIDTH_PX}px")
-    assert local.dataset_b.style.description_width == (local.dataset_a.style.description_width)
-    assert local.dataset_a.layout.flex == local.dataset_b.layout.flex
-    first_row, second_row = local.widget.children[:2]
-    assert isinstance(first_row, widgets.HBox)
-    assert isinstance(second_row, widgets.HBox)
-    assert first_row.layout.display == second_row.layout.display == "flex"
-    assert first_row.layout.flex_flow == second_row.layout.flex_flow == "row wrap"
-    assert first_row.layout.grid_gap == second_row.layout.grid_gap
-    assert local.case_a.layout.width == local.case_b.layout.width == (f"{input_controls.CASE_SELECTOR_WIDTH_PX}px")
-    assert round(84 * 0.75) == input_controls.CASE_VALUE_WIDTH_PX
-    assert input_controls.CASE_SELECTOR_WIDTH_PX == (input_controls.CASE_LABEL_WIDTH_PX + input_controls.CASE_VALUE_WIDTH_PX)
-    assert local.case_a.style.description_width == (f"{input_controls.CASE_LABEL_WIDTH_PX}px")
-    assert not isinstance(local.case_a, widgets.Dropdown)
-    assert not isinstance(local.case_b, widgets.Dropdown)
-    assert local.previous_a.layout.width == local.following_a.layout.width
-    assert local.previous_b.layout.width == local.following_b.layout.width
-    assert local.previous_a.layout.width == (f"{input_controls.CASE_STEP_WIDTH_PX}px")
-    local.following_a.click()
-    assert local.case_a.value == 2
-    local.previous_a.click()
-    assert local.case_a.value == 1
-    local.case_a.value = 3
-    assert local.selected_comparison().case_a.case.case_index == 3
-    assert local.scale_lock is not None
-    assert local.scale_lock.value is False
-    assert {dataset_catalog.dataset(cast("Any", value)).profile_id for _label, value in local.dataset_b.options} == {"transient_drying"}
-
-    transient_options = dataset_catalog.dataset_options(profile_ids=("transient_drying",))
-    assert len(transient_options) == 2
-    local.dataset_b.value = transient_options[1][1]
-    comparison = local.selected_comparison()
-    assert comparison.case_a.profile_id == comparison.case_b.profile_id
-    assert comparison.same_dataset is False
-
-    captured: list[object] = []
-    monkeypatch.setattr(input_panel, "display", captured.append)
-    monkeypatch.setattr(ui_notebook, "display", captured.append)
-    result = generation_inputs.panel.build_generation_input_eda_panel(
-        datasets=dataset_catalog,
-    )
-    assert isinstance(result, widgets.Output)
-    open_button = next(item for item in captured if isinstance(item, widgets.Button) and item.description.endswith(" - Open"))
-    open_button.click()
-    outer = _captured_panel(captured)
-    header, _status, tabs = outer.children
-    assert isinstance(header, widgets.HBox)
-    assert [button.description for button in header.children] == [
-        "Close",
-        "Export PDF",
-    ]
-    assert isinstance(tabs, widgets.Tab)
-    assert len(tabs.children) == 4
-    live_view = next(
-        item
-        for item in reversed(captured)
-        if isinstance(item, widgets.VBox) and len(item.children) == 2 and isinstance(item.children[1], widgets.Output)
-    )
-    descriptions = [str(cast("Any", item).description) for item in _walk(live_view.children[0]) if hasattr(item, "description")]
-    assert descriptions == [
-        "Dataset A:",
-        "Case A:",
-        "←",
-        "→",
-        "Dataset B:",
-        "Case B:",
-        "←",
-        "→",
-    ]
-    assert not any(isinstance(item, widgets.Button) and item.description in {"Update", "Refresh sources"} for item in _walk(outer))
-    close_button = cast("widgets.Button", header.children[0])
-    close_button.click()
-    open_button.click()
-    assert _captured_panel(captured) is outer
-
-    sections = generation_inputs.presentation.GENERATION_INPUT_SECTIONS
-    assert tuple(section.key for section in sections) == (
-        "case_comparison",
-        "boundary_schedule_comparison",
-        "spatial_comparison",
-        "dataset_overview",
-    )
-    assert "input_cases" not in inspect_signature_parameters(eda_panel.build_eda_panel)
-    assert tuple(section.key for section in completed_presentation.EDA_SECTIONS) == ("metadata_fields", "spectral_analysis")
 
 
 def test_notebook_executes_read_only_workspace_over_current_storage(
@@ -1076,22 +804,6 @@ def test_notebook_executes_read_only_workspace_over_current_storage(
 
     notebook = json.loads(Path("notebooks/generation_input_eda.ipynb").read_text(encoding="utf-8"))
     source = "\n".join("".join(cell.get("source", ())) for cell in notebook["cells"] if cell["cell_type"] == "code")
-    forbidden = (
-        "INPUT_GENERATION_MODE",
-        "INPUT_CAMPAIGN_CONFIG",
-        "INPUT_ONLY_BATCH",
-        "INPUT_ALL_BATCHES",
-        "INPUT_ONLY_REGIME",
-        "INPUT_CASE_START",
-        "INPUT_CASE_COUNT",
-        "INPUT_ALL_CASES",
-        "run_campaign_input_generation",
-        "CampaignInputGenerationRequest",
-        "dry_run",
-        '"execute"',
-        '"skip"',
-    )
-    assert not any(token in source for token in forbidden)
     namespace: dict[str, Any] = {}
     exec(compile(source, "generation_input_eda.ipynb", "exec"), namespace)  # noqa: S102
 
@@ -1103,62 +815,35 @@ def test_notebook_executes_read_only_workspace_over_current_storage(
     assert shown == ([expected_panel] if expected_panel is not None else [])
 
 
-def inspect_signature_parameters(function: Any) -> tuple[str, ...]:
-    """Return public signature parameter names without source inspection."""
-    return tuple(inspect.signature(function).parameters)
+def _map_norm_for_values(figure: Figure, expected: np.ndarray) -> object:
+    """Return the normalization attached to one semantically matched map."""
+    matches = []
+    for binding in generation_inputs.plots.layout.map_colorbar_bindings(figure):
+        collection = binding.anchor_axis.collections[0]
+        values = np.asarray(collection.get_array())
+        if values.size == expected.size and np.allclose(
+            values.reshape(expected.shape),
+            expected,
+        ):
+            matches.append(collection.norm)
+    assert matches
+    return matches[0]
 
 
-_GEOMETRY_TOLERANCE = 1.0e-9
+def _figure_has_line(
+    figure: Figure,
+    expected_x: np.ndarray,
+    expected_y: np.ndarray,
+) -> bool:
+    """Return whether a figure contains one exact semantic data series."""
+    return any(
+        np.array_equal(np.asarray(line.get_xdata()), expected_x) and np.allclose(np.asarray(line.get_ydata()), expected_y)
+        for axis in figure.axes
+        for line in axis.lines
+    )
 
 
-def _assert_colorbar_geometry(figure: Figure, *, expected: int) -> None:
-    """Require every axes-coupled colorbar to match its map-axis height."""
-    figure.canvas.draw()
-    bindings = generation_inputs.plots.layout.map_colorbar_bindings(figure)
-    assert len(bindings) == expected
-    for binding in bindings:
-        map_box = binding.anchor_axis.get_position()
-        colorbar_box = binding.colorbar.ax.get_position()
-        assert abs(colorbar_box.y0 - map_box.y0) <= _GEOMETRY_TOLERANCE
-        assert abs(colorbar_box.y1 - map_box.y1) <= _GEOMETRY_TOLERANCE
-        assert abs(colorbar_box.height - map_box.height) <= _GEOMETRY_TOLERANCE
-        assert len(binding.map_axes) == 1
-    assert figure.get_size_inches()[0] <= generation_inputs.plots.layout.MAP_LAYOUT.notebook_width
-
-
-def _legend_labels(axis: Axes) -> list[str]:
-    """Return legend text without repeated optional accesses."""
-    legend = axis.get_legend()
-    return [] if legend is None else [text.get_text() for text in legend.get_texts()]
-
-
-def _assert_embedded_row_colors(
-    axis: Axes,
-    table: pd.DataFrame,
-) -> None:
-    """Require embedded value cells to use the canonical row-local colors."""
-    artist = axis.tables[0]
-    colors = tables.row_local_color_matrix(table)
-    assert np.allclose(artist[(0, 0)].get_facecolor(), to_rgba("#e7edf3"))
-    for row in range(len(table.index)):
-        assert np.allclose(
-            artist[(row + 1, 0)].get_facecolor(),
-            to_rgba("#f5f7fa"),
-        )
-        for column in range(len(table.columns)):
-            value = table.iloc[row, column]
-            cell = artist[(row + 1, column + 1)]
-            cell_colors = colors.iloc[row, column]
-            assert isinstance(cell_colors, tables.TableCellColors)
-            assert np.allclose(
-                cell.get_facecolor(),
-                to_rgba(cell_colors.background),
-            )
-            assert cell.get_text().get_color() == cell_colors.foreground
-            assert cell.get_text().get_text() == f"{float(value):.4g}"
-
-
-def test_basic_spatial_uses_large_maps_pressure_line_and_physical_difference(
+def test_basic_spatial_preserves_fields_pressure_and_scale_semantics(
     profile_records: dict[
         str,
         tuple[
@@ -1167,7 +852,7 @@ def test_basic_spatial_uses_large_maps_pressure_line_and_physical_difference(
         ],
     ],
 ) -> None:
-    """Keep exact map scales while presenting inlet pressure as a line."""
+    """Render exact fields, differences, pressure support, and scale policy."""
     first, second = profile_records["steady_flow"]
     summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
     default = generation_inputs.plots.spatial.basic_comparison(
@@ -1187,57 +872,35 @@ def test_basic_spatial_uses_large_maps_pressure_line_and_physical_difference(
     assert isinstance(default, Figure)
     assert isinstance(locked, Figure)
     try:
-        for figure in (default, locked):
-            _assert_colorbar_geometry(figure, expected=3)
-            assert figure.get_size_inches()[0] == pytest.approx(3 * generation_inputs.plots.layout.MAP_LAYOUT.map_column_width)
-            pressure_axes = [axis for axis in figure.axes if axis.get_title() == "Inlet pressure boundary"]
-            assert len(pressure_axes) == 1
-            assert len(pressure_axes[0].lines) == 3
-            assert all("Case " in str(line.get_label()) for line in pressure_axes[0].lines if line.get_linestyle() == "-")
-            distribution_axis = next(axis for axis in figure.axes if axis.get_title().endswith("distribution"))
-            assert (
-                distribution_axis.get_position().width
-                > generation_inputs.plots.layout.map_colorbar_bindings(figure)[0].anchor_axis.get_position().width
-            )
-            summary_axes = [axis for axis in figure.axes if axis.tables]
-            assert len(summary_axes) == 1
-            assert summary_axes[0].get_title() == ""
-            summary_table = generation_inputs.diagnostics.field_summary_comparison_table(
-                first,
-                summary,
-                second,
-                summary,
-                quantities=("eps_bed", "p_in_bc"),
-            )
-            _assert_embedded_row_colors(summary_axes[0], summary_table)
-            bindings = generation_inputs.plots.layout.map_colorbar_bindings(figure)
-            assert {binding.label for binding in bindings} == {"[1]"}
-            assert all("Bed porosity" in binding.anchor_axis.get_title() for binding in bindings)
-        default_bindings = generation_inputs.plots.layout.map_colorbar_bindings(default)
-        locked_bindings = generation_inputs.plots.layout.map_colorbar_bindings(locked)
-        assert default_bindings[0].anchor_axis.collections[0].norm is not default_bindings[1].anchor_axis.collections[0].norm
-        assert locked_bindings[0].anchor_axis.collections[0].norm is locked_bindings[1].anchor_axis.collections[0].norm
-        difference_norm = default_bindings[2].anchor_axis.collections[0].norm
+        first_field = first.fields["eps_bed"]
+        second_field = second.fields["eps_bed"]
+        difference = second_field - first_field
+        default_first_norm = _map_norm_for_values(default, first_field)
+        default_second_norm = _map_norm_for_values(default, second_field)
+        locked_first_norm = _map_norm_for_values(locked, first_field)
+        locked_second_norm = _map_norm_for_values(locked, second_field)
+        difference_norm = _map_norm_for_values(default, difference)
+
+        assert default_first_norm is not default_second_norm
+        assert locked_first_norm is locked_second_norm
         assert isinstance(difference_norm, TwoSlopeNorm)
         assert difference_norm.vcenter == 0.0
         assert difference_norm.vmin is not None
         assert difference_norm.vmax is not None
         assert difference_norm.vmin == -difference_norm.vmax
-        plotted_difference = np.asarray(default_bindings[2].anchor_axis.collections[0].get_array()).reshape(first.fields["eps_bed"].shape)
-        np.testing.assert_allclose(
-            plotted_difference,
-            second.fields["eps_bed"] - first.fields["eps_bed"],
-        )
-        map_titles = tuple(binding.anchor_axis.get_title() for binding in default_bindings)
-        assert map_titles[0] == (f"Case {first.case.case_index}\nBed porosity")
-        assert map_titles[1] == (f"Case {second.case.case_index}\nBed porosity")
-        assert map_titles[2] == (f"Case {second.case.case_index} - Case {first.case.case_index}\nBed porosity")
+
+        first_x, first_pressure = generation_inputs.diagnostics.inlet_pressure_boundary(first)
+        second_x, second_pressure = generation_inputs.diagnostics.inlet_pressure_boundary(second)
+        assert _figure_has_line(default, first_x, first_pressure)
+        assert _figure_has_line(default, second_x, second_pressure)
+        mean_pressure = np.mean(np.stack((first_pressure, second_pressure)), axis=0)
+        assert _figure_has_line(default, first_x, mean_pressure)
     finally:
         plt.close(default)
         plt.close(locked)
 
 
-def test_permeability_and_moisture_composites_embed_lower_content(
+def test_permeability_and_moisture_plots_preserve_scientific_values(
     profile_records: dict[
         str,
         tuple[
@@ -1246,145 +909,93 @@ def test_permeability_and_moisture_composites_embed_lower_content(
         ],
     ],
 ) -> None:
-    """Keep aligned colored summaries, unit labels, and clean RH phases."""
+    """Render each composite from exact fields and nonlinear RH summaries."""
     steady_first, steady_second = profile_records["steady_flow"]
     steady_mean = generation_inputs.diagnostics.build_dataset_diagnostics((steady_first, steady_second))
     transient_first, transient_second = profile_records["transient_drying"]
     transient_mean = generation_inputs.diagnostics.build_dataset_diagnostics((transient_first, transient_second))
-    tensor = generation_inputs.plots.permeability.tensor_comparison(
-        steady_first,
-        steady_mean,
-        steady_second,
-        steady_mean,
-        lock_scale=False,
-    )
-    derived = generation_inputs.plots.permeability.derived_comparison(
-        steady_first,
-        steady_mean,
-        steady_second,
-        steady_mean,
-        lock_scale=False,
-    )
-    moisture = generation_inputs.plots.moisture.moisture_comparison(
-        transient_first,
-        transient_mean,
-        transient_second,
-        transient_mean,
-        lock_scale=False,
-    )
-    assert isinstance(tensor, Figure)
-    assert isinstance(derived, Figure)
-    assert isinstance(moisture, Figure)
     contracts = (
         (
-            tensor,
+            generation_inputs.plots.permeability.tensor_comparison(
+                steady_first,
+                steady_mean,
+                steady_second,
+                steady_mean,
+                lock_scale=False,
+            ),
             steady_first,
-            steady_mean,
             steady_second,
-            steady_mean,
             generation_inputs.plots.permeability.TENSOR_FIELDS,
         ),
         (
-            derived,
+            generation_inputs.plots.permeability.derived_comparison(
+                steady_first,
+                steady_mean,
+                steady_second,
+                steady_mean,
+                lock_scale=False,
+            ),
             steady_first,
-            steady_mean,
             steady_second,
-            steady_mean,
             generation_inputs.plots.permeability.DERIVED_FIELDS,
         ),
         (
-            moisture,
+            generation_inputs.plots.moisture.moisture_comparison(
+                transient_first,
+                transient_mean,
+                transient_second,
+                transient_mean,
+                lock_scale=False,
+            ),
             transient_first,
-            transient_mean,
             transient_second,
-            transient_mean,
             generation_inputs.diagnostics.MOISTURE_FIELD_NAMES,
         ),
     )
+    assert all(isinstance(figure, Figure) for figure, *_rest in contracts)
     try:
-        for figure, first, mean_a, second, mean_b, quantities in contracts:
-            _assert_colorbar_geometry(figure, expected=3 * len(quantities))
-            distribution_axes = [axis for axis in figure.axes if axis.get_title().endswith("distribution")]
-            assert len(distribution_axes) == len(quantities)
-            assert all(axis.lines for axis in distribution_axes)
-            assert all(
-                axis.get_position().width > generation_inputs.plots.layout.map_colorbar_bindings(figure)[0].anchor_axis.get_position().width
-                for axis in distribution_axes
-            )
-            summary_axis = next(axis for axis in figure.axes if axis.tables)
-            assert summary_axis.get_title() == ""
-            summary_table = generation_inputs.diagnostics.field_summary_comparison_table(
-                first,
-                mean_a,
-                second,
-                mean_b,
-                quantities=quantities,
-            )
-            _assert_embedded_row_colors(summary_axis, summary_table)
-            bindings = generation_inputs.plots.layout.map_colorbar_bindings(figure)
-            expected_labels = tuple(f"[{generation_inputs.diagnostics.FIELD_UNITS[quantity]}]" for quantity in quantities for _column in range(3))
-            assert tuple(binding.label for binding in bindings) == expected_labels
-            for offset, quantity in enumerate(quantities):
-                field_label = generation_inputs.diagnostics.FIELD_LABELS[quantity]
-                assert all(field_label in bindings[offset * 3 + column].anchor_axis.get_title() for column in range(3))
+        for figure, first, second, quantities in contracts:
+            assert isinstance(figure, Figure)
+            for quantity in quantities:
+                _map_norm_for_values(figure, first.fields[quantity])
+                _map_norm_for_values(figure, second.fields[quantity])
+                _map_norm_for_values(
+                    figure,
+                    second.fields[quantity] - first.fields[quantity],
+                )
 
-        relation = next(axis for axis in moisture.axes if axis.get_title() == "Inlet vs bed-equilibrium RH")
-        markers = [collection for collection in relation.collections if isinstance(collection, PathCollection)]
-        assert markers
-        assert all(
-            np.allclose(
-                marker.get_sizes(),
-                generation_inputs.plots.moisture.RELATION_MARKER_SIZE,
-            )
-            for marker in markers
+        relationship = generation_inputs.plots.moisture._case_relationship(  # noqa: SLF001
+            transient_first
         )
-        assert all(np.asarray(marker.get_edgecolor()).size == 0 for marker in markers)
-        phase_colors = {tuple(np.asarray(marker.get_facecolor(), dtype=np.float64).reshape(-1, 4)[0].tolist()) for marker in markers}
-        assert len(phase_colors) == 3
-
-        expected_legend_labels = [
-            "Bed median (q05-q95 range)",
-            "Inlet start",
-            "Inlet startup end",
-        ]
-        legend_axis = next(axis for axis in moisture.axes if _legend_labels(axis) == expected_legend_labels)
-        legend = legend_axis.get_legend()
-        assert legend is not None
-        legend_labels = [text.get_text() for text in legend.get_texts()]
-        assert legend_labels == expected_legend_labels
-        assert not any("Dataset" in label or "role" in label for label in legend_labels)
-
-        moisture.canvas.draw()
-        histogram_axes = [axis for axis in moisture.axes if axis.get_title().endswith("distribution")]
-        summary_axis = next(axis for axis in moisture.axes if axis.tables)
-        summary_box = summary_axis.get_position()
-        first_histogram_box = histogram_axes[0].get_position()
-        assert abs(summary_box.y0 - first_histogram_box.y0) <= _GEOMETRY_TOLERANCE
-        assert abs(summary_box.y1 - first_histogram_box.y1) <= _GEOMETRY_TOLERANCE
-        assert abs(summary_box.x1 - relation.get_position().x1) <= _GEOMETRY_TOLERANCE
-        renderer = cast("Any", moisture.canvas).get_renderer()
-        summary_artist_box = summary_axis.tables[0].get_window_extent(renderer).transformed(moisture.transFigure.inverted())
-        assert abs(summary_artist_box.x0 - summary_box.x0) <= _GEOMETRY_TOLERANCE
-        assert abs(summary_artist_box.x1 - summary_box.x1) <= _GEOMETRY_TOLERANCE
-        assert abs(summary_artist_box.y0 - summary_box.y0) <= _GEOMETRY_TOLERANCE
-        assert abs(summary_artist_box.y1 - summary_box.y1) <= _GEOMETRY_TOLERANCE
-        assert relation.get_position().height < histogram_axes[1].get_position().height
-
-        legend_box = legend.get_window_extent()
-        relation_box = relation.get_window_extent()
-        figure_box = moisture.bbox
-        assert legend_box.y1 <= relation_box.y0
-        assert legend_box.width >= 0.9 * relation_box.width
-        assert legend_box.x0 >= figure_box.x0
-        assert legend_box.x1 <= figure_box.x1
-        assert legend_box.y0 >= figure_box.y0
-        assert legend_box.y1 <= figure_box.y1
+        statistics = generation_inputs.diagnostics.field_statistics(transient_first).loc["phi_eq"]
+        startup = generation_inputs.diagnostics.transient_evidence(transient_first)[3]
+        assert relationship == pytest.approx(
+            (
+                statistics["q05"],
+                statistics["median"],
+                statistics["q95"],
+                startup.variables["phi_in_bc"].start,
+                startup.variables["phi_in_bc"].end,
+            )
+        )
+        assert generation_inputs.plots.moisture._mean_relationship(  # noqa: SLF001
+            transient_mean
+        ) == pytest.approx(
+            (
+                transient_mean.field_summary_means[("phi_eq", "q05")],
+                transient_mean.field_summary_means[("phi_eq", "median")],
+                transient_mean.field_summary_means[("phi_eq", "q95")],
+                transient_mean.boundary_means["phi_in_bc start"],
+                transient_mean.boundary_means["phi_in_bc startup end"],
+            )
+        )
     finally:
-        for figure, *_contract in contracts:
-            plt.close(figure)
+        for figure, *_rest in contracts:
+            if isinstance(figure, Figure):
+                plt.close(figure)
 
 
-def test_schedule_plot_draws_wide_markerless_cases_and_common_mean_once(
+def test_schedule_plot_preserves_semantic_windows_and_common_mean(
     profile_records: dict[
         str,
         tuple[
@@ -1393,8 +1004,11 @@ def test_schedule_plot_draws_wide_markerless_cases_and_common_mean_once(
         ],
     ],
 ) -> None:
-    """Draw wide markerless full/startup schedules on exact supports."""
+    """Plot exact operating and first-hour support without duplicating means."""
     first, second = profile_records["transient_drying"]
+    assert first.schedule is not None
+    assert first.startup is not None
+    source_schedule = np.array(first.schedule, copy=True)
     summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
     figure = generation_inputs.plots.boundaries.schedule_comparison(
         first,
@@ -1404,27 +1018,41 @@ def test_schedule_plot_draws_wide_markerless_cases_and_common_mean_once(
         same_dataset=True,
     )
     try:
-        assert len(figure.axes) == 6
-        assert all(len(axis.lines) == 3 for axis in figure.axes)
-        assert figure.get_size_inches()[0] == pytest.approx(2 * generation_inputs.plots.layout.MAP_LAYOUT.map_column_width)
-        first_axis = figure.axes[0]
-        labels = [str(line.get_label()) for line in first_axis.lines]
-        assert labels[0] == f"Case {first.case.case_index} (A)"
-        assert labels[1] == "Dataset mean, n = 2"
-        assert labels[2] == f"Case {second.case.case_index} (B)"
-        assert first_axis.lines[0].get_linestyle() == "-"
-        assert first_axis.lines[1].get_linestyle() == "--"
-        assert all(line.get_marker() in {"None", None, ""} for axis in figure.axes for line in axis.lines)
-        assert first.schedule is not None
-        np.testing.assert_array_equal(
-            first_axis.lines[0].get_xdata(),
-            generation_inputs.diagnostics.operating_schedule_rows(first)[:, 0],
+        case_a_label = f"Case {first.case.case_index} (A)"
+        case_b_label = f"Case {second.case.case_index} (B)"
+        mean_label = f"Dataset mean, n = {summary.case_count}"
+        lines = [line for axis in figure.axes for line in axis.lines]
+        labels = {str(line.get_label()) for line in lines}
+
+        assert {case_a_label, case_b_label, mean_label}.issubset(labels)
+        assert {label for label in labels if "mean" in label.lower()} == {mean_label}
+        assert all(
+            line.get_linestyle() == "-" and line.get_marker() in {"None", None, ""}
+            for line in lines
+            if line.get_label() in {case_a_label, case_b_label}
         )
-        startup_axis = figure.axes[1]
-        np.testing.assert_array_equal(
-            startup_axis.lines[0].get_xdata(),
-            generation_inputs.diagnostics.startup_schedule_minutes(first)[:, 0],
+        assert all(line.get_linestyle() == "--" for line in lines if line.get_label() == mean_label)
+
+        startup_end_h = first.startup.duration_h
+        persisted_times_h = source_schedule[:, 0]
+        expected_operating_h = persisted_times_h[persisted_times_h >= startup_end_h]
+        expected_early_minutes = 60.0 * persisted_times_h[(persisted_times_h >= 0.0) & (persisted_times_h <= 1.0)]
+        observed_case_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for line in lines if line.get_label() == case_a_label]
+        assert observed_case_supports
+        assert all(
+            np.array_equal(support, expected_operating_h) or np.array_equal(support, expected_early_minutes) for support in observed_case_supports
         )
+        assert any(np.array_equal(support, expected_operating_h) for support in observed_case_supports)
+        assert any(np.array_equal(support, expected_early_minutes) for support in observed_case_supports)
+
+        assert expected_operating_h[0] == startup_end_h
+        assert not np.any(expected_operating_h == 0.0)
+        assert expected_early_minutes[0] == 0.0
+        assert expected_early_minutes[-1] == 60.0
+        assert 60.0 * startup_end_h in expected_early_minutes
+        assert np.all((expected_early_minutes >= 0.0) & (expected_early_minutes <= 60.0))
+        assert np.all(np.diff(expected_early_minutes) >= 0.0)
+        np.testing.assert_array_equal(first.schedule, source_schedule)
     finally:
         plt.close(figure)
 

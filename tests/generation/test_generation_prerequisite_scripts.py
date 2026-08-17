@@ -7,6 +7,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.integration
+
 _COMMIT = "a" * 40
 _REPOSITORY_URL = "https://github.com/Rinovative/grainlegumes-pino-drying.git"
 _CAMPAIGN_RUN_ID = "synthetic__0123456789abcdef"
@@ -39,7 +43,7 @@ def _fake_environment(tmp_path: Path, *, include_rsync: bool) -> tuple[dict[str,
     binary = tmp_path / "bin"
     binary.mkdir(parents=True)
     log = tmp_path / "commands.log"
-    for name in ("dirname", "hostname", "mktemp", "rmdir", "stat"):
+    for name in ("date", "dirname", "hostname", "mktemp", "rmdir", "stat"):
         _link_command(binary, name)
     _executable(binary / "module", 'printf \'module <%s>\\n\' "$*" >> "${FAKE_COMMAND_LOG}"')
     _executable(
@@ -322,6 +326,7 @@ def _worker_environment(
     return {
         **environment,
         "SLURM_JOB_ID": "123",
+        "SLURMD_NODENAME": "node-test",
         "TMPDIR": str(scratch),
         "GENERATION_GIT_COMMIT": _COMMIT,
         "GENERATION_CPU_VENV": str(venv),
@@ -364,6 +369,13 @@ def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
+    start_lines = [line for line in result.stdout.splitlines() if line.startswith("CASE START ")]
+    assert len(start_lines) == 1
+    assert result.stdout.splitlines()[0] == start_lines[0]
+    assert f"campaign_run_id={_CAMPAIGN_RUN_ID}" in start_lines[0]
+    assert "batch=synthetic.batch" in start_lines[0]
+    assert "case=case_0001 case_index=1 job=123 node=node-test cores=16" in start_lines[0]
+    assert start_lines[0].endswith("Z")
     assert "check=exact-worker-checkout status=pass" in result.stdout
     assert "initialize-worker-workspace" in log.read_text(encoding="utf-8")
     assert "run-campaign-case" in log.read_text(encoding="utf-8")

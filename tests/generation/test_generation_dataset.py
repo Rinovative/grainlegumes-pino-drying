@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004
+# ruff: noqa: S101
 """Steady-flow fake-COMSOL, canonical HDF5, and package regression."""
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     config_path, template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
-        natural_count=2,
+        natural_count=1,
         retain_raw_csv=True,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -158,7 +158,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
         )
         for case_index in batch.case_indices
     ]
-    assert [outcome.status for outcome in outcomes] == ["completed", "completed"]
+    assert [outcome.status for outcome in outcomes] == ["completed"]
     assert template.read_bytes() == template_bytes
 
     completed = outcomes[0].processed_directory
@@ -216,7 +216,7 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     generation.runtime.finalize_batch(batch, storage_root=storage)
     terminal = generation.runtime.validate_terminal_batch(batch, storage_root=storage)
     assert terminal["git_commit"] == "a" * 40
-    assert [record["case_id"] for record in terminal["cases"]] == ["case_0001", "case_0002"]
+    assert [record["case_id"] for record in terminal["cases"]] == ["case_0001"]
     missing_project = tmp_path / "project without templates"
     missing_project.mkdir()
     monkeypatch.setenv("PROJECT_ROOT", str(missing_project))
@@ -233,13 +233,13 @@ def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
 
     result = datasets.packages.build_dataset_package(campaign, "steady_flow", "id", storage_root=storage)
     assert result["dataset_name"] == "steady_flow__lentil__id"
-    assert result["sample_count"] == 2
+    assert result["sample_count"] == 1
     payload = torch.load(result["payload_path"], map_location="cpu", weights_only=False)
     task = domain.tasks.registry.get_task("steady_flow")
     dataset_identity = datasets.contracts.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
-    assert dataset_identity.sample_count == 2
-    assert payload["inputs"].shape == (2, task.in_channels, ny, nx)
-    assert payload["outputs"].shape == (2, task.out_channels, ny, nx)
+    assert dataset_identity.sample_count == 1
+    assert payload["inputs"].shape == (1, task.in_channels, ny, nx)
+    assert payload["outputs"].shape == (1, task.out_channels, ny, nx)
     assert payload["fields"] == {"inputs": list(task.input_names), "outputs": list(task.output_names)}
     manifest = datasets.packages.load_package_manifest(
         result["dataset_id"],

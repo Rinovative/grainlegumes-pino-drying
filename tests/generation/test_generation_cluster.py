@@ -113,7 +113,7 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
                 "squeue",
                 "--noheader",
                 "--jobs=12345",
-                "--format=%i|%T|%R|%N",
+                "--format=%i|%T|%R|%N|%V|%S|%M",
             ]
             output = "12345|PENDING|Resources|\n" if scheduler_mode["value"] == "active" else ""
             return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")

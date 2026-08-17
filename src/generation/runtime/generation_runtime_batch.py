@@ -6,6 +6,7 @@ Run, admit, and atomically publish isolated profile-qualified COMSOL cases.
 Responsibilities:
   - Execute safe one-node COMSOL commands and retain complete runtime evidence
   - Collect explicit raw adapters and convert them to canonical case.h5
+  - Publish non-authoritative case phases without changing solver outcomes
   - Publish cases and admit terminal batches through immutable typed evidence
 Design principles:
   - Scientific configuration and execution provenance are physically separate
@@ -54,6 +55,7 @@ from src.generation.publication import generation_publication_storage as storage
 from . import generation_runtime_comsol as comsol_service
 from . import generation_runtime_diagnostics as diagnostics_service
 from . import generation_runtime_license as license_service
+from . import generation_runtime_progress as progress_service
 from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
@@ -311,6 +313,84 @@ def _terminate_solver_and_wait(process: subprocess.Popen[str]) -> int:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         return process.wait()
+
+
+def _create_runtime_progress_reporter(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    scheduler_kind: str,
+    storage_root: Path,
+) -> progress_service.RuntimeProgressReporter | None:
+    """Create optional exact campaign progress without affecting execution."""
+    if scheduler_kind != "slurm":
+        return None
+    run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID")
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not run_id or not job_id:
+        return None
+    try:
+        return progress_service.RuntimeProgressReporter.create(
+            run_id,
+            batch_name=config.batch_name,
+            batch_id=config.batch_id,
+            case_index=case_index,
+            case_id=config.case_id(case_index),
+            slurm_job_id=job_id,
+            storage_root=storage_root,
+        )
+    except Exception:  # noqa: BLE001 -- monitoring setup cannot terminate a case
+        return None
+
+
+def _bind_runtime_progress_stdout(
+    reporter: progress_service.RuntimeProgressReporter | None,
+    stdout_path: Path,
+) -> None:
+    """Best-effort bind the case-local solver stdout source."""
+    if reporter is None:
+        return
+    try:
+        reporter.bind_stdout(stdout_path)
+    except Exception:  # noqa: BLE001 -- monitoring setup cannot terminate a case
+        return
+
+
+def _update_runtime_progress(
+    reporter: progress_service.RuntimeProgressReporter | None,
+    *,
+    phase: str,
+    terminal: bool = False,
+    force: bool = False,
+) -> None:
+    """Best-effort publish one observational phase or solver snapshot."""
+    if reporter is None:
+        return
+    try:
+        reporter.update(phase=phase, terminal=terminal, force=force)
+    except Exception:  # noqa: BLE001 -- monitoring cannot terminate a case
+        return
+
+
+def _wait_for_solver(
+    process: subprocess.Popen[str],
+    *,
+    timeout_seconds: float,
+    progress_reporter: progress_service.RuntimeProgressReporter | None,
+) -> tuple[int, bool]:
+    """Wait to the exact timeout while sampling observational progress."""
+    solver_deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = max(0.0, solver_deadline - time.monotonic())
+        try:
+            exit_code = process.wait(timeout=min(progress_service.PROGRESS_POLL_INTERVAL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            _update_runtime_progress(progress_reporter, phase="starting_solver")
+            if time.monotonic() >= solver_deadline:
+                return _terminate_solver_and_wait(process), True
+        else:
+            _update_runtime_progress(progress_reporter, phase="starting_solver")
+            return exit_code, False
 
 
 class _SolvedModelOutputError(RuntimeError):
@@ -1008,6 +1088,7 @@ def execute_prepared_case(
     worker_slot: int,
     scheduler_kind: str = "local",
     allocated_node: str | None = None,
+    progress_reporter: progress_service.RuntimeProgressReporter | None = None,
 ) -> ExecutionResult:
     """Run one isolated COMSOL process and create its validated canonical HDF5."""
     scalar_handoff = prepared.bundle.scalar_handoff
@@ -1061,6 +1142,7 @@ def execute_prepared_case(
     monotonic_start = time.monotonic()
     stdout_path = prepared.runtime_directory / "stdout.log"
     stderr_path = prepared.runtime_directory / "stderr.log"
+    _bind_runtime_progress_stdout(progress_reporter, stdout_path)
     process: subprocess.Popen[str] | None = None
     timed_out = False
     exit_code: int | None = None
@@ -1068,6 +1150,7 @@ def execute_prepared_case(
         stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
         stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
     ):
+        _update_runtime_progress(progress_reporter, phase="starting_solver", force=True)
         try:
             process = subprocess.Popen(  # noqa: S603 -- validated argument vector without a shell
                 command,
@@ -1081,14 +1164,14 @@ def execute_prepared_case(
             )
             _register_solver(process)
             try:
-                try:
-                    exit_code = process.wait(timeout=float(config.execution_values["runtime"]["timeout_seconds"]))
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    exit_code = _terminate_solver_and_wait(process)
-                except BaseException:
-                    _terminate_solver_and_wait(process)
-                    raise
+                exit_code, timed_out = _wait_for_solver(
+                    process,
+                    timeout_seconds=float(config.execution_values["runtime"]["timeout_seconds"]),
+                    progress_reporter=progress_reporter,
+                )
+            except BaseException:
+                _terminate_solver_and_wait(process)
+                raise
             finally:
                 _unregister_solver(process)
         except OSError as error:
@@ -1189,6 +1272,7 @@ def execute_prepared_case(
             exit_code=exit_code,
         )
     export_conversion_start = time.monotonic()
+    _update_runtime_progress(progress_reporter, phase="collecting_exports", force=True)
     solved_model: Path | None = None
     if retain_solved_model:
         try:
@@ -1217,6 +1301,7 @@ def execute_prepared_case(
             missing_or_invalid_artifacts=(str(error),),
             failure_stage="export",
         ) from error
+    _update_runtime_progress(progress_reporter, phase="canonicalizing", force=True)
     try:
         canonical_case = storage_service.convert_exports_to_hdf5(
             config,
@@ -3342,11 +3427,23 @@ def run_case(
 ) -> CaseRunOutcome:
     """Run or integrity-skip one case and always close marked scratch."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
-    initialize_batch_metadata(config, storage_root=storage)
+    progress_reporter = _create_runtime_progress_reporter(
+        config,
+        case_index,
+        scheduler_kind=scheduler_kind,
+        storage_root=storage,
+    )
+    _update_runtime_progress(progress_reporter, phase="preparing", force=True)
+    try:
+        initialize_batch_metadata(config, storage_root=storage)
+    except BaseException:
+        _update_runtime_progress(progress_reporter, phase="failed", terminal=True)
+        raise
     lock_path = case_lock_path(config, case_index, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=blocking_lock):
         if completed_case_is_valid(config, case_index, storage_root=storage):
             clear_case_failure(config, case_index, storage_root=storage)
+            _update_runtime_progress(progress_reporter, phase="completed", terminal=True)
             return CaseRunOutcome(
                 status="skipped",
                 case_id=config.case_id(case_index),
@@ -3379,14 +3476,18 @@ def run_case(
                 worker_slot=worker_slot,
                 scheduler_kind=scheduler_kind,
                 allocated_node=allocated_node,
+                progress_reporter=progress_reporter,
             )
             failure_stage = "invalid_result"
+            _update_runtime_progress(progress_reporter, phase="publishing", force=True)
             destination = publish_completed_case(
                 config,
                 result,
                 storage_root=storage,
             )
+            _update_runtime_progress(progress_reporter, phase="completed", terminal=True)
         except BaseException as error:
+            _update_runtime_progress(progress_reporter, phase="failed", terminal=True)
             attempt_directory, attempt_root, attempt_run_id = _workspace_from_attempt(prepared, error)
             try:
                 publication_complete = completed_case_is_valid(

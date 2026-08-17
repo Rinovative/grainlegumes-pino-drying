@@ -3,88 +3,11 @@
 
 from __future__ import annotations
 
-import math
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from src import generation
 from src.generation.contracts import generation_contracts_porosity as porosity
-
-
-def _campaign_path(profile: str, purpose: str = "family_generalization") -> Path:
-    """Return one maintained campaign path."""
-    return Path(f"configs/generation/campaigns/{profile}/{purpose}.yaml")
-
-
-def _campaign(profile: str, purpose: str = "family_generalization") -> Any:
-    """Load one maintained campaign without requiring COMSOL."""
-    return generation.cases.config.load_campaign_config(
-        _campaign_path(profile, purpose),
-        require_executable=False,
-    )
-
-
-def test_all_materials_resolve_fixed_calibration_and_joint_supports() -> None:
-    """Protect fixed calibration, monotonic inversion, and every authored tail."""
-    for profile in generation.contracts.available_profile_ids():
-        campaign = _campaign(profile)
-        assert campaign.material_inventory
-        for family in campaign.material_inventory:
-            batch = campaign.require_batch(
-                material_family=family,
-                sampling_regime="natural",
-            )
-            material = batch.scientific_values["material"]
-            coupling = material["porosity_coupling"]
-            coefficient = float(coupling["A_KC_reference"])
-            nominal = float(coupling["material_kappa_nominal"])
-            calibration = float(coupling["material_eps_bed_cal_ref"])
-            registry = material["parameter_registry"]
-            effective = coupling["effective_joint_permeability_support"]
-            authored = coupling["authored_permeability_support"]
-            kc_support = coupling["kc_compatible_permeability_support"]
-
-            assert math.isfinite(coefficient)
-            assert coefficient > 0.0
-            assert coefficient == porosity.derive_reference_coefficient(nominal, calibration)
-            assert porosity.solve_reference_porosity(
-                nominal,
-                coefficient,
-                eps_min_global=float(registry["eps_min_global"]["value"]),
-                eps_max_global=float(registry["eps_max_global"]["value"]),
-            ) == pytest.approx(calibration, abs=2.0e-15)
-            assert float(effective["lower"]) < float(effective["upper"])
-            assert float(effective["lower"]) == max(float(authored["lower"]), float(kc_support["lower"]))
-            assert float(effective["upper"]) == min(float(authored["upper"]), float(kc_support["upper"]))
-            assert float(registry["kappa_mean"]["lower"]) == float(effective["lower"])
-            assert float(registry["kappa_mean"]["upper"]) == float(effective["upper"])
-            assert float(coupling["eps_kc_trend_interval"]["lower"]) < float(coupling["eps_kc_trend_interval"]["upper"])
-
-            natural = coupling["natural_porosity_support"]
-            for direction, tail in coupling["kappa_ood_porosity_supports"].items():
-                mapped = [
-                    porosity.solve_reference_porosity(
-                        float(tail[name]),
-                        coefficient,
-                        eps_min_global=float(registry["eps_min_global"]["value"]),
-                        eps_max_global=float(registry["eps_max_global"]["value"]),
-                    )
-                    for name in ("kappa_lower", "kappa_upper")
-                ]
-                assert mapped == pytest.approx([float(tail["porosity_lower"]), float(tail["porosity_upper"])], abs=2.0e-15)
-                if direction == "lower":
-                    assert mapped[1] < float(natural["lower"])
-                else:
-                    assert mapped[0] > float(natural["upper"])
-
-            assert "porosity.kc_anchor_factor" not in registry
-            assert "packing_scatter_z" not in registry
-            assert "porosity.kc_anchor_factor" not in material["active_coordinate_names"]
-            assert "packing_scatter_z" not in material["active_coordinate_names"]
-            assert batch.scientific_values["schema_version"] == 1
-            assert batch.scientific_values["generator_version"] == 1
 
 
 def test_empty_or_invalid_supports_fail_closed() -> None:

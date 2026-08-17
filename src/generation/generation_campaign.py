@@ -36,6 +36,7 @@ from .publication import generation_publication_campaign_evidence as campaign_ev
 from .runtime import generation_runtime_batch as batch_runtime
 from .runtime import generation_runtime_cluster as cluster_service
 from .runtime import generation_runtime_license as license_service
+from .runtime import generation_runtime_progress as progress_service
 from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
@@ -381,7 +382,7 @@ def _scheduler_evidence(job_ids: Sequence[str]) -> dict[str, Any]:
         "squeue",
         "--noheader",
         f"--jobs={selection}",
-        "--format=%i|%T|%R|%N",
+        "--format=%i|%T|%R|%N|%V|%S|%M",
     ]
     sacct_command = [
         "sacct",
@@ -479,6 +480,85 @@ def _scheduler_state(value: str) -> str:
     return value.split("+", maxsplit=1)[0].split(maxsplit=1)[0]
 
 
+def _scheduler_field(row: object, index: int) -> str | None:
+    """Return one available scheduler field from a parsed row."""
+    if not isinstance(row, list) or index >= len(row):
+        return None
+    value = row[index].strip()
+    if not value or value.upper() in {"N/A", "NONE", "NOT_SET", "UNKNOWN", "(NULL)"}:
+        return None
+    return value
+
+
+def _task_scheduler_view(
+    latest_submission: Mapping[str, Any] | None,
+    scheduler: Mapping[str, Any],
+) -> dict[str, str | None]:
+    """Return named scheduler evidence for one task's latest attempt."""
+    if latest_submission is None:
+        return {
+            "latest_job_id": None,
+            "latest_job_name": None,
+            "scheduler_state": None,
+            "node": None,
+            "submit_time": None,
+            "start_time": None,
+            "elapsed": None,
+        }
+    raw_job_id = latest_submission.get("job_id")
+    job_id = raw_job_id if isinstance(raw_job_id, str) else None
+    job_name_value = latest_submission.get("job_name")
+    job_name = job_name_value if isinstance(job_name_value, str) else None
+    active = scheduler["active"].get(job_id) if job_id is not None else None
+    accounted = scheduler["accounted"].get(job_id) if job_id is not None else None
+    if active is not None:
+        raw_scheduler_state = _scheduler_field(active, 1)
+        scheduler_state = _scheduler_state(raw_scheduler_state) if raw_scheduler_state is not None else None
+        is_pending = scheduler_state == _ACTIVE_PENDING_STATE
+        return {
+            "latest_job_id": job_id,
+            "latest_job_name": job_name,
+            "scheduler_state": scheduler_state,
+            "node": None if is_pending else _scheduler_field(active, 3),
+            "submit_time": _scheduler_field(active, 4),
+            "start_time": None if is_pending else _scheduler_field(active, 5),
+            "elapsed": None if is_pending else _scheduler_field(active, 6),
+        }
+    return {
+        "latest_job_id": job_id,
+        "latest_job_name": job_name,
+        "scheduler_state": (_scheduler_state(accounted_state) if (accounted_state := _scheduler_field(accounted, 1)) is not None else None),
+        "node": _scheduler_field(accounted, 7),
+        "submit_time": _scheduler_field(accounted, 3),
+        "start_time": _scheduler_field(accounted, 4),
+        "elapsed": _scheduler_field(accounted, 6),
+    }
+
+
+def _task_runtime_progress_view(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    *,
+    latest_job_id: str | None,
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Return best-effort progress for one task's latest exact job."""
+    if latest_job_id is None:
+        return {
+            "availability": "unavailable",
+            "reason": "no_job",
+            "age_seconds": None,
+            "stale": None,
+        }
+    return progress_service.load_runtime_progress(
+        str(manifest["campaign_run_id"]),
+        latest_job_id,
+        _task_payload(task),
+        storage_root=storage_root,
+        manifest=manifest,
+    )
+
+
 def _task_state(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -490,6 +570,7 @@ def _task_state(
     """Reconcile one case from immutable evidence and its exact submitted jobs."""
     batch = campaign.batch(task.batch_name)
     submissions = _task_submissions(manifest, task)
+    latest_submission = submissions[-1] if submissions else None
     retry_attempt: Mapping[str, Any] | None = None
     if batch_runtime.completed_case_is_valid(
         batch,
@@ -505,7 +586,6 @@ def _task_state(
             for record in submissions
             if record["status"] == "submitted" and record["job_id"] not in scheduler["active"] and record["job_id"] not in scheduler["accounted"]
         ]
-        latest_submission = submissions[-1] if submissions else None
         latest_accounted = next(
             (scheduler["accounted"][record["job_id"]] for record in reversed(submissions) if record["job_id"] in scheduler["accounted"]),
             None,
@@ -557,11 +637,20 @@ def _task_state(
             else:
                 state = "unsent"
                 reason = "not_submitted"
+    scheduler_view = _task_scheduler_view(latest_submission, scheduler)
+    runtime_progress = _task_runtime_progress_view(
+        manifest,
+        task,
+        latest_job_id=scheduler_view["latest_job_id"],
+        storage_root=storage_root,
+    )
     return {
         **_task_payload(task),
         "state": state,
         "reason": reason,
         "submission_count": len(submissions),
+        **scheduler_view,
+        "runtime_progress": runtime_progress,
         "temporary_license_retry": retry_attempt,
     }
 
@@ -1032,6 +1121,9 @@ def campaign_status(
         "scheduler_job_name": manifest["scheduler_job_name"],
         "scheduler_log_directory": manifest["scheduler_log_directory"],
         "submission_config": manifest["submission_config"],
+        "planned_cases": planned_cases,
+        "completed_cases": completed_cases,
+        "failed_cases": failed_cases,
         "pending_jobs": pending_jobs,
         "running_jobs": running_jobs,
         "unsent_cases": unsent_cases,
@@ -1041,6 +1133,7 @@ def campaign_status(
         "squeue": manifest_scheduler_view(scheduler["squeue"]),
         "sacct": manifest_scheduler_view(scheduler["sacct"]),
         "batches": batches,
+        "cases": task_views,
         "remote_storage_root": manifest["remote_storage_root"],
         "campaign_meta_directory": manifest["campaign_meta_directory"],
         "suggested_next_command": next_command,
