@@ -799,6 +799,7 @@ python_module="${10}"
 module load "${python_module}"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
+export GENERATION_GIT_COMMIT="${commit}"
 cd "${repository}"
 command=("${venv}/bin/python" -m src.generation.cli.cli_generation
   "${operation}" "${campaign}"
@@ -1058,8 +1059,13 @@ launch_campaign() {
   if [[ ${output} =~ \"campaign_run_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]+__[0-9a-f]{16})\" ]]; then
     RUN_ID="${BASH_REMATCH[1]}"
     printf 'Campaign run ID: %s\n' "${RUN_ID}"
-    remote_cli campaign-status "${RUN_ID}" --format summary --max-active-cases 8 \
-      --storage-root "${REMOTE_STORAGE_ROOT}"
+    ALL_STAGE="initial campaign status reconstruction"
+    if ! remote_cli campaign-status "${RUN_ID}" --format summary --max-active-cases 8 \
+      --storage-root "${REMOTE_STORAGE_ROOT}"; then
+      printf 'Campaign was submitted, but initial status reconstruction failed.\n' >&2
+      printf 'campaign_run_id=%s\n' "${RUN_ID}" >&2
+      return 1
+    fi
   else
     fail 1 "Launch returned no campaign-run ID."
   fi
@@ -1067,14 +1073,16 @@ launch_campaign() {
 
 remote_cli() {
   verify_remote_setup_for_output || return $?
+  validate_commit "${REQUESTED_COMMIT}"
   remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${PYTHON_MODULE}" "$@" <<'REMOTE'
+    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${PYTHON_MODULE}" "$@" <<'REMOTE'
 set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; python_module="$4"
-shift 4
+repository="$1"; storage="$2"; venv="$3"; commit="$4"; python_module="$5"
+shift 5
 module load "${python_module}"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
+export GENERATION_GIT_COMMIT="${commit}"
 cd "${repository}"
 "${venv}/bin/python" -m src.generation.cli.cli_generation "$@"
 REMOTE

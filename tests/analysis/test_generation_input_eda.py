@@ -5,9 +5,7 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import replace
-from numbers import Real
 from pathlib import Path
 from typing import Any, cast
 
@@ -176,11 +174,12 @@ def test_input_batch_merging_uses_all_unique_cases(
             "eps_bed",
             "mean",
         ]
-        assert not isinstance(scalar, (bool, np.bool_))
-        assert isinstance(scalar, Real)
-        number = float(scalar)
-        assert math.isfinite(number)
-        field_means.append(number)
+        field_means.append(
+            generation_inputs.diagnostics._finite_real_scalar(  # noqa: SLF001
+                scalar,
+                label="eps_bed mean",
+            )
+        )
     expected_field_mean = float(np.mean(np.asarray(field_means, dtype=np.float64)))
     assert summary.field_summary_means[("eps_bed", "mean")] == pytest.approx(expected_field_mean)
 

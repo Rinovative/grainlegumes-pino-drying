@@ -261,6 +261,20 @@ if [[ "${FAKE_LOGIN_PREFLIGHT_STDOUT:-false}" == true \
     'Preflight domain=CPU login check=command:git status=pass detail=resolved' \
     'Generation-venv-runtime status=pass'
 fi
+if [[ " $* " == *' campaign-status '* || " $* " == *' feed-campaign '* ]]; then
+  if [[ " $* " != *" ${FAKE_GIT_COMMIT} "* ]]; then
+    printf '%s\n' 'Remote Generation operation omitted the pinned commit argument.' >&2
+    exit 76
+  fi
+  if [[ "${payload}" != *'commit="$4"'* ]]; then
+    printf '%s\n' 'Remote Generation operation did not bind its commit argument.' >&2
+    exit 77
+  fi
+  if [[ "${payload}" != *'export GENERATION_GIT_COMMIT="${commit}"'* ]]; then
+    printf '%s\n' 'Remote Generation operation omitted launcher provenance.' >&2
+    exit 78
+  fi
+fi
 if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
   printf '%s\n' '/remote/home'
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
@@ -301,6 +315,10 @@ elif [[ " $* " == *' campaign-source-status '* ]]; then
   else
     printf 'source-status\t%s\t%s\t%s\tineligible\tFalse\n'       "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
   fi
+elif [[ " $* " == *' campaign-status '* \
+  && "${FAKE_CAMPAIGN_STATUS_FAIL:-false}" == true ]]; then
+  printf '%s\n' 'Synthetic initial campaign status failure.' >&2
+  exit 79
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; then
   state="$(next_campaign_state)"
   case "${state}" in
@@ -368,6 +386,14 @@ elif [[ " $* " == *' prepare-campaign-inputs'* ]]; then
   printf 'canonical-inputs\t%s\t%s\n' \
     "${FAKE_INPUT_GENERATED_COUNT:-1}" "${FAKE_INPUT_REUSED_COUNT:-0}"
 elif [[ " $* " == *' submit-campaign'* ]]; then
+  if [[ "${payload}" != *'export GENERATION_GIT_COMMIT="${commit}"'* ]]; then
+    printf '%s\n' 'Remote submit-campaign omitted GENERATION_GIT_COMMIT launcher provenance.' >&2
+    exit 74
+  fi
+  if [[ "${payload}" != *'--git-commit "${commit}"'* ]]; then
+    printf '%s\n' 'Remote submit-campaign omitted the matching explicit Git commit.' >&2
+    exit 75
+  fi
   if [[ "${FAKE_TRACK_SINGLE_SUBMISSION:-false}" == true ]]; then
     [[ ! -e "${FAKE_SUBMISSION_FILE}" ]] || {
       printf '%s\n' 'synthetic duplicate campaign submission' >&2
@@ -605,6 +631,7 @@ fi
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
             "FAKE_CAMPAIGN_STATE": "publication_complete",
+            "FAKE_CAMPAIGN_STATUS_FAIL": "false",
             "FAKE_CAMPAIGN_STATES": "",
             "FAKE_CAMPAIGN_PROGRESS_SIGNATURES": "",
             "FAKE_PROGRESS_VALUES": "",
@@ -1650,6 +1677,91 @@ def test_plan_launch_and_current_option_validation(tmp_path: Path) -> None:
         environment,
     )
     assert rejected.returncode == 2
+
+
+def test_remote_campaign_launch_binds_pinned_commit_to_environment_and_cli(
+    tmp_path: Path,
+) -> None:
+    """Bind one pinned commit through both remote Generation source contracts."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+
+    result = _run(
+        workflow,
+        ["launch", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(_COMMIT) == 40
+    log_text = log.read_text(encoding="utf-8")
+    assert f"<{_COMMIT}>" in log_text
+    assert 'export GENERATION_GIT_COMMIT="${commit}"' in log_text
+    assert '--git-commit "${commit}"' in log_text
+    command_lines = log_text.splitlines()
+    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
+    status_index = next(index for index, line in enumerate(command_lines) if "campaign-status" in line)
+    assert submit_index < status_index
+    assert sum("submit-campaign" in line for line in command_lines) == 1
+    assert sum("campaign-status" in line for line in command_lines) == 1
+
+
+def test_remote_campaign_monitoring_binds_pinned_commit_to_status_and_feed(
+    tmp_path: Path,
+) -> None:
+    """Bind status and feeding to the same pinned remote Python source."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATES"] = "publication_complete"
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+
+    result = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "campaign-status" in log_text
+    assert sum("feed-campaign" in line for line in log_text.splitlines()) == 1
+    assert f" {_COMMIT} " in log_text
+    assert 'commit="$4"' in log_text
+    assert 'export GENERATION_GIT_COMMIT="${commit}"' in log_text
+
+
+def test_initial_status_failure_retains_submitted_run_for_safe_inspection(
+    tmp_path: Path,
+) -> None:
+    """Keep one submitted run authoritative when initial status rendering fails."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_CAMPAIGN_STATUS_FAIL"] = "true"
+
+    failed = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert failed.returncode != 0
+    assert "Campaign was submitted, but initial status reconstruction failed." in failed.stderr
+    assert f"campaign_run_id={_RUN_ID}" in failed.stderr
+    assert "FAILED: initial campaign status reconstruction" in failed.stderr
+    assert "Remote launch failed." not in failed.stderr
+    assert "./scripts/generation_workflow.sh resume" in failed.stderr
+    first_log = log.read_text(encoding="utf-8")
+    assert sum("submit-campaign" in line for line in first_log.splitlines()) == 1
+    submission_file = Path(environment["FAKE_SUBMISSION_FILE"])
+    assert submission_file.read_text(encoding="utf-8") == "591776\n"
+
+    environment["FAKE_CAMPAIGN_STATUS_FAIL"] = "false"
+    inspected = _run(workflow, ["status", _RUN_ID, *_remote_options()], environment)
+
+    assert inspected.returncode == 0, inspected.stderr
+    assert f"Campaign: {_RUN_ID}" in inspected.stdout
+    final_log = log.read_text(encoding="utf-8")
+    assert sum("submit-campaign" in line for line in final_log.splitlines()) == 1
+    assert submission_file.read_text(encoding="utf-8") == "591776\n"
 
 
 def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -> None:
