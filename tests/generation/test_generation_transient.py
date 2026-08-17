@@ -229,11 +229,6 @@ def _write_transient_case(
     schedule[:, 0] = schedule_times
     schedule[:, 1] = 295.0 + 0.01 * schedule[:, 0]
     schedule[:, 2] = 0.009
-    schedule[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
-        schedule[:, 2],
-        schedule[:, 1],
-        pressure=float(scientific["scientific_fixed_values"]["p_ref"]),
-    )
     conversion_pressure = {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"}
     boundary_schedule = schedule_service.build_comsol_boundary_schedule(
         schedule_service.Schedule(
@@ -659,15 +654,15 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     first = dataset[0]
     assert first["state"].shape == (4, 251, 401)
     assert first["static"].shape == (7, 251, 401)
-    assert first["boundary"].shape == (10,)
+    assert first["boundary"].shape == (9,)
     with h5py.File(source, "r") as handle:
         support = np.asarray(_hdf5_dataset(handle, "schedule/values")[1], dtype=np.float32)
     assert first["boundary"][5].item() == pytest.approx(1.0 / 6.0)
-    torch.testing.assert_close(first["boundary"][6:9], torch.from_numpy(support[1:4]))
-    assert first["boundary"][9].item() == 1.0
+    torch.testing.assert_close(first["boundary"][6:8], torch.from_numpy(support[1:3]))
+    assert first["boundary"][8].item() == 1.0
     second = dataset[1]
     assert second["boundary"][5].item() == 0.0
-    assert second["boundary"][9].item() == 0.0
+    assert second["boundary"][8].item() == 0.0
     assert first["scalars"].shape == (8,)
     torch.testing.assert_close(
         first["scalars"],
@@ -840,15 +835,16 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
     third = dataset[2]
     assert first["state"].shape == (4, 4, 5)
     assert first["static"].shape == (7, 4, 5)
-    assert first["boundary"].shape == (2, 10)
+    assert first["boundary"].shape == (2, 9)
     assert first["scalars"].shape == (8,)
     assert first["target"].shape == (2, 4, 4, 5)
     first_time = cast("dict[str, torch.Tensor]", first["time"])
     torch.testing.assert_close(first["state"][:, 0, 0], torch.tensor([296.0, 0.41, 109.5, 109.75]))
     torch.testing.assert_close(first["boundary"][:, :2], torch.tensor([[295.01, 295.02], [295.02, 295.03]]))
+    torch.testing.assert_close(first["boundary"][0, 1], first["boundary"][1, 0])
     torch.testing.assert_close(first["boundary"][0, 3], first["boundary"][1, 2])
     torch.testing.assert_close(first["boundary"][:, 5], torch.zeros(2))
-    torch.testing.assert_close(first["boundary"][:, 9], torch.zeros(2))
+    torch.testing.assert_close(first["boundary"][:, 8], torch.zeros(2))
     assert {name: value.shape for name, value in first_time.items()} == {
         "t_n": (2,),
         "t_n_plus_1": (2,),

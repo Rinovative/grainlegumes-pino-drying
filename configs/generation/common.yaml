@@ -275,7 +275,6 @@ input_contract:
     - t
     - T_in_bc
     - omega_in_bc
-    - phi_in_bc
 validation:
   transient_initial_state:
     rtol: 1.0e-04

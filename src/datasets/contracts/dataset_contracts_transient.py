@@ -197,17 +197,16 @@ TRANSIENT_STEP_CONTRACT: Final = TransientStepContract(
     step_boundary_conditioning=(
         _scheduled_field("T_in_bc", "t_n"),
         _scheduled_field("T_in_bc", "t_n_plus_1"),
-        _scheduled_field("phi_in_bc", "t_n"),
-        _scheduled_field("phi_in_bc", "t_n_plus_1"),
+        _scheduled_field("omega_in_bc", "t_n"),
+        _scheduled_field("omega_in_bc", "t_n_plus_1"),
         _source_field("T_amb"),
         DataField("startup_support_time_offset", _TIME_UNIT),
         _scheduled_field("T_in_bc", "startup_support"),
         _scheduled_field("omega_in_bc", "startup_support"),
-        _scheduled_field("phi_in_bc", "startup_support"),
         DataField("startup_support_present", "1"),
     ),
     boundary_interval_interpolation="linear_between_boundary_schedule_support_nodes",
-    boundary_interval_representation=("regular_endpoints_plus_optional_startup_support_without_extra_training_timestep"),
+    boundary_interval_representation=("primitive_regular_endpoints_plus_optional_startup_support_without_extra_training_timestep"),
     scalar_conditioning=tuple(
         _source_field(name)
         for name in (

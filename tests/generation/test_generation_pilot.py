@@ -302,11 +302,12 @@ def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None
         "automatic_failure_tolerance": None,
     }
     schedule = analysis_service.schedule_diagnostics(
-        [[0.0, 305.0, 0.01, 0.4], [1.0, 306.0, 0.011, 0.5]],
+        [[0.0, 305.0, 0.01], [1.0, 306.0, 0.011]],
         schedule_metadata={
             "min_phi_source_air": 0.35,
             "max_phi_source_air": 0.55,
             "min_heater_temperature_rise": 4.0,
+            "conversion_pressure": {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"},
             "boundary_handoff": {
                 "startup_ramp": {"enabled": False, "duration_h": 1.0 / 6.0},
                 "rejoin_row": None,
@@ -320,17 +321,19 @@ def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None
 
     startup_schedule = analysis_service.schedule_diagnostics(
         [
-            [0.0, 300.0, 0.01, 0.9],
-            [1.0 / 6.0, 305.0, 0.01, 0.4],
-            [1.0, 306.0, 0.011, 0.5],
+            [0.0, 300.0, 0.01],
+            [1.0 / 6.0, 305.0, 0.01],
+            [1.0, 306.0, 0.011],
         ],
         schedule_metadata={
             "min_phi_source_air": 0.35,
             "max_phi_source_air": 0.55,
             "min_heater_temperature_rise": 4.0,
+            "conversion_pressure": {"name": "p_ref", "value": 101325.0, "unit": "Pa", "owner": "package_fixed"},
             "boundary_handoff": {
                 "startup_ramp": {"enabled": True, "duration_h": 1.0 / 6.0},
-                "rejoin_row": [1.0 / 6.0, 305.0, 0.01, 0.4],
+                "canonical_start_row": [0.0, 305.0, 0.01],
+                "rejoin_row": [1.0 / 6.0, 305.0, 0.01],
             },
         },
         ambient_temperature=300.0,

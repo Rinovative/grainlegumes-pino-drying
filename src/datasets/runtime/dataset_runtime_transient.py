@@ -402,13 +402,12 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 boundary_values = {
                     "T_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in_bc")]),
                     "T_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("T_in_bc")]),
-                    "phi_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("phi_in_bc")]),
-                    "phi_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("phi_in_bc")]),
+                    "omega_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("omega_in_bc")]),
+                    "omega_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("omega_in_bc")]),
                     "T_amb": scalar_lookup["T_amb"],
                     "startup_support_time_offset": support_time_offset,
                     "T_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("T_in_bc")]),
                     "omega_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("omega_in_bc")]),
-                    "phi_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("phi_in_bc")]),
                     "startup_support_present": float(raw_support_index is not None),
                 }
                 boundary_rows.append([boundary_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning])

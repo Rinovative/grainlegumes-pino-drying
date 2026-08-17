@@ -609,7 +609,7 @@ def _schedule_values(
         raise RuntimeError(msg)
     header, values = input_admission.read_input_adapter_table(path, delimiter=spec["delimiter"])
     if header != list(profiles.SCHEDULE_FIELDS):
-        msg = "Schedule adapter does not match the configured four-column contract."
+        msg = "Schedule adapter does not match the configured primitive-column contract."
         raise ValueError(msg)
     metadata = case_payload.get("schedule_diagnostics")
     if not isinstance(metadata, Mapping):
@@ -1668,6 +1668,7 @@ def _validate_hdf5_schedule(
             label="schedule.boundary_handoff",
         )
     )
+    handoff_ramp = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, Mapping) else None
     if (
         conversion
         != {
@@ -1679,14 +1680,23 @@ def _validate_hdf5_schedule(
         or conversion_owner != "generation_schedule"
         or not isinstance(metadata, Mapping)
         or not isinstance(sampled_values, Mapping)
+        or not isinstance(handoff_ramp, Mapping)
         or boundary_handoff != metadata.get("boundary_handoff")
     ):
         msg = "COMSOL boundary schedule provenance is invalid."
         raise ValueError(msg)
+    enabled = handoff_ramp.get("enabled")
+    duration_h = handoff_ramp.get("duration_h")
+    scientific_ramp = {"enabled": enabled}
+    if enabled is True:
+        scientific_ramp["duration_h"] = duration_h
+    if scientific.get("boundary_schedule") != {"startup_ramp": scientific_ramp}:
+        msg = "COMSOL boundary handoff disagrees with active scientific startup identity."
+        raise ValueError(msg)
     schedule_service.validate_comsol_boundary_schedule(
         values,
         regular_times=np.asarray(scientific["time"]["regular_times"], dtype=np.float64),
-        startup_ramp=scientific["boundary_schedule"]["startup_ramp"],
+        startup_ramp={"enabled": enabled, "duration_h": duration_h},
         initial_temperature=float(sampled_values["T_init"]),
         pressure=p_ref,
         metadata=metadata,

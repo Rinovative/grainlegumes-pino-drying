@@ -31,6 +31,7 @@ import numpy as np
 
 from src import domain
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.publication import generation_publication_storage as storage_service
 
@@ -593,7 +594,7 @@ def schedule_diagnostics(
     phi_operational_min: float,
     phi_operational_max: float,
 ) -> dict[str, Any]:
-    """Recheck heater-only feasibility from canonical values and retained metadata."""
+    """Recheck heater-only feasibility from primitive values and derived RH."""
     values = np.asarray(schedule_values, dtype=np.float64)
     if values.ndim != _TABLE_RANK or values.shape[1] != len(profiles.SCHEDULE_FIELDS) or not np.isfinite(values).all():
         message = "Pilot schedule values are malformed."
@@ -613,6 +614,20 @@ def schedule_diagnostics(
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in metadata_values):
         message = "Pilot schedule metadata lacks finite source-air and heater diagnostics."
         raise ValueError(message)
+    conversion = schedule_metadata.get("conversion_pressure")
+    if (
+        not isinstance(conversion, Mapping)
+        or conversion.get("name") != "p_ref"
+        or conversion.get("unit") != "Pa"
+        or conversion.get("owner") != "package_fixed"
+        or isinstance(conversion.get("value"), bool)
+        or not isinstance(conversion.get("value"), (int, float))
+        or not math.isfinite(float(conversion["value"]))
+        or float(conversion["value"]) <= 0.0
+    ):
+        message = "Pilot schedule metadata lacks valid conversion-pressure provenance."
+        raise ValueError(message)
+    pressure = float(conversion["value"])
     handoff = schedule_metadata.get("boundary_handoff")
     if not isinstance(handoff, Mapping):
         message = "Pilot schedule metadata lacks boundary-handoff provenance."
@@ -633,8 +648,27 @@ def schedule_diagnostics(
         and time[0] == 0.0
         and ((enabled and time.size > _MINIMUM_BALANCE_STATES and time[1] == duration_value) or (not enabled and handoff.get("rejoin_row") is None))
     )
-    operating = time >= duration_value if enabled else np.ones(time.shape, dtype=bool)
-    startup_segment = time < duration_value if enabled else np.zeros(time.shape, dtype=bool)
+    if enabled:
+        canonical_start = np.asarray(handoff.get("canonical_start_row"), dtype=np.float64)
+        canonical_rows = np.concatenate((canonical_start[np.newaxis, :], values[2:]), axis=0)
+        startup_phi_extrema = schedule_service.derived_relative_humidity_extrema(
+            values[:2, 1],
+            values[:2, 2],
+            pressure=pressure,
+        )
+    else:
+        canonical_rows = values
+        startup_phi_extrema = None
+    operating_phi_extrema = schedule_service.derived_relative_humidity_extrema(
+        canonical_rows[:, 1],
+        canonical_rows[:, 2],
+        pressure=pressure,
+    )
+    physical_phi_extrema = schedule_service.derived_relative_humidity_extrema(
+        columns["T_in_bc"],
+        columns["omega_in_bc"],
+        pressure=pressure,
+    )
     source_min_value = float(cast("float", source_min))
     source_max_value = float(cast("float", source_max))
     heater_rise_value = float(cast("float", heater_rise))
@@ -642,10 +676,8 @@ def schedule_diagnostics(
         "T_in_bc_at_or_above_T_amb": bool(np.all(columns["T_in_bc"] >= ambient_temperature)),
         "omega_in_bc_positive": bool(np.all(columns["omega_in_bc"] > 0.0)),
         "phi_source_air_physical": bool(0.0 < source_min_value <= source_max_value <= 1.0),
-        "phi_in_bc_operational": bool(
-            np.all((columns["phi_in_bc"][operating] >= phi_operational_min) & (columns["phi_in_bc"][operating] <= phi_operational_max))
-        ),
-        "startup_phi_in_bc_physical": bool(np.all((columns["phi_in_bc"][startup_segment] >= 0.0) & (columns["phi_in_bc"][startup_segment] <= 1.0))),
+        "phi_in_bc_operational": bool(phi_operational_min <= operating_phi_extrema[0] <= operating_phi_extrema[1] <= phi_operational_max),
+        "startup_phi_in_bc_physical": bool(startup_phi_extrema is None or 0.0 < startup_phi_extrema[0] <= startup_phi_extrema[1] <= 1.0),
         "startup_handoff_valid": startup_handoff_valid,
     }
     return {
@@ -655,8 +687,8 @@ def schedule_diagnostics(
         "max_T_in_bc": float(np.max(columns["T_in_bc"])),
         "min_omega_in_bc": float(np.min(columns["omega_in_bc"])),
         "max_omega_in_bc": float(np.max(columns["omega_in_bc"])),
-        "min_phi_in_bc": float(np.min(columns["phi_in_bc"])),
-        "max_phi_in_bc": float(np.max(columns["phi_in_bc"])),
+        "min_phi_in_bc": physical_phi_extrema[0],
+        "max_phi_in_bc": physical_phi_extrema[1],
         "min_phi_source_air": source_min_value,
         "max_phi_source_air": source_max_value,
         "min_heater_temperature_rise": heater_rise_value,

@@ -140,6 +140,5 @@ module = [
   "scipy",
   "scipy.*",
   "tqdm",
-  "tqdm.auto",
 ]
 ignore_missing_imports = true

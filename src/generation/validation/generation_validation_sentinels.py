@@ -288,13 +288,18 @@ def _realization_evidence(
         raise ValueError(message)
     temperature = schedule.values[:, 1]
     humidity_ratio = schedule.values[:, 2]
-    relative_humidity = schedule.values[:, 3]
+    relative_humidity_extrema = schedule_service.derived_relative_humidity_extrema(
+        temperature,
+        humidity_ratio,
+        pressure=float(fixed["p_ref"]),
+    )
     if (
         np.any((temperature < fixed["T_in_min"]) | (temperature > fixed["T_in_max"]))
         or np.any((humidity_ratio < fixed["omega_min"]) | (humidity_ratio > fixed["omega_max"]))
-        or np.any((relative_humidity < fixed["phi_operational_min"]) | (relative_humidity > fixed["phi_operational_max"]))
+        or relative_humidity_extrema[0] < fixed["phi_operational_min"]
+        or relative_humidity_extrema[1] > fixed["phi_operational_max"]
     ):
-        message = "Static schedule sentinel escaped its temperature, humidity-ratio, or RH envelope."
+        message = "Static schedule sentinel escaped its primitive or continuous derived-RH envelope."
         raise ValueError(message)
     schedule_diagnostics = schedule.diagnostics
     minimum_source_phi = float(cast("float", schedule_diagnostics["min_phi_source_air"]))
@@ -309,7 +314,7 @@ def _realization_evidence(
         or minimum_heater_rise < 0.0
         or rejection_count != acceptance_attempt - 1
     ):
-        message = "Static schedule sentinel violated heater-only diagnostics or the four-column contract."
+        message = "Static schedule sentinel violated heater-only diagnostics or the primitive-column contract."
         raise ValueError(message)
     if float(sample.values["schedule.event_duration_rel"]) < 2.0 * float(sample.values["schedule.event_width_rel"]):
         message = "Static schedule sentinel violated duration >= 2*width."
@@ -342,14 +347,6 @@ def _realization_evidence(
     ):
         message = "Static schedule sentinel violated exact discrete-node correlation semantics."
         raise ValueError(message)
-    recomputed_phi = schedule_service.humidity_ratio_to_relative_humidity(
-        humidity_ratio,
-        temperature,
-        pressure=float(fixed["p_ref"]),
-    )
-    if not np.array_equal(relative_humidity, recomputed_phi):
-        message = "Static schedule sentinel found phi_in_bc not derived exactly from T_in_bc and omega_in_bc."
-        raise ValueError(message)
     moisture_metadata = fields.metadata["initial_moisture"]
     target_constraint = batch.scientific_values["material"]["initial_moisture_field_constraint"]
     if float(moisture_metadata["minimum"]) < float(target_constraint["minimum_db"]) - 1e-12:
@@ -380,7 +377,7 @@ def _realization_evidence(
             "schedule_shape": list(schedule.values.shape),
             "schedule_temperature_range": [float(np.min(temperature)), float(np.max(temperature))],
             "schedule_humidity_ratio_range": [float(np.min(humidity_ratio)), float(np.max(humidity_ratio))],
-            "schedule_relative_humidity_range": [float(np.min(relative_humidity)), float(np.max(relative_humidity))],
+            "schedule_relative_humidity_range": list(relative_humidity_extrema),
             "schedule_diagnostics": schedule_diagnostics,
             "event_duration_at_least_twice_width": True,
         }

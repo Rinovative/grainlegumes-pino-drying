@@ -851,6 +851,29 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
 
 
+def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evidence(tmp_path: Path) -> None:
+    """Poll a retry-delay campaign until its later publication completes."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATES"] = "waiting_retry,publication_complete"
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+
+    result = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.index("State: waiting_retry") < result.stdout.index("State: publication_complete")
+    log_text = log.read_text(encoding="utf-8")
+    assert sum("--format monitor" in line for line in log_text.splitlines()) == 2
+    assert sum("validate-campaign-terminal" in line for line in log_text.splitlines()) == 1
+    assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
+    assert "record-workflow-failure" not in log_text
+
+
 def test_unchanged_campaign_states_are_coalesced(tmp_path: Path) -> None:
     """Suppress repeated unchanged states while reporting a later state change."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)

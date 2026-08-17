@@ -40,8 +40,13 @@ _GAUSSIAN_KERNEL_STANDARD_DEVIATIONS = 4.0
 _RANDOM_BINARY_THRESHOLD = 0.5
 _MINIMUM_LAG1_NODES = 3
 _INTERVAL_BOUND_COUNT = 2
+_DRY_AIR_TO_WATER_MASS_RATIO = 0.621945
+_MAGNUS_BASE_PRESSURE_PA = 610.94
+_MAGNUS_EXPONENT = 17.625
+_MAGNUS_TEMPERATURE_OFFSET_C = 243.04
+_RELATIVE_HUMIDITY_ROOT_TOLERANCE = 256.0 * np.finfo(np.float64).eps
 SCHEDULE_GENERATOR_VERSION: Final = 1
-COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 2
+COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
 CORRELATION_TOLERANCE: Final = 2.0e-12
 MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
 MINIMUM_EVENT_WIDTH_INTERVALS: Final = 2.0
@@ -166,6 +171,14 @@ def _startup_ramp_metadata(
 ) -> dict[str, Any]:
     """Return truthful startup-ramp policy evidence."""
     canonical_humidity_ratio = float(canonical_start[2])
+    boundary_start_temperature = initial_temperature if enabled else float(canonical_start[1])
+    startup_phi = float(
+        humidity_ratio_to_relative_humidity(
+            np.asarray([canonical_humidity_ratio], dtype=np.float64),
+            np.asarray([boundary_start_temperature], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
     if not enabled:
         return {
             "enabled": False,
@@ -173,17 +186,10 @@ def _startup_ramp_metadata(
             "temperature_start_policy": "disabled_retain_canonical_schedule",
             "initial_temperature_K": initial_temperature,
             "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
-            "startup_relative_humidity": float(canonical_start[3]),
-            "humidity_start_policy": "disabled_retain_canonical_schedule",
+            "startup_relative_humidity": startup_phi,
+            "humidity_start_policy": "disabled_derive_from_retained_canonical_primitives",
             "rejoin_policy": "not_applicable",
         }
-    startup_phi = float(
-        humidity_ratio_to_relative_humidity(
-            np.asarray([canonical_humidity_ratio], dtype=np.float64),
-            np.asarray([initial_temperature], dtype=np.float64),
-            pressure=pressure,
-        )[0]
-    )
     return {
         "enabled": True,
         "duration_h": duration_h,
@@ -191,8 +197,8 @@ def _startup_ramp_metadata(
         "initial_temperature_K": initial_temperature,
         "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
         "startup_relative_humidity": startup_phi,
-        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
-        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_recompute_phi_in_bc",
+        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_derive_phi_in_bc",
+        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_derive_phi_in_bc",
     }
 
 
@@ -230,7 +236,7 @@ def validate_comsol_boundary_schedule(
     pressure: float,
     metadata: Mapping[str, Any],
 ) -> None:
-    """Validate the dedicated physical and temporal COMSOL handoff contract."""
+    """Validate the primitive COMSOL boundary and continuous derived-RH contract."""
     if not isinstance(metadata, Mapping):
         msg = "COMSOL boundary schedule metadata must be a mapping."
         raise TypeError(msg)
@@ -264,8 +270,8 @@ def validate_comsol_boundary_schedule(
     if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
         msg = "COMSOL startup temperature source must be finite and physically positive."
         raise ValueError(msg)
-    if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0) or np.any((values[:, 3] <= 0.0) | (values[:, 3] > 1.0)):
-        msg = "COMSOL boundary temperature, humidity ratio, or relative humidity is physically invalid."
+    if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0):
+        msg = "COMSOL boundary temperature or humidity ratio is physically invalid."
         raise ValueError(msg)
     temperature_minimum, temperature_maximum = _operational_bounds(
         metadata,
@@ -314,42 +320,30 @@ def validate_comsol_boundary_schedule(
         msg = "COMSOL boundary handoff provenance disagrees with the active schedule contract."
         raise ValueError(msg)
 
-    thermodynamic_tolerance = 64.0 * np.finfo(np.float64).eps
-    operating_rows = np.concatenate(
-        (canonical_start[np.newaxis, :], values[1:]),
-        axis=0,
-    )
-    if (
-        np.any((operating_rows[:, 1] < temperature_minimum) | (operating_rows[:, 1] > temperature_maximum))
-        or np.any((operating_rows[:, 2] < humidity_minimum) | (operating_rows[:, 2] > humidity_maximum))
-        or np.any((operating_rows[:, 3] < phi_minimum) | (operating_rows[:, 3] > phi_maximum))
-    ):
-        msg = "COMSOL rejoin or canonical regular schedule nodes violate persisted operational bounds."
-        raise ValueError(msg)
     source_phi = humidity_ratio_to_relative_humidity(
         values[:, 2],
         np.full(values.shape[0], initial_temperature, dtype=np.float64),
         pressure=pressure,
     )
-    if np.any((source_phi <= 0.0) | (source_phi > 1.0)) or np.any(values[:, 1] < initial_temperature):
-        msg = "COMSOL boundary schedule violates heater-only source-air physics."
+    physical_phi_minimum, physical_phi_maximum = derived_relative_humidity_extrema(
+        values[:, 1],
+        values[:, 2],
+        pressure=pressure,
+    )
+    if (
+        np.any((source_phi <= 0.0) | (source_phi > 1.0))
+        or np.any(values[:, 1] < initial_temperature)
+        or physical_phi_minimum <= 0.0
+        or physical_phi_maximum > 1.0
+    ):
+        msg = "COMSOL boundary schedule violates heater-only or physical humidity constraints."
         raise ValueError(msg)
 
     if enabled:
         fraction = duration_h / regular_interval
         expected_rejoin = canonical_start + fraction * (values[2] - canonical_start)
         expected_rejoin[0] = duration_h
-        expected_rejoin[3] = humidity_ratio_to_relative_humidity(
-            expected_rejoin[2:3],
-            expected_rejoin[1:2],
-            pressure=pressure,
-        )[0]
         rejoin_row = np.asarray(handoff["rejoin_row"], dtype=np.float64)
-        expected_start_phi = humidity_ratio_to_relative_humidity(
-            values[:1, 2],
-            values[:1, 1],
-            pressure=pressure,
-        )[0]
         expected_startup_metadata = _startup_ramp_metadata(
             canonical_start,
             enabled=True,
@@ -361,7 +355,6 @@ def validate_comsol_boundary_schedule(
             handoff["startup_ramp"] != expected_startup_metadata
             or values[0, 1] != initial_temperature
             or values[0, 2] != canonical_start[2]
-            or not math.isclose(values[0, 3], expected_start_phi, rel_tol=thermodynamic_tolerance, abs_tol=thermodynamic_tolerance)
             or rejoin_row.shape != (len(profiles.SCHEDULE_FIELDS),)
             or not np.array_equal(values[1], expected_rejoin)
             or not np.array_equal(rejoin_row, expected_rejoin)
@@ -369,8 +362,8 @@ def validate_comsol_boundary_schedule(
         ):
             msg = "COMSOL startup node, rejoin node, or retained regular nodes are invalid."
             raise ValueError(msg)
-        thermodynamic_rows = np.concatenate(
-            (canonical_start[np.newaxis, :], values),
+        canonical_rows = np.concatenate(
+            (canonical_start[np.newaxis, :], values[2:]),
             axis=0,
         )
     else:
@@ -388,19 +381,20 @@ def validate_comsol_boundary_schedule(
         ):
             msg = "Disabled COMSOL startup ramp must retain the canonical schedule exactly."
             raise ValueError(msg)
-        thermodynamic_rows = values
-    expected_phi = humidity_ratio_to_relative_humidity(
-        thermodynamic_rows[:, 2],
-        thermodynamic_rows[:, 1],
+        canonical_rows = values
+
+    operating_phi_minimum, operating_phi_maximum = derived_relative_humidity_extrema(
+        canonical_rows[:, 1],
+        canonical_rows[:, 2],
         pressure=pressure,
     )
-    if not np.allclose(
-        thermodynamic_rows[:, 3],
-        expected_phi,
-        rtol=thermodynamic_tolerance,
-        atol=thermodynamic_tolerance,
+    if (
+        np.any((canonical_rows[:, 1] < temperature_minimum) | (canonical_rows[:, 1] > temperature_maximum))
+        or np.any((canonical_rows[:, 2] < humidity_minimum) | (canonical_rows[:, 2] > humidity_maximum))
+        or operating_phi_minimum < phi_minimum
+        or operating_phi_maximum > phi_maximum
     ):
-        msg = "COMSOL boundary schedule is thermodynamically inconsistent at physical state nodes."
+        msg = "COMSOL canonical schedule or its continuous derived relative humidity violates persisted operational bounds."
         raise ValueError(msg)
 
 
@@ -411,7 +405,7 @@ def build_comsol_boundary_schedule(
     initial_temperature: float,
     pressure: float,
 ) -> ComsolBoundarySchedule:
-    """Apply the configured startup handoff after canonical schedule validation."""
+    """Apply the configured startup handoff to primitive schedule values."""
     canonical_values = np.asarray(canonical.values, dtype=np.float64)
     if (
         canonical_values.ndim != _TABLE_RANK
@@ -433,11 +427,6 @@ def build_comsol_boundary_schedule(
         fraction = duration_h / regular_interval
         constructed_rejoin = canonical_values[0] + fraction * (canonical_values[1] - canonical_values[0])
         constructed_rejoin[0] = duration_h
-        constructed_rejoin[3] = humidity_ratio_to_relative_humidity(
-            constructed_rejoin[2:3],
-            constructed_rejoin[1:2],
-            pressure=pressure,
-        )[0]
         startup_metadata = _startup_ramp_metadata(
             canonical_values[0],
             enabled=True,
@@ -447,7 +436,6 @@ def build_comsol_boundary_schedule(
         )
         start_row = canonical_values[0].copy()
         start_row[1] = initial_temperature
-        start_row[3] = float(startup_metadata["startup_relative_humidity"])
         handoff_values = np.concatenate(
             (start_row[np.newaxis, :], constructed_rejoin[np.newaxis, :], canonical_values[1:]),
             axis=0,
@@ -490,11 +478,11 @@ def saturation_vapor_pressure(temperature: np.ndarray) -> np.ndarray:
         msg = "Temperature must be finite and positive for vapor-pressure conversion."
         raise ValueError(msg)
     temperature_c = values - 273.15
-    denominator = temperature_c + 243.04
+    denominator = temperature_c + _MAGNUS_TEMPERATURE_OFFSET_C
     if np.any(denominator <= 0):
         msg = "Temperature lies outside the maintained Magnus relation domain."
         raise ValueError(msg)
-    return 610.94 * np.exp(17.625 * temperature_c / denominator)
+    return _MAGNUS_BASE_PRESSURE_PA * np.exp(_MAGNUS_EXPONENT * temperature_c / denominator)
 
 
 def humidity_ratio_to_relative_humidity(
@@ -512,12 +500,98 @@ def humidity_ratio_to_relative_humidity(
     if not math.isfinite(pressure) or pressure <= 0:
         msg = "Reference pressure must be finite and positive."
         raise ValueError(msg)
-    vapor_pressure = pressure * omega / (0.621945 + omega)
+    vapor_pressure = pressure * omega / (_DRY_AIR_TO_WATER_MASS_RATIO + omega)
     relative_humidity = vapor_pressure / saturation_vapor_pressure(temperature)
     if not np.isfinite(relative_humidity).all():
         msg = "Thermodynamic relative-humidity conversion produced non-finite values."
         raise ValueError(msg)
     return relative_humidity
+
+
+def _relative_humidity_stationary_fractions(
+    temperature_start: float,
+    temperature_end: float,
+    humidity_start: float,
+    humidity_end: float,
+) -> tuple[float, ...]:
+    """Return interior extrema fractions for one linear primitive interval."""
+    temperature_offset = temperature_start - 273.15 + _MAGNUS_TEMPERATURE_OFFSET_C
+    temperature_delta = temperature_end - temperature_start
+    humidity_delta = humidity_end - humidity_start
+    mass_ratio = _DRY_AIR_TO_WATER_MASS_RATIO
+    magnus_slope = _MAGNUS_EXPONENT * _MAGNUS_TEMPERATURE_OFFSET_C
+    coefficients = np.asarray(
+        (
+            mass_ratio * humidity_delta * temperature_offset**2 - magnus_slope * temperature_delta * humidity_start * (mass_ratio + humidity_start),
+            2.0 * mass_ratio * humidity_delta * temperature_offset * temperature_delta
+            - magnus_slope * temperature_delta * humidity_delta * (mass_ratio + 2.0 * humidity_start),
+            mass_ratio * humidity_delta * temperature_delta**2 - magnus_slope * temperature_delta * humidity_delta**2,
+        ),
+        dtype=np.float64,
+    )
+    scale = float(np.max(np.abs(coefficients)))
+    coefficient_tolerance = _RELATIVE_HUMIDITY_ROOT_TOLERANCE * max(1.0, scale)
+    if abs(float(coefficients[2])) <= coefficient_tolerance:
+        if abs(float(coefficients[1])) <= coefficient_tolerance:
+            return ()
+        roots = np.asarray((-float(coefficients[0]) / float(coefficients[1]),), dtype=np.complex128)
+    else:
+        roots = np.asarray(np.roots(coefficients[::-1]), dtype=np.complex128)
+    fractions: list[float] = []
+    for root in roots:
+        if abs(float(root.imag)) > _RELATIVE_HUMIDITY_ROOT_TOLERANCE * max(1.0, abs(float(root.real))):
+            continue
+        fraction = float(root.real)
+        if -_RELATIVE_HUMIDITY_ROOT_TOLERANCE <= fraction <= 1.0 + _RELATIVE_HUMIDITY_ROOT_TOLERANCE:
+            clipped = min(1.0, max(0.0, fraction))
+            if 0.0 < clipped < 1.0 and clipped not in fractions:
+                fractions.append(clipped)
+    return tuple(sorted(fractions))
+
+
+def derived_relative_humidity_extrema(
+    temperature: np.ndarray,
+    humidity_ratio: np.ndarray,
+    *,
+    pressure: float,
+) -> tuple[float, float]:
+    """
+    Return exact-candidate extrema after linear primitive interpolation.
+
+    The logarithmic derivative on each interval reduces to a quadratic.
+    Endpoints and every real interior stationary point are evaluated through
+    the authoritative psychrometric conversion, without inserting support.
+    """
+    temperatures = np.asarray(temperature, dtype=np.float64)
+    humidity_ratios = np.asarray(humidity_ratio, dtype=np.float64)
+    if (
+        temperatures.ndim != 1
+        or humidity_ratios.shape != temperatures.shape
+        or temperatures.size < _MINIMUM_SCHEDULE_NODES
+        or not np.isfinite(temperatures).all()
+        or not np.isfinite(humidity_ratios).all()
+        or np.any(temperatures <= 0.0)
+        or np.any(humidity_ratios <= 0.0)
+    ):
+        msg = "Continuous relative-humidity validation requires aligned positive finite primitive series."
+        raise ValueError(msg)
+    candidate_temperatures = list(temperatures)
+    candidate_humidity_ratios = list(humidity_ratios)
+    for index in range(temperatures.size - 1):
+        for fraction in _relative_humidity_stationary_fractions(
+            float(temperatures[index]),
+            float(temperatures[index + 1]),
+            float(humidity_ratios[index]),
+            float(humidity_ratios[index + 1]),
+        ):
+            candidate_temperatures.append(float(temperatures[index] + fraction * (temperatures[index + 1] - temperatures[index])))
+            candidate_humidity_ratios.append(float(humidity_ratios[index] + fraction * (humidity_ratios[index + 1] - humidity_ratios[index])))
+    derived = humidity_ratio_to_relative_humidity(
+        np.asarray(candidate_humidity_ratios, dtype=np.float64),
+        np.asarray(candidate_temperatures, dtype=np.float64),
+        pressure=pressure,
+    )
+    return float(np.min(derived)), float(np.max(derived))
 
 
 def relative_humidity_to_humidity_ratio(
@@ -539,7 +613,7 @@ def relative_humidity_to_humidity_ratio(
     if np.any(vapor_pressure >= pressure):
         msg = "Relative-humidity conversion requires vapor pressure below reference pressure."
         raise ValueError(msg)
-    humidity_ratio = 0.621945 * vapor_pressure / (pressure - vapor_pressure)
+    humidity_ratio = _DRY_AIR_TO_WATER_MASS_RATIO * vapor_pressure / (pressure - vapor_pressure)
     if not np.isfinite(humidity_ratio).all() or np.any(humidity_ratio < 0.0):
         msg = "Thermodynamic humidity-ratio conversion produced invalid values."
         raise ValueError(msg)
@@ -559,13 +633,13 @@ def humidity_ratio_dew_point_temperature(
     if not math.isfinite(pressure) or pressure <= 0.0:
         msg = "Reference pressure must be finite and positive."
         raise ValueError(msg)
-    vapor_pressure = pressure * omega / (0.621945 + omega)
-    logarithm = np.log(vapor_pressure / 610.94)
-    denominator = 17.625 - logarithm
+    vapor_pressure = pressure * omega / (_DRY_AIR_TO_WATER_MASS_RATIO + omega)
+    logarithm = np.log(vapor_pressure / _MAGNUS_BASE_PRESSURE_PA)
+    denominator = _MAGNUS_EXPONENT - logarithm
     if np.any(denominator <= 0.0):
         msg = "Humidity ratio lies outside the maintained Magnus inverse domain."
         raise ValueError(msg)
-    return 273.15 + 243.04 * logarithm / denominator
+    return 273.15 + _MAGNUS_TEMPERATURE_OFFSET_C * logarithm / denominator
 
 
 def _regular_time(
@@ -1069,6 +1143,7 @@ def _feasibility_reason(
     humidity_ratio: np.ndarray,
     phi_in: np.ndarray,
     phi_source: np.ndarray,
+    phi_extrema: tuple[float, float],
     *,
     ambient_temperature: float,
     fixed: Mapping[str, Any],
@@ -1089,8 +1164,8 @@ def _feasibility_reason(
         return "phi_source_air lies outside (0, 1]"
     phi_minimum = float(fixed["phi_operational_min"])
     phi_maximum = float(fixed["phi_operational_max"])
-    if np.any((phi_in < phi_minimum) | (phi_in > phi_maximum)):
-        return f"phi_in_bc violates the configured operating envelope [{phi_minimum}, {phi_maximum}]"
+    if phi_extrema[0] < phi_minimum or phi_extrema[1] > phi_maximum:
+        return f"derived phi_in_bc violates the configured continuous operating envelope [{phi_minimum}, {phi_maximum}]"
     return None
 
 
@@ -1226,6 +1301,11 @@ def generate_schedule(
                 np.full_like(temperature, ambient_temperature),
                 pressure=float(fixed["p_ref"]),
             )
+            relative_humidity_extrema = derived_relative_humidity_extrema(
+                temperature,
+                humidity_ratio,
+                pressure=float(fixed["p_ref"]),
+            )
         except ValueError as error:
             rejection_reasons.append(str(error))
             continue
@@ -1234,6 +1314,7 @@ def generate_schedule(
             humidity_ratio,
             relative_humidity,
             source_relative_humidity,
+            relative_humidity_extrema,
             ambient_temperature=ambient_temperature,
             fixed=fixed,
         )
@@ -1246,12 +1327,24 @@ def generate_schedule(
         )
         raise ValueError(message)
 
-    values_array = np.column_stack((time, temperature, humidity_ratio, relative_humidity)).astype(
+    values_array = np.column_stack((time, temperature, humidity_ratio)).astype(
         np.float64,
         copy=False,
     )
     realized_correlation = _discrete_pearson(temperature, humidity_ratio)
     correlation_error = None if realized_correlation is None else abs(realized_correlation - correlation)
+    relative_humidity_diagnostics = _series_diagnostics(
+        relative_humidity,
+        name="phi_in_bc",
+        interval=interval,
+    )
+    relative_humidity_diagnostics.update(
+        {
+            "min_phi_in_bc": relative_humidity_extrema[0],
+            "max_phi_in_bc": relative_humidity_extrema[1],
+            "peak_to_peak_phi_in_bc": relative_humidity_extrema[1] - relative_humidity_extrema[0],
+        }
+    )
     diagnostics: dict[str, float | int | bool | None] = {
         **_series_diagnostics(
             temperature,
@@ -1271,11 +1364,7 @@ def generate_schedule(
             amplitude_name="omega_in_amp",
             configured_amplitude=humidity_amplitude,
         ),
-        **_series_diagnostics(
-            relative_humidity,
-            name="phi_in_bc",
-            interval=interval,
-        ),
+        **relative_humidity_diagnostics,
         "configured_T_omega_correlation": correlation,
         "realized_T_omega_correlation": realized_correlation,
         "absolute_T_omega_correlation_error": correlation_error,
@@ -1318,6 +1407,8 @@ def generate_schedule(
             "heater_physics": "humidity_ratio_conserved_across_ambient_air_heater",
             "source_air_humidity_ratio": "omega_source_air(t)=omega_in_bc(t)",
             "humidity_formula": "phi_in_bc=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_in_bc)",
+            "relative_humidity_interpolation_contract": "linearly_interpolate_T_in_bc_and_omega_in_bc_then_derive_phi_in_bc",
+            "relative_humidity_extrema_method": "interval_endpoints_and_exact_quadratic_stationary_points",
             "source_humidity_formula": "phi_source_air=p_ref*omega_in_bc/(0.621945+omega_in_bc)/p_sat(T_amb)",
             "phi_source_air_usage": "validation_and_provenance_only",
             "humidity_conversion_owner": "generation_schedule",
@@ -1350,7 +1441,6 @@ def generate_schedule(
                     "t": "h",
                     "T_in_bc": "K",
                     "omega_in_bc": "kg/kg",
-                    "phi_in_bc": "1",
                 },
                 "diagnostics": {
                     "smooth.correlation_time_hours": "h",

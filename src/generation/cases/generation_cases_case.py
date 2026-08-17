@@ -228,7 +228,7 @@ def _write_scalar_file(
 
 
 def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: schedule_service.ComsolBoundarySchedule) -> Path:
-    """Write the exact four-column COMSOL boundary interpolation table."""
+    """Write the exact primitive COMSOL boundary interpolation table."""
     columns = list(spec["columns"])
     if tuple(columns) != profiles.SCHEDULE_FIELDS or schedule.values.ndim != _TABLE_RANK or schedule.values.shape[1] != len(columns):
         msg = "Generated schedule does not satisfy the configured adapter field contract."

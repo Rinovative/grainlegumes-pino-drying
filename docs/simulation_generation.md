@@ -110,7 +110,11 @@ values. Do not copy derived inventories into this guide.
 ### Updating a COMSOL template
 
 The selected profile YAML owns the repository-relative <code>template:</code>
-value. Its expected SHA-256 is the adjacent <code>.sha256</code> file.
+value. Its expected SHA-256 is the adjacent <code>.sha256</code> file. The
+transient template must read only <code>t</code>, <code>T_in_bc</code>, and
+<code>omega_in_bc</code> from the schedule table, derive inlet relative humidity
+after primitive interpolation, and continue exporting the solved
+<code>mt.phi</code> field.
 
 1. Save the intended <code>.mph</code> file and update the profile locator if it
    was renamed.
@@ -162,9 +166,13 @@ is read-only. It admits persisted canonical input manifests and never plans,
 generates, locks, publishes, or inspects completed solver output.
 
 Generate cases first, then rerun the notebook. Completed solver output belongs
-to completed-output EDA. The transient boundary ramp begins from the case
-initial state and rejoins the regular schedule at the configured startup
-duration. Scientific startup and schedule semantics are owned by the
+to completed-output EDA. Current ramp-disabled transient inputs persist the exact
+hourly primitive schedule from time zero; the notebook may evaluate denser
+display-only curves but never writes extra support. A deliberately ramp-enabled
+campaign adds its documented primitive rejoin row without changing regular
+output times. Four-column schedules containing <code>phi_in_bc</code> are stale
+and fail admission; regenerate those input cases under the current contract.
+Scientific startup and schedule semantics are owned by the
 [scientific parameter reference](generation_parameter_reference.md#inlet-schedule).
 
 ## Operational stages
@@ -195,7 +203,10 @@ gated cleanup policy; incomplete or invalid evidence is not cleanup-eligible.
 Production uses one ordinary non-exclusive Slurm job per case. Configuration
 owns resources, queue feeding, timeout, failure budget, and retention. Temporary
 license-capacity exhaustion uses bounded retry/backoff for the same deterministic
-case without holding a compute allocation during backoff.
+case without holding a compute allocation during backoff. A campaign in
+<code>waiting_retry</code> remains nonterminal: the foreground workflow keeps
+polling, submits the eligible retry through normal reconciliation, and records no
+workflow failure merely because it observed the wait state.
 
 The foreground <code>all</code> or <code>resume</code> process feeds and
 reconciles the campaign. Already submitted Slurm jobs continue if that

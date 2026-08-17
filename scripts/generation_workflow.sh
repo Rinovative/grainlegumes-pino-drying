@@ -1277,7 +1277,7 @@ wait_for_terminal_publication() {
           --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
         return
         ;;
-      running|submitted|feeding|submission_pending_or_unknown)
+      running|submitted|feeding|waiting_retry|submission_pending_or_unknown)
         sleep "${STATUS_POLL_SECONDS}"
         ;;
       completed)

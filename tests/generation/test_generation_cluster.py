@@ -170,6 +170,135 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
 
 
+def test_license_retry_waits_then_resubmits_the_same_case_once(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress one persisted case through waiting, eligibility, retry, and success."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    commit = "9" * 40
+    storage = tmp_path / "storage"
+    submitted_ids = iter(("4101", "4102"))
+    submit_commands: list[list[str]] = []
+    retry_eligible = {"value": False}
+    completed = {"value": False}
+    retry_attempt = {
+        "classification": "temporary_license_capacity",
+        "retry_budget_remaining": True,
+    }
+
+    def fake_submit(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        arguments = list(command)
+        assert arguments[0] == "sbatch"
+        submit_commands.append(arguments)
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=f"{next(submitted_ids)}\n",
+            stderr="",
+        )
+
+    def scheduler_evidence(job_ids: list[str]) -> dict[str, Any]:
+        return _scheduler(
+            accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids},
+        )
+
+    def latest_attempt(
+        *_args: Any,
+        job_id: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any] | None:
+        return retry_attempt if job_id == "4101" else None
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", scheduler_evidence)
+    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_submit)
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda *_args, **_kwargs: completed["value"],
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "case_failure_is_recorded",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        generation.campaign.license_service,
+        "latest_attempt_for_job",
+        latest_attempt,
+    )
+    monkeypatch.setattr(
+        generation.campaign.license_service,
+        "retry_attempt_is_eligible",
+        lambda _attempt: retry_eligible["value"],
+    )
+    monkeypatch.setattr(
+        generation.campaign.progress_service,
+        "load_runtime_progress",
+        lambda *_args, **_kwargs: {
+            "availability": "unavailable",
+            "reason": "not_reported",
+            "age_seconds": None,
+            "stale": None,
+        },
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_finalize_completed_batches",
+        lambda *_args, **_kwargs: None,
+    )
+
+    initial = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    run_id = str(initial["campaign_run_id"])
+    assert initial["slurm_job_ids"] == ["4101"]
+    assert len(submit_commands) == 1
+
+    waiting = generation.campaign.campaign_status(run_id, storage_root=storage)
+    assert waiting["campaign_state"] == "waiting_retry"
+    assert waiting["cases"][0]["state"] == "retry_waiting"
+    held = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert held["state"] == "waiting_retry"
+    assert len(submit_commands) == 1
+
+    retry_eligible["value"] = True
+    eligible = generation.campaign.campaign_status(run_id, storage_root=storage)
+    assert eligible["campaign_state"] == "feeding"
+    assert eligible["cases"][0]["state"] == "retry_eligible"
+    retried = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert retried["slurm_job_ids"] == ["4101", "4102"]
+    assert [record["mode"] for record in retried["submissions"]] == [
+        "initial",
+        "license_retry",
+    ]
+    expected_case = {
+        "batch_name": task.batch_name,
+        "batch_id": task.batch_id,
+        "case_index": task.case_index,
+        "case_id": task.case_id,
+    }
+    assert all(record["case"] == expected_case for record in retried["submissions"])
+    assert len(submit_commands) == 2
+
+    completed["value"] = True
+    terminal = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert terminal["state"] == "complete"
+    successful = generation.campaign.campaign_status(run_id, storage_root=storage)
+    assert successful["campaign_state"] == "completed"
+    assert successful["cases"][0]["state"] == "successful"
+    assert successful["cases"][0]["submission_count"] == 2
+
+
 def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     generation_config_factory: Any,
     tmp_path: Path,

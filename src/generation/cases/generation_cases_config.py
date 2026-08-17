@@ -2113,6 +2113,22 @@ def _selected_mapping(
     return {key: copy.deepcopy(value[key]) for key in value if key in allowed}
 
 
+def _boundary_schedule_identity(value: Any) -> dict[str, Any]:
+    """Return only active startup-ramp semantics for scientific identity."""
+    schedule = _mapping(value, label="resolved boundary schedule identity")
+    ramp = _mapping(
+        schedule.get("startup_ramp"),
+        label="resolved boundary schedule identity startup_ramp",
+    )
+    enabled = ramp.get("enabled")
+    if not isinstance(enabled, bool):
+        message = "Resolved boundary-schedule identity requires boolean startup-ramp enabled."
+        raise GenerationConfigError(message)
+    if not enabled:
+        return {"startup_ramp": {"enabled": False}}
+    return {"startup_ramp": copy.deepcopy(dict(ramp))}
+
+
 def _operation_identity_config(value: Any) -> dict[str, Any]:
     """Return active operation values and rules without evidence provenance."""
     operation = _mapping(value, label="resolved operation identity")
@@ -2140,7 +2156,7 @@ def _operation_identity_config(value: Any) -> dict[str, Any]:
         "constraints": copy.deepcopy(operation["constraints"]),
     }
     if "boundary_schedule" in operation:
-        result["boundary_schedule"] = copy.deepcopy(operation["boundary_schedule"])
+        result["boundary_schedule"] = _boundary_schedule_identity(operation["boundary_schedule"])
     return result
 
 
@@ -2266,6 +2282,8 @@ def _scientific_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]
         raise GenerationConfigError(message)
     result: dict[str, Any] = {key: copy.deepcopy(value[key]) for key in _SCIENTIFIC_IDENTITY_KEYS if key in value}
     result["material"] = _material_identity_config(value["material"])
+    if "boundary_schedule" in result:
+        result["boundary_schedule"] = _boundary_schedule_identity(value["boundary_schedule"])
     assignments = value["assignments"]
     if not isinstance(assignments, list):
         message = "Resolved scientific batch assignments must be a list."

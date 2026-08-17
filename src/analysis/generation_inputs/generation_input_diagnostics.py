@@ -6,7 +6,7 @@ Build immutable diagnostics from admitted profile-aware generation inputs.
 Responsibilities:
   - Preserve exact sampled, scalar, schedule, spatial, and provenance evidence
   - Derive shared permeability and transient moisture diagnostics canonically
-  - Reconstruct transient schedule supports without interpolation or resampling
+  - Preserve exact persisted supports and evaluate display-only boundary curves
   - Provide Celsius-aware A/B comparisons and empirical dataset summaries
 Design principles:
   - Generation, profile, and domain owners define every scientific semantic
@@ -21,8 +21,10 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
@@ -87,8 +89,10 @@ FIELD_UNITS: Final = MappingProxyType(
 )
 STAT_NAMES: Final = ("min", "q05", "median", "mean", "q95", "max", "std")
 COMPARISON_COLUMNS: Final = ("Case A", "Mean A", "Case B", "Mean B")
-_SCHEDULE_NAMES: Final = profiles.SCHEDULE_FIELDS[1:]
-_SCHEDULE_UNITS: Final = profiles.SCHEDULE_UNITS[1:]
+_PRIMITIVE_SCHEDULE_NAMES: Final = profiles.SCHEDULE_FIELDS[1:]
+_PRIMITIVE_SCHEDULE_UNITS: Final = profiles.SCHEDULE_UNITS[1:]
+_SCHEDULE_NAMES: Final = (*_PRIMITIVE_SCHEDULE_NAMES, "phi_in_bc")
+_SCHEDULE_UNITS: Final = (*_PRIMITIVE_SCHEDULE_UNITS, "1")
 _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES: Final = frozenset(
     (
         "T_amb",
@@ -101,6 +105,7 @@ _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES: Final = frozenset(
     )
 )
 _MINIMUM_SCHEDULE_NODES: Final = 2
+_SCHEDULE_TABLE_RANK: Final = 2
 _SPATIAL_DIMENSIONS: Final = 2
 if set(FIELD_UNITS) != set(FIELD_LABELS):
     msg = "Generation-input field labels and units must cover the same inventory."
@@ -123,7 +128,7 @@ class StartupVariableDiagnostics:
     name : str
         Canonical schedule-channel name.
     unit : str
-        Physical unit persisted by the transient schedule contract.
+        Physical unit of the primitive or canonically derived channel.
     start, end : float
         Exact values at the first schedule support and the startup endpoint.
     delta : float
@@ -155,10 +160,6 @@ class StartupDiagnostics:
         Read-only final COMSOL schedule support through the persisted duration.
     variables : Mapping[str, StartupVariableDiagnostics]
         Exact endpoint diagnostics for every maintained boundary channel.
-    phi_expected_start, phi_expected_end : float
-        Relative humidity recomputed by the canonical psychrometric owner.
-    phi_error_start, phi_error_end : float
-        Stored-minus-recomputed endpoint residuals.
 
     """
 
@@ -168,10 +169,6 @@ class StartupDiagnostics:
     t_end_h: float
     support_times_h: np.ndarray
     variables: Mapping[str, StartupVariableDiagnostics]
-    phi_expected_start: float
-    phi_expected_end: float
-    phi_error_start: float
-    phi_error_end: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +187,7 @@ class GenerationInputDiagnostics:
     fields : Mapping[str, numpy.ndarray]
         Read-only raw and canonically derived structured-grid fields.
     schedule : numpy.ndarray | None
-        Exact final COMSOL boundary schedule for transient inputs.
+        Exact primitive COMSOL boundary schedule for transient inputs.
     canonical_schedule : numpy.ndarray | None
         Canonical pre-handoff transient schedule support.
     regular_output_schedule : numpy.ndarray | None
@@ -333,12 +330,24 @@ def _plain_json(value: Any) -> Any:
     return value
 
 
+def _finite_real_scalar(value: object, *, label: str) -> float:
+    """Return one finite Python or NumPy real scalar."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        msg = f"{label} must be a finite real scalar."
+        raise TypeError(msg)
+    number = float(value)
+    if not math.isfinite(number):
+        msg = f"{label} must be finite."
+        raise ValueError(msg)
+    return number
+
+
 def _numeric_parameter(value: Any) -> float | None:
     """Return one finite scalar parameter or None for structured evidence."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    try:
+        return _finite_real_scalar(value, label="Parameter value")
+    except (TypeError, ValueError):
         return None
-    number = float(value)
-    return number if np.isfinite(number) else None
 
 
 def _parameter_display(value: Any) -> float | str:
@@ -432,9 +441,9 @@ def _startup_diagnostics(
     enabled: bool,
     duration_h: float,
 ) -> StartupDiagnostics:
-    """Build exact startup values and canonical psychrometric residuals."""
+    """Build primitive startup values and derived psychrometric endpoints."""
     end_index = 1 if enabled else 0
-    variables = {
+    variables: dict[str, StartupVariableDiagnostics] = {
         name: StartupVariableDiagnostics(
             name=name,
             unit=unit,
@@ -442,13 +451,23 @@ def _startup_diagnostics(
             end=float(schedule[end_index, column]),
             delta=float(schedule[end_index, column] - schedule[0, column]),
         )
-        for column, (name, unit) in enumerate(zip(_SCHEDULE_NAMES, _SCHEDULE_UNITS, strict=True), start=1)
+        for column, (name, unit) in enumerate(
+            zip(_PRIMITIVE_SCHEDULE_NAMES, _PRIMITIVE_SCHEDULE_UNITS, strict=True),
+            start=1,
+        )
     }
     pressure = _fixed_value(case.payload, "p_ref")
-    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(
+    derived_phi = schedule_service.humidity_ratio_to_relative_humidity(
         np.asarray((variables["omega_in_bc"].start, variables["omega_in_bc"].end)),
         np.asarray((variables["T_in_bc"].start, variables["T_in_bc"].end)),
         pressure=pressure,
+    )
+    variables["phi_in_bc"] = StartupVariableDiagnostics(
+        name="phi_in_bc",
+        unit="1",
+        start=float(derived_phi[0]),
+        end=float(derived_phi[1]),
+        delta=float(derived_phi[1] - derived_phi[0]),
     )
     support = _immutable(schedule[schedule[:, 0] <= duration_h, 0])
     return StartupDiagnostics(
@@ -458,10 +477,6 @@ def _startup_diagnostics(
         t_end_h=float(schedule[end_index, 0]),
         support_times_h=support,
         variables=MappingProxyType(variables),
-        phi_expected_start=float(expected_phi[0]),
-        phi_expected_end=float(expected_phi[1]),
-        phi_error_start=float(variables["phi_in_bc"].start - expected_phi[0]),
-        phi_error_end=float(variables["phi_in_bc"].end - expected_phi[1]),
     )
 
 
@@ -607,16 +622,99 @@ def schedule_window_rows(
     return _immutable(np.array(schedule[mask], copy=True))
 
 
+def evaluate_boundary_schedule(
+    schedule: np.ndarray,
+    times_h: np.ndarray,
+    *,
+    pressure: float,
+) -> np.ndarray:
+    """Evaluate primitive interpolation and derive RH at display times."""
+    values = np.asarray(schedule, dtype=np.float64)
+    display_times = np.asarray(times_h, dtype=np.float64)
+    if (
+        values.ndim != _SCHEDULE_TABLE_RANK
+        or values.shape[1] != len(profiles.SCHEDULE_FIELDS)
+        or values.shape[0] < _MINIMUM_SCHEDULE_NODES
+        or not np.isfinite(values).all()
+        or np.any(np.diff(values[:, 0]) <= 0.0)
+    ):
+        msg = "Boundary display evaluation requires a finite ordered primitive schedule."
+        raise ValueError(msg)
+    if (
+        display_times.ndim != 1
+        or not np.isfinite(display_times).all()
+        or np.any(display_times < values[0, 0])
+        or np.any(display_times > values[-1, 0])
+    ):
+        msg = "Boundary display times must be finite and inside persisted support."
+        raise ValueError(msg)
+    temperature = np.interp(display_times, values[:, 0], values[:, 1])
+    humidity_ratio = np.interp(display_times, values[:, 0], values[:, 2])
+    relative_humidity = schedule_service.humidity_ratio_to_relative_humidity(
+        humidity_ratio,
+        temperature,
+        pressure=pressure,
+    )
+    return _immutable(
+        np.column_stack(
+            (
+                display_times,
+                temperature,
+                humidity_ratio,
+                relative_humidity,
+            )
+        )
+    )
+
+
+def case_boundary_schedule(
+    record: GenerationInputDiagnostics,
+    times_h: np.ndarray,
+) -> np.ndarray:
+    """Evaluate one case's primitive schedule and derived inlet RH."""
+    schedule, _canonical, _output, _startup = _require_transient(record)
+    return evaluate_boundary_schedule(
+        schedule,
+        times_h,
+        pressure=_fixed_value(record.case.payload, "p_ref"),
+    )
+
+
+def dataset_boundary_schedule(
+    dataset: DatasetDiagnostics,
+    times_h: np.ndarray,
+) -> np.ndarray:
+    """Average per-case evaluated primitive and derived boundary curves."""
+    evaluated = tuple(case_boundary_schedule(record, times_h) for record in dataset.records)
+    support = evaluated[0][:, 0]
+    if any(not np.array_equal(values[:, 0], support) for values in evaluated[1:]):
+        msg = "Dataset boundary display evaluations must share exact display times."
+        raise ValueError(msg)
+    return _immutable(
+        np.column_stack(
+            (
+                support,
+                np.mean(
+                    np.stack(tuple(values[:, 1:] for values in evaluated)),
+                    axis=0,
+                ),
+            )
+        )
+    )
+
+
 def startup_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
-    """Return exact final-schedule rows from startup start through rejoin."""
+    """Return exact final-schedule rows over the active startup interval."""
     schedule, _canonical, _output, startup = _require_transient(record)
-    return schedule_window_rows(schedule, startup.duration_h, startup_only=True)
+    duration_h = startup.duration_h if startup.enabled else 0.0
+    return schedule_window_rows(schedule, duration_h, startup_only=True)
 
 
 def operating_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
-    """Return exact final-schedule rows from startup rejoin through operation."""
+    """Return exact final-schedule rows from active startup rejoin or time zero."""
     schedule, _canonical, _output, startup = _require_transient(record)
-    return schedule_window_rows(schedule, startup.duration_h, startup_only=False)
+    start_h = startup.duration_h if startup.enabled else 0.0
+    return schedule_window_rows(schedule, start_h, startup_only=False)
 
 
 def startup_schedule_minutes(record: GenerationInputDiagnostics) -> np.ndarray:
@@ -704,7 +802,17 @@ def _dataset_boundary_means(
     for name in profiles.STATIONARY_FIXED_FIELDS:
         result[name] = float(np.mean([_fixed_value(record.case.payload, name) for record in records]))
     for statistic in STAT_NAMES:
-        result[f"p_in_bc {statistic}"] = float(np.mean([field_statistics(record).loc["p_in_bc", statistic] for record in records]))
+        result[f"p_in_bc {statistic}"] = float(
+            np.mean(
+                [
+                    _finite_real_scalar(
+                        field_statistics(record).loc["p_in_bc", statistic],
+                        label=f"p_in_bc {statistic}",
+                    )
+                    for record in records
+                ]
+            )
+        )
     if is_transient(records[0]):
         for name in _SCHEDULE_NAMES:
             for label, attribute in (
@@ -792,7 +900,17 @@ def build_dataset_diagnostics(
     summaries = {id(record): field_statistics(record) for record in selected}
     field_means = MappingProxyType(
         {
-            (quantity, statistic): float(np.mean([summaries[id(record)].loc[quantity, statistic] for record in selected]))
+            (quantity, statistic): float(
+                np.mean(
+                    [
+                        _finite_real_scalar(
+                            summaries[id(record)].loc[quantity, statistic],
+                            label=f"{quantity} {statistic}",
+                        )
+                        for record in selected
+                    ]
+                )
+            )
             for quantity in display_field_names(first)
             for statistic in STAT_NAMES
         }
@@ -866,9 +984,13 @@ def grouped_table_sections(
         msg_0 = "Grouped generation-input tables require a Section/Category/item index."
         raise ValueError(msg_0)
     sections = tuple(dict.fromkeys(str(value) for value in table.index.get_level_values("Section")))
-    result = []
+    result: list[tuple[str, pd.DataFrame]] = []
     for section in sections:
-        subset = table.xs(section, level="Section", drop_level=True).copy()
+        selected = table.xs(section, level="Section", drop_level=True)
+        if not isinstance(selected, pd.DataFrame):
+            msg_0 = f"Grouped table section {section!r} did not preserve a DataFrame."
+            raise TypeError(msg_0)
+        subset = selected.copy()
         subset.attrs = dict(table.attrs)
         result.append((section, subset))
     return tuple(result)
@@ -1085,9 +1207,9 @@ def field_summary_comparison_table(
     rows = [
         (
             _field_row_index(quantity, statistic),
-            float(first_stats.loc[quantity, statistic]),
+            _finite_real_scalar(first_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case A"),
             mean_a.field_summary_means[(quantity, statistic)],
-            float(second_stats.loc[quantity, statistic]),
+            _finite_real_scalar(second_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case B"),
             mean_b.field_summary_means[(quantity, statistic)],
         )
         for quantity, statistic in specs
@@ -1106,7 +1228,15 @@ def _boundary_case_values(
     """Return maintained boundary scalars for one case."""
     result: dict[str, float | str] = {name: _fixed_value(record.case.payload, name) for name in profiles.STATIONARY_FIXED_FIELDS}
     statistics = field_statistics(record).loc["p_in_bc"]
-    result.update({f"p_in_bc {statistic}": float(statistics[statistic]) for statistic in STAT_NAMES})
+    result.update(
+        {
+            f"p_in_bc {statistic}": _finite_real_scalar(
+                statistics[statistic],
+                label=f"p_in_bc {statistic}",
+            )
+            for statistic in STAT_NAMES
+        }
+    )
     if is_transient(record):
         startup = _require_transient(record)[3]
         for name in _SCHEDULE_NAMES:
@@ -1208,7 +1338,16 @@ def dataset_field_summary_table(
         names=("Section", "Category", "Field / statistic"),
     )
     columns = tuple(f"Case {record.case.case_index}" for record in dataset.records)
-    values = tuple(tuple(float(summary.loc[quantity, statistic]) for summary in summaries) for quantity, statistic in specs)
+    values = tuple(
+        tuple(
+            _finite_real_scalar(
+                summary.loc[quantity, statistic],
+                label=f"{quantity} {statistic}",
+            )
+            for summary in summaries
+        )
+        for quantity, statistic in specs
+    )
     return pd.DataFrame(values, index=index, columns=columns)
 
 

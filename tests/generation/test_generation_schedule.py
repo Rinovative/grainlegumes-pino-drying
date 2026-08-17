@@ -81,21 +81,9 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
     assert handoff.values[-1, 0] == 168.0
     assert handoff.values[0, 1] == 293.15
     assert handoff.values[0, 2] == canonical.values[0, 2]
-    expected_start_phi = schedule_service.humidity_ratio_to_relative_humidity(
-        handoff.values[:1, 2],
-        handoff.values[:1, 1],
-        pressure=float(_FIXED["p_ref"]),
-    )[0]
-    assert handoff.values[0, 3] == expected_start_phi
-
     fraction = duration_h / float(_TIME["interval"])
     expected_rejoin = canonical.values[0] + fraction * (canonical.values[1] - canonical.values[0])
     expected_rejoin[0] = duration_h
-    expected_rejoin[3] = schedule_service.humidity_ratio_to_relative_humidity(
-        expected_rejoin[2:3],
-        expected_rejoin[1:2],
-        pressure=float(_FIXED["p_ref"]),
-    )[0]
     np.testing.assert_array_equal(handoff.values[1], expected_rejoin)
     np.testing.assert_array_equal(handoff.values[2:], canonical.values[1:])
 
@@ -110,16 +98,11 @@ def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearl
     """Derive the thermodynamic midpoint of one analytically simple ramp."""
     canonical_values = np.asarray(
         (
-            (0.0, 302.0, 0.008, 0.0),
-            (1.0, 310.0, 0.010, 0.0),
-            (2.0, 308.0, 0.009, 0.0),
+            (0.0, 302.0, 0.008),
+            (1.0, 310.0, 0.010),
+            (2.0, 308.0, 0.009),
         ),
         dtype=np.float64,
-    )
-    canonical_values[:, 3] = schedule_service.humidity_ratio_to_relative_humidity(
-        canonical_values[:, 2],
-        canonical_values[:, 1],
-        pressure=float(_FIXED["p_ref"]),
     )
     canonical = schedule_service.Schedule(
         values=canonical_values,
@@ -156,18 +139,35 @@ def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearl
         np.asarray([midpoint_temperature]),
         pressure=float(_FIXED["p_ref"]),
     )[0]
-    independently_interpolated_phi = ramp_start[3] + 0.5 * (ramp_end[3] - ramp_start[3])
-    assert midpoint_phi != independently_interpolated_phi
-    np.testing.assert_allclose(
-        handoff.values[:, 3],
-        schedule_service.humidity_ratio_to_relative_humidity(
-            handoff.values[:, 2],
-            handoff.values[:, 1],
-            pressure=float(_FIXED["p_ref"]),
-        ),
-        rtol=64.0 * np.finfo(np.float64).eps,
-        atol=64.0 * np.finfo(np.float64).eps,
+    endpoint_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        np.asarray((ramp_start[2], ramp_end[2])),
+        np.asarray((ramp_start[1], ramp_end[1])),
+        pressure=float(_FIXED["p_ref"]),
     )
+    independently_interpolated_phi = 0.5 * (endpoint_phi[0] + endpoint_phi[1])
+    assert midpoint_phi != independently_interpolated_phi
+    assert handoff.values.shape[1] == 3
+
+
+def test_continuous_derived_relative_humidity_detects_interval_interior_extremum() -> None:
+    """Evaluate the nonlinear RH extremum after linear primitive interpolation."""
+    temperature = np.asarray((306.0, 296.0), dtype=np.float64)
+    humidity_ratio = np.asarray((0.011, 0.006), dtype=np.float64)
+
+    minimum, maximum = schedule_service.derived_relative_humidity_extrema(
+        temperature,
+        humidity_ratio,
+        pressure=float(_FIXED["p_ref"]),
+    )
+    endpoint_phi = schedule_service.humidity_ratio_to_relative_humidity(
+        humidity_ratio,
+        temperature,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+    assert minimum == pytest.approx(float(np.min(endpoint_phi)))
+    assert maximum > float(np.max(endpoint_phi))
+    assert maximum == pytest.approx(0.3652169067)
 
 
 def test_disabled_comsol_startup_handoff_is_semantically_canonical() -> None:
@@ -222,7 +222,6 @@ def test_comsol_startup_handoff_uses_cold_initial_state_without_preheating() -> 
     assert _FIXED["phi_operational_max"] < expected_phi < 1.0
     assert handoff.values[0, 1] == initial_temperature
     assert handoff.values[0, 2] == canonical.values[0, 2]
-    assert handoff.values[0, 3] == expected_phi
     assert startup == {
         "enabled": True,
         "duration_h": 0.5,
@@ -230,10 +229,10 @@ def test_comsol_startup_handoff_uses_cold_initial_state_without_preheating() -> 
         "initial_temperature_K": initial_temperature,
         "canonical_start_humidity_ratio_kg_per_kg": canonical.values[0, 2],
         "startup_relative_humidity": expected_phi,
-        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_recompute_phi_in_bc",
-        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_recompute_phi_in_bc",
+        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_derive_phi_in_bc",
+        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_derive_phi_in_bc",
     }
-    assert handoff.metadata["boundary_handoff"]["handoff_version"] == 2
+    assert handoff.metadata["boundary_handoff"]["handoff_version"] == 1
 
 
 def test_comsol_startup_handoff_rejects_supersaturated_initial_state() -> None:
@@ -246,7 +245,7 @@ def test_comsol_startup_handoff_rejects_supersaturated_initial_state() -> None:
         T_amb=288.7,
     )
 
-    with pytest.raises(ValueError, match="physically invalid"):
+    with pytest.raises(ValueError, match="physical humidity constraints"):
         schedule_service.build_comsol_boundary_schedule(
             canonical,
             {"enabled": True, "duration_h": 0.5},
@@ -260,7 +259,6 @@ def test_comsol_startup_handoff_rejects_supersaturated_initial_state() -> None:
     [
         (1, 289.15),
         (2, 0.015),
-        (3, 0.9),
     ],
 )
 def test_comsol_handoff_rejects_operational_rejoin_violation(
@@ -278,7 +276,7 @@ def test_comsol_handoff_rejects_operational_rejoin_violation(
     invalid = handoff.values.copy()
     invalid[1, column] = invalid_value
 
-    with pytest.raises(ValueError, match="rejoin or canonical regular schedule nodes"):
+    with pytest.raises(ValueError, match=r"invalid|constraints"):
         schedule_service.validate_comsol_boundary_schedule(
             invalid,
             regular_times=np.asarray(_TIME["regular_times"], dtype=np.float64),

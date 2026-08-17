@@ -45,8 +45,8 @@ STEADY_SPATIAL_INPUT_FIELDS: Final = (
     "p_in_bc",
 )
 TRANSIENT_SPATIAL_INPUT_FIELDS: Final = (*STEADY_SPATIAL_INPUT_FIELDS, "X_0_db_field")
-SCHEDULE_FIELDS: Final = ("t", "T_in_bc", "omega_in_bc", "phi_in_bc")
-SCHEDULE_UNITS: Final = ("h", "K", "kg/kg", "1")
+SCHEDULE_FIELDS: Final = ("t", "T_in_bc", "omega_in_bc")
+SCHEDULE_UNITS: Final = ("h", "K", "kg/kg")
 STATIONARY_FIXED_FIELDS: Final = ("T_flow_ref", "p_ref", "p_out")
 STATIONARY_FIXED_UNITS: Final = ("K", "Pa", "Pa")
 TRANSIENT_SCALAR_INPUT_FIELDS: Final = (

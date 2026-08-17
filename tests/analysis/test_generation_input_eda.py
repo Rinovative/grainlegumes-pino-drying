@@ -39,11 +39,11 @@ def _config(
         natural_count=4,
         campaign_purpose=campaign_purpose,
     )
-    if profile_id == "transient_drying" and not startup_enabled:
+    if profile_id == "transient_drying":
         campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
         operations_path = path.parent / campaign["operations_config"]
         operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-        operations["boundary_schedule"]["startup_ramp"]["enabled"] = False
+        operations["boundary_schedule"]["startup_ramp"]["enabled"] = startup_enabled
         operations_path.write_text(
             yaml.safe_dump(operations, sort_keys=False),
             encoding="utf-8",
@@ -386,6 +386,40 @@ def test_dataset_schedule_mean_requires_exact_persisted_support(
         "str",
         unavailable.schedule_mean_unavailable,
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [1, 1.5, np.int64(2), np.float64(2.5)],
+)
+def test_finite_real_scalar_accepts_python_and_numpy_reals(value: object) -> None:
+    """Accept the finite real scalar families produced by pandas reductions."""
+    assert generation_inputs.diagnostics._finite_real_scalar(  # noqa: SLF001
+        value,
+        label="test value",
+    ) == pytest.approx(float(cast("Any", value)))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(True, id="bool"),
+        pytest.param(1.0 + 0.0j, id="complex"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinite"),
+        pytest.param("1.0", id="string"),
+        pytest.param(pd.Timestamp("2024-01-01"), id="timestamp"),
+        pytest.param(np.asarray((1.0,)), id="array"),
+        pytest.param(pd.Series((1.0,)), id="series"),
+    ],
+)
+def test_finite_real_scalar_rejects_nonreal_or_structured_values(value: object) -> None:
+    """Reject ambiguous, non-finite, and structured pandas values clearly."""
+    with pytest.raises((TypeError, ValueError), match=r"finite|real scalar"):
+        generation_inputs.diagnostics._finite_real_scalar(  # noqa: SLF001
+            value,
+            label="test value",
+        )
 
 
 def test_grouped_tables_expand_components_and_preserve_raw_values(
@@ -1036,7 +1070,8 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         startup_end_h = first.startup.duration_h
         persisted_times_h = source_schedule[:, 0]
         expected_operating_h = persisted_times_h[persisted_times_h >= startup_end_h]
-        expected_early_minutes = 60.0 * persisted_times_h[(persisted_times_h >= 0.0) & (persisted_times_h <= 1.0)]
+        display_times_h = np.linspace(0.0, 1.0, 61, dtype=np.float64)
+        expected_early_minutes = 60.0 * display_times_h
         observed_case_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for line in lines if line.get_label() == case_a_label]
         assert observed_case_supports
         assert all(
@@ -1045,13 +1080,91 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         assert any(np.array_equal(support, expected_operating_h) for support in observed_case_supports)
         assert any(np.array_equal(support, expected_early_minutes) for support in observed_case_supports)
 
+        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == "phi_in_bc [1]" and axis.get_xlabel() == "time [min]")
+        case_phi = next(line for line in phi_axis.lines if line.get_label() == case_a_label)
+        mean_phi = next(line for line in phi_axis.lines if line.get_label() == mean_label)
+        expected_case = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)
+        expected_mean = np.mean(
+            np.stack(tuple(generation_inputs.diagnostics.case_boundary_schedule(record, display_times_h)[:, 3] for record in summary.records)),
+            axis=0,
+        )
+        np.testing.assert_allclose(
+            np.asarray(case_phi.get_ydata(), dtype=np.float64),
+            expected_case[:, 3],
+        )
+        np.testing.assert_allclose(
+            np.asarray(mean_phi.get_ydata(), dtype=np.float64),
+            expected_mean,
+        )
+
         assert expected_operating_h[0] == startup_end_h
         assert not np.any(expected_operating_h == 0.0)
         assert expected_early_minutes[0] == 0.0
         assert expected_early_minutes[-1] == 60.0
         assert 60.0 * startup_end_h in expected_early_minutes
-        assert np.all((expected_early_minutes >= 0.0) & (expected_early_minutes <= 60.0))
-        assert np.all(np.diff(expected_early_minutes) >= 0.0)
+        assert {axis.get_title() for axis in figure.axes} >= {
+            "Operating schedule: 30 min onward",
+            "Startup and early operation: 0-60 min",
+        }
+        np.testing.assert_array_equal(first.schedule, source_schedule)
+    finally:
+        plt.close(figure)
+
+
+def test_disabled_startup_plot_uses_hourly_operation_without_hidden_support(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Treat ramp-disabled schedules as operating from time zero."""
+    config = _config(
+        generation_config_factory,
+        "transient_drying",
+        startup_enabled=False,
+    )
+    records = []
+    for case_index in (1, 2):
+        bundle = generation.cases.case.generate_case_input_bundle(
+            config,
+            case_index,
+            tmp_path / f"case_{case_index:04d}",
+        )
+        admitted = generation.cases.admission.admit_input_case(
+            bundle.directory,
+            source_id="disabled-startup-input",
+            label="disabled startup diagnostic fixture",
+            batch_storage_name=config.batch_storage_name,
+            campaign_purpose=str(config.scientific_values["campaign_purpose"]),
+        )
+        records.append(generation_inputs.diagnostics.build_case_diagnostics(admitted))
+
+    first, second = records
+    summary = generation_inputs.diagnostics.build_dataset_diagnostics(records)
+    source_schedule = np.array(generation_inputs.diagnostics.transient_evidence(first)[0], copy=True)
+    assert first.startup is not None
+    assert first.startup.enabled is False
+    np.testing.assert_array_equal(source_schedule[:3, 0], (0.0, 1.0, 2.0))
+    assert not np.any(source_schedule[:, 0] == 0.5)
+    np.testing.assert_array_equal(
+        generation_inputs.diagnostics.operating_schedule_rows(first),
+        source_schedule,
+    )
+
+    figure = generation_inputs.plots.boundaries.schedule_comparison(
+        first,
+        summary,
+        second,
+        summary,
+        same_dataset=True,
+    )
+    try:
+        titles = {axis.get_title() for axis in figure.axes}
+        assert "Operating schedule" in titles
+        assert "Early operation: 0-60 min" in titles
+        assert not any("startup" in title.lower() for title in titles)
+        case_label = f"Case {first.case.case_index} (A)"
+        supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines if line.get_label() == case_label]
+        assert any(np.array_equal(support, source_schedule[:, 0]) for support in supports)
+        assert any(np.array_equal(support, 60.0 * np.linspace(0.0, 1.0, 61)) for support in supports)
         np.testing.assert_array_equal(first.schedule, source_schedule)
     finally:
         plt.close(figure)
@@ -1134,7 +1247,7 @@ def test_schedule_plot_rejects_mismatched_startup_durations(
         second,
         startup=replace(second.startup, duration_h=second.startup.duration_h + 0.1),
     )
-    with pytest.raises(ValueError, match="different persisted startup durations"):
+    with pytest.raises(ValueError, match="different persisted startup policies"):
         generation_inputs.plots.boundaries.schedule_comparison(
             first,
             summary,

@@ -135,9 +135,23 @@ material trend only.
 ### Inlet schedule
 
 Generation creates temporal signals `T_in_bc(t)` and
-`omega_in_bc(t)`. Relative humidity `phi_in_bc(t)` is derived
-thermodynamically from temperature, humidity ratio, and reference pressure; it
-is not sampled independently.
+`omega_in_bc(t)`. The persisted `schedule.csv` contract is exactly
+`t;T_in_bc;omega_in_bc`, with units `h;K;kg/kg`; relative humidity is never a
+persisted or independently interpolated schedule channel. Instead,
+`phi_in_bc(t)` is derived canonically from the linearly interpolated primitive
+temperature and humidity ratio at `p_ref`:
+
+```text
+phi_in_bc = [p_ref omega_in_bc / (0.621945 + omega_in_bc)]
+            / p_sat(T_in_bc)
+```
+
+Python uses this derivation for validation and read-only input EDA. Continuous
+relative-humidity bounds are checked at every interval endpoint and exact
+interior stationary point, so a between-node extremum cannot escape validation.
+The transient COMSOL model must apply the same derivation after its primitive
+interpolation functions; the solved and exported relative-humidity field remains
+COMSOL's `mt.phi`.
 
 Schedule variability combines:
 
@@ -165,34 +179,28 @@ repaired by pointwise clipping. Schedule supports and composition are synthetic
 design assumptions, not literature measurements or active control.
 
 The accepted stochastic schedule remains canonical on
-`common.time.regular_times`. The fixed-bed operation applies a separate COMSOL
-handoff policy from `boundary_schedule.startup_ramp`: `enabled` selects the
-transformation, and `duration_h` is the physical boundary-startup duration in
-hours. It must lie strictly between zero and the first regular interval. The
-policy uses no bed-state or solver feedback and does not change regular COMSOL
-output, HDF5, or Dataset state times.
+`common.time.regular_times`. The maintained fixed-bed operation currently sets
+`boundary_schedule.startup_ramp.enabled: false`; consequently, the final COMSOL
+table is the unchanged canonical hourly support from 0 through 168 h. There is
+no hidden 0.5 h row, sub-hour output state, or boundary rejoin. `T_init` remains
+the domain initial state and is not substituted for the time-zero inlet forcing.
+The authored inactive `duration_h` is retained as resolved provenance but does
+not affect scientific or case-input identity while the ramp is disabled.
 
-At zero, the startup boundary begins exactly at the case initial temperature
-`T_init` and preserves the canonical initial `omega_in_bc`. Its `phi_in_bc` is
-derived thermodynamically from that temperature, humidity ratio, and `p_ref`.
-The initial startup state may therefore lie outside the regular operating
-temperature and relative-humidity envelopes, but it must remain physically valid;
-a supersaturated state fails closed rather than being repaired.
+The ramp capability remains explicit for campaigns that deliberately enable it.
+In that mode, `duration_h` must lie strictly between zero and the first regular
+interval. The boundary begins at `T_init` while preserving the canonical initial
+humidity ratio, then adds one primitive interpolation row at `duration_h` whose
+temperature and humidity ratio are the exact canonical linear interpolation.
+Derived relative humidity is recomputed from those primitives; it is never added
+to `schedule.csv`. The extra row is interpolation support, not a regular output
+state.
 
-The configured linear startup ramp rejoins the canonical schedule at
-`boundary_schedule.startup_ramp.duration_h`. Rejoin temperature and humidity
-ratio are the exact canonical linear interpolation at that time, and rejoin
-relative humidity is recomputed thermodynamically. Regular operating envelopes
-apply to the rejoin and canonical operating schedule, while every retained
-regular node remains unchanged.
-
-The extra row is boundary interpolation support, not a regular output state.
-COMSOL output, HDF5 state time, and Dataset transitions continue to use only
-`common.time.regular_times`. The final schedule bytes and handoff provenance
-participate in exact input identity. Disabling the ramp retains the canonical
-table values and times exactly. Absolute temperatures are persisted in kelvin;
-Celsius conversion is a
-presentation concern, while amplitudes, changes, differences, and rates remain
+In either mode, the handoff uses no bed-state or solver feedback. COMSOL output,
+HDF5 state time, and Dataset transitions use only `common.time.regular_times`.
+Final schedule bytes and active handoff provenance participate in exact input
+identity. Absolute temperatures are persisted in kelvin; Celsius conversion is
+a presentation concern, while amplitudes, changes, differences, and rates remain
 in K or K/h.
 
 ### Moisture, heat, and equilibrium coupling
