@@ -23,26 +23,20 @@ sampling:
   seed_base: 9200
   counts:
     natural:
-      lentil: 120
-      chickpea: 120
-      kidney_bean: 120
-      field_pea: 40
+      lentil: 160
+      chickpea: 160
+      kidney_bean: 160
+      field_pea: 60
       rapeseed: 40
-      sunflower_seed: 40
-    parameter_ood:
-      lentil: 60
-      chickpea: 60
-      kidney_bean: 60
+      sunflower_seed: 20
 membership:
   seed: 9250
   per_seen_material:
-    train: 96
-    validation: 12
-    id_test: 12
+    train: 128
+    validation: 16
+    id_test: 16
 dataset_packages:
 - evaluation_regime: id
-  source_role: seen
-- evaluation_regime: parameter_ood
   source_role: seen
 - evaluation_regime: near_family_ood
   source_role: near_family_ood

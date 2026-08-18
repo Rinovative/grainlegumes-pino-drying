@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +57,25 @@ _TERMINAL_FAILURE_STATES: Final = frozenset(
     }
 )
 _ACTIVE_PENDING_STATE: Final = "PENDING"
+_JOB_NAME_PATTERN: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_MAX_SLURM_JOB_NAME_LENGTH: Final = 48
+_TRANSFER_PUBLICATION_JOURNAL: Final = ".generation-transfer-publication.json"
+_MATERIAL_JOB_CODES: Final = {
+    "lentil": "lentil",
+    "chickpea": "chickpea",
+    "kidney_bean": "kidney",
+    "field_pea": "fieldpea",
+    "rapeseed": "rapeseed",
+    "sunflower_seed": "sunflower",
+}
+_REGIME_JOB_CODES: Final = {
+    "id": "id",
+    "parameter_ood": "param",
+    "near_family_ood": "near",
+    "far_family_ood": "far",
+    "extreme_family_ood": "stress",
+    "none": "none",
+}
 
 
 def _utc_now() -> str:
@@ -171,9 +189,50 @@ def _task_from_payload(
     return task
 
 
-def _scheduler_job_name(prefix: str, submission_index: int) -> str:
-    """Return one unique bounded job name for an exact submission intent."""
-    return f"{prefix}-{submission_index:04d}"
+def _profile_job_code(campaign: config_service.CampaignConfig) -> str:
+    """Return the compact readable profile component for Slurm names."""
+    return "td" if campaign.profile.id == "transient_drying" else "sf"
+
+
+def _regime_job_code(
+    campaign: config_service.CampaignConfig,
+    batch: config_service.GenerationConfig,
+) -> str:
+    """Return the operator-facing regime component for one campaign batch."""
+    if campaign.campaign_purpose == "technical_runtime_smoke":
+        return "smoke"
+    if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+        return "pilot"
+    if batch.sampling_regime == "parameter_ood":
+        return "param"
+    try:
+        return _REGIME_JOB_CODES[batch.evaluation_regime]
+    except KeyError as error:
+        message = f"Campaign batch has no readable Slurm regime code: {batch.evaluation_regime!r}."
+        raise ValueError(message) from error
+
+
+def _scheduler_job_name(
+    campaign: config_service.CampaignConfig,
+    task: cluster_service.CampaignTask,
+    *,
+    attempt_index: int,
+    run_id: str,
+) -> str:
+    """Return one readable, unique, bounded Slurm name for a case attempt."""
+    if attempt_index < 1:
+        message = "Campaign Slurm attempt_index must be positive."
+        raise ValueError(message)
+    batch = campaign.batch(task.batch_name)
+    material = _MATERIAL_JOB_CODES.get(batch.material_family)
+    if material is None:
+        material = re.sub(r"[^a-z0-9]+", "", batch.material_family.lower())
+    suffix = run_id.rsplit("__", maxsplit=1)[-1][:4]
+    value = f"{_profile_job_code(campaign)}-{material}-{_regime_job_code(campaign, batch)}-c{task.case_index:04d}-a{attempt_index:02d}-{suffix}"
+    if len(value) > _MAX_SLURM_JOB_NAME_LENGTH or _JOB_NAME_PATTERN.fullmatch(value) is None:
+        message = f"Campaign Slurm job name is unsafe or exceeds 48 characters: {value!r}."
+        raise ValueError(message)
+    return value
 
 
 def _state_batch_root_for_plan(
@@ -199,7 +258,7 @@ def _new_campaign_manifest(
 ) -> dict[str, Any]:
     """Return durable feeder state before the first one-case submission."""
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
-    scheduler_prefix = f"vp2-{run_id.rsplit('__', maxsplit=1)[-1]}"
+    scheduler_prefix = f"{_profile_job_code(campaign)}-campaign-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
     return {
         "schema_kind": "generation_campaign_run",
         "schema_version": 1,
@@ -269,13 +328,18 @@ def plan_campaign(
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     log_directory = run_directory / "scheduler"
     tasks = cluster_service.campaign_tasks(campaign)
-    prefix = f"vp2-{run_id.rsplit('__', maxsplit=1)[-1]}"
     first_command = cluster_service.build_campaign_case_slurm_submission_command(
         campaign,
         tasks[0],
         run_id=run_id,
         scheduler_log_directory=log_directory,
-        scheduler_job_name=_scheduler_job_name(prefix, 1),
+        scheduler_job_name=_scheduler_job_name(
+            campaign,
+            tasks[0],
+            attempt_index=1,
+            run_id=run_id,
+        ),
+        attempt_index=1,
     )
     return {
         "schema_kind": "generation_campaign_plan",
@@ -677,6 +741,9 @@ def _task_state(
     attempt_index: int | None = None
     quality_flag_count = 0
     canonical_raw_case: str | None = None
+    license_retry_eligible = False
+    license_wait_exhausted = False
+    license_first_blocked_at: str | None = None
 
     if batch_runtime.completed_case_is_valid(
         batch,
@@ -724,6 +791,15 @@ def _task_state(
                     job_id=str(latest_submission["job_id"]),
                     storage_root=storage_root,
                 )
+            if retry_attempt is not None:
+                first_blocked_at = retry_attempt.get(
+                    "first_blocked_at",
+                    retry_attempt.get("timestamp"),
+                )
+                if first_blocked_at is not None and not isinstance(first_blocked_at, str):
+                    message = f"Temporary-license first blocked timestamp is malformed for {task.case_id}."
+                    raise TypeError(message)
+                license_first_blocked_at = first_blocked_at
             attempt = _admitted_case_attempt(
                 manifest,
                 batch,
@@ -750,18 +826,23 @@ def _task_state(
                 quality_flag_count = len(flags) if isinstance(flags, list) else 0
                 raw_reference = attempt.payload.get("canonical_raw_case")
                 canonical_raw_case = raw_reference if isinstance(raw_reference, str) else None
+                if state == "license_blocked":
+                    cleanup = attempt_service.attempt_cleanup_evidence(attempt)
+                    if cleanup is not None and cleanup["status"] == "failed":
+                        state = "failed"
+                        reason = "license_attempt_scratch_cleanup_failed"
+                        pipeline["solver_state"] = "failed"
+                    else:
+                        if retry_attempt is None:
+                            message = f"License-blocked attempt lacks its retry receipt: {attempt.receipt_path}"
+                            raise ValueError(message)
+                        license_wait_exhausted = not bool(retry_attempt["retry_budget_remaining"])
+                        license_retry_eligible = not license_wait_exhausted and license_service.retry_attempt_is_eligible(retry_attempt)
             elif retry_attempt is not None:
-                if not retry_attempt["retry_budget_remaining"]:
-                    state = "failed"
-                    reason = license_service.EXHAUSTED_REASON
-                    failure_stage = "solver"
-                    pipeline["solver_state"] = "failed"
-                elif license_service.retry_attempt_is_eligible(retry_attempt):
-                    state = "retry_eligible"
-                    reason = license_service.TEMPORARY_LICENSE_CAPACITY
-                else:
-                    state = "retry_waiting"
-                    reason = license_service.TEMPORARY_LICENSE_CAPACITY
+                state = "license_blocked"
+                reason = license_service.TEMPORARY_LICENSE_CAPACITY
+                license_wait_exhausted = not bool(retry_attempt["retry_budget_remaining"])
+                license_retry_eligible = not license_wait_exhausted and license_service.retry_attempt_is_eligible(retry_attempt)
             elif batch_runtime.case_failure_is_recorded(
                 batch,
                 task.case_index,
@@ -805,6 +886,9 @@ def _task_state(
         **scheduler_view,
         "runtime_progress": runtime_progress,
         "temporary_license_retry": retry_attempt,
+        "license_retry_eligible": license_retry_eligible,
+        "license_wait_exhausted": license_wait_exhausted,
+        "license_first_blocked_at": license_first_blocked_at,
     }
 
 
@@ -844,6 +928,20 @@ def _reconciled(
     return task_views, pending_jobs, running_jobs
 
 
+def _next_case_attempt_index(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+) -> int:
+    """Return one plus the count of real persisted jobs for this case."""
+    return (
+        sum(
+            record["status"] == "submitted" and isinstance(record["job_id"], str) and bool(record["job_id"])
+            for record in _task_submissions(manifest, task)
+        )
+        + 1
+    )
+
+
 def _submit_one(
     manifest: dict[str, Any],
     campaign: config_service.CampaignConfig,
@@ -857,13 +955,20 @@ def _submit_one(
         message = f"Unsupported campaign submission mode: {mode!r}."
         raise ValueError(message)
     index = len(manifest["submissions"]) + 1
-    job_name = _scheduler_job_name(str(manifest["scheduler_job_name"]), index)
+    attempt_index = _next_case_attempt_index(manifest, task)
+    job_name = _scheduler_job_name(
+        campaign,
+        task,
+        attempt_index=attempt_index,
+        run_id=str(manifest["campaign_run_id"]),
+    )
     command = cluster_service.build_campaign_case_slurm_submission_command(
         campaign,
         task,
         run_id=str(manifest["campaign_run_id"]),
         scheduler_log_directory=Path(manifest["scheduler_log_directory"]),
         scheduler_job_name=job_name,
+        attempt_index=attempt_index,
     )
     record = {
         "submission_index": index,
@@ -991,10 +1096,15 @@ def feed_campaign(
             )
             return manifest
 
-        next_retry = next(
-            (view for view in task_views if view["state"] == "retry_eligible"),
-            None,
+        active_license_probe = any(
+            record["mode"] == "license_retry" and record["status"] == "submitted" and record["job_id"] in scheduler["active"]
+            for record in manifest.get("submissions", ())
         )
+        eligible_blocked = sorted(
+            (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
+            key=lambda view: str(view["license_first_blocked_at"]),
+        )
+        next_retry = None if active_license_probe or not eligible_blocked else eligible_blocked[0]
         next_unsent = next(
             (view for view in task_views if view["state"] == "never_started"),
             None,
@@ -1002,14 +1112,15 @@ def feed_campaign(
         unresolved_solver_failures = sum(view["state"] in {"failed", "timed_out"} for view in task_views)
         maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
         circuit_breaker_tripped = unresolved_solver_failures > maximum_failed_cases
+        blocked_cases_exist = any(view["state"] == "license_blocked" for view in task_views)
         next_view = next_retry
-        if next_view is None and not circuit_breaker_tripped:
+        if next_view is None and not active_license_probe and not blocked_cases_exist and not circuit_breaker_tripped:
             next_view = next_unsent
         if next_view is None:
             if pending_jobs or running_jobs:
                 manifest["state"] = "active"
-            elif any(view["state"] == "retry_waiting" for view in task_views):
-                manifest["state"] = "waiting_retry"
+            elif any(view["state"] == "license_blocked" for view in task_views):
+                manifest["state"] = "license_blocked"
             elif circuit_breaker_tripped and next_unsent is not None:
                 manifest["state"] = "failure_threshold_reached"
             else:
@@ -1027,7 +1138,7 @@ def feed_campaign(
             manifest,
             campaign,
             task,
-            mode=("license_retry" if next_view["state"] == "retry_eligible" else "initial"),
+            mode=("license_retry" if next_view["state"] == "license_blocked" else "initial"),
             storage_root=storage_root,
         )
 
@@ -1138,6 +1249,21 @@ def resume_campaign(
                 storage_root=storage_root,
             )
 
+        eligible_blocked = sorted(
+            (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
+            key=lambda view: str(view["license_first_blocked_at"]),
+        )
+        if eligible_blocked:
+            task = _task_from_payload(campaign, eligible_blocked[0])
+            manifest["state"] = "active"
+            return _submit_one(
+                manifest,
+                campaign,
+                task,
+                mode="license_retry",
+                storage_root=storage_root,
+            )
+
         replay_view = next(
             (
                 view
@@ -1188,6 +1314,12 @@ def resume_campaign(
             restart_view = next(
                 (view for view in task_views if view["state"] == "never_started"),
                 None,
+            )
+        if restart_view is None and any(view["state"] == "license_blocked" for view in task_views):
+            manifest["state"] = "license_blocked"
+            return _write_campaign_manifest(
+                manifest,
+                storage_root=storage_root,
             )
         if restart_view is None:
             manifest["state"] = "completed_with_failures"
@@ -1270,8 +1402,7 @@ def retry_campaign_case(
             "active",
             "pending",
             "scheduler_unknown",
-            "retry_waiting",
-            "retry_eligible",
+            "license_blocked",
         }:
             message = f"Case is still active or operationally retrying: {batch_name}/{case_id}."
             raise RuntimeError(message)
@@ -1477,8 +1608,8 @@ def _batch_status(
         "cancelled": sum(view["state"] == "cancelled" for view in selected),
         "interrupted": sum(view["state"] == "interrupted" for view in selected),
         "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in selected),
-        "waiting_retry": sum(view["state"] == "retry_waiting" for view in selected),
-        "retry_eligible": sum(view["state"] == "retry_eligible" for view in selected),
+        "license_blocked": sum(view["state"] == "license_blocked" for view in selected),
+        "license_retry_eligible": sum(view["state"] == "license_blocked" and view["license_retry_eligible"] is True for view in selected),
         "scheduler_unknown": sum(view["state"] == "scheduler_unknown" for view in selected),
         "quarantined": (len(tuple(quarantine.iterdir())) if quarantine.is_dir() else 0),
         "terminal_manifest": str(terminal_path),
@@ -1538,10 +1669,10 @@ def campaign_status(
         "cancelled": sum(view["state"] == "cancelled" for view in task_views),
         "interrupted": sum(view["state"] == "interrupted" for view in task_views),
         "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in task_views),
-        "waiting_retry": sum(view["state"] == "retry_waiting" for view in task_views),
+        "license_blocked": sum(view["state"] == "license_blocked" for view in task_views),
     }
     unknown_cases = sum(view["state"] == "scheduler_unknown" for view in task_views)
-    retry_eligible_cases = sum(view["state"] == "retry_eligible" for view in task_views)
+    license_retry_eligible_cases = sum(view["state"] == "license_blocked" and view["license_retry_eligible"] is True for view in task_views)
     replayable_cases = sum(view["postprocessing_replay_available"] is True for view in task_views)
     unresolved_failure_states = {
         "failed",
@@ -1573,8 +1704,8 @@ def campaign_status(
     elif manifest["submission_intent"] is not None or unknown_cases:
         state = "submission_pending_or_unknown"
         next_command = f"status {run_id}"
-    elif count_states["waiting_retry"]:
-        state = "waiting_retry"
+    elif count_states["license_blocked"]:
+        state = "license_blocked"
         next_command = f"status {run_id}"
     elif all_successful and publication_complete:
         state = "transfer_complete" if transfer_receipt else "successful"
@@ -1582,7 +1713,9 @@ def campaign_status(
     elif cancellation_requested:
         state = "cancelled"
         next_command = f"resume {run_id}"
-    elif count_states["never_started"] or count_states["cancelled"] or count_states["interrupted"] or replayable_cases or retry_eligible_cases:
+    elif (
+        count_states["never_started"] or count_states["cancelled"] or count_states["interrupted"] or replayable_cases or license_retry_eligible_cases
+    ):
         state = "feeding"
         next_command = f"resume {run_id}"
     elif unresolved_cases:
@@ -1593,11 +1726,12 @@ def campaign_status(
         next_command = f"feed-campaign {run_id}"
 
     failed_cases = unresolved_cases
+    cases_per_material = len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None
     return {
         "campaign_run_id": run_id,
         "campaign_state": state,
         "campaign_purpose": campaign.campaign_purpose,
-        "cases_per_material": (len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None),
+        "cases_per_material": cases_per_material,
         "git_commit": manifest["git_commit"],
         "slurm_job_ids": manifest["slurm_job_ids"],
         "scheduler_job_name": manifest["scheduler_job_name"],
@@ -1611,8 +1745,8 @@ def campaign_status(
         "running_jobs": running_jobs,
         "unsent_cases": count_states["never_started"],
         "unknown_cases": unknown_cases,
-        "retry_waiting_cases": count_states["waiting_retry"],
-        "retry_eligible_cases": retry_eligible_cases,
+        "license_blocked_cases": count_states["license_blocked"],
+        "license_retry_eligible_cases": license_retry_eligible_cases,
         "postprocessing_replay_available_cases": replayable_cases,
         "unresolved_solver_failed_cases": unresolved_solver_failures,
         "maximum_failed_cases": maximum_failed_cases,
@@ -1705,6 +1839,7 @@ def finalize_campaign_run(
         batch_manifest = batch_runtime.validate_terminal_batch(
             batch,
             storage_root=storage_root,
+            validation_depth="routine",
         )
         path = batch_runtime.batch_meta_directory(batch, storage_root=storage_root) / "batch_manifest.json"
         if batch_manifest["git_commit"] != manifest["git_commit"]:
@@ -1845,6 +1980,168 @@ def campaign_transfer_inventory(
     return campaign_evidence.transfer_inventory_from_plan(plan, storage_root=root)
 
 
+def _transfer_ignored_paths(plan: dict[str, Any], relative_value: str) -> frozenset[str]:
+    """Return post-transfer operational paths ignored for one directory."""
+    if relative_value == plan["campaign_directory"]:
+        return campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS
+    return frozenset()
+
+
+def _campaign_transfer_directory_records(
+    plan: dict[str, Any],
+    *,
+    staging: Path,
+) -> list[dict[str, str]]:
+    """Return journal-ready directory identities from complete incoming bytes."""
+    relative_directories = [
+        directory
+        for batch in plan["batches"]
+        for directory in (
+            batch["meta_directory"],
+            batch["raw_directory"],
+            batch["processed_directory"],
+            *batch["attempt_directories"],
+        )
+    ]
+    relative_directories.append(plan["campaign_directory"])
+    records: list[dict[str, str]] = []
+    for relative_value in relative_directories:
+        relative = Path(relative_value)
+        source = (staging / relative).resolve()
+        if relative.is_absolute() or ".." in relative.parts or not source.is_relative_to(staging):
+            message = f"Transfer plan contains an unsafe directory: {relative_value!r}"
+            raise ValueError(message)
+        records.append(
+            {
+                "relative_path": relative_value,
+                "identity": campaign_evidence.directory_identity(
+                    source,
+                    ignored_relative_paths=_transfer_ignored_paths(plan, relative_value),
+                ),
+            }
+        )
+    return records
+
+
+def _load_or_create_campaign_transfer_journal(
+    run_id: str,
+    *,
+    staging: Path,
+    destination: Path,
+    source_host: str,
+    source_storage_root: str,
+) -> dict[str, Any]:
+    """Load or immutably establish interruption-recovery transfer evidence."""
+    journal_path = staging / _TRANSFER_PUBLICATION_JOURNAL
+    expected_identity = {
+        "schema_kind": "generation_transfer_publication",
+        "schema_version": 1,
+        "campaign_run_id": run_id,
+        "source_host": source_host,
+        "source_storage_root": source_storage_root,
+        "destination_storage_root": str(destination),
+    }
+    expected_keys = {
+        *expected_identity,
+        "terminal",
+        "plan",
+        "source_inventory",
+        "directories",
+    }
+    if journal_path.exists():
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            message = f"Could not read transfer publication journal: {journal_path}"
+            raise ValueError(message) from error
+        if (
+            not isinstance(journal, dict)
+            or set(journal) != expected_keys
+            or any(journal.get(key) != value for key, value in expected_identity.items())
+        ):
+            message = f"Transfer publication journal conflicts: {journal_path}"
+            raise RuntimeError(message)
+        return journal
+    terminal = validate_terminal_campaign(run_id, storage_root=staging)
+    plan = campaign_transfer_plan(run_id, storage_root=staging)
+    source_inventory = campaign_evidence.transfer_inventory_from_plan(
+        plan,
+        storage_root=staging,
+    )
+    journal = {
+        **expected_identity,
+        "terminal": {
+            "campaign_id": terminal["campaign_id"],
+            "git_commit": terminal["git_commit"],
+        },
+        "plan": plan,
+        "source_inventory": source_inventory,
+        "directories": _campaign_transfer_directory_records(plan, staging=staging),
+    }
+    common.serialization.atomic_write_json(journal_path, journal)
+    return journal
+
+
+def _publish_incoming_campaign_directories(
+    journal: dict[str, Any],
+    *,
+    staging: Path,
+    destination: Path,
+) -> list[dict[str, str]]:
+    """Publish journaled incoming directories by verified atomic rename."""
+    plan = journal.get("plan")
+    records = journal.get("directories")
+    if not isinstance(plan, dict) or not isinstance(records, list):
+        message = "Transfer publication journal plan or directories are malformed."
+        raise TypeError(message)
+    outcomes: list[dict[str, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"relative_path", "identity"}:
+            message = "Transfer publication journal directory is malformed."
+            raise TypeError(message)
+        relative_value = record["relative_path"]
+        expected_identity = record["identity"]
+        if not isinstance(relative_value, str) or not isinstance(expected_identity, str):
+            message = "Transfer publication journal directory identity is malformed."
+            raise TypeError(message)
+        relative = Path(relative_value)
+        source = (staging / relative).resolve()
+        target = (destination / relative).resolve()
+        if relative.is_absolute() or ".." in relative.parts or not source.is_relative_to(staging) or not target.is_relative_to(destination):
+            message = f"Transfer directory escapes a storage root: {relative_value!r}"
+            raise ValueError(message)
+        ignored = _transfer_ignored_paths(plan, relative_value)
+        if target.exists():
+            if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored) != expected_identity:
+                message = f"Existing transfer destination conflicts with incoming identity: {target}"
+                raise FileExistsError(message)
+            if source.exists() and campaign_evidence.directory_identity(source, ignored_relative_paths=ignored) != expected_identity:
+                message = f"Incoming transfer source conflicts with its journal: {source}"
+                raise RuntimeError(message)
+            status = "reused"
+        else:
+            if not source.is_dir() or source.is_symlink():
+                message = f"Incoming transfer source is missing or unsafe: {source}"
+                raise FileNotFoundError(message)
+            if campaign_evidence.directory_identity(source, ignored_relative_paths=ignored) != expected_identity:
+                message = f"Incoming transfer source conflicts with its journal: {source}"
+                raise RuntimeError(message)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+            if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored) != expected_identity:
+                message = f"Transferred directory identity changed during atomic publication: {target}"
+                raise RuntimeError(message)
+            status = "published"
+        outcomes.append(
+            {
+                "directory": relative_value,
+                "status": status,
+                "identity": expected_identity,
+            }
+        )
+    return outcomes
+
+
 def publish_transferred_campaign(
     run_id: str,
     *,
@@ -1853,7 +2150,7 @@ def publish_transferred_campaign(
     source_host: str,
     source_storage_root: str,
 ) -> dict[str, Any]:
-    """Validate staged bytes, atomically publish directories, and mark transfer."""
+    """Validate incoming bytes and atomically rename them into final locations."""
     if not source_host or any(character in source_host for character in "\r\n\t"):
         message = "Transfer source_host must be non-empty text without control characters."
         raise ValueError(message)
@@ -1866,94 +2163,34 @@ def publish_transferred_campaign(
     ):
         message = "Transfer source_storage_root must be one absolute non-root path without traversal or controls."
         raise ValueError(message)
-    staging = workspace_service.validate_transfer_staging(
-        staging_root,
-        run_id=run_id,
-    )
-    destination = workspace_service.resolve_storage_root(
-        destination_root,
-        create=True,
-    )
-    if staging == destination:
-        message = "Transfer staging and destination storage roots must differ."
+    staging = workspace_service.validate_transfer_staging(staging_root, run_id=run_id)
+    destination = workspace_service.resolve_storage_root(destination_root, create=True)
+    incoming_root = (destination / ".incoming").resolve()
+    if not staging.is_relative_to(incoming_root) or staging.stat().st_dev != destination.stat().st_dev:
+        message = "Transfer staging must be below destination .incoming on the destination filesystem."
         raise ValueError(message)
-    terminal = validate_terminal_campaign(run_id, storage_root=staging)
-    plan = campaign_transfer_plan(run_id, storage_root=staging)
-    source_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=staging)
-    relative_directories = [
-        directory
-        for batch in plan["batches"]
-        for directory in (
-            batch["meta_directory"],
-            batch["raw_directory"],
-            batch["processed_directory"],
-            *batch["attempt_directories"],
-        )
-    ]
-    relative_directories.append(plan["campaign_directory"])
-    publication_root = common.paths.get_generation_state_root(storage_root=destination) / "transfer-publication"
-    outcomes: list[dict[str, str]] = []
-    for directory_index, relative_value in enumerate(relative_directories):
-        relative = Path(relative_value)
-        if relative.is_absolute() or ".." in relative.parts:
-            message = f"Transfer plan contains an unsafe directory: {relative_value!r}"
-            raise ValueError(message)
-        source = (staging / relative).resolve()
-        target = (destination / relative).resolve()
-        if not source.is_relative_to(staging) or not target.is_relative_to(destination):
-            message = f"Transfer directory escapes a storage root: {relative_value!r}"
-            raise ValueError(message)
-        ignored_relative_paths = campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
-        source_identity = campaign_evidence.directory_identity(source, ignored_relative_paths=ignored_relative_paths)
-        if target.exists():
-            target_identity = campaign_evidence.directory_identity(target, ignored_relative_paths=ignored_relative_paths)
-            if target_identity != source_identity:
-                message = f"Existing transfer destination conflicts with staged identity: {target}"
-                raise FileExistsError(message)
-            outcomes.append(
-                {
-                    "directory": relative_value,
-                    "status": "reused",
-                    "identity": source_identity,
-                }
-            )
-            continue
-        publication_case_id = f"transfer-{directory_index:04d}"
-        publication_stage = workspace_service.create_publication_staging(
-            storage_root=destination,
-            publication_root=publication_root,
-            run_id=run_id,
-            case_id=publication_case_id,
-        )
-        payload = publication_stage / "payload"
-        shutil.copytree(source, payload)
-        if campaign_evidence.directory_identity(payload, ignored_relative_paths=ignored_relative_paths) != source_identity:
-            message = f"Transfer copy changed staged identity: {relative_value!r}"
-            raise RuntimeError(message)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        payload.replace(target)
-        if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored_relative_paths) != source_identity:
-            message = f"Transferred directory identity changed during publication: {target}"
-            raise RuntimeError(message)
-        workspace_service.cleanup_publication_staging(
-            publication_stage,
-            storage_root=destination,
-            publication_root=publication_root,
-            run_id=run_id,
-            case_id=publication_case_id,
-            allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
-        )
-        outcomes.append(
-            {
-                "directory": relative_value,
-                "status": "published",
-                "identity": source_identity,
-            }
-        )
+    journal = _load_or_create_campaign_transfer_journal(
+        run_id,
+        staging=staging,
+        destination=destination,
+        source_host=source_host,
+        source_storage_root=source_storage_root,
+    )
+    outcomes = _publish_incoming_campaign_directories(
+        journal,
+        staging=staging,
+        destination=destination,
+    )
+    plan = journal["plan"]
+    source_inventory = journal["source_inventory"]
+    terminal = journal["terminal"]
+    if not isinstance(plan, dict) or not isinstance(source_inventory, dict) or not isinstance(terminal, dict):
+        message = "Transfer publication journal terminal evidence is malformed."
+        raise TypeError(message)
     validated = validate_terminal_campaign(run_id, storage_root=destination)
     destination_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
     if destination_inventory != source_inventory:
-        message = "Published GPU campaign inventory differs from the staged transfer source."
+        message = "Published campaign inventory differs from the incoming transfer source."
         raise RuntimeError(message)
     terminal_path = campaign_evidence.campaign_run_directory(run_id, storage_root=destination) / "campaign_terminal.json"
     receipt_path = campaign_evidence.campaign_run_directory(run_id, storage_root=destination) / "transfer_complete.json"

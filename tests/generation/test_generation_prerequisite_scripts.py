@@ -357,6 +357,7 @@ def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) 
         {
             "SLURM_CPUS_PER_TASK": "16",
             "GENERATION_CAMPAIGN_RUN_ID": _CAMPAIGN_RUN_ID,
+            "GENERATION_ATTEMPT_INDEX": "1",
         }
     )
 

@@ -236,14 +236,25 @@ def test_attempt_admission_requires_exact_version_one_schema(
 def test_production_solver_failure_is_compact_and_hash_admitted(
     generation_config_factory: Any,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Omit large model and export bytes from a Production solver failure."""
+    """Omit large payloads and bound logs for a Production solver failure."""
     config, storage, prepared = _configured_case(
         generation_config_factory,
         tmp_path,
         campaign_purpose="family_generalization",
     )
     exported = _populate_attempt_artifacts(config, prepared)
+    maximum_log_bytes = 128
+    monkeypatch.setattr(
+        attempt_service,
+        "_MAX_RETAINED_RUNTIME_LOG_BYTES",
+        maximum_log_bytes,
+    )
+    for name in ("solver.log", "stdout.log", "stderr.log"):
+        (prepared.runtime_directory / name).write_bytes(
+            b"HEAD-" + b"x" * maximum_log_bytes + b"-TAIL\n",
+        )
 
     attempt = _publish(
         config,
@@ -260,6 +271,12 @@ def test_production_solver_failure_is_compact_and_hash_admitted(
     assert "payload/solved.mph" not in retained
     assert all(f"payload/{relative}" not in retained for relative in exported)
     assert not attempt.replay_available
+    for name in ("solver.log", "stdout.log", "stderr.log"):
+        retained_log = (attempt.directory / "payload/runtime" / name).read_bytes()
+        assert len(retained_log) <= maximum_log_bytes
+        assert retained_log.startswith(b"HEAD-")
+        assert retained_log.endswith(b"-TAIL\n")
+        assert b"retained log middle omitted" in retained_log
     solver_log = attempt.directory / "payload/runtime/solver.log"
     solver_log.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="artifact identity"):

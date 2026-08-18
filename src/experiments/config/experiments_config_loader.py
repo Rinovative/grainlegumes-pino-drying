@@ -1313,7 +1313,7 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
         "project_root": str(common.paths.get_project_root()),
         "storage_root": str(common.paths.get_storage_root()),
         "dataset_metadata_root": str(common.paths.get_dataset_metadata_root()),
-        "dataset_root": str(common.paths.get_dataset_payload_root()),
+        "dataset_root": str(common.paths.get_dataset_packages_root()),
         "output_root": str(common.paths.get_experiments_root()),
     }
     run = _as_mapping(effective["run"], path="run")

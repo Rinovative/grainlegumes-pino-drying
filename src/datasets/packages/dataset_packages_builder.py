@@ -345,7 +345,7 @@ def _publish(
     storage_root: Path | str | None,
 ) -> tuple[Path, Path, bool]:
     """Atomically publish or integrity-reuse one locked immutable package."""
-    payload_root = common.paths.get_dataset_payload_root(storage_root=storage_root)
+    payload_root = common.paths.get_dataset_packages_root(storage_root=storage_root)
     metadata_root = common.paths.get_dataset_metadata_root(storage_root=storage_root)
     destination_dir = payload_root / dataset_id
     metadata_dir = metadata_root / dataset_id

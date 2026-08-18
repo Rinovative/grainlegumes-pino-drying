@@ -171,7 +171,7 @@ def _validate_campaign_run_header(
         "submission_unknown",
         "scheduler_unknown",
         "failure_threshold_reached",
-        "waiting_retry",
+        "license_blocked",
         "completed_with_failures",
         "complete",
         "cancel_requested",
@@ -245,11 +245,18 @@ def _validate_submission_configuration(
             for key in (
                 "initial_delay_seconds",
                 "maximum_delay_seconds",
-                "maximum_wait_seconds",
+            )
+        )
+        or (
+            retry.get("maximum_wait_seconds") is not None
+            and (
+                isinstance(retry["maximum_wait_seconds"], bool)
+                or not isinstance(retry["maximum_wait_seconds"], (int, float))
+                or not 0.0 < float(retry["maximum_wait_seconds"]) < float("inf")
             )
         )
         or retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]
-        or retry["maximum_wait_seconds"] < retry["initial_delay_seconds"]
+        or (retry["maximum_wait_seconds"] is not None and retry["maximum_wait_seconds"] < retry["initial_delay_seconds"])
     ):
         message = f"Campaign-run temporary-license retry configuration is malformed: {run_id}."
         raise ValueError(message)

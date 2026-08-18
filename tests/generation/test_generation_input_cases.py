@@ -941,3 +941,27 @@ def test_generate_input_cases_cli_reports_bounded_technical_smoke(
     overflow[overflow.index("--case-count") + 1] = "2"
     assert cli_generation.main(overflow) == 2
     assert "exceeds configured batch membership" in capsys.readouterr().err
+
+
+def test_generation_cli_renders_context_for_unexpected_key_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Never reduce a workflow failure to one bare missing-key string."""
+
+    def fail_dispatch(_arguments: Any) -> int:
+        missing_key = "T_flow_ref"
+        raise KeyError(missing_key)
+
+    monkeypatch.setattr(cli_generation, "_dispatch", fail_dispatch)
+
+    assert cli_generation.main(["list-campaigns"]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error == {
+        "command": "list-campaigns",
+        "context": {},
+        "error_type": "KeyError",
+        "message": "'T_flow_ref'",
+        "stage": "list-campaigns",
+        "status": "error",
+    }

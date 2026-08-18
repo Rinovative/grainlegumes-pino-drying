@@ -1,4 +1,4 @@
-# ruff: noqa: S101, PLR2004
+# ruff: noqa: S101, PLR2004, SLF001
 """Dynamic per-case feeder, Slurm identity, and transfer contracts."""
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ def test_one_case_submission_and_local_only_concurrency(
         run_id="synthetic__0123456789abcdef",
         scheduler_log_directory=tmp_path.resolve(),
         scheduler_job_name="vp2-synthetic-0001",
+        attempt_index=1,
     )
     assert command[0] == "sbatch"
     assert "--nodes=1" in command
@@ -70,6 +71,7 @@ def test_one_case_submission_and_local_only_concurrency(
     assert worker_arguments[launcher_index + 1] == str(launcher.parents[1])
     assert task.batch_name in worker_arguments
     assert str(task.case_index) in worker_arguments
+    assert "GENERATION_ATTEMPT_INDEX=1" in worker_arguments
 
     plan = cluster.build_local_resource_plan(
         cores_per_case=1,
@@ -235,38 +237,46 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Progress one persisted case through waiting, eligibility, retry, and success."""
+    """Retry the oldest blocked case without allowing a fresh license probe."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
-        natural_count=1,
+        natural_count=2,
+        pending_buffer=2,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     task = cluster.campaign_tasks(campaign)[0]
     commit = "9" * 40
     storage = tmp_path / "storage"
-    submitted_ids = iter(("4101", "4102"))
+    submitted_ids = iter(("4101", "4102", "4103"))
     submit_commands: list[list[str]] = []
     retry_eligible = {"value": False}
+    retry_active = {"value": False}
     completed = {"value": False}
     retry_attempt = {
         "classification": "temporary_license_capacity",
         "retry_budget_remaining": True,
+        "timestamp": "2026-01-01T00:00:00+00:00",
     }
 
     def fake_submit(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         arguments = list(command)
         assert arguments[0] == "sbatch"
         submit_commands.append(arguments)
+        job_id = next(submitted_ids)
+        if job_id == "4102":
+            retry_active["value"] = True
         return subprocess.CompletedProcess(
             arguments,
             0,
-            stdout=f"{next(submitted_ids)}\n",
+            stdout=f"{job_id}\n",
             stderr="",
         )
 
     def scheduler_evidence(job_ids: list[str]) -> dict[str, Any]:
+        active = {"4102": ["4102", "RUNNING"]} if retry_active["value"] and "4102" in job_ids else {}
         return _scheduler(
-            accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids},
+            active=active,
+            accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids if job_id not in active},
         )
 
     def latest_attempt(
@@ -325,16 +335,18 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     assert len(submit_commands) == 1
 
     waiting = generation.campaign.campaign_status(run_id, storage_root=storage)
-    assert waiting["campaign_state"] == "waiting_retry"
-    assert waiting["cases"][0]["state"] == "retry_waiting"
+    assert waiting["campaign_state"] == "license_blocked"
+    assert waiting["cases"][0]["state"] == "license_blocked"
+    assert waiting["cases"][0]["license_retry_eligible"] is False
     held = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert held["state"] == "waiting_retry"
+    assert held["state"] == "license_blocked"
     assert len(submit_commands) == 1
 
     retry_eligible["value"] = True
     eligible = generation.campaign.campaign_status(run_id, storage_root=storage)
-    assert eligible["campaign_state"] == "feeding"
-    assert eligible["cases"][0]["state"] == "retry_eligible"
+    assert eligible["campaign_state"] == "license_blocked"
+    assert eligible["cases"][0]["state"] == "license_blocked"
+    assert eligible["cases"][0]["license_retry_eligible"] is True
     retried = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert retried["slurm_job_ids"] == ["4101", "4102"]
     assert [record["mode"] for record in retried["submissions"]] == [
@@ -349,7 +361,11 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     }
     assert all(record["case"] == expected_case for record in retried["submissions"])
     assert len(submit_commands) == 2
+    active_probe = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert active_probe["state"] == "active"
+    assert len(submit_commands) == 2
 
+    retry_active["value"] = False
     completed["value"] = True
     terminal = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert terminal["state"] == "complete"
@@ -1192,12 +1208,12 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
 ) -> None:
     """Protect marked staging, destination hashes, source retention, and retries."""
     run_id = "synthetic_transfer__0123456789abcdef"
-    source_storage = tmp_path / "source storage"
     destination = tmp_path / "destination storage"
     staging = workspace.create_transfer_staging(
-        storage_root=source_storage,
+        storage_root=destination,
         run_id=run_id,
     )
+    assert staging.parent == (destination / ".incoming").resolve()
     campaign_directory = f"01_generation/meta/campaigns/{run_id}"
     relative_directories = (
         "01_generation/meta/batches/synthetic_batch",
@@ -1247,8 +1263,11 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
         if root == destination.resolve():
             destination_checks["count"] += 1
             for relative, expected in source_bytes.items():
+                published = destination / relative
                 assert {
-                    path.relative_to(staging / relative).as_posix(): path.read_bytes() for path in (staging / relative).rglob("*") if path.is_file()
+                    path.relative_to(published).as_posix(): path.read_bytes()
+                    for path in published.rglob("*")
+                    if path.is_file() and path.relative_to(published).as_posix() not in campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS
                 } == expected
         return terminal
 
@@ -1275,7 +1294,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     assert receipt["transferred_bytes"] == sum(len(payload) for directory in source_bytes.values() for payload in directory.values())
     assert len(receipt["files"]) == receipt["transferred_file_count"]
     assert destination_checks["count"] == 2
-    assert all((staging / relative).is_dir() for relative in relative_directories)
+    assert all(not (staging / relative).exists() for relative in relative_directories)
     assert all((destination / relative).is_dir() for relative in relative_directories)
 
     repeated = generation.campaign.publish_transferred_campaign(
@@ -1346,3 +1365,26 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
             source_host="cpu.example",
             source_storage_root="/remote/storage",
         )
+
+
+def test_case_attempt_index_counts_only_real_slurm_submissions(
+    generation_config_factory: Any,
+) -> None:
+    """Do not consume a case attempt number when sbatch never returns a job ID."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    case = generation.campaign._task_payload(task)
+    manifest = {
+        "submissions": [
+            {"case": case, "status": "submission_failed", "job_id": None},
+        ]
+    }
+    assert generation.campaign._next_case_attempt_index(manifest, task) == 1
+    manifest["submissions"].extend(
+        (
+            {"case": case, "status": "submitted", "job_id": "4101"},
+            {"case": case, "status": "submission_failed", "job_id": None},
+        )
+    )
+    assert generation.campaign._next_case_attempt_index(manifest, task) == 2

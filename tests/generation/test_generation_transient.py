@@ -342,6 +342,7 @@ def _write_transient_case(
                 "schema_kind": generation.publication.storage.HDF5_SCHEMA_KIND,
                 "schema_version": generation.publication.storage.HDF5_SCHEMA_VERSION,
                 "converter_version": generation.publication.storage.HDF5_CONVERTER_VERSION,
+                "retention_policy": "compact",
                 "simulation_profile": "transient_drying",
                 "case_id": "case_0001",
                 "case_index": 1,
@@ -369,10 +370,22 @@ def _write_transient_case(
                 "schedule.csv": {"sha256": "c" * 64, "size_bytes": 1},
             },
             "source_exports_json": {
-                "exports/steady.csv": {"role": "steady_flow_fields", "sha256": "7" * 64, "size_bytes": 1},
-                "exports/transient.csv": {"role": "transient_fields", "sha256": "8" * 64, "size_bytes": 1},
-                "exports/global.csv": {"role": "global_time_series", "sha256": "9" * 64, "size_bytes": 1},
-                "exports/final.csv": {"role": "final_status", "sha256": "a" * 64, "size_bytes": 1},
+                name: {
+                    "logical_role": role,
+                    "configured_relative_name": name,
+                    "sha256": digest * 64,
+                    "size_bytes": 1,
+                    "row_count": None,
+                    "column_count": None,
+                    "conversion_status": "converted",
+                    "retained": False,
+                }
+                for name, role, digest in (
+                    ("exports/steady.csv", "steady_flow_fields", "7"),
+                    ("exports/transient.csv", "transient_fields", "8"),
+                    ("exports/global.csv", "global_time_series", "9"),
+                    ("exports/final.csv", "final_status", "a"),
+                )
             },
             "template_json": {
                 "sha256": template_sha256,

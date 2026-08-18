@@ -68,6 +68,8 @@ _CASE_PUBLICATION_SCHEMA_KIND: Final = "simulation_case_publication"
 _CASE_SUCCESS_SCHEMA_KIND: Final = "simulation_case_success"
 _CASE_ID_PATTERN: Final = re.compile(r"case_[0-9]{4,}")
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+_MAX_RETAINED_SOLVER_LOG_BYTES: Final = 1024 * 1024
+ValidationDepth = Literal["routine", "full", "deep"]
 _BATCH_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -133,6 +135,7 @@ _CASE_PUBLICATION_KEYS: Final = frozenset(
         "export_contract_sha256",
         "available_learning_views",
         "airflow_source",
+        "retention_policy",
         "artifacts",
     }
 )
@@ -476,6 +479,7 @@ class HDF5IdentityEvidence:
     export_contract_sha256: str
     available_learning_views: tuple[str, ...]
     airflow_source: str
+    retention_policy: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,6 +637,23 @@ class _PublicationEvidence:
 def _utc_now() -> str:
     """Return one timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _prior_license_wait_seconds(
+    config: config_contract.GenerationConfig,
+    prepared: PreparedCase,
+) -> float:
+    """Return controller-managed backoff accumulated before this real attempt."""
+    campaign_run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID")
+    if campaign_run_id is None:
+        return 0.0
+    attempts = license_service.load_temporary_license_attempts(
+        config,
+        int(prepared.bundle.case_payload["case_index"]),
+        campaign_run_id=campaign_run_id,
+        storage_root=prepared.storage_root,
+    )
+    return 0.0 if not attempts else float(attempts[-1]["cumulative_wait_seconds"])
 
 
 def _state_batch_root(config: config_contract.GenerationConfig, *, storage_root: Path | str | None) -> Path:
@@ -939,19 +960,40 @@ def collect_exports(
     )
 
 
+def _bounded_log_text(path: Path, *, maximum_bytes: int) -> str:
+    """Return bounded UTF-8 head-and-tail evidence from one runtime log."""
+    size = path.stat().st_size
+    if size <= maximum_bytes:
+        payload = path.read_bytes()
+    else:
+        half = maximum_bytes // 2
+        with path.open("rb") as stream:
+            head = stream.read(half)
+            stream.seek(-half, os.SEEK_END)
+            tail = stream.read(half)
+        payload = head + b"\n... retained log middle omitted ...\n" + tail
+    return payload.decode("utf-8", errors="replace")
+
+
 def _write_solver_log(prepared: PreparedCase) -> Path:
-    """Combine case-owned stdout and stderr into one retained solver log."""
+    """Combine bounded head-and-tail evidence from case-owned solver logs."""
     stdout_path = prepared.runtime_directory / "stdout.log"
     stderr_path = prepared.runtime_directory / "stderr.log"
-    payload = "===== stdout =====\n" + stdout_path.read_text(encoding="utf-8", errors="replace")
+    per_stream = _MAX_RETAINED_SOLVER_LOG_BYTES // 2
+    payload = "===== stdout =====\n" + _bounded_log_text(stdout_path, maximum_bytes=per_stream)
     if not payload.endswith("\n"):
         payload += "\n"
-    payload += "===== stderr =====\n" + stderr_path.read_text(encoding="utf-8", errors="replace")
+    payload += "===== stderr =====\n" + _bounded_log_text(stderr_path, maximum_bytes=per_stream)
     if not payload.endswith("\n"):
         payload += "\n"
     path = prepared.runtime_directory / "solver.log"
     common.serialization.atomic_write_text(path, payload)
     return path
+
+
+def _workspace_regular_file_bytes(directory: Path) -> int:
+    """Return current regular-file bytes without following symbolic links."""
+    return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file() and not path.is_symlink())
 
 
 def _scalar_handoff_execution_provenance(
@@ -1403,8 +1445,22 @@ def execute_prepared_case(
             missing_or_invalid_artifacts=(str(error),),
             failure_stage="conversion",
         ) from error
-    timing["export_conversion_s"] = time.monotonic() - export_conversion_start
-    timing["complete_execution_s"] = time.monotonic() - monotonic_start
+    export_conversion_seconds = time.monotonic() - export_conversion_start
+    source_export_bytes = sum(export.size_bytes for export in exports)
+    timing.update(
+        {
+            "comsol_process_seconds": elapsed,
+            "export_conversion_s": export_conversion_seconds,
+            "export_conversion_seconds": export_conversion_seconds,
+            "complete_execution_s": time.monotonic() - monotonic_start,
+            "license_wait_seconds": _prior_license_wait_seconds(config, prepared),
+            "source_export_bytes": source_export_bytes,
+            "case_hdf5_bytes": canonical_case.path.stat().st_size,
+            "solved_model_scratch_bytes": solved_model.stat().st_size,
+            "scratch_peak_bytes": _workspace_regular_file_bytes(prepared.work_directory),
+            "bytes_hashed_during_conversion": source_export_bytes,
+        }
+    )
     common.serialization.atomic_write_json(
         prepared.runtime_directory / "timing.json",
         timing,
@@ -1466,6 +1522,7 @@ def _complete_stage(
         "export_contract_sha256": case_payload["export_contract_sha256"],
         "available_learning_views": list(config.profile.available_learning_views),
         "airflow_source": config.profile.airflow_source,
+        "retention_policy": config.execution_values["retention_policy"],
         "artifacts": artifacts,
     }
     provenance_path = common.serialization.atomic_write_json(directory / "provenance.json", provenance)
@@ -1483,22 +1540,32 @@ def _complete_stage(
 
 
 def _stage_processed_case(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
-    """Stage canonical post-COMSOL payload and direct solver exports."""
+    """Stage one retention-exact canonical post-COMSOL payload with I/O evidence."""
+    publication_start = time.monotonic()
     destination.mkdir(parents=True)
-    export_root = destination / "comsol_exports"
-    for export in result.exports:
-        target = export_root / export.relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(export.source_path, target)
-        if common.serialization.file_sha256(target) != export.sha256:
-            msg = f"COMSOL export digest changed during publication: {target}"
-            raise RuntimeError(msg)
-    shutil.copy2(result.canonical_case.path, destination / "case.h5")
-    shutil.copy2(result.solver_log, destination / "solver.log")
-    shutil.copy2(
-        result.prepared.runtime_directory / "timing.json",
-        destination / "timing.json",
+    copied_bytes = 0
+    retained_export_bytes = 0
+    if config.execution_values["retention_policy"] == "full":
+        export_root = destination / "comsol_exports"
+        for export in result.exports:
+            target = export_root / export.relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(export.source_path, target)
+            copied_bytes += export.size_bytes
+            retained_export_bytes += export.size_bytes
+            if common.serialization.file_sha256(target) != export.sha256:
+                msg = f"COMSOL export digest changed during publication: {target}"
+                raise RuntimeError(msg)
+    copied_sources = (
+        (result.canonical_case.path, destination / "case.h5"),
+        (result.solver_log, destination / "solver.log"),
+        (result.prepared.runtime_directory / "timing.json", destination / "timing.json"),
+        (result.execution_provenance, destination / "execution_provenance.json"),
+        (result.processing_provenance, destination / "processing_provenance.json"),
     )
+    for source, target in copied_sources:
+        shutil.copy2(source, target)
+        copied_bytes += source.stat().st_size
     status = _load_json_object(
         result.canonical_case.status_path,
         label="converted case status",
@@ -1508,20 +1575,50 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         message = "Converted case status lacks the pending publication stage."
         raise ValueError(message)
     stages["publication"] = "succeeded"
-    common.serialization.atomic_write_json(destination / "status.json", status)
-    shutil.copy2(result.execution_provenance, destination / "execution_provenance.json")
-    shutil.copy2(
-        result.processing_provenance,
-        destination / "processing_provenance.json",
-    )
+    status_path = common.serialization.atomic_write_json(destination / "status.json", status)
+    retained_model_bytes = 0
     if config.execution_values["retention_policy"] == "full":
         if result.solved_model is None:
             message = "Full retention completed without an admitted solved model."
             raise FileNotFoundError(message)
+        retained_model_bytes = result.solved_model.stat().st_size
         shutil.copy2(
             result.solved_model,
             destination / comsol_service.RETAINED_MODEL_FILENAME,
         )
+        copied_bytes += retained_model_bytes
+    validation_start = time.monotonic()
+    storage_service.validate_case_hdf5(
+        destination / "case.h5",
+        expected_profile=config.profile.id,
+    )
+    post_validation_seconds = time.monotonic() - validation_start
+    timing = dict(result.timing)
+    timing.update(
+        {
+            "publication_seconds": time.monotonic() - publication_start,
+            "post_publication_validation_seconds": post_validation_seconds,
+            "persistent_case_bytes": 0,
+            "direct_exports_retained_bytes": retained_export_bytes,
+            "solved_model_retained_bytes": retained_model_bytes,
+            "recovery_payload_bytes": 0,
+            "bytes_hashed_during_publication": 0,
+            "bytes_hashed_during_post_publication_validation": 0,
+            "bytes_copied_during_publication": copied_bytes,
+        }
+    )
+    timing_path = destination / "timing.json"
+    for _ in range(8):
+        common.serialization.atomic_write_json(timing_path, timing)
+        persistent_bytes = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file() and not path.is_symlink())
+        hashed_bytes = persistent_bytes + retained_export_bytes
+        if timing["persistent_case_bytes"] == persistent_bytes and timing["bytes_hashed_during_publication"] == hashed_bytes:
+            break
+        timing["persistent_case_bytes"] = persistent_bytes
+        timing["bytes_hashed_during_publication"] = hashed_bytes
+    else:
+        message = f"Case timing byte accounting did not stabilize: {timing_path}"
+        raise RuntimeError(message)
     _complete_stage(
         destination,
         config=config,
@@ -1529,6 +1626,9 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         input_generation_id=result.prepared.input_generation_id,
         stage="processed",
     )
+    if not status_path.is_file():
+        message = f"Case status disappeared during staging: {status_path}"
+        raise RuntimeError(message)
 
 
 def case_failure_path(
@@ -1809,6 +1909,8 @@ def _attempt_case_state(
     failure_stage: str,
 ) -> attempt_service.AttemptCaseState:
     """Classify one precise unsuccessful attempt state without collapsing stages."""
+    if isinstance(error, license_service.TemporaryLicenseCapacityError):
+        return "license_blocked"
     if bool(getattr(error, "timed_out", False)):
         return "timed_out"
     if isinstance(error, CaseInterruptedError):
@@ -2359,7 +2461,12 @@ def case_failure_is_recorded(
         ),
     )
     if attempt is not None:
-        return attempt.payload["campaign_run_id"] == run_id and attempt.payload["solver_git_commit"] == commit
+        cleanup = attempt_service.attempt_cleanup_evidence(attempt)
+        return (
+            (attempt.payload["case_state"] != "license_blocked" or (cleanup is not None and cleanup["status"] == "failed"))
+            and attempt.payload["campaign_run_id"] == run_id
+            and attempt.payload["solver_git_commit"] == commit
+        )
     return (
         _case_failure_evidence_state(
             config,
@@ -2421,8 +2528,13 @@ def _safe_file_sha256(path: Path, *, label: str) -> str:
     return common.serialization.file_sha256(path)
 
 
-def _admit_artifacts(directory: Path, provenance: Mapping[str, Any]) -> tuple[ArtifactEvidence, ...]:
-    """Admit exact publication membership and every declared artifact hash."""
+def _admit_artifacts(
+    directory: Path,
+    provenance: Mapping[str, Any],
+    *,
+    validation_depth: ValidationDepth,
+) -> tuple[ArtifactEvidence, ...]:
+    """Admit exact membership and hash content at full or deep boundaries."""
     raw_artifacts = provenance.get("artifacts")
     if not isinstance(raw_artifacts, dict) or not raw_artifacts:
         msg = f"Case publication has no artifact identity map: {directory}"
@@ -2452,7 +2564,7 @@ def _admit_artifacts(directory: Path, provenance: Mapping[str, Any]) -> tuple[Ar
             not artifact_path.is_file()
             or artifact_path.is_symlink()
             or artifact_path.stat().st_size != size_bytes
-            or common.serialization.file_sha256(artifact_path) != digest
+            or (validation_depth != "routine" and common.serialization.file_sha256(artifact_path) != digest)
         ):
             msg = f"Case artifact integrity failure for {artifact_path}."
             raise RuntimeError(msg)
@@ -2501,6 +2613,7 @@ def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
         ),
         available_learning_views=views,
         airflow_source=str(identity["airflow_source"]),
+        retention_policy=str(identity["retention_policy"]),
     )
 
 
@@ -2564,19 +2677,26 @@ def _require_processed_publication_layout(
     *,
     artifact_names: set[str],
     required: set[str],
+    retention_policy: str,
 ) -> None:
-    """Require the fixed processed ownership boundary and optional solved model."""
+    """Require the explicit full or compact processed ownership boundary."""
     expected_top_level = {
         "_SUCCESS",
         "provenance.json",
-        "comsol_exports",
         *required,
     }
-    if "solved.mph" in artifact_names:
-        expected_top_level.add("solved.mph")
-    exports = directory / "comsol_exports"
-    if {entry.name for entry in directory.iterdir()} != expected_top_level or not exports.is_dir() or exports.is_symlink():
-        message = f"Processed publication top-level membership is not canonical: {directory}"
+    retained_exports = {name for name in artifact_names if name.startswith("comsol_exports/")}
+    if retention_policy == "full":
+        expected_top_level.update({"comsol_exports", "solved.mph"})
+        exports = directory / "comsol_exports"
+        valid = bool(retained_exports) and "solved.mph" in artifact_names and exports.is_dir() and not exports.is_symlink()
+    elif retention_policy == "compact":
+        valid = not retained_exports and "solved.mph" not in artifact_names and not (directory / "comsol_exports").exists()
+    else:
+        message = f"Processed publication has an invalid retention policy: {retention_policy!r}."
+        raise RuntimeError(message)
+    if {entry.name for entry in directory.iterdir()} != expected_top_level or not valid:
+        message = f"Processed publication top-level membership is not canonical for {retention_policy}: {directory}"
         raise RuntimeError(message)
 
 
@@ -2600,8 +2720,22 @@ def _admit_processed_raw_publication(
     return input_generation_id, _admit_raw_publication_directory(raw_case)
 
 
-def _admit_publication_directory(directory: Path, *, stage: str) -> _PublicationEvidence:
-    """Admit one raw or processed case publication by producer-owned contracts."""
+def _require_validation_depth(value: ValidationDepth) -> ValidationDepth:
+    """Return one supported explicit publication-validation depth."""
+    if value not in {"routine", "full", "deep"}:
+        message = f"Unsupported publication validation depth: {value!r}."
+        raise ValueError(message)
+    return value
+
+
+def _admit_publication_directory(
+    directory: Path,
+    *,
+    stage: str,
+    validation_depth: ValidationDepth = "full",
+) -> _PublicationEvidence:
+    """Admit one publication at an explicit integrity-validation depth."""
+    validation_depth = _require_validation_depth(validation_depth)
     if stage not in {"raw", "processed"}:
         msg = f"Unsupported case publication stage: {stage!r}."
         raise ValueError(msg)
@@ -2707,6 +2841,7 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         "export_contract_sha256": export_contract_sha256,
         "available_learning_views": list(profile.available_learning_views),
         "airflow_source": profile.airflow_source,
+        "retention_policy": provenance.get("retention_policy"),
     }
     if any(provenance.get(key) != value for key, value in expected_publication.items()):
         msg = f"Case publication identity mismatch in {directory}."
@@ -2725,7 +2860,11 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
     if success.get("provenance_sha256") != provenance_sha256:
         msg = f"Case provenance digest mismatch in {directory}."
         raise RuntimeError(msg)
-    artifacts = _admit_artifacts(directory, provenance)
+    artifacts = _admit_artifacts(
+        directory,
+        provenance,
+        validation_depth=validation_depth,
+    )
     required = {
         "case.h5",
         "solver.log",
@@ -2735,14 +2874,13 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         "processing_provenance.json",
     }
     artifact_names = {artifact.relative_path for artifact in artifacts}
+    retention_policy = provenance.get("retention_policy")
     _require_processed_publication_layout(
         directory,
         artifact_names=artifact_names,
         required=required,
+        retention_policy=str(retention_policy),
     )
-    if not any(name.startswith("comsol_exports/") for name in artifact_names):
-        message = f"Processed publication lacks direct COMSOL exports: {directory}"
-        raise RuntimeError(message)
     if not required.issubset(artifact_names):
         msg = f"Processed publication lacks canonical payload or runtime evidence: {directory}"
         raise RuntimeError(msg)
@@ -2786,12 +2924,27 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         msg = f"Processed solver/processing provenance disagrees in {directory}."
         raise RuntimeError(msg)
     source_service.validate_git_commit(processing.get("processing_git_commit"))
-    hdf5_identity = _hdf5_evidence(
-        storage_service.validate_case_hdf5(
-            directory / "case.h5",
-            expected_profile=profile.id,
+    if validation_depth == "routine":
+        hdf5_identity = HDF5IdentityEvidence(
+            simulation_profile=profile.id,
+            git_commit=None,
+            template_relative_path=None,
+            template_sha256=template_sha256,
+            case_input_id=case_input_id,
+            simulation_case_id=simulation_case_id,
+            scientific_config_digest=scientific_digest,
+            export_contract_sha256=export_contract_sha256,
+            available_learning_views=profile.available_learning_views,
+            airflow_source=profile.airflow_source,
+            retention_policy=str(retention_policy),
         )
-    )
+    else:
+        hdf5_identity = _hdf5_evidence(
+            storage_service.validate_case_hdf5(
+                directory / "case.h5",
+                expected_profile=profile.id,
+            )
+        )
     expected_hdf5 = HDF5IdentityEvidence(
         simulation_profile=profile.id,
         git_commit=(None if hdf5_identity.git_commit is None else git_commit),
@@ -2803,6 +2956,7 @@ def _admit_publication_directory(directory: Path, *, stage: str) -> _Publication
         export_contract_sha256=export_contract_sha256,
         available_learning_views=profile.available_learning_views,
         airflow_source=profile.airflow_source,
+        retention_policy=str(retention_policy),
     )
     if hdf5_identity != expected_hdf5:
         msg = f"Canonical HDF5 identities disagree with case publication in {directory}."
@@ -2871,11 +3025,13 @@ def validate_completed_case(
     case_index: int,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: ValidationDepth = "full",
 ) -> dict[str, Any]:
-    """Validate one completed case and layer exact authored-config comparison."""
+    """Validate one completed case at an explicit integrity depth."""
     processed = _admit_publication_directory(
         processed_case_directory(config, case_index, storage_root=storage_root),
         stage="processed",
+        validation_depth=validation_depth,
     )
     _require_publication_matches_config(
         processed,
@@ -2901,7 +3057,12 @@ def completed_case_is_valid(
     if not raw.exists():
         message = f"Processed completion exists without canonical raw inputs: {processed}"
         raise RuntimeError(message)
-    validate_completed_case(config, case_index, storage_root=storage_root)
+    validate_completed_case(
+        config,
+        case_index,
+        storage_root=storage_root,
+        validation_depth="routine",
+    )
     return True
 
 
@@ -2960,7 +3121,12 @@ def publish_completed_case(
         _quarantine_incomplete(processed_destination, state_root=state_root)
         processed_destination.parent.mkdir(parents=True, exist_ok=True)
         processed_stage.replace(processed_destination)
-        validate_completed_case(config, case_index, storage_root=storage)
+        validate_completed_case(
+            config,
+            case_index,
+            storage_root=storage,
+            validation_depth="routine",
+        )
     finally:
         workspace_service.cleanup_publication_staging(
             staging,
@@ -3260,7 +3426,12 @@ def replay_case_postprocessing(
                 result,
                 storage_root=storage,
             )
-            validate_completed_case(config, case_index, storage_root=storage)
+            validate_completed_case(
+                config,
+                case_index,
+                storage_root=storage,
+                validation_depth="routine",
+            )
             publication_complete = True
         except BaseException as error:
             recorded_failure = _record_replay_failure(
@@ -3538,6 +3709,18 @@ def run_case(
                         temporary_license_error,
                         storage_root=storage,
                     )
+                    failure_path = record_case_failure(
+                        config,
+                        case_index,
+                        temporary_license_error,
+                        worker_slot=worker_slot,
+                        scheduler_kind=scheduler_kind,
+                        allocated_node=allocated_node,
+                        work_directory=attempt_directory,
+                        storage_root=storage,
+                        scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
+                        failure_stage="solver",
+                    )
                 except Exception as retry_error:  # noqa: BLE001 -- failed provenance is terminal
                     failure_path = record_case_failure(
                         config,
@@ -3695,7 +3878,12 @@ def finalize_batch(
     git_commits: set[str] = set()
     input_generation_ids: set[str] = set()
     for case_index in config.case_indices:
-        provenance = validate_completed_case(config, case_index, storage_root=storage_root)
+        provenance = validate_completed_case(
+            config,
+            case_index,
+            storage_root=storage_root,
+            validation_depth="routine",
+        )
         git_commits.add(source_service.validate_git_commit(provenance.get("git_commit")))
         input_generation_ids.add(
             common.paths.validate_logical_name(
@@ -3713,7 +3901,7 @@ def finalize_batch(
                 "simulation_case_id": provenance["simulation_case_id"],
                 "success_sha256": common.serialization.file_sha256(success_path),
                 "provenance_sha256": common.serialization.file_sha256(success_path.parent / "provenance.json"),
-                "case_hdf5_sha256": common.serialization.file_sha256(success_path.parent / "case.h5"),
+                "case_hdf5_sha256": provenance["artifacts"]["case.h5"]["sha256"],
             }
         )
     if len(input_generation_ids) != 1:
@@ -3882,6 +4070,7 @@ def admit_terminal_batch(
     batch_storage_name: str,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: ValidationDepth = "full",
 ) -> TerminalBatchEvidence:
     """
     Admit one terminal batch without requiring its authored configuration.
@@ -3892,6 +4081,8 @@ def admit_terminal_batch(
         Flat semantic locator for the generated batch publication.
     storage_root : Path | str | None, optional
         Storage root containing the Generation publication.
+    validation_depth : {"routine", "full", "deep"}, optional
+        Integrity depth; full and deep rehash every retained artifact.
 
     Returns
     -------
@@ -3909,6 +4100,7 @@ def admit_terminal_batch(
         If independently valid evidence disagrees across publication layers.
 
     """
+    validation_depth = _require_validation_depth(validation_depth)
     safe_storage_name = common.paths.validate_logical_name(
         batch_storage_name,
         label="batch_storage_name",
@@ -4080,8 +4272,16 @@ def admit_terminal_batch(
             "case_hdf5_sha256",
         ):
             _require_sha256(record.get(key), label=f"{expected_case_id}.{key}")
-        raw = _admit_publication_directory(raw_root / expected_case_id, stage="raw")
-        processed = _admit_publication_directory(processed_root / expected_case_id, stage="processed")
+        raw = _admit_publication_directory(
+            raw_root / expected_case_id,
+            stage="raw",
+            validation_depth=validation_depth,
+        )
+        processed = _admit_publication_directory(
+            processed_root / expected_case_id,
+            stage="processed",
+            validation_depth=validation_depth,
+        )
         if raw.case_payload != processed.case_payload:
             msg = f"Raw and processed canonical metadata disagree for {expected_case_id}."
             raise RuntimeError(msg)
@@ -4100,10 +4300,11 @@ def admit_terminal_batch(
             processed.directory / "provenance.json",
             label=f"{expected_case_id} publication provenance",
         )
-        processed_hdf5_sha256 = _safe_file_sha256(
-            processed.directory / "case.h5",
-            label=f"{expected_case_id} canonical HDF5",
-        )
+        hdf5_artifacts = tuple(artifact for artifact in processed.artifacts if artifact.relative_path == "case.h5")
+        if len(hdf5_artifacts) != 1:
+            message = f"Terminal case lacks one declared canonical HDF5: {expected_case_id}."
+            raise RuntimeError(message)
+        processed_hdf5_sha256 = hdf5_artifacts[0].sha256
         if (
             processed_success_sha256 != record["success_sha256"]
             or processed_provenance_sha256 != record["provenance_sha256"]
@@ -4169,9 +4370,14 @@ def validate_terminal_batch(
     config: config_contract.GenerationConfig,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: ValidationDepth = "full",
 ) -> dict[str, Any]:
     """Admit a terminal batch and require exact authored-config agreement."""
-    evidence = admit_terminal_batch(config.batch_storage_name, storage_root=storage_root)
+    evidence = admit_terminal_batch(
+        config.batch_storage_name,
+        storage_root=storage_root,
+        validation_depth=validation_depth,
+    )
     expected = {
         "simulation_profile": config.profile.id,
         "available_learning_views": config.profile.available_learning_views,

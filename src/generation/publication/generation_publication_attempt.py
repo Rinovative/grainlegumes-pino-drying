@@ -55,6 +55,7 @@ _CASE_STATES: Final = frozenset(
         "exports_failed",
         "conversion_failed",
         "publication_failed",
+        "license_blocked",
     }
 )
 _FAILURE_STAGES: Final = frozenset({"input", "solver", "exports", "conversion", "publication"})
@@ -67,6 +68,14 @@ _SMALL_RUNTIME_PATHS: Final = (
     Path("runtime/processing_provenance.json"),
     Path("runtime/status.json"),
     Path("runtime/stop.json"),
+)
+_MAX_RETAINED_RUNTIME_LOG_BYTES: Final = 1024 * 1024
+_BOUNDED_RUNTIME_LOG_PATHS: Final = frozenset(
+    {
+        Path("runtime/solver.log"),
+        Path("runtime/stdout.log"),
+        Path("runtime/stderr.log"),
+    }
 )
 _LARGE_MODEL_PATHS: Final = (Path("model.mph"), Path("solved.mph"))
 _STAGE_STATE_KEYS: Final = (
@@ -91,6 +100,7 @@ _ATTEMPT_RECEIPT_KEYS: Final = frozenset(
         "case_input_id",
         "simulation_case_id",
         "attempt_index",
+        "previous_attempt",
         "case_state",
         *_STAGE_STATE_KEYS,
         "failure_stage",
@@ -188,7 +198,23 @@ AttemptCaseState = Literal[
     "exports_failed",
     "conversion_failed",
     "publication_failed",
+    "license_blocked",
 ]
+_PREVIOUS_ATTEMPT_KEYS: Final = frozenset({"attempt_index", "receipt_sha256"})
+_ATTEMPT_CHAIN_IDENTITY_KEYS: Final = (
+    "campaign_run_id",
+    "batch_storage_name",
+    "batch_id",
+    "batch_identity",
+    "input_generation_id",
+    "case_id",
+    "case_index",
+    "case_input_id",
+    "simulation_case_id",
+    "solver_git_commit",
+    "scientific_config_digest",
+    "export_contract_sha256",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +333,30 @@ def _attempt_index(
         else []
     )
     return max(indices, default=0) + 1
+
+
+def _previous_attempt_evidence(
+    target: Path,
+    attempt_index: int,
+) -> AttemptEvidence | None:
+    """Admit the exact contiguous predecessor for one new attempt."""
+    parent = target.parent
+    existing_indices = (
+        sorted(
+            int(entry.name[8:])
+            for entry in parent.iterdir()
+            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
+        )
+        if parent.is_dir() and not parent.is_symlink()
+        else []
+    )
+    expected_indices = list(range(1, attempt_index))
+    if existing_indices != expected_indices:
+        message = f"Attempt history must be contiguous before append; expected={expected_indices}, observed={existing_indices}: {parent}"
+        raise ValueError(message)
+    if attempt_index == 1:
+        return None
+    return load_attempt(parent / f"attempt_{attempt_index - 1:04d}")
 
 
 def _path_has_symlink(path: Path, *, stop: Path) -> bool:
@@ -490,6 +540,32 @@ def derive_stage_states(
     return states
 
 
+def _copy_retained_file(
+    source: Path,
+    destination: Path,
+    *,
+    relative: Path,
+) -> None:
+    """Copy one artifact while bounding retained runtime-log bytes."""
+    maximum = _MAX_RETAINED_RUNTIME_LOG_BYTES
+    if relative not in _BOUNDED_RUNTIME_LOG_PATHS or source.stat().st_size <= maximum:
+        shutil.copy2(source, destination)
+        return
+    marker = b"\n... retained log middle omitted ...\n"
+    if maximum <= len(marker):
+        message = "Retained runtime-log byte bound is too small for its omission marker."
+        raise RuntimeError(message)
+    payload_bytes = maximum - len(marker)
+    head_bytes = payload_bytes // 2
+    tail_bytes = payload_bytes - head_bytes
+    with source.open("rb") as stream:
+        head = stream.read(head_bytes)
+        stream.seek(-tail_bytes, os.SEEK_END)
+        tail = stream.read(tail_bytes)
+    destination.write_bytes(head + marker + tail)
+    shutil.copystat(source, destination, follow_symlinks=False)
+
+
 def _copy_retained(
     work_directory: Path,
     staging: Path,
@@ -505,7 +581,7 @@ def _copy_retained(
             continue
         destination = staging / "payload" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        _copy_retained_file(source, destination, relative=relative)
         if destination.is_symlink() or not destination.is_file():
             message = f"Attempt retention did not produce an ordinary file: {destination}"
             raise RuntimeError(message)
@@ -545,6 +621,16 @@ def _reject_success_marker(root: Path) -> None:
     """Reject a forbidden success marker anywhere in an attempt bundle."""
     if any(path.name == "_SUCCESS" for path in root.rglob("*")):
         message = "Attempt bundles must never contain _SUCCESS."
+        raise ValueError(message)
+
+
+def _require_previous_attempt_identity(
+    previous: AttemptEvidence | None,
+    receipt: Mapping[str, Any],
+) -> None:
+    """Require one appended attempt to preserve its predecessor identity."""
+    if previous is not None and any(previous.payload.get(key) != receipt.get(key) for key in _ATTEMPT_CHAIN_IDENTITY_KEYS):
+        message = f"Previous attempt identity conflicts with the new append: {previous.receipt_path}"
         raise ValueError(message)
 
 
@@ -624,6 +710,7 @@ def publish_case_attempt(
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     _safe_attempt_target(target, storage_root=storage)
+    previous = _previous_attempt_evidence(target, index)
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
     try:
         inventory = (
@@ -657,6 +744,14 @@ def publish_case_attempt(
             "case_input_id": case_payload["case_input_id"],
             "simulation_case_id": case_payload["simulation_case_id"],
             "attempt_index": index,
+            "previous_attempt": (
+                None
+                if previous is None
+                else {
+                    "attempt_index": int(previous.payload["attempt_index"]),
+                    "receipt_sha256": common.serialization.file_sha256(previous.receipt_path),
+                }
+            ),
             "case_state": case_state,
             **stage_states,
             "failure_stage": failure_stage,
@@ -699,6 +794,7 @@ def publish_case_attempt(
             "postprocessing_replay_available": replay_available,
             "recorded_at": _utc_now(),
         }
+        _require_previous_attempt_identity(previous, receipt)
         common.serialization.atomic_write_json(staging / "attempt.json", receipt)
         _reject_success_marker(staging)
         staging.replace(target)
@@ -748,6 +844,19 @@ def _validate_quality_flags(value: Any, *, path: Path) -> None:
         ):
             message = f"Attempt quality flag is malformed: {path}"
             raise ValueError(message)
+
+
+def _valid_previous_attempt_reference(value: Any, *, attempt_index: int) -> bool:
+    """Return whether one receipt has the exact immediate-predecessor reference."""
+    if attempt_index == 1:
+        return value is None
+    return (
+        isinstance(value, dict)
+        and set(value) == _PREVIOUS_ATTEMPT_KEYS
+        and value.get("attempt_index") == attempt_index - 1
+        and isinstance(value.get("receipt_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["receipt_sha256"]) is not None
+    )
 
 
 def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
@@ -805,6 +914,10 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
                 "final_simulation_time",
                 "last_accepted_step_size",
             )
+        )
+        or not _valid_previous_attempt_reference(
+            payload.get("previous_attempt"),
+            attempt_index=int(payload.get("attempt_index", 0)),
         )
         or not isinstance(payload.get("timed_out"), bool)
         or payload["timed_out"] is not (case_state == "timed_out")
@@ -926,6 +1039,39 @@ def _validate_cleanup_audit(
     return payload
 
 
+def _validate_attempt_chain(
+    directory: Path,
+    payload: Mapping[str, Any],
+) -> None:
+    """Validate every immediate receipt link without rereading retained payload bytes."""
+    current_directory = directory
+    current_payload = dict(payload)
+    while True:
+        index = int(current_payload["attempt_index"])
+        if current_directory.name != f"attempt_{index:04d}":
+            message = f"Attempt directory name disagrees with its receipt index: {current_directory}"
+            raise ValueError(message)
+        previous = current_payload["previous_attempt"]
+        if index == 1:
+            return
+        if not isinstance(previous, dict):
+            message = f"Attempt predecessor reference is malformed: {current_directory / 'attempt.json'}"
+            raise TypeError(message)
+        previous_directory = current_directory.parent / f"attempt_{index - 1:04d}"
+        previous_path = previous_directory / "attempt.json"
+        previous_payload = _load_json(previous_path, label="previous attempt receipt")
+        _validate_attempt_receipt(previous_payload, path=previous_path)
+        if (
+            previous["attempt_index"] != previous_payload["attempt_index"]
+            or previous["receipt_sha256"] != common.serialization.file_sha256(previous_path)
+            or any(previous_payload.get(key) != current_payload.get(key) for key in _ATTEMPT_CHAIN_IDENTITY_KEYS)
+        ):
+            message = f"Attempt predecessor chain is inconsistent: {current_directory / 'attempt.json'}"
+            raise ValueError(message)
+        current_directory = previous_directory
+        current_payload = previous_payload
+
+
 def load_attempt(directory: Path | str) -> AttemptEvidence:
     """Admit one attempt receipt, inventory, and optional replay audit."""
     root = Path(directory)
@@ -938,6 +1084,7 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
     receipt_path = root / "attempt.json"
     payload = _load_json(receipt_path, label="attempt receipt")
     _validate_attempt_receipt(payload, path=receipt_path)
+    _validate_attempt_chain(root, payload)
     inventory = payload.get("retained_inventory")
     if not isinstance(inventory, dict):
         message = f"Attempt retained inventory is invalid: {receipt_path}"

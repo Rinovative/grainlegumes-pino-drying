@@ -34,8 +34,7 @@ _PENDING_CASE_STATES = frozenset(
         "never_started",
         "cancelled",
         "interrupted",
-        "retry_eligible",
-        "retry_waiting",
+        "license_blocked",
         "scheduler_unknown",
     }
 )
@@ -259,15 +258,11 @@ def format_campaign_status_summary(
     if omitted:
         active_lines.append(f"... {omitted} additional active case(s) omitted")
     _append_section(lines, "Active cases", active_lines)
-    retry_records = [
-        _nonactive_case_line(case, show_batch=show_batch) for case in buckets["pending"] if case.get("state") in {"retry_eligible", "retry_waiting"}
+    license_blocked_records = [
+        _nonactive_case_line(case, show_batch=show_batch) for case in buckets["pending"] if case.get("state") == "license_blocked"
     ]
-    pending_records = [
-        _nonactive_case_line(case, show_batch=show_batch)
-        for case in buckets["pending"]
-        if case.get("state") not in {"retry_eligible", "retry_waiting"}
-    ]
-    _append_section(lines, "Retrying cases", retry_records)
+    pending_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["pending"] if case.get("state") != "license_blocked"]
+    _append_section(lines, "License-blocked cases", license_blocked_records)
     _append_section(lines, "Pending cases", pending_records)
     _append_section(
         lines,

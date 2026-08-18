@@ -175,7 +175,7 @@ def _package_record(
     dataset_id = common.paths.validate_logical_name(result.get("dataset_id"), label="dataset_id")
     manifest, inspection, smoke = _package_runtime_evidence(dataset_id, storage_root=storage_root)
     manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / dataset_id / "dataset_manifest.json"
-    payload_path = common.paths.get_dataset_payload_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
+    payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
     return {
         "dataset_name": manifest["dataset_name"],
         "dataset_id": dataset_id,
@@ -225,7 +225,7 @@ def _validate_package_record(
     dataset_id = common.paths.validate_logical_name(record["dataset_id"], label="dataset_id")
     manifest, inspection, smoke = _package_runtime_evidence(dataset_id, storage_root=storage_root)
     manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / dataset_id / "dataset_manifest.json"
-    payload_path = common.paths.get_dataset_payload_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
+    payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
     expected = {
         "dataset_name": manifest["dataset_name"],
         "dataset_id": dataset_id,
@@ -1954,7 +1954,7 @@ def storage_status(
                         "dataset_id": dataset_id,
                         "dataset_view": manifest["dataset_view"],
                         "evaluation_regime": manifest["evaluation_regime"],
-                        "size_bytes": _tree_size(directory) + _tree_size(common.paths.get_dataset_payload_root(storage_root=storage) / dataset_id),
+                        "size_bytes": _tree_size(directory) + _tree_size(common.paths.get_dataset_packages_root(storage_root=storage) / dataset_id),
                     }
                 )
             except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
@@ -1980,7 +1980,7 @@ def storage_status(
             "generation": str(generation_root),
             "datasets": str(datasets_root),
             "experiments": str(experiments_root),
-            "transfer_staging": str(common.paths.get_generation_state_root(storage_root=storage) / "transfer-staging"),
+            "transfer_staging": str(storage / ".incoming"),
         },
         "generation_total_bytes": _tree_size(generation_root),
         "datasets_total_bytes": _tree_size(datasets_root),

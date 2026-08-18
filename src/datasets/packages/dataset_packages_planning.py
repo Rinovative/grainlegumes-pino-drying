@@ -101,6 +101,7 @@ def _load_candidates(
         terminal = generation.runtime.admit_terminal_batch(
             batch.batch_storage_name,
             storage_root=storage,
+            validation_depth="routine",
         )
         manifest = terminal.manifest_payload()
         if terminal.batch_identity != batch.batch_identity:

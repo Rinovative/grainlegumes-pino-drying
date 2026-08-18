@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from src import common
+from src.generation import generation_background as background_service
 from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_status as campaign_status_service
@@ -92,6 +93,43 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     """Build the complete generation command parser."""
     parser = argparse.ArgumentParser(description="Generate and run isolated profile-qualified COMSOL cases")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    create_background = subparsers.add_parser(
+        "create-background-session",
+        help="create durable host workflow-session evidence and command",
+    )
+    create_background.add_argument("--source-commit", required=True)
+    create_background.add_argument("--storage-root", type=Path, required=True)
+    create_background.add_argument(
+        "--host-paths-json",
+        required=True,
+        help="JSON object carrying host workflow, Python runner, and storage paths",
+    )
+    create_background.add_argument("--active-tmux-session", action="append", default=[])
+    create_background.add_argument("workflow_arguments", nargs=argparse.REMAINDER)
+
+    complete_background = subparsers.add_parser(
+        "complete-background-session",
+        help="atomically record one background workflow exit result",
+    )
+    complete_background.add_argument("workflow_session_id")
+    complete_background.add_argument("--exit-code", type=int, required=True)
+    complete_background.add_argument("--storage-root", type=Path, required=True)
+
+    inspect_background = subparsers.add_parser(
+        "inspect-background-session",
+        help="read one durable background workflow session",
+    )
+    inspect_background.add_argument("workflow_session_id")
+    inspect_background.add_argument("--storage-root", type=Path, required=True)
+    inspect_background.add_argument("--active-tmux-session", action="append", default=[])
+
+    list_background = subparsers.add_parser(
+        "list-background-sessions",
+        help="list current-user background workflow sessions",
+    )
+    list_background.add_argument("--storage-root", type=Path, required=True)
+    list_background.add_argument("--active-tmux-session", action="append", default=[])
 
     validate = subparsers.add_parser("validate-config", help="validate one generation configuration")
     validate.add_argument("config", type=Path)
@@ -176,23 +214,52 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     inspect_benchmark.add_argument("--variant")
     inspect_benchmark.add_argument("--require-executable", action="store_true")
 
+    preflight_benchmark = subparsers.add_parser(
+        "preflight-core-benchmark",
+        help="persist benchmark-owned exact-source and runtime preflight evidence",
+    )
+    preflight_benchmark.add_argument("suite", type=Path)
+    preflight_benchmark.add_argument("--git-commit", required=True)
+    preflight_benchmark.add_argument("--storage-root", type=Path, required=True)
+    preflight_benchmark.add_argument("--scratch-root", type=Path, required=True)
+    preflight_benchmark.add_argument("--comsol-version-output", required=True)
+    preflight_benchmark.add_argument(
+        "--comsol-executable-path",
+        type=Path,
+        required=True,
+    )
+
     plan_benchmark = subparsers.add_parser(
         "plan-core-benchmark",
-        help="validate native evidence and print isolated Slurm submissions",
+        help="reuse standalone preflight and print isolated Slurm submissions",
     )
     plan_benchmark.add_argument("suite", type=Path)
     plan_benchmark.add_argument("--git-commit", required=True)
     plan_benchmark.add_argument("--variant")
     plan_benchmark.add_argument("--storage-root", type=Path, required=True)
+    plan_benchmark.add_argument("--scratch-root", type=Path, required=True)
+    plan_benchmark.add_argument("--comsol-version-output", required=True)
+    plan_benchmark.add_argument(
+        "--comsol-executable-path",
+        type=Path,
+        required=True,
+    )
 
     submit_benchmark = subparsers.add_parser(
         "submit-core-benchmark",
-        help="submit the shared-case four-variant core-scaling benchmark",
+        help="submit the standalone shared-case core-scaling benchmark",
     )
     submit_benchmark.add_argument("suite", type=Path)
     submit_benchmark.add_argument("--git-commit", required=True)
     submit_benchmark.add_argument("--variant")
     submit_benchmark.add_argument("--storage-root", type=Path, required=True)
+    submit_benchmark.add_argument("--scratch-root", type=Path, required=True)
+    submit_benchmark.add_argument("--comsol-version-output", required=True)
+    submit_benchmark.add_argument(
+        "--comsol-executable-path",
+        type=Path,
+        required=True,
+    )
 
     prepare_benchmark = subparsers.add_parser(
         "prepare-core-benchmark-case",
@@ -930,6 +997,58 @@ def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
 
 def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
+    if args.command == "create-background-session":
+        arguments = list(args.workflow_arguments)
+        if arguments and arguments[0] == "--":
+            arguments = arguments[1:]
+        if not arguments:
+            message = "create-background-session requires workflow argv after --."
+            raise ValueError(message)
+        host_paths = json.loads(args.host_paths_json)
+        if not isinstance(host_paths, dict) or set(host_paths) != {
+            "stable_script",
+            "docker_python",
+            "storage_root",
+            "host",
+        }:
+            message = "Background host paths JSON must contain exactly stable_script, docker_python, storage_root, and host."
+            raise ValueError(message)
+        session = background_service.create_background_session(
+            arguments[0],
+            arguments=arguments,
+            source_commit=args.source_commit,
+            storage_root=args.storage_root,
+            stable_script=host_paths["stable_script"],
+            docker_python=host_paths["docker_python"],
+            host_storage_root=host_paths["storage_root"],
+            host_name=host_paths["host"],
+            active_tmux_sessions=args.active_tmux_session,
+        )
+        print(json.dumps(session, sort_keys=True))
+        return 0
+    if args.command == "complete-background-session":
+        result = background_service.complete_background_session(
+            args.workflow_session_id,
+            exit_code=args.exit_code,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "inspect-background-session":
+        status = background_service.inspect_background_session(
+            args.workflow_session_id,
+            storage_root=args.storage_root,
+            active_tmux_sessions=args.active_tmux_session,
+        )
+        print(json.dumps(status, sort_keys=True))
+        return 0
+    if args.command == "list-background-sessions":
+        sessions = background_service.list_background_sessions(
+            storage_root=args.storage_root,
+            active_tmux_sessions=args.active_tmux_session,
+        )
+        print(json.dumps({"sessions": sessions}, sort_keys=True))
+        return 0
     if args.command == "list-campaigns":
         print(json.dumps(_campaign_catalog(require_workflow=args.workflow), sort_keys=True))
         return 0
@@ -997,11 +1116,25 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(inspection, sort_keys=True))
         return 0
+    if args.command == "preflight-core-benchmark":
+        preflight = benchmark_service.preflight_core_benchmark(
+            args.suite,
+            git_commit=args.git_commit,
+            storage_root=args.storage_root,
+            scratch_root=args.scratch_root,
+            comsol_version_output=args.comsol_version_output,
+            comsol_executable_path=args.comsol_executable_path,
+        )
+        print(json.dumps(preflight, sort_keys=True))
+        return 0
     if args.command == "plan-core-benchmark":
         plan = benchmark_service.plan_core_benchmark(
             args.suite,
             git_commit=args.git_commit,
             storage_root=args.storage_root,
+            scratch_root=args.scratch_root,
+            comsol_version_output=args.comsol_version_output,
+            comsol_executable_path=args.comsol_executable_path,
             variant_id=args.variant,
         )
         print(json.dumps(plan, sort_keys=True))
@@ -1011,6 +1144,9 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             args.suite,
             git_commit=args.git_commit,
             storage_root=args.storage_root,
+            scratch_root=args.scratch_root,
+            comsol_version_output=args.comsol_version_output,
+            comsol_executable_path=args.comsol_executable_path,
             variant_id=args.variant,
         )
         print(json.dumps(manifest, sort_keys=True))
@@ -1787,6 +1923,46 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     raise ValueError(message)
 
 
+def _cli_error_payload(
+    args: argparse.Namespace,
+    error: Exception,
+) -> dict[str, Any]:
+    """Return one concise contextual error record for the CLI boundary."""
+    context: dict[str, Any] = {}
+    for name in (
+        "campaign_run_id",
+        "steady_campaign_run_id",
+        "transient_campaign_run_id",
+        "benchmark_run_id",
+        "batch_name",
+        "case_id",
+        "case_index",
+        "config",
+        "suite",
+        "storage_root",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            context[name] = str(value)
+    for name in (
+        "failure_stage",
+        "work_directory",
+        "cwd",
+        "missing_or_invalid_artifacts",
+    ):
+        value = getattr(error, name, None)
+        if value is not None:
+            context[name] = [str(item) for item in value] if isinstance(value, (list, tuple)) else str(value)
+    return {
+        "status": "error",
+        "command": args.command,
+        "stage": str(getattr(error, "failure_stage", args.command)),
+        "error_type": type(error).__name__,
+        "message": str(error),
+        "context": context,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
@@ -1804,7 +1980,14 @@ def main(argv: list[str] | None = None) -> int:
             details = config_service.validation_error_details(args.config, error)
             print(json.dumps(details, sort_keys=True), file=sys.stderr)
         else:
-            print(str(error), file=sys.stderr)
+            print(
+                json.dumps(
+                    _cli_error_payload(args, error),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
         return 2
     finally:
         if previous_term is not None:

@@ -192,7 +192,11 @@ def load_generated_batch(
     if max_cases is not None and (isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 1):
         msg = f"max_cases must be a positive integer or None, got {max_cases!r}."
         raise ValueError(msg)
-    batch = generation.runtime.admit_terminal_batch(batch_name, storage_root=storage_root)
+    batch = generation.runtime.admit_terminal_batch(
+        batch_name,
+        storage_root=storage_root,
+        validation_depth="routine",
+    )
     selected = batch.cases if max_cases is None else batch.cases[:max_cases]
     generated_identity = identity.build_generated_batch_identity(batch.manifest_payload())
     rows: list[dict[str, Any]] = []

@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from src import generation
+from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_license as license_service
 
 if TYPE_CHECKING:
@@ -88,6 +90,33 @@ def test_license_retry_backoff_is_exponential_and_bounded() -> None:
     assert all(delay >= 0.0 for delay in delays)
 
 
+def test_unbounded_license_retry_wait_never_exhausts() -> None:
+    """Interpret a null maximum wait as indefinitely controller-retryable."""
+    policy = {
+        "enabled": True,
+        "initial_delay_seconds": 60.0,
+        "maximum_delay_seconds": 300.0,
+        "maximum_wait_seconds": None,
+    }
+
+    assert (
+        license_service.bounded_retry_delay_seconds(
+            policy,
+            attempt_index=1,
+            cumulative_wait_seconds=0.0,
+        )
+        == 60.0
+    )
+    assert (
+        license_service.bounded_retry_delay_seconds(
+            policy,
+            attempt_index=100,
+            cumulative_wait_seconds=10_000_000.0,
+        )
+        == 300.0
+    )
+
+
 @pytest.mark.integration
 def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     generation_config_factory: Any,
@@ -146,6 +175,18 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     assert attempts[0]["slurm_job_id"] == "701"
     assert attempts[0]["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
     assert attempts[0]["retry_budget_remaining"] is True
+    blocked_attempt = attempt_service.latest_case_attempt(
+        config,
+        1,
+        run_id,
+        storage_root=storage,
+    )
+    assert blocked_attempt is not None
+    assert blocked_attempt.payload["case_state"] == "license_blocked"
+    assert blocked_attempt.payload["previous_attempt"] is None
+    cleanup = attempt_service.attempt_cleanup_evidence(blocked_attempt)
+    assert cleanup is not None
+    assert cleanup["status"] == "complete"
     assert not generation.runtime.case_failure_artifacts_directory(
         config,
         1,
@@ -163,6 +204,17 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         work_root=work,
     )
     assert outcome.status == "completed"
+    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    assert timing["license_wait_seconds"] == retry_policy["initial_delay_seconds"]
+    assert (
+        attempt_service.latest_case_attempt(
+            config,
+            1,
+            run_id,
+            storage_root=storage,
+        )
+        == blocked_attempt
+    )
     assert generation.runtime.completed_case_is_valid(
         config,
         1,
@@ -230,6 +282,15 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     assert attempts[-1]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
     assert attempts[-1]["retry_budget_remaining"] is False
     assert attempts[-1]["next_eligible_at"] is None
+    latest = license_service.latest_attempt_for_job(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id=attempts[-1]["slurm_job_id"],
+        storage_root=storage,
+    )
+    assert latest is not None
+    assert latest["first_blocked_at"] == attempts[0]["timestamp"]
 
 
 @pytest.mark.integration

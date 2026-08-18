@@ -129,6 +129,67 @@ def _assert_terminal_purpose_corruption_rejected(*, batch: Any, storage: Path) -
         success_path.write_bytes(original_success)
 
 
+def test_compact_case_builds_and_loads_package_without_direct_exports(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """Build and load a normal package from only canonical compact HDF5."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        executable=fake_comsol,
+        natural_count=1,
+        retain_raw_csv=False,
+        retain_solved_model=False,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.require_batch(
+        material_family="lentil",
+        sampling_regime="natural",
+    )
+    storage = tmp_path / "compact-storage"
+    generation.cases.input_generation.generate_input_cases(
+        batch,
+        1,
+        storage_root=storage,
+    )
+    outcome = generation.runtime.run_case(
+        batch,
+        1,
+        cores_per_case=1,
+        storage_root=storage,
+        work_root=tmp_path / "compact-work",
+    )
+    assert not (outcome.processed_directory / "comsol_exports").exists()
+    assert not (outcome.processed_directory / "solved.mph").exists()
+    assert not tuple(outcome.processed_directory.rglob("*.csv"))
+
+    generation.runtime.finalize_batch(batch, storage_root=storage)
+    result = datasets.packages.build_dataset_package(
+        campaign,
+        "steady_flow",
+        "id",
+        storage_root=storage,
+    )
+    loaded = datasets.runtime.factory.create_dataset(
+        datasets.runtime.factory.DatasetRequest(
+            dataset_id=result["dataset_id"],
+            dataset_view="steady_flow",
+            evaluation_regime="id",
+            storage_root=storage,
+            allow_technical_smoke=True,
+        )
+    )
+
+    loaded_steady: Any = loaded
+    assert len(loaded_steady) == 1
+    sample = loaded_steady[0]
+    task = domain.tasks.registry.get_task("steady_flow")
+    assert set(sample) == {"meta", "x", "y"}
+    assert sample["x"].shape[0] == task.in_channels
+    assert sample["y"].shape[0] == task.out_channels
+
+
 def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     generation_config_factory: Any,
     fake_comsol: Path,

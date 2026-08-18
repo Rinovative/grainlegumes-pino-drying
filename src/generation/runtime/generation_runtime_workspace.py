@@ -529,10 +529,10 @@ def create_transfer_staging(
     storage_root: Path | str,
     run_id: str,
 ) -> Path:
-    """Create one marked collision-safe transfer staging directory."""
+    """Create marked incoming staging on the destination filesystem."""
     storage = resolve_storage_root(storage_root, create=True)
     safe_run_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    root = common.paths.get_generation_state_root(storage_root=storage) / "transfer-staging"
+    root = storage / ".incoming"
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"{safe_run_id}.", dir=root)).resolve()
     marker = {
@@ -566,7 +566,7 @@ def validate_transfer_staging(
         message = f"Transfer staging marker has no storage identity: {resolved}"
         raise TypeError(message)
     storage = resolve_storage_root(storage_value, create=False)
-    root = common.paths.get_generation_state_root(storage_root=storage) / "transfer-staging"
+    root = storage / ".incoming"
     guarded, validated_marker = _guard_cleanup_target(
         resolved,
         allowed_root=root,
@@ -592,7 +592,7 @@ def cleanup_transfer_staging(
 ) -> int:
     """Remove one exact marked transfer staging directory."""
     storage = resolve_storage_root(storage_root, create=False)
-    root = common.paths.get_generation_state_root(storage_root=storage) / "transfer-staging"
+    root = storage / ".incoming"
     resolved, marker = _guard_cleanup_target(
         directory,
         allowed_root=root,
@@ -619,7 +619,7 @@ def transfer_staging_candidates(
 ) -> tuple[dict[str, Any], ...]:
     """Return only valid marked transfer staging cleanup candidates."""
     storage = resolve_storage_root(storage_root, create=False)
-    root = common.paths.get_generation_state_root(storage_root=storage) / "transfer-staging"
+    root = storage / ".incoming"
     if not root.exists():
         return ()
     if not root.is_dir() or root.is_symlink():

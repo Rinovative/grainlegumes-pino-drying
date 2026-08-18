@@ -1,10 +1,10 @@
 """
 generation_runtime_license.py
 
-Classify and persist bounded retry evidence for temporary COMSOL license capacity.
+Classify and persist retry evidence for temporary COMSOL license capacity.
 Responsibilities:
   - Recognize conservative floating-license capacity signatures in captured logs
-  - Derive bounded exponential retry delays from resolved execution policy
+  - Derive capped exponential retry delays from resolved execution policy
   - Persist and validate immutable per-case license-attempt evidence
 Design principles:
   - License exit codes never replace captured-text classification
@@ -158,7 +158,7 @@ def bounded_retry_delay_seconds(
     attempt_index: int,
     cumulative_wait_seconds: float,
 ) -> float:
-    """Return the next exponential delay without exceeding maximum wait."""
+    """Return the next capped delay, optionally bounded by cumulative wait."""
     if isinstance(attempt_index, bool) or not isinstance(attempt_index, int) or attempt_index < 1:
         message = "License retry attempt_index must be a positive integer."
         raise ValueError(message)
@@ -174,16 +174,16 @@ def bounded_retry_delay_seconds(
         raise ValueError(message)
     initial = float(policy["initial_delay_seconds"])
     maximum = float(policy["maximum_delay_seconds"])
-    maximum_wait = float(policy["maximum_wait_seconds"])
-    remaining = max(0.0, maximum_wait - cumulative)
-    if remaining == 0.0:
-        return 0.0
     delay = initial
     for _index in range(1, attempt_index):
         if delay >= maximum:
             delay = maximum
             break
         delay = min(maximum, delay * 2.0)
+    maximum_wait = policy["maximum_wait_seconds"]
+    if maximum_wait is None:
+        return delay
+    remaining = max(0.0, float(maximum_wait) - cumulative)
     return min(delay, remaining)
 
 
@@ -453,7 +453,12 @@ def latest_attempt_for_job(
     if len(matches) > 1:
         message = f"Temporary-license retry history duplicates Slurm job {job_id}."
         raise ValueError(message)
-    return None if not matches else matches[0]
+    if not matches:
+        return None
+    return {
+        **matches[0],
+        "first_blocked_at": attempts[0]["timestamp"],
+    }
 
 
 def retry_attempt_is_eligible(

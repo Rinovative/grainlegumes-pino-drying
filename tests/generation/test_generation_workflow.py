@@ -180,6 +180,39 @@ fi
 """.replace("$", "$"),
     )
     _executable(
+        fake_bin / "tmux",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'tmux <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
+case "${1:-}" in
+  list-sessions)
+    [[ ! -f "${FAKE_TMUX_SESSION_FILE}" ]] || cat "${FAKE_TMUX_SESSION_FILE}"
+    ;;
+  new-session)
+    session=''
+    arguments=("$@")
+    for ((index=0; index<${#arguments[@]}; index++)); do
+      [[ "${arguments[index]}" != -s ]] || session="${arguments[index+1]}"
+    done
+    [[ -n "${session}" ]] || exit 2
+    if [[ "${FAKE_TMUX_IMMEDIATE_EXIT:-false}" != true ]]; then
+      printf '%s\n' "${session}" > "${FAKE_TMUX_SESSION_FILE}"
+    fi
+    count=0
+    [[ ! -f "${FAKE_TMUX_START_COUNT_FILE}" ]] || read -r count < "${FAKE_TMUX_START_COUNT_FILE}"
+    printf '%s\n' "$((count + 1))" > "${FAKE_TMUX_START_COUNT_FILE}"
+    ;;
+  has-session)
+    [[ -f "${FAKE_TMUX_SESSION_FILE}" ]]
+    ;;
+  display-message)
+    printf '%s\n' '4242'
+    ;;
+  *) exit 2 ;;
+esac
+""",
+    )
+    _executable(
         fake_bin / "git",
         r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -492,9 +525,84 @@ if [[ " $* " == *' inspect-core-benchmark '* ]]; then
 '{"variant_id":"cores_32","cores_per_case":32}]}'
   exit 0
 fi
+if [[ " $* " == *' create-background-session '* ]]; then
+  storage=''
+  child=false
+  : > "${FAKE_BACKGROUND_CHILD_ARGUMENTS_FILE}"
+  arguments=("$@")
+  for ((index=0; index<${#arguments[@]}; index++)); do
+    argument="${arguments[index]}"
+    if [[ "${argument}" == --storage-root ]]; then
+      storage="${arguments[index+1]}"
+    elif [[ "${argument}" == -- ]]; then
+      child=true
+    elif [[ "${child}" == true ]]; then
+      printf '%s\n' "${argument}" >> "${FAKE_BACKGROUND_CHILD_ARGUMENTS_FILE}"
+    fi
+  done
+  session_id='gw-20260818T154501Z-all-01234567'
+  tmux_name='gw-all-154501-01234567'
+  directory="${storage}/01_generation/meta/workflow_sessions/${session_id}"
+  mkdir -p "${directory}"
+  command_path="${directory}/command.sh"
+  log_path="${directory}/workflow.log"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${command_path}"
+  chmod 700 "${command_path}"
+  : > "${log_path}"
+  printf '{"status":"created","workflow_session_id":"%s",' "${session_id}"
+  printf '"tmux_session_name":"%s","source_commit":"%s",' \
+    "${tmux_name}" "${FAKE_GIT_COMMIT}"
+  printf '"log_path":"%s","command_path":"%s",' \
+    "${log_path}" "${command_path}"
+  printf '%s\n' '"host":"synthetic-host"}'
+  exit 0
+fi
+if [[ " $* " == *' inspect-background-session '* ]]; then
+  printf '{"workflow_session_id":"gw-20260818T154501Z-all-01234567",'
+  printf '"source_commit":"%s","subcommand":"all",' "${FAKE_GIT_COMMIT}"
+  if [[ "${FAKE_TMUX_IMMEDIATE_EXIT:-false}" == true ]]; then
+    printf '"tmux_session_name":"gw-all-154501-01234567","tmux_active":false,'
+    printf '"workflow_state":"completed","exit_code":0,'
+    printf '"started_at":"2026-08-18T15:45:01+00:00","ended_at":"2026-08-18T15:45:02+00:00",'
+    printf '"campaign_run_ids":[],"benchmark_run_ids":[],"final_stage":"DONE: synthetic",'
+  else
+    printf '"tmux_session_name":"gw-all-154501-01234567","tmux_active":true,'
+    printf '"workflow_state":"running","exit_code":null,'
+    printf '"started_at":"2026-08-18T15:45:01+00:00","ended_at":null,'
+    printf '"campaign_run_ids":[],"benchmark_run_ids":[],"final_stage":"running",'
+  fi
+  printf '"log_path":"%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
+  printf '%s\n' 'gw-20260818T154501Z-all-01234567/workflow.log"}'
+  exit 0
+fi
+if [[ " $* " == *' list-background-sessions '* ]]; then
+  printf '%s\n' '{"sessions":[]}'
+  exit 0
+fi
 if [[ " $* " == *' -c '* ]]; then
   cat >/dev/null
-  if [[ " $* " == *'resource = value'* ]]; then
+  if [[ " $* " == *'keys = ("status"'* ]]; then
+    printf 'created\tgw-20260818T154501Z-all-01234567\tgw-all-154501-01234567\t%s\t' \
+      "${FAKE_GIT_COMMIT}"
+    printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
+    printf 'gw-20260818T154501Z-all-01234567/workflow.log\t'
+    printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
+    printf 'gw-20260818T154501Z-all-01234567/command.sh\tsynthetic-host\n'
+  elif [[ " $* " == *'fields = (value["workflow_state"]'* ]]; then
+    if [[ "${FAKE_TMUX_IMMEDIATE_EXIT:-false}" == true ]]; then
+      printf 'completed\t0\tDONE: synthetic\n'
+    else
+      printf 'running\t-\trunning\n'
+    fi
+  elif [[ " $* " == *'keys = ("workflow_session_id"'* ]]; then
+    printf 'gw-20260818T154501Z-all-01234567\t%s\tall\t' "${FAKE_GIT_COMMIT}"
+    printf 'gw-all-154501-01234567\ttrue\trunning\t-\t'
+    printf '2026-08-18T15:45:01+00:00\t-\t-\t-\trunning\t'
+    printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
+    printf 'gw-20260818T154501Z-all-01234567/workflow.log\n'
+  elif [[ " $* " == *'sessions = json.load'* ]]; then
+    printf '%s\n' 'No background workflow sessions.'
+  elif [[ " $* " == *'resource = value'* ]]; then
     printf 'benchmark\ttransient_core_scaling\t%s\t3\t4,8,16,32\tfixture.cluster\t'\
 'slurm\tstandard\t32\tPython/3.10\tComsol/v6.4\tpython\tcomsol\t1\n' \
       '8888888888888888888888888888888888888888888888888888888888888888'
@@ -518,6 +626,8 @@ if [[ " $* " == *' -c '* ]]; then
     purpose="$(cat "${FAKE_CAMPAIGN_PURPOSE_FILE}")"
     printf 'execution\t%s\t8\t01:00:00\t48\t1\t1\t-\tfixture.cluster\tslurm\tfixture\t'\
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' "${purpose}"
+  elif [[ " $* " == *'value["completed_cases"]'* ]]; then
+    printf 'deferred\t%s\t%s\t1\t0\t0\n' "${FAKE_RUN_ID}" "${FAKE_GIT_COMMIT}"
   elif [[ " $* " == *'campaign_purpose'* ]]; then
     printf 'campaign\tfamily_generalization\t-\t1\n'
   fi
@@ -544,7 +654,7 @@ elif [[ " $* " == *' validate-core-benchmark '* ]]; then
 elif [[ " $* " == *' validate-published-campaign '* ]]; then
   [[ "${FAKE_GPU_ALWAYS_VALID:-false}" == true || -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' create-transfer-staging '* ]]; then
-  staging="${storage}/01_generation/.state/transfer-staging/${FAKE_RUN_ID}.synthetic"
+  staging="${storage}/.incoming/${FAKE_RUN_ID}.synthetic"
   mkdir -p "${staging}"
   printf '%s\n' "${staging}"
 elif [[ " $* " == *' publish-transferred-core-benchmark '* ]]; then
@@ -597,6 +707,9 @@ elif [[ " $* " == *' finalize-technical-smoke-evidence '* ]]; then
   printf '%s\n' '{}' > "${evidence}"
   printf '/workspace/storage/01_generation/meta/campaigns/%s/technical_smoke_evidence.json\n' "${run_id}"
 elif [[ " $* " == *' finalize-real-smoke '* ]]; then
+  if [[ "${FAKE_FINALIZE_SMOKE_FAIL:-false}" == true ]]; then
+    exit 4
+  fi
   printf '%s\n' '/workspace/storage/01_generation/meta/smoke_receipts/current.json'
 elif [[ " $* " == *' record-workflow-failure '* ]]; then
   run_id="${arguments[3]}"
@@ -667,6 +780,9 @@ fi
             "FAKE_REMOTE_CLEANED_FILE": str(state_root / "remote-cleaned"),
             "FAKE_SOURCE_DIRECTORIES_FILE": str(source_directories_file),
             "FAKE_LOCAL_PYTHON": str(local_python),
+            "FAKE_TMUX_SESSION_FILE": str(state_root / "tmux-session"),
+            "FAKE_TMUX_START_COUNT_FILE": str(state_root / "tmux-start-count"),
+            "FAKE_BACKGROUND_CHILD_ARGUMENTS_FILE": str(state_root / "background-child-arguments"),
             "GENERATION_STATUS_POLL_SECONDS": "0",
             "STORAGE_ROOT": str(storage),
         }
@@ -1082,17 +1198,22 @@ def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: 
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source", "--detach"],
+        ["all", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
         environment,
     )
 
     assert result.returncode == 0, result.stderr
     assert "reused=1 generated=0" in result.stdout
-    command_lines = log.read_text(encoding="utf-8").splitlines()
+    log_text = log.read_text(encoding="utf-8")
+    command_lines = log_text.splitlines()
     prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
     plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
     submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
     assert prepare_index < plan_index < submit_index
+    assert "state=cpu_terminal_awaiting_collection" in result.stdout
+    assert "rsync-start" not in log_text
+    assert "<build-campaign-datasets>" not in log_text
+    assert "cleanup-campaign-source" not in log_text
 
 
 def test_invalid_canonical_inputs_abort_before_plan_or_submission(tmp_path: Path) -> None:
@@ -1135,11 +1256,11 @@ def test_pilot_prepares_canonical_inputs_before_plan_and_submission(tmp_path: Pa
     assert prepare_index < plan_index < submit_index
 
 
-def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evidence(tmp_path: Path) -> None:
+def test_license_blocked_campaign_polling_reaches_publication_without_failure_evidence(tmp_path: Path) -> None:
     """Poll a retry-delay campaign until its later publication completes."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "waiting_retry,successful"
+    environment["FAKE_CAMPAIGN_STATES"] = "license_blocked,successful"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
 
@@ -1150,7 +1271,7 @@ def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evid
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.index("State: waiting_retry") < result.stdout.index("State: successful")
+    assert result.stdout.index("State: license_blocked") < result.stdout.index("State: successful")
     log_text = log.read_text(encoding="utf-8")
     assert sum("--format monitor" in line for line in log_text.splitlines()) == 2
     assert sum("validate-campaign-terminal" in line for line in log_text.splitlines()) == 1
@@ -1436,9 +1557,52 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     assert log_text.count("submit-campaign") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text
     assert "<finalize-real-smoke>" in log_text
+    assert result.stdout.count("PROFILE COMPLETE:") == 2
+    assert result.stdout.count("DONE:") == 1
+    assert result.stdout.rstrip().endswith("DONE: paired Technical Smoke and all workflow receipts validated")
     assert f"local-python-commit <{commit}>" in log_text
     assert "Dirty untracked source reached local Python." not in result.stderr
     assert "Local Python did not receive the committed Generation source." not in result.stderr
+
+
+def test_smoke_finalization_failure_prints_no_top_level_done(tmp_path: Path) -> None:
+    """Do not announce top-level success before paired finalization succeeds."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_FINALIZE_SMOKE_FAIL"] = "true"
+
+    result = _run(workflow, ["smoke", *_remote_options()], environment)
+
+    assert result.returncode != 0
+    assert result.stdout.count("PROFILE COMPLETE:") == 2
+    assert "DONE:" not in result.stdout
+    assert "Could not atomically finalize paired Technical Smoke evidence" in result.stderr
+
+
+def test_finalize_smoke_is_explicit_idempotent_and_never_submits(tmp_path: Path) -> None:
+    """Finalize one explicit pair repeatedly without Slurm or COMSOL work."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    steady_run_id = _RUN_ID
+    transient_run_id = "synthetic_transient__fedcba9876543210"
+    arguments = [
+        "finalize-smoke",
+        steady_run_id,
+        transient_run_id,
+        *_remote_options(),
+    ]
+
+    first = _run(workflow, arguments, environment)
+    first_log = log.read_text(encoding="utf-8")
+    first_finalize_count = first_log.count("<finalize-real-smoke>")
+    second = _run(workflow, arguments, environment)
+
+    assert first.returncode == second.returncode == 0
+    assert first.stdout.count("DONE:") == second.stdout.count("DONE:") == 1
+    assert first_finalize_count > 0
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count("<finalize-real-smoke>") == 2 * first_finalize_count
+    assert "submit-campaign" not in log_text
+    assert "submit-core-benchmark" not in log_text
 
 
 def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) -> None:
@@ -2005,9 +2169,9 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     assert all((mirror / relative).is_dir() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("rsync-start") == 5
-    assert f"<{storage}/01_generation/.state/transfer-staging/{_RUN_ID}.synthetic/>" in log_text
+    assert f"<{storage}/.incoming/{_RUN_ID}.synthetic/>" in log_text
     assert "<cpu.example:/remote/generation root/storage/./" in log_text
-    assert not any((storage / "01_generation/.state/transfer-staging").glob("*"))
+    assert not any((storage / ".incoming").glob("*"))
 
     failed_root = tmp_path / "failed"
     failed_root.mkdir()
@@ -2023,7 +2187,7 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     assert failed.returncode == 1
     failed_text = failed_log.read_text(encoding="utf-8")
     assert "<publish-transferred-campaign>" in failed_text
-    assert any((failed_storage / "01_generation/.state/transfer-staging").glob("*"))
+    assert any((failed_storage / ".incoming").glob("*"))
 
 
 def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(tmp_path: Path) -> None:
@@ -2090,7 +2254,7 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert all((mirror / relative).is_dir() for relative in source_directories)
     assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()
     first_log = log.read_text(encoding="utf-8")
-    assert not any(Path(environment["STORAGE_ROOT"]).joinpath("01_generation/.state/transfer-staging").glob("*"))
+    assert not any(Path(environment["STORAGE_ROOT"]).joinpath(".incoming").glob("*"))
 
     environment["FAKE_BUILD_FAIL"] = "false"
     resumed = _run(
@@ -2117,8 +2281,8 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert final_log.count("cleanup-campaign-source") == cleanup_count
 
 
-def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None:
-    """Preserve source for partial failure and detached submit-only execution."""
+def test_partial_remote_failure_and_removed_detach_never_cleanup(tmp_path: Path) -> None:
+    """Preserve source on failure and reject the removed detach mode before launch."""
     workflow, _log, environment, _storage, mirror = _harness(tmp_path)
     source_directories = _seed_transfer(mirror, environment)
     environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
@@ -2144,7 +2308,131 @@ def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None
         detached_environment,
     )
 
-    assert detached.returncode == 0, detached.stderr
+    assert detached.returncode == 2
+    assert "--detach is no longer supported" in detached.stderr
+    assert "generation_workflow.sh launch CAMPAIGN" in detached.stderr
+    assert "generation_workflow.sh all CAMPAIGN --background" in detached.stderr
     assert all((detached_mirror / relative).is_dir() for relative in detached_directories)
-    detached_text = detached_log.read_text(encoding="utf-8")
-    assert "submit-campaign" in detached_text
+    detached_text = detached_log.read_text(encoding="utf-8") if detached_log.exists() else ""
+    assert "submit-campaign" not in detached_text
+
+
+@pytest.mark.parametrize("collection_mode", ["--defer-collection", "--keep-cpu-source"])
+def test_background_launch_starts_one_exact_tmux_child(
+    tmp_path: Path,
+    collection_mode: str,
+) -> None:
+    """Preserve exact child argv and actionable detached-session output."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    campaign = _campaign(workflow)
+    result = _run(
+        workflow,
+        [
+            "all",
+            str(campaign),
+            *_remote_options(),
+            collection_mode,
+            "--background",
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BACKGROUND STARTED" in result.stdout
+    assert "workflow_session_id=gw-20260818T154501Z-all-01234567" in result.stdout
+    assert "tmux attach-session -t gw-all-154501-01234567" in result.stdout
+    assert "press Ctrl+B, then D" in result.stdout
+    assert "background-status gw-20260818T154501Z-all-01234567" in result.stdout
+    assert "tail -n 100 -F" in result.stdout
+    state_root = Path(environment["FAKE_TMUX_START_COUNT_FILE"]).parent
+    assert (state_root / "tmux-start-count").read_text(encoding="utf-8").strip() == "1"
+    child_arguments = (state_root / "background-child-arguments").read_text(encoding="utf-8").splitlines()
+    assert child_arguments[0] == "all"
+    assert str(campaign) in child_arguments
+    assert collection_mode in child_arguments
+    assert "--background" not in child_arguments
+    assert child_arguments[child_arguments.index("--git-commit") + 1] == _COMMIT
+    assert child_arguments[child_arguments.index("--cpu-host") + 1] == "cpu.example"
+    assert "cancel-campaign" not in log.read_text(encoding="utf-8")
+
+    environment["FAKE_GIT_STATUS"] = " M unrelated-development-file\n"
+    status = _run(
+        workflow,
+        ["background-status", "gw-20260818T154501Z-all-01234567"],
+        environment,
+    )
+    assert status.returncode == 0, status.stderr
+    assert "workflow_state=running" in status.stdout
+    assert "Attach:" in status.stdout
+    listing = _run(workflow, ["background-list"], environment)
+    assert listing.returncode == 0, listing.stderr
+    assert listing.stdout.strip() == "No background workflow sessions."
+
+
+def test_background_launch_requires_a_clean_stable_host_checkout(tmp_path: Path) -> None:
+    """Reject dirty stable bootstrap code before session metadata or tmux mutation."""
+    workflow, _log, environment, storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GIT_STATUS"] = " M scripts/generation_workflow.sh\n"
+
+    result = _run(
+        workflow,
+        [
+            "all",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            "--defer-collection",
+            "--background",
+        ],
+        environment,
+    )
+
+    assert result.returncode == 1
+    assert "stable host checkout to be clean and committed" in result.stderr
+    assert not Path(environment["FAKE_TMUX_START_COUNT_FILE"]).exists()
+    assert not storage.exists()
+
+
+def test_background_launch_accepts_an_immediately_completed_child(tmp_path: Path) -> None:
+    """Treat a durable terminal result as success when tmux exits immediately."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TMUX_IMMEDIATE_EXIT"] = "true"
+
+    result = _run(
+        workflow,
+        [
+            "all",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            "--defer-collection",
+            "--background",
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BACKGROUND COMPLETED" in result.stdout
+    assert "workflow_session_id=gw-20260818T154501Z-all-01234567" in result.stdout
+    assert "exit_code=0" in result.stdout
+    assert "final_stage=DONE: synthetic" in result.stdout
+    assert "tmux attach-session" not in result.stdout
+
+
+def test_background_launch_rejects_unsupported_command_and_recursion(tmp_path: Path) -> None:
+    """Reject unsupported or recursively detached controller invocations before tmux."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    unsupported = _run(
+        workflow,
+        ["preflight", str(_campaign(workflow)), *_remote_options(), "--background"],
+        environment,
+    )
+    assert unsupported.returncode == 2
+    assert "--background is not supported for preflight" in unsupported.stderr
+    environment["GENERATION_WORKFLOW_BACKGROUND_CHILD"] = "1"
+    recursive = _run(
+        workflow,
+        ["all", str(_campaign(workflow)), *_remote_options(), "--background"],
+        environment,
+    )
+    assert recursive.returncode == 2
+    assert "cannot create another tmux session" in recursive.stderr
+    assert not Path(environment["FAKE_TMUX_START_COUNT_FILE"]).exists()

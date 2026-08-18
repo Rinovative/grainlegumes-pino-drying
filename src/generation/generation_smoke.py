@@ -320,7 +320,12 @@ def _export_inventory(
 
 
 def _load_hdf5(
-    path: Path, *, profile_id: str
+    path: Path,
+    *,
+    profile_id: str,
+    campaign_run_id: str,
+    batch_id: str,
+    case_id: str,
 ) -> tuple[
     dict[str, np.ndarray],
     dict[str, float],
@@ -336,11 +341,80 @@ def _load_hdf5(
     with h5py.File(path, "r") as handle:
         static_dataset = _required_dataset(handle, "static/fields")
         static = _field_map(static_dataset, label="static/fields")
-        fixed_name = "stationary_fixed/values" if profile_id == profiles.STEADY_FLOW_PROFILE else "scalar/values"
-        fixed_dataset = _required_dataset(handle, fixed_name)
-        all_scalars = _scalar_map(fixed_dataset, label="case scalars")
-        fixed = {name: all_scalars[name] for name in profiles.STATIONARY_FIXED_FIELDS}
-        scalars = {} if profile_id == profiles.STEADY_FLOW_PROFILE else all_scalars
+        if profile_id == profiles.STEADY_FLOW_PROFILE:
+            fixed_dataset = _required_dataset(handle, "stationary_fixed/values")
+            all_fixed = _scalar_map(
+                fixed_dataset,
+                label="stationary_fixed/values",
+            )
+            scalars: dict[str, float] = {}
+        else:
+            scalar_dataset = _required_dataset(handle, "scalar/values")
+            scalars = _scalar_map(
+                scalar_dataset,
+                label="scalar/values",
+            )
+            scientific_dataset = _required_dataset(
+                handle,
+                "provenance/scientific_config_json",
+            )
+            ownership_dataset = _required_dataset(
+                handle,
+                "provenance/stationary_fixed_ownership_json",
+            )
+            scientific = json.loads(
+                _text(
+                    scientific_dataset[()],
+                    label="provenance/scientific_config_json",
+                )
+            )
+            ownership = json.loads(
+                _text(
+                    ownership_dataset[()],
+                    label="provenance/stationary_fixed_ownership_json",
+                )
+            )
+            fixed_source = scientific.get("scientific_fixed_values") if isinstance(scientific, dict) else None
+            if not isinstance(fixed_source, dict) or not isinstance(
+                ownership,
+                dict,
+            ):
+                message = (
+                    "Technical Smoke fixed-value provenance is malformed: "
+                    f"run={campaign_run_id} profile={profile_id} "
+                    f"batch={batch_id} case={case_id} artifact={path}"
+                )
+                raise TypeError(message)
+            all_fixed = {}
+            for name in profiles.STATIONARY_FIXED_FIELDS:
+                record = ownership.get(name)
+                raw_value = fixed_source.get(name)
+                if (
+                    isinstance(raw_value, bool)
+                    or not isinstance(raw_value, (int, float))
+                    or not np.isfinite(float(raw_value))
+                    or not isinstance(record, dict)
+                    or record.get("owner") != "package_fixed"
+                    or record.get("fixed_value") != raw_value
+                ):
+                    message = (
+                        "Technical Smoke fixed-value ownership is invalid: "
+                        f"run={campaign_run_id} profile={profile_id} "
+                        f"batch={batch_id} case={case_id} artifact={path} "
+                        f"field={name}"
+                    )
+                    raise ValueError(message)
+                all_fixed[name] = float(raw_value)
+        try:
+            fixed = {name: all_fixed[name] for name in profiles.STATIONARY_FIXED_FIELDS}
+        except KeyError as error:
+            message = (
+                "Technical Smoke fixed-value evidence is incomplete: "
+                f"run={campaign_run_id} profile={profile_id} "
+                f"batch={batch_id} case={case_id} artifact={path} "
+                f"field={error.args[0]}"
+            )
+            raise ValueError(message) from error
         schedule: np.ndarray | None = None
         global_values: np.ndarray | None = None
         transient_dataset: h5py.Dataset | None = None
@@ -377,10 +451,16 @@ def _case_evidence(
     config: config_service.GenerationConfig,
     case_index: int,
     *,
+    campaign_run_id: str,
     storage: Path,
 ) -> _CaseEvidence:
     """Validate and summarize one published smoke case."""
-    publication = runtime_service.validate_completed_case(config, case_index, storage_root=storage)
+    publication = runtime_service.validate_completed_case(
+        config,
+        case_index,
+        storage_root=storage,
+        validation_depth="deep",
+    )
     raw = runtime_service.raw_case_directory(config, case_index, storage_root=storage)
     processed = runtime_service.processed_case_directory(config, case_index, storage_root=storage)
     case_payload = _json_object(raw / "case.json", label="smoke canonical raw case")
@@ -406,6 +486,9 @@ def _case_evidence(
     static, fixed, scalars, schedule, global_values, initial_state, exports, hdf5 = _load_hdf5(
         hdf5_path,
         profile_id=config.profile.id,
+        campaign_run_id=campaign_run_id,
+        batch_id=config.batch_id,
+        case_id=config.case_id(case_index),
     )
     input_records = _input_inventory(raw / "inputs", case_payload)
     expected_inputs = {"fields.csv"} if config.profile.id == profiles.STEADY_FLOW_PROFILE else {"fields.csv", "scalars.csv", "schedule.csv"}
@@ -516,7 +599,15 @@ def _validate_campaign(
     ):
         message = f"Campaign run {run_id!r} is not a retained {expected_profile!r} technical smoke with at least two natural cases."
         raise ValueError(message)
-    cases = tuple(_case_evidence(batch, case_index, storage=storage) for case_index in batch.case_indices)
+    cases = tuple(
+        _case_evidence(
+            batch,
+            case_index,
+            campaign_run_id=run_id,
+            storage=storage,
+        )
+        for case_index in batch.case_indices
+    )
     case_count = len(cases)
     if len({case.record["case_input_id"] for case in cases}) != case_count:
         message = f"Technical smoke {expected_profile!r} reused a case-input identity."

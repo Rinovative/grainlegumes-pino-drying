@@ -26,6 +26,10 @@ if [[ ! "${BATCH_NAME}" =~ ^[A-Za-z0-9._-]+$ || ! "${CASE_INDEX}" =~ ^[1-9][0-9]
   printf 'Campaign batch, case, or core arguments are malformed.\n' >&2
   exit 2
 fi
+if [[ ! "${GENERATION_ATTEMPT_INDEX:-}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'GENERATION_ATTEMPT_INDEX must identify the exact positive case attempt.\n' >&2
+  exit 2
+fi
 if [[ ! "${SLURM_CPUS_PER_TASK:-}" =~ ^[1-9][0-9]*$ || "${SLURM_CPUS_PER_TASK}" -ne "${CORES_PER_CASE}" ]]; then
   printf 'Slurm cpus-per-task (%s) must equal cores_per_case (%s).\n' \
     "${SLURM_CPUS_PER_TASK:-unset}" "${CORES_PER_CASE}" >&2

@@ -646,7 +646,7 @@ def _global_range_diagnostics(
 ) -> list[validation_policy.DiagnosticRecord]:
     """Return advisory finite global-range diagnostics."""
     records: list[validation_policy.DiagnosticRecord] = []
-    diagnostic_sources = ("comsol_exports/global_timeseries.csv", "comsol_exports/final_status.csv")
+    diagnostic_sources = ("source_export:global_timeseries.csv", "source_export:final_status.csv")
     if np.any(_outside_unit_interval(f_wet)):
         records.append(
             validation_policy.diagnostic_record(
@@ -673,7 +673,7 @@ def _global_range_diagnostics(
                 message="One or more finite exported mass-flow series use an unexpected negative sign.",
                 metrics=minimum_flows,
                 thresholds={"preferred_minimum": 0.0},
-                source_artifacts=("comsol_exports/global_timeseries.csv",),
+                source_artifacts=("source_export:global_timeseries.csv",),
             )
         )
     return records
@@ -717,7 +717,7 @@ def _transient_output_diagnostics(
         raise ValueError(message)
 
     records: list[validation_policy.DiagnosticRecord] = []
-    diagnostic_sources = ("comsol_exports/global_timeseries.csv", "comsol_exports/final_status.csv")
+    diagnostic_sources = ("source_export:global_timeseries.csv", "source_export:final_status.csv")
     f_wet = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]
     evaporation = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_evap")]
     vapor_in = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_in")]
@@ -762,7 +762,7 @@ def _transient_output_diagnostics(
                 message="Solved initial moisture fields differ from the canonical reconstructed initial state.",
                 metrics=initial_metrics,
                 thresholds={"rtol": initial_rtol, "atol": initial_atol},
-                source_artifacts=("comsol_exports/transient_states.csv", "raw/case.json"),
+                source_artifacts=("source_export:transient_states.csv", "raw/case.json"),
             )
         )
 
@@ -811,7 +811,7 @@ def _transient_output_diagnostics(
                 message="Solved relative humidity contains finite values outside the preferred [0, 1] range.",
                 metrics={"minimum": float(np.min(final_phi)), "maximum": float(np.max(final_phi))},
                 thresholds={"minimum": 0.0, "maximum": 1.0},
-                source_artifacts=("comsol_exports/transient_states.csv",),
+                source_artifacts=("source_export:transient_states.csv",),
             )
         )
 
@@ -833,7 +833,7 @@ def _transient_output_diagnostics(
                 severity="warning",
                 stage="diagnostics",
                 message=f"Bulk-moisture reconstruction diagnostic was unavailable: {type(error).__name__}: {error}",
-                source_artifacts=("comsol_exports/transient_states.csv", "comsol_exports/global_timeseries.csv"),
+                source_artifacts=("source_export:transient_states.csv", "source_export:global_timeseries.csv"),
             )
         )
     else:
@@ -846,7 +846,7 @@ def _transient_output_diagnostics(
                     message="Exported bulk moisture differs from the weighted reconstructed series.",
                     metrics={"maximum_absolute_difference": float(np.max(np.abs(bulk.exported - bulk.reconstructed)))},
                     thresholds={"rtol": bulk.rtol, "atol": bulk.atol},
-                    source_artifacts=("comsol_exports/transient_states.csv", "comsol_exports/global_timeseries.csv"),
+                    source_artifacts=("source_export:transient_states.csv", "source_export:global_timeseries.csv"),
                 )
             )
 
@@ -863,7 +863,7 @@ def _transient_output_diagnostics(
                 message="Finite mass-balance residual exceeds the preferred scale-relative diagnostic tolerance.",
                 metrics={"maximum_absolute_residual": maximum_residual, "flow_scale": flow_scale},
                 thresholds={"relative": _MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE, "absolute": preferred},
-                source_artifacts=("comsol_exports/global_timeseries.csv",),
+                source_artifacts=("source_export:global_timeseries.csv",),
             )
         )
     return records
@@ -937,16 +937,34 @@ def _json_attribute(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _source_hashes(exports: Sequence[Any]) -> dict[str, dict[str, Any]]:
-    """Return relative-path, role, hash, and size evidence for every adapter export."""
-    return {
-        item.relative_path.as_posix(): {
-            "role": item.role,
+def _source_hashes(
+    exports: Sequence[Any],
+    *,
+    retention_policy: str,
+    role_shapes: Mapping[str, tuple[int, int]],
+) -> dict[str, dict[str, Any]]:
+    """Return complete conversion evidence for every hash-admitted export."""
+    if retention_policy not in {"full", "compact"}:
+        message = f"Unsupported source-export retention policy: {retention_policy!r}."
+        raise ValueError(message)
+    role_counts: dict[str, int] = {}
+    for item in exports:
+        role_counts[item.role] = role_counts.get(item.role, 0) + 1
+    evidence: dict[str, dict[str, Any]] = {}
+    for item in exports:
+        relative_name = item.relative_path.as_posix()
+        shape = role_shapes.get(item.role) if role_counts[item.role] == 1 else None
+        evidence[relative_name] = {
+            "logical_role": item.role,
+            "configured_relative_name": relative_name,
             "sha256": item.sha256,
             "size_bytes": item.size_bytes,
+            "row_count": None if shape is None else shape[0],
+            "column_count": None if shape is None else shape[1],
+            "conversion_status": "converted",
+            "retained": retention_policy == "full",
         }
-        for item in exports
-    }
+    return evidence
 
 
 def _status(
@@ -1139,6 +1157,7 @@ def _write_hdf5(
         handle.attrs["schema_kind"] = HDF5_SCHEMA_KIND
         handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
         handle.attrs["converter_version"] = storage["converter_version"]
+        handle.attrs["retention_policy"] = config.execution_values["retention_policy"]
         for key in (
             "simulation_profile",
             "case_id",
@@ -1356,19 +1375,46 @@ def _validate_source_export_provenance(
     value: Any,
     *,
     profile_contract: profiles.SimulationProfile,
+    retention_policy: str,
 ) -> None:
-    """Validate exact source-export roles with portable hashes and multiplicity."""
+    """Validate exact source-export conversion, shape, hash, and retention evidence."""
     if not isinstance(value, dict) or not value:
         msg = "Canonical source-export provenance must be one non-empty mapping."
         raise ValueError(msg)
     role_counts = {spec.role: 0 for spec in profile_contract.export_roles}
+    expected_keys = {
+        "logical_role",
+        "configured_relative_name",
+        "sha256",
+        "size_bytes",
+        "row_count",
+        "column_count",
+        "conversion_status",
+        "retained",
+    }
     for relative_path, record in value.items():
         _safe_relative_path(relative_path, label="source export path")
-        role = _validate_hash_record(record, label=f"source_exports[{relative_path!r}]", include_role=True)
-        if role not in role_counts:
-            msg = f"Canonical source export declares an unknown role {role!r}."
-            raise ValueError(msg)
-        role_counts[role] += 1
+        if not isinstance(record, dict) or set(record) != expected_keys:
+            message = f"source_exports[{relative_path!r}] has an invalid evidence record."
+            raise ValueError(message)
+        role = record.get("logical_role")
+        row_count = record.get("row_count")
+        column_count = record.get("column_count")
+        if (
+            role not in role_counts
+            or record.get("configured_relative_name") != relative_path
+            or not _is_sha256(record.get("sha256"))
+            or isinstance(record.get("size_bytes"), bool)
+            or not isinstance(record.get("size_bytes"), int)
+            or record["size_bytes"] < 1
+            or (row_count is not None and (isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 1))
+            or (column_count is not None and (isinstance(column_count, bool) or not isinstance(column_count, int) or column_count < 1))
+            or record.get("conversion_status") != "converted"
+            or record.get("retained") is not (retention_policy == "full")
+        ):
+            message = f"source_exports[{relative_path!r}] has invalid conversion or retention evidence."
+            raise ValueError(message)
+        role_counts[str(role)] += 1
     for spec in profile_contract.export_roles:
         count = role_counts[spec.role]
         if (spec.required and count < 1) or (not spec.allow_multiple and count > 1):
@@ -1583,9 +1629,17 @@ def _validate_hdf5_provenance(
             sha256=scalar_identity["sha256"],
             size_bytes=scalar_identity["size_bytes"],
         )
+    retention_policy = _hdf5_text_attribute(
+        handle.attrs.get("retention_policy", ""),
+        label="retention_policy",
+    )
+    if retention_policy not in {"full", "compact"}:
+        message = "Canonical HDF5 retention policy is invalid."
+        raise ValueError(message)
     _validate_source_export_provenance(
         source_exports,
         profile_contract=profile_contract,
+        retention_policy=retention_policy,
     )
     template_sha256 = _hdf5_text_attribute(
         handle.attrs.get("template_sha256", ""),
@@ -2025,10 +2079,15 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         )
         available_views = json.loads(_hdf5_text_attribute(handle.attrs.get("available_learning_views", ""), label="available_learning_views"))
         airflow_source = _hdf5_text_attribute(handle.attrs.get("airflow_source", ""), label="airflow_source")
+        retention_policy = _hdf5_text_attribute(
+            handle.attrs.get("retention_policy", ""),
+            label="retention_policy",
+        )
         if (
             not _is_sha256(export_contract_sha256)
             or available_views != list(profile_contract.available_learning_views)
             or airflow_source != profile_contract.airflow_source
+            or retention_policy not in {"full", "compact"}
         ):
             msg = "Canonical HDF5 export, learning-view, or airflow provenance is invalid."
             raise ValueError(msg)
@@ -2045,6 +2104,7 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
             "export_contract_sha256": export_contract_sha256,
             "available_learning_views": tuple(available_views),
             "airflow_source": airflow_source,
+            "retention_policy": retention_policy,
             **identities,
         }
 
@@ -2319,7 +2379,38 @@ def convert_exports_to_hdf5(
                 f_surf=f_surf,
             )
         )
-    source_hashes = _source_hashes(exports)
+    role_shapes = {
+        profiles.STEADY_FLOW_EXPORT_ROLE: (
+            int(x_axis.size * y_axis.size),
+            len(_contract(config, profiles.STEADY_FLOW_EXPORT_ROLE)["columns"]),
+        )
+    }
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        if transient_time is None or global_values is None or final_status is None:
+            message = "Transient conversion completed without source-shape evidence."
+            raise RuntimeError(message)
+        state_count = int(transient_time.size + (exact_stop_time is not None))
+        role_shapes.update(
+            {
+                profiles.TRANSIENT_RAW_EXPORT_ROLE: (
+                    int(x_axis.size * y_axis.size),
+                    state_count * len(_contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)["columns"]),
+                ),
+                profiles.GLOBAL_EXPORT_ROLE: (
+                    int(global_values.shape[0]),
+                    int(global_values.shape[1]),
+                ),
+                profiles.FINAL_STATUS_EXPORT_ROLE: (
+                    int(final_status.shape[0]),
+                    int(final_status.shape[1]),
+                ),
+            }
+        )
+    source_hashes = _source_hashes(
+        exports,
+        retention_policy=config.execution_values["retention_policy"],
+        role_shapes=role_shapes,
+    )
     runtime_directory.mkdir(parents=True, exist_ok=True)
     destination = runtime_directory / "case.h5"
     descriptor, temporary_name = tempfile.mkstemp(prefix=".case.", suffix=".h5.tmp", dir=runtime_directory)

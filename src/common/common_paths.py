@@ -166,9 +166,45 @@ def get_dataset_metadata_root(*, storage_root: Path | str | None = None) -> Path
     return get_datasets_root(storage_root=storage_root) / "meta"
 
 
-def get_dataset_payload_root(*, storage_root: Path | str | None = None) -> Path:
-    """Return the immutable final-dataset payload stage."""
-    return get_datasets_root(storage_root=storage_root) / "raw"
+def _directory_contains_data(path: Path, *, label: str) -> bool:
+    """Return whether one optional ordinary directory contains any entry."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        message = f"{label} is not a safe directory: {path}"
+        raise ValueError(message)
+    if not path.exists():
+        return False
+    return next(path.iterdir(), None) is not None
+
+
+def get_dataset_packages_root(
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Return the sole final-dataset package stage after legacy detection."""
+    datasets = get_datasets_root(storage_root=storage_root)
+    legacy = datasets / "raw"
+    packages = datasets / "packages"
+    legacy_has_data = _directory_contains_data(
+        legacy,
+        label="legacy dataset raw root",
+    )
+    packages_has_data = _directory_contains_data(
+        packages,
+        label="dataset packages root",
+    )
+    if legacy_has_data and packages_has_data:
+        message = f"Both legacy and current dataset roots contain data; refusing to merge {legacy} and {packages}."
+        raise RuntimeError(message)
+    if legacy_has_data:
+        message = "\n".join(
+            (
+                "Legacy dataset packages require a one-time explicit move:",
+                'mv -- "$STORAGE_ROOT/02_datasets/raw" ' + "\\",
+                '       "$STORAGE_ROOT/02_datasets/packages"',
+            )
+        )
+        raise RuntimeError(message)
+    return packages
 
 
 def get_dataset_state_root(*, storage_root: Path | str | None = None) -> Path:
@@ -504,7 +540,7 @@ def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = No
 
     """
     dataset_id = validate_logical_name(dataset_id, label="dataset_id")
-    root = Path(dataset_root).expanduser() if dataset_root is not None else get_dataset_payload_root()
+    root = Path(dataset_root).expanduser() if dataset_root is not None else get_dataset_packages_root()
     return root / dataset_id
 
 

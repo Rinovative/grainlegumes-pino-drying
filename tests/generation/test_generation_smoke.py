@@ -8,11 +8,126 @@ import json
 from pathlib import Path
 from typing import Any
 
+import h5py
+import numpy as np
 import pytest
 import yaml
 
 from src import generation
 from src.generation.contracts import generation_contracts_mapping as mapping_contract
+from src.generation.contracts import generation_contracts_profiles as profiles
+
+
+def test_transient_smoke_reads_fixed_airflow_values_from_scientific_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep package-fixed airflow values out of transient sampled scalars."""
+    path = tmp_path / "transient-case.h5"
+    fixed = {
+        "T_flow_ref": 300.65,
+        "p_ref": 101325.0,
+        "p_out": 0.0,
+    }
+    scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
+    scalar_values = np.arange(1, len(scalar_names) + 1, dtype=np.float64)
+    with h5py.File(path, "w") as handle:
+        static = handle.create_group("static").create_dataset(
+            "fields",
+            data=np.ones((1, 2, 2), dtype=np.float64),
+        )
+        static.attrs["field_names"] = json.dumps(["epsilon"])
+        scalar = handle.create_group("scalar").create_dataset(
+            "values",
+            data=scalar_values,
+        )
+        scalar.attrs["field_names"] = json.dumps(list(scalar_names))
+        handle.create_group("schedule").create_dataset(
+            "values",
+            data=np.asarray([[0.0, 300.0, 0.01]], dtype=np.float64),
+        )
+        handle.create_group("global").create_dataset(
+            "values",
+            data=np.asarray([[0.0, 1.0]], dtype=np.float64),
+        )
+        transient = handle.create_group("transient").create_dataset(
+            "fields",
+            data=np.ones((1, 1, 2, 2), dtype=np.float64),
+        )
+        transient.attrs["field_names"] = json.dumps(["T"])
+        provenance = handle.create_group("provenance")
+        provenance.create_dataset(
+            "scientific_config_json",
+            data=json.dumps({"scientific_fixed_values": fixed}),
+        )
+        provenance.create_dataset(
+            "stationary_fixed_ownership_json",
+            data=json.dumps(
+                {
+                    name: {
+                        "owner": "package_fixed",
+                        "fixed_value": value,
+                        "unit": "K" if name == "T_flow_ref" else "Pa",
+                    }
+                    for name, value in fixed.items()
+                }
+            ),
+        )
+        provenance.create_dataset(
+            "source_exports_json",
+            data=json.dumps(
+                {
+                    "global.csv": {
+                        "role": "global_timeseries",
+                        "sha256": "a" * 64,
+                        "size_bytes": 1,
+                    }
+                }
+            ),
+        )
+    monkeypatch.setattr(
+        generation.smoke.storage_service,
+        "validate_case_hdf5",
+        lambda *_args, **_kwargs: {
+            "case_input_id": "b" * 64,
+            "simulation_case_id": "c" * 64,
+        },
+    )
+
+    _static, observed_fixed, scalars, *_remaining = generation.smoke._load_hdf5(
+        path,
+        profile_id=profiles.TRANSIENT_DRYING_PROFILE,
+        campaign_run_id="transient-smoke__0123456789abcdef",
+        batch_id="transient-smoke-batch",
+        case_id="case_0001",
+    )
+
+    assert observed_fixed == fixed
+    assert set(scalars) == set(profiles.TRANSIENT_SCALAR_INPUT_FIELDS)
+    assert not set(profiles.STATIONARY_FIXED_FIELDS).intersection(scalars)
+
+    incomplete_fixed = dict(fixed)
+    del incomplete_fixed["T_flow_ref"]
+    with h5py.File(path, "r+") as handle:
+        scientific_dataset = handle.get("provenance/scientific_config_json")
+        assert isinstance(scientific_dataset, h5py.Dataset)
+        scientific_dataset[()] = json.dumps({"scientific_fixed_values": incomplete_fixed})
+    with pytest.raises(
+        ValueError,
+        match=r"fixed-value ownership is invalid: .*field=T_flow_ref",
+    ) as caught:
+        generation.smoke._load_hdf5(
+            path,
+            profile_id=profiles.TRANSIENT_DRYING_PROFILE,
+            campaign_run_id="transient-smoke__0123456789abcdef",
+            batch_id="transient-smoke-batch",
+            case_id="case_0001",
+        )
+    message = str(caught.value)
+    assert "field=T_flow_ref" in message
+    assert "profile=transient_drying" in message
+    assert "case=case_0001" in message
+    assert str(path) in message
 
 
 def _successful_smoke_report(
@@ -126,8 +241,10 @@ def _patch_finalizer_dependencies(
         _batch: Any,
         case_index: int,
         *,
+        campaign_run_id: str,
         storage: Path,
     ) -> generation.smoke._CaseEvidence:
+        assert campaign_run_id
         assert storage.is_dir()
         try:
             return cases[case_index]

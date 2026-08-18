@@ -1802,6 +1802,56 @@ def _validated_wall_time(value: Any, *, timeout_seconds: float) -> str:
     return text
 
 
+def _validated_temporary_license_retry(value: Any) -> dict[str, Any]:
+    """Return one validated finite- or unbounded-wait license policy."""
+    retry = _mapping(
+        value,
+        label="execution.runtime.temporary_license_retry",
+    )
+    _exact_keys(
+        retry,
+        required={
+            "enabled",
+            "initial_delay_seconds",
+            "maximum_delay_seconds",
+            "maximum_wait_seconds",
+        },
+        optional=set(),
+        label="execution.runtime.temporary_license_retry",
+    )
+    if not isinstance(retry["enabled"], bool):
+        message = "execution.runtime.temporary_license_retry.enabled must be boolean."
+        raise TypeError(message)
+    for key in (
+        "initial_delay_seconds",
+        "maximum_delay_seconds",
+    ):
+        retry[key] = _finite(
+            retry[key],
+            label=f"execution.runtime.temporary_license_retry.{key}",
+        )
+        if retry[key] <= 0.0:
+            message = f"execution.runtime.temporary_license_retry.{key} must be positive."
+            raise GenerationConfigError(message)
+    if retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]:
+        message = "execution.runtime.temporary_license_retry.maximum_delay_seconds must be at least initial_delay_seconds."
+        raise GenerationConfigError(message)
+    maximum_wait = retry["maximum_wait_seconds"]
+    if maximum_wait is not None:
+        maximum_wait = _finite(
+            maximum_wait,
+            label="execution.runtime.temporary_license_retry.maximum_wait_seconds",
+        )
+        if maximum_wait <= 0.0:
+            message = "execution.runtime.temporary_license_retry.maximum_wait_seconds must be positive or null."
+            raise GenerationConfigError(message)
+        retry["maximum_wait_seconds"] = maximum_wait
+    if maximum_wait is not None and maximum_wait < retry["initial_delay_seconds"]:
+        message = "execution.runtime.temporary_license_retry.maximum_wait_seconds must be at least initial_delay_seconds."
+        raise GenerationConfigError(message)
+    return retry
+
+
 def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     """Validate authored execution owners and derive repeated runtime fields."""
     execution = _mapping(value, label="generation execution configuration")
@@ -1866,43 +1916,9 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         label="execution.runtime.maximum_failed_cases",
         minimum=0,
     )
-    retry = _mapping(
+    runtime["temporary_license_retry"] = _validated_temporary_license_retry(
         runtime["temporary_license_retry"],
-        label="execution.runtime.temporary_license_retry",
     )
-    _exact_keys(
-        retry,
-        required={
-            "enabled",
-            "initial_delay_seconds",
-            "maximum_delay_seconds",
-            "maximum_wait_seconds",
-        },
-        optional=set(),
-        label="execution.runtime.temporary_license_retry",
-    )
-    if not isinstance(retry["enabled"], bool):
-        message = "execution.runtime.temporary_license_retry.enabled must be boolean."
-        raise TypeError(message)
-    for key in (
-        "initial_delay_seconds",
-        "maximum_delay_seconds",
-        "maximum_wait_seconds",
-    ):
-        retry[key] = _finite(
-            retry[key],
-            label=f"execution.runtime.temporary_license_retry.{key}",
-        )
-        if retry[key] <= 0.0:
-            message = f"execution.runtime.temporary_license_retry.{key} must be positive."
-            raise GenerationConfigError(message)
-    if retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]:
-        message = "execution.runtime.temporary_license_retry.maximum_delay_seconds must be at least initial_delay_seconds."
-        raise GenerationConfigError(message)
-    if retry["maximum_wait_seconds"] < retry["initial_delay_seconds"]:
-        message = "execution.runtime.temporary_license_retry.maximum_wait_seconds must be at least initial_delay_seconds."
-        raise GenerationConfigError(message)
-    runtime["temporary_license_retry"] = retry
 
     arguments = runtime["extra_arguments"]
     if not isinstance(arguments, list) or not all(

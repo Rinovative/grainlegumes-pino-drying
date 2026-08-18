@@ -959,7 +959,7 @@ def record_transfer_staging_inventory(
     *,
     staging_root: Path | str,
 ) -> dict[str, Any]:
-    """Record exact transfer-staging bytes before publication and later cleanup."""
+    """Record exact incoming transfer bytes before atomic publication."""
     staging = workspace_service.validate_transfer_staging(staging_root, run_id=run_id)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=staging)
     path = run_directory / PILOT_STAGING_INVENTORY_FILENAME
@@ -1071,7 +1071,7 @@ def validate_transfer_staging_inventory(
     storage_root: Path | str | None = None,
     require_staging_present: bool = False,
 ) -> dict[str, Any]:
-    """Validate recorded staging size and, while retained, its exact live tree."""
+    """Validate received-byte provenance and the retained staging marker."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / PILOT_STAGING_INVENTORY_FILENAME
     payload = _load_json(path, label="pilot transfer staging inventory")
@@ -1104,13 +1104,14 @@ def validate_transfer_staging_inventory(
     staging = Path(staging_value)
     if staging.exists():
         validated = workspace_service.validate_transfer_staging(staging, run_id=run_id)
-        files = _regular_files([validated])
-        if (
-            sum(item.stat().st_size for item in files) != payload["transfer_staging_bytes_before_cleanup"]
-            or len(files) != payload["transfer_staging_file_count"]
-        ):
-            message = f"Pilot transfer staging changed after inventory: {staging}"
-            raise ValueError(message)
+        if storage == validated:
+            files = _regular_files([validated])
+            if (
+                sum(item.stat().st_size for item in files) != payload["transfer_staging_bytes_before_cleanup"]
+                or len(files) != payload["transfer_staging_file_count"]
+            ):
+                message = f"Pilot transfer staging changed before atomic publication: {staging}"
+                raise ValueError(message)
     elif require_staging_present:
         message = f"Pilot transfer staging is missing before cleanup authorization: {staging}"
         raise FileNotFoundError(message)
@@ -1541,7 +1542,10 @@ def _summary_markdown(receipt: Mapping[str, Any]) -> str:
             f"- CPU source before cleanup: {receipt['pre_cleanup_cpu_inventory']['cpu_source_bytes_before_cleanup']} bytes",
             f"- CPU exports before cleanup: {receipt['pre_cleanup_cpu_inventory']['cpu_exports_bytes']} bytes",
             f"- CPU logs before cleanup: {receipt['pre_cleanup_cpu_inventory']['cpu_logs_bytes']} bytes",
-            f"- Transfer staging before cleanup: {receipt['transfer_staging_inventory']['transfer_staging_bytes_before_cleanup']} bytes",
+            (
+                "- Incoming transfer received before atomic publication: "
+                f"{receipt['transfer_staging_inventory']['transfer_staging_bytes_before_cleanup']} bytes"
+            ),
             f"- Current permanent GPU pilot: {receipt['post_transfer_gpu_inventory']['current_pilot_gpu_permanent_bytes']} bytes",
             f"- CPU cleanup: {receipt['cleanup']['cpu_source']['status']} ({receipt['cleanup']['cpu_source']['bytes_reclaimed']} bytes reclaimed)",
             (
@@ -1902,53 +1906,96 @@ def cleanup_recorded_transfer_staging(
     storage_root: Path | str | None,
     confirm: bool,
 ) -> dict[str, Any]:
-    """Transactionally remove only the exact inventoried pilot staging tree."""
+    """Transactionally remove only the live residual pilot staging tree."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     validate_pilot_pre_cleanup(run_id, storage_root=storage)
     inventory = validate_transfer_staging_inventory(run_id, storage_root=storage)
     staging = Path(inventory["transfer_staging_path"])
-    expected_bytes = int(inventory["transfer_staging_bytes_before_cleanup"])
-    expected_files = int(inventory["transfer_staging_file_count"])
     directory = pilot_check_directory(run_id, storage_root=storage)
     receipt_path = directory / PILOT_STAGING_CLEANUP_FILENAME
-    identity = {
+    base_identity = {
         "schema_kind": "generation_pilot_staging_cleanup",
         "schema_version": PILOT_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         "staging_path": str(staging),
-        "expected_bytes": expected_bytes,
-        "expected_file_count": expected_files,
         "pre_cleanup_snapshot_sha256": common.serialization.file_sha256(directory / PILOT_PRE_CLEANUP_FILENAME),
     }
+    receipt_keys = {
+        *base_identity,
+        "expected_bytes",
+        "expected_file_count",
+        "status",
+        "removed",
+        "reclaimed_bytes",
+        "started_at",
+        "completed_at",
+    }
     existing = _load_json(receipt_path, label="pilot staging cleanup receipt") if receipt_path.exists() else None
-    if existing is not None and any(existing.get(key) != value for key, value in identity.items()):
-        message = f"Pilot staging cleanup receipt identity conflicts: {receipt_path}"
-        raise ValueError(message)
-    if existing is not None and existing.get("status") == "complete":
+    if existing is not None:
         if (
-            staging.exists()
-            or existing.get("removed") is not True
-            or existing.get("reclaimed_bytes") != expected_bytes
-            or not isinstance(existing.get("completed_at"), str)
+            set(existing) != receipt_keys
+            or any(existing.get(key) != value for key, value in base_identity.items())
+            or not isinstance(existing.get("expected_bytes"), int)
+            or isinstance(existing.get("expected_bytes"), bool)
+            or existing["expected_bytes"] < 0
+            or not isinstance(existing.get("expected_file_count"), int)
+            or isinstance(existing.get("expected_file_count"), bool)
+            or existing["expected_file_count"] < 1
+            or not isinstance(existing.get("started_at"), str)
         ):
-            message = f"Pilot staging cleanup completion is invalid: {receipt_path}"
+            message = f"Pilot staging cleanup receipt is malformed or conflicts: {receipt_path}"
             raise ValueError(message)
-        return existing
-    if not confirm:
-        return {
-            **identity,
-            "status": "cleanup_not_authorized",
-            "removed": False,
-            "reclaimed_bytes": 0,
-        }
-    if existing is None:
+        expected_bytes = int(existing["expected_bytes"])
+        expected_files = int(existing["expected_file_count"])
+        if existing.get("status") == "complete":
+            if (
+                staging.exists()
+                or existing.get("removed") is not True
+                or existing.get("reclaimed_bytes") != expected_bytes
+                or not isinstance(existing.get("completed_at"), str)
+            ):
+                message = f"Pilot staging cleanup completion is invalid: {receipt_path}"
+                raise ValueError(message)
+            return existing
+        if (
+            existing.get("status") != "pending"
+            or existing.get("removed") is not False
+            or existing.get("reclaimed_bytes") != 0
+            or existing.get("completed_at") is not None
+        ):
+            message = f"Pilot staging cleanup receipt has an unsupported state: {receipt_path}"
+            raise ValueError(message)
+    else:
+        if not confirm:
+            if staging.exists():
+                validated = workspace_service.validate_transfer_staging(staging, run_id=run_id)
+                files = _regular_files([validated])
+                expected_bytes = sum(item.stat().st_size for item in files)
+                expected_files = len(files)
+            else:
+                expected_bytes = 0
+                expected_files = 0
+            return {
+                **base_identity,
+                "expected_bytes": expected_bytes,
+                "expected_file_count": expected_files,
+                "status": "cleanup_not_authorized",
+                "removed": False,
+                "reclaimed_bytes": 0,
+            }
         validate_pilot_pre_cleanup(
             run_id,
             storage_root=storage,
             require_live_evidence=True,
         )
+        validated = workspace_service.validate_transfer_staging(staging, run_id=run_id)
+        files = _regular_files([validated])
+        expected_bytes = sum(item.stat().st_size for item in files)
+        expected_files = len(files)
         existing = {
-            **identity,
+            **base_identity,
+            "expected_bytes": expected_bytes,
+            "expected_file_count": expected_files,
             "status": "pending",
             "removed": False,
             "reclaimed_bytes": 0,
@@ -1956,27 +2003,26 @@ def cleanup_recorded_transfer_staging(
             "completed_at": None,
         }
         common.serialization.atomic_write_json(receipt_path, existing)
-    elif existing.get("status") != "pending":
-        message = f"Pilot staging cleanup receipt has an unsupported state: {receipt_path}"
-        raise ValueError(message)
     if staging.exists():
-        validate_transfer_staging_inventory(
-            run_id,
-            storage_root=storage,
-            require_staging_present=True,
-        )
+        validated = workspace_service.validate_transfer_staging(staging, run_id=run_id)
+        files = _regular_files([validated])
+        if sum(item.stat().st_size for item in files) != expected_bytes or len(files) != expected_files:
+            message = "Pilot transfer staging changed after cleanup intent was recorded."
+            raise ValueError(message)
         reclaimed = workspace_service.cleanup_transfer_staging(
-            staging,
+            validated,
             storage_root=storage,
             run_id=run_id,
         )
     else:
         reclaimed = expected_bytes
     if staging.exists() or reclaimed != expected_bytes:
-        message = "Pilot transfer staging cleanup did not reclaim the exact inventoried tree."
+        message = "Pilot transfer staging cleanup did not reclaim the exact live residual tree."
         raise RuntimeError(message)
     receipt = {
-        **identity,
+        **base_identity,
+        "expected_bytes": expected_bytes,
+        "expected_file_count": expected_files,
         "status": "complete",
         "removed": True,
         "reclaimed_bytes": reclaimed,
@@ -2013,18 +2059,21 @@ def finalize_cleanup_receipt(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             message = f"{label} must be a non-negative integer."
             raise ValueError(message)
-    expected_staging = int(receipt["transfer_staging_inventory"]["transfer_staging_bytes_before_cleanup"])
     staging_cleanup_path = pilot_check_directory(run_id, storage_root=storage) / PILOT_STAGING_CLEANUP_FILENAME
     staging_cleanup = _load_json(staging_cleanup_path, label="pilot staging cleanup receipt") if staging_cleanup_path.exists() else None
+    expected_staging = staging_cleanup.get("expected_bytes") if staging_cleanup is not None else None
     if transfer_staging_removed and (
-        staging_bytes_reclaimed != expected_staging
-        or staging_cleanup is None
+        staging_cleanup is None
+        or not isinstance(expected_staging, int)
+        or isinstance(expected_staging, bool)
+        or expected_staging < 0
+        or staging_bytes_reclaimed != expected_staging
         or staging_cleanup.get("status") != "complete"
         or staging_cleanup.get("removed") is not True
         or staging_cleanup.get("reclaimed_bytes") != expected_staging
         or staging_cleanup_receipt_sha256 != common.serialization.file_sha256(staging_cleanup_path)
     ):
-        message = "Verified staging cleanup differs from the recorded pre-cleanup inventory."
+        message = "Verified staging cleanup differs from its durable cleanup intent."
         raise ValueError(message)
     cleanup_requested = bool(receipt["cleanup"]["cleanup_requested"])
     if cleanup_requested and not cpu_source_removed:

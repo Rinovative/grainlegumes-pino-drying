@@ -71,7 +71,7 @@ flowchart TD
     C[configs/generation] --> G[Generation]
     G --> S[01_generation]
     S --> D[Dataset publication]
-    D --> P[02_datasets]
+    D --> P[02_datasets/packages]
     L[configs/learning] --> T[Training and Optuna]
     P --> T
     T --> E[03_experiments]
@@ -143,13 +143,20 @@ workflow.
 ```text
 STORAGE_ROOT/
 ├── 01_generation/   # canonical simulation source and provenance
-├── 02_datasets/     # immutable learning packages addressed by dataset_id
+├── 02_datasets/
+│   ├── packages/     # immutable learning payloads addressed by dataset_id
+│   ├── meta/         # package manifests and validated metadata
+│   └── .state/       # publication coordination only
 └── 03_experiments/  # training, tuning, logs, and analysis artifacts
 ```
 
-Generation source is retained independently of Dataset packages. Cleanup of CPU
-source must use the gated Generation workflow; it never removes the canonical
-GPU-side publication.
+Generation source is retained independently of Dataset packages. Canonical
+completed science lives in <code>case.h5</code>; compact Production publications
+retain neither direct COMSOL CSV exports nor <code>solved.mph</code>. Cleanup of
+CPU source must use the gated Generation workflow; it never removes the
+canonical GPU-side publication. A populated legacy
+<code>02_datasets/raw</code> requires the explicit migration documented in the
+Generation operations guide and is never selected silently.
 
 ## ✅ Maintained Validation
 

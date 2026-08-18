@@ -250,6 +250,8 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
     assert first is not None
     assert first.payload["case_state"] == "interrupted"
     assert first.payload["attempt_index"] == 1
+    assert first.payload["previous_attempt"] is None
+    assert first.payload["schema_version"] == 1
     first_cleanup = attempt_service.attempt_cleanup_evidence(first)
     assert first_cleanup is not None
     assert first_cleanup["status"] == "complete"
@@ -282,7 +284,17 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
     assert second is not None
     assert second.payload["case_state"] == "interrupted"
     assert second.payload["attempt_index"] == first.payload["attempt_index"] + 1
+    assert second.payload["previous_attempt"] == {
+        "attempt_index": first.payload["attempt_index"],
+        "receipt_sha256": common.serialization.file_sha256(first.receipt_path),
+    }
     second_cleanup = attempt_service.attempt_cleanup_evidence(second)
     assert second_cleanup is not None
     assert second_cleanup["status"] == "complete"
     assert first.receipt_path.read_bytes() == first_receipt
+
+    corrupted = json.loads(first.receipt_path.read_text(encoding="utf-8"))
+    corrupted["reason"] = "synthetic predecessor corruption"
+    common.serialization.atomic_write_json(first.receipt_path, corrupted)
+    with pytest.raises(ValueError, match="predecessor chain"):
+        attempt_service.load_attempt(second.directory)

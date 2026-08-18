@@ -161,7 +161,7 @@ def load_package_manifest(
     if not isinstance(manifest, dict) or not isinstance(manifest.get("payload_filename"), str):
         message = f"Dataset package manifest is malformed: {metadata_path}."
         raise TypeError(message)
-    payload_path = common.paths.get_dataset_payload_root(storage_root=storage_root) / logical_id / manifest["payload_filename"]
+    payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / logical_id / manifest["payload_filename"]
     if not payload_path.is_file() or payload_path.is_symlink():
         message = f"Dataset package payload is missing or unsafe: {payload_path}."
         raise FileNotFoundError(message)

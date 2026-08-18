@@ -21,6 +21,43 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() -> None:
+    """Protect the commissioned campaign allocation and Seen split contract."""
+    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/transient_drying/family_generalization.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        campaign_path,
+        require_executable=False,
+    )
+    case_counts = {(batch.material_family, batch.sampling_regime): len(batch.case_indices) for batch in campaign.batches}
+
+    assert case_counts == {
+        ("chickpea", "natural"): 160,
+        ("field_pea", "natural"): 60,
+        ("kidney_bean", "natural"): 160,
+        ("lentil", "natural"): 160,
+        ("rapeseed", "natural"): 40,
+        ("sunflower_seed", "natural"): 20,
+    }
+    assert campaign.total_case_count == 600
+    assert campaign.membership["per_seen_material"] == {
+        "train": 128,
+        "validation": 16,
+        "id_test": 16,
+    }
+    assert {name: count * len(campaign.material_roles["seen"]) for name, count in campaign.membership["per_seen_material"].items()} == {
+        "train": 384,
+        "validation": 48,
+        "id_test": 48,
+    }
+    assert all(batch.sampling_regime != "parameter_ood" for batch in campaign.batches)
+    assert {package["evaluation_regime"] for package in campaign.dataset_packages} == {
+        "id",
+        "near_family_ood",
+        "far_family_ood",
+        "extreme_family_ood",
+    }
+
+
 def test_semantic_seed_derivation_is_version_bound() -> None:
     """Protect persisted random-substream identity across internal ownership changes."""
     assert (
@@ -895,6 +932,23 @@ def test_temporary_license_retry_configuration_validation(
 
     with pytest.raises(exception, match=message):
         generation.cases.config.load_campaign_config(config_path)
+
+
+def test_temporary_license_retry_allows_indefinite_controller_wait(
+    generation_config_factory: Any,
+) -> None:
+    """Accept null as the explicit unbounded controller retry policy."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["runtime"]["temporary_license_retry"]["maximum_wait_seconds"] = None
+    execution_path.write_text(
+        yaml.safe_dump(execution, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    assert campaign.batches[0].execution_values["runtime"]["temporary_license_retry"]["maximum_wait_seconds"] is None
 
 
 @pytest.mark.parametrize(

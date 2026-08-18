@@ -2248,7 +2248,7 @@ def load_or_build_run_artifacts(
         msg = "artifact_roles must contain unique values from {'id', 'ood'}."
         raise ValueError(msg)
     path = Path(run_dir).expanduser().resolve()
-    current_dataset_root = Path(dataset_root) if dataset_root is not None else common.paths.get_dataset_payload_root()
+    current_dataset_root = Path(dataset_root) if dataset_root is not None else common.paths.get_dataset_packages_root()
     current_metadata_root = Path(metadata_root) if metadata_root is not None else common.paths.get_dataset_metadata_root()
     actions: dict[str, str] = {}
     if device_resolution is not None and not isinstance(device_resolution, learning.device.DeviceResolution):

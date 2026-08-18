@@ -40,8 +40,6 @@ PILOT_CASES_PER_MATERIAL=""
 PILOT_MATERIAL_COUNT=""
 PILOT_TOTAL_CASES=""
 SKIP_EXTREME_FAMILY_OOD=false
-PILOT_STAGING=""
-PILOT_STAGING_BYTES=0
 PILOT_STAGING_RECLAIMED=0
 REMOTE_SETUP_IDENTITY=""
 HUMAN_WORKFLOW_MODE=false
@@ -58,6 +56,9 @@ DATASET_SUMMARY=""
 WORKFLOW_FAILURE_EVIDENCE=""
 CAMPAIGN_INTERRUPT_ACTIVE=false
 CAMPAIGN_INTERRUPT_COUNT=0
+DEFER_COLLECTION=false
+SMOKE_PROFILE_MODE=false
+SMOKE_PROFILE_NAME=""
 
 usage() {
   cat >&2 <<EOF
@@ -66,12 +67,16 @@ Usage:
   $0 preflight CAMPAIGN [options]
   $0 plan CAMPAIGN [options]
   $0 launch CAMPAIGN [options]
-  $0 all CAMPAIGN [--detach] [--keep-cpu-source] [options]
-  $0 smoke [options]
-  $0 benchmark-cores [--variant VARIANT_ID] [remote options]
-  $0 pilot-check CAMPAIGN [--cases-per-material N] [--keep-cpu-source] [options]
+  $0 all CAMPAIGN [--background] [--defer-collection|--keep-cpu-source] [options]
+  $0 smoke [--background] [--defer-collection] [options]
+  $0 finalize-smoke STEADY_CAMPAIGN_RUN_ID TRANSIENT_CAMPAIGN_RUN_ID [remote options]
+  $0 benchmark-cores [--variant VARIANT_ID] [--background] [--defer-collection] [remote options]
+  $0 collect-benchmark BENCHMARK_RUN_ID [remote options]
+  $0 pilot-check CAMPAIGN [--cases-per-material N] [--background] [--defer-collection|--keep-cpu-source] [options]
   $0 status [CAMPAIGN_RUN_ID] [remote options]
   $0 collect|build-datasets|resume CAMPAIGN_RUN_ID [options]
+  $0 background-status WORKFLOW_SESSION_ID
+  $0 background-list
   $0 retry-case CAMPAIGN_RUN_ID BATCH_NAME CASE_ID [remote options]
   $0 cleanup CAMPAIGN_RUN_ID [--confirm] [remote options]
   $0 accounting|validate CAMPAIGN_RUN_ID [remote options]
@@ -90,10 +95,11 @@ configuration. setup-cpu and cleanup are dry runs unless --execute or --confirm
 is supplied.
 collect validates and publishes GPU generation data without deleting CPU sources.
 all waits synchronously, builds every package, smokes every loader, and cleans the
-verified CPU source by default. Use only --keep-cpu-source to retain it.
-smoke owns the canonical paired two-profile technical run and always retains CPU source.
+verified CPU source by default. --keep-cpu-source still collects but retains CPU data.
+--defer-collection validates CPU results without host transfer, package build, or cleanup.
+smoke owns the canonical paired two-profile technical run and retains CPU source.
 benchmark-cores runs the four isolated same-case transient core variants; --variant retries one.
-pilot-check runs configured-material transient diagnostics and safely cleans CPU/staging by default.
+pilot-check runs configured-material transient diagnostics and safely cleans CPU source by default.
 EOF
 }
 fail() {
@@ -154,6 +160,15 @@ generation_console_failure() {
 
 generation_console_final() {
   printf 'DONE: %s\n' "$*"
+}
+
+campaign_workflow_complete() {
+  if [[ "${SMOKE_PROFILE_MODE}" == true ]]; then
+    printf 'PROFILE COMPLETE:\nprofile=%s\ncampaign_run_id=%s\nworkflow_receipt=validated\n' \
+      "${SMOKE_PROFILE_NAME}" "${RUN_ID}"
+    return
+  fi
+  generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
 }
 
 disarm_campaign_interrupt() {
@@ -552,6 +567,241 @@ handoff_to_pinned_workflow() {
   cleanup_pinned_source || true
   trap - EXIT
   exit "${workflow_status}"
+}
+
+background_active_arguments() {
+  BACKGROUND_ACTIVE_ARGUMENTS=()
+  command -v tmux >/dev/null 2>&1 || return 0
+  local sessions session
+  sessions="$(tmux list-sessions -F '#S' 2>/dev/null || true)"
+  while IFS= read -r session; do
+    [[ -n "${session}" ]] || continue
+    BACKGROUND_ACTIVE_ARGUMENTS+=(--active-tmux-session "${session}")
+  done <<< "${sessions}"
+}
+
+resolve_background_host_runtime() {
+  local require_clean="${1:-false}"
+  [[ "${require_clean}" == true || "${require_clean}" == false ]] ||
+    fail 2 "Internal background clean-check selector is invalid."
+  resolve_bootstrap_requested_commit
+  resolve_host_layout
+  local head status
+  head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
+    fail 1 "Could not resolve the background workflow source commit."
+  validate_commit "${head}"
+  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]] ||
+    fail 1 "Requested commit differs from local HEAD."
+  if [[ "${require_clean}" == true ]]; then
+    status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status \
+      --porcelain=v1 --untracked-files=all)" ||
+      fail 1 "Could not verify the stable background workflow checkout."
+    [[ -z "${status}" ]] ||
+      fail 1 "--background requires the stable host checkout to be clean and committed."
+  fi
+  REQUESTED_COMMIT="${head}"
+  PINNED_SOURCE_COMMIT="${head}"
+  HOST_REPO_ROOT="${DEVELOPMENT_REPO_ROOT}"
+  DOCKER_PYTHON="${DEVELOPMENT_REPO_ROOT}/scripts/docker_python.sh"
+  [[ -x "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
+    && ! -L "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
+    && -x "${DOCKER_PYTHON}" && ! -L "${DOCKER_PYTHON}" ]] ||
+    fail 1 "Stable host workflow or canonical Docker Python runner is missing or unsafe."
+  resolve_local_storage
+  resolve_local_python
+}
+
+background_host_paths_json() {
+  local host_name
+  host_name="$(hostname -f 2>/dev/null || hostname)"
+  printf '%s\n%s\n%s\n%s\n' \
+    "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
+    "${DEVELOPMENT_REPO_ROOT}/scripts/docker_python.sh" \
+    "${LOCAL_STORAGE_ROOT}" "${host_name}" |
+    local_python -c 'import json, sys
+values = [line.rstrip("\n") for line in sys.stdin]
+if len(values) != 4 or any(not value for value in values):
+    raise SystemExit("background host paths are incomplete")
+print(json.dumps(dict(zip(("stable_script", "docker_python", "storage_root", "host"), values, strict=True)), separators=(",", ":"), sort_keys=True))'
+}
+
+launch_background_workflow() {
+  [[ "${GENERATION_WORKFLOW_BACKGROUND_CHILD:-}" != 1 ]] ||
+    fail 2 "A background workflow child cannot create another tmux session."
+  require_command tmux "background workflow execution"
+  local subcommand="${ORIGINAL_ARGUMENTS[0]}" background_count=0 argument
+  case "${subcommand}" in
+    all|resume|smoke|benchmark-cores|pilot-check|collect|build-datasets|finalize-smoke|collect-benchmark) ;;
+    *) fail 2 "--background is not supported for ${subcommand}." ;;
+  esac
+  local -a child_arguments=()
+  local has_commit=false has_cpu_host=false has_remote_root=false
+  for argument in "${ORIGINAL_ARGUMENTS[@]}"; do
+    if [[ "${argument}" == --background ]]; then
+      background_count=$((background_count + 1))
+      continue
+    fi
+    child_arguments+=("${argument}")
+    [[ "${argument}" != --git-commit ]] || has_commit=true
+    [[ "${argument}" != --cpu-host ]] || has_cpu_host=true
+    [[ "${argument}" != --remote-root ]] || has_remote_root=true
+  done
+  (( background_count == 1 )) || fail 2 "Specify --background exactly once."
+  if [[ " ${child_arguments[*]} " == *' --defer-collection '* \
+    && " ${child_arguments[*]} " == *' --keep-cpu-source '* ]]; then
+    fail 2 "--defer-collection cannot be combined with --keep-cpu-source."
+  fi
+  resolve_background_host_runtime true
+  if [[ "${has_commit}" != true ]]; then
+    child_arguments+=(--git-commit "${REQUESTED_COMMIT}")
+  fi
+  if [[ "${subcommand}" != build-datasets ]]; then
+    CPU_HOST="${GENERATION_CPU_HOST:-}"
+    REMOTE_ROOT=""
+    local index
+    for ((index=0; index<${#child_arguments[@]}; index++)); do
+      case "${child_arguments[index]}" in
+        --cpu-host) CPU_HOST="${child_arguments[index+1]:-}" ;;
+        --remote-root) REMOTE_ROOT="${child_arguments[index+1]:-}" ;;
+      esac
+    done
+    ensure_execution_bootstrap
+    resolve_remote_layout
+    [[ "${has_cpu_host}" == true ]] || child_arguments+=(--cpu-host "${CPU_HOST}")
+    [[ "${has_remote_root}" == true ]] || child_arguments+=(--remote-root "${REMOTE_ROOT}")
+  fi
+  background_active_arguments
+  local host_paths session_json record status session_id tmux_name source_commit log_path command_path
+  host_paths="$(background_host_paths_json)" || fail 1 "Could not encode background host paths."
+  session_json="$(local_cli create-background-session \
+    --source-commit "${REQUESTED_COMMIT}" --storage-root "${LOCAL_STORAGE_ROOT}" \
+    --host-paths-json "${host_paths}" "${BACKGROUND_ACTIVE_ARGUMENTS[@]}" \
+    -- "${child_arguments[@]}")" || fail 1 "Could not create durable background session metadata."
+  record="$(printf '%s' "${session_json}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+keys = ("status", "workflow_session_id", "tmux_session_name", "source_commit", "log_path", "command_path", "host")
+print("\t".join(str(value[key]) for key in keys))')" ||
+    fail 1 "Could not decode background session metadata."
+  local session_host
+  IFS=$'\t' read -r status session_id tmux_name source_commit log_path command_path session_host <<< "${record}"
+  if [[ "${status}" == reused ]]; then
+    printf 'BACKGROUND REUSED\nworkflow_session_id=%s\ntmux_session=%s\nhost=%s\nsource_commit=%s\nlog=%s\n\nAttach:\n  tmux attach-session -t %q\n\nStatus:\n  %q background-status %q\n' \
+      "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
+      "${log_path}" "${tmux_name}" \
+      "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}"
+    exit 3
+  fi
+  [[ "${status}" == created && -x "${command_path}" ]] ||
+    fail 1 "Created background command is missing or unsafe: ${command_path}"
+  local quoted_command
+  printf -v quoted_command '%q' "${command_path}"
+  if ! tmux new-session -d -s "${tmux_name}" "${quoted_command}"; then
+    local_cli complete-background-session "${session_id}" --exit-code 1 \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1 || true
+    fail 1 "tmux could not start the durable background workflow session."
+  fi
+  if ! tmux has-session -t "=${tmux_name}" 2>/dev/null; then
+    background_active_arguments
+    local completion_json completion_record completion_state completion_exit completion_stage
+    completion_json="$(local_cli inspect-background-session "${session_id}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" "${BACKGROUND_ACTIVE_ARGUMENTS[@]}")" ||
+      fail 1 "tmux exited before its durable workflow result could be inspected."
+    completion_record="$(printf '%s' "${completion_json}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+fields = (value["workflow_state"], value["exit_code"], value["final_stage"])
+print("\t".join("-" if item is None else str(item).replace("\t", " ").replace("\n", " ") for item in fields))')" ||
+      fail 1 "Could not decode the immediate background workflow result."
+    IFS=$'\t' read -r completion_state completion_exit completion_stage <<< "${completion_record}"
+    case "${completion_state}" in
+      completed)
+        printf 'BACKGROUND COMPLETED
+workflow_session_id=%s
+tmux_session=%s
+host=%s
+source_commit=%s
+exit_code=0
+final_stage=%s
+log=%s
+' \
+          "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
+          "${completion_stage}" "${log_path}"
+        return 0
+        ;;
+      failed)
+        validate_nonnegative "background exit code" "${completion_exit}"
+        printf 'BACKGROUND FAILED
+workflow_session_id=%s
+tmux_session=%s
+host=%s
+source_commit=%s
+exit_code=%s
+final_stage=%s
+log=%s
+' \
+          "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
+          "${completion_exit}" "${completion_stage}" "${log_path}" >&2
+        return "${completion_exit}"
+        ;;
+      *) fail 1 "tmux returned without an active session or a durable terminal workflow result." ;;
+    esac
+  fi
+  local pane_pid
+  pane_pid="$(tmux display-message -p -t "=${tmux_name}" '#{pane_pid}' 2>/dev/null || true)"
+  [[ -n "${pane_pid}" ]] || pane_pid=unavailable
+  printf 'BACKGROUND STARTED\nworkflow_session_id=%s\ntmux_session=%s\nhost=%s\nsource_commit=%s\npid=%s\nlog=%s\n\nAttach:\n  tmux attach-session -t %q\n\nDetach without stopping:\n  press Ctrl+B, then D\n\nStatus:\n  %q background-status %q\n\nFollow log:\n  tail -n 100 -F %q\n\nThe workflow survives terminal/SSH disconnection.\nIt does not survive a reboot of %s; use resume afterwards.\n' \
+    "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
+    "${pane_pid}" "${log_path}" "${tmux_name}" \
+    "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}" \
+    "${log_path}" "${session_host}"
+}
+
+background_status_command() {
+  (( ${#ORIGINAL_ARGUMENTS[@]} == 2 )) || fail 2 "background-status requires one workflow-session ID."
+  resolve_background_host_runtime
+  background_active_arguments
+  local session_json record
+  session_json="$(local_cli inspect-background-session "${ORIGINAL_ARGUMENTS[1]}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" "${BACKGROUND_ACTIVE_ARGUMENTS[@]}")" ||
+    fail 1 "Could not inspect background workflow session."
+  record="$(printf '%s' "${session_json}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+def field(name):
+    item = value[name]
+    if isinstance(item, list):
+        item = ",".join(str(entry) for entry in item) or "-"
+    if item is None:
+        item = "-"
+    return str(item).replace("\t", " ").replace("\n", " ")
+keys = ("workflow_session_id", "source_commit", "subcommand", "tmux_session_name", "tmux_active", "workflow_state", "exit_code", "started_at", "ended_at", "campaign_run_ids", "benchmark_run_ids", "final_stage", "log_path")
+print("\t".join(field(key) for key in keys))')" || fail 1 "Could not decode background status."
+  local session_id source_commit subcommand tmux_name tmux_active state exit_code started ended campaigns benchmarks stage log_path
+  IFS=$'\t' read -r session_id source_commit subcommand tmux_name tmux_active state exit_code started ended campaigns benchmarks stage log_path <<< "${record}"
+  printf 'workflow_session_id=%s\nsource_commit=%s\nsubcommand=%s\ntmux_session=%s\ntmux_active=%s\nworkflow_state=%s\nexit_code=%s\nstarted_at=%s\nended_at=%s\ncampaign_run_ids=%s\nbenchmark_run_ids=%s\ncurrent_or_final_stage=%s\nlog=%s\n' \
+    "${session_id}" "${source_commit}" "${subcommand}" "${tmux_name}" \
+    "${tmux_active}" "${state}" "${exit_code}" "${started}" "${ended}" \
+    "${campaigns}" "${benchmarks}" "${stage}" "${log_path}"
+  if [[ "${tmux_active}" == True || "${tmux_active}" == true ]]; then
+    printf 'Attach:\n  tmux attach-session -t %q\n' "${tmux_name}"
+  else
+    printf 'Follow log:\n  tail -n 100 -F %q\n' "${log_path}"
+  fi
+}
+
+background_list_command() {
+  (( ${#ORIGINAL_ARGUMENTS[@]} == 1 )) || fail 2 "background-list accepts no arguments."
+  resolve_background_host_runtime
+  background_active_arguments
+  local sessions_json
+  sessions_json="$(local_cli list-background-sessions --storage-root "${LOCAL_STORAGE_ROOT}" \
+    "${BACKGROUND_ACTIVE_ARGUMENTS[@]}")" || fail 1 "Could not list background workflow sessions."
+  printf '%s' "${sessions_json}" | local_python -c 'import json, sys
+sessions = json.load(sys.stdin)["sessions"]
+if not sessions:
+    print("No background workflow sessions.")
+else:
+    print("workflow_session_id\tstate\tsubcommand\tstarted_at\ttmux_session")
+    for item in sessions:
+        print("\t".join((item["workflow_session_id"], item["workflow_state"], item["subcommand"], item["started_at"], item["tmux_session_name"])))'
 }
 
 resolve_workflow_campaigns() {
@@ -1030,43 +1280,72 @@ REMOTE
     fail 2 "CPU-side technical-smoke evidence is missing, stale, or incomplete after transfer."
 }
 
-run_smoke() {
-  [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
-    fail 2 "smoke does not support --detach, --confirm, or --only-batch."
+finalize_smoke_runs() {
+  local stationary_run_id="$1" transient_run_id="$2"
+  validate_run_id "${stationary_run_id}"
+  validate_run_id "${transient_run_id}"
   resolve_local_commit
   resolve_workflow_campaigns
-  KEEP_CPU_SOURCE=true
-  CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
-  preflight_cpu
-  local comsol_version
+  resolve_local_storage
+  resolve_local_python
+  resolve_remote_layout
+  verify_remote_setup_for_output >/dev/null
+  local comsol_version steady_evidence transient_evidence receipt
   comsol_version="$(remote_comsol_version)"
-  CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
-  run_all
-  local stationary_run_id="${RUN_ID}" steady_evidence
   steady_evidence="$(local_cli finalize-technical-smoke-evidence "${stationary_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+    fail 1 "Could not finalize steady-flow Technical Smoke evidence for ${stationary_run_id}."
   steady_evidence="$(container_path_to_host "${steady_evidence}")"
   sync_technical_smoke_evidence \
     "${steady_evidence}" "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
-  CAMPAIGN_ARGUMENT="${TRANSIENT_SMOKE_CAMPAIGN_PATH}"
-  run_all
-  local transient_run_id="${RUN_ID}" transient_evidence
   transient_evidence="$(local_cli finalize-technical-smoke-evidence "${transient_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+    fail 1 "Could not finalize transient-drying Technical Smoke evidence for ${transient_run_id}."
   transient_evidence="$(container_path_to_host "${transient_evidence}")"
   sync_technical_smoke_evidence \
     "${transient_evidence}" "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
-  local receipt
   receipt="$(local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")"
+    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+    fail 1 "Could not atomically finalize paired Technical Smoke evidence."
   receipt="$(container_path_to_host "${receipt}")"
+  local_cli validate-real-smoke "${receipt}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Paired Technical Smoke receipt did not validate after finalization: ${receipt}"
   printf 'Profile technical-smoke evidence: %s and %s\n' \
     "${steady_evidence}" "${transient_evidence}"
   printf 'Paired technical runtime diagnostic receipt: %s\n' "${receipt}"
   printf 'CPU sources retained for review for runs %s and %s.\n' \
     "${stationary_run_id}" "${transient_run_id}"
+  generation_console_final "paired Technical Smoke and all workflow receipts validated"
 }
 
+run_smoke() {
+  [[ "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
+    fail 2 "smoke does not support --confirm or --only-batch."
+  resolve_local_commit
+  resolve_workflow_campaigns
+  KEEP_CPU_SOURCE=true
+  SMOKE_PROFILE_MODE=true
+  SMOKE_PROFILE_NAME=steady_flow
+  CAMPAIGN_ARGUMENT="${STATIONARY_SMOKE_CAMPAIGN_PATH}"
+  preflight_cpu
+  run_all
+  local stationary_run_id="${RUN_ID}"
+  SMOKE_PROFILE_NAME=transient_drying
+  CAMPAIGN_ARGUMENT="${TRANSIENT_SMOKE_CAMPAIGN_PATH}"
+  run_all
+  local transient_run_id="${RUN_ID}"
+  SMOKE_PROFILE_MODE=false
+  SMOKE_PROFILE_NAME=""
+  if [[ "${DEFER_COLLECTION}" == true ]]; then
+    printf 'Later paired Smoke finalization (after both collect and build-datasets commands):\n'
+    print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" finalize-smoke \
+      "${stationary_run_id}" "${transient_run_id}" --cpu-host "${CPU_HOST}" \
+      --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}"
+    printf 'DEFERRED: CPU Technical Smoke results validated and awaiting host collection\n'
+    return
+  fi
+  finalize_smoke_runs "${stationary_run_id}" "${transient_run_id}"
+}
 
 plan_campaign() {
   resolve_local_commit
@@ -1263,7 +1542,6 @@ collect_campaign() {
   if [[ -n "${PILOT_CASES_PER_MATERIAL}" ]]; then
     local_cli record-pilot-staging-inventory "${RUN_ID}" --staging-root "${staging}" >/dev/null ||
       fail 1 "Could not record exact pilot transfer-staging storage."
-    PILOT_STAGING="${staging}"
   fi
   receipt="$(local_cli publish-transferred-campaign "${RUN_ID}" \
     --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
@@ -1273,7 +1551,7 @@ collect_campaign() {
     local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
       --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" --confirm >/dev/null
   else
-    printf 'Pilot transfer staging retained through analysis: %s\n' "${staging}"
+    printf 'Pilot transfer staging marker retained through analysis: %s\n' "${staging}"
   fi
   printf '%s\nCPU source retained: %s:%s\n' "${receipt}" "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}"
 }
@@ -1358,7 +1636,7 @@ wait_for_terminal_publication() {
         disarm_campaign_interrupt
         return
         ;;
-      running|feeding|waiting_retry|submission_pending_or_unknown)
+      running|feeding|license_blocked|submission_pending_or_unknown)
         sleep "${STATUS_POLL_SECONDS}" || true
         ;;
       completed_with_failures)
@@ -1377,6 +1655,53 @@ wait_for_terminal_publication() {
   done
 }
 
+
+deferred_campaign_report() {
+  local report kind report_run report_commit successful blocked failed extra
+  report="$(remote_cli campaign-status "${RUN_ID}" --no-scheduler \
+    --storage-root "${REMOTE_STORAGE_ROOT}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+fields = (
+    value["campaign_run_id"], value["git_commit"],
+    value["completed_cases"], value["license_blocked_cases"],
+    value["failed_cases"],
+)
+if any("\t" in str(item) or "\n" in str(item) or "\r" in str(item) for item in fields):
+    raise SystemExit("campaign status contains unsafe shell transport text")
+print("\t".join(("deferred", *(str(item) for item in fields))))')" ||
+    fail 1 "Could not render the deferred CPU campaign summary."
+  IFS=$'\t' read -r kind report_run report_commit successful blocked failed extra <<< "${report}"
+  [[ "${kind}" == deferred && "${report_run}" == "${RUN_ID}" \
+    && "${report_commit}" == "${REQUESTED_COMMIT}" && -z "${extra:-}" ]] ||
+    fail 1 "Malformed deferred CPU campaign summary."
+  validate_nonnegative "successful case count" "${successful}"
+  validate_nonnegative "blocked case count" "${blocked}"
+  validate_nonnegative "failed case count" "${failed}"
+  validate_nonnegative "retained CPU bytes" "${CPU_BYTES_RETAINED}"
+  printf '%s\n' \
+    "campaign_run_id=${RUN_ID}" \
+    "git_commit=${report_commit}" \
+    "cpu_host=${CPU_HOST}" \
+    "remote_storage_root=${REMOTE_STORAGE_ROOT}" \
+    "successful_count=${successful}" \
+    "blocked_count=${blocked}" \
+    "failed_count=${failed}" \
+    "retained_cpu_bytes=${CPU_BYTES_RETAINED}" \
+    'state=cpu_terminal_awaiting_collection' \
+    'Later collection:'
+  print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" collect "${RUN_ID}" \
+    --cpu-host "${CPU_HOST}" --remote-root "${REMOTE_ROOT}" \
+    --git-commit "${REQUESTED_COMMIT}"
+  printf 'Later dataset build:\n'
+  print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" build-datasets "${RUN_ID}" \
+    --git-commit "${REQUESTED_COMMIT}"
+  if [[ "${SMOKE_PROFILE_MODE}" == true ]]; then
+    printf 'PROFILE COMPLETE:\nprofile=%s\ncampaign_run_id=%s\ncpu_terminal_publication=validated\ncollection=deferred\n' \
+      "${SMOKE_PROFILE_NAME}" "${RUN_ID}"
+  else
+    printf 'DEFERRED: CPU campaign validated and awaiting collection\n'
+  fi
+}
 
 prepare_all_receipt() {
   local -a arguments=(prepare-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
@@ -1661,8 +1986,9 @@ continue_pilot_workflow() {
   resolve_local_storage
   resolve_remote_layout
   ALL_STAGE="existing pilot receipt validation"
-  if local_cli validate-pilot-check "${RUN_ID}" --require-cleanup-complete \
-    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
+  if [[ "${DEFER_COLLECTION}" != true ]] \
+    && local_cli validate-pilot-check "${RUN_ID}" --require-cleanup-complete \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
     local_cli validate-pilot-check "${RUN_ID}" --format summary \
       --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
     generation_console_stage 8 12 "Generation" REUSED "campaign_run_id=${RUN_ID}"
@@ -1679,6 +2005,12 @@ continue_pilot_workflow() {
   wait_for_terminal_publication 8 12 "Generation"
   generation_console_stage 8 12 "Generation" OK \
     "campaign_run_id=${RUN_ID} state=successful"
+  if [[ "${DEFER_COLLECTION}" == true ]]; then
+    ALL_STAGE="deferred CPU pilot summary"
+    deferred_campaign_report
+    ALL_WORKFLOW_ACTIVE=false
+    return
+  fi
 
   ALL_STAGE="pilot source inventory, transfer, and hash validation"
   generation_console_stage 9 12 "GPU publication" RUNNING
@@ -1738,8 +2070,8 @@ continue_pilot_workflow() {
   ALL_WORKFLOW_ACTIVE=false
 }
 run_pilot_check() {
-  [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
-    fail 2 "pilot-check does not support --detach, --confirm, or --only-batch."
+  [[ "${CONFIRM_CLEANUP}" == false && -z "${ONLY_BATCH}" ]] ||
+    fail 2 "pilot-check does not support --confirm or --only-batch."
   HUMAN_WORKFLOW_MODE=true
   ALL_WORKFLOW_ACTIVE=true
   trap 'workflow_exit_handler $?' EXIT
@@ -1815,13 +2147,15 @@ continue_all_workflow() {
   resolve_local_storage
   resolve_remote_layout
   ALL_STAGE="existing terminal receipt validation"
-  if local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
+  if [[ "${DEFER_COLLECTION}" != true ]] \
+    && local_cli validate-all-workflow "${RUN_ID}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
     generation_console_stage 6 9 "Generation" REUSED "campaign_run_id=${RUN_ID}"
     generation_console_stage 7 9 "GPU publication" REUSED "validated destination=${LOCAL_STORAGE_ROOT}"
     generation_console_stage 8 9 "Dataset packages" REUSED "validated campaign_run_id=${RUN_ID}"
     generation_console_stage 9 9 "Workflow receipt" REUSED \
       "campaign_run_id=${RUN_ID} already complete and validated"
-    generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
+    campaign_workflow_complete
     ALL_WORKFLOW_ACTIVE=false
     return
   fi
@@ -1830,6 +2164,12 @@ continue_all_workflow() {
   wait_for_terminal_publication 6 9 "Generation"
   generation_console_stage 6 9 "Generation" OK \
     "campaign_run_id=${RUN_ID} state=successful"
+  if [[ "${DEFER_COLLECTION}" == true ]]; then
+    ALL_STAGE="deferred CPU terminal summary"
+    deferred_campaign_report
+    ALL_WORKFLOW_ACTIVE=false
+    return
+  fi
 
   ALL_STAGE="GPU collection and atomic publication"
   generation_console_stage 7 9 "GPU publication" RUNNING
@@ -1869,7 +2209,7 @@ continue_all_workflow() {
   local_cli validate-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
   generation_console_stage 9 9 "Workflow receipt" OK \
     "campaign_run_id=${RUN_ID} ${cleanup_detail}"
-  generation_console_final "campaign_run_id=${RUN_ID} workflow receipt validated"
+  campaign_workflow_complete
   ALL_WORKFLOW_ACTIVE=false
 }
 run_all() {
@@ -1909,21 +2249,11 @@ run_all() {
   generation_console_stage 4 9 "Campaign plan" RUNNING
   remote_plan_submit plan-campaign >/dev/null
   generation_console_stage 4 9 "Campaign plan" OK \
-    "purpose=${CAMPAIGN_PURPOSE} cleanup=$([[ "${KEEP_CPU_SOURCE}" == true ]] && printf retain || printf verified-delete)"
+    "purpose=${CAMPAIGN_PURPOSE} cleanup=$([[ "${DEFER_COLLECTION}" == true ]] && printf deferred || { [[ "${KEEP_CPU_SOURCE}" == true ]] && printf retain || printf verified-delete; })"
   ALL_STAGE="campaign launch"
   generation_console_stage 5 9 "Campaign launch" RUNNING
   launch_campaign >/dev/null
   generation_console_stage 5 9 "Campaign launch" OK "campaign_run_id=${RUN_ID}"
-  if [[ "${DETACH}" == true ]]; then
-    generation_console_stage 6 9 "Generation" SKIPPED "detached after launch"
-    generation_console_stage 7 9 "GPU publication" SKIPPED "resume required"
-    generation_console_stage 8 9 "Dataset packages" SKIPPED "resume required"
-    generation_console_stage 9 9 "Workflow receipt" SKIPPED "resume required"
-    generation_console_final "campaign_run_id=${RUN_ID} detached; resume required"
-    printf 'Resume-all command: %s\n' "$(resume_command_text)"
-    ALL_WORKFLOW_ACTIVE=false
-    return
-  fi
   ALLOW_REMOTE_RESUME=false
   continue_all_workflow
 }
@@ -2004,75 +2334,57 @@ print("\t".join(("benchmark", *(str(item) for item in fields))))')" ||
   printf '%s\n' "${inspection}"
 }
 
-resolve_runtime_smoke_receipt() {
-  local report record kind container_path extra
-  report="$(local_cli validate-real-smoke --storage-root "${LOCAL_STORAGE_ROOT}")" ||
-    fail 2 "No immutable real runtime-smoke receipt is valid for the current source."
-  record="$(printf '%s\n' "${report}" | local_python -c 'import json, sys
-value = json.load(sys.stdin)
-valid = value["valid_receipts"]
-if not valid:
-    raise SystemExit("no current runtime-smoke receipt")
-record = valid[0]
-fields = (record["path"], record["receipt_digest"])
-if any("\t" in item or "\n" in item or "\r" in item for item in fields):
-    raise SystemExit("runtime-smoke receipt contains unsafe shell transport text")
-print("\t".join(("smoke", *fields)))')" ||
-    fail 2 "Could not resolve the native runtime-smoke receipt."
-  IFS=$'\t' read -r kind container_path RUNTIME_SMOKE_DIGEST extra <<< "${record}"
-  [[ "${kind}" == smoke && -z "${extra:-}" ]] ||
-    fail 1 "Malformed runtime-smoke receipt record."
-  validate_digest "${RUNTIME_SMOKE_DIGEST}"
-  RUNTIME_SMOKE_RECEIPT="$(container_path_to_host "${container_path}")"
-  [[ "${RUNTIME_SMOKE_RECEIPT}" == "${LOCAL_STORAGE_ROOT}/"* \
-    && -f "${RUNTIME_SMOKE_RECEIPT}" && ! -L "${RUNTIME_SMOKE_RECEIPT}" ]] ||
-    fail 1 "Runtime-smoke receipt is outside canonical local storage."
-  RUNTIME_SMOKE_RELATIVE="${RUNTIME_SMOKE_RECEIPT#"${LOCAL_STORAGE_ROOT}/"}"
-  validate_transfer_path "${RUNTIME_SMOKE_RELATIVE}"
-}
-
-sync_runtime_smoke_receipt() {
-  require_command rsync "runtime-smoke receipt transfer"
-  local destination="${REMOTE_STORAGE_ROOT}/${RUNTIME_SMOKE_RELATIVE}"
-  local temporary="${destination}.incoming.$$"
-  remote_bash "${CPU_HOST}" "$(dirname "${destination}")" <<'REMOTE'
-set -euo pipefail
-directory="$1"
-mkdir -p "${directory}"
-REMOTE
-  rsync -a --protect-args "${RUNTIME_SMOKE_RECEIPT}" "${CPU_HOST}:${temporary}" ||
-    fail 1 "Could not transfer the compact runtime-smoke receipt to the CPU host."
-  remote_bash "${CPU_HOST}" "${destination}" "${temporary}" <<'REMOTE'
-set -euo pipefail
-destination="$1"; temporary="$2"
-[[ -f "${temporary}" && ! -L "${temporary}" ]]
-if [[ -e "${destination}" ]]; then
-  [[ -f "${destination}" && ! -L "${destination}" ]]
-  if ! cmp -s "${temporary}" "${destination}"; then
-    rm -f -- "${temporary}"
-    printf 'Existing CPU runtime-smoke receipt conflicts: %s\n' "${destination}" >&2
-    exit 1
-  fi
-  rm -f -- "${temporary}"
-else
-  mv -- "${temporary}" "${destination}"
-fi
-REMOTE
-  remote_cli validate-real-smoke --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null ||
-    fail 2 "CPU-side runtime-smoke evidence is missing, stale, or incomplete."
-}
-
 remote_benchmark_plan_submit() {
   local operation="$1"
   local remote_suite
   remote_suite="$(remote_repository_path "${BENCHMARK_SUITE_RELATIVE_PATH}")"
-  local -a arguments=(
-    "${operation}" "${remote_suite}"
-    --git-commit "${REQUESTED_COMMIT}"
-    --storage-root "${REMOTE_STORAGE_ROOT}"
-  )
-  [[ -z "${BENCHMARK_VARIANT}" ]] || arguments+=(--variant "${BENCHMARK_VARIANT}")
-  remote_cli "${arguments[@]}"
+  remote_bash "${CPU_HOST}" \
+    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
+    "${REQUESTED_COMMIT}" "${remote_suite}" "${BENCHMARK_VARIANT}" \
+    "${operation}" "${REMOTE_ROOT}/benchmark-preflight-scratch" \
+    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
+set -euo pipefail
+repository="$1"; storage="$2"; venv="$3"; commit="$4"; suite="$5"
+variant="$6"; operation="$7"; scratch="$8"; python_module="$9"
+comsol_module="${10}"; comsol_executable="${11}"
+module load "${python_module}"
+if ! module load "${comsol_module}"; then
+  printf 'CPU benchmark preflight failed: COMSOL module %s is unavailable.\n' \
+    "${comsol_module}" >&2
+  exit 1
+fi
+resolved_comsol="$(command -v "${comsol_executable}")" || {
+  printf 'CPU benchmark preflight failed: COMSOL executable %s is unavailable.\n' \
+    "${comsol_executable}" >&2
+  exit 1
+}
+resolved_comsol="$(readlink -f -- "${resolved_comsol}")"
+[[ "${resolved_comsol}" == /* && -x "${resolved_comsol}" ]] || {
+  printf 'CPU benchmark preflight resolved an unsafe executable: %s\n' \
+    "${resolved_comsol}" >&2
+  exit 1
+}
+comsol_version="$("${resolved_comsol}" -version 2>&1)" || {
+  printf 'CPU benchmark preflight failed: COMSOL version query failed.\n' >&2
+  exit 1
+}
+mkdir -p -- "${scratch}"
+export GENERATION_CPU_VENV="${venv}"
+export STORAGE_ROOT="${storage}"
+export GENERATION_GIT_COMMIT="${commit}"
+cd "${repository}"
+command=("${venv}/bin/python" -m src.generation.cli.cli_generation
+  "${operation}" "${suite}"
+  --git-commit "${commit}"
+  --storage-root "${storage}"
+  --scratch-root "${scratch}"
+  --comsol-version-output "${comsol_version}"
+  --comsol-executable-path "${resolved_comsol}")
+if [[ "${operation}" != preflight-core-benchmark && -n "${variant}" ]]; then
+  command+=(--variant "${variant}")
+fi
+"${command[@]}"
+REMOTE
 }
 
 wait_for_core_benchmark() {
@@ -2081,10 +2393,10 @@ wait_for_core_benchmark() {
     local state
     state="$(remote_cli core-benchmark-status "${RUN_ID}" --format state \
       --storage-root "${REMOTE_STORAGE_ROOT}")"
-    generation_console_progress benchmark 4 6 "Benchmark execution" RUNNING "${state}" \
+    generation_console_progress benchmark 4 7 "Canary and measurements" RUNNING "${state}" \
       "benchmark_run_id=${RUN_ID} state=${state}"
     case "${state}" in
-      complete|retry_required)
+      complete|retry_required|canary_failed)
         BENCHMARK_TERMINAL_STATE="${state}"
         return
         ;;
@@ -2100,7 +2412,7 @@ wait_for_core_benchmark() {
         fi
         sleep "${STATUS_POLL_SECONDS}"
         ;;
-      running|scheduler_unknown)
+      running|scheduler_unknown|license_blocked)
         sleep "${STATUS_POLL_SECONDS}"
         ;;
       *)
@@ -2155,34 +2467,34 @@ collect_core_benchmark() {
 }
 
 run_core_benchmark() {
-  [[ "${DETACH}" == false && "${CONFIRM_CLEANUP}" == false \
+  [[ "${CONFIRM_CLEANUP}" == false \
     && "${KEEP_CPU_SOURCE}" == false && -z "${ONLY_BATCH}" ]] ||
-    fail 2 "benchmark-cores accepts only --variant and remote options."
+    fail 2 "benchmark-cores accepts only --variant, --defer-collection, and remote options."
   HUMAN_WORKFLOW_MODE=true
 
-  generation_console_stage 1 6 "Local preflight" RUNNING
+  generation_console_stage 1 7 "Local preflight" RUNNING
   resolve_local_commit
   resolve_local_storage
   resolve_local_python
   resolve_benchmark_contract >/dev/null
-  resolve_runtime_smoke_receipt
   resolve_remote_layout
-  generation_console_stage 1 6 "Local preflight" OK \
-    "suite=${BENCHMARK_SUITE_NAME} repetitions=${BENCHMARK_REPETITIONS} cores=${BENCHMARK_CORE_COUNTS}"
+  generation_console_stage 1 7 "Local preflight" OK \
+    "commit=${REQUESTED_COMMIT:0:12} suite=${BENCHMARK_SUITE_NAME} smoke_dependency=none"
 
-  generation_console_stage 2 6 "CPU readiness" RUNNING
+  generation_console_stage 2 7 "CPU runtime preflight" RUNNING
   EXECUTE_SETUP=true
   setup_cpu >/dev/null
-  sync_runtime_smoke_receipt >/dev/null
-  generation_console_stage 2 6 "CPU readiness" OK \
-    "host=${CPU_HOST} runtime_smoke=${RUNTIME_SMOKE_DIGEST:0:12}"
+  remote_benchmark_plan_submit preflight-core-benchmark >/dev/null ||
+    fail 1 "Standalone benchmark CPU preflight failed before any measured submission."
+  generation_console_stage 2 7 "CPU runtime preflight" OK \
+    "host=${CPU_HOST} COMSOL=${COMSOL_MODULE} scratch=${REMOTE_ROOT}/benchmark-preflight-scratch"
 
-  generation_console_stage 3 6 "Benchmark plan" RUNNING
+  generation_console_stage 3 7 "Benchmark plan" RUNNING
   remote_benchmark_plan_submit plan-core-benchmark >/dev/null
-  generation_console_stage 3 6 "Benchmark plan" OK \
-    "suite=${BENCHMARK_SUITE_NAME} variant=${BENCHMARK_VARIANT:-all}"
+  generation_console_stage 3 7 "Benchmark plan" OK \
+    "suite=${BENCHMARK_SUITE_NAME} repetitions=${BENCHMARK_REPETITIONS} cores=${BENCHMARK_CORE_COUNTS} variant=${BENCHMARK_VARIANT:-all}"
 
-  generation_console_stage 4 6 "Benchmark execution" RUNNING
+  generation_console_stage 4 7 "Canary and measurements" RUNNING
   local output
   local benchmark_run_pattern='"benchmark_run_id"[[:space:]]*:[[:space:]]*"(core_scaling_transient__[0-9a-f]{16})"'
   output="$(remote_benchmark_plan_submit submit-core-benchmark)" ||
@@ -2196,21 +2508,48 @@ run_core_benchmark() {
   wait_for_core_benchmark
   case "${BENCHMARK_TERMINAL_STATE}" in
     complete)
-      generation_console_stage 4 6 "Benchmark execution" OK \
-        "benchmark_run_id=${RUN_ID} state=complete"
-      generation_console_stage 5 6 "GPU publication" RUNNING
+      generation_console_stage 4 7 "Canary and measurements" OK \
+        "benchmark_run_id=${RUN_ID} canary=validated state=complete"
+      generation_console_stage 5 7 "CPU finalization" RUNNING
       remote_cli finalize-core-benchmark "${RUN_ID}" \
         --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
+      generation_console_stage 5 7 "CPU finalization" OK \
+        "benchmark_run_id=${RUN_ID} terminal evidence validated"
+      if [[ "${DEFER_COLLECTION}" == true ]]; then
+        generation_console_stage 6 7 "GPU publication" DEFERRED \
+          "benchmark_run_id=${RUN_ID} CPU evidence retained exclusively"
+        printf '%s\n' \
+          "benchmark_run_id=${RUN_ID}" \
+          "git_commit=${REQUESTED_COMMIT}" \
+          "cpu_host=${CPU_HOST}" \
+          "remote_storage_root=${REMOTE_STORAGE_ROOT}" \
+          'state=cpu_terminal_awaiting_collection' \
+          'Later benchmark collection:'
+        print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" collect-benchmark \
+          "${RUN_ID}" --cpu-host "${CPU_HOST}" --remote-root "${REMOTE_ROOT}" \
+          --git-commit "${REQUESTED_COMMIT}"
+        generation_console_stage 7 7 "Final validation" DEFERRED \
+          "benchmark_run_id=${RUN_ID} CPU evidence validated"
+        printf 'DEFERRED: CPU benchmark validated and awaiting collection\n'
+        return
+      fi
+      generation_console_stage 6 7 "GPU publication" RUNNING
       local benchmark_output publication_status=OK
       benchmark_output="$(collect_core_benchmark)"
       if [[ "${benchmark_output}" == *"validated and reused"* ]]; then
         publication_status=REUSED
       fi
-      generation_console_stage 5 6 "GPU publication" "${publication_status}" \
+      printf '%s\n' "${benchmark_output}"
+      generation_console_stage 6 7 "GPU publication" "${publication_status}" \
         "benchmark_run_id=${RUN_ID} destination=${LOCAL_STORAGE_ROOT}"
-      generation_console_stage 6 6 "Final validation" OK \
+      generation_console_stage 7 7 "Final validation" OK \
         "benchmark_run_id=${RUN_ID} evidence published; CPU source retained"
       generation_console_final "benchmark_run_id=${RUN_ID} benchmark evidence validated"
+      ;;
+    canary_failed)
+      generation_console_stage 4 7 "Canary and measurements" FAILED \
+        "benchmark_run_id=${RUN_ID} production-core repetition-1 canary failed; later repetitions were not submitted"
+      fail 1 "Benchmark canary failed validation. Inspect the preserved repetition and scheduler evidence before an explicit retry."
       ;;
     retry_required)
       local retry_output variant_id=unavailable
@@ -2220,12 +2559,12 @@ run_core_benchmark() {
       if [[ ${retry_output} =~ ${variant_pattern} ]]; then
         variant_id="${BASH_REMATCH[1]}"
       fi
-      generation_console_stage 4 6 "Benchmark execution" FAILED \
+      generation_console_stage 4 7 "Canary and measurements" FAILED \
         "benchmark_run_id=${RUN_ID} variant_id=${variant_id}; CPU evidence retained"
       fail 1 "One benchmark repetition requires retry. Use its reported variant_id with: ./scripts/generation_workflow.sh benchmark-cores --variant VARIANT_ID"
       ;;
     incomplete)
-      generation_console_stage 4 6 "Benchmark execution" FAILED \
+      generation_console_stage 4 7 "Canary and measurements" FAILED \
         "benchmark_run_id=${RUN_ID} selected subset complete; suite incomplete"
       fail 1 "The selected benchmark subset finished but the four-variant suite is incomplete. Run benchmark-cores or retry another --variant."
       ;;
@@ -2234,6 +2573,29 @@ run_core_benchmark() {
 
 (( $# > 0 )) || { usage; exit 2; }
 [[ "$1" != -h && "$1" != --help ]] || { usage; exit 0; }
+for bootstrap_argument in "${ORIGINAL_ARGUMENTS[@]}"; do
+  if [[ "${bootstrap_argument}" == --detach ]]; then
+    fail 2 $'--detach is no longer supported because its former launch-only meaning was ambiguous.\nUse:
+  generation_workflow.sh launch CAMPAIGN\nto submit and return, or:
+  generation_workflow.sh all CAMPAIGN --background\nto keep the complete workflow running in tmux.'
+  fi
+done
+case "${ORIGINAL_ARGUMENTS[0]}" in
+  background-status)
+    background_status_command
+    exit 0
+    ;;
+  background-list)
+    background_list_command
+    exit 0
+    ;;
+esac
+for bootstrap_argument in "${ORIGINAL_ARGUMENTS[@]}"; do
+  if [[ "${bootstrap_argument}" == --background ]]; then
+    launch_background_workflow
+    exit 0
+  fi
+done
 if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" != 1 ]]; then
   resolve_bootstrap_requested_commit
   resolve_host_layout
@@ -2249,8 +2611,8 @@ REMOTE_ROOT=""
 REQUESTED_COMMIT=""
 EXECUTE_SETUP=false
 CONFIRM_CLEANUP=false
-DETACH=false
 KEEP_CPU_SOURCE=false
+DEFER_COLLECTION=false
 FORCE_CANCEL=false
 SKIP_EXTREME_FAMILY_OOD=false
 ONLY_BATCH=""
@@ -2272,8 +2634,8 @@ while (( $# > 0 )); do
     --execute) EXECUTE_SETUP=true; shift ;;
     --confirm) CONFIRM_CLEANUP=true; shift ;;
     --force) FORCE_CANCEL=true; shift ;;
-    --detach) DETACH=true; shift ;;
     --keep-cpu-source) KEEP_CPU_SOURCE=true; shift ;;
+    --defer-collection) DEFER_COLLECTION=true; shift ;;
     --skip-extreme-family-ood) SKIP_EXTREME_FAMILY_OOD=true; shift ;;
     --only-batch) (( $# >= 2 )) || fail 2 "--only-batch requires a value."; ONLY_BATCH="$2"; shift 2 ;;
     --cases-per-material) (( $# >= 2 )) || fail 2 "--cases-per-material requires a value."; PILOT_CASES_PER_MATERIAL="$2"; shift 2 ;;
@@ -2294,6 +2656,13 @@ fi
 if [[ "${SUBCOMMAND}" != cancel && "${FORCE_CANCEL}" == true ]]; then
   fail 2 "--force is supported only by cancel."
 fi
+if [[ "${DEFER_COLLECTION}" == true && "${KEEP_CPU_SOURCE}" == true ]]; then
+  fail 2 "--defer-collection cannot be combined with --keep-cpu-source."
+fi
+if [[ "${DEFER_COLLECTION}" == true \
+  && ! "${SUBCOMMAND}" =~ ^(all|resume|smoke|benchmark-cores|pilot-check)$ ]]; then
+  fail 2 "--defer-collection is supported only by all, resume, smoke, benchmark-cores, and pilot-check."
+fi
 if [[ "${SKIP_EXTREME_FAMILY_OOD}" == true ]]; then
   [[ "${SUBCOMMAND}" =~ ^(plan|launch|all)$ ]] ||
     fail 2 "--skip-extreme-family-ood is supported only by plan, launch, and all."
@@ -2309,7 +2678,8 @@ handoff_to_pinned_workflow
 case "${SUBCOMMAND}" in
   setup-cpu)
     (( ${#POSITIONAL[@]} == 0 )) || fail 2 "setup-cpu accepts no positional arguments."
-    [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false && "${CONFIRM_CLEANUP}" == false ]]       || fail 2 "Unsupported setup-cpu option."
+    [[ "${KEEP_CPU_SOURCE}" == false && "${CONFIRM_CLEANUP}" == false ]] ||
+      fail 2 "Unsupported setup-cpu option."
     setup_cpu
     ;;
   pilot-check)
@@ -2326,15 +2696,15 @@ case "${SUBCOMMAND}" in
     CAMPAIGN_ARGUMENT="${POSITIONAL[0]}"
     case "${SUBCOMMAND}" in
       preflight)
-        [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "Unsupported preflight option."
+        [[ "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "Unsupported preflight option."
         preflight_cpu
         ;;
       plan)
-        [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "Unsupported plan option."
+        [[ "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "Unsupported plan option."
         plan_campaign
         ;;
       launch)
-        [[ "${DETACH}" == false && "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "launch already submits and returns."
+        [[ "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "launch already submits and returns."
         launch_requested_campaign
         ;;
       all) run_all ;;
@@ -2343,6 +2713,30 @@ case "${SUBCOMMAND}" in
   smoke)
     (( ${#POSITIONAL[@]} == 0 )) || fail 2 "smoke accepts no campaign positional argument."
     run_smoke
+    ;;
+  finalize-smoke)
+    (( ${#POSITIONAL[@]} == 2 )) ||
+      fail 2 "finalize-smoke requires explicit steady and transient campaign run IDs."
+    [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false \
+      && -z "${ONLY_BATCH}" ]] || fail 2 "Unsupported finalize-smoke option."
+    [[ "${POSITIONAL[0]}" != "${POSITIONAL[1]}" ]] ||
+      fail 2 "finalize-smoke requires two distinct explicit campaign run IDs."
+    finalize_smoke_runs "${POSITIONAL[0]}" "${POSITIONAL[1]}"
+    ;;
+  collect-benchmark)
+    (( ${#POSITIONAL[@]} == 1 )) ||
+      fail 2 "collect-benchmark requires one benchmark run ID."
+    [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false \
+      && -z "${ONLY_BATCH}" ]] || fail 2 "collect-benchmark is always non-destructive."
+    RUN_ID="${POSITIONAL[0]}"
+    validate_benchmark_run_id "${RUN_ID}"
+    resolve_local_commit
+    resolve_local_storage
+    resolve_local_python
+    resolve_benchmark_contract >/dev/null
+    resolve_remote_layout
+    collect_core_benchmark
+    generation_console_final "benchmark_run_id=${RUN_ID} benchmark evidence validated"
     ;;
   status)
     (( ${#POSITIONAL[@]} <= 1 )) || fail 2 "status accepts at most one campaign-run ID."
@@ -2372,19 +2766,21 @@ case "${SUBCOMMAND}" in
     resolve_local_commit
     case "${SUBCOMMAND}" in
       collect)
-        [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]]           || fail 2 "collect is always non-destructive."
+        [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]] ||
+          fail 2 "collect is always non-destructive."
         collect_campaign
         ;;
       build-datasets)
-        [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]]           || fail 2 "Unsupported build-datasets option."
+        [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]] ||
+          fail 2 "Unsupported build-datasets option."
         build_datasets
         ;;
       resume)
-        [[ "${CONFIRM_CLEANUP}" == false && "${DETACH}" == false ]]           || fail 2 "Unsupported resume option."
+        [[ "${CONFIRM_CLEANUP}" == false ]] || fail 2 "Unsupported resume option."
         resume_all
         ;;
       cleanup)
-        [[ "${KEEP_CPU_SOURCE}" == false && "${DETACH}" == false ]]           || fail 2 "Unsupported cleanup option."
+        [[ "${KEEP_CPU_SOURCE}" == false ]] || fail 2 "Unsupported cleanup option."
         cleanup_cpu_source
         ;;
       accounting)
@@ -2392,8 +2788,7 @@ case "${SUBCOMMAND}" in
         remote_cli campaign-accounting "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
         ;;
       cancel)
-        [[ "${CONFIRM_CLEANUP}" == false && "${DETACH}" == false \
-          && "${KEEP_CPU_SOURCE}" == false ]] ||
+        [[ "${CONFIRM_CLEANUP}" == false && "${KEEP_CPU_SOURCE}" == false ]] ||
           fail 2 "Unsupported cancel option."
         resolve_remote_layout
         cancel_arguments=(

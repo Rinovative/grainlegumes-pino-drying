@@ -9,7 +9,7 @@ runtime:
     enabled: true
     initial_delay_seconds: 60
     maximum_delay_seconds: 300
-    maximum_wait_seconds: 3600
+    maximum_wait_seconds: null
 retention:
   family_generalization: compact
   technical_runtime_smoke: full

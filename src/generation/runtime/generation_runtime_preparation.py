@@ -41,6 +41,7 @@ class PreparedCase:
     bundle: case_service.CaseBundle
     work_directory: Path
     work_root: Path
+    storage_root: Path
     workspace_run_id: str
     workspace_marker: Path
     input_generation_id: str
@@ -216,6 +217,7 @@ def prepare_case_work_directory(
         bundle=bundle,
         work_directory=work_directory,
         work_root=root,
+        storage_root=storage,
         workspace_run_id=run_id,
         workspace_marker=marker_path,
         input_generation_id=admitted_input_generation_id,

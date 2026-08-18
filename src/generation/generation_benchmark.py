@@ -28,6 +28,8 @@ import shutil
 import socket
 import statistics
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -35,6 +37,8 @@ from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+import h5py
+import numpy as np
 import yaml
 
 from src import common
@@ -47,8 +51,6 @@ from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_preparation as preparation_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
 
-from . import generation_smoke as smoke_service
-
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -58,9 +60,13 @@ BENCHMARK_RUN_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_run"
 BENCHMARK_PROOF_SCHEMA_KIND: Final = "generation_core_scaling_case_proof"
 BENCHMARK_RESULT_SCHEMA_KIND: Final = "generation_core_scaling_result"
 BENCHMARK_SUMMARY_SCHEMA_KIND: Final = "generation_core_scaling_summary"
+BENCHMARK_PREFLIGHT_SCHEMA_KIND: Final = "generation_core_scaling_preflight"
 BENCHMARK_SCHEMA_VERSION: Final = 1
 BENCHMARK_FAMILY: Final = "core_scaling"
 _BENCHMARK_VARIANT_COUNT: Final = 4
+_MAX_COMSOL_VERSION_EVIDENCE_BYTES: Final = 16 * 1024
+_MAX_SLURM_JOB_NAME_LENGTH: Final = 48
+_MAX_DIRTY_PATH_PREVIEW: Final = 5
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _BENCHMARK_RUN_ID_PATTERN: Final = re.compile(r"core_scaling_transient__[0-9a-f]{16}")
 _ACTIVE_SCHEDULER_STATES: Final = frozenset(
@@ -84,6 +90,7 @@ _SUCCESS_TIMING_FIELDS: Final = frozenset(
         "export_conversion",
         "hdf5_admission",
         "complete_case",
+        "license_wait_seconds",
     }
 )
 _SUMMARY_METRIC_FIELDS: Final = (
@@ -103,6 +110,7 @@ _SUMMARY_METRIC_FIELDS: Final = (
     "queue_wait_interpretation",
     "production_configuration_modified",
     "dataset_membership",
+    "benchmark_canary_seconds",
 )
 _RESERVED_SCHEDULER_OPTIONS: Final = (
     "--array",
@@ -113,6 +121,7 @@ _RESERVED_SCHEDULER_OPTIONS: Final = (
     "--exclusive",
     "--export",
     "--job-name",
+    "--licenses",
     "--nodelist",
     "--nodes",
     "--ntasks",
@@ -155,6 +164,7 @@ class CoreBenchmarkSuite:
     production_campaign_path: Path
     production_cores_config_path: Path
     production_cores_key: str
+    production_cores_per_case: int
 
     def variant(self, variant_id: str) -> CoreBenchmarkVariant:
         """Return one configured variant by its stable identifier."""
@@ -194,6 +204,17 @@ class CoreBenchmarkSuite:
             raise ValueError(message)
         return f"{self.execution_id(variant)}__rep_{repetition:03d}"
 
+    def canary_variant(self) -> CoreBenchmarkVariant:
+        """Return the unique variant matching the production core setting."""
+        matches = tuple(variant for variant in self.variants if variant.cores_per_case == self.production_cores_per_case)
+        if len(matches) != 1:
+            message = (
+                "Core benchmark requires exactly one variant matching production "
+                f"cores_per_case={self.production_cores_per_case}; found {len(matches)}."
+            )
+            raise ValueError(message)
+        return matches[0]
+
     def resource_contract(self) -> dict[str, Any]:
         """Return the common site and scheduler contract for every variant."""
         site = self.case_campaign.execution_values["site"]
@@ -231,6 +252,8 @@ class CoreBenchmarkSuite:
             "assignment": assignment,
             "scientific_config_digest": self.case_config.scientific_config_digest,
             "case_input_config_digest": self.case_config.case_input_config_digest,
+            "export_contract_sha256": common.serialization.canonical_json_sha256(self.case_config.scientific_values["output_contract"]),
+            "execution_config_digest": common.serialization.canonical_json_sha256(self.case_config.execution_values),
             "template": {
                 "relative_path": self.case_config.template_relative_path,
                 "sha256": self.case_config.template_sha256,
@@ -579,6 +602,13 @@ def load_core_benchmark_suite(
     if core_counts != sorted(core_counts):
         message = "Core benchmark variants must be authored in increasing cores_per_case order."
         raise ValueError(message)
+    matching_production_variants = [variant for variant in variants if variant.cores_per_case == authored_cores]
+    if len(matching_production_variants) != 1:
+        message = (
+            "Core benchmark requires exactly one variant matching production "
+            f"cores_per_case={authored_cores}; found {len(matching_production_variants)}."
+        )
+        raise ValueError(message)
     repetitions = _positive_integer(
         suite["repetitions"],
         label="benchmark.repetitions",
@@ -632,6 +662,7 @@ def load_core_benchmark_suite(
         production_campaign_path=production_campaign_path,
         production_cores_config_path=production_cores_config_path,
         production_cores_key=production_cores_key,
+        production_cores_per_case=authored_cores,
     )
 
 
@@ -653,6 +684,11 @@ def inspect_core_benchmark(
         "case": suite.case_selection(),
         "repetitions": suite.repetitions,
         "resource_contract": suite.resource_contract(),
+        "canary": {
+            "variant_id": suite.canary_variant().variant_id,
+            "cores_per_case": suite.canary_variant().cores_per_case,
+            "repetition": 1,
+        },
         "variants": [
             {
                 "variant_id": variant.variant_id,
@@ -679,6 +715,23 @@ def _repository_commit() -> str:
     return source_service.validate_git_commit(result.stdout.strip())
 
 
+def _require_clean_repository() -> None:
+    """Require the benchmark checkout to contain only exact committed source."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],  # noqa: S607 -- site PATH owns Git
+        cwd=common.paths.get_project_root(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changes = [line for line in result.stdout.splitlines() if line]
+    if changes:
+        preview = ", ".join(changes[:_MAX_DIRTY_PATH_PREVIEW])
+        suffix = "" if len(changes) <= _MAX_DIRTY_PATH_PREVIEW else f" (+{len(changes) - _MAX_DIRTY_PATH_PREVIEW} more)"
+        message = f"Standalone benchmark requires clean exact committed source; working-tree changes: {preview}{suffix}"
+        raise RuntimeError(message)
+
+
 def _require_current_checkout(manifest: Mapping[str, Any]) -> None:
     """Require the executing repository to equal the persisted source commit."""
     expected = source_service.validate_git_commit(manifest.get("git_commit"))
@@ -688,22 +741,67 @@ def _require_current_checkout(manifest: Mapping[str, Any]) -> None:
         raise RuntimeError(message)
 
 
-def _smoke_gate(*, storage_root: Path | str) -> dict[str, Any]:
-    """Validate and compactly bind the current native runtime-smoke evidence."""
-    report = smoke_service.validate_current_real_smoke_receipts(
-        storage_root=storage_root,
-    )
-    receipts = [
-        {
-            "receipt_digest": record["receipt_digest"],
-            "campaign_run_ids": record["campaign_run_ids"],
-        }
-        for record in report["valid_receipts"]
-    ]
+def _comsol_version_evidence(
+    output: str,
+    *,
+    configured_executable: str,
+) -> dict[str, str]:
+    """Return normalized COMSOL version evidence for benchmark identity."""
+    if not isinstance(output, str):
+        message = "Benchmark COMSOL version evidence must be text."
+        raise TypeError(message)
+    normalized = output.strip()
+    if not normalized or len(normalized.encode("utf-8")) > _MAX_COMSOL_VERSION_EVIDENCE_BYTES or "\x00" in normalized:
+        message = "Benchmark COMSOL version evidence is empty or unsafe."
+        raise ValueError(message)
     return {
-        "status": report["status"],
-        "valid_receipts": receipts,
-        "gate_digest": common.serialization.canonical_json_sha256(receipts),
+        "configured_executable": configured_executable,
+        "output": normalized,
+        "digest": common.serialization.canonical_json_sha256(
+            {
+                "configured_executable": configured_executable,
+                "output": normalized,
+            }
+        ),
+    }
+
+
+def _benchmark_identity(
+    suite: CoreBenchmarkSuite,
+    *,
+    git_commit: str,
+    comsol_version: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the actual dependency-scoped standalone benchmark identity."""
+    commit = source_service.validate_git_commit(git_commit)
+    version = _mapping(comsol_version, label="benchmark COMSOL version evidence")
+    if (
+        set(version) != {"configured_executable", "output", "digest"}
+        or version.get("configured_executable") != suite.resource_contract()["comsol_executable"]
+        or _SHA256_PATTERN.fullmatch(str(version.get("digest"))) is None
+        or _comsol_version_evidence(
+            str(version.get("output")),
+            configured_executable=str(version.get("configured_executable")),
+        )
+        != version
+    ):
+        message = "Benchmark COMSOL version evidence is malformed or inconsistent."
+        raise ValueError(message)
+    case = suite.case_selection()
+    return {
+        "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "git_commit": commit,
+        "suite_digest": suite.suite_digest,
+        "case_selection_digest": case["selection_digest"],
+        "scientific_config_digest": case["scientific_config_digest"],
+        "case_input_config_digest": case["case_input_config_digest"],
+        "template_sha256": case["template"]["sha256"],
+        "export_contract_sha256": case["export_contract_sha256"],
+        "execution_config_digest": case["execution_config_digest"],
+        "variants": _variant_records(suite),
+        "repetitions": suite.repetitions,
+        "comsol_version": version,
     }
 
 
@@ -711,21 +809,15 @@ def core_benchmark_run_id(
     suite: CoreBenchmarkSuite,
     *,
     git_commit: str,
-    smoke_gate_digest: str,
+    comsol_version: Mapping[str, Any],
 ) -> str:
-    """Return the run identity binding source, suite, and native gate."""
-    commit = source_service.validate_git_commit(git_commit)
-    if _SHA256_PATTERN.fullmatch(smoke_gate_digest) is None:
-        message = "smoke_gate_digest must be one lowercase SHA-256 digest."
-        raise ValueError(message)
+    """Return the standalone run identity from actual benchmark dependencies."""
     digest = common.serialization.canonical_json_sha256(
-        {
-            "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
-            "schema_version": BENCHMARK_SCHEMA_VERSION,
-            "suite_digest": suite.suite_digest,
-            "git_commit": commit,
-            "smoke_gate_digest": smoke_gate_digest,
-        }
+        _benchmark_identity(
+            suite,
+            git_commit=git_commit,
+            comsol_version=comsol_version,
+        )
     )
     return f"core_scaling_transient__{digest[:16]}"
 
@@ -747,6 +839,311 @@ def core_benchmark_directory(
         / BENCHMARK_FAMILY
         / safe_id
     )
+
+
+def _preflight_path(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> Path:
+    """Return the immutable standalone preflight receipt path."""
+    return core_benchmark_directory(run_id, storage_root=storage_root) / "benchmark_preflight.json"
+
+
+def _probe_directory_capability(path: Path | str, *, label: str) -> dict[str, Any]:
+    """Prove one existing directory supports small same-filesystem writes."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        message = f"{label} must be an absolute directory: {candidate}"
+        raise ValueError(message)
+    resolved = candidate.resolve()
+    if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
+        message = f"{label} is not an available readable/writable directory: {resolved}"
+        raise FileNotFoundError(message)
+    descriptor, probe_name = tempfile.mkstemp(prefix=".benchmark-preflight.", dir=resolved)
+    probe = Path(probe_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(b"benchmark-preflight\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not probe.is_file() or probe.stat().st_size < 1:
+            message = f"{label} capability probe did not persist an ordinary file: {resolved}"
+            raise RuntimeError(message)
+    finally:
+        probe.unlink(missing_ok=True)
+    usage = shutil.disk_usage(resolved)
+    if usage.free < 1:
+        message = f"{label} reports no free storage capacity: {resolved}"
+        raise RuntimeError(message)
+    return {
+        "path": str(resolved),
+        "free_bytes_observed": usage.free,
+        "small_write_probe": "pass",
+    }
+
+
+def _validate_preflight_payload(
+    payload: Mapping[str, Any],
+    *,
+    run_id: str,
+    suite: CoreBenchmarkSuite,
+    git_commit: str,
+) -> None:
+    """Validate immutable standalone preflight identity and owned checks."""
+    expected_keys = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "recorded_at",
+        "benchmark_preflight_seconds",
+        "benchmark_run_id",
+        "suite_config",
+        "benchmark_identity",
+        "comsol_runtime",
+        "python_runtime",
+        "storage_capabilities",
+        "submission_command_digest",
+        "checks",
+    }
+    if (
+        set(payload) != expected_keys
+        or payload.get("schema_kind") != BENCHMARK_PREFLIGHT_SCHEMA_KIND
+        or payload.get("schema_version") != BENCHMARK_SCHEMA_VERSION
+        or payload.get("status") != "pass"
+        or payload.get("benchmark_run_id") != run_id
+        or payload.get("suite_config") != _repository_relative(suite.source_path)
+    ):
+        message = f"Standalone benchmark preflight receipt is malformed: {run_id}"
+        raise ValueError(message)
+    identity = _mapping(
+        payload.get("benchmark_identity"),
+        label="benchmark preflight identity",
+    )
+    expected_identity = _benchmark_identity(
+        suite,
+        git_commit=git_commit,
+        comsol_version=_mapping(
+            identity.get("comsol_version"),
+            label="benchmark preflight COMSOL version",
+        ),
+    )
+    if (
+        identity != expected_identity
+        or core_benchmark_run_id(
+            suite,
+            git_commit=git_commit,
+            comsol_version=identity["comsol_version"],
+        )
+        != run_id
+    ):
+        message = f"Standalone benchmark preflight identity conflicts: {run_id}"
+        raise ValueError(message)
+    checks = payload.get("checks")
+    if not isinstance(checks, dict) or not checks or set(checks.values()) != {"pass"}:
+        message = f"Standalone benchmark preflight checks are incomplete: {run_id}"
+        raise ValueError(message)
+    capabilities = payload.get("storage_capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != {
+        "scratch",
+        "persistent",
+    }:
+        message = f"Standalone benchmark storage capability evidence is malformed: {run_id}"
+        raise ValueError(message)
+    runtime = payload.get("comsol_runtime")
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime) != {"resolved_executable", "version"}
+        or not Path(str(runtime.get("resolved_executable"))).is_absolute()
+        or runtime.get("version") != identity["comsol_version"]
+    ):
+        message = f"Standalone benchmark COMSOL runtime evidence is malformed: {run_id}"
+        raise ValueError(message)
+    python_runtime = payload.get("python_runtime")
+    if (
+        not isinstance(python_runtime, dict)
+        or set(python_runtime) != {"executable", "version", "imports"}
+        or not isinstance(python_runtime.get("imports"), dict)
+    ):
+        message = f"Standalone benchmark Python runtime evidence is malformed: {run_id}"
+        raise ValueError(message)
+    if _SHA256_PATTERN.fullmatch(str(payload.get("submission_command_digest"))) is None:
+        message = f"Standalone benchmark command evidence is malformed: {run_id}"
+        raise ValueError(message)
+    _timestamp(payload.get("recorded_at"), label="benchmark preflight recorded_at")
+    preflight_seconds = payload.get("benchmark_preflight_seconds")
+    if (
+        isinstance(preflight_seconds, bool)
+        or not isinstance(preflight_seconds, (int, float))
+        or not math.isfinite(float(preflight_seconds))
+        or float(preflight_seconds) < 0.0
+    ):
+        message = "Standalone benchmark preflight duration is malformed."
+        raise ValueError(message)
+
+
+def preflight_core_benchmark(
+    path: Path | str,
+    *,
+    git_commit: str,
+    storage_root: Path | str,
+    scratch_root: Path | str,
+    comsol_version_output: str,
+    comsol_executable_path: Path | str,
+) -> dict[str, Any]:
+    """Run inexpensive benchmark-owned source, runtime, storage, and command checks."""
+    started = time.perf_counter()
+    requested_commit = source_service.validate_git_commit(git_commit)
+    current_commit = _repository_commit()
+    if current_commit != requested_commit:
+        message = f"CPU checkout commit {current_commit} does not match requested benchmark commit {requested_commit}."
+        raise RuntimeError(message)
+    _require_clean_repository()
+    suite = load_core_benchmark_suite(path, require_executable=True)
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    persistent = _probe_directory_capability(storage, label="benchmark persistent storage")
+    scratch = _probe_directory_capability(scratch_root, label="benchmark scratch")
+    executable = Path(comsol_executable_path).expanduser()
+    if not executable.is_absolute():
+        message = "Resolved benchmark COMSOL executable must be an absolute path."
+        raise ValueError(message)
+    resolved_executable = executable.resolve()
+    if not resolved_executable.is_file() or not os.access(resolved_executable, os.X_OK):
+        message = f"Resolved benchmark COMSOL executable is unavailable: {resolved_executable}"
+        raise FileNotFoundError(message)
+    version = _comsol_version_evidence(
+        comsol_version_output,
+        configured_executable=suite.resource_contract()["comsol_executable"],
+    )
+    if any(
+        argument == "-usebatchlic" or argument.startswith("-usebatchlic=")
+        for argument in suite.case_config.execution_values["runtime"]["extra_arguments"]
+    ):
+        message = "Standalone benchmark rejects unverified COMSOL -usebatchlic."
+        raise ValueError(message)
+    identity = _benchmark_identity(
+        suite,
+        git_commit=requested_commit,
+        comsol_version=version,
+    )
+    run_id = core_benchmark_run_id(
+        suite,
+        git_commit=requested_commit,
+        comsol_version=version,
+    )
+    directory = core_benchmark_directory(run_id, storage_root=storage)
+    logs = directory / "scheduler"
+    commands = [
+        build_core_benchmark_slurm_command(
+            suite,
+            run_id=run_id,
+            storage_root=storage,
+            log_directory=logs,
+            role="prepare",
+        ),
+        *[
+            build_core_benchmark_slurm_command(
+                suite,
+                run_id=run_id,
+                storage_root=storage,
+                log_directory=logs,
+                role="measure",
+                variant=variant,
+                repetition=repetition,
+            )
+            for variant, repetition in _measured_sequence(suite)
+        ],
+    ]
+    if any(argument == "--licenses" or argument.startswith("--licenses=") for command in commands for argument in command):
+        message = "Standalone benchmark Slurm commands must not request --licenses."
+        raise ValueError(message)
+    payload = {
+        "schema_kind": BENCHMARK_PREFLIGHT_SCHEMA_KIND,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "status": "pass",
+        "recorded_at": _utc_now(),
+        "benchmark_preflight_seconds": time.perf_counter() - started,
+        "benchmark_run_id": run_id,
+        "suite_config": _repository_relative(suite.source_path),
+        "benchmark_identity": identity,
+        "comsol_runtime": {
+            "resolved_executable": str(resolved_executable),
+            "version": version,
+        },
+        "python_runtime": {
+            "executable": sys.executable,
+            "version": sys.version,
+            "imports": {
+                "h5py": h5py.__version__,
+                "numpy": np.__version__,
+                "pyyaml": yaml.__version__,
+            },
+        },
+        "storage_capabilities": {
+            "scratch": scratch,
+            "persistent": persistent,
+        },
+        "submission_command_digest": common.serialization.canonical_json_sha256(commands),
+        "checks": {
+            "clean_exact_source": "pass",
+            "suite_and_case": "pass",
+            "template_and_export_contract": "pass",
+            "comsol_executable_and_version": "pass",
+            "python_runtime_and_imports": "pass",
+            "scheduler_resources": "pass",
+            "scratch_storage": "pass",
+            "persistent_storage": "pass",
+            "slurm_commands": "pass",
+            "unsupported_license_flags_absent": "pass",
+        },
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    receipt_path = _preflight_path(run_id, storage_root=storage)
+    if receipt_path.exists():
+        existing = _load_json(
+            receipt_path,
+            label="standalone benchmark preflight receipt",
+        )
+        _validate_preflight_payload(
+            existing,
+            run_id=run_id,
+            suite=suite,
+            git_commit=requested_commit,
+        )
+        return existing
+    _write_immutable_json(
+        receipt_path,
+        payload,
+        label="standalone benchmark preflight receipt",
+    )
+    _validate_preflight_payload(
+        payload,
+        run_id=run_id,
+        suite=suite,
+        git_commit=requested_commit,
+    )
+    return payload
+
+
+def _load_core_benchmark_preflight(
+    run_id: str,
+    *,
+    suite: CoreBenchmarkSuite,
+    git_commit: str,
+    storage_root: Path | str,
+) -> dict[str, Any]:
+    """Load and validate the immutable standalone preflight receipt."""
+    payload = _load_json(
+        _preflight_path(run_id, storage_root=storage_root),
+        label="standalone benchmark preflight receipt",
+    )
+    _validate_preflight_payload(
+        payload,
+        run_id=run_id,
+        suite=suite,
+        git_commit=git_commit,
+    )
+    return payload
 
 
 def _variant_records(suite: CoreBenchmarkSuite) -> list[dict[str, Any]]:
@@ -787,9 +1184,13 @@ def _measured_sequence(
     *,
     variant_id: str | None = None,
 ) -> tuple[tuple[CoreBenchmarkVariant, int], ...]:
-    """Return canonical round-robin order: all cores once per repetition."""
+    """Return canary-first order followed by remaining round-robin runs."""
     variants = _selected_variants(suite, variant_id)
-    return tuple((variant, repetition) for repetition in range(1, suite.repetitions + 1) for variant in variants)
+    round_robin = tuple((variant, repetition) for repetition in range(1, suite.repetitions + 1) for variant in variants)
+    if variant_id is not None:
+        return round_robin
+    canary = (suite.canary_variant(), 1)
+    return (canary, *(item for item in round_robin if item != canary))
 
 
 def build_core_benchmark_slurm_command(
@@ -821,7 +1222,7 @@ def build_core_benchmark_slurm_command(
             raise ValueError(message)
         cpus = 1
         worker = [str(launcher), str(repository), run_id, "prepare"]
-        job_suffix = "prep"
+        job_suffix = f"prep-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
     else:
         if variant is None or repetition is None:
             message = "Measured benchmark submission requires one variant and repetition."
@@ -836,9 +1237,12 @@ def build_core_benchmark_slurm_command(
             variant.variant_id,
             str(repetition),
         ]
-        job_suffix = f"{variant.variant_id}-{repetition:03d}"
+        job_suffix = f"c{variant.cores_per_case:02d}-r{repetition:02d}-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
     wrapped = shlex.join(["env", *environment, *worker])
-    job_name = f"vp2-bench-{run_id.rsplit('__', maxsplit=1)[-1]}-{job_suffix}"[:48]
+    job_name = f"td-bench-{job_suffix}"
+    if len(job_name) > _MAX_SLURM_JOB_NAME_LENGTH or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", job_name) is None:
+        message = f"Benchmark Slurm job name is unsafe or exceeds 48 characters: {job_name!r}."
+        raise ValueError(message)
     command = [
         "sbatch",
         "--parsable",
@@ -865,15 +1269,11 @@ def _plan_payload(
     *,
     git_commit: str,
     storage: Path,
-    smoke_gate: Mapping[str, Any],
+    preflight: Mapping[str, Any],
     variant_id: str | None,
 ) -> dict[str, Any]:
-    """Build a read-only suite plan including canonical serial commands."""
-    run_id = core_benchmark_run_id(
-        suite,
-        git_commit=git_commit,
-        smoke_gate_digest=str(smoke_gate["gate_digest"]),
-    )
+    """Build the canonical serial plan from benchmark-owned preflight."""
+    run_id = str(preflight["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     logs = directory / "scheduler"
     selected = _selected_variants(suite, variant_id)
@@ -906,17 +1306,38 @@ def _plan_payload(
         "schema_kind": "generation_core_scaling_benchmark_plan",
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "state": "planned",
-        "filesystem_mutated": False,
+        "filesystem_mutated": True,
         "benchmark_run_id": run_id,
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
         "suite_config": _repository_relative(suite.source_path),
         "git_commit": git_commit,
-        "runtime_smoke": dict(smoke_gate),
+        "preflight": {
+            "receipt_sha256": common.serialization.file_sha256(_preflight_path(run_id, storage_root=storage)),
+            "benchmark_identity": preflight["benchmark_identity"],
+            "comsol_runtime": preflight["comsol_runtime"],
+            "checks": preflight["checks"],
+        },
         "case": suite.case_selection(),
         "repetitions": suite.repetitions,
         "variants": _variant_records(suite),
         "selected_variant_ids": [variant.variant_id for variant in selected],
+        "canary": {
+            "variant_id": suite.canary_variant().variant_id,
+            "cores_per_case": suite.canary_variant().cores_per_case,
+            "repetition": 1,
+            "included_in_final_measurements": True,
+        },
+        "measurement_order": [
+            {
+                "position": position,
+                "variant_id": variant.variant_id,
+                "cores_per_case": variant.cores_per_case,
+                "repetition": repetition,
+                "role": ("canary" if position == 1 and variant == suite.canary_variant() and repetition == 1 else "measurement"),
+            }
+            for position, (variant, repetition) in enumerate(sequence, start=1)
+        ],
         "resource_contract": suite.resource_contract(),
         "paths": {
             "storage_root": str(storage),
@@ -943,25 +1364,28 @@ def plan_core_benchmark(
     *,
     git_commit: str,
     storage_root: Path | str,
+    scratch_root: Path | str,
+    comsol_version_output: str,
+    comsol_executable_path: Path | str,
     variant_id: str | None = None,
 ) -> dict[str, Any]:
-    """Validate native evidence and return a non-mutating benchmark plan."""
+    """Run or reuse standalone preflight and return the canonical plan."""
     requested_commit = source_service.validate_git_commit(git_commit)
-    current_commit = _repository_commit()
-    if current_commit != requested_commit:
-        message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
-        raise RuntimeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    if not storage.is_dir():
-        message = f"Core benchmark plan requires the prepared storage root: {storage}"
-        raise FileNotFoundError(message)
     suite = load_core_benchmark_suite(path, require_executable=True)
-    gate = _smoke_gate(storage_root=storage)
+    preflight = preflight_core_benchmark(
+        path,
+        git_commit=requested_commit,
+        storage_root=storage,
+        scratch_root=scratch_root,
+        comsol_version_output=comsol_version_output,
+        comsol_executable_path=comsol_executable_path,
+    )
     return _plan_payload(
         suite,
         git_commit=requested_commit,
         storage=storage,
-        smoke_gate=gate,
+        preflight=preflight,
         variant_id=variant_id,
     )
 
@@ -1023,10 +1447,12 @@ def load_core_benchmark_manifest(
             "suite_digest",
             "suite_config",
             "git_commit",
-            "runtime_smoke",
+            "preflight",
             "case",
             "repetitions",
             "variants",
+            "canary",
+            "measurement_order",
             "resource_contract",
             "created_at",
             "state",
@@ -1049,25 +1475,48 @@ def load_core_benchmark_manifest(
         label="benchmark manifest suite_config",
     )
     suite = load_core_benchmark_suite(suite_path, require_executable=True)
+    sequence = _measured_sequence(suite)
     expected = {
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
         "case": suite.case_selection(),
         "repetitions": suite.repetitions,
         "variants": _variant_records(suite),
+        "canary": {
+            "variant_id": suite.canary_variant().variant_id,
+            "cores_per_case": suite.canary_variant().cores_per_case,
+            "repetition": 1,
+            "included_in_final_measurements": True,
+        },
+        "measurement_order": [
+            {
+                "position": position,
+                "variant_id": variant.variant_id,
+                "cores_per_case": variant.cores_per_case,
+                "repetition": repetition,
+                "role": ("canary" if position == 1 and variant == suite.canary_variant() and repetition == 1 else "measurement"),
+            }
+            for position, (variant, repetition) in enumerate(sequence, start=1)
+        ],
         "resource_contract": suite.resource_contract(),
     }
     if any(manifest.get(key) != value for key, value in expected.items()):
         message = f"Core benchmark manifest no longer matches current suite source: {run_id}"
         raise ValueError(message)
-    gate = _mapping(manifest["runtime_smoke"], label="benchmark runtime_smoke")
-    expected_run_id = core_benchmark_run_id(
-        suite,
-        git_commit=manifest["git_commit"],
-        smoke_gate_digest=str(gate.get("gate_digest")),
+    preflight = _load_core_benchmark_preflight(
+        run_id,
+        suite=suite,
+        git_commit=str(manifest["git_commit"]),
+        storage_root=storage_root,
     )
-    if expected_run_id != run_id:
-        message = f"Core benchmark run identity is inconsistent: {run_id}"
+    expected_preflight = {
+        "receipt_sha256": common.serialization.file_sha256(_preflight_path(run_id, storage_root=storage_root)),
+        "benchmark_identity": preflight["benchmark_identity"],
+        "comsol_runtime": preflight["comsol_runtime"],
+        "checks": preflight["checks"],
+    }
+    if manifest.get("preflight") != expected_preflight:
+        message = f"Core benchmark manifest preflight identity is inconsistent: {run_id}"
         raise ValueError(message)
     return manifest, suite
 
@@ -1101,6 +1550,64 @@ def _success_path(
     return directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, repetition) / "success.json"
 
 
+def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
+    """Validate contiguous benchmark attempts and immediate receipt digests."""
+    stable_identity: dict[str, Any] | None = None
+    previous_path: Path | None = None
+    identity_keys = (
+        "benchmark_run_id",
+        "suite_digest",
+        "variant_id",
+        "execution_id",
+        "repetition",
+        "repetition_id",
+        "git_commit",
+        "case_input_id",
+        "simulation_case_id",
+        "scientific_config_digest",
+        "template_sha256",
+        "benchmark_preflight_sha256",
+        "cores_per_case",
+    )
+    for expected_index, attempt_path in enumerate(attempts, start=1):
+        if attempt_path.name != f"attempt-{expected_index:04d}.json":
+            message = f"Benchmark attempt history is not contiguous: {attempt_path}"
+            raise ValueError(message)
+        payload = _load_json(attempt_path, label="benchmark repetition attempt")
+        previous = payload.get("previous_attempt")
+        if expected_index == 1:
+            valid_previous = previous is None
+        else:
+            valid_previous = (
+                isinstance(previous, dict)
+                and set(previous) == {"attempt", "receipt_sha256"}
+                and previous.get("attempt") == expected_index - 1
+                and previous_path is not None
+                and previous.get("receipt_sha256") == common.serialization.file_sha256(previous_path)
+            )
+        if payload.get("attempt") != expected_index or not valid_previous:
+            message = f"Benchmark attempt predecessor chain is invalid: {attempt_path}"
+            raise ValueError(message)
+        identity = {key: payload.get(key) for key in identity_keys}
+        if stable_identity is None:
+            stable_identity = identity
+        elif identity != stable_identity:
+            message = f"Benchmark attempt identity changed across retry: {attempt_path}"
+            raise ValueError(message)
+        previous_path = attempt_path
+
+
+def _benchmark_previous_attempt_reference(attempts: Sequence[Path]) -> dict[str, Any] | None:
+    """Return the exact immediate predecessor after admitting the prior chain."""
+    _validate_benchmark_attempt_chain(attempts)
+    if not attempts:
+        return None
+    return {
+        "attempt": len(attempts),
+        "receipt_sha256": common.serialization.file_sha256(attempts[-1]),
+    }
+
+
 def _validate_result_identity(
     result: Mapping[str, Any],
     *,
@@ -1130,13 +1637,28 @@ def _validate_result_identity(
         message = f"Benchmark result has a malformed run ID for {expected['repetition_id']}."
         raise ValueError(message)
     source_service.validate_git_commit(result.get("git_commit"))
+    if _SHA256_PATTERN.fullmatch(str(result.get("benchmark_preflight_sha256"))) is None:
+        message = f"Benchmark result has malformed preflight identity for {expected['repetition_id']}."
+        raise ValueError(message)
     for key in ("case_input_id", "simulation_case_id"):
         if _SHA256_PATTERN.fullmatch(str(result.get(key))) is None:
             message = f"Benchmark result has malformed {key} for {expected['repetition_id']}."
             raise ValueError(message)
     attempt = result.get("attempt")
+    previous = result.get("previous_attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
-        message = f"Benchmark result has an invalid attempt for {expected['repetition_id']}."
+        message = f"Benchmark result has an invalid attempt index for {expected['repetition_id']}."
+        raise ValueError(message)
+    valid_previous = (
+        previous is None
+        if attempt == 1
+        else isinstance(previous, dict)
+        and set(previous) == {"attempt", "receipt_sha256"}
+        and previous.get("attempt") == attempt - 1
+        and _SHA256_PATTERN.fullmatch(str(previous.get("receipt_sha256"))) is not None
+    )
+    if not valid_previous:
+        message = f"Benchmark result has an invalid attempt chain for {expected['repetition_id']}."
         raise ValueError(message)
 
 
@@ -1323,6 +1845,7 @@ def _validate_failure_result(
     attempts: Sequence[Path],
 ) -> None:
     """Validate one append-only failed repetition attempt."""
+    del attempts
     _validate_result_identity(
         result,
         suite=suite,
@@ -1344,11 +1867,13 @@ def _validate_failure_result(
     if not isinstance(timings, dict) or set(timings) != {
         "case_materialization",
         "complete_case",
+        "license_wait_seconds",
     }:
         message = f"Benchmark failure timings are malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
     materialization = timings["case_materialization"]
     complete = timings["complete_case"]
+    license_wait = timings["license_wait_seconds"]
     if (
         materialization is not None
         and (
@@ -1357,7 +1882,16 @@ def _validate_failure_result(
             or not math.isfinite(float(materialization))
             or float(materialization) < 0.0
         )
-    ) or (isinstance(complete, bool) or not isinstance(complete, (int, float)) or not math.isfinite(float(complete)) or float(complete) < 0.0):
+    ) or (
+        isinstance(complete, bool)
+        or not isinstance(complete, (int, float))
+        or not math.isfinite(float(complete))
+        or float(complete) < 0.0
+        or isinstance(license_wait, bool)
+        or not isinstance(license_wait, (int, float))
+        or not math.isfinite(float(license_wait))
+        or float(license_wait) < 0.0
+    ):
         message = f"Benchmark failure timings are malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
     error = result.get("error")
@@ -1365,19 +1899,8 @@ def _validate_failure_result(
         message = f"Benchmark failure error evidence is malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
     if result.get("temporary_license_retry") is not None:
-        retry_count, _, exhausted = _validated_benchmark_license_retry_history(
-            suite.case_config,
-            attempts,
-            repetition_label=suite.repetition_id(variant, repetition),
-        )
-        if (
-            retry_count < 1
-            or not exhausted
-            or error.get("type") != "TemporaryLicenseCapacityExhausted"
-            or error.get("message") != license_service.EXHAUSTED_REASON
-        ):
-            message = f"Benchmark exhausted temporary-license evidence is malformed for {suite.repetition_id(variant, repetition)}."
-            raise ValueError(message)
+        message = f"Temporary license capacity must remain operationally pending for {suite.repetition_id(variant, repetition)}."
+        raise ValueError(message)
 
 
 def _validate_pending_license_result(
@@ -1410,15 +1933,25 @@ def _validate_pending_license_result(
     if not isinstance(timings, dict) or set(timings) != {
         "case_materialization",
         "complete_case",
+        "license_wait_seconds",
     }:
         message = f"Benchmark temporary-license timings are malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
-    retry_count, _, exhausted = _validated_benchmark_license_retry_history(
+    license_wait = timings["license_wait_seconds"]
+    if (
+        isinstance(license_wait, bool)
+        or not isinstance(license_wait, (int, float))
+        or not math.isfinite(float(license_wait))
+        or float(license_wait) < 0.0
+    ):
+        message = f"Benchmark temporary-license wait is malformed for {suite.repetition_id(variant, repetition)}."
+        raise ValueError(message)
+    retry_count, _, _exhausted = _validated_benchmark_license_retry_history(
         suite.case_config,
         attempts,
         repetition_label=suite.repetition_id(variant, repetition),
     )
-    if retry_count < 1 or exhausted:
+    if retry_count < 1:
         message = f"Benchmark temporary-license evidence is malformed for {suite.repetition_id(variant, repetition)}."
         raise ValueError(message)
 
@@ -1430,6 +1963,7 @@ def _validated_benchmark_license_retry_history(
     repetition_label: str,
 ) -> tuple[int, float, bool]:
     """Validate and summarize one append-only benchmark retry chain."""
+    _validate_benchmark_attempt_chain(attempts)
     policy = config.execution_values["runtime"]["temporary_license_retry"]
     expected_keys = {
         "classification",
@@ -1496,7 +2030,7 @@ def _validated_benchmark_license_retry_history(
             or not valid_delay
             or not valid_cumulative
             or retry.get("retry_budget_remaining") is not expected_remaining
-            or payload.get("status") != ("pending" if expected_remaining else "failed")
+            or payload.get("status") != "pending"
         ):
             message = f"Benchmark temporary-license retry history is inconsistent: {attempt_path}"
             raise ValueError(message)
@@ -1692,6 +2226,45 @@ def _pending_repetitions(
     return tuple(pending)
 
 
+def _canary_attempts(
+    directory: Path,
+    suite: CoreBenchmarkSuite,
+) -> tuple[Path, ...]:
+    """Return append-only attempt receipts for the measured canary."""
+    variant = suite.canary_variant()
+    repetition_directory = directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, 1)
+    return tuple(sorted(repetition_directory.glob("attempt-*.json")))
+
+
+def _validated_canary_result(
+    directory: Path,
+    suite: CoreBenchmarkSuite,
+    *,
+    run_id: str,
+    manifest: Mapping[str, Any],
+    proof: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return a fully admitted canary success, or no success evidence."""
+    variant = suite.canary_variant()
+    path = _success_path(directory, suite, variant, 1)
+    if not path.is_file():
+        return None
+    result = _load_json(path, label="benchmark canary success")
+    _validate_success_result(
+        result,
+        suite=suite,
+        variant=variant,
+        repetition=1,
+    )
+    _validate_records_against_proof(
+        [result],
+        run_id=run_id,
+        manifest=manifest,
+        proof=proof,
+    )
+    return result
+
+
 def _persist_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     """Atomically replace mutable benchmark orchestration state."""
     common.serialization.atomic_write_json(path, dict(manifest))
@@ -1735,8 +2308,10 @@ def _submit_pending(
             suite,
             directory,
         )
-        if latest_retry is not None and not license_service.retry_attempt_is_eligible(latest_retry):
-            manifest["state"] = "waiting_retry"
+        if latest_retry is not None and (
+            not bool(latest_retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(latest_retry)
+        ):
+            manifest["state"] = "license_blocked"
             _persist_manifest(
                 _manifest_path(run_id, storage_root=storage),
                 manifest,
@@ -1780,27 +2355,98 @@ def _submit_pending(
         manifest["state"] = "submitted"
         _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
         return manifest
-    next_execution = next(
-        (
-            (variant, repetition)
-            for variant, repetition in _measured_sequence(
-                suite,
-                variant_id=variant_id,
-            )
-            if repetition in _pending_repetitions(directory, suite, variant)
-        ),
-        None,
+    proof_payload = _load_case_proof(
+        run_id,
+        suite,
+        storage_root=storage,
     )
+    canary = suite.canary_variant()
+    canary_success = _validated_canary_result(
+        directory,
+        suite,
+        run_id=run_id,
+        manifest=manifest,
+        proof=proof_payload,
+    )
+    canary_attempts = _canary_attempts(directory, suite)
+    if canary_success is None:
+        if canary_attempts:
+            latest_canary = _load_json(
+                canary_attempts[-1],
+                label="benchmark canary attempt",
+            )
+            if latest_canary.get("status") == "pending":
+                _validate_pending_license_result(
+                    latest_canary,
+                    suite=suite,
+                    variant=canary,
+                    repetition=1,
+                    attempts=canary_attempts,
+                )
+                retry = _mapping(
+                    latest_canary.get("temporary_license_retry"),
+                    label="benchmark canary temporary-license retry",
+                )
+                if not bool(retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(retry):
+                    manifest["state"] = "license_blocked"
+                    _persist_manifest(
+                        _manifest_path(run_id, storage_root=storage),
+                        manifest,
+                    )
+                    return manifest
+            elif latest_canary.get("status") == "failed":
+                _validate_failure_result(
+                    latest_canary,
+                    suite=suite,
+                    variant=canary,
+                    repetition=1,
+                    attempts=canary_attempts,
+                )
+                if variant_id != canary.variant_id:
+                    manifest["state"] = "canary_failed"
+                    _persist_manifest(
+                        _manifest_path(run_id, storage_root=storage),
+                        manifest,
+                    )
+                    return manifest
+            else:
+                message = "Benchmark canary attempt has an unsupported status."
+                raise ValueError(message)
+        else:
+            canary_submitted = any(
+                record.get("role") == "measure" and record.get("variant_id") == canary.variant_id and record.get("repetitions") == [1]
+                for record in manifest["submission_history"]
+            )
+            if canary_submitted and variant_id != canary.variant_id:
+                manifest["state"] = "canary_failed"
+                _persist_manifest(
+                    _manifest_path(run_id, storage_root=storage),
+                    manifest,
+                )
+                return manifest
+        next_execution: tuple[CoreBenchmarkVariant, int] | None = (canary, 1)
+    else:
+        next_execution = next(
+            (
+                (variant, repetition)
+                for variant, repetition in _measured_sequence(
+                    suite,
+                    variant_id=variant_id,
+                )
+                if repetition in _pending_repetitions(directory, suite, variant)
+            ),
+            None,
+        )
     if next_execution is None:
         remaining = sum(len(_pending_repetitions(directory, suite, variant)) for variant in suite.variants)
         records = _result_records(directory, suite)
-        retry_exhausted = any(
-            record.get("status") == "failed"
+        license_blocked = any(
+            record.get("status") == "pending"
             and isinstance(record.get("temporary_license_retry"), dict)
             and record["temporary_license_retry"].get("retry_budget_remaining") is False
             for record in records
         )
-        manifest["state"] = "retry_exhausted" if retry_exhausted else "complete" if remaining == 0 else "incomplete"
+        manifest["state"] = "license_blocked" if license_blocked else "complete" if remaining == 0 else "incomplete"
         _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
         return manifest
     variant, repetition = next_execution
@@ -1840,6 +2486,9 @@ def submit_core_benchmark(
     *,
     git_commit: str,
     storage_root: Path | str,
+    scratch_root: Path | str,
+    comsol_version_output: str,
+    comsol_executable_path: Path | str,
     variant_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist benchmark intent and submit isolated measured repetitions."""
@@ -1847,6 +2496,9 @@ def submit_core_benchmark(
         path,
         git_commit=git_commit,
         storage_root=storage_root,
+        scratch_root=scratch_root,
+        comsol_version_output=comsol_version_output,
+        comsol_executable_path=comsol_executable_path,
         variant_id=variant_id,
     )
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
@@ -1867,6 +2519,9 @@ def submit_core_benchmark(
                 storage=storage,
                 variant_id=variant_id,
             )
+        if variant_id is not None:
+            message = f"Explicit benchmark --variant retry requires an existing standalone run; no manifest exists for {run_id}."
+            raise FileNotFoundError(message)
         suite = load_core_benchmark_suite(path, require_executable=True)
         manifest = {
             "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
@@ -1876,10 +2531,12 @@ def submit_core_benchmark(
             "suite_digest": suite.suite_digest,
             "suite_config": _repository_relative(suite.source_path),
             "git_commit": plan["git_commit"],
-            "runtime_smoke": plan["runtime_smoke"],
+            "preflight": plan["preflight"],
             "case": suite.case_selection(),
             "repetitions": suite.repetitions,
             "variants": _variant_records(suite),
+            "canary": plan["canary"],
+            "measurement_order": plan["measurement_order"],
             "resource_contract": suite.resource_contract(),
             "created_at": _utc_now(),
             "state": "submitting",
@@ -2088,6 +2745,8 @@ def run_core_benchmark_repetition(
     success_path = repetition_directory / "success.json"
     lock_path = repetition_directory / "execution.lock"
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
+        attempts = tuple(sorted(repetition_directory.glob("attempt-*.json")))
+        _validate_benchmark_attempt_chain(attempts)
         if success_path.exists():
             existing_success = _load_json(
                 success_path,
@@ -2100,8 +2759,13 @@ def run_core_benchmark_repetition(
                 repetition=repetition,
             )
             return existing_success
-        attempts = tuple(sorted(repetition_directory.glob("attempt-*.json")))
         attempt_number = len(attempts) + 1
+        previous_attempt = _benchmark_previous_attempt_reference(attempts)
+        _, prior_license_wait_seconds, _ = _validated_benchmark_license_retry_history(
+            suite.case_config,
+            attempts,
+            repetition_label=repetition_id,
+        )
         attempt_path = repetition_directory / f"attempt-{attempt_number:04d}.json"
         prepared: preparation_service.PreparedCase | None = None
         total_start = time.monotonic()
@@ -2150,11 +2814,13 @@ def run_core_benchmark_repetition(
                 "repetition": repetition,
                 "repetition_id": repetition_id,
                 "attempt": attempt_number,
+                "previous_attempt": previous_attempt,
                 "git_commit": manifest["git_commit"],
                 "case_input_id": proof["case_input_id"],
                 "simulation_case_id": proof["simulation_case_id"],
                 "scientific_config_digest": proof["scientific_config_digest"],
                 "template_sha256": suite.case_config.template_sha256,
+                "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
                 "cores_per_case": variant.cores_per_case,
                 "resource": {
                     "node": os.environ.get("SLURMD_NODENAME", socket.gethostname()),
@@ -2175,6 +2841,7 @@ def run_core_benchmark_repetition(
                     "export_conversion": float(result.timing["export_conversion_s"]),
                     "hdf5_admission": hdf5_admission_s,
                     "complete_case": time.monotonic() - total_start,
+                    "license_wait_seconds": prior_license_wait_seconds,
                 },
                 "hdf5": {
                     "sha256": common.serialization.file_sha256(result.canonical_case.path),
@@ -2205,7 +2872,7 @@ def run_core_benchmark_repetition(
             failure = {
                 "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
                 "schema_version": BENCHMARK_SCHEMA_VERSION,
-                "status": ("pending" if retry_metadata is not None and retry_metadata["retry_budget_remaining"] else "failed"),
+                "status": ("pending" if retry_metadata is not None else "failed"),
                 "recorded_at": completion_time,
                 "benchmark_run_id": run_id,
                 "suite_digest": suite.suite_digest,
@@ -2214,11 +2881,13 @@ def run_core_benchmark_repetition(
                 "repetition": repetition,
                 "repetition_id": repetition_id,
                 "attempt": attempt_number,
+                "previous_attempt": previous_attempt,
                 "git_commit": manifest["git_commit"],
                 "case_input_id": proof["case_input_id"],
                 "simulation_case_id": proof["simulation_case_id"],
                 "scientific_config_digest": proof["scientific_config_digest"],
                 "template_sha256": suite.case_config.template_sha256,
+                "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
                 "cores_per_case": variant.cores_per_case,
                 "resource": {
                     "node": os.environ.get("SLURMD_NODENAME", socket.gethostname()),
@@ -2236,18 +2905,11 @@ def run_core_benchmark_repetition(
                 "timings_s": {
                     "case_materialization": materialization_s,
                     "complete_case": time.monotonic() - total_start,
+                    "license_wait_seconds": prior_license_wait_seconds,
                 },
                 "error": {
-                    "type": (
-                        "TemporaryLicenseCapacityExhausted"
-                        if retry_metadata is not None and not retry_metadata["retry_budget_remaining"]
-                        else type(error).__name__
-                    ),
-                    "message": (
-                        license_service.EXHAUSTED_REASON
-                        if retry_metadata is not None and not retry_metadata["retry_budget_remaining"]
-                        else str(error)
-                    ),
+                    "type": type(error).__name__,
+                    "message": str(error),
                 },
             }
             if retry_metadata is not None:
@@ -2353,9 +3015,10 @@ def _validate_records_against_proof(
         "simulation_case_id": proof["simulation_case_id"],
         "scientific_config_digest": proof["scientific_config_digest"],
         "template_sha256": proof["template"]["sha256"],
+        "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
     }
     for record in records:
-        if record.get("status") == "pending":
+        if record.get("status") == "pending" and "benchmark_run_id" not in record:
             continue
         if any(record.get(key) != value for key, value in expected.items()):
             message = f"Benchmark result is not bound to the canonical proof: {record.get('repetition_id')!r}."
@@ -2514,6 +3177,12 @@ def summarize_core_benchmark_results(
         if recommendation_pool
         else None
     )
+    canary_variant = suite.canary_variant()
+    canary_record = next(record for record in records if record.get("variant_id") == canary_variant.variant_id and record.get("repetition") == 1)
+    canary_timings = canary_record.get("timings_s")
+    benchmark_canary_seconds = (
+        float(canary_timings["complete_case"]) if canary_record.get("status") == "success" and isinstance(canary_timings, dict) else None
+    )
     current_cores = int(production["current_production_cores_per_case"])
     fastest_cores = None if fastest is None else int(fastest["cores_per_case"])
     best_efficiency_cores = None if best_efficiency is None else int(best_efficiency["cores_per_case"])
@@ -2572,6 +3241,7 @@ def summarize_core_benchmark_results(
         "queue_wait_interpretation": ("observed scheduler conditions only; excluded from solve, core-hour, and recommendation metrics"),
         "production_configuration_modified": False,
         "dataset_membership": "none",
+        "benchmark_canary_seconds": benchmark_canary_seconds,
     }
 
 
@@ -2632,14 +3302,10 @@ def core_benchmark_status(
     success_count = sum(record["status"] == "success" for record in records)
     failure_count = sum(record["status"] == "failed" for record in records)
     pending_count = sum(record["status"] == "pending" for record in records)
-    exhausted_retries = [
-        record
-        for record in records
-        if record.get("status") == "failed"
-        and isinstance(record.get("temporary_license_retry"), dict)
-        and record["temporary_license_retry"].get("retry_budget_remaining") is False
-    ]
-    retryable_failure_count = failure_count - len(exhausted_retries)
+    canary = suite.canary_variant()
+    canary_failed = any(
+        record.get("status") == "failed" and record.get("variant_id") == canary.variant_id and record.get("repetition") == 1 for record in records
+    )
     job_ids = [*manifest["preparation_job_ids"], *manifest["measured_job_ids"]]
     scheduler = (
         _scheduler_evidence(job_ids)
@@ -2659,24 +3325,29 @@ def core_benchmark_status(
     )
     if scheduler["squeue"]["output"]:
         state = "running"
-    elif latest_retry is not None and not license_service.retry_attempt_is_eligible(latest_retry):
-        state = "waiting_retry"
+    elif latest_retry is not None and (
+        not bool(latest_retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(latest_retry)
+    ):
+        state = "license_blocked"
+    elif latest_retry is not None:
+        state = "incomplete"
     elif success_count == len(records):
         state = "complete"
-    elif retryable_failure_count:
+    elif canary_failed:
+        state = "canary_failed"
+    elif failure_count:
         state = "retry_required"
-    elif exhausted_retries and pending_count == 0:
-        state = "retry_exhausted"
     elif query_scheduler and manifest["submission_history"] and _latest_submission_result_state(manifest, suite, directory) == "pending":
+        terminal_without_result = _latest_job_is_terminal_without_result(
+            manifest,
+            suite,
+            directory,
+            scheduler,
+        )
+        latest = manifest["submission_history"][-1]
+        latest_is_canary = latest.get("role") == "measure" and latest.get("variant_id") == canary.variant_id and latest.get("repetitions") == [1]
         state = (
-            "retry_required"
-            if _latest_job_is_terminal_without_result(
-                manifest,
-                suite,
-                directory,
-                scheduler,
-            )
-            else "scheduler_unknown"
+            "canary_failed" if terminal_without_result and latest_is_canary else "retry_required" if terminal_without_result else "scheduler_unknown"
         )
     else:
         state = "incomplete"
@@ -2688,7 +3359,7 @@ def core_benchmark_status(
             "evidence_status": "failed",
         }
         for record in records
-        if record["status"] == "failed" and record not in exhausted_retries
+        if record["status"] == "failed"
     ]
     if state == "retry_required" and not retry_repetitions:
         latest = manifest["submission_history"][-1]
@@ -2713,9 +3384,20 @@ def core_benchmark_status(
         "total_repetitions": len(records),
         "retry_repetitions": retry_repetitions,
         "scheduler": scheduler,
+        "canary": {
+            "variant_id": canary.variant_id,
+            "cores_per_case": canary.cores_per_case,
+            "repetition": 1,
+            "validated": any(
+                record.get("status") == "success" and record.get("variant_id") == canary.variant_id and record.get("repetition") == 1
+                for record in records
+            ),
+        },
         "suggested_next_command": (
             f"finalize-core-benchmark {run_id}"
-            if state in {"complete", "retry_exhausted"}
+            if state == "complete"
+            else f"resume-core-benchmark {run_id} --variant {canary.variant_id}"
+            if state == "canary_failed"
             else f"resume-core-benchmark {run_id}"
             if state in {"retry_required", "incomplete"}
             else f"core-benchmark-status {run_id}"
@@ -2909,7 +3591,7 @@ def _validate_summary_identity(
         "template_sha256": suite.case_config.template_sha256,
         "case_input_id": proof["case_input_id"],
         "simulation_case_id": proof["simulation_case_id"],
-        "runtime_smoke": manifest["runtime_smoke"],
+        "preflight": manifest["preflight"],
         "result_set_digest": common.serialization.canonical_json_sha256(records),
     }
     if any(summary.get(key) != value for key, value in expected_identity.items()):
@@ -3042,7 +3724,7 @@ def finalize_core_benchmark(
             "template_sha256": suite.case_config.template_sha256,
             "case_input_id": proof["case_input_id"],
             "simulation_case_id": proof["simulation_case_id"],
-            "runtime_smoke": manifest["runtime_smoke"],
+            "preflight": manifest["preflight"],
             "scheduler_accounting": scheduler["sacct"],
             "result_set_digest": result_set_digest,
             "generated_at": _utc_now(),
@@ -3242,10 +3924,19 @@ def publish_transferred_core_benchmark(
         raise ValueError(message)
     staging = workspace_service.validate_transfer_staging(staging_root, run_id=run_id)
     destination = workspace_service.resolve_storage_root(destination_root, create=True)
-    staged_validation = validate_core_benchmark(run_id, storage_root=staging)
+    incoming_root = (destination / ".incoming").resolve()
+    if not staging.is_relative_to(incoming_root) or staging.stat().st_dev != destination.stat().st_dev:
+        message = "Benchmark staging must be below destination .incoming on the destination filesystem."
+        raise ValueError(message)
     source = core_benchmark_directory(run_id, storage_root=staging)
     target = core_benchmark_directory(run_id, storage_root=destination)
-    inventory = staged_validation["inventory"]
+    if source.is_dir() and not source.is_symlink():
+        inventory = validate_core_benchmark(run_id, storage_root=staging)["inventory"]
+    elif target.is_dir() and not target.is_symlink():
+        inventory = validate_core_benchmark(run_id, storage_root=destination)["inventory"]
+    else:
+        message = f"Benchmark incoming and final publications are both missing: {run_id}"
+        raise FileNotFoundError(message)
     _validate_expected_transfer_inventory(
         inventory,
         expected_sha256=expected_inventory_sha256,
@@ -3260,35 +3951,15 @@ def publish_transferred_core_benchmark(
         if target_inventory != inventory:
             message = f"Existing benchmark publication conflicts: {target}"
             raise FileExistsError(message)
+        if source.exists() and _directory_inventory(source) != inventory:
+            message = f"Incoming benchmark publication conflicts: {source}"
+            raise RuntimeError(message)
     else:
-        publication_root = common.paths.get_generation_state_root(storage_root=destination) / "benchmark-transfer-publication"
-        publication = workspace_service.create_publication_staging(
-            storage_root=destination,
-            publication_root=publication_root,
-            run_id=run_id,
-            case_id="benchmark-transfer",
-        )
-        payload = publication / "payload"
-        try:
-            shutil.copytree(source, payload)
-            copied = _directory_inventory(
-                payload,
-                ignored_names=frozenset({"transfer_complete.json"}),
-            )
-            if copied != inventory:
-                message = "Benchmark transfer copy changed the staged inventory."
-                raise RuntimeError(message)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            payload.replace(target)
-        finally:
-            workspace_service.cleanup_publication_staging(
-                publication,
-                storage_root=destination,
-                publication_root=publication_root,
-                run_id=run_id,
-                case_id="benchmark-transfer",
-                allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
-            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+        if _directory_inventory(target) != inventory:
+            message = "Benchmark inventory changed during atomic incoming publication."
+            raise RuntimeError(message)
     validate_core_benchmark(run_id, storage_root=destination)
     receipt_path = target / "transfer_complete.json"
     if receipt_path.exists():

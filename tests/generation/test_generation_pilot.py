@@ -753,6 +753,118 @@ def test_staging_cleanup_writes_pending_transaction_before_deletion(
     assert not staging.exists()
 
 
+def test_staging_cleanup_accounts_for_residual_after_atomic_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep received-byte provenance while reclaiming only live staging bytes."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_atomic_publication"
+    staging = workspace_service.create_transfer_staging(storage_root=storage, run_id=run_id)
+    staging_campaign = campaign_evidence.campaign_run_directory(run_id, storage_root=staging)
+    staging_campaign.mkdir(parents=True)
+    (staging_campaign / "campaign_terminal.json").write_bytes(b"terminal evidence" + bytes([10]))
+    inventory = pilot_service.record_transfer_staging_inventory(
+        run_id,
+        staging_root=staging,
+    )
+
+    destination_campaign = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
+    destination_campaign.parent.mkdir(parents=True, exist_ok=True)
+    staging_campaign.replace(destination_campaign)
+    residual_files = [path for path in staging.rglob("*") if path.is_file()]
+    residual_bytes = sum(path.stat().st_size for path in residual_files)
+    assert residual_bytes < inventory["transfer_staging_bytes_before_cleanup"]
+    assert (
+        pilot_service.validate_transfer_staging_inventory(
+            run_id,
+            storage_root=storage,
+            require_staging_present=True,
+        )
+        == inventory
+    )
+
+    check_directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    check_directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(
+        check_directory / pilot_service.PILOT_PRE_CLEANUP_FILENAME,
+        {"bound": True},
+    )
+    monkeypatch.setattr(pilot_service, "validate_pilot_pre_cleanup", lambda *args, **kwargs: {"bound": True})
+
+    receipt = pilot_service.cleanup_recorded_transfer_staging(
+        run_id,
+        storage_root=storage,
+        confirm=True,
+    )
+
+    assert receipt["status"] == "complete"
+    assert receipt["expected_bytes"] == residual_bytes
+    assert receipt["expected_file_count"] == len(residual_files)
+    assert receipt["reclaimed_bytes"] == residual_bytes
+    assert not staging.exists()
+    assert (destination_campaign / pilot_service.PILOT_STAGING_INVENTORY_FILENAME).is_file()
+
+
+def test_cleanup_finalization_uses_live_staging_cleanup_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind final cleanup bytes to residual intent, not received provenance."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_residual_finalization"
+    check_directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    check_directory.mkdir(parents=True)
+    common.serialization.atomic_write_json(
+        pilot_service.pilot_receipt_path(run_id, storage_root=storage),
+        {
+            "transfer_staging_inventory": {
+                "transfer_staging_bytes_before_cleanup": 10_000,
+            },
+            "cleanup": {"cleanup_requested": False},
+        },
+    )
+    cleanup_path = check_directory / pilot_service.PILOT_STAGING_CLEANUP_FILENAME
+    common.serialization.atomic_write_json(
+        cleanup_path,
+        {
+            "expected_bytes": 17,
+            "status": "complete",
+            "removed": True,
+            "reclaimed_bytes": 17,
+        },
+    )
+    cleanup_sha256 = common.serialization.file_sha256(cleanup_path)
+    monkeypatch.setattr(pilot_service, "validate_pilot_pre_cleanup", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        pilot_service,
+        "_write_receipt_and_views",
+        lambda _run_id, receipt, **_kwargs: receipt,
+    )
+
+    receipt = pilot_service.finalize_cleanup_receipt(
+        run_id,
+        storage_root=storage,
+        workflow_evidence=pilot_service.CleanupWorkflowEvidence(
+            campaign_run_id=run_id,
+            status="skipped_by_request",
+            receipt_sha256=None,
+            reclaimed_bytes=0,
+        ),
+        cpu_source_removed=False,
+        cpu_bytes_reclaimed=0,
+        cpu_cleanup_receipt_sha256=None,
+        transfer_staging_removed=True,
+        staging_bytes_reclaimed=17,
+        staging_cleanup_receipt_sha256=cleanup_sha256,
+    )
+
+    assert receipt["cleanup"]["transfer_staging"]["bytes_reclaimed"] == 17
+    assert receipt["transfer_staging_inventory"]["transfer_staging_bytes_before_cleanup"] == 10_000
+
+
 def test_missing_retained_evidence_blocks_pre_cleanup(tmp_path: Path) -> None:
     """Protect fail-closed cleanup authorization when GPU evidence is missing."""
     storage = tmp_path / "storage"

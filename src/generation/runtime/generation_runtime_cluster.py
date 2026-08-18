@@ -234,6 +234,7 @@ def build_campaign_case_slurm_submission_command(
     run_id: str,
     scheduler_log_directory: Path,
     scheduler_job_name: str,
+    attempt_index: int,
 ) -> list[str]:
     """Build one ordinary non-exclusive Slurm job for one exact campaign case."""
     if campaign.execution_values["cluster"]["scheduler_kind"] != "slurm":
@@ -263,6 +264,9 @@ def build_campaign_case_slurm_submission_command(
     if len(job_name) > _MAX_SCHEDULER_JOB_NAME_LENGTH:
         message = "scheduler_job_name must contain at most 48 characters."
         raise ValueError(message)
+    if isinstance(attempt_index, bool) or not isinstance(attempt_index, int) or attempt_index < 1:
+        message = "Campaign Slurm attempt_index must be a positive integer."
+        raise ValueError(message)
     cluster = campaign.execution_values["cluster"]
     cores_per_case = int(cluster["cores_per_case"])
     site = campaign.execution_values["site"]
@@ -271,6 +275,7 @@ def build_campaign_case_slurm_submission_command(
         f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
         f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
         f"GENERATION_COMSOL_EXECUTABLE={site['comsol_executable']}",
+        f"GENERATION_ATTEMPT_INDEX={attempt_index}",
     ]
     worker_command = [
         str(launcher),

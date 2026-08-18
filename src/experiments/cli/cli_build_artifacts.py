@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             runs_root = common.paths.resolve_runs_root(task)
         if runs_root is None and args.run_dirs is None:
             parser.error("exactly one of --task, --runs-root, or --run-dir is required")
-        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_dataset_payload_root()
+        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_dataset_packages_root()
         metadata_root = args.metadata_root if args.metadata_root is not None else common.paths.get_dataset_metadata_root()
         if args.run_dirs is not None and args.run_names is not None:
             parser.error("--run-name selects storage aliases below --task/--runs-root and cannot accompany --run-dir")

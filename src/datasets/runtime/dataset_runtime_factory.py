@@ -125,7 +125,7 @@ class LoaderSettings:
 
 def _payload_path(manifest: Mapping[str, Any], *, storage_root: Path | str | None) -> Path:
     """Resolve a manifest-bound payload under the dataset lifecycle root."""
-    return common.paths.get_dataset_payload_root(storage_root=storage_root) / str(manifest["dataset_id"]) / str(manifest["payload_filename"])
+    return common.paths.get_dataset_packages_root(storage_root=storage_root) / str(manifest["dataset_id"]) / str(manifest["payload_filename"])
 
 
 def _select_transient(

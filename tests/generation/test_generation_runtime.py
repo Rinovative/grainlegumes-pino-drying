@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+import h5py
 import numpy as np
 import pytest
 
@@ -43,12 +44,14 @@ def test_processed_publication_layout_rejects_extra_declared_artifact(
     for name in {"_SUCCESS", "provenance.json", *required}:
         (directory / name).write_text("evidence\n", encoding="utf-8")
     (exports / "fields.csv").write_text("export\n", encoding="utf-8")
-    artifact_names = {*required, "comsol_exports/fields.csv"}
+    (directory / "solved.mph").write_bytes(b"model")
+    artifact_names = {*required, "comsol_exports/fields.csv", "solved.mph"}
 
     runtime_service._require_processed_publication_layout(
         directory,
         artifact_names=artifact_names,
         required=required,
+        retention_policy="full",
     )
     (directory / "unexpected.bin").write_bytes(b"unexpected")
     artifact_names.add("unexpected.bin")
@@ -57,6 +60,7 @@ def test_processed_publication_layout_rejects_extra_declared_artifact(
             directory,
             artifact_names=artifact_names,
             required=required,
+            retention_policy="full",
         )
 
 
@@ -860,6 +864,7 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Use solved.mph for stop control while keeping compact publication bounded."""
     config_path, _template = generation_config_factory(
@@ -889,6 +894,18 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         storage_root=storage,
     )
     assert not (outcome.processed_directory / "solved.mph").exists()
+    assert not (outcome.processed_directory / "comsol_exports").exists()
+    assert not tuple(outcome.processed_directory.rglob("*.csv"))
+    assert {path.name for path in outcome.processed_directory.iterdir()} == {
+        "_SUCCESS",
+        "case.h5",
+        "execution_provenance.json",
+        "processing_provenance.json",
+        "provenance.json",
+        "solver.log",
+        "status.json",
+        "timing.json",
+    }
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
     arguments = execution["invocation"]["arguments"]
     assert arguments[:10] == [
@@ -905,10 +922,65 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
     ]
     assert "-nosave" not in arguments
     assert execution["result"]["solved_model"]["canonical_relative_path"] == "solved.mph"
-    assert (outcome.processed_directory / "case.h5").is_file()
+    case_hdf5 = outcome.processed_directory / "case.h5"
+    assert case_hdf5.is_file()
+    with h5py.File(case_hdf5, "r") as handle:
+        source_export_dataset = handle.get("provenance/source_exports_json")
+        assert isinstance(source_export_dataset, h5py.Dataset)
+        raw_source_exports: Any = source_export_dataset[()]
+    source_export_text = raw_source_exports.decode("utf-8") if isinstance(raw_source_exports, bytes) else str(raw_source_exports)
+    source_exports = json.loads(source_export_text)
+    assert source_exports
+    for configured_name, evidence in source_exports.items():
+        assert evidence == {
+            "logical_role": evidence["logical_role"],
+            "configured_relative_name": configured_name,
+            "sha256": evidence["sha256"],
+            "size_bytes": evidence["size_bytes"],
+            "row_count": evidence["row_count"],
+            "column_count": evidence["column_count"],
+            "conversion_status": "converted",
+            "retained": False,
+        }
+        assert evidence["size_bytes"] > 0
+        assert evidence["row_count"] > 0
+        assert evidence["column_count"] > 0
+    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    assert timing["source_export_bytes"] > 0
+    assert timing["solved_model_scratch_bytes"] > 0
+    assert timing["case_hdf5_bytes"] == case_hdf5.stat().st_size
+    assert timing["persistent_case_bytes"] > 0
+    assert timing["direct_exports_retained_bytes"] == 0
+    assert timing["solved_model_retained_bytes"] == 0
+    assert timing["recovery_payload_bytes"] == 0
+    assert timing["scratch_peak_bytes"] >= timing["source_export_bytes"]
     processing = json.loads((outcome.processed_directory / "processing_provenance.json").read_text(encoding="utf-8"))
     assert processing["mode"] == "initial"
     assert processing["solver_git_commit"] == processing["processing_git_commit"]
+
+    hashed_paths: list[Path] = []
+    original_file_sha256 = common.serialization.file_sha256
+
+    def record_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return original_file_sha256(path)
+
+    monkeypatch.setattr(common.serialization, "file_sha256", record_hash)
+    generation.runtime.validate_completed_case(
+        config,
+        1,
+        storage_root=storage,
+        validation_depth="routine",
+    )
+    assert case_hdf5 not in hashed_paths
+    hashed_paths.clear()
+    generation.runtime.validate_completed_case(
+        config,
+        1,
+        storage_root=storage,
+        validation_depth="deep",
+    )
+    assert case_hdf5 in hashed_paths
 
 
 @pytest.mark.integration

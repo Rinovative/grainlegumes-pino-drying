@@ -14,12 +14,69 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_dataset_packages_root_is_canonical_and_preserves_logical_id(tmp_path: Path) -> None:
+    """Relocating the lifecycle root must not alter one logical Dataset ID."""
+    dataset_id = "steady_flow__lentil__id"
+    first_root = common.paths.get_dataset_packages_root(storage_root=tmp_path / "first")
+    second_root = common.paths.get_dataset_packages_root(storage_root=tmp_path / "second")
+
+    first_path = common.paths.resolve_dataset_path(dataset_id, dataset_root=first_root)
+    second_path = common.paths.resolve_dataset_path(dataset_id, dataset_root=second_root)
+
+    assert first_root == tmp_path / "first/02_datasets/packages"
+    assert second_root == tmp_path / "second/02_datasets/packages"
+    assert first_path.relative_to(first_root) == second_path.relative_to(second_root)
+    assert first_path.parent.name == second_path.parent.name == dataset_id
 
 
+def test_populated_legacy_dataset_root_requires_explicit_move(tmp_path: Path) -> None:
+    """Never read or migrate a populated legacy Dataset root implicitly."""
+    legacy = tmp_path / "02_datasets/raw"
+    legacy.mkdir(parents=True)
+    (legacy / "existing-package").mkdir()
+
+    with pytest.raises(RuntimeError) as caught:
+        common.paths.get_dataset_packages_root(storage_root=tmp_path)
+
+    expected = (
+        "Legacy dataset packages require a one-time explicit move:\n"
+        'mv -- "$STORAGE_ROOT/02_datasets/raw" \\\n'
+        '       "$STORAGE_ROOT/02_datasets/packages"'
+    )
+    assert str(caught.value) == expected
 
 
+def test_populated_legacy_and_current_dataset_roots_fail_closed(tmp_path: Path) -> None:
+    """Never merge or silently select between two populated Dataset roots."""
+    legacy = tmp_path / "02_datasets/raw"
+    current = tmp_path / "02_datasets/packages"
+    legacy.mkdir(parents=True)
+    current.mkdir(parents=True)
+    (legacy / "legacy-package").mkdir()
+    (current / "current-package").mkdir()
+
+    with pytest.raises(RuntimeError, match="Both legacy and current dataset roots contain data"):
+        common.paths.get_dataset_packages_root(storage_root=tmp_path)
 
 
+def test_empty_legacy_dataset_root_is_ignored_narrowly(tmp_path: Path) -> None:
+    """An empty ordinary legacy directory does not become a second root."""
+    legacy = tmp_path / "02_datasets/raw"
+    legacy.mkdir(parents=True)
+
+    assert common.paths.get_dataset_packages_root(storage_root=tmp_path) == tmp_path / "02_datasets/packages"
+
+
+def test_unsafe_legacy_dataset_root_is_rejected(tmp_path: Path) -> None:
+    """A legacy symlink cannot bypass lifecycle-root detection."""
+    target = tmp_path / "legacy-target"
+    target.mkdir()
+    legacy = tmp_path / "02_datasets/raw"
+    legacy.parent.mkdir(parents=True)
+    legacy.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="legacy dataset raw root is not a safe directory"):
+        common.paths.get_dataset_packages_root(storage_root=tmp_path)
 
 
 def test_output_override_cannot_relocate_dataset_inputs(
@@ -56,7 +113,7 @@ def test_output_override_cannot_relocate_dataset_inputs(
 
     assert dataset_before == dataset_after
     assert run_before != run_after
-    assert dataset_after.is_relative_to(storage_root / "02_datasets/raw")
+    assert dataset_after.is_relative_to(storage_root / "02_datasets/packages")
     assert run_after.is_relative_to(second_output_root)
 
 

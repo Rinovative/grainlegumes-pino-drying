@@ -484,7 +484,7 @@ def load_inference_context_with_resolution(
     device = device_resolution.device
     run_dir = Path(run_dir)
     requested_dataset_paths = _normalize_dataset_paths(dataset_path)
-    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_payload_root()
+    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_packages_root()
     evaluable_run = experiments.run.validate_evaluable_run(run_dir)
 
     cfg = evaluable_run["config"]

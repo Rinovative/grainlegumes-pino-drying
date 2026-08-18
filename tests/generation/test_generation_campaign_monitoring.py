@@ -173,7 +173,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "successful",
         "active",
         "failed",
-        "retry_eligible",
+        "license_blocked",
         "pending",
         "never_started",
     ]
@@ -325,6 +325,29 @@ def test_human_summary_shows_two_cases_and_bounds_only_automatic_inventory() -> 
     assert "case_0001" in bounded
     assert "case_0002" not in bounded
     assert "1 additional active case(s) omitted" in bounded
+
+
+def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
+    """Render temporary licence capacity as an operational blocked section."""
+    status = {
+        "campaign_run_id": "transient_campaign__0123456789abcdef",
+        "campaign_state": "license_blocked",
+        "cases": [
+            {
+                "batch_name": "transient_drying__lentil__natural",
+                "case_id": "case_0001",
+                "state": "license_blocked",
+                "reason": "temporary_license_capacity",
+            }
+        ],
+    }
+
+    rendered = status_service.format_campaign_status_summary(status)
+
+    assert "License-blocked cases:" in rendered
+    assert "state=license_blocked" in rendered
+    assert "Failed cases:" not in rendered
+    assert "0 failed" in rendered
 
 
 def test_monitor_signatures_separate_phase_changes_from_rate_limited_advancement() -> None:
