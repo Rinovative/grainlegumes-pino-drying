@@ -177,6 +177,20 @@ Scientific startup and schedule semantics are owned by the
 
 ## Operational stages
 
+Each attempt records five separate stages: solver, exports, conversion,
+diagnostics, and publication. Solver success does not imply that later stages
+succeeded. Structural validity, identities, required files, array shapes, finite
+required values, ordering, hashes, path containment, and atomic publication are
+blocking and fail closed. Finite scientific plausibility observations are
+advisory: they remain visible as complete quality-flag records but do not turn
+an otherwise valid processed publication into a failure.
+
+A configured target event may end a transient solve before the next regular
+output time. The accepted event state is a valid irregular final state when the
+time axis remains strictly increasing and the final status is consistent with
+the stop condition. This does not change the current ramp-disabled scientific
+configuration.
+
 ### Technical Smoke
 
 <code>smoke</code> runs maintained steady and transient technical cases with real
@@ -200,19 +214,30 @@ configuration. Retry one failed variant with
 materials and retains a diagnostic receipt. Accepted work follows the configured
 gated cleanup policy; incomplete or invalid evidence is not cleanup-eligible.
 
-### Production and license retry
+### Production, attempt budget, and feeder breaker
 
-Production uses one ordinary non-exclusive Slurm job per case. Configuration
-owns resources, queue feeding, timeout, failure budget, and retention. Temporary
-license-capacity exhaustion uses bounded retry/backoff for the same deterministic
-case without holding a compute allocation during backoff. A campaign in
-<code>waiting_retry</code> remains nonterminal: the foreground workflow keeps
-polling, submits the eligible retry through normal reconciliation, and records no
-workflow failure merely because it observed the wait state.
+Production uses one ordinary non-exclusive Slurm job per case. The total
+controlled attempt budget is 3600 seconds: ordinary compute ends at 3300 seconds,
+leaving a 300-second graceful-stop reserve inside that same hour. Slurm requests
+<code>01:05:00</code> only to allow worker publication and cleanup around the
+one-hour attempt. The COMSOL stop owner writes exactly <code>Stop 2\n</code>
+once to the status file, requests <code>Cancel</code>, and force-escalates only
+when the solver does not leave within the reserve.
 
-The foreground <code>all</code> or <code>resume</code> process feeds and
-reconciles the campaign. Already submitted Slurm jobs continue if that
-foreground process disconnects.
+<code>maximum_failed_cases</code> is the sole feeder circuit breaker. A value
+<code>N</code> permits up to <code>N</code> distinct unresolved
+<code>failed</code> or <code>timed_out</code> cases and stops feeding new,
+never-started work at <code>N + 1</code>. Already active or pending jobs remain
+active and monitored. Export, conversion, publication, cancellation,
+interruption, license retry, warning, and quality-flag states do not count. The
+maintained value is <code>0</code>.
+
+Temporary license-capacity exhaustion uses bounded retry/backoff for the same
+deterministic case without holding a compute allocation during backoff. A
+campaign in <code>waiting_retry</code> remains nonterminal. There are no automatic
+reserve cases and no automatic rerun of scientific solver failures. The
+foreground <code>all</code> or <code>resume</code> process reconciles the campaign;
+already submitted Slurm jobs continue if that process or terminal disconnects.
 
 ## Monitor campaigns
 
@@ -233,10 +258,16 @@ Useful durable locations are:
   <code>scheduler_log_directory</code>;
 - successful combined solver log:
   <code>01_generation/processed/&lt;batch_storage_name&gt;/&lt;case_id&gt;/solver.log</code>;
-- retained failed-case log:
-  <code>01_generation/meta/&lt;batch_storage_name&gt;/failures/&lt;case_id&gt;/artifacts/runtime/solver.log</code>;
-- failure inventory and bounded tail: the failed case's
-  <code>failure.json</code>.
+- immutable unsuccessful attempt evidence:
+  <code>01_generation/attempts/&lt;batch_storage_name&gt;/&lt;case_id&gt;/&lt;campaign_run_id&gt;/attempt_0001/</code>;
+- authoritative attempt identity, stage states, retention inventory, hashes,
+  metrics, and quality flags: that directory's <code>attempt.json</code>;
+- successful postprocessing replay and recovery-payload cleanup audit:
+  <code>replay.json</code>.
+
+Later attempts use <code>attempt_0002</code>, <code>attempt_0003</code>, and so
+on. Earlier attempts are immutable, and attempt directories never contain
+<code>_SUCCESS</code>.
 
 Use <code>campaign-status --format json</code> for the complete machine-readable
 case inventory.
@@ -245,46 +276,90 @@ case inventory.
 
 <code>readiness-report</code> is the launch-state authority. Production is ready
 only when resolved campaigns, static checks, and current profile-specific
-Technical-Smoke evidence pass.
+Technical-Smoke evidence pass. All campaign-lifecycle receipts introduced by
+this workflow use schema version <code>1</code> and are admitted against their
+exact schema and identities.
 
-Technical Smoke retains diagnostic evidence. Accepted Pilot and Production
-work follows the configured gated cleanup policy; incomplete or invalid evidence
-remains ineligible for cleanup. <code>01_generation</code> is the canonical
-simulation archive, while <code>02_datasets</code> contains immutable learning
-packages. Dataset publication never removes canonical Generation source.
+Technical Smoke and Pilot retain full unsuccessful-attempt bundles. Production
+retains compact logs, timings, provenance, metrics, and hashes while deliberately
+omitting unrelated large model and export files. Conversion failures retain the
+required exports temporarily; publication failures also retain the converted
+payload and publication evidence. A successful replay verifies processed
+publication, removes only the declared large temporary recovery payload, and
+keeps the small attempt and replay audit.
 
-## Resume, cancel, collect, and cleanup
+Collection transfers the exact campaign-scoped attempt directories and their
+hashes along with raw, processed, batch metadata, and campaign metadata. It does
+not copy another campaign's attempt tree. The ordinary authorized CPU cleanup
+removes only its enumerated raw, processed, and batch-metadata source directories;
+canonical attempt directories remain protected.
 
-Resume reuses valid successful cases and never duplicates active or pending
-attempts. Accounting uncertainty fails closed.
+<code>01_generation</code> is the canonical simulation archive, while
+<code>02_datasets</code> contains immutable learning packages. Attempts are
+excluded from processed membership, batch success, Dataset identity, training
+readiness, and completed-output EDA. Processed status and attempt evidence retain
+stable batch, case, input-generation, case-input, simulation, campaign, source
+commit, and attempt keys for later outcome EDA; this workflow does not perform
+outcome-driven parameter analysis or automatic retuning.
+
+## Resume, retry, cancel, collect, and cleanup
+
+Resume reuses successful processed publications, submits permitted
+never-started work, and restarts cancelled or interrupted cases from time zero.
+It replays conversion or publication without COMSOL when the exact retained
+payload is valid. It does not silently rerun <code>failed</code>,
+<code>timed_out</code>, or <code>exports_failed</code> solver work. If no automatic
+action remains, it prints the explicit <code>retry-case</code> recovery guidance.
 
 ~~~bash
 ./scripts/generation_workflow.sh status "$GENERATION_RUN_ID"
 ./scripts/generation_workflow.sh resume "$GENERATION_RUN_ID"
+./scripts/generation_workflow.sh retry-case \
+  "$GENERATION_RUN_ID" "<batch_name>" "<case_id>"
 ~~~
 
-Cancel every persisted active attempt explicitly:
+<code>retry-case</code> accepts only one eligible unresolved case, requires the
+original solver commit, template, science, canonical input generation, and case
+identities, and allocates a new immutable attempt. There is no
+<code>retry-all</code>. A terminal <code>completed_with_failures</code> campaign
+blocks terminal validation, collection, and Dataset publication until every case
+has a valid processed publication.
+
+The first Ctrl+C after campaign launch prints exactly:
+
+~~~text
+Graceful campaign cancellation requested.
+Press Ctrl+C again to force cancellation.
+~~~
+
+It persists <code>cancel_requested</code>, cancels pending jobs, signals running
+workers through the controlled-stop path, keeps rendering status, and waits for
+their durable terminal evidence. A second Ctrl+C invokes force cancellation and
+stops waiting. Before a run ID exists, no cancellation trap or receipt exists.
+The public commands use those same Python-owned paths:
 
 ~~~bash
 ./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID"
+./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID" --force
 ~~~
 
-Transfer and publish terminal Generation evidence:
+Transfer and publish a successful terminal campaign, then build requested
+Datasets:
 
 ~~~bash
 ./scripts/generation_workflow.sh collect "$GENERATION_RUN_ID"
 ./scripts/generation_workflow.sh build-datasets "$GENERATION_RUN_ID"
 ~~~
 
-Preview cleanup, review the deletion plan, then confirm:
+Preview cleanup, review the exact cryptographic authorization, then confirm:
 
 ~~~bash
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID"
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
 ~~~
 
-Cleanup is destructive only on the authorized CPU source. Canonical GPU
-Generation and Dataset publications remain intact.
+Cleanup is destructive only for explicitly authorized CPU directories. Canonical
+GPU Generation, attempts, and Dataset publications remain intact.
 
 ## Command reference
 
@@ -301,11 +376,12 @@ All wrapper commands run on bare <code>hpc115</code>.
 | <code>launch CAMPAIGN</code> | Submit the low-level campaign primitive |
 | <code>all CAMPAIGN</code> | Run Production through Dataset receipts and gated cleanup |
 | <code>status [RUN_ID]</code> / <code>accounting RUN_ID</code> | Inspect workflow or scheduler evidence |
-| <code>resume RUN_ID</code> | Reconcile and continue incomplete work |
+| <code>resume RUN_ID</code> | Apply the reuse, restart, and postprocessing-replay matrix |
+| <code>retry-case RUN_ID BATCH CASE</code> | Explicitly rerun one eligible unresolved case |
 | <code>validate RUN_ID</code> | Revalidate terminal CPU evidence |
 | <code>collect RUN_ID</code> | Transfer and publish terminal Generation evidence |
 | <code>build-datasets RUN_ID</code> | Build/reuse requested immutable packages |
-| <code>cancel RUN_ID</code> | Cancel persisted active Slurm attempts |
+| <code>cancel RUN_ID [--force]</code> | Request graceful or force cancellation through the shared owner |
 | <code>cleanup RUN_ID [--confirm]</code> | Preview or execute authorized CPU-source cleanup |
 
 Run <code>./scripts/generation_workflow.sh --help</code> for complete current
@@ -320,6 +396,9 @@ options. Resource and feeder decisions remain configuration-owned.
 - Failed collection retains marked staging and CPU source. Use
   <code>status</code> and <code>resume</code>; never move partial data into
   <code>01_generation</code> manually.
+- <code>completed_with_failures</code> means no automatic resumable case remains.
+  Inspect the failed-case stage and use <code>retry-case</code> only for one
+  deliberately selected eligible case.
 - A benchmark refusal usually indicates missing current smoke evidence, a failed
   repetition, or conflicting successful evidence. Use the printed recovery
   command.

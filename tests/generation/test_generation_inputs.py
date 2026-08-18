@@ -284,7 +284,14 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     common["scientific_fixed_values"]["T_flow_ref"]["value"] = 301.15
     common["scientific_fixed_values"]["p_ref"]["value"] = 100000.0
     common["storage"]["compression_level"] = 6
-    execution["runtime"].update({"timeout_seconds": 4200, "maximum_failures": 3})
+    execution["runtime"].update(
+        {
+            "timeout_seconds": 4200,
+            "graceful_stop_reserve_seconds": 300,
+            "maximum_failed_cases": 3,
+        }
+    )
+    execution["cluster"]["wall_time"] = "01:15:00"
     execution["submission"].update(
         {
             "pending_buffer": 2,
@@ -326,7 +333,9 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
     assert scientific["storage"]["compression_level"] == 6
     assert resolved.execution_values["runtime"]["timeout_seconds"] == 4200.0
-    assert resolved.execution_values["runtime"]["maximum_failures"] == 3
+    assert resolved.execution_values["runtime"]["maximum_failed_cases"] == 3
+    assert resolved.execution_values["runtime"]["graceful_stop_reserve_seconds"] == 300.0
+    assert resolved.execution_values["cluster"]["wall_time"] == "01:15:00"
     assert resolved.execution_values["cluster"]["cores_per_case"] == 8
     assert resolved.execution_values["submission"] == {
         "pending_buffer": 2,

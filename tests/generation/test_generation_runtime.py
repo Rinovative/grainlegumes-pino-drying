@@ -38,6 +38,7 @@ def test_processed_publication_layout_rejects_extra_declared_artifact(
         "timing.json",
         "status.json",
         "execution_provenance.json",
+        "processing_provenance.json",
     }
     for name in {"_SUCCESS", "provenance.json", *required}:
         (directory / name).write_text("evidence\n", encoding="utf-8")
@@ -93,6 +94,7 @@ def _record_synthetic_failure(
     """Record one compact test-owned execution failure."""
     monkeypatch.setenv("GENERATION_GIT_COMMIT", git_commit)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", execution_run_id)
+    _prepare_canonical_inputs(config, storage)
     return generation.runtime.record_case_failure(
         config,
         1,
@@ -105,6 +107,23 @@ def _record_synthetic_failure(
         scratch_cleanup_status="not_created",
         failure_stage="input",
     )
+
+
+def _latest_attempt(
+    config: Any,
+    storage: Path,
+    *,
+    run_id: str | None = None,
+) -> Any:
+    """Return one required latest synthetic attempt."""
+    attempt = generation.publication.attempt.latest_case_attempt(
+        config,
+        1,
+        config.batch_id if run_id is None else run_id,
+        storage_root=storage,
+    )
+    assert attempt is not None
+    return attempt
 
 
 def test_float32_conversion_requires_explicit_tolerance() -> None:
@@ -390,24 +409,14 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     assert shlex.split(capsys.readouterr().out.strip()) == local
 
 
-@pytest.mark.parametrize(
-    ("retain_solved_model", "save_arguments"),
-    [
-        (True, ["-outputfile", "solved.mph"]),
-        (False, ["-nosave"]),
-    ],
-)
-def test_comsol_builder_owns_fixed_job_models_and_save_mode(
+def test_comsol_builder_owns_fixed_job_and_controlled_stop_output(
     generation_config_factory: Any,
     fake_comsol: Path,
-    retain_solved_model: bool,
-    save_arguments: list[str],
 ) -> None:
-    """Protect the fixed job, workspace names, explicit cores, and exclusive save modes."""
+    """Bind every run to solved.mph so its documented status path is fixed."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
-        retain_solved_model=retain_solved_model,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
@@ -423,13 +432,11 @@ def test_comsol_builder_owns_fixed_job_models_and_save_mode(
         "model.mph",
         "-job",
         "b1",
-        *save_arguments,
+        "-outputfile",
+        "solved.mph",
         "-np",
         "16",
     ]
-    assert command.count("-job") == 1
-    assert command.count("-np") == 1
-    assert ("-nosave" in command) != ("-outputfile" in command)
 
 
 def test_comsol_builder_rejects_invalid_retention_state(
@@ -445,10 +452,10 @@ def test_comsol_builder_rejects_invalid_retention_state(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
-    execution = {**config.execution_values, "retention": {"retain_raw_csv": False, "retain_solved_model": None}}
+    execution = {**config.execution_values, "retention_policy": None}
     invalid = replace(config, execution_values=execution)
 
-    with pytest.raises(TypeError, match="retain_solved_model must be boolean"):
+    with pytest.raises(TypeError, match="retention_policy must be resolved"):
         comsol_service.build_comsol_command(invalid, cores_per_case=16)
 
 
@@ -565,6 +572,7 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
         only_batch=_natural_batch_name("transient_drying"),
     )
     storage = tmp_path / "storage"
+    _prepare_canonical_inputs(config, storage)
 
     def reject_preparation(*_args: Any, **_kwargs: Any) -> None:
         message = "synthetic preparation failure"
@@ -581,54 +589,57 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
         )
 
     assert generation.runtime.case_failure_is_recorded(config, 1, storage_root=storage)
-    failure = json.loads(generation.runtime.case_failure_path(config, 1, storage_root=storage).read_text(encoding="utf-8"))
-    assert failure["error"]["type"] == "OSError"
-    assert failure["work_directory"] is None
+    attempt = generation.publication.attempt.latest_case_attempt(
+        config,
+        1,
+        config.batch_id,
+        storage_root=storage,
+    )
+    assert attempt is not None
+    assert attempt.payload["case_state"] == "failed"
+    assert attempt.payload["failure_stage"] == "input"
+    assert "synthetic preparation failure" in attempt.payload["reason"]
+    cleanup = json.loads((attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
+    assert cleanup["status"] == "not_created"
 
 
-@pytest.mark.parametrize(
-    ("identity_key", "stale_value"),
-    [
-        ("git_commit", "b" * 40),
-        ("execution_run_id", "prior-campaign__0123456789abcdef"),
-        ("template_sha256", "d" * 64),
-        ("scientific_config_digest", "e" * 64),
-    ],
-)
-def test_failure_receipt_with_different_execution_identity_is_stale(
+def test_attempt_from_another_campaign_is_not_current(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    identity_key: str,
-    stale_value: str,
 ) -> None:
-    """Treat a well-formed receipt from another execution as non-current."""
+    """Scope append-only attempt evidence to its exact campaign run."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow")
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
-    storage = tmp_path / "stale identity storage"
-    current_commit = "a" * 40
+    storage = tmp_path / "campaign-scoped attempt storage"
+    old_run_id = "old-campaign__0123456789abcdef"
     current_run_id = "current-campaign__0123456789abcdef"
-    path = _record_synthetic_failure(
+    _record_synthetic_failure(
         config,
         storage,
         monkeypatch,
-        git_commit=current_commit,
-        execution_run_id=current_run_id,
+        git_commit="a" * 40,
+        execution_run_id=old_run_id,
     )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload[identity_key] = stale_value
-    common.serialization.atomic_write_json(path, payload)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
 
     assert not generation.runtime.case_failure_is_recorded(
         config,
         1,
         storage_root=storage,
         execution_run_id=current_run_id,
-        git_commit=current_commit,
+        git_commit="a" * 40,
     )
+    old_attempt = generation.publication.attempt.latest_case_attempt(
+        config,
+        1,
+        old_run_id,
+        storage_root=storage,
+    )
+    assert old_attempt is not None
 
 
 def test_malformed_or_symlinked_failure_receipt_fails_closed(
@@ -675,13 +686,13 @@ def test_malformed_or_symlinked_failure_receipt_fails_closed(
 
 
 @pytest.mark.integration
-def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
+def test_attempt_history_is_append_only_across_failure_and_success(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Allow a new attempt to replace or clear one obsolete diagnostic."""
+    """Preserve old campaign attempts after a newer failure or successful run."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
@@ -690,20 +701,19 @@ def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
-    old_commit = "b" * 40
     old_run_id = "old-campaign__0123456789abcdef"
-    current_commit = "a" * 40
     current_run_id = "current-campaign__0123456789abcdef"
+    commit = "a" * 40
 
-    failed_storage = tmp_path / "new failure storage"
-    path = _record_synthetic_failure(
+    failed_storage = tmp_path / "append-only failure storage"
+    old_path = _record_synthetic_failure(
         config,
         failed_storage,
         monkeypatch,
-        git_commit=old_commit,
+        git_commit=commit,
         execution_run_id=old_run_id,
     )
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
+    old_bytes = old_path.read_bytes()
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
     with monkeypatch.context() as scoped:
 
@@ -724,26 +734,26 @@ def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
                 storage_root=failed_storage,
                 work_root=tmp_path / "new failure work",
             )
-    replacement = json.loads(path.read_text(encoding="utf-8"))
-    assert replacement["git_commit"] == current_commit
-    assert replacement["execution_run_id"] == current_run_id
-    assert generation.runtime.case_failure_is_recorded(
+    assert old_path.read_bytes() == old_bytes
+    current_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
+        current_run_id,
         storage_root=failed_storage,
     )
+    assert current_attempt is not None
+    assert current_attempt.payload["case_state"] == "failed"
 
-    success_storage = tmp_path / "recovery storage"
+    success_storage = tmp_path / "append-only recovery storage"
     success_path = _record_synthetic_failure(
         config,
         success_storage,
         monkeypatch,
-        git_commit=old_commit,
+        git_commit=commit,
         execution_run_id=old_run_id,
     )
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
+    success_bytes = success_path.read_bytes()
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
-    _prepare_canonical_inputs(config, success_storage)
     outcome = generation.runtime.run_case(
         config,
         1,
@@ -752,16 +762,18 @@ def test_stale_failure_is_replaced_after_failure_and_cleared_after_success(
         work_root=tmp_path / "recovery work",
     )
     assert outcome.status == "completed"
+    assert success_path.read_bytes() == success_bytes
     assert generation.runtime.completed_case_is_valid(
         config,
         1,
         storage_root=success_storage,
     )
-    assert not success_path.exists()
     assert not generation.runtime.case_failure_is_recorded(
         config,
         1,
         storage_root=success_storage,
+        execution_run_id=current_run_id,
+        git_commit=commit,
     )
 
 
@@ -787,20 +799,15 @@ def test_failure_timeout_missing_export_and_case_lock(
     with pytest.raises(generation.runtime.CaseExecutionError) as failed:
         generation.runtime.run_case(config, 1, cores_per_case=1, storage_root=storage, work_root=work)
     assert not failed.value.work_directory.exists()
-    failure_record = json.loads(
-        generation.runtime.case_failure_path(
-            config,
-            1,
-            storage_root=storage,
-        ).read_text(encoding="utf-8")
-    )
-    assert failure_record["execution"]["cwd"] == str(failed.value.work_directory)
-    assert failure_record["execution"]["exit_code"] == 7
-    assert failure_record["execution"]["command"]
-    assert failure_record["input_files"]["declared"] == failure_record["input_files"]["observed"]
-    assert failure_record["template_sha256"] == config.template_sha256
-    assert failure_record["scratch_cleanup"]["status"] == "complete"
-    assert failure_record["log_tail"]["source"] == "solver.log"
+    failed_attempt = _latest_attempt(config, storage)
+    assert failed_attempt.payload["case_state"] == "failed"
+    assert failed_attempt.payload["failure_stage"] == "solver"
+    assert failed_attempt.payload["process_exit_code"] == 7
+    assert failed_attempt.payload["template"]["sha256"] == config.template_sha256
+    assert failed_attempt.payload["retention_policy"] == "full"
+    assert "payload/runtime/solver.log" in failed_attempt.payload["retained_inventory"]
+    cleanup = json.loads((failed_attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
+    assert cleanup["status"] == "complete"
 
     monkeypatch.setenv("FAKE_COMSOL_MODE", "timeout")
     with pytest.raises(generation.runtime.CaseExecutionError, match="timeout") as timed_out:
@@ -812,6 +819,9 @@ def test_failure_timeout_missing_export_and_case_lock(
             work_root=tmp_path / "timeout-work",
         )
     assert not timed_out.value.work_directory.exists()
+    timeout_attempt = _latest_attempt(config, tmp_path / "timeout-storage")
+    assert timeout_attempt.payload["case_state"] == "timed_out"
+    assert timeout_attempt.payload["timed_out"] is True
 
     monkeypatch.setenv("FAKE_COMSOL_MODE", "success")
     prepared = runtime_service.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work)
@@ -825,7 +835,12 @@ def test_failure_timeout_missing_export_and_case_lock(
         expected_case_id=prepared.bundle.case_id,
     )
 
-    lock_path = generation.runtime.case_lock_path(config, 1, storage_root=tmp_path / "locked")
+    _prepare_canonical_inputs(config, tmp_path / "locked")
+    lock_path = generation.runtime.case_lock_path(
+        config,
+        1,
+        storage_root=tmp_path / "locked",
+    )
     with common.locking.exclusive_file_lock(lock_path, blocking=False), ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             generation.runtime.run_case,
@@ -841,16 +856,17 @@ def test_failure_timeout_missing_export_and_case_lock(
 
 
 @pytest.mark.integration
-def test_no_save_case_converts_and_publishes_without_solved_model(
+def test_compact_case_uses_solved_output_but_omits_model_from_publication(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
 ) -> None:
-    """Prove production-like success depends on exports and HDF5, not solved.mph."""
+    """Use solved.mph for stop control while keeping compact publication bounded."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
         retain_solved_model=False,
+        retain_raw_csv=False,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
@@ -875,20 +891,24 @@ def test_no_save_case_converts_and_publishes_without_solved_model(
     assert not (outcome.processed_directory / "solved.mph").exists()
     execution = json.loads((outcome.processed_directory / "execution_provenance.json").read_text(encoding="utf-8"))
     arguments = execution["invocation"]["arguments"]
-    assert arguments[:8] == [
+    assert arguments[:10] == [
         str(fake_comsol),
         "batch",
         "-inputfile",
         "model.mph",
         "-job",
         "b1",
-        "-nosave",
+        "-outputfile",
+        "solved.mph",
         "-np",
+        "16",
     ]
-    assert arguments[8] == "16"
-    assert "-outputfile" not in arguments
-    assert execution["result"]["solved_model"] is None
+    assert "-nosave" not in arguments
+    assert execution["result"]["solved_model"]["canonical_relative_path"] == "solved.mph"
     assert (outcome.processed_directory / "case.h5").is_file()
+    processing = json.loads((outcome.processed_directory / "processing_provenance.json").read_text(encoding="utf-8"))
+    assert processing["mode"] == "initial"
+    assert processing["solver_git_commit"] == processing["processing_git_commit"]
 
 
 @pytest.mark.integration
@@ -1109,13 +1129,12 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         raise RuntimeError(message)
 
     def evidence_first_cleanup(*args: Any, **kwargs: Any) -> int:
-        failure_path = generation.runtime.case_failure_path(
-            config,
-            1,
-            storage_root=storage,
+        attempt = _latest_attempt(config, storage)
+        observed["failure_before_cleanup"] = (
+            attempt.payload["case_state"] == "publication_failed"
+            and attempt.payload["failure_stage"] == "publication"
+            and not (attempt.directory / "cleanup.json").exists()
         )
-        failure = json.loads(failure_path.read_text(encoding="utf-8"))
-        observed["failure_before_cleanup"] = failure["scratch_cleanup"]["status"] == "pending"
         return original_cleanup(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -1140,14 +1159,13 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
         "publication_called": True,
         "failure_before_cleanup": True,
     }
-    failure = json.loads(
-        generation.runtime.case_failure_path(
-            config,
-            1,
-            storage_root=storage,
-        ).read_text(encoding="utf-8")
-    )
-    assert failure["scratch_cleanup"]["status"] == "complete"
+    attempt = _latest_attempt(config, storage)
+    assert attempt.payload["case_state"] == "publication_failed"
+    assert attempt.payload["solver_state"] == "succeeded"
+    assert attempt.payload["conversion_state"] == "succeeded"
+    assert attempt.payload["publication_state"] == "failed"
+    cleanup = json.loads((attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
+    assert cleanup["status"] == "complete"
     assert not generation.runtime.completed_case_is_valid(
         config,
         1,
@@ -1162,7 +1180,7 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect cooperative TERM propagation, evidence, cleanup, and rerun state."""
+    """Protect controlled-stop cancellation, attempt evidence, and cleanup."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
@@ -1197,16 +1215,15 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
                 future.result(timeout=10.0)
     finally:
         generation.runtime.reset_runtime_cancellation()
-    failure = json.loads(
-        generation.runtime.case_failure_path(
-            config,
-            1,
-            storage_root=storage,
-        ).read_text(encoding="utf-8")
-    )
-    assert failure["state"] == "cancelled"
-    assert failure["execution"]["exit_code"] is not None
-    assert failure["scratch_cleanup"]["status"] == "complete"
+    attempt = _latest_attempt(config, storage)
+    assert attempt.payload["case_state"] == "cancelled"
+    assert attempt.payload["failure_stage"] == "solver"
+    assert attempt.payload["process_exit_code"] is not None
+    assert (attempt.directory / "payload" / "solved.mph.status").read_text(encoding="utf-8") == "Stop 2\n"
+    stop = json.loads((attempt.directory / "payload/runtime/stop.json").read_text(encoding="utf-8"))
+    assert stop["reason"] == "cancelled"
+    cleanup = json.loads((attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
+    assert cleanup["status"] == "complete"
     assert not generation.runtime.completed_case_is_valid(
         config,
         1,

@@ -174,8 +174,10 @@ def _validate_campaign_run_header(
         "scheduler_unknown",
         "failure_threshold_reached",
         "waiting_retry",
+        "completed_with_failures",
         "complete",
         "cancel_requested",
+        "force_cancel_requested",
     }
     job_ids = manifest.get("slurm_job_ids")
     if (
@@ -212,7 +214,7 @@ def _validate_submission_configuration(
         "poll_interval_seconds",
         "max_running_cases",
         "cores_per_case",
-        "maximum_failures",
+        "maximum_failed_cases",
         "temporary_license_retry",
         "partition",
         "wall_time",
@@ -220,16 +222,15 @@ def _validate_submission_configuration(
     }:
         message = f"Campaign-run submission configuration is malformed: {run_id}."
         raise ValueError(message)
-    for key in (
-        "pending_buffer",
-        "poll_interval_seconds",
-        "cores_per_case",
-        "maximum_failures",
-    ):
+    for key in ("pending_buffer", "poll_interval_seconds", "cores_per_case"):
         value = submission[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."
             raise ValueError(message)
+    maximum_failed_cases = submission["maximum_failed_cases"]
+    if isinstance(maximum_failed_cases, bool) or not isinstance(maximum_failed_cases, int) or maximum_failed_cases < 0:
+        message = f"Campaign-run submission configuration 'maximum_failed_cases' is malformed: {run_id}."
+        raise ValueError(message)
     retry = submission["temporary_license_retry"]
     if (
         not isinstance(retry, dict)
@@ -286,7 +287,7 @@ def _validate_submission_record(
             "error",
         }
         or record.get("submission_index") != index
-        or record.get("mode") not in {"initial", "resume", "license_retry"}
+        or record.get("mode") not in {"initial", "resume", "license_retry", "explicit_retry"}
         or not isinstance(record.get("recorded_at"), str)
         or not isinstance(record.get("case"), dict)
         or set(record["case"]) != {"batch_name", "batch_id", "case_index", "case_id"}
@@ -482,6 +483,7 @@ def transfer_inventory_from_plan(
             batch["meta_directory"],
             batch["raw_directory"],
             batch["processed_directory"],
+            *batch["attempt_directories"],
         )
     ]
     relative_directories.append(plan["campaign_directory"])
@@ -568,6 +570,7 @@ def validate_transfer_receipt(
                 batch["meta_directory"],
                 batch["raw_directory"],
                 batch["processed_directory"],
+                *batch["attempt_directories"],
             )
         ),
     }

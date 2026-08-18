@@ -30,8 +30,26 @@ if TYPE_CHECKING:
 _MONITOR_RECORD_KIND = "campaign-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
-_PENDING_CASE_STATES = frozenset({"retry_eligible", "retry_waiting", "scheduler_unknown", "unsent"})
-_FAILED_CASE_STATES = frozenset({"failed", "submission_failed"})
+_PENDING_CASE_STATES = frozenset(
+    {
+        "pending",
+        "never_started",
+        "cancelled",
+        "interrupted",
+        "retry_eligible",
+        "retry_waiting",
+        "scheduler_unknown",
+    }
+)
+_FAILED_CASE_STATES = frozenset(
+    {
+        "failed",
+        "timed_out",
+        "exports_failed",
+        "conversion_failed",
+        "publication_failed",
+    }
+)
 
 
 def _text(value: object) -> str:
@@ -103,9 +121,11 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
         return "completed"
     if state in _FAILED_CASE_STATES:
         return "failed"
-    if state == "active" and case.get("scheduler_state") != "PENDING":
+    if state == "active":
         return "active"
-    return "pending"
+    if state in _PENDING_CASE_STATES:
+        return "pending"
+    return "failed"
 
 
 def _case_heading(case: Mapping[str, Any], *, show_batch: bool) -> str:
@@ -159,7 +179,18 @@ def _active_case_lines(case: Mapping[str, Any], *, show_batch: bool) -> list[str
 def _nonactive_case_line(case: Mapping[str, Any], *, show_batch: bool) -> str:
     """Return one concise state line for a non-active case."""
     heading = _case_heading(case, show_batch=show_batch)
-    return f"{heading}  state={_text(case.get('state'))}  reason={_text(case.get('reason'))}"
+    details = [
+        f"state={_text(case.get('state'))}",
+        f"reason={_text(case.get('reason'))}",
+    ]
+    if case.get("failure_stage") is not None:
+        details.extend(
+            (
+                f"solver={_text(case.get('solver_state'))}",
+                f"failure_stage={_text(case.get('failure_stage'))}",
+            )
+        )
+    return f"{heading}  {'  '.join(details)}"
 
 
 def _case_inventory(status: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:

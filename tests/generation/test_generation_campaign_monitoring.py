@@ -92,9 +92,10 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "slurm_job_ids": [record["job_id"] for record in submissions],
         "scheduler_job_name": "campaign",
         "scheduler_log_directory": str(run_directory / "scheduler"),
-        "submission_config": {"maximum_failures": 10},
+        "submission_config": {"maximum_failed_cases": 10},
         "submission_intent": None,
         "submissions": submissions,
+        "state": "active",
         "remote_storage_root": str(tmp_path),
         "campaign_meta_directory": str(run_directory),
     }
@@ -173,8 +174,8 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "active",
         "failed",
         "retry_eligible",
-        "active",
-        "unsent",
+        "pending",
+        "never_started",
     ]
     active = status["cases"][1]
     assert active["latest_job_id"] == "102"
@@ -203,6 +204,106 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     without_progress = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
     assert query_count["value"] == 2
     assert without_progress["campaign_state"] == state_with_progress
+
+
+def test_conversion_failure_cannot_terminalize_an_active_campaign(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Derive terminal partial failure only after every active case finishes."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=2,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    run_id = "synthetic_campaign__fedcba9876543210"
+    run_directory = tmp_path / "campaign"
+    run_directory.mkdir()
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": "a" * 40,
+        "slurm_job_ids": ["101", "102"],
+        "scheduler_job_name": "campaign",
+        "scheduler_log_directory": str(run_directory / "scheduler"),
+        "submission_config": {"maximum_failed_cases": 0},
+        "submission_intent": None,
+        "submissions": [],
+        "remote_storage_root": str(tmp_path),
+        "campaign_meta_directory": str(run_directory),
+        "state": "active",
+    }
+
+    def view(task: cluster.CampaignTask, state: str) -> dict[str, Any]:
+        return {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": state,
+            "quality_flag_count": 0,
+            "postprocessing_replay_available": state == "conversion_failed",
+        }
+
+    reconciled = {"value": ([view(tasks[0], "conversion_failed"), view(tasks[1], "active")], 0, 1)}
+    scheduler = {
+        "squeue": {"command": ["squeue"], "output": "", "error": None},
+        "sacct": {"command": ["sacct"], "output": "", "error": None},
+        "active": {},
+        "accounted": {},
+    }
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: campaign,
+    )
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "campaign_run_directory",
+        lambda *_args, **_kwargs: run_directory,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: scheduler,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_reconciled",
+        lambda *_args, **_kwargs: reconciled["value"],
+    )
+
+    running = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
+
+    assert running["campaign_state"] == "running"
+    assert running["counts"]["conversion_failed"] == 1
+    assert running["counts"]["active"] == 1
+    assert running["failure_circuit_breaker_tripped"] is False
+
+    reconciled["value"] = (
+        [view(tasks[0], "conversion_failed"), view(tasks[1], "successful")],
+        0,
+        0,
+    )
+    terminal = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
+
+    assert terminal["campaign_state"] == "feeding"
+    assert terminal["postprocessing_replay_available_cases"] == 1
+
+    reconciled["value"] = (
+        [view(tasks[0], "conversion_failed"), view(tasks[1], "successful")],
+        0,
+        0,
+    )
+    reconciled["value"][0][0]["postprocessing_replay_available"] = False
+    unresolved = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
+    assert unresolved["campaign_state"] == "completed_with_failures"
 
 
 def test_human_summary_shows_two_cases_and_bounds_only_automatic_inventory() -> None:

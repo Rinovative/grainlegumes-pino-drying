@@ -42,6 +42,7 @@ def _mock_local_gates(
         "01_generation/meta/batches/batch_a",
         "01_generation/raw/batch_a",
         "01_generation/processed/batch_a",
+        f"01_generation/attempts/batch_a/case_00001/{_RUN_ID}",
     )
     files = [
         {
@@ -92,6 +93,7 @@ def _mock_local_gates(
                 "meta_directory": directories[0],
                 "raw_directory": directories[1],
                 "processed_directory": directories[2],
+                "attempt_directories": [directories[3]],
             }
         ],
     }
@@ -188,6 +190,47 @@ def test_dataset_finalization_lock_uses_generation_local_state(
     assert not (run_directory / "dataset_packages_complete.lock").exists()
 
 
+def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep durable workflow errors outside private coordination state."""
+    storage = tmp_path / "storage"
+    run_directory = campaign_evidence.campaign_run_directory(
+        _RUN_ID,
+        storage_root=storage,
+    )
+    run_directory.mkdir(parents=True)
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {},
+    )
+
+    first = generation.workflow.record_workflow_failure(
+        _RUN_ID,
+        storage_root=storage,
+        stage="synthetic transfer",
+        resume_command="./scripts/generation_workflow.sh resume synthetic",
+        cpu_bytes_retained=17,
+    )
+    first_bytes = first.read_bytes()
+    second = generation.workflow.record_workflow_failure(
+        _RUN_ID,
+        storage_root=storage,
+        stage="synthetic publication",
+        resume_command="./scripts/generation_workflow.sh resume synthetic",
+        cpu_bytes_retained=17,
+    )
+
+    assert first == (run_directory / "workflow_failures" / "failure-0001.json").resolve()
+    assert second.name == "failure-0002.json"
+    assert ".state" not in first.parts
+    assert first.read_bytes() == first_bytes
+    assert json.loads(first.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(second.read_text(encoding="utf-8"))["stage"] == ("synthetic publication")
+
+
 def test_all_receipt_records_distinct_gates_and_cleanup_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -259,6 +302,7 @@ def _remote_cleanup_fixture(
         "01_generation/meta/batches/batch_a",
         "01_generation/raw/batch_a",
         "01_generation/processed/batch_a",
+        f"01_generation/attempts/batch_a/case_00001/{_RUN_ID}",
     )
     for index, relative in enumerate(directories, start=1):
         directory = storage / relative
@@ -284,6 +328,7 @@ def _remote_cleanup_fixture(
                 "meta_directory": directories[0],
                 "raw_directory": directories[1],
                 "processed_directory": directories[2],
+                "attempt_directories": [directories[3]],
             }
         ],
     }
@@ -320,18 +365,19 @@ def _remote_cleanup_fixture(
         generation.campaign,
         "campaign_status",
         lambda *_args, **_kwargs: {
-            "campaign_state": "publication_complete",
+            "campaign_state": "successful",
             "squeue": {"output": "", "error": None},
             "sacct": {"output": "123|COMPLETED|0:0", "error": None},
         },
     )
+    eligible_files = files[:3]
     directory_records = [
         {
             "relative_path": relative,
             "file_count": 1,
             "size_bytes": (storage / relative / "payload.bin").stat().st_size,
         }
-        for relative in directories
+        for relative in directories[:3]
     ]
     payload = {
         "campaign_run_id": _RUN_ID,
@@ -342,9 +388,9 @@ def _remote_cleanup_fixture(
         "source_storage_root": str(storage),
         "destination_storage_root": "/gpu/storage",
         **_AUTH_DIGESTS,
-        "source_inventory_sha256": common.serialization.canonical_json_sha256(files),
-        "source_file_count": len(files),
-        "source_bytes": sum(record["size_bytes"] for record in files),
+        "source_inventory_sha256": common.serialization.canonical_json_sha256(eligible_files),
+        "source_file_count": len(eligible_files),
+        "source_bytes": sum(record["size_bytes"] for record in eligible_files),
         "source_directories": directory_records,
     }
     arguments = {
@@ -396,6 +442,7 @@ def test_cpu_cleanup_is_dry_run_transactional_and_idempotent(
     for key in ("meta_directory", "raw_directory", "processed_directory"):
         assert not (storage / plan["batches"][0][key]).exists()
     assert (storage / plan["campaign_directory"]).is_dir()
+    assert (storage / plan["batches"][0]["attempt_directories"][0]).is_dir()
     assert (storage / plan["campaign_directory"] / generation.workflow.CPU_CLEANUP_RECEIPT_FILENAME).is_file()
 
     repeated = generation.workflow.cleanup_cpu_campaign_source(
@@ -415,7 +462,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
     unsafe_statuses = (
         (
             {
-                "campaign_state": "publication_complete",
+                "campaign_state": "successful",
                 "squeue": {"output": "123|RUNNING|node", "error": None},
                 "sacct": {"output": "123|RUNNING|0:0", "error": None},
             },
@@ -427,7 +474,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
                 "squeue": {"output": "", "error": None},
                 "sacct": {"output": "123|FAILED|1:0", "error": None},
             },
-            "requires a complete untransferred source publication",
+            "requires a successful terminal source publication",
         ),
         (
             {
@@ -435,7 +482,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
                 "squeue": {"output": "", "error": None},
                 "sacct": {"output": "123|COMPLETED|0:0", "error": None},
             },
-            "requires a complete untransferred source publication",
+            "requires a successful terminal source publication",
         ),
     )
     for status, expected_message in unsafe_statuses:
@@ -451,7 +498,7 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
                 **arguments,
             )
     resumed_status = {
-        "campaign_state": "publication_complete",
+        "campaign_state": "transfer_complete",
         "squeue": {"output": "", "error": None},
         "sacct": {
             "output": "123|FAILED|1:0\n124|COMPLETED|0:0",
@@ -467,6 +514,56 @@ def test_cpu_cleanup_rejects_active_failed_and_incomplete_runs(
     for key in ("meta_directory", "raw_directory", "processed_directory"):
         assert (storage / plan["batches"][0][key]).is_dir()
     assert not (storage / plan["campaign_directory"] / generation.workflow.CPU_CLEANUP_RECEIPT_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    "campaign_state",
+    ["successful", "transfer_complete"],
+)
+def test_campaign_source_status_accepts_authoritative_terminal_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    campaign_state: str,
+) -> None:
+    """Keep cleanup eligibility aligned with canonical campaign states."""
+    storage, _arguments, plan = _remote_cleanup_fixture(tmp_path, monkeypatch)
+    batch = plan["batches"][0]
+    manifest = {
+        "batches": [
+            {
+                key: str((storage / batch[key]).resolve())
+                for key in (
+                    "meta_directory",
+                    "raw_directory",
+                    "processed_directory",
+                )
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "campaign_status",
+        lambda *_args, **_kwargs: {
+            "campaign_state": campaign_state,
+            "squeue": {"output": "", "error": None},
+            "sacct": {"output": "123|COMPLETED|0:0", "error": None},
+        },
+    )
+
+    status = generation.workflow.campaign_source_status(
+        _RUN_ID,
+        storage_root=storage,
+        query_scheduler=True,
+    )
+
+    assert status["campaign_state"] == campaign_state
+    assert status["cleanup_eligibility"] == "requires_gpu_authorization"
+    assert status["active_slurm"] is False
 
 
 def test_cpu_cleanup_rejects_sources_shared_with_another_campaign_run(

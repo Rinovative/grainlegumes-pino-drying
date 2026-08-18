@@ -7,6 +7,7 @@ import json
 import shlex
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -352,8 +353,17 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     completed["value"] = True
     terminal = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert terminal["state"] == "complete"
+    terminal_batch = (
+        generation.runtime.batch_meta_directory(
+            campaign.batches[0],
+            storage_root=storage,
+        )
+        / "batch_manifest.json"
+    )
+    terminal_batch.parent.mkdir(parents=True, exist_ok=True)
+    terminal_batch.write_text("{}\n", encoding="utf-8")
     successful = generation.campaign.campaign_status(run_id, storage_root=storage)
-    assert successful["campaign_state"] == "completed"
+    assert successful["campaign_state"] == "successful"
     assert successful["cases"][0]["state"] == "successful"
     assert successful["cases"][0]["submission_count"] == 2
 
@@ -378,6 +388,11 @@ def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     monkeypatch.setenv(
         "GENERATION_CAMPAIGN_RUN_ID",
         "old-campaign__0123456789abcdef",
+    )
+    generation.cases.input_generation.generate_input_cases(
+        batch,
+        len(batch.case_indices),
+        storage_root=storage,
     )
     generation.runtime.record_case_failure(
         batch,
@@ -442,6 +457,11 @@ def test_current_failure_still_requires_explicit_retry(
     run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
     monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    generation.cases.input_generation.generate_input_cases(
+        batch,
+        len(batch.case_indices),
+        storage_root=storage,
+    )
     generation.runtime.record_case_failure(
         batch,
         task.case_index,
@@ -476,10 +496,157 @@ def test_current_failure_still_requires_explicit_retry(
     assert stopped["state"] == "failure_threshold_reached"
     assert submitted == []
 
-    resumed = generation.campaign.resume_campaign(run_id, storage_root=storage)
+    resumed = generation.campaign.retry_campaign_case(
+        run_id,
+        task.batch_name,
+        task.case_id,
+        storage_root=storage,
+    )
     assert resumed["slurm_job_ids"] == ["654"]
     assert len(submitted) == 1
-    assert resumed["submissions"][0]["mode"] == "resume"
+    assert resumed["submissions"][0]["mode"] == "explicit_retry"
+
+
+@pytest.mark.parametrize(
+    ("case_state", "replay_available", "expected_action", "expected_state"),
+    [
+        ("successful", False, "reuse", "complete"),
+        ("never_started", False, "submit_initial", "active"),
+        ("cancelled", False, "submit_resume", "active"),
+        ("interrupted", False, "submit_resume", "active"),
+        ("conversion_failed", True, "replay", "complete"),
+        ("publication_failed", True, "replay", "complete"),
+        ("exports_failed", False, "stop", "completed_with_failures"),
+        ("failed", False, "stop", "completed_with_failures"),
+        ("timed_out", False, "stop", "completed_with_failures"),
+    ],
+)
+def test_campaign_resume_matrix_never_silently_retries_solver_failures(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_state: str,
+    replay_available: bool,
+    expected_action: str,
+    expected_state: str,
+) -> None:
+    """Protect reuse, restart, replay, and explicit-retry boundaries."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    target = tasks[0]
+    run_id = "resume-matrix__0123456789abcdef"
+    commit = "c" * 40
+    storage = tmp_path / case_state
+    campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    ).mkdir(parents=True)
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": commit,
+        "slurm_job_ids": [],
+        "submission_config": {"maximum_failed_cases": 0},
+        "state": "active",
+    }
+    views = [
+        {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": (case_state if task == target else "successful"),
+            "postprocessing_replay_available": (replay_available if task == target else False),
+        }
+        for task in tasks
+    ]
+    submissions: list[tuple[str, str]] = []
+    replays: list[tuple[str, int]] = []
+    finalized: list[bool] = []
+
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: campaign,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: _scheduler(),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_reconciled",
+        lambda *_args, **_kwargs: (views, [], []),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_repository_commit",
+        lambda: commit,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_write_campaign_manifest",
+        lambda payload, **_kwargs: dict(payload),
+    )
+
+    def submit(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        submissions.append((task.case_id, mode))
+        payload["state"] = "active"
+        return dict(payload)
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit)
+
+    def replay(batch: Any, case_index: int, **_kwargs: Any) -> Any:
+        replays.append((batch.batch_name, case_index))
+        return SimpleNamespace(status="replayed")
+
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "replay_case_postprocessing",
+        replay,
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_finalize_completed_batches",
+        lambda *_args, **_kwargs: finalized.append(True),
+    )
+
+    resumed = generation.campaign.resume_campaign(
+        run_id,
+        storage_root=storage,
+    )
+
+    assert resumed["state"] == expected_state
+    if expected_action == "submit_initial":
+        assert submissions == [(target.case_id, "initial")]
+    elif expected_action == "submit_resume":
+        assert submissions == [(target.case_id, "resume")]
+    else:
+        assert submissions == []
+    if expected_action == "replay":
+        assert replays == [(target.batch_name, target.case_index)]
+    else:
+        assert replays == []
+    assert bool(finalized) is (expected_action in {"reuse", "replay"})
 
 
 def test_malformed_persisted_job_id_fails_before_scheduler_query(
@@ -675,10 +842,104 @@ def test_optional_running_cap_and_failure_threshold_require_explicit_resume(
     assert stopped["state"] == "failure_threshold_reached"
     assert stopped["slurm_job_ids"] == ["201"]
 
-    resumed = generation.campaign.resume_campaign(manifest["campaign_run_id"], storage_root=storage)
+    resumed = generation.campaign.retry_campaign_case(
+        manifest["campaign_run_id"],
+        first_task.batch_name,
+        first_task.case_id,
+        storage_root=storage,
+    )
     assert resumed["slurm_job_ids"] == ["201", "202"]
-    assert resumed["submissions"][-1]["mode"] == "resume"
+    assert resumed["submissions"][-1]["mode"] == "explicit_retry"
     assert resumed["submissions"][-1]["case"]["case_id"] == first_task.case_id
+
+
+def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signal running workers gracefully first and force only on request."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    commit = "c" * 40
+    scheduler = _scheduler()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_submit_case",
+        lambda *_args, **_kwargs: "301",
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: scheduler,
+    )
+
+    def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        persisted = campaign_evidence.load_campaign_run(
+            manifest["campaign_run_id"],
+            storage_root=storage,
+        )
+        expected_state = "force_cancel_requested" if "--signal=KILL" in command else "cancel_requested"
+        assert persisted["state"] == expected_state
+        assert (
+            campaign_evidence.campaign_run_directory(
+                manifest["campaign_run_id"],
+                storage_root=storage,
+            )
+            / "cancellations.json"
+        ).is_file()
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(generation.campaign.subprocess, "run", run)
+    storage = tmp_path / "storage"
+    manifest = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    scheduler["active"] = {
+        "301": ["301", "RUNNING", "node-a", "node-a"],
+    }
+
+    graceful = generation.campaign.cancel_campaign(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert commands == [["scancel", "--signal=TERM", "--batch", "301"]]
+    assert graceful["schema_version"] == 1
+    assert graceful["attempts"][-1]["mode"] == "graceful"
+    running = generation.campaign.campaign_status(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert running["campaign_state"] == "running"
+    assert running["cancellation_requested"] is True
+
+    forced = generation.campaign.cancel_campaign(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+        force=True,
+    )
+    assert commands[-1] == ["scancel", "--signal=KILL", "--full", "301"]
+    assert [attempt["mode"] for attempt in forced["attempts"]] == [
+        "graceful",
+        "force",
+    ]
+
+    scheduler["active"] = {}
+    scheduler["accounted"] = {"301": ["301", "CANCELLED", "0:15"]}
+    cancelled = generation.campaign.campaign_status(
+        manifest["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert cancelled["campaign_state"] == "cancelled"
+    assert cancelled["counts"]["cancelled"] == 1
 
 
 def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
@@ -839,6 +1100,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
         "01_generation/meta/batches/synthetic_batch",
         "01_generation/raw/synthetic_batch",
         "01_generation/processed/synthetic_batch",
+        f"01_generation/attempts/synthetic_batch/case_00001/{run_id}",
         campaign_directory,
     )
     for index, relative in enumerate(relative_directories):
@@ -862,6 +1124,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
                 "meta_directory": relative_directories[0],
                 "raw_directory": relative_directories[1],
                 "processed_directory": relative_directories[2],
+                "attempt_directories": [relative_directories[3]],
             }
         ],
     }
@@ -905,7 +1168,7 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
     )
     assert receipt["status"] == "transfer_complete"
     assert receipt["source_removed"] is False
-    assert receipt["transferred_file_count"] == 5
+    assert receipt["transferred_file_count"] == 6
     assert receipt["transferred_bytes"] == sum(len(payload) for directory in source_bytes.values() for payload in directory.values())
     assert len(receipt["files"]) == receipt["transferred_file_count"]
     assert destination_checks["count"] == 2

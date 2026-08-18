@@ -14,7 +14,9 @@ import yaml
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.cases import generation_cases_input as input_service
 from src.generation.cases import generation_cases_sampling as sampling_service
+from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
@@ -439,8 +441,16 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     meta = storage / "01_generation/meta/batches/pilot_batch"
     raw = storage / "01_generation/raw/pilot_batch"
     processed = storage / "01_generation/processed/pilot_batch"
+    attempts = storage / f"01_generation/attempts/pilot_batch/case_00002/{run_id}"
     failure = meta / "pilot_failure_evidence/case_00002/failure.json"
-    for directory in (campaign, meta, raw / "exports", processed, failure.parent):
+    for directory in (
+        campaign,
+        meta,
+        raw / "exports",
+        processed,
+        attempts,
+        failure.parent,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
     (campaign / "campaign_terminal.json").write_bytes(b"terminal\n")
     (meta / "solver.log").write_bytes(b"log\n")
@@ -449,6 +459,7 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     export.write_bytes(b"x,y\n1,2\n")
     hdf5 = processed / "case.h5"
     hdf5.write_bytes(b"canonical-hdf5")
+    (attempts / "attempt.json").write_text("{}\n", encoding="utf-8")
 
     def relative(path: Path) -> str:
         return path.relative_to(storage).as_posix()
@@ -477,6 +488,7 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
                 "meta_directory": relative(meta),
                 "raw_directory": relative(raw),
                 "processed_directory": relative(processed),
+                "attempt_directories": [relative(attempts)],
             }
         ],
     }
@@ -495,7 +507,8 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     }
     assert result["cpu_logs_bytes"] == (meta / "solver.log").stat().st_size
     assert result["cpu_exports_bytes"] == export.stat().st_size
-    all_files = [path for root in (campaign, meta, raw, processed) for path in root.rglob("*") if path.is_file()]
+    assert relative(attempts) not in result["cleanup_eligible_publication_directories"]
+    all_files = [path for root in (campaign, meta, raw, processed, attempts) for path in root.rglob("*") if path.is_file()]
     unique_files = {path.resolve() for path in all_files}
     assert result["cpu_source_bytes_before_cleanup"] == sum(path.stat().st_size for path in unique_files)
     assert result["cpu_source_file_count_before_cleanup"] == len(unique_files)
@@ -523,60 +536,175 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     )
 
 
-def test_failed_pilot_retains_compact_artifacts_before_scratch_disappears(
+def test_failed_pilot_retains_full_attempt_before_scratch_disappears(
     pilot_campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect compact failed evidence before marked scratch disappears."""
+    """Retain a full hash-admitted pilot attempt before scratch disappears."""
     batch = _pilot(pilot_campaign_path, 1).batches[0]
     storage = tmp_path / "storage"
-    work = tmp_path / "case-work"
-    (work / "runtime").mkdir(parents=True)
-    (work / "exports").mkdir()
-    (work / "case.json").write_text('{"input_files": {}}\n', encoding="utf-8")
-    for name in ("fields.csv", "scalars.csv", "schedule.csv"):
-        (work / name).write_text("header\n1\n", encoding="utf-8")
-    (work / "runtime" / "solver.log").write_text("solver failed\n", encoding="utf-8")
-    (work / "runtime" / "status.json").write_text("{}\n", encoding="utf-8")
-    (work / "exports" / "partial.csv").write_text("t,value\n0,1\n", encoding="utf-8")
+    input_service.generate_input_cases(batch, 1, storage_root=storage)
+    prepared = runtime_service.prepare_case_work_directory(
+        batch,
+        1,
+        storage_root=storage,
+        work_root=tmp_path / "work",
+    )
+    (prepared.runtime_directory / "solver.log").write_text(
+        "solver failed\n",
+        encoding="utf-8",
+    )
+    (prepared.runtime_directory / "status.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (prepared.exports_directory / "partial.csv").write_text(
+        "t,value\n0,1\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
-    runtime_service.record_case_failure(
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", "pilot-full-retention")
+    receipt = runtime_service.record_case_failure(
         batch,
         1,
         RuntimeError("synthetic pilot failure"),
         worker_slot=0,
         scheduler_kind="slurm",
         allocated_node="node01",
-        work_directory=work,
+        work_directory=prepared.work_directory,
         storage_root=storage,
         failure_stage="solver",
     )
-    assert runtime_service.case_failure_is_recorded(batch, 1, storage_root=storage)
-    failure = json.loads(runtime_service.case_failure_path(batch, 1, storage_root=storage).read_text(encoding="utf-8"))
-    assert {
-        "case.json",
-        "fields.csv",
-        "scalars.csv",
-        "schedule.csv",
-        "runtime/solver.log",
-        "runtime/status.json",
-        "export_inventory.json",
-    }.issubset(failure["retained_artifacts"])
-    shutil.rmtree(work)
-    assert runtime_service.case_failure_is_recorded(batch, 1, storage_root=storage)
-    retained = runtime_service.case_failure_artifacts_directory(
+    attempt = attempt_service.load_attempt(receipt.parent)
+    attempt_service.record_attempt_cleanup(
+        attempt,
+        status="complete",
+        reclaimed_bytes=0,
+        error=None,
+    )
+    assert runtime_service.case_failure_is_recorded(
         batch,
         1,
         storage_root=storage,
     )
-    (retained / "fields.csv").write_text("tampered\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="retained-artifact identity is invalid"):
+    assert attempt.payload["retention_policy"] == "full"
+    assert {
+        "payload/case.json",
+        "payload/model.mph",
+        "payload/runtime/solver.log",
+        "payload/runtime/status.json",
+        "payload/exports/partial.csv",
+    }.issubset(attempt.payload["retained_inventory"])
+    shutil.rmtree(prepared.work_directory)
+    assert runtime_service.case_failure_is_recorded(
+        batch,
+        1,
+        storage_root=storage,
+    )
+    retained_log = attempt.directory / "payload/runtime/solver.log"
+    retained_log.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact identity"):
         runtime_service.case_failure_is_recorded(
             batch,
             1,
             storage_root=storage,
         )
+
+
+def test_pilot_terminal_references_canonical_attempt_without_copying_it(
+    pilot_campaign_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep one in-place attempt authority for a failed pilot case."""
+    campaign = _pilot(pilot_campaign_path, 1)
+    batch = campaign.batches[0]
+    run_id = "pilot-attempt-terminal"
+    storage = tmp_path / "storage"
+    input_service.generate_input_cases(batch, 1, storage_root=storage)
+    prepared = runtime_service.prepare_case_work_directory(
+        batch,
+        1,
+        storage_root=storage,
+        work_root=tmp_path / "work",
+    )
+    attempt = attempt_service.publish_case_attempt(
+        batch,
+        1,
+        campaign_run_id=run_id,
+        case_state="failed",
+        failure_stage="solver",
+        reason="synthetic pilot solver failure",
+        solver_git_commit="a" * 40,
+        processing_git_commit="a" * 40,
+        work_directory=prepared.work_directory,
+        storage_root=storage,
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node01",
+        exit_code=7,
+        timed_out=False,
+        quality_flags=(
+            {
+                "code": "solver_native_failure_count",
+                "severity": "warning",
+                "stage": "solver",
+                "message": "Synthetic native solver failure count.",
+                "metrics": {"Tfail": 1},
+                "thresholds": {},
+                "source_artifacts": [],
+                "recorded_at": "2026-08-18T00:00:00+00:00",
+                "quality_flag": True,
+            },
+        ),
+    )
+    attempt_service.record_attempt_cleanup(
+        attempt,
+        status="complete",
+        reclaimed_bytes=0,
+        error=None,
+    )
+    campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    ).mkdir(parents=True)
+    manifest = {
+        "campaign_config": str(pilot_campaign_path),
+        "git_commit": "a" * 40,
+        "slurm_job_ids": ["123"],
+        "scheduler_job_name": "pilot-attempt-terminal",
+        "scheduler_log_directory": str(tmp_path / "logs"),
+    }
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_for_run",
+        lambda *_args, **_kwargs: campaign,
+    )
+
+    pilot_service.finalize_pilot_campaign(run_id, storage_root=storage)
+    terminal = pilot_service.validate_pilot_terminal(run_id, storage_root=storage)
+
+    record = terminal["cases"][0]
+    evidence = record["failure_evidence"]
+    assert record["simulation_case_id"] == attempt.payload["simulation_case_id"]
+    assert evidence["evidence_kind"] == "attempt"
+    assert storage / evidence["relative_path"] == attempt.receipt_path
+    assert storage / evidence["evidence_directory"] == attempt.directory
+    assert evidence["scratch_cleanup"]["status"] == "complete"
+    assert not (runtime_service.batch_meta_directory(batch, storage_root=storage) / "pilot_failure_evidence").exists()
+    result = pilot_service._failure_case_result(  # noqa: SLF001 -- focused result mapping
+        record,
+        storage=storage,
+    )
+    assert result["simulation_case_id"] == attempt.payload["simulation_case_id"]
+    assert result["warning_count"] == 1
+    assert result["warnings"] == ["solver_native_failure_count"]
 
 
 def test_staging_cleanup_writes_pending_transaction_before_deletion(

@@ -35,10 +35,10 @@ from src import common, domain
 from src.generation.cases import generation_cases_admission as input_admission
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_fields as fields_service
-from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
+from src.generation.validation import generation_validation_policy as validation_policy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -55,6 +55,7 @@ _STATIONARITY_RTOL = profiles.STATIONARITY_TOLERANCE
 _TIME_CLASSIFICATION_FACTOR = 16.0
 _THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
 _UNIT_INTERVAL_ROUNDOFF_ATOL = 64.0 * np.finfo(np.float64).eps
+_MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE = 1.0e-6
 _FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
@@ -594,13 +595,8 @@ def _stationary_fixed_values(
 def _schedule_values(
     case_payload: Mapping[str, Any],
     work_directory: Path,
-    *,
-    p_ref: float,
-    time_contract: Mapping[str, Any],
-    startup_ramp: Mapping[str, Any],
-    initial_temperature: float,
 ) -> np.ndarray:
-    """Read and revalidate the configured schedule bound by case.json."""
+    """Read the exact hash-admitted primitive schedule without re-proving authored science."""
     spec = case_payload["input_contract"]["schedule"]
     path = work_directory / spec["filename"]
     identity = case_payload["input_files"][path.name]
@@ -611,22 +607,15 @@ def _schedule_values(
     if header != list(profiles.SCHEDULE_FIELDS):
         msg = "Schedule adapter does not match the configured primitive-column contract."
         raise ValueError(msg)
-    metadata = case_payload.get("schedule_diagnostics")
-    if not isinstance(metadata, Mapping):
-        msg = "Schedule handoff provenance must be a mapping."
-        raise TypeError(msg)
-    conversion = metadata.get("conversion_pressure")
-    if conversion != {"name": "p_ref", "value": p_ref, "unit": "Pa", "owner": "package_fixed"}:
-        msg = "Schedule conversion-pressure provenance is missing or inconsistent."
-        raise ValueError(msg)
-    schedule_service.validate_comsol_boundary_schedule(
-        values,
-        regular_times=np.asarray(time_contract["regular_times"], dtype=np.float64),
-        startup_ramp=startup_ramp,
-        initial_temperature=initial_temperature,
-        pressure=p_ref,
-        metadata=metadata,
-    )
+    if (
+        values.ndim != _TABLE_RANK
+        or values.shape[0] < 1
+        or values.shape[1] != len(profiles.SCHEDULE_FIELDS)
+        or not np.isfinite(values).all()
+        or np.any(np.diff(values[:, 0]) <= 0.0)
+    ):
+        message = "Hash-admitted schedule must remain finite, two-dimensional, and strictly increasing in time."
+        raise ValueError(message)
     return values
 
 
@@ -651,7 +640,48 @@ def transient_initial_state_matches(
     return bool(np.allclose(actual, expected, rtol=rtol, atol=atol))
 
 
-def _validate_transient_outputs(
+def _global_range_diagnostics(
+    f_wet: np.ndarray,
+    evaporation: np.ndarray,
+    vapor_in: np.ndarray,
+    vapor_out: np.ndarray,
+) -> list[validation_policy.DiagnosticRecord]:
+    """Return advisory finite global-range diagnostics."""
+    records: list[validation_policy.DiagnosticRecord] = []
+    diagnostic_sources = ("comsol_exports/global_timeseries.csv", "comsol_exports/final_status.csv")
+    if np.any(_outside_unit_interval(f_wet)):
+        records.append(
+            validation_policy.diagnostic_record(
+                "physical_range_unexpected",
+                severity="warning",
+                stage="diagnostics",
+                message="Finite global f_wet_dm values extend outside the preferred [0, 1] range.",
+                metrics={"minimum": float(np.min(f_wet)), "maximum": float(np.max(f_wet))},
+                thresholds={"minimum": 0.0, "maximum": 1.0},
+                source_artifacts=diagnostic_sources,
+            )
+        )
+    minimum_flows = {
+        "m_dot_evap": float(np.min(evaporation)),
+        "m_dot_v_in": float(np.min(vapor_in)),
+        "m_dot_v_out": float(np.min(vapor_out)),
+    }
+    if any(value < 0.0 for value in minimum_flows.values()):
+        records.append(
+            validation_policy.diagnostic_record(
+                "physical_range_unexpected",
+                severity="warning",
+                stage="diagnostics",
+                message="One or more finite exported mass-flow series use an unexpected negative sign.",
+                metrics=minimum_flows,
+                thresholds={"preferred_minimum": 0.0},
+                source_artifacts=("comsol_exports/global_timeseries.csv",),
+            )
+        )
+    return records
+
+
+def _transient_output_diagnostics(
     config: GenerationConfig,
     static_fields: np.ndarray,
     regular_time: np.ndarray,
@@ -662,8 +692,8 @@ def _validate_transient_outputs(
     final_status: np.ndarray,
     *,
     f_surf: float,
-) -> None:
-    """Validate final weighted moisture, diagnostic signs, and exact-stop alignment."""
+) -> list[validation_policy.DiagnosticRecord]:
+    """Return advisory scientific diagnostics after structural admission."""
     time_tolerance = time_classification_tolerance(config.scientific_values["time"])
     state_time = _combined_state_time(regular_time, exact_stop_time, exact_stop_fields)
     if global_values.shape != (state_time.size, len(profiles.GLOBAL_FIELD_NAMES)):
@@ -673,47 +703,71 @@ def _validate_transient_outputs(
     if not np.allclose(global_time, state_time, rtol=0.0, atol=time_tolerance):
         message = "Global diagnostic times do not align with the complete exported state axis."
         raise ValueError(message)
+    if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
+        message = "Final status export must contain exactly one complete row."
+        raise ValueError(message)
+    final: dict[str, float] = {
+        name: float(value)
+        for name, value in zip(
+            profiles.FINAL_STATUS_FIELDS,
+            final_status[0],
+            strict=True,
+        )
+    }
+    if abs(float(final["t_final"]) - float(state_time[-1])) > time_tolerance:
+        message = "Final Status t_final must identify the actual last exported solution state."
+        raise ValueError(message)
+
+    records: list[validation_policy.DiagnosticRecord] = []
+    diagnostic_sources = ("comsol_exports/global_timeseries.csv", "comsol_exports/final_status.csv")
     f_wet = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]
     evaporation = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_evap")]
     vapor_in = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_in")]
     vapor_out = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("m_dot_v_out")]
-    if np.any(_outside_unit_interval(f_wet)):
-        message = "Global f_wet_dm must lie in [0, 1] within binary64 roundoff."
-        raise ValueError(message)
-    if np.any(evaporation < 0.0) or np.any(vapor_in < 0.0) or np.any(vapor_out < 0.0):
-        message = "Canonical evaporation, inlet, and outlet mass-flow signs must be externally non-negative."
-        raise ValueError(message)
-    if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
-        message = "Final status export must contain exactly one complete row."
-        raise ValueError(message)
-    final = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
-    if abs(float(final["t_final"]) - float(state_time[-1])) > time_tolerance:
-        message = "Final Status t_final must identify the actual last exported solution state."
-        raise ValueError(message)
-    if not np.isclose(float(final["f_wet_dm_final"]), float(f_wet[-1]), rtol=1e-6, atol=1e-9):
-        message = "Final Status f_wet_dm_final disagrees with the complete global series."
-        raise ValueError(message)
-    if not np.isclose(
-        float(final["X_wb_bulk_final"]),
-        float(global_values[-1, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]),
-        rtol=1e-6,
-        atol=1e-9,
-    ):
-        message = "Final Status X_wb_bulk_final disagrees with the complete global series."
-        raise ValueError(message)
+    records.extend(
+        _global_range_diagnostics(
+            f_wet,
+            evaporation,
+            vapor_in,
+            vapor_out,
+        )
+    )
+
+    consistency_metrics: dict[str, float] = {}
+    comparisons = {
+        "f_wet_dm_final": float(f_wet[-1]),
+        "X_wb_bulk_final": float(global_values[-1, profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]),
+    }
+    for name, expected in comparisons.items():
+        observed = float(final[name])
+        if not np.isclose(observed, expected, rtol=1.0e-6, atol=1.0e-9):
+            consistency_metrics[f"{name}_observed"] = observed
+            consistency_metrics[f"{name}_derived"] = expected
+
     static_names = profiles.TRANSIENT_STATIC_FIELD_NAMES
     rho_bu_dry = static_fields[static_names.index("rho_bu_dry")]
     x_initial = static_fields[static_names.index("X_0_db_field")]
     initial_water = rho_bu_dry * x_initial
     state_names = profiles.TRANSIENT_FIELD_NAMES
+    initial_rtol, initial_atol = transient_initial_state_tolerance(config)
+    initial_metrics: dict[str, float] = {}
     for name in ("w_surf", "w_int"):
-        if not transient_initial_state_matches(
-            config,
-            regular_fields[0, state_names.index(name)],
-            initial_water,
-        ):
-            message = f"Initial {name} must equal rho_bu_dry*X_0_db_field without compartment splitting."
-            raise ValueError(message)
+        actual = regular_fields[0, state_names.index(name)]
+        if not transient_initial_state_matches(config, actual, initial_water):
+            initial_metrics[f"{name}_maximum_absolute_difference"] = float(np.max(np.abs(actual - initial_water)))
+    if initial_metrics:
+        records.append(
+            validation_policy.diagnostic_record(
+                "initial_state_tolerance_exceeded",
+                severity="warning",
+                stage="diagnostics",
+                message="Solved initial moisture fields differ from the canonical reconstructed initial state.",
+                metrics=initial_metrics,
+                thresholds={"rtol": initial_rtol, "atol": initial_atol},
+                source_artifacts=("comsol_exports/transient_states.csv", "raw/case.json"),
+            )
+        )
+
     final_state = regular_fields[-1] if exact_stop_fields is None else exact_stop_fields
     final_water = domain.moisture.granular_water_content(
         final_state[state_names.index("w_surf")],
@@ -721,9 +775,10 @@ def _validate_transient_outputs(
         f_surf,
     )
     final_x_wb = domain.moisture.wet_basis_moisture(final_water, rho_bu_dry)
-    if not np.isclose(float(final["X_wb_max_final"]), float(np.max(final_x_wb)), rtol=1e-6, atol=1e-9):
-        message = "Final Status X_wb_max_final disagrees with the weighted Python-derived field."
-        raise ValueError(message)
+    derived_maximum = float(np.max(final_x_wb))
+    if not np.isclose(float(final["X_wb_max_final"]), derived_maximum, rtol=1.0e-6, atol=1.0e-9):
+        consistency_metrics["X_wb_max_final_observed"] = float(final["X_wb_max_final"])
+        consistency_metrics["X_wb_max_final_derived"] = derived_maximum
     final_temperature = final_state[state_names.index("T")]
     final_phi = final_state[state_names.index("phi")]
     extrema = {
@@ -732,24 +787,129 @@ def _validate_transient_outputs(
         "phi_min_final": float(np.min(final_phi)),
         "phi_max_final": float(np.max(final_phi)),
     }
-    if (
-        not np.isclose(float(final["T_min_final"]), extrema["T_min_final"], rtol=1e-6, atol=1e-9)
-        or not np.isclose(float(final["T_max_final"]), extrema["T_max_final"], rtol=1e-6, atol=1e-9)
-        or not np.isclose(float(final["phi_min_final"]), extrema["phi_min_final"], rtol=1e-6, atol=1e-9)
-        or not np.isclose(float(final["phi_max_final"]), extrema["phi_max_final"], rtol=1e-6, atol=1e-9)
+    for name, expected in extrema.items():
+        observed = float(final[name])
+        if not np.isclose(observed, expected, rtol=1.0e-6, atol=1.0e-9):
+            consistency_metrics[f"{name}_observed"] = observed
+            consistency_metrics[f"{name}_derived"] = expected
+    if consistency_metrics:
+        records.append(
+            validation_policy.diagnostic_record(
+                "final_status_consistency",
+                severity="warning",
+                stage="diagnostics",
+                message="Finite Final Status values differ from independently reconstructed exported-state values.",
+                metrics=consistency_metrics,
+                thresholds={"rtol": 1.0e-6, "atol": 1.0e-9},
+                source_artifacts=diagnostic_sources,
+            )
+        )
+    if np.any(_outside_unit_interval(final_phi)):
+        records.append(
+            validation_policy.diagnostic_record(
+                "relative_humidity_excursion",
+                severity="warning",
+                stage="diagnostics",
+                message="Solved relative humidity contains finite values outside the preferred [0, 1] range.",
+                metrics={"minimum": float(np.min(final_phi)), "maximum": float(np.max(final_phi))},
+                thresholds={"minimum": 0.0, "maximum": 1.0},
+                source_artifacts=("comsol_exports/transient_states.csv",),
+            )
+        )
+
+    try:
+        bulk = evaluate_transient_bulk_moisture_consistency(
+            config,
+            static_fields,
+            state_time,
+            regular_fields,
+            exact_stop_fields,
+            global_values,
+            f_surf=f_surf,
+            time_tolerance=time_tolerance,
+        )
+    except Exception as error:  # noqa: BLE001 -- optional diagnostics cannot invalidate admitted solver output
+        records.append(
+            validation_policy.diagnostic_record(
+                "optional_diagnostic_unavailable",
+                severity="warning",
+                stage="diagnostics",
+                message=f"Bulk-moisture reconstruction diagnostic was unavailable: {type(error).__name__}: {error}",
+                source_artifacts=("comsol_exports/transient_states.csv", "comsol_exports/global_timeseries.csv"),
+            )
+        )
+    else:
+        if not bulk.matches:
+            records.append(
+                validation_policy.diagnostic_record(
+                    "bulk_moisture_tolerance_exceeded",
+                    severity="warning",
+                    stage="diagnostics",
+                    message="Exported bulk moisture differs from the weighted reconstructed series.",
+                    metrics={"maximum_absolute_difference": float(np.max(np.abs(bulk.exported - bulk.reconstructed)))},
+                    thresholds={"rtol": bulk.rtol, "atol": bulk.atol},
+                    source_artifacts=("comsol_exports/transient_states.csv", "comsol_exports/global_timeseries.csv"),
+                )
+            )
+
+    mass_balance = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("mt_mass_balance")]
+    flow_scale = max(1.0e-30, float(np.max(np.abs(np.column_stack((evaporation, vapor_in, vapor_out))))))
+    preferred = _MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE * flow_scale
+    maximum_residual = float(np.max(np.abs(mass_balance)))
+    if maximum_residual > preferred:
+        records.append(
+            validation_policy.diagnostic_record(
+                "mass_balance_tolerance_exceeded",
+                severity="warning",
+                stage="diagnostics",
+                message="Finite mass-balance residual exceeds the preferred scale-relative diagnostic tolerance.",
+                metrics={"maximum_absolute_residual": maximum_residual, "flow_scale": flow_scale},
+                thresholds={"relative": _MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE, "absolute": preferred},
+                source_artifacts=("comsol_exports/global_timeseries.csv",),
+            )
+        )
+    return records
+
+
+def _solver_diagnostics(
+    metrics: Mapping[str, Any] | None,
+) -> list[validation_policy.DiagnosticRecord]:
+    """Return advisory diagnostics from final finite solver-progress evidence."""
+    if metrics is None:
+        return []
+    records: list[validation_policy.DiagnosticRecord] = []
+    for key, code, label in (
+        ("time_failures", "solver_time_failure_count_high", "time-step failures"),
+        ("nonlinear_failures", "solver_nonlinear_failure_count_high", "nonlinear failures"),
     ):
-        message = "Final Status temperature or relative-humidity extrema disagree with the actual final state."
-        raise ValueError(message)
-    _validate_global_bulk_moisture(
-        config,
-        static_fields,
-        state_time,
-        regular_fields,
-        exact_stop_fields,
-        global_values,
-        f_surf=f_surf,
-        time_tolerance=time_tolerance,
-    )
+        value = metrics.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            records.append(
+                validation_policy.diagnostic_record(
+                    code,
+                    severity="warning",
+                    stage="diagnostics",
+                    message=f"COMSOL reported {value} {label}; the solved output remains structurally admissible.",
+                    metrics={key: value},
+                    thresholds={"preferred_maximum": 0},
+                    source_artifacts=("runtime/stdout.log",),
+                )
+            )
+    step_size = metrics.get("step_size_seconds")
+    if isinstance(step_size, (int, float)) and not isinstance(step_size, bool) and np.isfinite(step_size) and step_size > 0.0:
+        records.append(
+            validation_policy.diagnostic_record(
+                "solver_step_size_small",
+                severity="info",
+                stage="diagnostics",
+                message="Final accepted COMSOL step size was recorded for later quality review.",
+                metrics={"final_step_size_seconds": float(step_size)},
+                thresholds={},
+                source_artifacts=("runtime/stdout.log",),
+                quality_flag=False,
+            )
+        )
+    return records
 
 
 def validate_float32_conversion(values: np.ndarray, *, rtol: float, atol: float, label: str) -> np.ndarray:
@@ -799,6 +959,7 @@ def _status(
     final_status: np.ndarray | None,
     global_values: np.ndarray | None,
     runtime_seconds: float,
+    diagnostics: Sequence[validation_policy.DiagnosticRecord],
 ) -> dict[str, Any]:
     """Derive status while retaining observed QA without a pass tolerance."""
     if transient_time is None or final_status is None or global_values is None:
@@ -852,6 +1013,17 @@ def _status(
         "contains_nan_or_inf": False,
         "field_shape_valid": True,
         "schedule_valid": None if transient_time is None else True,
+        "case_state": "successful",
+        "stages": {
+            "solver": "succeeded",
+            "exports": "succeeded",
+            "conversion": "succeeded",
+            "diagnostics": "complete_with_warnings" if diagnostics else "complete",
+            "publication": "pending",
+        },
+        "diagnostics": [dict(record) for record in diagnostics],
+        "quality_flags": [dict(record) for record in diagnostics if record["quality_flag"]],
+        "quality_flag_count": sum(record["quality_flag"] for record in diagnostics),
     }
 
 
@@ -1693,14 +1865,6 @@ def _validate_hdf5_schedule(
     if scientific.get("boundary_schedule") != {"startup_ramp": scientific_ramp}:
         msg = "COMSOL boundary handoff disagrees with active scientific startup identity."
         raise ValueError(msg)
-    schedule_service.validate_comsol_boundary_schedule(
-        values,
-        regular_times=np.asarray(scientific["time"]["regular_times"], dtype=np.float64),
-        startup_ramp={"enabled": enabled, "duration_h": duration_h},
-        initial_temperature=float(sampled_values["T_init"]),
-        pressure=p_ref,
-        metadata=metadata,
-    )
 
 
 def _complete_hdf5_time(
@@ -2095,6 +2259,7 @@ def convert_exports_to_hdf5(
     runtime_directory: Path,
     runtime_seconds: float,
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
+    solver_metrics: Mapping[str, Any] | None = None,
 ) -> CanonicalCase:
     """Validate all adapters and atomically create the sole canonical payload."""
     x_axis, y_axis, static_fields = _static_fields(config, exports)
@@ -2124,6 +2289,7 @@ def convert_exports_to_hdf5(
     schedule_values: np.ndarray | None = None
     global_values: np.ndarray | None = None
     final_status: np.ndarray | None = None
+    diagnostics: list[validation_policy.DiagnosticRecord] = _solver_diagnostics(solver_metrics)
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         transient_time, transient_fields, exact_stop_time, exact_stop_fields = _transient_fields(
             config,
@@ -2132,31 +2298,28 @@ def convert_exports_to_hdf5(
             y_axis=y_axis,
         )
         scalar_names = profiles.scalar_input_fields(config.profile.id)
-        p_ref = float(config.scientific_values["scientific_fixed_values"]["p_ref"])
         f_surf = float(scalar_values[scalar_names.index("f_surf")])
         schedule_values = _schedule_values(
             case_payload,
             work_directory,
-            p_ref=p_ref,
-            time_contract=config.scientific_values["time"],
-            startup_ramp=config.scientific_values["boundary_schedule"]["startup_ramp"],
-            initial_temperature=float(case_payload["sampled_values"]["T_init"]),
         )
         global_values = _ordered_values(config, exports, profiles.GLOBAL_EXPORT_ROLE, profiles.GLOBAL_FIELD_NAMES)
         if np.any(np.diff(global_values[:, 0]) <= 0):
             msg = "Global diagnostic time must be strictly increasing."
             raise ValueError(msg)
         final_status = _ordered_values(config, exports, profiles.FINAL_STATUS_EXPORT_ROLE, profiles.FINAL_STATUS_FIELDS)
-        _validate_transient_outputs(
-            config,
-            static_fields,
-            transient_time,
-            transient_fields,
-            exact_stop_time,
-            exact_stop_fields,
-            global_values,
-            final_status,
-            f_surf=f_surf,
+        diagnostics.extend(
+            _transient_output_diagnostics(
+                config,
+                static_fields,
+                transient_time,
+                transient_fields,
+                exact_stop_time,
+                exact_stop_fields,
+                global_values,
+                final_status,
+                f_surf=f_surf,
+            )
         )
     source_hashes = _source_hashes(exports)
     runtime_directory.mkdir(parents=True, exist_ok=True)
@@ -2195,6 +2358,7 @@ def convert_exports_to_hdf5(
         final_status=final_status,
         global_values=global_values,
         runtime_seconds=runtime_seconds,
+        diagnostics=diagnostics,
     )
     status_path = common.serialization.atomic_write_json(runtime_directory / "status.json", status)
     return CanonicalCase(

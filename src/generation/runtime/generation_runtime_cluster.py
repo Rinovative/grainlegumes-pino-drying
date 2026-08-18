@@ -155,8 +155,8 @@ def run_local_batch(
                 outcomes[case_index] = future.result()
             except Exception as error:  # noqa: BLE001 -- report independent local failures together
                 failures.append((case_index, error))
-    failure_limit = int(config.execution_values["runtime"]["maximum_failures"])
-    if len(failures) >= failure_limit:
+    failure_limit = int(config.execution_values["runtime"]["maximum_failed_cases"])
+    if len(failures) > failure_limit:
         details = "; ".join(f"{config.case_id(index)}: {error}" for index, error in sorted(failures))
         message = f"Local batch reached its failure limit after {len(failures)} case(s): {details}"
         raise RuntimeError(message) from failures[0][1]

@@ -56,6 +56,8 @@ REMOTE_CAMPAIGN_SUMMARY=""
 TRANSFER_SUMMARY=""
 DATASET_SUMMARY=""
 WORKFLOW_FAILURE_EVIDENCE=""
+CAMPAIGN_INTERRUPT_ACTIVE=false
+CAMPAIGN_INTERRUPT_COUNT=0
 
 usage() {
   cat >&2 <<EOF
@@ -70,8 +72,10 @@ Usage:
   $0 pilot-check CAMPAIGN [--cases-per-material N] [--keep-cpu-source] [options]
   $0 status [CAMPAIGN_RUN_ID] [remote options]
   $0 collect|build-datasets|resume CAMPAIGN_RUN_ID [options]
+  $0 retry-case CAMPAIGN_RUN_ID BATCH_NAME CASE_ID [remote options]
   $0 cleanup CAMPAIGN_RUN_ID [--confirm] [remote options]
-  $0 accounting|cancel|validate CAMPAIGN_RUN_ID [remote options]
+  $0 accounting|validate CAMPAIGN_RUN_ID [remote options]
+  $0 cancel CAMPAIGN_RUN_ID [--force] [remote options]
 
 Remote options:
   --cpu-host HOST       explicit override for the configured CPU site
@@ -150,6 +154,41 @@ generation_console_failure() {
 
 generation_console_final() {
   printf 'DONE: %s\n' "$*"
+}
+
+disarm_campaign_interrupt() {
+  CAMPAIGN_INTERRUPT_ACTIVE=false
+  trap - INT
+}
+
+campaign_interrupt_handler() {
+  [[ "${CAMPAIGN_INTERRUPT_ACTIVE}" == true && -n "${RUN_ID}" ]] || return 130
+  CAMPAIGN_INTERRUPT_COUNT=$(( CAMPAIGN_INTERRUPT_COUNT + 1 ))
+  if (( CAMPAIGN_INTERRUPT_COUNT == 1 )); then
+    printf '%s\n' \
+      'Graceful campaign cancellation requested.' \
+      'Press Ctrl+C again to force cancellation.' >&2
+    if ! remote_cli cancel-campaign "${RUN_ID}" \
+      --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null; then
+      generation_console_warning \
+        "graceful cancellation request failed; campaign state remains authoritative"
+    fi
+    return 0
+  fi
+  printf '%s\n' 'Force campaign cancellation requested.' >&2
+  if ! remote_cli cancel-campaign "${RUN_ID}" --force \
+    --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null; then
+    generation_console_warning \
+      "force cancellation request failed; inspect scheduler and campaign evidence"
+  fi
+  disarm_campaign_interrupt
+  exit 130
+}
+
+arm_campaign_interrupt() {
+  CAMPAIGN_INTERRUPT_COUNT=0
+  CAMPAIGN_INTERRUPT_ACTIVE=true
+  trap campaign_interrupt_handler INT
 }
 
 require_command() {
@@ -276,6 +315,15 @@ validate_run_id() {
 validate_benchmark_run_id() {
   [[ "$1" =~ ^core_scaling_transient__[0-9a-f]{16}$ ]] ||
     fail 2 "Malformed core benchmark run ID: $1"
+}
+
+validate_batch_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    fail 2 "Malformed campaign batch name: $1"
+}
+
+validate_case_id() {
+  [[ "$1" =~ ^case_[0-9]+$ ]] || fail 2 "Malformed Generation case ID: $1"
 }
 
 validate_positive() {
@@ -1174,8 +1222,24 @@ collect_campaign() {
   while IFS=$'\t' read -r kind field2 field3 field4 field5 field6 field7 extra; do
     [[ -z "${extra:-}" ]] || fail 1 "Malformed transfer plan."
     case "${kind}" in
-      campaign) directories+=("${field4}") ;;
-      batch) directories+=("${field5}" "${field6}" "${field7}") ;;
+      campaign)
+        [[ -n "${field2}" && -n "${field3}" && -n "${field4}" \
+          && -n "${field5}" && -z "${field6}" && -z "${field7}" ]] ||
+          fail 1 "Malformed campaign transfer-plan row."
+        directories+=("${field4}")
+        ;;
+      batch)
+        [[ -n "${field2}" && -n "${field3}" && -n "${field4}" \
+          && -n "${field5}" && -n "${field6}" && -n "${field7}" ]] ||
+          fail 1 "Malformed batch transfer-plan row."
+        directories+=("${field5}" "${field6}" "${field7}")
+        ;;
+      attempt)
+        [[ -n "${field2}" && -n "${field3}" && -z "${field4}" \
+          && -z "${field5}" && -z "${field6}" && -z "${field7}" ]] ||
+          fail 1 "Malformed attempt transfer-plan row."
+        directories+=("${field3}")
+        ;;
       *) fail 1 "Unknown transfer-plan row." ;;
     esac
   done <<< "${plan}"
@@ -1260,18 +1324,19 @@ wait_for_terminal_publication() {
   local console_index="${1:-5}" console_total="${2:-8}" console_label="${3:-Generation}"
   validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
   verify_remote_setup >/dev/null
+  arm_campaign_interrupt
   while true; do
     read_remote_source_status
     if [[ "${REMOTE_SOURCE_STATE}" == source_cleanup_complete ]]; then
       generation_console_progress campaign "${console_index}" "${console_total}" "${console_label}" REUSED \
         "source_cleanup_complete|0|False" \
         "campaign_run_id=${RUN_ID} source_cleanup_complete"
+      disarm_campaign_interrupt
       return
     fi
     if [[ "${ALLOW_REMOTE_RESUME}" == true ]]; then
       remote_cli resume-campaign "${RUN_ID}" \
         --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
-      ALLOW_REMOTE_RESUME=false
     else
       remote_cli feed-campaign "${RUN_ID}" \
         --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
@@ -1285,23 +1350,25 @@ wait_for_terminal_publication() {
       "${detail}" \
       "${REMOTE_CAMPAIGN_PROGRESS_SIGNATURE}|${CPU_BYTES_RETAINED}"
     case "${state}" in
-      publication_complete)
+      successful|transfer_complete)
         remote_cli validate-campaign-terminal "${RUN_ID}" \
           --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
+        disarm_campaign_interrupt
         return
         ;;
-      running|submitted|feeding|waiting_retry|submission_pending_or_unknown)
-        sleep "${STATUS_POLL_SECONDS}"
+      running|feeding|waiting_retry|submission_pending_or_unknown)
+        sleep "${STATUS_POLL_SECONDS}" || true
         ;;
-      completed)
-        remote_cli validate-campaign-terminal "${RUN_ID}" \
-          --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null
-        return
+      completed_with_failures)
+        disarm_campaign_interrupt
+        fail 1 $'No resumable cases remain.\nUse retry-case for an explicit failed or timed-out case.'
         ;;
-      failed|partially_failed|cancelled)
-        fail 1 "Campaign requires explicit resume from state ${state}."
+      cancelled)
+        disarm_campaign_interrupt
+        fail 1 "Campaign is cancelled; use resume to restart interrupted work from time zero."
         ;;
       *)
+        disarm_campaign_interrupt
         fail 1 "Campaign entered unsupported state: ${state}"
         ;;
     esac
@@ -1465,11 +1532,28 @@ workflow_failure_report() {
   WORKFLOW_FAILURE_EVIDENCE=""
   if [[ -n "${RUN_ID}" ]]; then
     resume="$(resume_command_text)"
-    if [[ -n "${LOCAL_STORAGE_ROOT:-}" ]]; then
-      WORKFLOW_FAILURE_EVIDENCE="$(local_cli record-workflow-failure "${RUN_ID}" \
+    local record kind canonical visible extra
+    if [[ -n "${LOCAL_STORAGE_ROOT:-}" ]] &&
+      record="$(local_cli record-workflow-failure "${RUN_ID}" \
         --storage-root "${LOCAL_STORAGE_ROOT}" --stage "${ALL_STAGE}" \
         --resume-command "${resume}" --cpu-bytes-retained "${CPU_BYTES_RETAINED}" \
-        2>/dev/null)" || WORKFLOW_FAILURE_EVIDENCE=""
+        --format tsv 2>/dev/null)"; then
+      IFS=$'\t' read -r kind canonical visible extra <<< "${record}"
+      if [[ "${kind}" == workflow-failure && -n "${canonical}" \
+        && -n "${visible}" && -z "${extra:-}" ]]; then
+        WORKFLOW_FAILURE_EVIDENCE="local canonical=${canonical} container=${visible}"
+      fi
+    fi
+    if [[ -z "${WORKFLOW_FAILURE_EVIDENCE}" ]] &&
+      record="$(remote_cli record-workflow-failure "${RUN_ID}" \
+        --storage-root "${REMOTE_STORAGE_ROOT}" --stage "${ALL_STAGE}" \
+        --resume-command "${resume}" --cpu-bytes-retained "${CPU_BYTES_RETAINED}" \
+        --format tsv 2>/dev/null)"; then
+      IFS=$'\t' read -r kind canonical visible extra <<< "${record}"
+      if [[ "${kind}" == workflow-failure && -n "${canonical}" \
+        && -n "${visible}" && -z "${extra:-}" ]]; then
+        WORKFLOW_FAILURE_EVIDENCE="CPU host=${CPU_HOST} canonical=${canonical} remote=${visible}"
+      fi
     fi
   else
     resume="$(all_command_text)"
@@ -1592,7 +1676,7 @@ continue_pilot_workflow() {
   ALL_STAGE="remote pilot terminal monitoring"
   wait_for_terminal_publication 8 12 "Generation"
   generation_console_stage 8 12 "Generation" OK \
-    "campaign_run_id=${RUN_ID} state=publication_complete"
+    "campaign_run_id=${RUN_ID} state=successful"
 
   ALL_STAGE="pilot source inventory, transfer, and hash validation"
   generation_console_stage 9 12 "GPU publication" RUNNING
@@ -1743,7 +1827,7 @@ continue_all_workflow() {
   ALL_STAGE="remote generation completion"
   wait_for_terminal_publication 6 9 "Generation"
   generation_console_stage 6 9 "Generation" OK \
-    "campaign_run_id=${RUN_ID} state=publication_complete"
+    "campaign_run_id=${RUN_ID} state=successful"
 
   ALL_STAGE="GPU collection and atomic publication"
   generation_console_stage 7 9 "GPU publication" RUNNING
@@ -2165,6 +2249,7 @@ EXECUTE_SETUP=false
 CONFIRM_CLEANUP=false
 DETACH=false
 KEEP_CPU_SOURCE=false
+FORCE_CANCEL=false
 SKIP_EXTREME_FAMILY_OOD=false
 ONLY_BATCH=""
 WALL_TIME=""
@@ -2184,6 +2269,7 @@ while (( $# > 0 )); do
     --git-commit) (( $# >= 2 )) || fail 2 "--git-commit requires a value."; REQUESTED_COMMIT="$2"; shift 2 ;;
     --execute) EXECUTE_SETUP=true; shift ;;
     --confirm) CONFIRM_CLEANUP=true; shift ;;
+    --force) FORCE_CANCEL=true; shift ;;
     --detach) DETACH=true; shift ;;
     --keep-cpu-source) KEEP_CPU_SOURCE=true; shift ;;
     --skip-extreme-family-ood) SKIP_EXTREME_FAMILY_OOD=true; shift ;;
@@ -2202,6 +2288,9 @@ if [[ "${SUBCOMMAND}" != pilot-check && -n "${PILOT_CASES_PER_MATERIAL}" ]]; the
 fi
 if [[ "${SUBCOMMAND}" != benchmark-cores && -n "${BENCHMARK_VARIANT}" ]]; then
   fail 2 "--variant is supported only by benchmark-cores."
+fi
+if [[ "${SUBCOMMAND}" != cancel && "${FORCE_CANCEL}" == true ]]; then
+  fail 2 "--force is supported only by cancel."
 fi
 if [[ "${SKIP_EXTREME_FAMILY_OOD}" == true ]]; then
   [[ "${SUBCOMMAND}" =~ ^(plan|launch|all)$ ]] ||
@@ -2260,6 +2349,20 @@ case "${SUBCOMMAND}" in
     resolve_local_commit
     storage_status_report
     ;;
+  retry-case)
+    (( ${#POSITIONAL[@]} == 3 )) ||
+      fail 2 "retry-case requires CAMPAIGN_RUN_ID BATCH_NAME CASE_ID."
+    RUN_ID="${POSITIONAL[0]}"
+    RETRY_BATCH_NAME="${POSITIONAL[1]}"
+    RETRY_CASE_ID="${POSITIONAL[2]}"
+    validate_run_id "${RUN_ID}"
+    validate_batch_name "${RETRY_BATCH_NAME}"
+    validate_case_id "${RETRY_CASE_ID}"
+    resolve_local_commit
+    resolve_remote_layout
+    remote_cli retry-case "${RUN_ID}" "${RETRY_BATCH_NAME}" \
+      "${RETRY_CASE_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
+    ;;
   collect|build-datasets|resume|cleanup|accounting|cancel|validate)
     (( ${#POSITIONAL[@]} == 1 )) || fail 2 "${SUBCOMMAND} requires one campaign-run ID."
     RUN_ID="${POSITIONAL[0]}"
@@ -2287,8 +2390,15 @@ case "${SUBCOMMAND}" in
         remote_cli campaign-accounting "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
         ;;
       cancel)
+        [[ "${CONFIRM_CLEANUP}" == false && "${DETACH}" == false \
+          && "${KEEP_CPU_SOURCE}" == false ]] ||
+          fail 2 "Unsupported cancel option."
         resolve_remote_layout
-        remote_cli cancel-campaign "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
+        cancel_arguments=(
+          cancel-campaign "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
+        )
+        [[ "${FORCE_CANCEL}" != true ]] || cancel_arguments+=(--force)
+        remote_cli "${cancel_arguments[@]}"
         ;;
       validate)
         resolve_remote_layout

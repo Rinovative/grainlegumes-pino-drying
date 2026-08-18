@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -322,10 +323,10 @@ elif [[ " $* " == *' campaign-status '* \
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; then
   state="$(next_campaign_state)"
   case "${state}" in
-    submitted) state_signature="$(printf '1%.0s' {1..64})" ;;
+    feeding) state_signature="$(printf '1%.0s' {1..64})" ;;
     running) state_signature="$(printf '2%.0s' {1..64})" ;;
-    publication_complete) state_signature="$(printf '3%.0s' {1..64})" ;;
-    failed|partially_failed|cancelled) state_signature="$(printf '4%.0s' {1..64})" ;;
+    successful|transfer_complete) state_signature="$(printf '3%.0s' {1..64})" ;;
+    completed_with_failures|cancelled) state_signature="$(printf '4%.0s' {1..64})" ;;
     *) state_signature="$(printf '5%.0s' {1..64})" ;;
   esac
   progress_signature="${state_signature}"
@@ -373,12 +374,15 @@ elif [[ " $* " == *' cleanup-campaign-source '* ]]; then
 elif [[ " $* " == *' validate-campaign-terminal '* ]]; then
   printf '%s\n' '{"status":"terminal"}'
 elif [[ " $* " == *' resume-campaign '* ]]; then
-  printf '%s\n' '{"state":"submitted"}'
+  printf '%s\n' '{"state":"active"}'
 elif [[ " $* " == *' campaign-accounting '* ]]; then
   printf '%s\n' '{"squeue":{"output":"12345_0|RUNNING|node-a"}}'
 elif [[ " $* " == *' cancel-campaign '* ]]; then
   printf '%s\n' '{"status":"cancel_requested"}'
 elif [[ " $* " == *' prepare-campaign-inputs'* ]]; then
+  if [[ "${FAKE_INPUT_PREPARATION_DELAY_SECONDS:-0}" != 0 ]]; then
+    sleep "${FAKE_INPUT_PREPARATION_DELAY_SECONDS}"
+  fi
   if [[ "${FAKE_INPUT_PREPARATION_FAIL:-false}" == true ]]; then
     printf '%s\n' 'Canonical inputs invalid for synthetic batch.' >&2
     exit 73
@@ -592,7 +596,10 @@ elif [[ " $* " == *' finalize-technical-smoke-evidence '* ]]; then
 elif [[ " $* " == *' finalize-real-smoke '* ]]; then
   printf '%s\n' '/workspace/storage/01_generation/meta/smoke_receipts/current.json'
 elif [[ " $* " == *' record-workflow-failure '* ]]; then
-  printf '%s\n' "${storage}/failure.json"
+  run_id="${arguments[3]}"
+  canonical="01_generation/meta/campaigns/${run_id}/workflow_failures/failure-0001.json"
+  printf 'workflow-failure\t%s\t%s/%s\n' \
+    "${canonical}" "${storage}" "${canonical}"
 fi
 """.replace("$", "$"),
     )
@@ -630,7 +637,7 @@ fi
             "FAKE_BENCHMARK_SIZE_BYTES": str(_BENCHMARK_SIZE_BYTES),
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
-            "FAKE_CAMPAIGN_STATE": "publication_complete",
+            "FAKE_CAMPAIGN_STATE": "successful",
             "FAKE_CAMPAIGN_STATUS_FAIL": "false",
             "FAKE_CAMPAIGN_STATES": "",
             "FAKE_CAMPAIGN_PROGRESS_SIGNATURES": "",
@@ -638,7 +645,7 @@ fi
             "FAKE_CAMPAIGN_STATE_INDEX_FILE": str(state_root / "campaign-state-index"),
             "FAKE_CONSOLE_TIMES": "",
             "FAKE_CONSOLE_TIME_INDEX_FILE": str(state_root / "console-time-index"),
-            "FAKE_SOURCE_STATE": "publication_complete",
+            "FAKE_SOURCE_STATE": "successful",
             "FAKE_AUTHORIZED_BYTES": str(_AUTHORIZED_BYTES),
             "FAKE_AUTHORIZATION_SHA": _AUTHORIZATION_SHA,
             "FAKE_TRANSFER_SHA": _TRANSFER_SHA,
@@ -677,6 +684,47 @@ def _run(
         text=True,
         env=environment,
     )
+
+
+def _wait_for_log(
+    path: Path,
+    needle: str,
+    *,
+    minimum_count: int = 1,
+    timeout_seconds: float = 10.0,
+) -> None:
+    """Wait until one fake-command log contains the requested evidence."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        if content.count(needle) >= minimum_count:
+            return
+        time.sleep(0.05)
+    message = f"Timed out waiting for {minimum_count} occurrence(s) of {needle!r}."
+    raise AssertionError(message)
+
+
+def _run_interruptible(
+    workflow: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+) -> subprocess.Popen[str]:
+    """Start one foreground workflow in its own test-owned process group."""
+    return subprocess.Popen(
+        [str(workflow), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        start_new_session=True,
+    )
+
+
+def _terminate_test_process(process: subprocess.Popen[str]) -> None:
+    """Force-stop one still-live test-owned workflow process group."""
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
 
 
 def _real_git(
@@ -788,7 +836,13 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
     meta_directory = f"01_generation/meta/batches/{batch_id}"
     raw_directory = f"01_generation/raw/{batch_id}"
     processed_directory = f"01_generation/processed/{batch_id}"
-    source_directories = (meta_directory, raw_directory, processed_directory)
+    attempt_directory = f"01_generation/attempts/{batch_id}/case_00001/{_RUN_ID}"
+    source_directories = (
+        meta_directory,
+        raw_directory,
+        processed_directory,
+        attempt_directory,
+    )
     for relative in (campaign_directory, *source_directories):
         (mirror / relative).mkdir(parents=True)
     (mirror / campaign_directory / "campaign_terminal.json").write_text(
@@ -798,13 +852,18 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
     (mirror / meta_directory / "batch_manifest.json").write_text("{}\n", encoding="utf-8")
     (mirror / raw_directory / "case_0001.txt").write_text("raw\n", encoding="utf-8")
     (mirror / processed_directory / "case_0001.txt").write_text("processed\n", encoding="utf-8")
+    (mirror / attempt_directory / "attempt.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
     environment["FAKE_TRANSFER_PLAN"] = (
         f"campaign\tsteady_flow_family_generalization\t{_COMMIT}\t{campaign_directory}"
         "\tconfigs/generation/campaigns/steady_flow/family_generalization.yaml\n"
         f"batch\t{_BATCH_NAME}\t{batch_id}\t1\t{meta_directory}\t{raw_directory}\t{processed_directory}\n"
+        f"attempt\t{_BATCH_NAME}\t{attempt_directory}\n"
     )
     Path(environment["FAKE_SOURCE_DIRECTORIES_FILE"]).write_text(
-        "\n".join(source_directories) + "\n",
+        "\n".join(source_directories[:3]) + "\n",
         encoding="utf-8",
     )
     return source_directories
@@ -860,7 +919,7 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "submitted,submitted,running,publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "feeding,feeding,running,successful"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     campaign = workflow.parent.parent / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
     assert not storage.exists()
@@ -872,9 +931,9 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("State: submitted") == 1
+    assert result.stdout.count("State: feeding") == 1
     assert result.stdout.count("State: running") == 1
-    assert "State: publication_complete" in result.stdout
+    assert "State: successful" in result.stdout
     assert f"Campaign: {_RUN_ID}" in result.stdout
     assert any(line.startswith("      case_0001") for line in result.stdout.splitlines())
     assert any(line.startswith("        phase=transient_drying") for line in result.stdout.splitlines())
@@ -889,6 +948,125 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
     assert prepare_index < plan_index < submit_index
     assert sum("submit-campaign" in line for line in command_lines) == 1
+
+
+def test_foreground_interrupts_request_graceful_then_force_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Route first and second Ctrl+C through the shared campaign owner."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATES"] = "running"
+    process = _run_interruptible(
+        workflow,
+        [
+            "all",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            "--keep-cpu-source",
+        ],
+        environment,
+    )
+    try:
+        _wait_for_log(log, " --format monitor ")
+        os.killpg(process.pid, signal.SIGINT)
+        _wait_for_log(log, " cancel-campaign ")
+        os.killpg(process.pid, signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        _terminate_test_process(process)
+
+    assert process.returncode != 0
+    assert stdout
+    assert stderr.count("Graceful campaign cancellation requested.") == 1
+    assert stderr.count("Press Ctrl+C again to force cancellation.") == 1
+    assert stderr.count("Force campaign cancellation requested.") == 1
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count(" cancel-campaign ") == 2
+    assert log_text.count(" --force") == 1
+
+
+def test_interrupt_before_campaign_launch_writes_no_cancellation_request(
+    tmp_path: Path,
+) -> None:
+    """Leave cancellation unarmed until a persisted campaign run ID exists."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_INPUT_PREPARATION_DELAY_SECONDS"] = "10"
+    process = _run_interruptible(
+        workflow,
+        [
+            "all",
+            str(_campaign(workflow)),
+            *_remote_options(),
+            "--keep-cpu-source",
+        ],
+        environment,
+    )
+    try:
+        _wait_for_log(log, " prepare-campaign-inputs ")
+        os.killpg(process.pid, signal.SIGINT)
+        _stdout, _stderr = process.communicate(timeout=10)
+    finally:
+        _terminate_test_process(process)
+
+    assert process.returncode != 0
+    log_text = log.read_text(encoding="utf-8")
+    assert " submit-campaign " not in log_text
+    assert " cancel-campaign " not in log_text
+
+
+def test_resume_reapplies_the_matrix_until_campaign_success(
+    tmp_path: Path,
+) -> None:
+    """Apply multiple replay or restart decisions without falling back to feed."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_SOURCE_STATE"] = "active"
+    environment["FAKE_CAMPAIGN_STATES"] = "feeding,feeding,successful"
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+
+    result = _run(
+        workflow,
+        ["resume", _RUN_ID, *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count(" resume-campaign ") == 3
+    assert " feed-campaign " not in log_text
+
+
+def test_public_cancel_force_and_retry_case_forward_exact_owners(
+    tmp_path: Path,
+) -> None:
+    """Expose force cancellation and one-case explicit retry without retry-all."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+
+    cancelled = _run(
+        workflow,
+        ["cancel", _RUN_ID, "--force", *_remote_options()],
+        environment,
+    )
+    retried = _run(
+        workflow,
+        [
+            "retry-case",
+            _RUN_ID,
+            _BATCH_NAME,
+            "case_00001",
+            *_remote_options(),
+        ],
+        environment,
+    )
+
+    assert cancelled.returncode == 0, cancelled.stderr
+    assert retried.returncode == 0, retried.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count(" cancel-campaign ") == 1
+    assert log_text.count(" --force") == 1
+    assert log_text.count(" retry-case ") == 1
+    assert " case_00001 " in log_text
+    assert "retry-all" not in log_text
 
 
 def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: Path) -> None:
@@ -957,7 +1135,7 @@ def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evid
     """Poll a retry-delay campaign until its later publication completes."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "waiting_retry,publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "waiting_retry,successful"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
 
@@ -968,7 +1146,7 @@ def test_waiting_retry_campaign_polling_reaches_publication_without_failure_evid
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.index("State: waiting_retry") < result.stdout.index("State: publication_complete")
+    assert result.stdout.index("State: waiting_retry") < result.stdout.index("State: successful")
     log_text = log.read_text(encoding="utf-8")
     assert sum("--format monitor" in line for line in log_text.splitlines()) == 2
     assert sum("validate-campaign-terminal" in line for line in log_text.splitlines()) == 1
@@ -980,7 +1158,7 @@ def test_unchanged_campaign_states_are_coalesced(tmp_path: Path) -> None:
     """Suppress repeated unchanged states while reporting a later state change."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "submitted,submitted,submitted,publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "feeding,feeding,feeding,successful"
     environment["FAKE_CONSOLE_TIMES"] = "1000,1299,1300,1301"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
 
@@ -991,9 +1169,9 @@ def test_unchanged_campaign_states_are_coalesced(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    submitted_lines = [line for line in result.stdout.splitlines() if "State: submitted" in line]
-    assert 0 < len(submitted_lines) < 3
-    assert "State: publication_complete" in result.stdout
+    feeding_lines = [line for line in result.stdout.splitlines() if "State: feeding" in line]
+    assert 0 < len(feeding_lines) < 3
+    assert "State: successful" in result.stdout
 
 
 def test_explicit_status_prints_campaign_summary_before_storage(tmp_path: Path) -> None:
@@ -1015,7 +1193,7 @@ def test_changed_solver_progress_is_rendered_only_after_the_minimum_interval(tmp
     """Show advancing solver evidence after 60 seconds without printing every poll."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "running,running,running,publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "running,running,running,successful"
     environment["FAKE_CAMPAIGN_PROGRESS_SIGNATURES"] = ",".join(("a" * 64, "b" * 64, "c" * 64, "d" * 64))
     environment["FAKE_PROGRESS_VALUES"] = "0.100,0.200,0.300,0.400"
     environment["FAKE_CONSOLE_TIMES"] = "1000,1030,1060,1061"
@@ -1711,7 +1889,7 @@ def test_remote_campaign_monitoring_binds_pinned_commit_to_status_and_feed(
     """Bind status and feeding to the same pinned remote Python source."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
-    environment["FAKE_CAMPAIGN_STATES"] = "publication_complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
 
     result = _run(
@@ -1822,7 +2000,7 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     assert collected.returncode == 0, collected.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
-    assert log_text.count("rsync-start") == 4
+    assert log_text.count("rsync-start") == 5
     assert f"<{storage}/01_generation/.state/transfer-staging/{_RUN_ID}.synthetic/>" in log_text
     assert "<cpu.example:/remote/generation root/storage/./" in log_text
     assert not any((storage / "01_generation/.state/transfer-staging").glob("*"))
@@ -1855,7 +2033,8 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
     )
 
     assert complete.returncode == 0, complete.stderr
-    assert all(not (mirror / relative).exists() for relative in source_directories)
+    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
+    assert (mirror / source_directories[3]).is_dir()
     log_text = log.read_text(encoding="utf-8")
     positions = [
         log_text.index("<publish-transferred-campaign>"),
@@ -1901,7 +2080,8 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
 
     assert failed.returncode != 0
     assert "dataset build" in failed.stderr.lower()
-    assert "/failure.json" in failed.stderr
+    assert "workflow_failures/failure-0001.json" in failed.stderr
+    assert "local canonical=" in failed.stderr
     assert "./scripts/generation_workflow.sh resume" in failed.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
     assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()
@@ -1917,7 +2097,8 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert resumed.returncode == 0, resumed.stderr
     after_resume = log.read_text(encoding="utf-8")
     assert after_resume.count("rsync-start") == first_log.count("rsync-start")
-    assert all(not (mirror / relative).exists() for relative in source_directories)
+    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
+    assert (mirror / source_directories[3]).is_dir()
 
     build_count = after_resume.count("<build-campaign-datasets>")
     cleanup_count = after_resume.count("cleanup-campaign-source")
@@ -1936,8 +2117,8 @@ def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None
     """Preserve source for partial failure and detached submit-only execution."""
     workflow, _log, environment, _storage, mirror = _harness(tmp_path)
     source_directories = _seed_transfer(mirror, environment)
-    environment["FAKE_CAMPAIGN_STATE"] = "partially_failed"
-    environment["FAKE_SOURCE_STATE"] = "partially_failed"
+    environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
+    environment["FAKE_SOURCE_STATE"] = "completed_with_failures"
     partial = _run(
         workflow,
         ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
@@ -1945,6 +2126,8 @@ def test_partial_remote_and_detached_modes_never_cleanup(tmp_path: Path) -> None
     )
 
     assert partial.returncode != 0
+    assert "No resumable cases remain." in partial.stderr
+    assert "Use retry-case for an explicit failed or timed-out case." in partial.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
 
     detached_root = tmp_path / "detached"

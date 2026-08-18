@@ -46,6 +46,7 @@ CPU_CLEANUP_SCHEMA_KIND: Final = "generation_cpu_source_cleanup"
 CPU_CLEANUP_TRANSACTION_SCHEMA_KIND: Final = "generation_cpu_source_cleanup_transaction"
 WORKFLOW_SCHEMA_VERSION: Final = 1
 _SHA256_LENGTH: Final = 64
+_SOURCE_CLEANUP_READY_CAMPAIGN_STATES: Final = frozenset({"successful", "transfer_complete"})
 _CLEANUP_RECEIPT_IDENTITY_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -1482,8 +1483,8 @@ def _cleanup_cpu_campaign_source_locked(
     if status["squeue"]["output"]:
         message = "CPU cleanup rejects an active campaign."
         raise RuntimeError(message)
-    if status["campaign_state"] != "publication_complete":
-        message = f"CPU cleanup requires a complete untransferred source publication, got {status['campaign_state']!r}."
+    if status["campaign_state"] not in _SOURCE_CLEANUP_READY_CAMPAIGN_STATES:
+        message = f"CPU cleanup requires a successful terminal source publication, got {status['campaign_state']!r}."
         raise RuntimeError(message)
     result = {
         "campaign_run_id": run_id,
@@ -1718,27 +1719,46 @@ def record_workflow_failure(
     resume_command: str,
     cpu_bytes_retained: int,
 ) -> Path:
-    """Persist one append-only compact all-workflow failure record."""
+    """Persist and re-admit one append-only compact workflow failure record."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
     safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
     if not stage or not resume_command or cpu_bytes_retained < 0:
         message = "Workflow failure evidence is incomplete."
         raise ValueError(message)
-    root = common.paths.get_generation_state_root(storage_root=storage) / "workflow-failures" / safe_id
-    root.mkdir(parents=True, exist_ok=True)
-    index = len(tuple(root.glob("failure-*.json"))) + 1
-    path = root / f"failure-{index:04d}.json"
-    receipt = {
-        "schema_kind": "generation_all_workflow_failure",
-        "schema_version": WORKFLOW_SCHEMA_VERSION,
-        "campaign_run_id": safe_id,
-        "stage": stage,
-        "resume_command": resume_command,
-        "cpu_bytes_retained": cpu_bytes_retained,
-        "recorded_at": _utc_now(),
-    }
-    common.serialization.atomic_write_json(path, receipt)
-    return path
+    campaign_evidence.load_campaign_run(safe_id, storage_root=storage)
+    root = (
+        campaign_evidence.campaign_run_directory(
+            safe_id,
+            storage_root=storage,
+        )
+        / "workflow_failures"
+    )
+    lock_path = common.paths.get_generation_state_root(storage_root=storage) / "workflow-failure-locks" / f"{safe_id}.lock"
+    with common.locking.exclusive_file_lock(lock_path, blocking=True):
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink():
+            message = f"Workflow failure evidence directory is unsafe: {root}"
+            raise ValueError(message)
+        indices = [
+            int(candidate.stem.removeprefix("failure-"))
+            for candidate in root.glob("failure-*.json")
+            if candidate.is_file() and not candidate.is_symlink() and candidate.stem.removeprefix("failure-").isdigit()
+        ]
+        path = root / f"failure-{max(indices, default=0) + 1:04d}.json"
+        receipt = {
+            "schema_kind": "generation_all_workflow_failure",
+            "schema_version": WORKFLOW_SCHEMA_VERSION,
+            "campaign_run_id": safe_id,
+            "stage": stage,
+            "resume_command": resume_command,
+            "cpu_bytes_retained": cpu_bytes_retained,
+            "recorded_at": _utc_now(),
+        }
+        common.serialization.atomic_write_json(path, receipt)
+        if _load_json(path, label="workflow failure receipt") != receipt:
+            message = f"Workflow failure receipt could not be re-admitted: {path}"
+            raise RuntimeError(message)
+    return path.resolve()
 
 
 def _manifest_source_directories(
@@ -1829,7 +1849,9 @@ def campaign_source_status(
         scheduler_error = str(error)
     terminal = (campaign_directory / "campaign_terminal.json").is_file()
     cleanup_eligibility = (
-        "requires_gpu_authorization" if terminal and active is False and scheduler_error is None and state == "publication_complete" else "ineligible"
+        "requires_gpu_authorization"
+        if terminal and active is False and scheduler_error is None and state in _SOURCE_CLEANUP_READY_CAMPAIGN_STATES
+        else "ineligible"
     )
     transfer_status = "gpu_receipt_present" if (campaign_directory / "transfer_complete.json").is_file() else "not_recorded_on_this_host"
     source_bytes = sum(int(record["size_bytes"]) for record in directory_records)

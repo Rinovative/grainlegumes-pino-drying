@@ -430,6 +430,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="cancel every persisted Slurm attempt",
     )
     cancel.add_argument("campaign_run_id")
+    cancel.add_argument("--force", action="store_true")
     _add_storage_arguments(cancel)
 
     feed = subparsers.add_parser(
@@ -441,10 +442,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     resume = subparsers.add_parser(
         "resume-campaign",
-        help="explicitly retry at most one failed campaign case",
+        help="advance one case through the campaign resume matrix",
     )
     resume.add_argument("campaign_run_id")
     _add_storage_arguments(resume)
+
+    retry_case = subparsers.add_parser(
+        "retry-case",
+        help="explicitly rerun one selected unresolved scientific case",
+    )
+    retry_case.add_argument("campaign_run_id")
+    retry_case.add_argument("batch_name")
+    retry_case.add_argument("case_id")
+    _add_storage_arguments(retry_case)
 
     interruption = subparsers.add_parser(
         "record-worker-interruption",
@@ -633,6 +643,11 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     workflow_failure.add_argument("--stage", required=True)
     workflow_failure.add_argument("--resume-command", required=True)
     workflow_failure.add_argument("--cpu-bytes-retained", type=int, required=True)
+    workflow_failure.add_argument(
+        "--format",
+        choices=("path", "json", "tsv"),
+        default="path",
+    )
     _add_storage_arguments(workflow_failure)
     return parser
 
@@ -822,8 +837,8 @@ def _campaign_summary(
             "runtime": campaign.execution_values["runtime"],
             "submission": campaign.execution_values["submission"],
             "cluster": campaign.execution_values["cluster"],
-            "retention_profile": campaign.execution_values["retention_profile"],
-            "retention": campaign.execution_values["retention"],
+            "retention_policy": campaign.execution_values["retention_policy"],
+            "retention_profiles": campaign.execution_values["retention_profiles"],
         },
         "unresolved_readiness_gates": unresolved_gates,
         "executable": not any(unresolved_gates.values()),
@@ -1215,6 +1230,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         receipt = campaign_runtime.cancel_campaign(
             args.campaign_run_id,
             storage_root=args.storage_root,
+            force=args.force,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
@@ -1228,6 +1244,15 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "resume-campaign":
         manifest = campaign_runtime.resume_campaign(
             args.campaign_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(manifest, sort_keys=True))
+        return 0
+    if args.command == "retry-case":
+        manifest = campaign_runtime.retry_campaign_case(
+            args.campaign_run_id,
+            args.batch_name,
+            args.case_id,
             storage_root=args.storage_root,
         )
         print(json.dumps(manifest, sort_keys=True))
@@ -1291,6 +1316,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                         )
                     )
                 )
+                for attempt_directory in batch["attempt_directories"]:
+                    print(
+                        "\t".join(
+                            (
+                                "attempt",
+                                batch["batch_name"],
+                                attempt_directory,
+                            )
+                        )
+                    )
         return 0
     if args.command == "validate-published-campaign":
         receipt = campaign_runtime.validate_transferred_campaign(
@@ -1537,7 +1572,33 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             resume_command=args.resume_command,
             cpu_bytes_retained=args.cpu_bytes_retained,
         )
-        print(path)
+        storage = workspace_service.resolve_storage_root(
+            args.storage_root,
+            create=False,
+        )
+        canonical_path = path.relative_to(storage).as_posix()
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "canonical_storage_path": canonical_path,
+                        "container_visible_path": str(path),
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif args.format == "tsv":
+            print(
+                "	".join(
+                    (
+                        "workflow-failure",
+                        canonical_path,
+                        str(path),
+                    )
+                )
+            )
+        else:
+            print(canonical_path)
         return 0
     if args.command == "run-campaign-case":
         outcome = campaign_runtime.run_campaign_case_job(

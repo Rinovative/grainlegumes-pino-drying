@@ -45,6 +45,8 @@ class PreparedCase:
     work_root: Path
     workspace_run_id: str
     workspace_marker: Path
+    input_generation_id: str
+    canonical_raw_directory: Path
     model_path: Path
     exports_directory: Path
     runtime_directory: Path
@@ -80,14 +82,24 @@ def _materialize_canonical_raw_bundle(
     work_directory: Path,
     *,
     storage_root: Path,
-) -> case_service.CaseBundle:
+    input_generation_id: str | None,
+) -> tuple[case_service.CaseBundle, str, Path]:
     """Copy an exactly admitted persisted raw case into isolated scratch."""
     case_id = config.case_id(case_index)
     try:
-        reference = input_service.admit_configured_input_case(
-            config,
-            case_index,
-            storage_root=storage_root,
+        reference = (
+            input_service.admit_configured_input_case(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            if input_generation_id is None
+            else input_service.admit_persisted_input_case(
+                config,
+                case_index,
+                input_generation_id,
+                storage_root=storage_root,
+            )
         )
     except (FileNotFoundError, FileExistsError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = (
@@ -122,14 +134,18 @@ def _materialize_canonical_raw_bundle(
     scalar_handoff = (
         None if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE else scalar_handoff_contract.admit_case_scalar_handoff(payload, work_directory)
     )
-    return case_service.CaseBundle(
-        directory=work_directory,
-        case_id=case_id,
-        case_input_id=str(payload["case_input_id"]),
-        simulation_case_id=str(payload["simulation_case_id"]),
-        case_payload=payload,
-        input_paths=tuple(input_paths),
-        scalar_handoff=scalar_handoff,
+    return (
+        case_service.CaseBundle(
+            directory=work_directory,
+            case_id=case_id,
+            case_input_id=str(payload["case_input_id"]),
+            simulation_case_id=str(payload["simulation_case_id"]),
+            case_payload=payload,
+            input_paths=tuple(input_paths),
+            scalar_handoff=scalar_handoff,
+        ),
+        reference.source_id,
+        reference.case_directory.resolve(),
     )
 
 
@@ -139,8 +155,15 @@ def prepare_case_work_directory(
     *,
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
+    input_generation_id: str | None = None,
 ) -> PreparedCase:
-    """Prepare a fresh case directory beside a digest-verified disposable model."""
+    """
+    Prepare a fresh case directory beside a digest-verified disposable model.
+
+    A supplied input-generation identity selects an already admitted historical
+    source for postprocessing replay. Normal solver execution omits it and stays
+    bound to the exact active source commit.
+    """
     case_id = config.case_id(case_index)
     _require_template_digest(
         config.template_path,
@@ -157,11 +180,16 @@ def prepare_case_work_directory(
     run_id = workspace_service.workspace_run_id(config)
     model_path = work_directory / comsol_service.WORK_MODEL_FILENAME
     try:
-        bundle = _materialize_canonical_raw_bundle(
+        (
+            bundle,
+            admitted_input_generation_id,
+            canonical_raw_directory,
+        ) = _materialize_canonical_raw_bundle(
             config,
             case_index,
             work_directory,
             storage_root=storage,
+            input_generation_id=input_generation_id,
         )
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(
@@ -192,6 +220,8 @@ def prepare_case_work_directory(
         work_root=root,
         workspace_run_id=run_id,
         workspace_marker=marker_path,
+        input_generation_id=admitted_input_generation_id,
+        canonical_raw_directory=canonical_raw_directory,
         model_path=model_path,
         exports_directory=exports_directory,
         runtime_directory=runtime_directory,

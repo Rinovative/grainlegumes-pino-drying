@@ -9,6 +9,7 @@ Provides:
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
 - progress: non-authoritative case runtime progress parsing and persistence
+- stop: controlled COMSOL status-file stop and force escalation
 - workspace: bounded scratch and publication staging
 - PUBLICATION_SCHEMA_VERSION: canonical case-publication schema version
 - CASE_FAILURE_SCHEMA_KIND: canonical persisted case-failure schema kind
@@ -27,7 +28,9 @@ Provides:
 - PreparedCase: prepared isolated case workspace
 - reset_runtime_cancellation: clear worker cancellation state
 - runtime_cancellation_requested: inspect worker cancellation state
-- request_runtime_cancellation: cancel active worker solvers
+- request_runtime_cancellation: gracefully stop active worker solvers
+- request_runtime_force_cancellation: force-stop active worker solvers
+- replay_case_postprocessing: conversion/publication replay without COMSOL
 - case_lock_path: persistent case-lock path resolution
 - raw_case_directory: canonical raw case-directory resolution
 - processed_case_directory: canonical processed case-directory resolution
@@ -65,6 +68,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
     from . import generation_runtime_progress as progress
+    from . import generation_runtime_stop as stop
     from . import generation_runtime_workspace as workspace
     from .generation_runtime_batch import (
         CASE_FAILURE_SCHEMA_KIND,
@@ -96,10 +100,13 @@ if TYPE_CHECKING:
         publish_completed_case,
         raw_case_directory,
         record_case_failure,
+        replay_case_postprocessing,
         request_runtime_cancellation,
+        request_runtime_force_cancellation,
         reset_runtime_cancellation,
         run_case,
         runtime_cancellation_requested,
+        runtime_force_cancellation_requested,
         validate_completed_case,
         validate_terminal_batch,
     )
@@ -118,6 +125,7 @@ _MODULES = {
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
     "progress": "generation_runtime_progress",
+    "stop": "generation_runtime_stop",
     "workspace": "generation_runtime_workspace",
 }
 _BATCH_EXPORTS = frozenset(
@@ -151,10 +159,13 @@ _BATCH_EXPORTS = frozenset(
         "publish_completed_case",
         "raw_case_directory",
         "record_case_failure",
+        "replay_case_postprocessing",
         "request_runtime_cancellation",
+        "request_runtime_force_cancellation",
         "reset_runtime_cancellation",
         "run_case",
         "runtime_cancellation_requested",
+        "runtime_force_cancellation_requested",
         "validate_completed_case",
         "validate_terminal_batch",
     }
@@ -208,11 +219,15 @@ __all__ = [
     "publish_completed_case",
     "raw_case_directory",
     "record_case_failure",
+    "replay_case_postprocessing",
     "request_runtime_cancellation",
+    "request_runtime_force_cancellation",
     "reset_runtime_cancellation",
     "resolve_comsol_executable",
     "run_case",
     "runtime_cancellation_requested",
+    "runtime_force_cancellation_requested",
+    "stop",
     "validate_completed_case",
     "validate_terminal_batch",
     "workspace",

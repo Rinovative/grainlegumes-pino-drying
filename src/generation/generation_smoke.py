@@ -397,8 +397,8 @@ def _case_evidence(
     ):
         message = f"Technical smoke case lacks successful native Slurm evidence: {config.case_id(case_index)}."
         raise RuntimeError(message)
-    if not config.execution_values["retention"]["retain_raw_csv"] or not config.execution_values["retention"]["retain_solved_model"]:
-        message = "Technical smoke execution must retain raw CSV and solved model evidence."
+    if config.execution_values["retention_policy"] != "full":
+        message = "Technical smoke execution must use full attempt and solved-model retention."
         raise RuntimeError(message)
     solved = processed / comsol_service.RETAINED_MODEL_FILENAME
     if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:

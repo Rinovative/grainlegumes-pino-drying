@@ -135,6 +135,11 @@ def get_generation_processed_root(*, storage_root: Path | str | None = None) -> 
     return get_generation_root(storage_root=storage_root) / "processed"
 
 
+def get_generation_attempts_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return durable unsuccessful-attempt and replay evidence."""
+    return get_generation_root(storage_root=storage_root) / "attempts"
+
+
 def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the transient generation-coordination state root."""
     return get_generation_root(storage_root=storage_root) / ".state"
@@ -289,6 +294,43 @@ def resolve_generation_comsol_exports_directory(
             storage_root=storage_root,
         )
         / "comsol_exports"
+    )
+
+
+def resolve_generation_attempt_case_directory(
+    batch_storage_name: str,
+    case_id: str,
+    campaign_run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one campaign-scoped case attempt history directory."""
+    batch = validate_logical_name(batch_storage_name, label="batch_storage_name")
+    case = validate_logical_name(case_id, label="case_id")
+    campaign = validate_logical_name(campaign_run_id, label="campaign_run_id")
+    return get_generation_attempts_root(storage_root=storage_root) / batch / case / campaign
+
+
+def resolve_generation_attempt_directory(
+    batch_storage_name: str,
+    case_id: str,
+    campaign_run_id: str,
+    attempt_index: int,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one immutable indexed attempt directory."""
+    if isinstance(attempt_index, bool) or not isinstance(attempt_index, int) or attempt_index < 1:
+        message = f"attempt_index must be a positive integer, got {attempt_index!r}."
+        raise ValueError(message)
+    return (
+        resolve_generation_attempt_case_directory(
+            batch_storage_name,
+            case_id,
+            campaign_run_id,
+            storage_root=storage_root,
+        )
+        / f"attempt_{attempt_index:04d}"
     )
 
 

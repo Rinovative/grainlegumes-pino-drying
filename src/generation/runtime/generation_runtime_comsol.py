@@ -20,7 +20,6 @@ This module does NOT:
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
 from src.generation.contracts import generation_contracts_profiles as profiles
@@ -80,15 +79,11 @@ def _comsol_parameter_arguments(
 
 
 def _save_arguments(config: config_contract.GenerationConfig) -> list[str]:
-    """Return exactly one save mode from the validated retention state."""
-    retention = config.execution_values.get("retention")
-    retain_solved_model = retention.get("retain_solved_model") if isinstance(retention, Mapping) else None
-    if not isinstance(retain_solved_model, bool):
-        message = "execution.retention.retain_solved_model must be boolean for COMSOL execution."
+    """Use the fixed output model required by controlled status-file stopping."""
+    if config.execution_values.get("retention_policy") not in {"full", "compact"}:
+        message = "execution.retention_policy must be resolved before COMSOL execution."
         raise TypeError(message)
-    if retain_solved_model:
-        return ["-outputfile", RETAINED_MODEL_FILENAME]
-    return ["-nosave"]
+    return ["-outputfile", RETAINED_MODEL_FILENAME]
 
 
 def build_comsol_command(

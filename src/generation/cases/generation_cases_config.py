@@ -59,6 +59,7 @@ _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL = 1.0e-10
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_RTOL = 1.0e-5
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_ATOL = 1.0e-9
 _STORAGE_COMPONENT_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
+_WALL_TIME_PATTERN = re.compile(r"([0-9]+):([0-5][0-9]):([0-5][0-9])")
 PILOT_CASE_KINDS = ("nominal_reference", "natural_pilot")
 _FINAL_PHYSICAL_FORMULAS = {
     "w_surf_balance": "f_surf*d(w_surf)/dt = j_int - m_evap",
@@ -1785,6 +1786,24 @@ def _safe_text_or_none(value: Any, *, label: str) -> str | None:
     return value
 
 
+def _validated_wall_time(value: Any, *, timeout_seconds: float) -> str:
+    """Return a bounded HH:MM:SS outer wall time beyond the attempt budget."""
+    text = _safe_text_or_none(value, label="execution.cluster.wall_time")
+    if text is None:
+        message = "execution.cluster.wall_time must use HH:MM:SS with a bounded outer safety margin."
+        raise GenerationConfigError(message)
+    match = _WALL_TIME_PATTERN.fullmatch(text)
+    if match is None:
+        message = "execution.cluster.wall_time must use HH:MM:SS with a bounded outer safety margin."
+        raise GenerationConfigError(message)
+    hours, minutes, seconds = (int(part) for part in match.groups())
+    wall_seconds = hours * 3_600 + minutes * 60 + seconds
+    if wall_seconds <= timeout_seconds:
+        message = "execution.cluster.wall_time must exceed the complete runtime timeout."
+        raise GenerationConfigError(message)
+    return text
+
+
 def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     """Validate authored execution owners and derive repeated runtime fields."""
     execution = _mapping(value, label="generation execution configuration")
@@ -1828,7 +1847,8 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         runtime,
         required={
             "timeout_seconds",
-            "maximum_failures",
+            "graceful_stop_reserve_seconds",
+            "maximum_failed_cases",
             "extra_arguments",
             "temporary_license_retry",
         },
@@ -1836,13 +1856,17 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         label="execution.runtime",
     )
     runtime["timeout_seconds"] = _finite(runtime["timeout_seconds"], label="execution.runtime.timeout_seconds")
-    if runtime["timeout_seconds"] <= 0:
-        msg = "execution.runtime.timeout_seconds must be positive."
-        raise GenerationConfigError(msg)
-    runtime["maximum_failures"] = _integer(
-        runtime["maximum_failures"],
-        label="execution.runtime.maximum_failures",
-        minimum=1,
+    runtime["graceful_stop_reserve_seconds"] = _finite(
+        runtime["graceful_stop_reserve_seconds"],
+        label="execution.runtime.graceful_stop_reserve_seconds",
+    )
+    if not 0.0 < runtime["graceful_stop_reserve_seconds"] < runtime["timeout_seconds"]:
+        message = "execution.runtime.graceful_stop_reserve_seconds must be positive and shorter than timeout_seconds."
+        raise GenerationConfigError(message)
+    runtime["maximum_failed_cases"] = _integer(
+        runtime["maximum_failed_cases"],
+        label="execution.runtime.maximum_failed_cases",
+        minimum=0,
     )
     retry = _mapping(
         runtime["temporary_license_retry"],
@@ -1899,14 +1923,12 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
 
     retention_profiles = _mapping(execution["retention"], label="execution.retention")
     _exact_keys(retention_profiles, required=set(CAMPAIGN_PURPOSES), optional=set(), label="execution.retention")
-    normalized_retention: dict[str, dict[str, bool]] = {}
+    normalized_retention: dict[str, str] = {}
     for purpose, raw in retention_profiles.items():
-        retention = _mapping(raw, label=f"execution.retention.{purpose}")
-        _exact_keys(retention, required={"retain_raw_csv", "retain_solved_model"}, optional=set(), label=f"execution.retention.{purpose}")
-        if not all(isinstance(retention[key], bool) for key in retention):
-            msg = f"execution.retention.{purpose} controls must be boolean."
-            raise TypeError(msg)
-        normalized_retention[purpose] = retention
+        if raw not in {"full", "compact"}:
+            message = f"execution.retention.{purpose} must be 'full' or 'compact'."
+            raise GenerationConfigError(message)
+        normalized_retention[purpose] = raw
 
     submission = _mapping(execution["submission"], label="execution.submission")
     _exact_keys(
@@ -1945,7 +1967,10 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         label="execution.cluster.cores_per_case",
         minimum=1,
     )
-    cluster["wall_time"] = _safe_text_or_none(cluster["wall_time"], label="execution.cluster.wall_time")
+    cluster["wall_time"] = _validated_wall_time(
+        cluster["wall_time"],
+        timeout_seconds=float(runtime["timeout_seconds"]),
+    )
     options = cluster["scheduler_options"]
     if not isinstance(options, list) or not all(isinstance(item, str) and item.startswith("--") for item in options):
         msg = "execution.cluster.scheduler_options must be long scheduler arguments."
@@ -1962,8 +1987,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
 
     execution["site"] = site
     execution["runtime"] = runtime
-    execution["retention_profile"] = campaign_purpose
-    execution["retention"] = normalized_retention[campaign_purpose]
+    execution["retention_policy"] = normalized_retention[campaign_purpose]
     execution["retention_profiles"] = normalized_retention
     execution["submission"] = submission
     execution["cluster"] = cluster

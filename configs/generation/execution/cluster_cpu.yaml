@@ -2,7 +2,8 @@ schema_kind: generation_execution
 schema_version: 1
 runtime:
   timeout_seconds: 3600
-  maximum_failures: 1
+  graceful_stop_reserve_seconds: 300
+  maximum_failed_cases: 5
   extra_arguments: []
   temporary_license_retry:
     enabled: true
@@ -10,22 +11,16 @@ runtime:
     maximum_delay_seconds: 300
     maximum_wait_seconds: 3600
 retention:
-  family_generalization:
-    retain_raw_csv: false
-    retain_solved_model: false
-  technical_runtime_smoke:
-    retain_raw_csv: true
-    retain_solved_model: true
-  pilot_check:
-    retain_raw_csv: true
-    retain_solved_model: true
+  family_generalization: compact
+  technical_runtime_smoke: full
+  pilot_check: full
 submission:
-  pending_buffer: 1
+  pending_buffer: 2
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:
   cores_per_case: 16
-  wall_time: null
+  wall_time: "01:05:00"
   scheduler_options: []
 site:
   cpu_host: sricehpc01

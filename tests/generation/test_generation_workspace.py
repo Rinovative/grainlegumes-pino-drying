@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from src import common, generation
+from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_preparation as preparation
 from src.generation.runtime import generation_runtime_workspace as workspace
@@ -197,7 +198,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
 
 
 @pytest.mark.integration
-def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
+def test_interrupted_case_persists_attempt_and_remains_rerunnable(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -240,17 +241,48 @@ def test_interrupted_case_persists_cancelled_evidence_and_remains_rerunnable(
             work_root=tmp_path / "work",
         )
     assert not observed["work"].exists()
-    failure = json.loads(
-        generation.runtime.case_failure_path(
-            config,
-            1,
-            storage_root=storage,
-        ).read_text(encoding="utf-8")
+    first = attempt_service.latest_case_attempt(
+        config,
+        1,
+        config.batch_id,
+        storage_root=storage,
     )
-    assert failure["state"] == "cancelled"
-    assert failure["scratch_cleanup"]["status"] == "complete"
+    assert first is not None
+    assert first.payload["case_state"] == "interrupted"
+    assert first.payload["attempt_index"] == 1
+    first_cleanup = attempt_service.attempt_cleanup_evidence(first)
+    assert first_cleanup is not None
+    assert first_cleanup["status"] == "complete"
+    first_receipt = first.receipt_path.read_bytes()
+    assert not generation.runtime.case_failure_path(
+        config,
+        1,
+        storage_root=storage,
+    ).exists()
     assert not generation.runtime.completed_case_is_valid(
         config,
         1,
         storage_root=storage,
     )
+
+    with pytest.raises(KeyboardInterrupt):
+        generation.runtime.run_case(
+            config,
+            1,
+            cores_per_case=1,
+            storage_root=storage,
+            work_root=tmp_path / "work",
+        )
+    second = attempt_service.latest_case_attempt(
+        config,
+        1,
+        config.batch_id,
+        storage_root=storage,
+    )
+    assert second is not None
+    assert second.payload["case_state"] == "interrupted"
+    assert second.payload["attempt_index"] == first.payload["attempt_index"] + 1
+    second_cleanup = attempt_service.attempt_cleanup_evidence(second)
+    assert second_cleanup is not None
+    assert second_cleanup["status"] == "complete"
+    assert first.receipt_path.read_bytes() == first_receipt

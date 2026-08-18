@@ -148,6 +148,84 @@ def configured_input_generation_id(
     return str(_manifest_base(config, _resolved_config(config))["input_generation_id"])
 
 
+def admit_persisted_input_case(
+    config: config_service.GenerationConfig,
+    case_index: int,
+    input_generation_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> admission_service.InputCaseReference:
+    """
+    Admit one persisted input case against its immutable scientific identity.
+
+    Parameters
+    ----------
+    config : GenerationConfig
+        Active scientific configuration used to validate stable case identity.
+    case_index : int
+        Configured case member to admit.
+    input_generation_id : str
+        Persisted generation identity, including its original source commit.
+    storage_root : Path | str | None, optional
+        Canonical storage root override.
+
+    Returns
+    -------
+    InputCaseReference
+        Exact persisted case reference admitted through its batch manifest.
+
+    Raises
+    ------
+    RuntimeError
+        If the persisted source disagrees with the active scientific identity.
+
+    Notes
+    -----
+    Source commit is intentionally owned by the persisted input generation.
+    This permits postprocessing replay under newer code without rebinding the
+    solver inputs to that newer processing commit.
+
+    """
+    case_id = config.case_id(case_index)
+    generation_id = common.paths.validate_logical_name(
+        input_generation_id,
+        label="input_generation_id",
+    )
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name,
+        generation_id,
+        storage_root=storage_root,
+    )
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name,
+        generation_id,
+        storage_root=storage_root,
+    )
+    source = admission_service.admit_input_batch_source(
+        metadata_directory,
+        raw_directory=raw_directory,
+        expected_input_generation_id=generation_id,
+    )
+    expected = {
+        "source_id": generation_id,
+        "profile_id": config.profile.id,
+        "batch_id": config.batch_id,
+        "batch_storage_name": config.batch_storage_name,
+        "batch_identity": config.batch_identity,
+        "material_family": config.material_family,
+        "sampling_regime": config.sampling_regime,
+        "campaign_purpose": config.scientific_values["campaign_purpose"],
+    }
+    if any(getattr(source, key) != value for key, value in expected.items()):
+        message = f"Persisted input generation disagrees with the active scientific configuration: {metadata_directory}"
+        raise RuntimeError(message)
+    matches = tuple(reference for reference in source.cases if reference.case_id == case_id)
+    if len(matches) != 1 or matches[0].case_index != case_index:
+        message = f"Persisted input manifest does not declare exactly one {case_id}."
+        raise RuntimeError(message)
+    return matches[0]
+
+
 def select_case_indices(
     config: config_service.GenerationConfig,
     case_count: int,

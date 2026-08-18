@@ -372,9 +372,9 @@ def _scheduler_options(value: object) -> tuple[str, ...]:
 def _production_like_benchmark_config(
     config: config_service.GenerationConfig,
 ) -> config_service.GenerationConfig:
-    """Return the benchmark execution view with production-equivalent no-save semantics."""
+    """Return the benchmark execution view with compact Production retention."""
     execution = copy.deepcopy(config.execution_values)
-    execution["retention"]["retain_solved_model"] = False
+    execution["retention_policy"] = "compact"
     return replace(config, execution_values=execution)
 
 
@@ -511,8 +511,8 @@ def load_core_benchmark_suite(
     if production_campaign.profile.id != profiles.TRANSIENT_DRYING_PROFILE:
         message = "Core benchmark production interpretation requires a transient campaign."
         raise ValueError(message)
-    if production_campaign.execution_values["retention"]["retain_solved_model"] is not False:
-        message = "Core benchmark production interpretation requires no-save production execution."
+    if production_campaign.execution_values["retention_policy"] != "compact":
+        message = "Core benchmark production interpretation requires compact retention."
         raise ValueError(message)
 
     if site["scheduler"] != "slurm":

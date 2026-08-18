@@ -163,8 +163,8 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         executable: Path | None = None,
         timeout: float = 5.0,
         scheduler_kind: str = "local",
-        retain_solved_model: bool = False,
-        retain_raw_csv: bool = False,
+        retain_solved_model: bool | None = None,
+        retain_raw_csv: bool | None = None,
         repeated_airflow_times: bool = False,
         extra_arguments: tuple[str, ...] = (),
         natural_count: int = _SMOKE_CASE_COUNT,
@@ -200,11 +200,13 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         profile["template"] = template_relative_path
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
         execution["runtime"]["timeout_seconds"] = timeout
+        execution["runtime"]["graceful_stop_reserve_seconds"] = float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0
         execution["runtime"]["extra_arguments"] = list(extra_arguments)
-        execution["retention"]["technical_runtime_smoke"] = {
-            "retain_raw_csv": retain_raw_csv,
-            "retain_solved_model": retain_solved_model,
-        }
+        if retain_raw_csv is None and retain_solved_model is None:
+            retention_policy = "full" if campaign_purpose in {"technical_runtime_smoke", "pilot_check"} else "compact"
+        else:
+            retention_policy = "full" if retain_raw_csv or retain_solved_model else "compact"
+        execution["retention"][campaign_purpose] = retention_policy
         execution["submission"].update(
             {
                 "pending_buffer": 1,
@@ -212,10 +214,12 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 "max_running_cases": max_running_cases,
             }
         )
+        wall_seconds = max(1, int(float(timeout))) + 300
+        wall_time = f"{wall_seconds // 3600:02d}:{(wall_seconds % 3600) // 60:02d}:{wall_seconds % 60:02d}"
         execution["cluster"].update(
             {
                 "cores_per_case": 1,
-                "wall_time": None,
+                "wall_time": wall_time,
                 "scheduler_options": [],
             }
         )

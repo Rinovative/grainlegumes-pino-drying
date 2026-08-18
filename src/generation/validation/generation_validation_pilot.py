@@ -24,7 +24,6 @@ import csv
 import io
 import json
 import math
-import shutil
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final
 from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.publication import generation_publication_storage as storage_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
@@ -72,6 +72,7 @@ _FAILURE_STAGE_RESULT_CLASS: Final = {
     "input": "INPUT_FAILED",
     "solver": "SOLVER_FAILED",
     "export": "EXPORT_FAILED",
+    "exports": "EXPORT_FAILED",
     "conversion": "CONVERSION_FAILED",
     "invalid_result": "INVALID_RESULT",
 }
@@ -329,124 +330,161 @@ def _file_records(files: Iterable[Path], *, storage_root: Path) -> list[dict[str
     return records
 
 
-def _validate_owned_directory(path: Path, *, owner: Path, label: str) -> None:
-    """Reject traversal, symlink, and non-directory states below one owned root."""
-    if not owner.is_dir() or owner.is_symlink():
-        message = f"{label} owner is missing or unsafe: {owner}"
-        raise ValueError(message)
-    try:
-        relative = path.relative_to(owner)
-    except ValueError as error:
-        message = f"{label} escapes its owned root: {path}"
-        raise ValueError(message) from error
-    current = owner
-    for part in relative.parts:
-        current /= part
-        if current.is_symlink():
-            message = f"{label} contains a symbolic-link component: {current}"
+def _attempt_artifact_records(
+    attempt: attempt_service.AttemptEvidence,
+) -> list[dict[str, Any]]:
+    """Hash every ordinary attempt file except its canonical receipt."""
+    records: list[dict[str, Any]] = []
+    for candidate in sorted(attempt.directory.rglob("*")):
+        if candidate.is_symlink():
+            message = f"Pilot attempt evidence contains a symbolic link: {candidate}"
             raise ValueError(message)
-    if not path.resolve().is_relative_to(owner.resolve()):
-        message = f"{label} resolves outside its owned root: {path}"
-        raise ValueError(message)
-    if path.exists() and not path.is_dir():
-        message = f"{label} is not a directory: {path}"
-        raise ValueError(message)
-    if path.is_dir():
-        for item in path.rglob("*"):
-            if item.is_symlink():
-                message = f"{label} contains a symbolic link: {item}"
-                raise ValueError(message)
-
-
-def _copy_failure_evidence(
-    *,
-    source: Path,
-    source_artifacts: Path,
-    destination: Path,
-    destination_owner: Path,
-) -> dict[str, Any]:
-    """Publish one validated private failure record and compact artifacts."""
-    payload = _load_json(source, label="case failure evidence")
-    serialized = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    _validate_owned_directory(
-        destination,
-        owner=destination_owner,
-        label="published pilot failure evidence directory",
-    )
-    destination.mkdir(parents=True, exist_ok=True)
-    _validate_owned_directory(
-        destination,
-        owner=destination_owner,
-        label="published pilot failure evidence directory",
-    )
-    failure_path = destination / "failure.json"
-    if failure_path.exists():
-        if not failure_path.is_file() or failure_path.is_symlink() or failure_path.read_text(encoding="utf-8") != serialized:
-            message = f"Published pilot failure evidence conflicts: {failure_path}"
-            raise FileExistsError(message)
-    else:
-        common.serialization.atomic_write_text(failure_path, serialized)
-    declared = payload["retained_artifacts"]
-    artifact_records: list[dict[str, Any]] = []
-    for relative_value, identity in sorted(declared.items()):
-        relative = Path(relative_value)
-        source_path = (source_artifacts / relative).resolve()
-        target = (destination / "artifacts" / relative).resolve()
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or not source_path.is_relative_to(source_artifacts.resolve())
-            or not target.is_relative_to(destination.resolve())
-            or not source_path.is_file()
-            or source_path.is_symlink()
-            or source_path.stat().st_size != identity["size_bytes"]
-            or common.serialization.file_sha256(source_path) != identity["sha256"]
-        ):
-            message = f"Private pilot failure artifact is invalid: {source_path}"
-            raise ValueError(message)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _validate_owned_directory(
-            destination,
-            owner=destination_owner,
-            label="published pilot failure evidence directory",
-        )
-        if target.exists():
-            if (
-                not target.is_file()
-                or target.is_symlink()
-                or target.stat().st_size != identity["size_bytes"]
-                or common.serialization.file_sha256(target) != identity["sha256"]
-            ):
-                message = f"Published pilot failure artifact conflicts: {target}"
-                raise FileExistsError(message)
-        else:
-            shutil.copy2(source_path, target)
-        artifact_records.append(
+        if not candidate.is_file() or candidate == attempt.receipt_path:
+            continue
+        records.append(
             {
-                "relative_path": target.relative_to(destination).as_posix(),
-                "sha256": identity["sha256"],
-                "size_bytes": identity["size_bytes"],
+                "relative_path": candidate.relative_to(attempt.directory).as_posix(),
+                "sha256": common.serialization.file_sha256(candidate),
+                "size_bytes": candidate.stat().st_size,
             }
         )
-    _validate_owned_directory(
-        destination,
-        owner=destination_owner,
-        label="published pilot failure evidence directory",
-    )
-    actual_artifacts = {item.relative_to(destination).as_posix() for item in destination.rglob("*") if item.is_file() and item != failure_path}
-    if actual_artifacts != {record["relative_path"] for record in artifact_records}:
-        message = f"Published pilot failure artifact membership is invalid: {destination}"
+    return records
+
+
+def _validate_pilot_attempt_identity(
+    attempt: attempt_service.AttemptEvidence,
+    batch: config_service.GenerationConfig,
+    case_index: int,
+    *,
+    run_id: str,
+    git_commit: str,
+) -> None:
+    """Bind one admitted attempt to the exact pilot campaign case."""
+    payload = attempt.payload
+    template = payload["template"]
+    if (
+        payload["campaign_run_id"] != run_id
+        or payload["campaign_purpose"] != config_service.PILOT_CAMPAIGN_PURPOSE
+        or payload["batch_storage_name"] != batch.batch_storage_name
+        or payload["batch_id"] != batch.batch_id
+        or payload["batch_identity"] != batch.batch_identity
+        or payload["case_id"] != batch.case_id(case_index)
+        or payload["case_index"] != case_index
+        or payload["solver_git_commit"] != git_commit
+        or payload["processing_git_commit"] != git_commit
+        or payload["scientific_config_digest"] != batch.scientific_config_digest
+        or template["relative_path"] != batch.template_relative_path
+        or template["sha256"] != batch.template_sha256
+    ):
+        message = f"Pilot attempt identity differs from its campaign case: {batch.batch_name}/{batch.case_id(case_index)}"
         raise ValueError(message)
+
+
+def _attempt_failure_evidence(
+    attempt: attempt_service.AttemptEvidence,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Describe one attempt in place without copying canonical evidence."""
+    cleanup = attempt_service.attempt_cleanup_evidence(attempt)
+    if cleanup is None:
+        message = f"Pilot attempt scratch cleanup is not terminal: {attempt.directory}"
+        raise RuntimeError(message)
+    attempt_root = attempt.directory.resolve()
+    storage_root = storage.resolve()
+    if not attempt_root.is_relative_to(storage_root):
+        message = f"Pilot attempt evidence escapes storage: {attempt.directory}"
+        raise ValueError(message)
+    artifacts = _attempt_artifact_records(attempt)
     return {
-        "relative_path": failure_path.name,
-        "sha256": common.serialization.file_sha256(failure_path),
-        "size_bytes": failure_path.stat().st_size,
-        "retained_artifacts": artifact_records,
-        "retained_evidence_size_bytes": failure_path.stat().st_size + sum(int(record["size_bytes"]) for record in artifact_records),
-        "error": payload["error"],
-        "missing_or_invalid_artifacts": payload["missing_or_invalid_artifacts"],
-        "scratch_cleanup": payload["scratch_cleanup"],
+        "evidence_kind": "attempt",
+        "relative_path": attempt.receipt_path.resolve().relative_to(storage_root).as_posix(),
+        "evidence_directory": attempt_root.relative_to(storage_root).as_posix(),
+        "sha256": common.serialization.file_sha256(attempt.receipt_path),
+        "size_bytes": attempt.receipt_path.stat().st_size,
+        "retained_artifacts": artifacts,
+        "retained_evidence_size_bytes": attempt.receipt_path.stat().st_size + sum(int(record["size_bytes"]) for record in artifacts),
+        "scratch_cleanup": cleanup,
     }
+
+
+def _safe_storage_evidence_path(
+    relative_value: Any,
+    *,
+    storage: Path,
+    label: str,
+) -> Path:
+    """Resolve one normalized storage-relative evidence path."""
+    if not isinstance(relative_value, str):
+        message = f"{label} must be one storage-relative path."
+        raise TypeError(message)
+    relative = Path(relative_value)
+    if not relative_value or relative.is_absolute() or ".." in relative.parts or relative.as_posix() != relative_value:
+        message = f"{label} is unsafe: {relative_value!r}"
+        raise ValueError(message)
+    candidate = storage / relative
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(storage.resolve()) or candidate.absolute() != resolved:
+        message = f"{label} escapes storage or contains a symbolic link: {candidate}"
+        raise ValueError(message)
+    return candidate
+
+
+def _validate_attempt_failure_evidence(
+    evidence: Any,
+    record: Mapping[str, Any],
+    batch: config_service.GenerationConfig,
+    *,
+    run_id: str,
+    git_commit: str,
+    storage: Path,
+) -> attempt_service.AttemptEvidence:
+    """Revalidate one in-place canonical attempt descriptor."""
+    required = {
+        "evidence_kind",
+        "relative_path",
+        "evidence_directory",
+        "sha256",
+        "size_bytes",
+        "retained_artifacts",
+        "retained_evidence_size_bytes",
+        "scratch_cleanup",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required or evidence.get("evidence_kind") != "attempt":
+        message = "Pilot attempt failure descriptor is malformed."
+        raise ValueError(message)
+    evidence_directory = _safe_storage_evidence_path(
+        evidence["evidence_directory"],
+        storage=storage,
+        label="pilot attempt evidence directory",
+    )
+    evidence_path = _safe_storage_evidence_path(
+        evidence["relative_path"],
+        storage=storage,
+        label="pilot attempt receipt",
+    )
+    attempt = attempt_service.load_attempt(evidence_directory)
+    _validate_pilot_attempt_identity(
+        attempt,
+        batch,
+        int(record["case_index"]),
+        run_id=run_id,
+        git_commit=git_commit,
+    )
+    artifacts = _attempt_artifact_records(attempt)
+    cleanup = attempt_service.attempt_cleanup_evidence(attempt)
+    if (
+        attempt.receipt_path.resolve() != evidence_path.resolve()
+        or evidence.get("sha256") != common.serialization.file_sha256(evidence_path)
+        or evidence.get("size_bytes") != evidence_path.stat().st_size
+        or evidence.get("retained_artifacts") != artifacts
+        or evidence.get("scratch_cleanup") != cleanup
+        or cleanup is None
+        or evidence.get("retained_evidence_size_bytes") != evidence_path.stat().st_size + sum(int(item["size_bytes"]) for item in artifacts)
+    ):
+        message = f"Pilot attempt failure evidence changed: {evidence_path}"
+        raise ValueError(message)
+    return attempt
 
 
 def finalize_pilot_campaign(
@@ -535,29 +573,26 @@ def finalize_pilot_campaign(
                 execution_run_id=run_id,
                 git_commit=str(manifest["git_commit"]),
             ):
-                source = runtime_service.case_failure_path(
+                attempt = attempt_service.latest_case_attempt(
                     batch,
                     case_index,
+                    run_id,
                     storage_root=storage,
                 )
-                payload = _load_json(source, label="case failure evidence")
-                cleanup = payload["scratch_cleanup"]
-                if cleanup["status"] not in {"complete", "not_created"}:
-                    message = f"Pilot failure scratch is not safely terminal for {batch.batch_name}/{case_id}."
+                if attempt is None:
+                    message = f"Pilot failure lacks canonical attempt evidence: {batch.batch_name}/{case_id}."
                     raise RuntimeError(message)
-                destination = meta_root / "pilot_failure_evidence" / case_id
-                evidence = _copy_failure_evidence(
-                    source=source,
-                    source_artifacts=runtime_service.case_failure_artifacts_directory(
-                        batch,
-                        case_index,
-                        storage_root=storage,
-                    ),
-                    destination=destination,
-                    destination_owner=meta_root,
+                _validate_pilot_attempt_identity(
+                    attempt,
+                    batch,
+                    case_index,
+                    run_id=run_id,
+                    git_commit=str(manifest["git_commit"]),
                 )
-                evidence["relative_path"] = (destination / "failure.json").relative_to(storage).as_posix()
-                evidence["evidence_directory"] = destination.relative_to(storage).as_posix()
+                evidence = _attempt_failure_evidence(
+                    attempt,
+                    storage=storage,
+                )
                 record = {
                     "batch_name": batch.batch_name,
                     "batch_id": batch.batch_id,
@@ -567,7 +602,7 @@ def finalize_pilot_campaign(
                     "material_role": batch.material_role,
                     "case_kind": assignment["pilot_case_kind"],
                     "terminal_state": "failure",
-                    "simulation_case_id": None,
+                    "simulation_case_id": attempt.payload["simulation_case_id"],
                     "processed_directory": None,
                     "raw_directory": None,
                     "failure_evidence": evidence,
@@ -661,13 +696,20 @@ def validate_pilot_terminal(
     ):
         message = f"Pilot terminal campaign is malformed: {path}"
         raise ValueError(message)
+    batches_by_name = {batch.batch_name: batch for batch in campaign.batches}
     for record in terminal["cases"]:
+        batch = batches_by_name.get(record.get("batch_name"))
+        case_index = record.get("case_index")
         if (
-            record.get("material") not in terminal["materials"]
+            batch is None
+            or not isinstance(case_index, int)
+            or isinstance(case_index, bool)
+            or case_index not in batch.case_indices
+            or record.get("batch_id") != batch.batch_id
+            or record.get("case_id") != batch.case_id(case_index)
+            or record.get("material") not in terminal["materials"]
             or record.get("material_role") not in config_service.MATERIAL_ROLES
             or record.get("case_kind") not in config_service.PILOT_CASE_KINDS
-            or not isinstance(record.get("case_index"), int)
-            or isinstance(record.get("case_index"), bool)
         ):
             message = f"Pilot terminal case provenance is malformed: {path}"
             raise ValueError(message)
@@ -679,6 +721,16 @@ def validate_pilot_terminal(
             )
         else:
             evidence = record["failure_evidence"]
+            if evidence.get("evidence_kind") == "attempt":
+                _validate_attempt_failure_evidence(
+                    evidence,
+                    record,
+                    batch,
+                    run_id=run_id,
+                    git_commit=str(terminal["git_commit"]),
+                    storage=storage,
+                )
+                continue
             evidence_path = storage / evidence["relative_path"]
             artifacts = evidence["retained_artifacts"]
             if (
@@ -720,6 +772,25 @@ def pilot_transfer_plan(
             raise FileNotFoundError(message)
         return resolved.relative_to(storage).as_posix()
 
+    def attempt_directories(
+        batch: config_service.GenerationConfig,
+    ) -> list[str]:
+        directories: list[str] = []
+        for case_index in batch.case_indices:
+            candidate = common.paths.resolve_generation_attempt_case_directory(
+                batch.batch_storage_name,
+                batch.case_id(case_index),
+                run_id,
+                storage_root=storage,
+            )
+            if candidate.is_symlink():
+                message = f"Pilot attempt transfer directory is unsafe: {candidate}"
+                raise ValueError(message)
+            if not candidate.exists():
+                continue
+            directories.append(relative(candidate))
+        return directories
+
     return {
         "campaign_run_id": run_id,
         "campaign_name": campaign.campaign_name,
@@ -746,6 +817,7 @@ def pilot_transfer_plan(
                         storage_root=storage,
                     )
                 ),
+                "attempt_directories": attempt_directories(batch),
             }
             for batch in campaign.batches
         ],
@@ -763,6 +835,7 @@ def _plan_roots(plan: Mapping[str, Any], *, storage: Path) -> list[Path]:
             batch["meta_directory"],
             batch["raw_directory"],
             batch["processed_directory"],
+            *batch["attempt_directories"],
         )
     )
     roots: dict[Path, Path] = {}
@@ -1050,7 +1123,31 @@ def _failure_case_result(record: Mapping[str, Any], *, storage: Path) -> dict[st
     """Return one canonical failed-case result from retained evidence."""
     evidence = record["failure_evidence"]
     evidence_path = storage / evidence["relative_path"]
-    payload = _load_json(evidence_path, label="published pilot failure evidence")
+    if evidence.get("evidence_kind") == "attempt":
+        attempt = attempt_service.load_attempt(storage / evidence["evidence_directory"])
+        payload = attempt.payload
+        failure_type = str(payload["case_state"])
+        failure_message = str(payload["reason"])
+        missing_artifacts = list(payload["unexpectedly_missing_artifacts"])
+        simulation_case_id = str(payload["simulation_case_id"])
+        quality_flags = [item for item in payload["quality_flags"] if item["quality_flag"] is True]
+        warnings = [str(item["code"]) for item in quality_flags]
+        numerical_runtime = {
+            "status": "failed",
+            "elapsed_seconds": payload["elapsed_seconds"],
+            "final_simulation_time": payload["final_simulation_time"],
+            "last_accepted_step_size": payload["last_accepted_step_size"],
+            "Tfail": payload["Tfail"],
+            "NLfail": payload["NLfail"],
+        }
+    else:
+        payload = _load_json(evidence_path, label="published pilot failure evidence")
+        failure_type = str(payload["error"]["type"])
+        failure_message = str(payload["error"]["message"])
+        missing_artifacts = list(payload["missing_or_invalid_artifacts"])
+        simulation_case_id = None
+        warnings = []
+        numerical_runtime = {"status": "failed"}
     failed_stage = str(payload["failure_stage"])
     try:
         result_class = _FAILURE_STAGE_RESULT_CLASS[failed_stage]
@@ -1061,7 +1158,7 @@ def _failure_case_result(record: Mapping[str, Any], *, storage: Path) -> dict[st
     return {
         "case_id": record["case_id"],
         "case_index": record["case_index"],
-        "simulation_case_id": None,
+        "simulation_case_id": simulation_case_id,
         "material": record["material"],
         "material_role": record["material_role"],
         "case_kind": record["case_kind"],
@@ -1073,14 +1170,14 @@ def _failure_case_result(record: Mapping[str, Any], *, storage: Path) -> dict[st
         "last_valid_time_h": None,
         "stop_reason": "runtime_failure",
         "failed_stage": failed_stage,
-        "warning_count": 0,
+        "warning_count": len(warnings),
         "final_X_wb_bulk": None,
         "final_f_wet_dm": None,
         "hard_contract": {
             "solver_completed": solver_status == "success",
-            "failure_type": payload["error"]["type"],
-            "failure_message": payload["error"]["message"],
-            "missing_or_invalid_artifacts": payload["missing_or_invalid_artifacts"],
+            "failure_type": failure_type,
+            "failure_message": failure_message,
+            "missing_or_invalid_artifacts": missing_artifacts,
         },
         "duration": {
             "result": result_class,
@@ -1096,12 +1193,12 @@ def _failure_case_result(record: Mapping[str, Any], *, storage: Path) -> dict[st
         "extrema_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
         "schedule_input_sanity": {"status": "unavailable_due_to_runtime_failure"},
         "applicability_domain_diagnostic": {"status": "unavailable_due_to_runtime_failure"},
-        "numerical_runtime": {"status": "failed"},
+        "numerical_runtime": numerical_runtime,
         "storage": {
             "canonical_hdf5_bytes": None,
             "retained_failure_evidence_bytes": evidence["retained_evidence_size_bytes"],
         },
-        "warnings": [],
+        "warnings": warnings,
         "retained_evidence_path": str(storage / evidence["evidence_directory"]),
     }
 
@@ -1490,7 +1587,7 @@ def _gpu_inventory(
     meta_files = _regular_files(meta_roots)
     meta_bytes = sum(path.stat().st_size for path in meta_files)
     log_bytes = sum(path.stat().st_size for path in generation_files if path.suffix in {".log", ".out", ".err"})
-    failure_bytes = sum(path.stat().st_size for path in generation_files if "pilot_failure_evidence" in path.parts)
+    failure_bytes = sum(path.stat().st_size for path in generation_files if "attempts" in path.parts or "pilot_failure_evidence" in path.parts)
     pilot_meta_bytes = sum(path.stat().st_size for path in pilot_files)
     return {
         "gpu_generation_bytes": generation_bytes,
