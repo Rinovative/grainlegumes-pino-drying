@@ -38,6 +38,10 @@ def pilot_campaign_path(generation_config_factory: Any) -> Path:
     campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
     campaign["campaign_purpose"] = "pilot_check"
     campaign.pop("membership")
+    execution_path = path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["retention"]["pilot_check"] = "full"
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
     campaign["sampling"] = {
         "method": "lhs",
         "seed_base": 9940,

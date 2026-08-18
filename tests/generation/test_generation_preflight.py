@@ -209,13 +209,14 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert report["python"]["executable"].endswith("native venv/bin/python")
     assert report["python"]["resolved_executable"].endswith("software/Python/3.10/bin/python3.10")
     assert report["python"]["venv_runtime"]["sys_prefix"].endswith("native venv")
+    campaign = generation.cases.config.load_campaign_config(campaign_path)
     assert report["submission_plan"] == {
         "cases_per_job": 1,
-        "cores_per_case": 1,
-        "cores_per_node": 24,
-        "pending_buffer": 1,
-        "poll_interval_seconds": 1,
-        "max_running_cases": None,
+        "cores_per_case": campaign.execution_values["cluster"]["cores_per_case"],
+        "cores_per_node": campaign.execution_values["site"]["cores_per_node"],
+        "pending_buffer": campaign.execution_values["submission"]["pending_buffer"],
+        "poll_interval_seconds": campaign.execution_values["submission"]["poll_interval_seconds"],
+        "max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
     }
     assert report["path_cleanup_probe"]["probe_removed"] is True
     assert not Path(report["path_cleanup_probe"]["probe_path"]).exists()

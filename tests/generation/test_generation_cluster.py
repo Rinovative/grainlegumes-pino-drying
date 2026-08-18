@@ -447,8 +447,12 @@ def test_current_failure_still_requires_explicit_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep the configured failure threshold for the exact current execution."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    """Never retry a failed scientific case without the explicit rerun path."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=1,
+        maximum_failed_cases=2,
+    )
     campaign = generation.cases.config.load_campaign_config(config_path)
     task = cluster.campaign_tasks(campaign)[0]
     batch = campaign.batch(task.batch_name)
@@ -488,23 +492,23 @@ def test_current_failure_still_requires_explicit_retry(
     )
     monkeypatch.setattr(generation.campaign, "_submit_case", submit)
 
-    stopped = generation.campaign.submit_campaign(
+    unchanged = generation.campaign.submit_campaign(
         campaign,
         git_commit=commit,
         storage_root=storage,
     )
-    assert stopped["state"] == "failure_threshold_reached"
+    assert unchanged["state"] == "completed_with_failures"
     assert submitted == []
 
-    resumed = generation.campaign.retry_campaign_case(
+    retried = generation.campaign.retry_campaign_case(
         run_id,
         task.batch_name,
         task.case_id,
         storage_root=storage,
     )
-    assert resumed["slurm_job_ids"] == ["654"]
+    assert retried["slurm_job_ids"] == ["654"]
     assert len(submitted) == 1
-    assert resumed["submissions"][0]["mode"] == "explicit_retry"
+    assert retried["submissions"][0]["mode"] == "explicit_retry"
 
 
 @pytest.mark.parametrize(
@@ -699,6 +703,7 @@ def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=6,
+        pending_buffer=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "a" * 40
@@ -805,17 +810,20 @@ def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
     assert advanced["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
 
 
-def test_optional_running_cap_and_failure_threshold_require_explicit_resume(
+def test_optional_running_cap_blocks_only_while_capacity_is_occupied(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Honor an optional running cap and retry failed cases only explicitly."""
+    """Hold new work at the explicit cap and advance after success frees capacity."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
+        natural_count=2,
+        maximum_failed_cases=2,
         max_running_cases=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
     commit = "b" * 40
     job_ids = iter(("201", "202"))
     scheduler = _scheduler()
@@ -830,27 +838,122 @@ def test_optional_running_cap_and_failure_threshold_require_explicit_resume(
     assert capped["slurm_job_ids"] == ["201"]
 
     scheduler["active"] = {}
-    scheduler["accounted"] = {"201": ["201", "FAILED", "1:0"]}
-    monkeypatch.setattr(generation.campaign.batch_runtime, "completed_case_is_valid", lambda *_args, **_kwargs: False)
-    first_task = cluster.campaign_tasks(campaign)[0]
+    scheduler["accounted"] = {"201": ["201", "COMPLETED", "0:0"]}
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
-        "case_failure_is_recorded",
-        lambda batch, case_index, **_kwargs: batch.batch_name == first_task.batch_name and case_index == first_task.case_index,
+        "completed_case_is_valid",
+        lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) == (tasks[0].batch_name, tasks[0].case_index),
     )
-    stopped = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
-    assert stopped["state"] == "failure_threshold_reached"
-    assert stopped["slurm_job_ids"] == ["201"]
+    advanced = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
+    assert advanced["slurm_job_ids"] == ["201", "202"]
+    assert advanced["submissions"][-1]["mode"] == "initial"
+    assert advanced["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
 
-    resumed = generation.campaign.retry_campaign_case(
-        manifest["campaign_run_id"],
-        first_task.batch_name,
-        first_task.case_id,
-        storage_root=storage,
+
+@pytest.mark.parametrize("maximum_failed_cases", [0, 2, 5])
+def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_jobs(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maximum_failed_cases: int,
+) -> None:
+    """Feed through N failures, stop at N+1, and retain active monitoring."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=maximum_failed_cases + 3,
+        maximum_failed_cases=maximum_failed_cases,
     )
-    assert resumed["slurm_job_ids"] == ["201", "202"]
-    assert resumed["submissions"][-1]["mode"] == "explicit_retry"
-    assert resumed["submissions"][-1]["case"]["case_id"] == first_task.case_id
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    commit = "d" * 40
+    run_id = f"failure-threshold-{maximum_failed_cases}__0123456789abcdef"
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
+    run_directory.mkdir(parents=True)
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": commit,
+        "slurm_job_ids": [],
+        "submission_config": {
+            "pending_buffer": 1,
+            "max_running_cases": None,
+            "maximum_failed_cases": maximum_failed_cases,
+        },
+        "submission_intent": None,
+        "state": "active",
+    }
+
+    def view(task: Any, state: str) -> dict[str, Any]:
+        return {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": state,
+            "postprocessing_replay_available": False,
+        }
+
+    reconciled: dict[str, tuple[list[dict[str, Any]], int, int]] = {"value": ([], 0, 0)}
+    submitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
+    monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
+    monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: reconciled["value"])
+    monkeypatch.setattr(
+        generation.campaign.common.serialization,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        submitted.append((task.case_id, mode))
+        return {**payload, "state": "active"}
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
+
+    reconciled["value"] = (
+        [view(task, "failed" if index < maximum_failed_cases else "never_started") for index, task in enumerate(tasks)],
+        0,
+        0,
+    )
+    feedable = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
+    assert feedable["state"] == "active"
+    assert submitted == [(tasks[maximum_failed_cases].case_id, "initial")]
+
+    submitted.clear()
+    manifest["state"] = "active"
+    reconciled["value"] = (
+        [view(task, "failed" if index <= maximum_failed_cases else "never_started") for index, task in enumerate(tasks)],
+        0,
+        0,
+    )
+    tripped = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
+    assert tripped["state"] == "failure_threshold_reached"
+    assert submitted == []
+
+    manifest["state"] = "active"
+    reconciled["value"] = (
+        [
+            view(
+                task,
+                "failed" if index <= maximum_failed_cases else "running" if index == maximum_failed_cases + 1 else "never_started",
+            )
+            for index, task in enumerate(tasks)
+        ],
+        0,
+        1,
+    )
+    monitored = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
+    assert monitored["state"] == "active"
+    assert submitted == []
 
 
 def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(

@@ -142,8 +142,9 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         storage_root=storage,
     )
     assert len(attempts) == 1
+    retry_policy = config.execution_values["runtime"]["temporary_license_retry"]
     assert attempts[0]["slurm_job_id"] == "701"
-    assert attempts[0]["delay_before_next_attempt_seconds"] == 60.0
+    assert attempts[0]["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
     assert attempts[0]["retry_budget_remaining"] is True
     assert not generation.runtime.case_failure_artifacts_directory(
         config,
@@ -185,37 +186,48 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconstruct cumulative wait from receipts and close the 3600-second budget."""
+    """Reconstruct cumulative wait receipts and close a test-owned budget."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
+        license_initial_delay_seconds=2.0,
+        license_maximum_delay_seconds=5.0,
+        license_maximum_wait_seconds=12.0,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch="transient_drying__lentil__natural",
     )
+    policy = config.execution_values["runtime"]["temporary_license_retry"]
     run_id = "license-budget__0123456789abcdef"
+    storage = tmp_path / "storage"
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     error = _capacity_error(tmp_path)
-    for job in range(801, 816):
-        monkeypatch.setenv("SLURM_JOB_ID", str(job))
+    next_job = 801
+    while True:
+        monkeypatch.setenv("SLURM_JOB_ID", str(next_job))
         license_service.record_temporary_license_capacity_attempt(
             config,
             1,
             error,
-            storage_root=tmp_path / "storage",
+            storage_root=storage,
         )
+        attempts = license_service.load_temporary_license_attempts(
+            config,
+            1,
+            campaign_run_id=run_id,
+            storage_root=storage,
+        )
+        if not attempts[-1]["retry_budget_remaining"]:
+            break
+        next_job += 1
+        if len(attempts) > 100:
+            pytest.fail("Synthetic retry policy did not exhaust within 100 attempts")
 
-    attempts = license_service.load_temporary_license_attempts(
-        config,
-        1,
-        campaign_run_id=run_id,
-        storage_root=tmp_path / "storage",
-    )
-    assert len(attempts) == 15
-    assert attempts[-2]["cumulative_wait_seconds"] == 3600.0
+    assert len(attempts) >= 2
+    assert attempts[-2]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
     assert attempts[-2]["retry_budget_remaining"] is True
     assert attempts[-1]["delay_before_next_attempt_seconds"] == 0.0
-    assert attempts[-1]["cumulative_wait_seconds"] == 3600.0
+    assert attempts[-1]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
     assert attempts[-1]["retry_budget_remaining"] is False
     assert attempts[-1]["next_eligible_at"] is None
 

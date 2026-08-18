@@ -169,7 +169,16 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         extra_arguments: tuple[str, ...] = (),
         natural_count: int = _SMOKE_CASE_COUNT,
         parameter_ood_count: int = 0,
+        startup_ramp_enabled: bool = True,
+        startup_ramp_duration_h: float = 0.25,
+        maximum_failed_cases: int = 2,
+        pending_buffer: int = 1,
+        poll_interval_seconds: int = 1,
         max_running_cases: int | None = None,
+        license_retry_enabled: bool = True,
+        license_initial_delay_seconds: float = 2.0,
+        license_maximum_delay_seconds: float = 5.0,
+        license_maximum_wait_seconds: float = 12.0,
         grid_overrides: Mapping[str, int | float] | None = None,
         campaign_purpose: str = "technical_runtime_smoke",
     ) -> tuple[Path, Path]:
@@ -184,6 +193,10 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             **({} if grid_overrides is None else dict(grid_overrides)),
         }
         operations = yaml.safe_load((repository_root / "configs/generation/operations/fixed_bed.yaml").read_text(encoding="utf-8"))
+        operations["boundary_schedule"]["startup_ramp"] = {
+            "enabled": startup_ramp_enabled,
+            "duration_h": startup_ramp_duration_h,
+        }
         template_relative_path = f"templates/{simulation_profile}_{campaign_number}.mph"
         template_path = project_root / template_relative_path
         template_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,9 +212,20 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         )
         profile["template"] = template_relative_path
         execution = yaml.safe_load((repository_root / "configs/generation/execution/cluster_cpu.yaml").read_text(encoding="utf-8"))
-        execution["runtime"]["timeout_seconds"] = timeout
-        execution["runtime"]["graceful_stop_reserve_seconds"] = float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0
-        execution["runtime"]["extra_arguments"] = list(extra_arguments)
+        execution["runtime"].update(
+            {
+                "timeout_seconds": timeout,
+                "graceful_stop_reserve_seconds": float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0,
+                "maximum_failed_cases": maximum_failed_cases,
+                "extra_arguments": list(extra_arguments),
+                "temporary_license_retry": {
+                    "enabled": license_retry_enabled,
+                    "initial_delay_seconds": license_initial_delay_seconds,
+                    "maximum_delay_seconds": license_maximum_delay_seconds,
+                    "maximum_wait_seconds": license_maximum_wait_seconds,
+                },
+            }
+        )
         if retain_raw_csv is None and retain_solved_model is None:
             retention_policy = "full" if campaign_purpose in {"technical_runtime_smoke", "pilot_check"} else "compact"
         else:
@@ -209,8 +233,8 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         execution["retention"][campaign_purpose] = retention_policy
         execution["submission"].update(
             {
-                "pending_buffer": 1,
-                "poll_interval_seconds": 1,
+                "pending_buffer": pending_buffer,
+                "poll_interval_seconds": poll_interval_seconds,
                 "max_running_cases": max_running_cases,
             }
         )

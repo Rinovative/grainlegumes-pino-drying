@@ -162,11 +162,11 @@ def test_stage_states_preserve_postsolver_success() -> None:
     assert publication["publication_state"] == "failed"
 
 
-def test_smoke_and_pilot_resolve_full_retention(
+def test_full_retention_preserves_complete_attempt_evidence(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Resolve full Smoke/Pilot policy and retain complete Smoke evidence."""
+    """Retain complete attempt evidence for an explicit full policy."""
     config, storage, prepared = _configured_case(
         generation_config_factory,
         tmp_path,
@@ -182,11 +182,8 @@ def test_smoke_and_pilot_resolve_full_retention(
         failure_stage="conversion",
     )
 
-    assert config.execution_values["retention_profiles"] == {
-        "family_generalization": "compact",
-        "technical_runtime_smoke": "full",
-        "pilot_check": "full",
-    }
+    purpose = str(config.scientific_values["campaign_purpose"])
+    assert config.execution_values["retention_profiles"][purpose] == "full"
     assert attempt.payload["retention_policy"] == "full"
     retained = attempt.payload["retained_inventory"]
     assert "payload/model.mph" in retained

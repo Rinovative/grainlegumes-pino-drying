@@ -177,36 +177,50 @@ def test_transient_initial_state_tolerance_validation(
         generation.cases.config.load_campaign_config(config_path)
 
 
-def test_startup_ramp_identity_ignores_inactive_duration_and_binds_enablement(
+def test_startup_ramp_identity_ignores_inactive_duration_and_binds_active_behavior(
     generation_config_factory: Any,
 ) -> None:
-    """Keep disabled duration as provenance while binding active handoff behavior."""
-    transient_path, _template = generation_config_factory(simulation_profile="transient_drying")
-    original_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    """Bind enabled ramp behavior while excluding disabled duration from identity."""
+    transient_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        startup_ramp_enabled=False,
+        startup_ramp_duration_h=0.25,
+    )
+    disabled = generation.cases.config.load_campaign_config(transient_path).batches[0]
     operations_path = transient_path.parent / "operations.yaml"
     operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-    assert operations["boundary_schedule"]["startup_ramp"]["enabled"] is False
 
-    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
+    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.375
     operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
     inactive_duration_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
-    assert inactive_duration_changed.scientific_values["boundary_schedule"] == {"startup_ramp": {"enabled": False, "duration_h": 0.25}}
-    assert inactive_duration_changed.scientific_config_digest == original_transient.scientific_config_digest
-    assert inactive_duration_changed.case_input_config_digest == original_transient.case_input_config_digest
-    assert inactive_duration_changed.batch_id == original_transient.batch_id
+    assert inactive_duration_changed.scientific_values["boundary_schedule"]["startup_ramp"]["duration_h"] == 0.375
+    assert inactive_duration_changed.scientific_config_digest == disabled.scientific_config_digest
+    assert inactive_duration_changed.case_input_config_digest == disabled.case_input_config_digest
+    assert inactive_duration_changed.batch_id == disabled.batch_id
 
     operations["boundary_schedule"]["startup_ramp"]["enabled"] = True
     operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
-    enabled_transient = generation.cases.config.load_campaign_config(transient_path).batches[0]
-    assert enabled_transient.scientific_config_digest != original_transient.scientific_config_digest
-    assert enabled_transient.case_input_config_digest != original_transient.case_input_config_digest
-    assert enabled_transient.batch_id != original_transient.batch_id
+    enabled = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    assert enabled.scientific_config_digest != disabled.scientific_config_digest
+    assert enabled.case_input_config_digest != disabled.case_input_config_digest
+    assert enabled.batch_id != disabled.batch_id
 
-    steady_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.125
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+    active_duration_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    assert active_duration_changed.scientific_config_digest != enabled.scientific_config_digest
+    assert active_duration_changed.case_input_config_digest != enabled.case_input_config_digest
+    assert active_duration_changed.batch_id != enabled.batch_id
+
+    steady_path, _template = generation_config_factory(
+        simulation_profile="steady_flow",
+        startup_ramp_enabled=True,
+        startup_ramp_duration_h=0.25,
+    )
     original_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
     steady_operations_path = steady_path.parent / "operations.yaml"
     steady_operations = yaml.safe_load(steady_operations_path.read_text(encoding="utf-8"))
-    steady_operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
+    steady_operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.375
     steady_operations_path.write_text(yaml.safe_dump(steady_operations, sort_keys=False), encoding="utf-8")
     changed_steady = generation.cases.config.load_campaign_config(steady_path).batches[0]
 
@@ -216,30 +230,12 @@ def test_startup_ramp_identity_ignores_inactive_duration_and_binds_enablement(
     assert changed_steady.batch_id == original_steady.batch_id
 
 
-def test_startup_ramp_half_hour_duration_resolves(
-    generation_config_factory: Any,
-) -> None:
-    """Resolve the maintained half-hour startup duration as transient science."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
-    operations_path = config_path.parent / "operations.yaml"
-    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-    operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.5
-    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
-
-    batch = generation.cases.config.load_campaign_config(config_path).batches[0]
-
-    assert batch.scientific_values["boundary_schedule"] == {
-        "startup_ramp": {"enabled": False, "duration_h": 0.5},
-    }
-    assert batch.scientific_values["time"]["interval"] == 1.0
-
-
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
         ("enabled", "true", "enabled must be boolean"),
         ("duration_h", 0.0, "strictly positive and shorter"),
-        ("duration_h", 1.0, "strictly positive and shorter"),
+        ("duration_h", 0.75, "strictly positive and shorter"),
     ],
 )
 def test_startup_ramp_configuration_is_strict(
@@ -248,12 +244,48 @@ def test_startup_ramp_configuration_is_strict(
     value: object,
     message: str,
 ) -> None:
-    """Reject disabled types and durations outside one regular interval."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    """Reject malformed ramp values against an explicit regular interval."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        startup_ramp_enabled=True,
+        startup_ramp_duration_h=0.25,
+    )
+    common_path = config_path.parent / "common.yaml"
+    common_config = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    common_config["time"]["interval"] = 0.75
+    common_path.write_text(yaml.safe_dump(common_config, sort_keys=False), encoding="utf-8")
     operations_path = config_path.parent / "operations.yaml"
     operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
     operations["boundary_schedule"]["startup_ramp"][key] = value
     operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("runtime", "maximum_failed_cases", -1, "must be an integer >= 0"),
+        ("runtime", "maximum_failed_cases", 1.5, "must be an integer >= 0"),
+        ("runtime", "maximum_failed_cases", True, "must be an integer >= 0"),
+        ("submission", "max_running_cases", 0, "must be an integer >= 1"),
+        ("submission", "max_running_cases", 1.5, "must be an integer >= 1"),
+    ],
+)
+def test_execution_count_limits_reject_invalid_domains(
+    generation_config_factory: Any,
+    section: str,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Reject invalid failure-threshold and optional running-cap values."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution[section][key] = value
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
         generation.cases.config.load_campaign_config(config_path)
@@ -486,8 +518,12 @@ def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Persist exact primitive hourly support when the startup ramp is disabled."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    """Persist exact primitive regular support for a test-owned disabled ramp."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        startup_ramp_enabled=False,
+        startup_ramp_duration_h=0.25,
+    )
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=generation.cases.config.build_batch_name(
@@ -509,8 +545,6 @@ def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
     assert schedule.shape == (regular_times.size, 3)
     np.testing.assert_array_equal(schedule[:, 0], regular_times)
     assert regular_times[0] == 0.0
-    assert regular_times[-1] == 168.0
-    assert 0.5 not in schedule[:, 0]
     handoff = bundle.case_payload["schedule_diagnostics"]["boundary_handoff"]
     assert handoff["startup_ramp"]["enabled"] is False
     assert handoff["rejoin_row"] is None
@@ -876,7 +910,11 @@ def test_temporary_license_retry_configuration_bounds(
     maximum_value: int,
 ) -> None:
     """Require both retry maxima to cover at least the initial delay."""
-    config_path, _template = generation_config_factory()
+    config_path, _template = generation_config_factory(
+        license_initial_delay_seconds=60.0,
+        license_maximum_delay_seconds=300.0,
+        license_maximum_wait_seconds=3600.0,
+    )
     execution_path = config_path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
     execution["runtime"]["temporary_license_retry"][maximum_key] = maximum_value

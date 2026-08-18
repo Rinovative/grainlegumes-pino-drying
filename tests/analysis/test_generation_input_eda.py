@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
-import yaml
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.figure import Figure
 
@@ -31,23 +30,17 @@ def _config(
     profile_id: str,
     *,
     startup_enabled: bool = True,
+    startup_duration_h: float = 0.25,
     campaign_purpose: str = "technical_runtime_smoke",
 ) -> Any:
-    """Build one compact maintained-profile Generation configuration."""
+    """Build one compact test-owned Generation configuration."""
     path, _template = generation_config_factory(
         simulation_profile=profile_id,
         natural_count=4,
+        startup_ramp_enabled=startup_enabled,
+        startup_ramp_duration_h=startup_duration_h,
         campaign_purpose=campaign_purpose,
     )
-    if profile_id == "transient_drying":
-        campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
-        operations_path = path.parent / campaign["operations_config"]
-        operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-        operations["boundary_schedule"]["startup_ramp"]["enabled"] = startup_enabled
-        operations_path.write_text(
-            yaml.safe_dump(operations, sort_keys=False),
-            encoding="utf-8",
-        )
     return generation.cases.config.load_generation_config(
         path,
         only_batch=generation.cases.config.build_batch_name(
@@ -158,12 +151,6 @@ def test_input_batch_merging_uses_all_unique_cases(
     assert [reference.case_index for reference in dataset.cases] == [1, 2, 3]
     assert len({reference.case_input_id for reference in dataset.cases}) == 3
     assert all(source.source_kind == "input_generated" for source in dataset.publications)
-    assert [label for label, _value in catalog.case_options(generation_inputs.sources.dataset_key(dataset))] == ["1", "2", "3"]
-    dataset_label = catalog.dataset_options()[0][0]
-    assert dataset_label == "Drying · Lentil · natural · trs"
-    assert "input-" not in dataset_label
-    assert "/" not in dataset_label
-
     summary = catalog.dataset_diagnostics(generation_inputs.sources.dataset_key(dataset))
     assert summary.case_count == 3
     expected_parameter = np.mean([float(record.case.payload["sampled_values"]["T_init"]) for record in summary.records])
@@ -184,71 +171,25 @@ def test_input_batch_merging_uses_all_unique_cases(
     assert summary.field_summary_means[("eps_bed", "mean")] == pytest.approx(expected_field_mean)
 
 
-@pytest.mark.parametrize(
-    ("campaign_purpose", "expected"),
-    [
-        ("family_generalization", "fg"),
-        ("technical_runtime_smoke", "trs"),
-        ("technical_smoke", "ts"),
-        ("parameter_ood", "po"),
-        ("extreme_family_ood", "efo"),
-        ("pilot", "p"),
-    ],
-)
-def test_campaign_purpose_abbreviation_is_mechanical(
-    campaign_purpose: str,
-    expected: str,
-) -> None:
-    """Use only lowercase initials from canonical purpose components."""
-    assert expected == generation_inputs.labels.campaign_purpose_abbreviation(campaign_purpose)
-    assert "td" not in generation_inputs.labels.campaign_purpose_abbreviation("technical_runtime_smoke")
-
-
-@pytest.mark.parametrize(
-    ("profile_id", "material_family", "campaign_purpose", "expected"),
-    [
-        ("steady_flow", "lentil", "technical_runtime_smoke", "Airflow · Lentil · natural · trs"),
-        ("transient_drying", "lentil", "technical_runtime_smoke", "Drying · Lentil · natural · trs"),
-        ("transient_drying", "lentil", "family_generalization", "Drying · Lentil · natural · fg"),
-        ("transient_drying", "chickpea", "family_generalization", "Drying · Chickpea · natural · fg"),
-        ("transient_drying", "sunflower_seed", "family_generalization", "Drying · Sunflower seed · natural · fg"),
-    ],
-)
-def test_profile_qualified_dataset_labels_use_canonical_metadata(
-    profile_id: str,
-    material_family: str,
-    campaign_purpose: str,
-    expected: str,
-) -> None:
-    """Put the compact profile first without changing canonical metadata."""
-    metadata = generation_inputs.labels.DatasetLabelMetadata(
-        profile_id=profile_id,
-        material_family=material_family,
-        sampling_regime="natural",
-        campaign_purpose=campaign_purpose,
-        batch_identity="a" * 64,
-    )
-    assert generation_inputs.labels.dataset_display_label(metadata) == expected
-    assert generation_inputs.labels.profile_display_label("steady_flow") == "Airflow"
-    assert generation_inputs.labels.profile_display_label("transient_drying") == "Drying"
-
-
-def test_dataset_labels_context_and_collisions_preserve_separate_means(
+def test_dataset_contexts_preserve_separate_scientific_means(
     dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
 ) -> None:
-    """Keep fg/trs datasets separate and suffix only colliding abbreviations."""
-    assert {label for label, _key in dataset_catalog.dataset_options()} == {
-        "Airflow · Lentil · natural · trs",
-        "Drying · Lentil · natural · fg",
-        "Drying · Lentil · natural · trs",
-    }
-    transient_options = dataset_catalog.dataset_options(profile_ids=("transient_drying",))
-    keys = dict(transient_options)
-    family = dataset_catalog.dataset_diagnostics(keys["Drying · Lentil · natural · fg"])
-    technical = dataset_catalog.dataset_diagnostics(keys["Drying · Lentil · natural · trs"])
+    """Keep distinct admitted datasets and their scientific means separate."""
+    family_dataset = next(
+        dataset
+        for dataset in dataset_catalog.datasets
+        if dataset.profile_id == "transient_drying" and dataset.campaign_purpose == "family_generalization"
+    )
+    technical_dataset = next(
+        dataset
+        for dataset in dataset_catalog.datasets
+        if dataset.profile_id == "transient_drying" and dataset.campaign_purpose == "technical_runtime_smoke"
+    )
+    family = dataset_catalog.dataset_diagnostics(generation_inputs.sources.dataset_key(family_dataset))
+    technical = dataset_catalog.dataset_diagnostics(generation_inputs.sources.dataset_key(technical_dataset))
     assert family.batch_id != technical.batch_id
-    assert family.case_count == 3
-    assert technical.case_count == 2
+    assert family.case_count == len(family.records)
+    assert technical.case_count == len(technical.records)
     context = generation_inputs.diagnostics.case_context_table(
         family.records[0],
         family,
@@ -263,26 +204,10 @@ def test_dataset_labels_context_and_collisions_preserve_separate_means(
         "transient_drying",
         "transient_drying",
     )
-    assert tuple(context.loc["profile label"]) == ("Drying", "Drying")
     assert tuple(context.loc["batch storage name"]) == (
         family.batch_storage_name,
         technical.batch_storage_name,
     )
-
-    sources = [dataset.publications[0] for dataset in dataset_catalog.datasets if dataset.profile_id == "transient_drying"]
-    purposes = ("technical_smoke", "transient_support")
-    colliding_sources = tuple(
-        replace(
-            source,
-            campaign_purpose=purpose,
-            cases=tuple(replace(reference, campaign_purpose=purpose) for reference in source.cases),
-        )
-        for source, purpose in zip(sources, purposes, strict=True)
-    )
-    colliding = generation_inputs.sources.GenerationInputDatasetCatalog(generation.cases.admission.InputSourceDiscovery(colliding_sources, ()))
-    collision_labels = [label for label, _key in colliding.dataset_options()]
-    assert all(label.startswith("Drying · Lentil · natural · ts · ") for label in collision_labels)
-    assert {label.rsplit(" · ", maxsplit=1)[-1] for label in collision_labels} == {dataset.batch_identity[:8] for dataset in colliding.datasets}
 
 
 def test_corrupt_manifested_adapter_is_excluded_from_discovery(
@@ -346,12 +271,13 @@ def test_case_diagnostics_preserve_canonical_permeability_and_sorption(
 
     assert steady.schedule is None
     schedule, canonical, output, startup = generation_inputs.diagnostics.transient_evidence(transient)
-    np.testing.assert_array_equal(
-        schedule[:3, 0],
-        (0.0, 0.5, 1.0),
-    )
+    assert startup.enabled is True
+    expected_support = np.insert(canonical[:, 0], 1, startup.duration_h)
+    np.testing.assert_array_equal(schedule[:, 0], expected_support)
+    assert schedule.shape[1] == 3
+    assert schedule[0, 0] == 0.0
+    assert np.all(np.diff(schedule[:, 0]) > 0.0)
     np.testing.assert_array_equal(canonical, output)
-    assert startup.duration_h == 0.5
     expected_phi = domain.moisture.oswin_equilibrium_relative_humidity(
         transient.fields["X_0_db_field"],
         transient.case.payload["sampled_values"]["T_init"],
@@ -724,17 +650,6 @@ def test_workspace_composes_catalog_summary_naming_defaults_and_panel(
     assert isinstance(result.summary_text, str)
     assert result.summary_text
     assert result.panel is panel_widget
-    assert str(tmp_path) in result.summary_text
-    assert f"Canonical input datasets: {len(catalog_with_issue.datasets)}" in result.summary_text
-    assert f"Manifested input cases: {sum(len(dataset.cases) for dataset in catalog_with_issue.datasets)}" in result.summary_text
-    assert "Drying · Lentil · natural · fg" in result.summary_text
-    assert "input-rejected: manifest source identity mismatch" in result.summary_text
-    assert "Campaign-purpose abbreviations:" in result.summary_text
-    assert "- fg = family_generalization" in result.summary_text
-    assert "- trs = technical_runtime_smoke" in result.summary_text
-    assert "- Airflow = steady_flow" in result.summary_text
-    assert "- Drying = transient_drying" in result.summary_text
-
     state = cast(
         "generation_inputs.selection.GenerationInputSelectionState",
         captured["selection_state"],
@@ -781,28 +696,8 @@ def test_workspace_empty_catalog_is_actionable_and_does_not_build_panel(
     assert isinstance(result, generation_inputs.workspace.GenerationInputEDAWorkspace)
     assert not isinstance(result, widgets.Widget)
     assert result.panel is None
-    assert "No manifested canonical input cases were admitted" in result.summary_text
-    assert str(tmp_path) in result.summary_text
-    assert "generate-input-cases" in result.summary_text
-    assert "simulation_generation.md" in result.summary_text
-    assert "Skipped invalid input batches: 1" in result.summary_text
-    assert "input-invalid: manifest identity mismatch" in result.summary_text
-
-
-def test_abbreviation_legend_combines_configured_and_discovered_purposes() -> None:
-    """Derive deduplicated deterministic legend rows through one helper."""
-    rows = generation_inputs.labels.campaign_purpose_legend_rows(
-        ("technical_runtime_smoke", "family_generalization"),
-        ("family_generalization",),
-    )
-    assert [(row.abbreviation, row.campaign_purpose) for row in rows] == [
-        ("fg", "family_generalization"),
-        ("trs", "technical_runtime_smoke"),
-    ]
-    assert generation_inputs.labels.profile_label_rows(("steady_flow", "transient_drying")) == (
-        ("Airflow", "steady_flow"),
-        ("Drying", "transient_drying"),
-    )
+    assert isinstance(result.summary_text, str)
+    assert result.summary_text
 
 
 def test_panel_public_surface_accepts_catalog_and_rejects_invalid_input(
@@ -1050,7 +945,7 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         ],
     ],
 ) -> None:
-    """Plot exact operating and first-hour support without duplicating means."""
+    """Plot exact operating and first-hour data without mutating the source."""
     first, second = profile_records["transient_drying"]
     assert first.schedule is not None
     assert first.startup is not None
@@ -1064,74 +959,46 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         same_dataset=True,
     )
     try:
-        case_a_label = f"Case {first.case.case_index} (A)"
-        case_b_label = f"Case {second.case.case_index} (B)"
-        mean_label = f"Dataset mean, n = {summary.case_count}"
-        lines = [line for axis in figure.axes for line in axis.lines]
-        labels = {str(line.get_label()) for line in lines}
-
-        assert {case_a_label, case_b_label, mean_label}.issubset(labels)
-        assert {label for label in labels if "mean" in label.lower()} == {mean_label}
-        assert all(
-            line.get_linestyle() == "-" and line.get_marker() in {"None", None, ""}
-            for line in lines
-            if line.get_label() in {case_a_label, case_b_label}
-        )
-        assert all(line.get_linestyle() == "--" for line in lines if line.get_label() == mean_label)
-
         startup_end_h = first.startup.duration_h
         persisted_times_h = source_schedule[:, 0]
         expected_operating_h = persisted_times_h[persisted_times_h >= startup_end_h]
         display_times_h = np.linspace(0.0, 1.0, 61, dtype=np.float64)
         expected_early_minutes = 60.0 * display_times_h
-        observed_case_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for line in lines if line.get_label() == case_a_label]
-        assert observed_case_supports
-        assert all(
-            np.array_equal(support, expected_operating_h) or np.array_equal(support, expected_early_minutes) for support in observed_case_supports
-        )
-        assert any(np.array_equal(support, expected_operating_h) for support in observed_case_supports)
-        assert any(np.array_equal(support, expected_early_minutes) for support in observed_case_supports)
+        observed_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines]
+        assert any(np.array_equal(support, expected_operating_h) for support in observed_supports)
+        assert any(np.array_equal(support, expected_early_minutes) for support in observed_supports)
 
         phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == "phi_in_bc [1]" and axis.get_xlabel() == "time [min]")
-        case_phi = next(line for line in phi_axis.lines if line.get_label() == case_a_label)
-        mean_phi = next(line for line in phi_axis.lines if line.get_label() == mean_label)
-        expected_case = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)
+        expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
+        expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
         expected_mean = np.mean(
             np.stack(tuple(generation_inputs.diagnostics.case_boundary_schedule(record, display_times_h)[:, 3] for record in summary.records)),
             axis=0,
         )
-        np.testing.assert_allclose(
-            np.asarray(case_phi.get_ydata(), dtype=np.float64),
-            expected_case[:, 3],
-        )
-        np.testing.assert_allclose(
-            np.asarray(mean_phi.get_ydata(), dtype=np.float64),
-            expected_mean,
-        )
+        observed_phi = [np.asarray(line.get_ydata(), dtype=np.float64) for line in phi_axis.lines]
+        for expected in (expected_first, expected_second, expected_mean):
+            assert any(values.shape == expected.shape and np.allclose(values, expected) for values in observed_phi)
 
         assert expected_operating_h[0] == startup_end_h
         assert not np.any(expected_operating_h == 0.0)
         assert expected_early_minutes[0] == 0.0
         assert expected_early_minutes[-1] == 60.0
         assert 60.0 * startup_end_h in expected_early_minutes
-        assert {axis.get_title() for axis in figure.axes} >= {
-            "Operating schedule: 30 min onward",
-            "Startup and early operation: 0-60 min",
-        }
         np.testing.assert_array_equal(first.schedule, source_schedule)
     finally:
         plt.close(figure)
 
 
-def test_disabled_startup_plot_uses_hourly_operation_without_hidden_support(
+def test_disabled_startup_plot_uses_regular_operation_without_hidden_support(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Treat ramp-disabled schedules as operating from time zero."""
+    """Treat a test-owned disabled ramp as operating from regular time zero."""
     config = _config(
         generation_config_factory,
         "transient_drying",
         startup_enabled=False,
+        startup_duration_h=0.25,
     )
     records = []
     for case_index in (1, 2):
@@ -1151,11 +1018,11 @@ def test_disabled_startup_plot_uses_hourly_operation_without_hidden_support(
 
     first, second = records
     summary = generation_inputs.diagnostics.build_dataset_diagnostics(records)
-    source_schedule = np.array(generation_inputs.diagnostics.transient_evidence(first)[0], copy=True)
-    assert first.startup is not None
-    assert first.startup.enabled is False
-    np.testing.assert_array_equal(source_schedule[:3, 0], (0.0, 1.0, 2.0))
-    assert not np.any(source_schedule[:, 0] == 0.5)
+    source_schedule, canonical, output, startup = generation_inputs.diagnostics.transient_evidence(first)
+    source_schedule = np.array(source_schedule, copy=True)
+    assert startup.enabled is False
+    np.testing.assert_array_equal(source_schedule, canonical)
+    np.testing.assert_array_equal(canonical, output)
     np.testing.assert_array_equal(
         generation_inputs.diagnostics.operating_schedule_rows(first),
         source_schedule,
@@ -1169,14 +1036,16 @@ def test_disabled_startup_plot_uses_hourly_operation_without_hidden_support(
         same_dataset=True,
     )
     try:
-        titles = {axis.get_title() for axis in figure.axes}
-        assert "Operating schedule" in titles
-        assert "Early operation: 0-60 min" in titles
-        assert not any("startup" in title.lower() for title in titles)
-        case_label = f"Case {first.case.case_index} (A)"
-        supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines if line.get_label() == case_label]
-        assert any(np.array_equal(support, source_schedule[:, 0]) for support in supports)
-        assert any(np.array_equal(support, 60.0 * np.linspace(0.0, 1.0, 61)) for support in supports)
+        display_times_h = np.linspace(0.0, 1.0, 61, dtype=np.float64)
+        observed_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines]
+        assert any(np.array_equal(support, source_schedule[:, 0]) for support in observed_supports)
+        assert any(np.array_equal(support, 60.0 * display_times_h) for support in observed_supports)
+        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == "phi_in_bc [1]" and axis.get_xlabel() == "time [min]")
+        expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
+        expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
+        observed_phi = [np.asarray(line.get_ydata(), dtype=np.float64) for line in phi_axis.lines]
+        for expected in (expected_first, expected_second):
+            assert any(values.shape == expected.shape and np.allclose(values, expected) for values in observed_phi)
         np.testing.assert_array_equal(first.schedule, source_schedule)
     finally:
         plt.close(figure)

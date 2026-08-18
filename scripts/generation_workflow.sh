@@ -168,8 +168,10 @@ campaign_interrupt_handler() {
     printf '%s\n' \
       'Graceful campaign cancellation requested.' \
       'Press Ctrl+C again to force cancellation.' >&2
-    if ! remote_cli cancel-campaign "${RUN_ID}" \
-      --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null; then
+    remote_cli cancel-campaign "${RUN_ID}" \
+      --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null &
+    local cancellation_pid=$!
+    if ! wait "${cancellation_pid}"; then
       generation_console_warning \
         "graceful cancellation request failed; campaign state remains authoritative"
     fi

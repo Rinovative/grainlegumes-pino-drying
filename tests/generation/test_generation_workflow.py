@@ -378,6 +378,9 @@ elif [[ " $* " == *' resume-campaign '* ]]; then
 elif [[ " $* " == *' campaign-accounting '* ]]; then
   printf '%s\n' '{"squeue":{"output":"12345_0|RUNNING|node-a"}}'
 elif [[ " $* " == *' cancel-campaign '* ]]; then
+  if [[ " $* " != *' --force'* && "${FAKE_GRACEFUL_CANCEL_DELAY_SECONDS:-0}" != 0 ]]; then
+    sleep "${FAKE_GRACEFUL_CANCEL_DELAY_SECONDS}"
+  fi
   printf '%s\n' '{"status":"cancel_requested"}'
 elif [[ " $* " == *' prepare-campaign-inputs'* ]]; then
   if [[ "${FAKE_INPUT_PREPARATION_DELAY_SECONDS:-0}" != 0 ]]; then
@@ -957,6 +960,7 @@ def test_foreground_interrupts_request_graceful_then_force_cancellation(
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
     environment["FAKE_CAMPAIGN_STATES"] = "running"
+    environment["FAKE_GRACEFUL_CANCEL_DELAY_SECONDS"] = "10"
     process = _run_interruptible(
         workflow,
         [
