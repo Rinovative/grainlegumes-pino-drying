@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_runtime_package_validation.py
-===============================================================================
+
 Inspect and smoke-load immutable Dataset packages through the unified runtime.
 Responsibilities:
   - Bind validated manifests to typed runtime Dataset requests
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Build or publish Dataset packages
   - Implement the supported command-line interface
-===============================================================================
 """
 
 from __future__ import annotations

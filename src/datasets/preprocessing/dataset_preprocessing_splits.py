@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_preprocessing_splits.py
-===============================================================================
+
 Own identity-bound dataset combinations and admitted split membership evidence.
 Responsibilities:
   - Construct identity-preserving ordered dataset views and combinations
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Fit preprocessing or construct DataLoaders
   - Persist split payloads or resolve experiment configuration
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_source.py
-===============================================================================
+
 Validate exact source-repository provenance for generation execution.
 Responsibilities:
   - Validate one full lowercase Git object identifier
@@ -13,7 +12,6 @@ Design principles:
 This module does NOT:
   - Mutate, fetch, or check out a Git repository
   - Add source revisions to human-readable batch or dataset names
-===============================================================================
 """
 
 from __future__ import annotations

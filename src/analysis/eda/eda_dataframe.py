@@ -1,7 +1,6 @@
 """
-===============================================================================
 eda_dataframe.py
-===============================================================================
+
 Materialize bounded task-aware EDA frames from generated COMSOL batches.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Build final training datasets or fit preprocessing state
   - Read model outputs, checkpoints, or experiment run directories
   - Implement plots or notebook controls. EDA plot and UI modules own presentation
-===============================================================================
 """
 
 from __future__ import annotations

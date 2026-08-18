@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_runtime_factory.py
-===============================================================================
+
 Resolve package requests and orchestrate generic Dataset runtime loading.
 Responsibilities:
   - Validate package-view, selector, and DataLoader requests
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Implement steady or transient Dataset storage access
   - Fit normalization, choose experiment splits, or train models
-===============================================================================
 """
 
 from __future__ import annotations

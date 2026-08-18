@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_validation_pilot_analysis.py
-===============================================================================
+
 Analyze successful transient pilot cases from canonical HDF5 evidence.
 Responsibilities:
   - Compute exact physical-bound, duration, balance, trend, and extrema diagnostics
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Execute COMSOL, calibrate parameters, or define empirical realism thresholds
   - Add exports, alter scientific values, or create learning dataset membership
-===============================================================================
 """
 
 from __future__ import annotations

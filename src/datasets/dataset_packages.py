@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages.py
-===============================================================================
+
 Expose the canonical Dataset package builder identity and supported package CLI.
 Responsibilities:
   - Preserve the persisted package-builder callable identity
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Implement package publication or Dataset loading
   - Duplicate manifest, identity, or runtime validation logic
-===============================================================================
 """
 
 from __future__ import annotations

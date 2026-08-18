@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_diagnostics.py
-===============================================================================
+
 Build immutable diagnostics from admitted profile-aware generation inputs.
 Responsibilities:
   - Preserve exact sampled, scalar, schedule, spatial, and provenance evidence
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Read unadmitted files, execute COMSOL, or mark inputs as completed
   - Invent missing profile inputs, mutate evidence, or render notebook widgets
-===============================================================================
 """
 
 from __future__ import annotations

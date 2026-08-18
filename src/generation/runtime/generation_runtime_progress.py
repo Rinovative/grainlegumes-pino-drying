@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_progress.py
-===============================================================================
+
 Persist non-authoritative incremental COMSOL runtime progress for campaign cases.
 Responsibilities:
   - Parse supported English COMSOL 6.4 stdout progress incrementally
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Classify solver convergence, health, or failure
   - Modify campaign manifests, case data, or publication state
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 cli_generation.py
-===============================================================================
+
 Expose the profile-qualified generation services through one thin command line.
 Responsibilities:
   - Parse explicit configuration, case, campaign, pilot, and publication commands
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define scientific values, sampling behavior, COMSOL mappings, or data schemas
   - Implement simulation, scheduling, persistence, or cleanup domain logic
-===============================================================================
 """
 
 from __future__ import annotations

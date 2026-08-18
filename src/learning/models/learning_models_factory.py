@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_models_factory.py
-===============================================================================
+
 Construct FNO and UNO models from resolved experiment configs.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Implement FNO or UNO architectures. ``neuraloperator`` supplies them
   - Orchestrate training. ``learning.training.loop`` owns execution
   - Derive task channels or axes. Task contracts and config resolution own them
-===============================================================================
 """
 
 from __future__ import annotations

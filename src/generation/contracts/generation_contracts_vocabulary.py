@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_vocabulary.py
-===============================================================================
+
 Define immutable campaign, evaluation, and Dataset-membership vocabulary.
 Responsibilities:
   - Declare typed evaluation-regime and ID-membership identifiers
@@ -11,7 +10,6 @@ Design principles:
   - Resolved configuration reuses these values without duplicating them
 This module does NOT:
   - Load configuration, assign membership, or plan cases
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_training_optim.py
-===============================================================================
+
 Construct optimizers and schedulers for training.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Execute gradients or epochs. ``learning.training.loop`` owns training
   - Persist optimizer or scheduler state. Checkpoint services own restoration
-===============================================================================
 """
 
 from __future__ import annotations

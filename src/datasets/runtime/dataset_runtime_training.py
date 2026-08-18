@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_runtime_training.py
-===============================================================================
+
 Orchestrate deterministic steady-data splitting, preprocessing, and DataLoaders.
 Responsibilities:
   - Resolve verified steady package runtimes for train and OOD roles
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define split schemas or normalizer artifact schemas
   - Persist run artifacts or resolve experiment paths
-===============================================================================
 """
 
 from __future__ import annotations

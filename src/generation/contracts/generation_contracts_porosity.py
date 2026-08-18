@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_porosity.py
-===============================================================================
+
 Resolve fixed material Kozeny-Carman calibration and packing-scatter supports.
 Responsibilities:
   - Derive and validate fixed material Kozeny-Carman reference coefficients
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Sample DOE coordinates, generate local fields, or author material values
   - Impose a pointwise permeability-to-porosity relation
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 eda_panel.py
-===============================================================================
+
 Compose numbered lazy EDA tabs from validated task-aware DataFrames.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Define display order, labels, or scientific EDA mathematics
   - Own generic widget callbacks or PDF-export behavior
-===============================================================================
 """
 
 from __future__ import annotations

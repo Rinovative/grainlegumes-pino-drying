@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_panel.py
-===============================================================================
+
 Compose curated evaluation panels over admitted artifacts.
 
 Responsibilities:
@@ -22,7 +21,6 @@ This module does NOT:
   - Create an alternate dataframe or generic interaction registry
   - Infer dataset identity from display names, paths, or row positions
   - Cache figures, case arrays, or numerical reductions
-===============================================================================
 """
 
 from __future__ import annotations

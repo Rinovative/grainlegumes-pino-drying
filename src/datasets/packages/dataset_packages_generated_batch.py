@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages_generated_batch.py
-===============================================================================
+
 Interpret admitted Generation HDF5 cases as task-owned steady-flow tensors.
 Responsibilities:
   - Apply the steady-flow TaskSpec field order and tensor representations
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Validate Generation publication schemas, membership, or artifact hashes
   - Admit CSV views, publish packages, or define transient tensor semantics
-===============================================================================
 """
 
 from __future__ import annotations

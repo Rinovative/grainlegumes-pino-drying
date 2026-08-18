@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_provenance.py
-===============================================================================
+
 Validate central scientific sources and effective parameter provenance.
 Responsibilities:
   - Validate one unique source register with plain canonical locators
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Search for evidence, invent derivations, or change scientific values
   - Decide material roles, sampling supports, or parameter-OOD applicability
-===============================================================================
 """
 
 from __future__ import annotations

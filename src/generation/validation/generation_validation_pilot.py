@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_validation_pilot.py
-===============================================================================
+
 Own technical pilot terminal evidence, storage accounting, and summaries.
 Responsibilities:
   - Terminally classify every pilot case as validated success or retained failure
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Execute SSH, Slurm, COMSOL, rsync, or destructive source cleanup
   - Retune scientific values, invent tolerances, or build production datasets
-===============================================================================
 """
 
 from __future__ import annotations

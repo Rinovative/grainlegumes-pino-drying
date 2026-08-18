@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_layout.py
-===============================================================================
+
 Define notebook-width map, normalization, and colorbar contracts.
 Responsibilities:
   - Create bounded generation-input map and composite figure grids
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Load generation inputs, derive fields, or select cases
   - Import evaluation internals or use manually positioned colorbar axes
-===============================================================================
 """
 
 from __future__ import annotations

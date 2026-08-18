@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_comsol.py
-===============================================================================
+
 Own the fixed Generation-side COMSOL process invocation contract.
 Responsibilities:
   - Own canonical COMSOL job and case-local model names
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Execute COMSOL, modify templates, or define scientific parameters
   - Expose job tags or model filenames as user configuration
-===============================================================================
 """
 
 from __future__ import annotations

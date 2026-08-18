@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_error_behavior.py
-===============================================================================
+
 Render predictive-error views from current session reducers.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Parse NPZ payloads or reconstruct the authoritative primary aggregate
   - Combine fields with incompatible physical units
   - Own notebook controls, dataset identity, or public panel composition
-===============================================================================
 """
 
 from __future__ import annotations

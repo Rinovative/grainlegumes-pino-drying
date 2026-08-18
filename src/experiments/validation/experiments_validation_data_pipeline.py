@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_validation_data_pipeline.py
-===============================================================================
+
 Validate the complete production data pipeline before an experiment is run.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Construct models, losses, optimizers, schedulers, or training runs
   - Initialize W&B, allocate paths, write checkpoints, or generate artifacts
   - Build pandas tables or own notebook display behavior
-===============================================================================
 """
 
 from __future__ import annotations

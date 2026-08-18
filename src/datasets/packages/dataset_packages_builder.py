@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages_builder.py
-===============================================================================
+
 Build immutable dual-view Dataset packages from terminal simulation evidence.
 Responsibilities:
   - Assemble content-bound steady payloads and transient indexes
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Provide the supported Dataset package CLI
   - Inspect or smoke-load published runtime Dataset objects
-===============================================================================
 """
 
 from __future__ import annotations

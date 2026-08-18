@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_comsol_spreadsheet.py
-===============================================================================
+
 Parse COMSOL Spreadsheet-format exports for observation and numeric admission.
 Responsibilities:
   - Identify percent-prefixed COMSOL metadata and column-header records
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Infer source aliases, delimiters, scientific mappings, or export roles
   - Rewrite COMSOL output text or make metadata part of scientific identity
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_inference.py
-===============================================================================
+
 Rebuild deterministic model inference contexts from saved run artifacts.
 
 Responsibilities:
@@ -38,7 +37,6 @@ Saved-run contract:
     4. Load split_indices.pt and select an explicit train/eval/OOD role
     5. Apply saved split membership before building the DataLoader
     6. Return the model, DataLoader, processor, and device for inference
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_config_temporal.py
-===============================================================================
+
 Resolve explicit transient sampling and temporal-conditioning configuration.
 Responsibilities:
   - Require both Dataset sampling and Learning conditioning declarations
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Register a transient task or mutate the steady experiment resolver
   - Select packages, read time coordinates, or transform model inputs
-===============================================================================
 """
 
 from __future__ import annotations

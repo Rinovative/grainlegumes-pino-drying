@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_mapping.py
-===============================================================================
+
 Define the semantic identity of one resolved Generation export-mapping contract.
 Responsibilities:
   - Select every resolved semantic input that technical smoke verifies
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Load YAML, inspect runtime files, execute COMSOL, or discover smoke evidence
   - Decide whether runtime evidence is current
-===============================================================================
 """
 
 from __future__ import annotations

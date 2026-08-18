@@ -1,7 +1,6 @@
 """
-===============================================================================
 cli_build_artifacts.py
-===============================================================================
+
 Parse artifact-build arguments and delegate evaluable-run orchestration.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Admit, generate, cache, or publish artifacts. ``analysis`` owns those services
   - Inspect run contents or render scientific outputs
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_contracts_transient.py
-===============================================================================
+
 Define and serialize the unregistered transient drying sample-data contract.
 Responsibilities:
   - Select Dataset-owned conditioning fields from Generation storage descriptors
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Register a transient learning task or build transient tensors
   - Validate HDF5 payloads, normalize time, or execute model rollouts
-===============================================================================
 """
 
 from __future__ import annotations

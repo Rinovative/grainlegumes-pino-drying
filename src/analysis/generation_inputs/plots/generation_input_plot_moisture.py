@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_moisture.py
-===============================================================================
+
 Compose transient moisture, sorption, and inlet-bed A/B diagnostics.
 Responsibilities:
   - Compare initial moisture and equilibrium-RH maps as A/B/B-minus-A rows
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Render single-case alternatives, copy sorption equations, or resample fields
   - Display dataset-mean maps or alter generation acceptance
-===============================================================================
 """
 
 from __future__ import annotations

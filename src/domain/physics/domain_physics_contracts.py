@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_physics_contracts.py
-===============================================================================
+
 Define dependency-light semantic identifiers for steady-flow physics.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Implement residual equations, derivatives, masks, or scalar reductions
   - Import Torch or allocate tensors
   - Select experiment loss weights or diagnostic schedules
-===============================================================================
 """
 
 from __future__ import annotations

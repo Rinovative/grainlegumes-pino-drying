@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_tuning_optuna.py
-===============================================================================
+
 Run reusable Optuna studies and trial objectives.
 
 Responsibilities:
@@ -23,7 +22,6 @@ This module does NOT:
   - Parse search-space schemas. ``experiments.tuning.search_space`` owns admission
   - Execute training epochs. ``learning.training.loop`` owns model optimization
   - Clean repository or run state
-===============================================================================
 """
 
 from __future__ import annotations

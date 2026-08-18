@@ -1,7 +1,6 @@
 """
-===============================================================================
 eda_plot_spectral_analysis.py
-===============================================================================
+
 Compare bounded dataset spectra without loading model activations or artifacts.
 
 Responsibilities:
@@ -18,7 +17,6 @@ Design principles:
 This module does NOT:
   - Load model-training datasets or infer undeclared task fields
   - Compare model predictions with references or inspect model activations
-===============================================================================
 """
 
 from __future__ import annotations

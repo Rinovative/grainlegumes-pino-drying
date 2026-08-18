@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_sources.py
-===============================================================================
+
 Group canonical input-generated batches into scientific datasets.
 Responsibilities:
   - Discover manifest-admitted input batches without exposing completed raw
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Refresh sources, generate inputs, or inspect completed simulation output
   - Compute scientific formulas, render plots, or resample persisted inputs
-===============================================================================
 """
 
 from __future__ import annotations

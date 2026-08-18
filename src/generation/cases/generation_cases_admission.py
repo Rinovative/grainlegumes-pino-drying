@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_admission.py
-===============================================================================
+
 Admit immutable canonical pre-execution input batches for inspection.
 Responsibilities:
   - Validate input-generation manifests, case evidence, and adapter hashes
@@ -13,7 +12,6 @@ Design principles:
   - Persisted identities, lifecycle state, and adapter contracts fail closed
 This module does NOT:
   - Run COMSOL, infer missing raw inputs, or publish generation results
-===============================================================================
 """
 
 from __future__ import annotations

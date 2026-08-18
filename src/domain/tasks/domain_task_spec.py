@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_task_spec.py
-===============================================================================
+
 Define immutable semantic contracts for learned operator tasks.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Register tasks or declare a concrete task's fields and defaults
   - Implement metric, loss, normalization, or physics equations
   - Load datasets or mutate persisted task contracts after construction
-===============================================================================
 """
 
 from __future__ import annotations

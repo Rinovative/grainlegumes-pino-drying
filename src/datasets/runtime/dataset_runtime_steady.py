@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_runtime_steady.py
-===============================================================================
+
 Load and select verified steady-flow tensor Dataset packages.
 Responsibilities:
   - Load steady tensor payloads in authoritative TaskSpec channel order
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Resolve package lifecycle paths or orchestrate DataLoaders
   - Fit normalizers, choose experiment splits, or build tensor payloads
-===============================================================================
 """
 
 from __future__ import annotations

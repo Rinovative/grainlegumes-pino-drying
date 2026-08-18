@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_sampling.py
-===============================================================================
+
 Generate deterministic blockwise design-of-experiments values.
 Responsibilities:
   - Build independent Latin-hypercube or Sobol designs for four physical blocks
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define material ranges, invent unresolved values, or generate spatial fields
   - Evaluate arbitrary expressions or select a simulation profile
-===============================================================================
 """
 
 from __future__ import annotations

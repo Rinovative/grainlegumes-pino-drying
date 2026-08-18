@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_overview.py
-===============================================================================
+
 Present generation-input comparison and dataset overview tables.
 Responsibilities:
   - Render compact A/B dataset, case, identity, and provenance context
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Render maps, standardize values, or load input files
   - Expose input-generation IDs or hashes in normal selectors
-===============================================================================
 """
 
 from __future__ import annotations

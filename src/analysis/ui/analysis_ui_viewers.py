@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_ui_viewers.py
-===============================================================================
+
 Build interactive viewers for case-level and aggregate analysis plots.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Compose numbered notebook sections or choose scientific control vocabularies
   - Load artifacts directly or implement domain-specific plot mathematics
-===============================================================================
 """
 
 from __future__ import annotations

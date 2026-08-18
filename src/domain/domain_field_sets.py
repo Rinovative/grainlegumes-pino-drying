@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_field_sets.py
-===============================================================================
+
 Validate exact ordered field contracts.
 
 Responsibilities:
@@ -16,7 +15,6 @@ This module does NOT:
   - Define canonical field names or complete task contracts
   - Reorder, deduplicate, alias, or coerce a producer declaration
   - Inspect tensor values, shapes, storage, or normalization state
-===============================================================================
 """
 
 from __future__ import annotations

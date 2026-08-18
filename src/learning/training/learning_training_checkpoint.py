@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_training_checkpoint.py
-===============================================================================
+
 Persist and restore exact completed-epoch training checkpoints.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Allocate run directories, choose resume policy, or validate mutable run status
   - Construct models, optimizers, schedulers, scalers, losses, or dataloaders
   - Repair or reinterpret malformed checkpoints
-===============================================================================
 """
 
 from __future__ import annotations

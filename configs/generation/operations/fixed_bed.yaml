@@ -10,8 +10,8 @@ constraints:
   porosity_natural_support_policy: realized_mean_must_retain_natural_or_kappa_mean_ood_state
 boundary_schedule:
   startup_ramp:
-    enabled: false
-    duration_h: 0.5
+    enabled: true
+    duration_h: 0.16666666666666666
 parameter_values:
   pressure_bc.mean:
     lower: 250.0

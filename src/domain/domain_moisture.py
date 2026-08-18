@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_moisture.py
-===============================================================================
+
 Define canonical granular-phase moisture and equilibrium-sorption conversions.
 Responsibilities:
   - Convert dry-basis and wet-basis moisture without duplicating formulas
@@ -16,7 +15,6 @@ Design principles:
 This module does NOT:
   - Cache derived moisture fields or define dataset normalization
   - Own material coefficients, humidity clipping policy, or spatial quadrature rules
-===============================================================================
 """
 
 from __future__ import annotations

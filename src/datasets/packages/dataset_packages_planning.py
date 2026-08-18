@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages_planning.py
-===============================================================================
+
 Plan Dataset package sources, eligibility, and case membership.
 Responsibilities:
   - Resolve declared campaign package sources through terminal evidence
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Build payloads, compute package identities, publish artifacts, or expose a CLI
   - Load runtime Dataset objects or fit preprocessing
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_profiles.py
-===============================================================================
+
 Define the authoritative reference-simulation profile contracts.
 Responsibilities:
   - Register the exact supported logical simulation profiles
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Own concrete template or sidecar paths
   - Load YAML, generate fields, execute COMSOL, or register transient learning
-===============================================================================
 """
 
 from __future__ import annotations

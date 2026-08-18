@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_sensitivity_capacity.py
-===============================================================================
+
 Separate exact model-capacity evidence from exploratory metadata sensitivity.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Infer architecture from run names, paths, or hidden defaults
   - Admit model or dataset identities for comparison
   - Perform hyperparameter search, causal inference, or model selection
-===============================================================================
 """
 
 from __future__ import annotations

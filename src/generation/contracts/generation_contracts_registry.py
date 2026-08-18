@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_registry.py
-===============================================================================
+
 Validate and resolve the typed scientific parameter registry.
 Responsibilities:
   - Validate exact schemas for all supported parameter kinds
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define material-family roles or VP2 block membership
   - Sample designs, generate fields, or evaluate arbitrary expressions
-===============================================================================
 """
 
 from __future__ import annotations

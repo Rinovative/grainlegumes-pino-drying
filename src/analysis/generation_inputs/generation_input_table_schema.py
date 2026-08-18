@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_table_schema.py
-===============================================================================
+
 Define compact grouped labels for generation-input EDA tables.
 Responsibilities:
   - Group persisted parameters into airflow and drying presentation families
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Read generation inputs, calculate summaries, or render notebook widgets
   - Define parameter validity, schedule science, or persistence contracts
-===============================================================================
 """
 
 from __future__ import annotations

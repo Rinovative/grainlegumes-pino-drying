@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_notebook_support.py
-===============================================================================
+
 Prepare typed, read-only state and tables for the training control notebook.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Load final tensor datasets, fit normalizers, or construct dataloaders
   - Allocate, resume, train, infer, initialize W&B, or generate artifacts
   - Reimplement scientific configuration, path, identity, or validation semantics
-===============================================================================
 """
 
 from __future__ import annotations

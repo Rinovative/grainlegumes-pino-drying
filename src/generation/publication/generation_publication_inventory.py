@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_publication_inventory.py
-===============================================================================
+
 Audit profile-qualified parameter ownership, dimensions, and effective consumers.
 Responsibilities:
   - Report exact profile-specific sampled-coordinate inventories
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Supply scientific values, infer COMSOL binary mappings, or execute simulations
   - Treat a passing ownership audit as proof of scientific plausibility
-===============================================================================
 """
 
 from __future__ import annotations

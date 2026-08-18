@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_scalar_handoff.py
-===============================================================================
+
 Admit the exact transient scalar handoff and its immutable source identity.
 Responsibilities:
   - Define the ordered 12-field runtime handoff and numeric serialization
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Sample scientific values, generate schedules, or execute COMSOL
   - Define learned Dataset scalar views or mutable production inventories
-===============================================================================
 """
 
 from __future__ import annotations

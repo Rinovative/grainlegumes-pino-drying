@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_case.py
-===============================================================================
+
 Load one current-schema artifact case for every evaluation plot and viewer.
 
 Responsibilities:
@@ -18,7 +17,6 @@ Design principles:
 This module does NOT:
   - Admit raw Parquet tables or validate cross-artifact provenance compatibility
   - Aggregate cases or answer plot-specific scientific questions
-===============================================================================
 """
 
 from __future__ import annotations

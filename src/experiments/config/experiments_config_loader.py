@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_config_loader.py
-===============================================================================
+
 Load and strictly resolve semantic experiment configurations.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Define dataset storage or fingerprints. Dataset objects enforce those contracts
   - Implement physics equations or metric mathematics. Domain and learning modules do
   - Own checkpoint, resume, run-directory, or artifact lifecycle
-===============================================================================
 """
 
 from __future__ import annotations

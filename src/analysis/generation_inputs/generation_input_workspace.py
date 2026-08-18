@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_workspace.py
-===============================================================================
+
 Prepare the read-only generation-input notebook workspace.
 Responsibilities:
   - Discover admitted canonical input datasets for notebook presentation
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Generate, plan, reuse, or publish canonical input cases
   - Implement scientific diagnostics, plots, or panel internals
-===============================================================================
 """
 
 from __future__ import annotations

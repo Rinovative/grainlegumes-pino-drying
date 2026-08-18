@@ -1,7 +1,6 @@
 """
-===============================================================================
 eda_plot_case_statistics.py
-===============================================================================
+
 Plot case-level statistics and metadata distributions for EDA.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Compute frequency-domain EDA or model-evaluation diagnostics
   - Own generic case-count navigation and widget rendering
-===============================================================================
 """
 
 from __future__ import annotations

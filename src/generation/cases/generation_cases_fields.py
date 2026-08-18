@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_fields.py
-===============================================================================
+
 Generate deterministic bed, pressure, and initial-moisture spatial fields.
 Responsibilities:
   - Preserve the maintained multiscale permeability and porosity construction
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define scientific ranges, schedules, COMSOL mappings, or storage semantics
   - Add local or high-frequency perturbations to initial moisture
-===============================================================================
 """
 
 from __future__ import annotations

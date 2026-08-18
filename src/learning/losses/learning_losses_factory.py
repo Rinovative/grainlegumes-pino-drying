@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_losses_factory.py
-===============================================================================
+
 Build semantic supervised and physics-informed loss compositions.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Define task contracts or allowed physics choices. ``domain.tasks`` owns them
   - Implement derivatives, equations, residuals, or diagnostics. ``domain.physics`` does
   - Define evaluation metrics or dataset aggregation. ``learning.metrics`` does
-===============================================================================
 """
 
 from __future__ import annotations

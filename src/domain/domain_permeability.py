@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_permeability.py
-===============================================================================
+
 Define permeability tensor naming, ordering, mapping, and diagnostics.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Normalize permeability for learned-model storage
   - Choose learned model input fields or task channel order
   - Evaluate permeability-dependent physics residuals
-===============================================================================
 """
 
 from __future__ import annotations

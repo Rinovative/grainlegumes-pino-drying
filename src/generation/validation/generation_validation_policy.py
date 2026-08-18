@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_validation_policy.py
-===============================================================================
+
 Define shared blocking-integrity and advisory-diagnostic severity contracts.
 Responsibilities:
   - Classify stable validation codes as blocking or advisory
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Validate concrete files, arrays, identities, or scientific formulas
   - Decide Dataset filtering or campaign outcomes
-===============================================================================
 """
 
 from __future__ import annotations

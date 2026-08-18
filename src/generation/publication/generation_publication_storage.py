@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_publication_storage.py
-===============================================================================
+
 Convert validated COMSOL tables into one canonical HDF5 case payload.
 Responsibilities:
   - Map explicit profile-config headers to stable logical fields
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Execute COMSOL, define scientific ranges, or register learning tasks
   - Preserve a parallel canonical CSV learning view
-===============================================================================
 """
 
 from __future__ import annotations

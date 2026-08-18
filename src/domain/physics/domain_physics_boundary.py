@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_physics_boundary.py
-===============================================================================
+
 Provide reusable pressure-boundary masks, residuals, and diagnostics.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Bind task channel names or convert normalized tensors to physical units
   - Choose boundary-loss weights, warmup schedules, or logging names
   - Differentiate fields or evaluate interior momentum and continuity equations
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 common_locking.py
-===============================================================================
+
 Coordinate exclusive filesystem writers with process-scoped advisory locks.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Delete persistent lock files or infer ownership from their existence
   - Coordinate threads through an in-memory mutex in place of a kernel lock
   - Make a multi-file operation transactional beyond the caller-held context
-===============================================================================
 """
 
 from __future__ import annotations

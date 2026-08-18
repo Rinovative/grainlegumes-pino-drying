@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_spatial.py
-===============================================================================
+
 Render coordinated A/B/B-minus-A blocks for generation-input fields.
 Responsibilities:
   - Group maintained channels as rows under three fixed map columns
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Render single-case alternatives, derive fields, or load input files
   - Pool unrelated fields or display dataset-mean maps
-===============================================================================
 """
 
 from __future__ import annotations

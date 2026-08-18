@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_preprocessing_normalization.py
-===============================================================================
+
 Own task-aware normalizer fitting, reconstruction, and persisted identity binding.
 Responsibilities:
   - Fit per-channel preprocessing from training membership only
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Choose split membership or construct training DataLoaders
   - Persist normalizer artifacts or resolve experiment paths
-===============================================================================
 """
 
 from __future__ import annotations

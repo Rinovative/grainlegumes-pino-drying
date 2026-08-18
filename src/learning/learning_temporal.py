@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_temporal.py
-===============================================================================
+
 Validate and apply explicit temporal conditioning for transient learning.
 Responsibilities:
   - Declare supported temporal-conditioning identities
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Select transient samples, read HDF5 data, or infer a time scale
   - Concatenate temporal features into any particular model architecture
-===============================================================================
 """
 
 from __future__ import annotations

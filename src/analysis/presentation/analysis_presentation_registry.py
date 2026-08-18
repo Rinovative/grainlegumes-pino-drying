@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_presentation_registry.py
-===============================================================================
+
 Declare user-facing EDA section and plot presentation order.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Wire plot callables or construct semantic notebook controls
   - Implement plot mathematics or admit artifact scientific contracts
-===============================================================================
 """
 
 from __future__ import annotations

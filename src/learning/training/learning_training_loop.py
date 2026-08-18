@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_training_loop.py
-===============================================================================
+
 Run the custom training and evaluation loop with checkpoint support.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Load or resolve configs. ``experiments.config.loader`` owns semantic admission
   - Construct models or losses. Caller-selected learning factories own construction
   - Parse CLI arguments. ``experiments.cli`` owns command boundaries
-===============================================================================
 """
 
 from __future__ import annotations

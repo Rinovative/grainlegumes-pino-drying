@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_dataframe.py
-===============================================================================
+
 Build and compare evaluation DataFrames from the current artifact contract.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Generate, repair, or publish artifact payloads
   - Parse per-case NPZ arrays or render scientific visualizations
   - Infer compatibility from run names, paths, or architecture similarity
-===============================================================================
 """
 
 from __future__ import annotations

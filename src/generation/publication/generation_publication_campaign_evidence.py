@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_publication_campaign_evidence.py
-===============================================================================
+
 Own cross-purpose campaign-run identity and immutable transfer evidence.
 Responsibilities:
   - Resolve canonical campaign-run paths and validate persisted run manifests
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Submit scheduler jobs or classify pilot case outcomes
   - Publish transferred files or build dataset packages
-===============================================================================
 """
 
 from __future__ import annotations

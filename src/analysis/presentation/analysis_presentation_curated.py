@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_presentation_curated.py
-===============================================================================
+
 Render the fixed scientific media inventory accepted by optional W&B tracking.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Import, initialize, or call W&B
   - Admit artifact provenance or decide whether frames are comparable
   - Own the scientific mathematics implemented by evaluation plot modules
-===============================================================================
 """
 
 from __future__ import annotations

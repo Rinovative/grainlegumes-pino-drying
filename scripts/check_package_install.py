@@ -1,7 +1,6 @@
 """
-===============================================================================
 check_package_install.py
-===============================================================================
+
 Verify editable and wheel installation contracts from unrelated directories.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Mutate the checkout, environment, or production data directories
   - Download project dependencies or contact external services
   - Validate scientific runtime behavior beyond packaging and CLI help contracts
-===============================================================================
 """
 
 from __future__ import annotations

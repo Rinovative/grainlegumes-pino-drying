@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages_manifest.py
-===============================================================================
+
 Admit immutable Dataset package manifests and their exact payloads.
 Responsibilities:
   - Define the current package-manifest schema and portable provenance keys
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Build packages, select source cases, construct Datasets, or create DataLoaders
   - Support alternate schemas, aliases, fallback paths, or partial admission
-===============================================================================
 """
 
 from __future__ import annotations

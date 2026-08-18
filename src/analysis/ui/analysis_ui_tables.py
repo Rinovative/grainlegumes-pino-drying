@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_ui_tables.py
-===============================================================================
+
 Render reusable styled DataFrame tables for analysis notebooks.
 Responsibilities:
   - Format numeric table values consistently for notebook display
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Compute scientific statistics or choose displayed columns
   - Compose notebook sections or manage figure-export state
-===============================================================================
 """
 
 from __future__ import annotations

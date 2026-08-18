@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_run.py
-===============================================================================
+
 Allocate, initialize, execute, resume, and validate saved experiment runs.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Define task physics, model architectures, loss formulas, or metric mathematics
   - Infer resume from an existing directory or treat observers as authoritative state
   - Render or publish post-training analysis artifacts
-===============================================================================
 """
 
 from __future__ import annotations

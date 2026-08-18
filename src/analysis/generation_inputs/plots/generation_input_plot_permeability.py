@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_permeability.py
-===============================================================================
+
 Compose tensor and derived-permeability A/B spatial comparisons.
 Responsibilities:
   - Group Kxx, Kxy, and Kyy as tensor-component rows
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Render single-case alternatives or recompute permeability diagnostics
   - Define tensor validity, resample grids, or load input files
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_benchmark.py
-===============================================================================
+
 Own the isolated transient COMSOL core-scaling benchmark lifecycle.
 Responsibilities:
   - Resolve one shared scientific case and exactly four resource-only variants
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Define scientific parameters, publish training cases, or modify production resources
   - Run on the bare control-plane host or treat isolated throughput as contention proof
-===============================================================================
 """
 
 from __future__ import annotations

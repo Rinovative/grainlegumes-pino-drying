@@ -1,7 +1,6 @@
 """
-===============================================================================
 common_queue_log_cli.py
-===============================================================================
+
 Resolve one queue-log directory for non-Python launchers.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Create directories, log files, runs, studies, or queue jobs
   - Validate Docker, GPU, scheduler, or experiment configuration state
   - Translate container paths to host mount paths
-===============================================================================
 """
 
 from __future__ import annotations

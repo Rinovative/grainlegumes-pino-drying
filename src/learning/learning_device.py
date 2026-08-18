@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_device.py
-===============================================================================
+
 Resolve the exact runtime device policy shared by every execution service.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Parse semantic config paths. ``experiments.config.loader`` owns config validation
   - Persist or forward runtime facts. Top-level service boundaries own publication
   - Construct or execute models, losses, metrics, checkpoints, or training loops
-===============================================================================
 """
 
 from __future__ import annotations

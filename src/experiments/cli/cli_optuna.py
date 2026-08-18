@@ -1,7 +1,6 @@
 """
-===============================================================================
 cli_optuna.py
-===============================================================================
+
 Run or validate config-driven Optuna studies from the command line.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Create, reopen, or optimize studies. ``experiments.tuning.optuna`` owns lifecycle
   - Parse trial search schemas. ``experiments.tuning.search_space`` owns admission
-===============================================================================
 """
 
 from __future__ import annotations

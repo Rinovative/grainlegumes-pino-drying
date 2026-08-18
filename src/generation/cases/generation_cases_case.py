@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_case.py
-===============================================================================
+
 Create deterministic scientific inputs and isolated COMSOL work directories.
 Responsibilities:
   - Resolve one typed sample into spatial, scalar, and schedule adapter tables
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Run COMSOL, infer template mappings, or publish canonical HDF5 results
   - Treat CSV as a canonical learning-view artifact
-===============================================================================
 """
 
 from __future__ import annotations

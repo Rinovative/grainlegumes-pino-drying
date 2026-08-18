@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_preparation.py
-===============================================================================
+
 Prepare isolated runtime workspaces from deterministic scientific case bundles.
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
@@ -12,7 +11,6 @@ Design principles:
   - Workspace creation and template copying remain runtime concerns
 This module does NOT:
   - Execute COMSOL, convert outputs, or publish canonical case results
-===============================================================================
 """
 
 from __future__ import annotations

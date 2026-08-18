@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_artifact_service.py
-===============================================================================
+
 Discover, validate, rebuild, generate, and reuse split-aware run artifacts.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Parse CLI arguments or choose which runs a user intends to process
   - Define scientific metrics or the Parquet/NPZ payload schema
   - Render notebook figures or broaden the curated W&B upload inventory
-===============================================================================
 """
 
 from __future__ import annotations

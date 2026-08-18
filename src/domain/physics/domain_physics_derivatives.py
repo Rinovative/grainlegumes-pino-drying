@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_physics_derivatives.py
-===============================================================================
+
 Provide reusable spatial derivative operators for physical tensor fields.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Bind task field names, transform normalized data, or select loss weights
   - Impose equation-specific interior crops or scalar residual reductions
   - Infer nonuniform, curvilinear, or unstructured-grid derivatives
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_artifact_contracts.py
-===============================================================================
+
 Define lightweight persisted contracts for generated analysis artifacts.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Import Torch or run trained-model inference
   - Write artifact payloads or publish completion markers
   - Admit, rebuild, lock, time, render, or upload artifact caches
-===============================================================================
 """
 
 from __future__ import annotations

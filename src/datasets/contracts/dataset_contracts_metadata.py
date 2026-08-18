@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_contracts_metadata.py
-===============================================================================
+
 Validate and summarize current model-training metadata packages.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Admit generated-batch, sampling, dataset, or timing schemas other than the current contract
   - Construct final datasets, splits, normalizers, checkpoints, or artifacts
   - Define a transient-drying tensor contract
-===============================================================================
 """
 
 from __future__ import annotations

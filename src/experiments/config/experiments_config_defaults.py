@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_config_defaults.py
-===============================================================================
+
 Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Parse or strictly validate user config. ``experiments.config.loader`` owns admission
   - Construct models, losses, metrics, or physics. Their registries own construction
   - Define dataset storage schemas or lifecycle behavior
-===============================================================================
 """
 
 from __future__ import annotations

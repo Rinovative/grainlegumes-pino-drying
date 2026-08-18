@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_smoke.py
-===============================================================================
+
 Validate, evidence, and compare native technical runtime smoke campaigns.
 Responsibilities:
   - Publish profile-scoped evidence only after a complete technical workflow
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Run COMSOL, submit Slurm jobs, infer export mappings, or launch production
   - Treat a technical smoke as experimental validation of scientific priors
-===============================================================================
 """
 
 from __future__ import annotations

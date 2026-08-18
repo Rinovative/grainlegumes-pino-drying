@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_workflow.py
-===============================================================================
+
 Prepare portable evaluation sessions and panels from concise run selections.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Admit runs, reconstruct models, generate payloads, or publish artifacts itself
   - Choose datasets, roles, labels, sections, devices, or rebuild policy for users
   - Contact tracking services or mutate run lifecycle evidence
-===============================================================================
 """
 
 from __future__ import annotations

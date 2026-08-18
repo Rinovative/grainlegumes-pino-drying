@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_metrics.py
-===============================================================================
+
 Compute task-resolved PyTorch metrics for training and evaluation.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Construct normalized or physical tensor views. Evaluation orchestration owns them
   - Log or persist metric results. Callers own observer and storage side effects
-===============================================================================
 """
 
 from __future__ import annotations

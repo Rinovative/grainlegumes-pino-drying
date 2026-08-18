@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_config.py
-===============================================================================
+
 Resolve and validate layered scientific and execution generation configurations.
 Responsibilities:
   - Resolve common, material-family, profile, dataset, and execution YAML owners
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Invent material ranges, coupled sets, production counts, or COMSOL mappings
   - Generate samples or fields, execute COMSOL, or modify templates
-===============================================================================
 """
 
 from __future__ import annotations

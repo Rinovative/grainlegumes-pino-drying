@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_run_summary.py
-===============================================================================
+
 Summarize authoritative model accuracy, architecture, and physical tradeoffs.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Infer model facts from run names, paths, or hidden configuration defaults
   - Invent parameter-efficiency or cross-diagnostic composite scores
   - Admit incompatible frames or serialize tracking media
-===============================================================================
 """
 
 from __future__ import annotations

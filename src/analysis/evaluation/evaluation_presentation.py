@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_presentation.py
-===============================================================================
+
 Expose small, current-native presentation data shared by evaluation views.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Load models, infer, generate, repair, mutate, or admit artifacts
   - Create an alternate dataframe or compatibility API
   - Own public view composition or plot-specific widget behavior
-===============================================================================
 """
 
 from __future__ import annotations

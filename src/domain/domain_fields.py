@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_fields.py
-===============================================================================
+
 Define reusable canonical field names and semantic field groups.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Define task-specific tensor layouts or model input/output membership
   - Define permeability storage conversion or source-field mapping
   - Accept aliases for canonical field identifiers
-===============================================================================
 """
 
 from __future__ import annotations

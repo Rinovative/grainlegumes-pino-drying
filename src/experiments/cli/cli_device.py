@@ -1,7 +1,6 @@
 """
-===============================================================================
 cli_device.py
-===============================================================================
+
 Define the shared semantic runtime-device option used by command modules.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Validate or resolve runtime hardware. ``learning.device`` owns that boundary
   - Apply service-specific overrides. Each command entry point owns forwarding
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_workflow.py
-===============================================================================
+
 Own post-simulation publication evidence, dataset gates, and source cleanup.
 Responsibilities:
   - Validate exact GPU transfer inventories and every declared dataset package
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Implement SSH, rsync, Slurm submission, COMSOL execution, or scientific logic
   - Delete GPU generation sources, dataset packages, repositories, or templates
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_cluster.py
-===============================================================================
+
 Coordinate local development concurrency and one-case Slurm submissions.
 Responsibilities:
   - Validate a bounded local-only development execution plan
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Pack cases into nodes, create Slurm arrays, or impose a cluster running cap
   - Poll the scheduler, persist feeder state, or implement scientific generation
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 learning_losses_pino.py
-===============================================================================
+
 Compose supervised and task-selected physics-informed loss components.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Define equations, derivatives, residuals, or boundaries. ``domain`` owns them
   - Parse semantic config or select implementations. ``losses.factory`` owns selection
   - Define or aggregate dataset metrics. ``learning.metrics`` owns evaluation
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_panel.py
-===============================================================================
+
 Compose the compact input-generated EDA panel.
 Responsibilities:
   - Bind the four-section registry to A/B comparison and dataset views
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Refresh or generate inputs, implement plot mathematics, or inspect outputs
   - Modify completed-output EDA or evaluation behavior
-===============================================================================
 """
 
 from __future__ import annotations

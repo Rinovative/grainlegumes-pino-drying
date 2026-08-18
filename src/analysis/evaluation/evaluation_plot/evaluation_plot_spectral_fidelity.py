@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_spectral_fidelity.py
-===============================================================================
+
 Render output-spectrum views from current bounded reducers.
 
 Responsibilities:
@@ -22,7 +21,6 @@ This module does NOT:
   - Inspect learned layers, latent activations, or model internals
   - Provide learned-layer or latent spectral hooks
   - Own notebook controls or public panel composition
-===============================================================================
 """
 
 from __future__ import annotations

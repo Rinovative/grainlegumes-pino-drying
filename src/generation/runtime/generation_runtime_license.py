@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_license.py
-===============================================================================
+
 Classify and persist bounded retry evidence for temporary COMSOL license capacity.
 Responsibilities:
   - Recognize conservative floating-license capacity signatures in captured logs
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Submit scheduler jobs, sleep inside allocations, or classify other failures
   - Change COMSOL models, scientific inputs, or case-publication admission
-===============================================================================
 """
 
 from __future__ import annotations

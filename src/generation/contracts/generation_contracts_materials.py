@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_materials.py
-===============================================================================
+
 Resolve compact role-neutral material records into typed scientific registries.
 Responsibilities:
   - Discover material identifiers and resolve profile-specific coordinate contracts
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Assign campaign roles, counts, seeds, dataset membership, or runtime mappings
   - Invent scientific values, derivations, sources, or compatibility modes
-===============================================================================
 """
 
 from __future__ import annotations

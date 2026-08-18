@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_artifact_loader.py
-===============================================================================
+
 Load strict path-selected evaluation artifacts without generation or inference.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Import artifact generation, reconstruct models, or execute inference
   - Create, repair, rebuild, publish, upload, or remove artifact payloads
   - Render figures or manage evaluation-session caches
-===============================================================================
 """
 
 from __future__ import annotations

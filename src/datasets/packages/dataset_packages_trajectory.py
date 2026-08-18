@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_packages_trajectory.py
-===============================================================================
+
 Build and admit compact transient trajectory indexes from canonical HDF5 cases.
 Responsibilities:
   - Validate source time, channel, status, and case identities
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Own process-local HDF5 handles or Dataset item materialization
   - Fit normalization, train models, or perform rollouts
-===============================================================================
 """
 
 from __future__ import annotations

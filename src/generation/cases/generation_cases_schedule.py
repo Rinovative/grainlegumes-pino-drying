@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_schedule.py
-===============================================================================
+
 Generate one deterministic grid-resolved temporal inlet schedule.
 Responsibilities:
   - Compose dedicated smooth, event, and trend processes on the regular time grid
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Generate pressure or other spatial fields, define supports, or add learned channels
   - Infer values from an early solver stop
-===============================================================================
 """
 
 from __future__ import annotations

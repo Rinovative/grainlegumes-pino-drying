@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_task_registry.py
-===============================================================================
+
 Register and resolve semantic task and task-selected physics identifiers.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Define task structure or concrete steady-flow field declarations
   - Translate aliases, import plugins, or mutate registrations at runtime
   - Implement physics equations, losses, models, or training behavior
-===============================================================================
 """
 
 from __future__ import annotations

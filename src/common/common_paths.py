@@ -1,7 +1,6 @@
 """
-===============================================================================
 common_paths.py
-===============================================================================
+
 Resolve repository paths and the unified scientific storage lifecycle.
 
 Responsibilities:
@@ -21,7 +20,6 @@ This module does NOT:
   - Create datasets, runs, checkpoints, summaries, or analysis artifacts
   - Decide dataset membership, experiment semantics, or resume eligibility
   - Validate run or artifact contents beyond shallow discovery predicates
-===============================================================================
 """
 
 from __future__ import annotations

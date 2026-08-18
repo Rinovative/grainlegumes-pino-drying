@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_descriptors.py
-===============================================================================
+
 Expose stable read-only generation schema descriptors across package boundaries.
 Responsibilities:
   - Describe canonical profile fields and units without exposing module layout
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Load campaigns, generate cases, validate HDF5 payloads, or execute workflows
   - Duplicate configured material roles, counts, seeds, or package requests
-===============================================================================
 """
 
 from __future__ import annotations

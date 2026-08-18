@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_publication_attempt.py
-===============================================================================
+
 Publish and admit durable unsuccessful Generation attempt evidence.
 Responsibilities:
   - Resolve collision-safe campaign, case, and attempt storage paths
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Execute COMSOL, derive campaign terminality, or publish processed cases
   - Duplicate canonical sampled parameters from raw case evidence
-===============================================================================
 """
 
 from __future__ import annotations

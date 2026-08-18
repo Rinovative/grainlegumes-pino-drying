@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_selection.py
-===============================================================================
+
 Own canonical shared A/B selection state for generation-input analysis.
 Responsibilities:
   - Store immutable Dataset A/B and Case A/B canonical keys
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Construct widgets, discover storage, or render scientific diagnostics
   - Modify completed-output EDA or evaluation selection behavior
-===============================================================================
 """
 
 from __future__ import annotations

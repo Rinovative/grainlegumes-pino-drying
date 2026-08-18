@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_preflight.py
-===============================================================================
+
 Audit the native CPU generation environment without starting a COMSOL solve.
 Responsibilities:
   - Validate compute Python, COMSOL, modules, templates, scratch, and storage
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Submit production work, execute a model, install packages, or change science
   - Treat template hashes or fake executables as runtime COMSOL validation
-===============================================================================
 """
 
 from __future__ import annotations

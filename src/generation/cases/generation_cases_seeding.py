@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_seeding.py
-===============================================================================
+
 Derive version-bound deterministic seeds for Generation scientific workflows.
 Responsibilities:
   - Own the Generation algorithm version used in semantic seed identities
@@ -13,7 +12,6 @@ Design principles:
 This module does NOT:
   - Resolve configuration, select sampling designs, or allocate OOD cases
   - Generate numerical samples, fields, schedules, or persisted artifacts
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_contracts_views.py
-===============================================================================
+
 Define buildable Dataset views and uniform immutable contract inspection.
 Responsibilities:
   - Register steady-flow and transient-drying Dataset-view identities
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Build packages, load HDF5 data, or register transient training behavior
   - Infer parameter relevance from filenames or mutable campaign membership
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_runtime_transient.py
-===============================================================================
+
 Lazily materialize physical-unit transient samples from admitted indexes.
 Responsibilities:
   - Resolve and revalidate immutable source HDF5 and temporal evidence
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Build or publish transient indexes
   - Normalize time, train models, or execute autoregressive model rollouts
-===============================================================================
 """
 
 from __future__ import annotations

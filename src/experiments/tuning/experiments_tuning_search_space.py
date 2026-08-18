@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_tuning_search_space.py
-===============================================================================
+
 Parse YAML-defined Optuna search spaces and apply trial overrides.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Create studies or execute trials. ``experiments.tuning.optuna`` owns lifecycle
   - Construct models or optimizers. Learning factories own runtime objects
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 experiments_tracking.py
-===============================================================================
+
 Mirror authoritative local experiment state to optional W&B observability.
 
 Responsibilities:
@@ -23,7 +22,6 @@ This module does NOT:
   - Own training, checkpoint, scheduler, pruning, or local lifecycle decisions
   - Upload raw datasets, resume-only checkpoints, arbitrary files, or cache internals
   - Make remote availability or W&B state a prerequisite for local correctness
-===============================================================================
 """
 
 from __future__ import annotations

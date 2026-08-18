@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_workspace.py
-===============================================================================
+
 Validate persistent roots and own disposable generation workspaces.
 Responsibilities:
   - Resolve user-owned persistent storage and explicitly bounded scratch roots
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Generate scientific inputs, run COMSOL, submit Slurm jobs, or publish cases
   - Delete canonical data or infer ownership from a directory name
-===============================================================================
 """
 
 from __future__ import annotations

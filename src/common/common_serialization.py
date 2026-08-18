@@ -1,7 +1,6 @@
 """
-===============================================================================
 common_serialization.py
-===============================================================================
+
 Publish authoritative files atomically and compute stable content digests.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Enforce checkpoint, experiment, dataset, or artifact schemas
   - Refuse overwrite of an existing destination on the caller's behalf
   - Turn several independently published files into one transaction
-===============================================================================
 """
 
 from __future__ import annotations

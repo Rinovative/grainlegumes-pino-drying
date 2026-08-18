@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_layout.py
-===============================================================================
+
 Define shared current-native layout contracts for evaluation field maps.
 
 Responsibilities:
@@ -20,7 +19,6 @@ This module does NOT:
   - Load artifacts, select cases, calculate statistics, or clip scientific data
   - Choose colormaps, labels, coordinates, or plot-specific panel composition
   - Own notebook controls, display calls, exports, or lazy rendering
-===============================================================================
 """
 
 from __future__ import annotations

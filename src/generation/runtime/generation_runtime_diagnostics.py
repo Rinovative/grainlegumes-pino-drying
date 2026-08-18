@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_diagnostics.py
-===============================================================================
+
 Measure failed transient semantic gates from already-produced raw exports.
 Responsibilities:
   - Reuse production canonical reconstruction before failed HDF5 publication
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Modify model, solver, or scientific initialization semantics
   - Publish canonical cases or retain runtime artifacts
-===============================================================================
 """
 
 from __future__ import annotations

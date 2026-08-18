@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_controls.py
-===============================================================================
+
 Build local canonical-dataset selectors for generation-input views.
 Responsibilities:
   - Bind Dataset A, Case A, Dataset B, and Case B controls
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Refresh discovery, construct tabs, render figures, or discover storage paths
   - Expose input-generation sources or lifecycle categories as datasets
-===============================================================================
 """
 
 from __future__ import annotations

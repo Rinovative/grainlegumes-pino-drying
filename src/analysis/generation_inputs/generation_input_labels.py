@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_labels.py
-===============================================================================
+
 Build concise generation-input dataset labels from canonical metadata.
 Responsibilities:
   - Map maintained simulation profiles to compact presentation labels
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Discover datasets, admit persisted inputs, or render notebook controls
   - Define canonical profile, campaign-purpose, or batch identity values
-===============================================================================
 """
 
 from __future__ import annotations

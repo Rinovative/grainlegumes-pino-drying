@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_task_steady_flow.py
-===============================================================================
+
 Declare the authoritative steady two-dimensional porous-flow task contract.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Implement derivatives, residual equations, losses, or metrics
   - Select datasets for explicit executable experiment recipes
   - Define checkpoint, resume, inference, or artifact lifecycle behavior
-===============================================================================
 """
 
 from __future__ import annotations

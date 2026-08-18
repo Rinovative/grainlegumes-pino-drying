@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_batch.py
-===============================================================================
+
 Run, admit, and atomically publish isolated profile-qualified COMSOL cases.
 Responsibilities:
   - Execute safe one-node COMSOL commands and retain complete runtime evidence
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Modify COMSOL templates or infer internal tags, expressions, or signs
   - Publish a parallel canonical CSV learning view
-===============================================================================
 """
 
 from __future__ import annotations

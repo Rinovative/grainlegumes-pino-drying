@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_campaign.py
-===============================================================================
+
 Persist, feed, inspect, and terminally validate one campaign run.
 Responsibilities:
   - Bind campaign execution to one clean exact Git commit and execution config
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Generate scientific inputs, implement SSH/rsync, or build dataset packages
   - Poll indefinitely, submit a whole campaign queue, or delete remote sources
-===============================================================================
 """
 
 from __future__ import annotations

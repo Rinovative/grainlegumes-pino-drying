@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_validation_sentinels.py
-===============================================================================
+
 Run deterministic no-COMSOL sentinels over both maintained VP2 profiles.
 Responsibilities:
   - Exercise every configured material under each resolved profile sampling plan
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Start COMSOL, mutate campaign YAML, authorize production, or fit parameters
   - Create alternate sampling modes or family-specific evaluation behavior
-===============================================================================
 """
 
 from __future__ import annotations

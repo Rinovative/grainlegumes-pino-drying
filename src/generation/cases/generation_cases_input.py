@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_cases_input.py
-===============================================================================
+
 Publish and plan canonical pre-execution inputs for maintained generation batches.
 Responsibilities:
   - Initialize shared batch metadata without duplicating runtime ownership
@@ -14,7 +13,6 @@ Design principles:
   - Conflicting or incomplete canonical evidence always fails closed
 This module does NOT:
   - Execute COMSOL, publish processed results, or admit alternate storage layouts
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_ui_notebook.py
-===============================================================================
+
 Build notebook dropdown sections, lazy panels and figure exports.
 
 Responsibilities:
@@ -17,7 +16,6 @@ Design principles:
 This module does NOT:
   - Define primitive widgets or domain-specific scientific controls
   - Load artifact cases or implement case-level plot mathematics
-===============================================================================
 """
 
 from collections.abc import Callable, Sequence

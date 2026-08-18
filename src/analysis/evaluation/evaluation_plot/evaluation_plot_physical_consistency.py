@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_physical_consistency.py
-===============================================================================
+
 Render physical-consistency CDFs, maps, and tables from current evidence.
 
 Responsibilities:
@@ -23,7 +22,6 @@ This module does NOT:
   - Fabricate an unavailable independent ground-truth physics baseline
   - Substitute one continuity diagnostic for another or derive a composite score
   - Admit artifacts or own notebook control composition
-===============================================================================
 """
 
 from __future__ import annotations

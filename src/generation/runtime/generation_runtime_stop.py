@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_runtime_stop.py
-===============================================================================
+
 Control one owned COMSOL process through its documented status-file protocol.
 Responsibilities:
   - Validate bounded graceful-stop and hard-timeout timing contracts
@@ -16,7 +15,6 @@ This module does NOT:
   - Start COMSOL processes or prepare case workspaces
   - Classify solver output or publish simulation results
   - Signal process groups that were not supplied as owned solver processes
-===============================================================================
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_readiness.py
-===============================================================================
+
 Report fail-closed VP2 scientific, technical-smoke, and launch readiness.
 Responsibilities:
   - Resolve both configured primary campaigns without requiring launch values
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Choose counts or seeds, confirm COMSOL mappings, or create runtime receipts
   - Run static sentinels unless the caller explicitly requests them
-===============================================================================
 """
 
 from __future__ import annotations

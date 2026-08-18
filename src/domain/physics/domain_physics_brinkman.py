@@ -1,7 +1,6 @@
 """
-===============================================================================
 domain_physics_brinkman.py
-===============================================================================
+
 Provide reusable steady Darcy-Brinkman equations and physical diagnostics.
 
 Responsibilities:
@@ -19,7 +18,6 @@ This module does NOT:
   - Normalize model tensors or choose physics-loss weights and warmup schedules
   - Own derivative discretization, checkpointing, W&B logging, or Optuna policy
   - Infer task channel order without explicit field-name declarations
-===============================================================================
 """
 
 from __future__ import annotations

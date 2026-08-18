@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_artifact_timing.py
-===============================================================================
+
 Measure and validate COMSOL and neural artifact runtime comparisons.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Select runs, datasets, checkpoints, or artifact memberships
   - Generate Parquet or NPZ scientific payloads
   - Upload runtime evidence or mutate tracking workspaces
-===============================================================================
 """
 
 from __future__ import annotations

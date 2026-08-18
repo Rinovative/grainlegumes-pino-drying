@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_plot_samples_outliers.py
-===============================================================================
+
 Render case, permeability, outlier, and input-extreme views.
 
 Responsibilities:
@@ -22,7 +21,6 @@ This module does NOT:
   - Compare models by row position without matching identity and reference fields
   - Redefine predictive, physics, or metadata-ranking semantics
   - Own interactive notebook controls or public panel composition
-===============================================================================
 """
 
 from __future__ import annotations

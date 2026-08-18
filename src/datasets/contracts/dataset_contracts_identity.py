@@ -1,7 +1,6 @@
 """
-===============================================================================
 dataset_contracts_identity.py
-===============================================================================
+
 Define and verify persisted final-dataset and split identity contracts.
 
 Responsibilities:
@@ -18,7 +17,6 @@ This module does NOT:
   - Load final datasets into model-ready samples. ``src.datasets.runtime.factory`` owns that
   - Choose training/evaluation ratios or random seeds. Experiment services own them
   - Publish dataset files. The generation-domain builder owns publication
-===============================================================================
 """
 
 from __future__ import annotations

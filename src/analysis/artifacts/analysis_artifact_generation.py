@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_artifact_generation.py
-===============================================================================
+
 Create persistent evaluation artifacts from trained neural-operator runs.
 
 Responsibilities:
@@ -101,7 +100,6 @@ Artifact contract:
     digests, saved train-fitted output scales, task-owned output groups, and the
     aggregate normalized_group_macro_rmse finalized once from global physical
     SSE/count evidence.
-===============================================================================
 """
 
 from __future__ import annotations

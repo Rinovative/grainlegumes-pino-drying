@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_input_plot_boundaries.py
-===============================================================================
+
 Render unified boundary tables and transient schedule comparisons.
 Responsibilities:
   - Present boundary scalars as Case A, Mean A, Case B, and Mean B
@@ -15,7 +14,6 @@ Design principles:
 This module does NOT:
   - Render single-case schedules or separate case-versus-mean views
   - Modify startup semantics, psychrometric logic, or generation inputs
-===============================================================================
 """
 
 from __future__ import annotations

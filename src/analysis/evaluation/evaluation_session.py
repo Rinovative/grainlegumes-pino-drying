@@ -1,7 +1,6 @@
 """
-===============================================================================
 evaluation_session.py
-===============================================================================
+
 Reuse validated evaluation cases and plot-independent numerical reductions.
 
 Responsibilities:
@@ -22,7 +21,6 @@ This module does NOT:
   - Load run directories, generate artifacts, run inference, or repair payloads
   - Cache Matplotlib figures, widgets, display labels, or export state
   - Keep an unbounded process-global case or numerical cache
-===============================================================================
 """
 
 from __future__ import annotations

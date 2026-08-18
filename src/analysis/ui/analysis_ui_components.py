@@ -1,7 +1,6 @@
 """
-===============================================================================
 analysis_ui_components.py
-===============================================================================
+
 Provide reusable widget constructors and UI helpers for analysis notebooks.
 
 Responsibilities:
@@ -18,7 +17,6 @@ Design principles:
 This module does NOT:
   - Compose complete notebook panels or manage figure-export lifecycle
   - Load analysis data or implement domain-specific case rendering
-===============================================================================
 """
 
 from __future__ import annotations

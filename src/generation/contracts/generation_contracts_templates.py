@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_contracts_templates.py
-===============================================================================
+
 Resolve configured COMSOL template paths and adjacent digest sidecars.
 Responsibilities:
   - Validate one repository-relative configured COMSOL template path
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Map profile identifiers to files or paths
   - Load profile YAML, update sidecars, or execute COMSOL
-===============================================================================
 """
 
 from __future__ import annotations

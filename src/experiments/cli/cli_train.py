@@ -1,7 +1,6 @@
 """
-===============================================================================
 cli_train.py
-===============================================================================
+
 Parse training CLI arguments and delegate to the reusable run service.
 
 Responsibilities:
@@ -18,7 +17,6 @@ Design principles:
 This module does NOT:
   - Allocate, seed, persist, resume, or train runs. ``experiments.run`` owns lifecycle
   - Discover artifact roles, rebuild incompatible targets, or upload to W&B
-===============================================================================
 """
 
 from __future__ import annotations

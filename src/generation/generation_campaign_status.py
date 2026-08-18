@@ -1,7 +1,6 @@
 """
-===============================================================================
 generation_campaign_status.py
-===============================================================================
+
 Render concise human and workflow-monitor views of canonical campaign status.
 Responsibilities:
   - Format deterministic per-case scheduler and runtime progress evidence
@@ -14,7 +13,6 @@ Design principles:
 This module does NOT:
   - Query Slurm, parse COMSOL logs, or validate terminal case success
   - Persist monitoring evidence or authorize publication and cleanup
-===============================================================================
 """
 
 from __future__ import annotations
