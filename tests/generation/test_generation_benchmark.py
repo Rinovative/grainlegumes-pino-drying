@@ -258,8 +258,13 @@ def test_resource_change_preserves_both_case_identities(
 def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> None:
     """Resolve the sole fast benchmark with production cores first."""
     repository = common.paths.get_project_root()
+    suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
+    suite = generation.benchmark.load_core_benchmark_suite(
+        suite_path,
+        require_executable=False,
+    )
     inspection = generation.benchmark.inspect_core_benchmark(
-        repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml",
+        suite_path,
         require_executable=False,
     )
     assert [case["case_role"] for case in inspection["representative_cases"]] == [
@@ -267,12 +272,9 @@ def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> No
         "natural",
     ]
     assert [case["case_index"] for case in inspection["representative_cases"]] == [1, 2]
-    assert [wave["cores_per_case"] for wave in inspection["variant_waves"]] == [
-        16,
-        4,
-        8,
-        32,
-    ]
+    wave_cores = [wave["cores_per_case"] for wave in inspection["variant_waves"]]
+    assert wave_cores[0] == suite.production_cores_per_case
+    assert wave_cores[1:] == sorted(variant.cores_per_case for variant in suite.variants if variant.cores_per_case != suite.production_cores_per_case)
     assert inspection["parallel_cases_per_variant"] == 2
     assert inspection["required_successful_measurements"] == 8
     assert inspection["canary_wave"]["included_in_final_measurements"] is True

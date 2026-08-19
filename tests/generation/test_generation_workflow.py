@@ -69,6 +69,7 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
         "configs/generation/campaigns/transient_drying/technical_smoke.yaml",
         "configs/generation/campaigns/transient_drying/material_pilot.yaml",
         "configs/generation/workflows/technical_smoke.yaml",
+        "configs/generation/execution/cluster_cpu.yaml",
     ):
         source = repository / relative
         destination = project / relative
@@ -349,6 +350,12 @@ elif [[ " $* " == *' core-benchmark-summary '* ]]; then
   printf '%s\n' '# Synthetic remote core benchmark summary'
 elif [[ " $* " == *' validate-real-smoke '* ]]; then
   printf '%s\n' '{"status":"valid"}'
+elif [[ " $* " == *' campaign-transfer-authority '* ]]; then
+  [[ "${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}" == compatible_repairable ]] || exit 4
+  printf '{"schema_kind":"generation_campaign_transfer_authority","schema_version":1,'
+  printf '"campaign_run_id":"%s","campaign_id":"synthetic-campaign",' "${FAKE_RUN_ID}"
+  printf '"git_commit":"%s","file_count":5,"size_bytes":5,' "${FAKE_GIT_COMMIT}"
+  printf '"inventory_sha256":"%s"}\n' "${FAKE_INVENTORY_SHA}"
 elif [[ " $* " == *' campaign-transfer-plan '* ]]; then
   printf '%b' "${FAKE_TRANSFER_PLAN}"
 elif [[ " $* " == *' campaign-source-status '* ]]; then
@@ -389,13 +396,17 @@ elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; 
     progress_value="${values[value_index]}"
   fi
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
-  printf 'Campaign: %s\nState: %s\nCases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n' "${FAKE_RUN_ID}" "${state}"
+  printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
+  printf 'Resources: cores_per_case=16  pending_buffer=2  max_running_cases=null\n'
+  printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
   printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
   printf '  phase=transient_drying  sim_time=%s h  step=0.075 s\n' "${progress_value}"
   printf '  order=2  Tfail=1  NLfail=3  updated=4 s ago\n'
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format summary '* ]]; then
-  printf 'Campaign: %s\nState: %s\nCases: 0/1 completed, 0 active, 1 pending, 0 failed\n\n' \
-    "${FAKE_RUN_ID}" "${FAKE_CAMPAIGN_STATE}"
+  printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' \
+    "${FAKE_RUN_ID}" "${FAKE_CAMPAIGN_STATE}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
+  printf 'Resources: cores_per_case=16  pending_buffer=2  max_running_cases=null\n'
+  printf 'Cases: 0/1 completed, 0 active, 1 pending, 0 failed\n\n'
   printf 'Pending cases:\ncase_0001  job=591776  node=unavailable  elapsed=unavailable  state=active  reason=PENDING\n'
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format state '* ]]; then
   next_campaign_state
@@ -544,7 +555,13 @@ if [[ " $* " == *' resolve-generation-run '* ]]; then
   exit 0
 fi
 if [[ " $* " == *' find-compatible-technical-smoke-run '* ]]; then
-  printf '%s\n' '{"status":"missing","campaign_run_id":null}'
+  compatible_smoke_status="${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}"
+  if [[ "${compatible_smoke_status}" == missing ]]; then
+    printf '%s\n' '{"status":"missing","campaign_run_id":null}'
+  else
+    printf '{"status":"%s","campaign_run_id":"%s"}\n' \
+      "${compatible_smoke_status}" "${FAKE_RUN_ID}"
+  fi
   exit 0
 fi
 if [[ " $* " == *' find-compatible-campaign-source '* ]]; then
@@ -669,6 +686,11 @@ if [[ " $* " == *' -c '* ]]; then
     else
       printf 'plan\tcampaign\t%s\t%s\t%s\t%s\t0\n' "${FAKE_RUN_ID}" "${config}" "${purpose}" "${profile}"
     fi
+  elif [[ " $* " == *'value["campaign_run_id"] is None'*     && " $* " != *'value.get("package_state"'* ]]; then
+    compatible_smoke_status="${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}"
+    compatible_smoke_run='-'
+    [[ "${compatible_smoke_status}" == missing ]] || compatible_smoke_run="${FAKE_RUN_ID}"
+    printf '%s\t%s\n' "${compatible_smoke_status}" "${compatible_smoke_run}"
   elif [[ " $* " == *'value.get("package_state"'* ]]; then
     compatible_state="${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}"
     if [[ "${compatible_state}" == missing \
@@ -735,7 +757,7 @@ if [[ " $* " == *' -c '* ]]; then
     printf 'pilot\tpilot_check\t4\t20\n'
   elif [[ " $* " == *'execution_resources'* ]]; then
     purpose="$(cat "${FAKE_CAMPAIGN_PURPOSE_FILE}")"
-    printf 'execution\t%s\t8\t01:00:00\t48\t1\t1\t-\tfixture.cluster\tslurm\tfixture\t'\
+    printf 'execution\t%s\t16\t01:00:00\t48\t2\t1\t-\tfixture.cluster\tslurm\tfixture\t'\
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' "${purpose}"
   elif [[ " $* " == *'value["completed_cases"]'* ]]; then
     printf 'deferred\t%s\t%s\t1\t0\t0\n' "${FAKE_RUN_ID}" "${FAKE_GIT_COMMIT}"
@@ -764,6 +786,10 @@ elif [[ " $* " == *' validate-core-benchmark '* ]]; then
   [[ -f "${FAKE_BENCHMARK_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' validate-published-campaign '* ]]; then
   [[ "${FAKE_GPU_ALWAYS_VALID:-false}" == true || -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
+elif [[ " $* " == *' repair-transferred-campaign '* ]]; then
+  [[ "${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}" == compatible_repairable ]] || exit 4
+  : > "${FAKE_GPU_PUBLISHED_FILE}"
+  printf '%s\n' '{"source_removed":false,"status":"transfer_complete"}'
 elif [[ " $* " == *' create-transfer-staging '* ]]; then
   staging="${storage}/.incoming/${FAKE_RUN_ID}.synthetic"
   mkdir -p "${staging}"
@@ -813,8 +839,9 @@ elif [[ " $* " == *' validate-all-workflow '* ]]; then
   fi
   printf '%s\n' '{"workflow_result":"success"}'
 elif [[ " $* " == *' cpu-cleanup-authorization '* ]]; then
+  authorization_destination="${FAKE_AUTH_DESTINATION_ROOT:-${storage}}"
   printf 'authorization\t%s\tcpu.example\t/remote/generation root/storage\t%s\t%s\t%s\t%s\t%s\t4\t%s\n' \
-    "${FAKE_AUTHORIZATION_SHA}" "${storage}" "${FAKE_TRANSFER_SHA}" \
+    "${FAKE_AUTHORIZATION_SHA}" "${authorization_destination}" "${FAKE_TRANSFER_SHA}" \
     "${FAKE_DATASET_SHA}" "${FAKE_WORKFLOW_SHA}" "${FAKE_INVENTORY_SHA}" \
     "${FAKE_AUTHORIZED_BYTES}"
 elif [[ " $* " == *' record-cpu-cleanup '* ]]; then
@@ -988,6 +1015,17 @@ def _real_git(
         capture_output=True,
         text=True,
     )
+
+
+def _execution_config_with_cores(content: str, cores_per_case: int) -> str:
+    """Return test-owned execution YAML with one replaced cluster core value."""
+    lines = content.splitlines(keepends=True)
+    matches = [index for index, line in enumerate(lines) if line.startswith("  cores_per_case:")]
+    assert len(matches) == 1
+    index = matches[0]
+    newline = "\n" if lines[index].endswith("\n") else ""
+    lines[index] = f"  cores_per_case: {cores_per_case}{newline}"
+    return "".join(lines)
 
 
 def _initialize_real_repository(
@@ -1654,8 +1692,21 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
 def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -> None:
     """Run paired Technical Smoke orchestration from committed source while dirty."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    project = workflow.parent.parent
+    execution_config = project / "configs/generation/execution/cluster_cpu.yaml"
+    committed_cores = 16
+    dirty_cores = 8
+    committed_execution = _execution_config_with_cores(
+        execution_config.read_text(encoding="utf-8"),
+        committed_cores,
+    )
+    execution_config.write_text(committed_execution, encoding="utf-8")
     project, source_probe, commit = _initialize_real_repository(workflow, environment)
     source_probe.write_text("dirty generation behavior", encoding="utf-8")
+    execution_config.write_text(
+        _execution_config_with_cores(committed_execution, dirty_cores),
+        encoding="utf-8",
+    )
     untracked = project / "notes-in-progress.txt"
     untracked.write_text("continue local development\n", encoding="utf-8")
     environment["FAKE_EXPECT_SOURCE_FILE"] = source_probe.relative_to(project).as_posix()
@@ -1669,7 +1720,10 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     assert result.stderr.count(f"Source: committed HEAD {commit}") == 1
     assert result.stderr.count("Local worktree: dirty; uncommitted changes ignored") == 1
     assert source_probe.read_text(encoding="utf-8") == "dirty generation behavior"
+    dirty_execution = execution_config.read_text(encoding="utf-8")
+    assert f"cores_per_case: {dirty_cores}" in dirty_execution
     assert untracked.read_text(encoding="utf-8") == "continue local development\n"
+    assert f"Resources: cores_per_case={committed_cores}  pending_buffer=2  max_running_cases=null" in result.stdout
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("submit-campaign") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text
@@ -2354,7 +2408,7 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
 
     retained_root = tmp_path / "retained"
     retained_root.mkdir()
-    retained_workflow, _retained_log, retained_environment, _storage, retained_mirror = _harness(retained_root)
+    retained_workflow, retained_log, retained_environment, _storage, retained_mirror = _harness(retained_root)
     retained_directories = _seed_transfer(retained_mirror, retained_environment)
     retained = _run(
         retained_workflow,
@@ -2369,6 +2423,91 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
 
     assert retained.returncode == 0, retained.stderr
     assert all((retained_mirror / relative).is_dir() for relative in retained_directories)
+    assert "cpu-cleanup-authorization" not in retained_log.read_text(encoding="utf-8")
+
+
+def test_cleanup_destination_accepts_verified_container_alias_and_rejects_unrelated_path(
+    tmp_path: Path,
+) -> None:
+    """Compare cleanup destinations only after verified namespace mapping."""
+    workflow, _log, environment, _storage, mirror = _harness(tmp_path)
+    _seed_transfer(mirror, environment)
+    environment["FAKE_AUTH_DESTINATION_ROOT"] = "/workspace/storage"
+
+    accepted = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+
+    rejected_root = tmp_path / "rejected"
+    rejected_root.mkdir()
+    rejected_workflow, _log, rejected_environment, _storage, rejected_mirror = _harness(rejected_root)
+    _seed_transfer(rejected_mirror, rejected_environment)
+    rejected_environment["FAKE_AUTH_DESTINATION_ROOT"] = "/unrelated/storage"
+
+    rejected = _run(
+        rejected_workflow,
+        ["run", str(_campaign(rejected_workflow)), *_remote_options()],
+        rejected_environment,
+    )
+
+    assert rejected.returncode != 0
+    assert "destination differs from GPU storage" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "collection_mode",
+    [None, "--keep-cpu-source", "--defer-collection"],
+)
+def test_failure_continuation_preserves_collection_mode(
+    tmp_path: Path,
+    collection_mode: str | None,
+) -> None:
+    """Keep operator-selected collection semantics in failure guidance."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_CAMPAIGN_STATUS_FAIL"] = "true"
+    arguments = ["run", str(_campaign(workflow)), *_remote_options()]
+    if collection_mode is not None:
+        arguments.append(collection_mode)
+
+    failed = _run(workflow, arguments, environment)
+
+    assert failed.returncode != 0
+    continuation = next(line for line in failed.stderr.splitlines() if "generation_workflow.sh run" in line)
+    if collection_mode is None:
+        assert "--keep-cpu-source" not in continuation
+        assert "--defer-collection" not in continuation
+    else:
+        assert collection_mode in continuation
+
+
+def test_repairable_technical_smoke_continues_without_new_work_units(
+    tmp_path: Path,
+) -> None:
+    """Repair transfer evidence and downstream gates without COMSOL resubmission."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_COMPATIBLE_SMOKE_STATUS"] = "compatible_repairable"
+    campaign = workflow.parent.parent / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+
+    result = _run(
+        workflow,
+        ["run", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "campaign-transfer-authority" in log_text
+    assert "<repair-transferred-campaign>" in log_text
+    assert "<build-campaign-datasets>" in log_text
+    assert "<prepare-all-workflow>" in log_text
+    assert "<submit-campaign>" not in log_text
+    assert "<resume-campaign>" not in log_text
+    assert "rsync-start" not in log_text
+    assert "<cpu-cleanup-authorization>" not in log_text
 
 
 def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> None:

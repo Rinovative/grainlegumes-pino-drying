@@ -736,6 +736,11 @@ def test_compatible_smoke_discovery_repairs_then_revalidates_completed_campaign(
 
     monkeypatch.setattr(generation.smoke, "_validate_campaign", validate_after_repair)
     monkeypatch.setattr(
+        generation.smoke.campaign_runtime,
+        "validate_transferred_campaign",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
         generation.smoke.runtime_service,
         "repair_completed_case_hdf5_from_retained_exports",
         repair_case,
@@ -751,6 +756,57 @@ def test_compatible_smoke_discovery_repairs_then_revalidates_completed_campaign(
     assert repair_calls == expected_calls
     assert result["status"] == "compatible_complete"
     assert len(result["hdf5_reconstructions"]) == len(expected_calls)
+
+
+def test_compatible_smoke_discovery_marks_invalid_transfer_as_repairable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve completed science while requiring canonical transfer recovery."""
+    storage = tmp_path / "storage"
+    run_id = "steady_flow_technical_smoke_v1__1234567890abcdef"
+    run_directory = storage / "01_generation/meta/campaigns" / run_id
+    run_directory.mkdir(parents=True)
+    (run_directory / generation.workflow.ALL_WORKFLOW_RECEIPT_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    config_path = generation.smoke.common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        config_path,
+        require_executable=True,
+    )
+    manifest = {
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "selected_batch_names": [batch.batch_name for batch in campaign.batches],
+        "state": "complete",
+    }
+    monkeypatch.setattr(
+        generation.smoke.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+
+    def invalid_workflow(*_args: Any, **_kwargs: Any) -> Any:
+        message = "Transfer completion receipt or GPU publication is invalid"
+        raise ValueError(message)
+
+    monkeypatch.setattr(generation.smoke, "_validate_campaign", invalid_workflow)
+    monkeypatch.setattr(
+        generation.smoke.campaign_runtime,
+        "validate_transferred_campaign",
+        invalid_workflow,
+    )
+
+    result = generation.smoke.find_compatible_completed_technical_smoke_run(
+        config_path,
+        storage_root=storage,
+    )
+
+    assert result["status"] == "compatible_repairable"
+    assert result["campaign_run_id"] == run_id
+    assert "transfer" in result["error"]
 
 
 def test_compatible_smoke_discovery_fails_closed_for_matching_corruption(
@@ -791,6 +847,11 @@ def test_compatible_smoke_discovery_fails_closed_for_matching_corruption(
         generation.smoke,
         "_validate_campaign",
         reject_corrupt_candidate,
+    )
+    monkeypatch.setattr(
+        generation.smoke.campaign_runtime,
+        "validate_transferred_campaign",
+        lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
         generation.smoke.runtime_service,

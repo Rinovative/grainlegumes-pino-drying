@@ -333,6 +333,14 @@ print_command() {
   printf '\n'
 }
 
+collection_mode_argument() {
+  if [[ "${KEEP_CPU_SOURCE:-false}" == true ]]; then
+    printf '%s' --keep-cpu-source
+  elif [[ "${DEFER_COLLECTION:-false}" == true ]]; then
+    printf '%s' --defer-collection
+  fi
+}
+
 remote_bash() {
   local host="$1"
   shift
@@ -1293,6 +1301,15 @@ gpu_publication_is_valid() {
   local_cli validate-published-campaign "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1
 }
 
+repair_existing_campaign_publication() {
+  local authority
+  authority="$(remote_cli campaign-transfer-authority "${RUN_ID}" \
+    --storage-root "${REMOTE_STORAGE_ROOT}")" || return 1
+  local_cli repair-transferred-campaign "${RUN_ID}" \
+    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}" \
+    --authority-json "${authority}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1
+}
+
 collect_campaign() {
   resolve_local_python
   resolve_remote_layout
@@ -1300,6 +1317,10 @@ collect_campaign() {
   verify_remote_setup_for_output
   if gpu_publication_is_valid; then
     printf 'GPU generation publication validated and reused for %s.\n' "${RUN_ID}"
+    return
+  fi
+  if repair_existing_campaign_publication; then
+    printf 'GPU generation publication receipt reconstructed from canonical CPU identity for %s.\n' "${RUN_ID}"
     return
   fi
   if [[ "${PILOT_MODE}" == true ]]; then
@@ -1419,9 +1440,15 @@ deferred_campaign_report() {
   printf 'state=awaiting_collection\nsource_state=%s\nretained_cpu_bytes=%s\n' \
     "${REMOTE_SOURCE_STATE}" "${CPU_BYTES_RETAINED}"
   printf 'Resume collection with the same config:\n'
-  print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run \
-    "${RUN_CONFIG_ARGUMENT}" --cpu-host "${CPU_HOST}" \
+  local -a continuation_arguments=(
+    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run
+    "${RUN_CONFIG_ARGUMENT}" --cpu-host "${CPU_HOST}"
     --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}"
+  )
+  local collection_mode
+  collection_mode="$(collection_mode_argument)"
+  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
+  print_command "${continuation_arguments[@]}"
 }
 
 prepare_all_receipt() {
@@ -1431,7 +1458,7 @@ prepare_all_receipt() {
 }
 
 read_cleanup_authorization() {
-  local line kind extra
+  local line kind authorization_destination_host extra
   line="$(local_cli cpu-cleanup-authorization "${RUN_ID}" --format tsv \
     --storage-root "${LOCAL_STORAGE_ROOT}")"
   IFS=$'\t' read -r kind AUTHORIZATION_SHA AUTH_SOURCE_HOST AUTH_SOURCE_ROOT \
@@ -1442,7 +1469,8 @@ read_cleanup_authorization() {
     fail 1 "Cleanup authorization source host differs from the selected CPU host."
   [[ "${AUTH_SOURCE_ROOT}" == "${REMOTE_STORAGE_ROOT}" ]] ||
     fail 1 "Cleanup authorization source root differs from the selected CPU storage."
-  [[ "${AUTH_DESTINATION_ROOT}" == "${LOCAL_STORAGE_ROOT}" ]] ||
+  authorization_destination_host="$(container_path_to_host "${AUTH_DESTINATION_ROOT}")"
+  [[ "${authorization_destination_host}" == "${LOCAL_STORAGE_ROOT}" ]] ||
     fail 1 "Cleanup authorization destination differs from GPU storage."
   validate_digest "${AUTHORIZATION_SHA}"
   validate_digest "${AUTH_TRANSFER_SHA}"
@@ -1540,6 +1568,9 @@ workflow_failure_report() {
     --remote-root "${REMOTE_ROOT:-configured}"
     --git-commit "${REQUESTED_COMMIT:-unknown}"
   )
+  local collection_mode
+  collection_mode="$(collection_mode_argument)"
+  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
   local continuation="" argument quoted
   for argument in "${continuation_arguments[@]}"; do
     printf -v quoted '%q' "${argument}"
@@ -1890,11 +1921,27 @@ print("\t".join((
 )))')" || fail 1 "Could not decode compatible Technical Smoke discovery."
   IFS=$'\t' read -r status compatible_run extra <<< "$record"
   [[ -z "${extra:-}" ]] || fail 1 "Malformed compatible Technical Smoke result."
-  [[ "$status" == compatible_complete ]] || return 1
-  validate_run_id "$compatible_run"
-  RUN_ID="$compatible_run"
-  campaign_local_completion_is_valid ||
-    fail 1 "Selected Technical Smoke compatibility candidate is not terminally valid."
+  case "$status" in
+    compatible_complete)
+      validate_run_id "$compatible_run"
+      RUN_ID="$compatible_run"
+      campaign_local_completion_is_valid ||
+        fail 1 "Selected Technical Smoke compatibility candidate is not terminally valid."
+      LEAF_RESULT=REUSED
+      LEAF_STATE=complete
+      LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID dependency-compatible completed Smoke child"
+      ;;
+    compatible_repairable)
+      validate_run_id "$compatible_run"
+      RUN_ID="$compatible_run"
+      resolve_remote_layout
+      verify_remote_setup >/dev/null
+      LEAF_STATE=transfer_repair
+      LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID compatible scientific source requires transfer-evidence recovery"
+      ;;
+    missing) return 1 ;;
+    *) fail 1 "Compatible Technical Smoke discovery returned unsupported status: $status" ;;
+  esac
   return 0
 }
 
@@ -2005,9 +2052,6 @@ resolve_leaf_plan() {
         resolve_pilot_contract
       fi
       if select_compatible_smoke_child; then
-        LEAF_RESULT=REUSED
-        LEAF_STATE=complete
-        LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID dependency-compatible completed Smoke child"
         return
       fi
       RUN_ID="$EXPECTED_RUN_ID"
@@ -2106,12 +2150,13 @@ print(json.load(sys.stdin)["benchmark_run_id"])')" ||
 }
 
 cleanup_core_benchmark_cpu() {
-  local line kind auth_run source_host source_root destination_root inventory_sha
+  local line kind auth_run source_host source_root destination_root destination_host inventory_sha
   local file_count size_bytes authorization_sha extra
   line="$(local_cli core-benchmark-cleanup-authorization "$RUN_ID"     --format tsv --storage-root "$LOCAL_STORAGE_ROOT")" ||
     fail 1 "Could not authorize benchmark CPU cleanup."
   IFS=$'\t' read -r kind auth_run source_host source_root destination_root     inventory_sha file_count size_bytes authorization_sha extra <<< "$line"
-  [[ "$kind" == benchmark-cleanup-authorization && "$auth_run" == "$RUN_ID"     && "$source_host" == "$CPU_HOST" && "$source_root" == "$REMOTE_STORAGE_ROOT"     && "$destination_root" == "$LOCAL_STORAGE_ROOT" && -z "${extra:-}" ]] ||
+  destination_host="$(container_path_to_host "$destination_root")"
+  [[ "$kind" == benchmark-cleanup-authorization && "$auth_run" == "$RUN_ID"     && "$source_host" == "$CPU_HOST" && "$source_root" == "$REMOTE_STORAGE_ROOT"     && "$destination_host" == "$LOCAL_STORAGE_ROOT" && -z "${extra:-}" ]] ||
     fail 1 "Malformed benchmark cleanup authorization."
   validate_digest "$inventory_sha"
   validate_nonnegative "benchmark source file count" "$file_count"
@@ -2145,7 +2190,15 @@ benchmark_deferred_report() {
   [[ -z "${extra:-}" ]] || fail 1 "Malformed deferred benchmark source state."
   printf 'benchmark_run_id=%s\nstate=awaiting_collection\nsource_state=%s\nretained_cpu_bytes=%s\n'     "$RUN_ID" "$source_state" "$bytes"
   printf 'Resume collection with the same config:\n'
-  print_command "$HOST_REPO_ROOT/scripts/generation_workflow.sh" run     "$RUN_CONFIG_ARGUMENT" --cpu-host "$CPU_HOST"     --remote-root "$REMOTE_ROOT" --git-commit "$REQUESTED_COMMIT"
+  local -a continuation_arguments=(
+    "$HOST_REPO_ROOT/scripts/generation_workflow.sh" run
+    "$RUN_CONFIG_ARGUMENT" --cpu-host "$CPU_HOST"
+    --remote-root "$REMOTE_ROOT" --git-commit "$REQUESTED_COMMIT"
+  )
+  local collection_mode
+  collection_mode="$(collection_mode_argument)"
+  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
+  print_command "${continuation_arguments[@]}"
 }
 
 finalize_leaf_cpu_evidence() {
@@ -2278,6 +2331,40 @@ run_leaf_plan() {
     LEAF_STATE=complete
     generation_console_stage 9 9 "Final validation" OK \
       "run_id=$RUN_ID kind=$RUN_KIND package_only=true"
+    return
+  fi
+
+  if [[ "$LEAF_STATE" == transfer_repair ]]; then
+    generation_console_stage 3 9 "Canonical inputs" REUSED \
+      "canonical CPU scientific publication already complete"
+    generation_console_stage 4 9 "Work-unit plan" REUSED \
+      "repair continuation adds zero Generation work units and zero COMSOL submissions"
+    generation_console_stage 5 9 "Work units" REUSED \
+      "completed source run=$RUN_ID remains authoritative"
+    if [[ "$DEFER_COLLECTION" == true ]]; then
+      LEAF_STATE=awaiting_collection
+      deferred_leaf_report
+      return
+    fi
+    ALL_STAGE="repairable host transfer publication"
+    generation_console_stage 6 9 "Host publication" RUNNING
+    collect_leaf_results
+    generation_console_stage 6 9 "Host publication" OK \
+      "run_id=$RUN_ID destination=$LOCAL_STORAGE_ROOT repaired_or_recollected=true"
+    ALL_STAGE="revalidated declared packages and scientific finalizers"
+    generation_console_stage 7 9 "Packages/finalizer" RUNNING
+    build_leaf_packages_and_finalizers
+    generation_console_stage 7 9 "Packages/finalizer" OK "$LEAF_PACKAGE_DETAIL"
+    ALL_STAGE="reconstructed workflow receipt and guarded CPU retention policy"
+    generation_console_stage 8 9 "Retention policy" RUNNING
+    apply_leaf_retention
+    generation_console_stage 8 9 "Retention policy" OK \
+      "keep_cpu_source=$KEEP_CPU_SOURCE reclaimed_bytes=$CPU_BYTES_RECLAIMED"
+    ALL_STAGE="terminal repaired workflow validation"
+    validate_leaf_result
+    LEAF_STATE=complete
+    generation_console_stage 9 9 "Final validation" OK \
+      "run_id=$RUN_ID kind=$RUN_KIND transfer_repair=true"
     return
   fi
 

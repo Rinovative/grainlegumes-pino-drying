@@ -1022,12 +1022,37 @@ def _submit_one(
     )
 
 
+def _recover_submission_gate(
+    manifest: dict[str, Any],
+    *,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, Any], bool]:
+    """Recover one durable intent or mark its scheduler identity unknown."""
+    if manifest["submission_intent"] is None:
+        return manifest, False
+    recovered = _recover_submission_intent(
+        manifest,
+        storage_root=storage_root,
+    )
+    if recovered["submission_intent"] is None:
+        return recovered, False
+    recovered["state"] = "submission_unknown"
+    common.serialization.atomic_write_json(
+        campaign_evidence.campaign_run_manifest_path(
+            str(recovered["campaign_run_id"]),
+            storage_root=storage_root,
+        ),
+        recovered,
+    )
+    return recovered, True
+
+
 def feed_campaign(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Reconcile exact jobs and submit at most one normally feedable case."""
+    """Reconcile exact jobs and fill the configured safe submission capacity."""
     run_directory = campaign_evidence.campaign_run_directory(
         run_id,
         storage_root=storage_root,
@@ -1045,21 +1070,12 @@ def feed_campaign(
             message = f"CPU checkout commit {current_commit} does not match run commit {manifest['git_commit']}."
             raise RuntimeError(message)
         campaign = campaign_evidence.campaign_from_manifest(manifest)
-        if manifest["submission_intent"] is not None:
-            manifest = _recover_submission_intent(
-                manifest,
-                storage_root=storage_root,
-            )
-            if manifest["submission_intent"] is not None:
-                manifest["state"] = "submission_unknown"
-                common.serialization.atomic_write_json(
-                    campaign_evidence.campaign_run_manifest_path(
-                        run_id,
-                        storage_root=storage_root,
-                    ),
-                    manifest,
-                )
-                return manifest
+        manifest, submission_unknown = _recover_submission_gate(
+            manifest,
+            storage_root=storage_root,
+        )
+        if submission_unknown:
+            return manifest
         scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
         _require_scheduler_evidence(scheduler)
         task_views, pending_jobs, running_jobs = _reconciled(
@@ -1092,9 +1108,40 @@ def feed_campaign(
             )
             return manifest
 
-        pending_buffer = int(manifest["submission_config"]["pending_buffer"])
-        max_running = manifest["submission_config"]["max_running_cases"]
-        if pending_jobs >= pending_buffer or (max_running is not None and running_jobs >= int(max_running)):
+        return _fill_submission_capacity(
+            manifest,
+            campaign,
+            task_views,
+            pending_jobs=pending_jobs,
+            running_jobs=running_jobs,
+            scheduler=scheduler,
+            storage_root=storage_root,
+        )
+
+
+def _fill_submission_capacity(
+    manifest: dict[str, Any],
+    campaign: config_service.CampaignConfig,
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    pending_jobs: int,
+    running_jobs: int,
+    scheduler: Mapping[str, Any],
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Submit eligible work until one configured admission limit is reached."""
+    run_id = str(manifest["campaign_run_id"])
+    pending_buffer = int(manifest["submission_config"]["pending_buffer"])
+    max_running = manifest["submission_config"]["max_running_cases"]
+    admitted_pending_jobs = pending_jobs
+    selected_tasks: set[tuple[str, int]] = set()
+    active_license_probe = any(
+        record["mode"] == "license_retry" and record["status"] == "submitted" and record["job_id"] in scheduler["active"]
+        for record in manifest.get("submissions", ())
+    )
+
+    while True:
+        if admitted_pending_jobs >= pending_buffer or (max_running is not None and running_jobs >= int(max_running)):
             manifest["state"] = "active"
             common.serialization.atomic_write_json(
                 campaign_evidence.campaign_run_manifest_path(
@@ -1105,17 +1152,17 @@ def feed_campaign(
             )
             return manifest
 
-        active_license_probe = any(
-            record["mode"] == "license_retry" and record["status"] == "submitted" and record["job_id"] in scheduler["active"]
-            for record in manifest.get("submissions", ())
-        )
         eligible_blocked = sorted(
             (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
             key=lambda view: str(view["license_first_blocked_at"]),
         )
         next_retry = None if active_license_probe or not eligible_blocked else eligible_blocked[0]
         next_unsent = next(
-            (view for view in task_views if view["state"] == "never_started"),
+            (
+                view
+                for view in task_views
+                if view["state"] == "never_started" and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
+            ),
             None,
         )
         unresolved_solver_failures = sum(view["state"] in {"failed", "timed_out"} for view in task_views)
@@ -1126,7 +1173,7 @@ def feed_campaign(
         if next_view is None and not active_license_probe and not blocked_cases_exist and not circuit_breaker_tripped:
             next_view = next_unsent
         if next_view is None:
-            if pending_jobs or running_jobs:
+            if admitted_pending_jobs or running_jobs:
                 manifest["state"] = "active"
             elif any(view["state"] == "license_blocked" for view in task_views):
                 manifest["state"] = "license_blocked"
@@ -1143,13 +1190,17 @@ def feed_campaign(
             )
             return manifest
         task = _task_from_payload(campaign, next_view)
-        return _submit_one(
+        selected_tasks.add((task.batch_id, task.case_index))
+        mode = "license_retry" if next_view["state"] == "license_blocked" else "initial"
+        manifest = _submit_one(
             manifest,
             campaign,
             task,
-            mode=("license_retry" if next_view["state"] == "license_blocked" else "initial"),
+            mode=mode,
             storage_root=storage_root,
         )
+        admitted_pending_jobs += 1
+        active_license_probe = active_license_probe or mode == "license_retry"
 
 
 def submit_campaign(
@@ -1158,7 +1209,7 @@ def submit_campaign(
     git_commit: str,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Create durable campaign state and submit only the first eligible case job."""
+    """Create durable campaign state and fill its safe submission capacity."""
     requested_commit = source_service.validate_git_commit(git_commit)
     current_commit = _repository_commit()
     if current_commit != requested_commit:
@@ -1229,7 +1280,7 @@ def resume_campaign(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Advance at most one case according to the explicit resume matrix."""
+    """Fill normal admission capacity, then apply the explicit repair matrix."""
     run_directory = campaign_evidence.campaign_run_directory(
         run_id,
         storage_root=storage_root,
@@ -1240,6 +1291,12 @@ def resume_campaign(
             run_id,
             storage_root=storage_root,
         )
+        manifest, submission_unknown = _recover_submission_gate(
+            manifest,
+            storage_root=storage_root,
+        )
+        if submission_unknown:
+            return manifest
         campaign = campaign_evidence.campaign_from_manifest(manifest)
         scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
         _require_scheduler_evidence(scheduler)
@@ -1251,9 +1308,17 @@ def resume_campaign(
             compact_license_attempt_payloads=True,
         )
         if pending_jobs or running_jobs:
-            manifest["state"] = "active"
-            return _write_campaign_manifest(
+            current_commit = _repository_commit()
+            if current_commit != manifest["git_commit"]:
+                message = f"CPU checkout commit {current_commit} does not match run commit {manifest['git_commit']}."
+                raise RuntimeError(message)
+            return _fill_submission_capacity(
                 manifest,
+                campaign,
+                task_views,
+                pending_jobs=pending_jobs,
+                running_jobs=running_jobs,
+                scheduler=scheduler,
                 storage_root=storage_root,
             )
         if all(view["state"] == "successful" for view in task_views):
@@ -1662,6 +1727,7 @@ def campaign_status(
         "campaign_purpose": campaign.campaign_purpose,
         "cases_per_material": cases_per_material,
         "git_commit": manifest["git_commit"],
+        "execution_config_digest": manifest.get("execution_config_digest"),
         "slurm_job_ids": manifest["slurm_job_ids"],
         "scheduler_job_name": manifest["scheduler_job_name"],
         "scheduler_log_directory": manifest["scheduler_log_directory"],
@@ -1909,6 +1975,26 @@ def campaign_transfer_inventory(
     return campaign_evidence.transfer_inventory_from_plan(plan, storage_root=root)
 
 
+def campaign_transfer_authority(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return the canonical terminal identity and inventory for transfer repair."""
+    terminal = validate_terminal_campaign(run_id, storage_root=storage_root)
+    inventory = campaign_transfer_inventory(run_id, storage_root=storage_root)
+    return {
+        "schema_kind": "generation_campaign_transfer_authority",
+        "schema_version": 1,
+        "campaign_run_id": run_id,
+        "campaign_id": terminal["campaign_id"],
+        "git_commit": terminal["git_commit"],
+        "file_count": inventory["file_count"],
+        "size_bytes": inventory["size_bytes"],
+        "inventory_sha256": inventory["inventory_sha256"],
+    }
+
+
 def _transfer_ignored_paths(plan: dict[str, Any], relative_value: str) -> frozenset[str]:
     """Return post-transfer operational paths ignored for one directory."""
     if relative_value == plan["campaign_directory"]:
@@ -2011,6 +2097,67 @@ def _load_or_create_campaign_transfer_journal(
     return journal
 
 
+def _campaign_directory_files(
+    directory: Path,
+    *,
+    ignored_relative_paths: frozenset[str],
+) -> dict[str, Path]:
+    """Return safe regular files participating in one directory identity."""
+    files: dict[str, Path] = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            message = f"Transfer directory contains a symbolic link: {path}"
+            raise ValueError(message)
+        relative = path.relative_to(directory).as_posix()
+        ignored = any(relative == ignored_path or relative.startswith(f"{ignored_path}/") for ignored_path in ignored_relative_paths)
+        if path.is_file() and not ignored:
+            files[relative] = path
+    return files
+
+
+def _publish_missing_campaign_files(
+    source: Path,
+    target: Path,
+    *,
+    ignored_relative_paths: frozenset[str],
+    expected_identity: str,
+) -> None:
+    """Atomically add exact missing source files to an unchanged host subset."""
+    source_files = _campaign_directory_files(
+        source,
+        ignored_relative_paths=ignored_relative_paths,
+    )
+    target_files = _campaign_directory_files(
+        target,
+        ignored_relative_paths=ignored_relative_paths,
+    )
+    for relative, target_path in target_files.items():
+        source_path = source_files.get(relative)
+        if source_path is None or common.serialization.file_sha256(target_path) != common.serialization.file_sha256(source_path):
+            message = f"Existing transfer destination conflicts with incoming identity: {target}"
+            raise FileExistsError(message)
+    for relative in sorted(set(source_files).difference(target_files)):
+        source_path = source_files[relative]
+        target_path = (target / relative).resolve()
+        if not target_path.is_relative_to(target):
+            message = f"Missing transfer file escapes its destination: {relative!r}"
+            raise ValueError(message)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.parent.is_symlink():
+            message = f"Missing transfer file parent is unsafe: {target_path.parent}"
+            raise ValueError(message)
+        source_path.replace(target_path)
+    if (
+        campaign_evidence.directory_identity(
+            target,
+            ignored_relative_paths=ignored_relative_paths,
+        )
+        != expected_identity
+    ):
+        message = f"Repaired transfer destination still differs from incoming identity: {target}"
+        raise RuntimeError(message)
+
+
 def _publish_incoming_campaign_directories(
     journal: dict[str, Any],
     *,
@@ -2041,13 +2188,26 @@ def _publish_incoming_campaign_directories(
             raise ValueError(message)
         ignored = _transfer_ignored_paths(plan, relative_value)
         if target.exists():
-            if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored) != expected_identity:
-                message = f"Existing transfer destination conflicts with incoming identity: {target}"
-                raise FileExistsError(message)
+            target_identity = campaign_evidence.directory_identity(
+                target,
+                ignored_relative_paths=ignored,
+            )
             if source.exists() and campaign_evidence.directory_identity(source, ignored_relative_paths=ignored) != expected_identity:
                 message = f"Incoming transfer source conflicts with its journal: {source}"
                 raise RuntimeError(message)
-            status = "reused"
+            if target_identity == expected_identity:
+                status = "reused"
+            else:
+                if not source.is_dir() or source.is_symlink():
+                    message = f"Incomplete transfer destination has no safe incoming source: {target}"
+                    raise FileNotFoundError(message)
+                _publish_missing_campaign_files(
+                    source,
+                    target,
+                    ignored_relative_paths=ignored,
+                    expected_identity=expected_identity,
+                )
+                status = "repaired"
         else:
             if not source.is_dir() or source.is_symlink():
                 message = f"Incoming transfer source is missing or unsafe: {source}"
@@ -2137,11 +2297,15 @@ def publish_transferred_campaign(
         "files": source_inventory["files"],
     }
     if receipt_path.exists():
-        existing = validate_transferred_campaign(run_id, storage_root=destination)
-        if any(existing.get(key) != value for key, value in identity.items()):
-            message = f"Existing transfer completion receipt conflicts: {receipt_path}"
-            raise FileExistsError(message)
-        return existing
+        try:
+            existing = validate_transferred_campaign(run_id, storage_root=destination)
+        except (FileNotFoundError, TypeError, ValueError):
+            existing = None
+        if existing is not None:
+            if any(existing.get(key) != value for key, value in identity.items()):
+                message = f"Existing transfer completion receipt conflicts: {receipt_path}"
+                raise FileExistsError(message)
+            return existing
     receipt = {
         "schema_kind": "generation_campaign_transfer",
         "schema_version": 1,
@@ -2152,6 +2316,112 @@ def publish_transferred_campaign(
         "terminal_validation": {
             "status": "pass",
             "batch_count": len(validated["batches"]),
+        },
+        "source_removed": False,
+    }
+    common.serialization.atomic_write_json(receipt_path, receipt)
+    return validate_transferred_campaign(run_id, storage_root=destination)
+
+
+def repair_transferred_campaign(
+    run_id: str,
+    *,
+    source_host: str,
+    source_storage_root: str,
+    authority: Mapping[str, Any],
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Reconstruct transfer evidence only for an exact canonical host copy."""
+    if not source_host or any(character in source_host for character in "\r\n\t"):
+        message = "Transfer source_host must be non-empty text without control characters."
+        raise ValueError(message)
+    source_storage = Path(source_storage_root)
+    if (
+        not source_storage.is_absolute()
+        or source_storage == Path("/")
+        or ".." in source_storage.parts
+        or any(character in source_storage_root for character in "\r\n\t")
+    ):
+        message = "Transfer source_storage_root must be one absolute non-root path without traversal or controls."
+        raise ValueError(message)
+    destination = workspace_service.resolve_storage_root(storage_root, create=False)
+    terminal = validate_terminal_campaign(run_id, storage_root=destination)
+    plan = campaign_transfer_plan(run_id, storage_root=destination)
+    inventory = campaign_evidence.transfer_inventory_from_plan(
+        plan,
+        storage_root=destination,
+    )
+    expected_authority = {
+        "schema_kind": "generation_campaign_transfer_authority",
+        "schema_version": 1,
+        "campaign_run_id": run_id,
+        "campaign_id": terminal["campaign_id"],
+        "git_commit": terminal["git_commit"],
+        "file_count": inventory["file_count"],
+        "size_bytes": inventory["size_bytes"],
+        "inventory_sha256": inventory["inventory_sha256"],
+    }
+    if dict(authority) != expected_authority:
+        message = "Host campaign publication differs from the canonical CPU transfer authority."
+        raise RuntimeError(message)
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=destination,
+    )
+    receipt_path = run_directory / "transfer_complete.json"
+    if receipt_path.exists():
+        try:
+            existing = validate_transferred_campaign(run_id, storage_root=destination)
+        except (FileNotFoundError, TypeError, ValueError):
+            existing = None
+        if existing is not None:
+            if existing["source_host"] != source_host or existing["source_storage_root"] != source_storage_root:
+                message = f"Existing transfer completion receipt conflicts: {receipt_path}"
+                raise FileExistsError(message)
+            return existing
+    directory_values = [
+        directory
+        for batch in plan["batches"]
+        for directory in (
+            batch["meta_directory"],
+            batch["raw_directory"],
+            batch["processed_directory"],
+            *batch["attempt_directories"],
+        )
+    ]
+    directory_values.append(plan["campaign_directory"])
+    directories = [
+        {
+            "directory": relative,
+            "status": "reused",
+            "identity": campaign_evidence.directory_identity(
+                destination / relative,
+                ignored_relative_paths=_transfer_ignored_paths(plan, relative),
+            ),
+        }
+        for relative in directory_values
+    ]
+    terminal_path = run_directory / "campaign_terminal.json"
+    receipt = {
+        "schema_kind": "generation_campaign_transfer",
+        "schema_version": 1,
+        "status": "transfer_complete",
+        "recorded_at": _utc_now(),
+        "campaign_run_id": run_id,
+        "campaign_id": terminal["campaign_id"],
+        "git_commit": terminal["git_commit"],
+        "source_host": source_host,
+        "source_storage_root": source_storage_root,
+        "destination_storage_root": str(destination),
+        "campaign_terminal_sha256": common.serialization.file_sha256(terminal_path),
+        "transferred_file_count": inventory["file_count"],
+        "transferred_bytes": inventory["size_bytes"],
+        "transfer_inventory_sha256": inventory["inventory_sha256"],
+        "files": inventory["files"],
+        "directories": directories,
+        "terminal_validation": {
+            "status": "pass",
+            "batch_count": len(terminal["batches"]),
         },
         "source_removed": False,
     }

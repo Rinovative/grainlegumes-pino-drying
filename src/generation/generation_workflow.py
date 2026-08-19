@@ -564,18 +564,17 @@ def validate_campaign_package_state(
     }
 
 
-def validate_dataset_packages_receipt(
+def _validate_dataset_receipt_payload(
     run_id: str,
+    receipt: Mapping[str, Any],
     *,
-    storage_root: Path | str | None = None,
-) -> dict[str, Any]:
-    """Validate every package, inspection, smoke, and campaign-bound receipt."""
-    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    storage: Path,
+) -> None:
+    """Validate one dataset receipt payload against current durable evidence."""
     transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
     campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
-    receipt = _load_json(receipt_path, label="dataset package completion receipt")
     required = {
         "schema_kind",
         "schema_version",
@@ -622,6 +621,35 @@ def validate_dataset_packages_receipt(
     if observed != declared or len({record["dataset_id"] for record in validated}) != len(validated):
         message = f"Dataset receipt does not cover each declared package exactly once: {receipt_path}"
         raise ValueError(message)
+
+
+def _repair_dataset_receipt_transfer_binding(
+    run_id: str,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Repair only a stale transfer-receipt hash after exact revalidation."""
+    receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
+    receipt = _load_json(receipt_path, label="dataset package completion receipt")
+    candidate = dict(receipt)
+    candidate["transfer_receipt_sha256"] = common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage))
+    _validate_dataset_receipt_payload(run_id, candidate, storage=storage)
+    common.serialization.atomic_write_json(receipt_path, candidate)
+    return validate_dataset_packages_receipt(run_id, storage_root=storage)
+
+
+def validate_dataset_packages_receipt(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate every package, inspection, smoke, and campaign-bound receipt."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    receipt = _load_json(
+        _dataset_receipt_path(run_id, storage_root=storage),
+        label="dataset package completion receipt",
+    )
+    _validate_dataset_receipt_payload(run_id, receipt, storage=storage)
     return receipt
 
 
@@ -693,10 +721,16 @@ def build_campaign_datasets(
 
     lock_path = _dataset_receipt_lock_path(run_id, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        base = validate_dataset_packages_receipt(
-            run_id,
-            storage_root=storage,
-        )
+        try:
+            base = validate_dataset_packages_receipt(
+                run_id,
+                storage_root=storage,
+            )
+        except ValueError:
+            base = _repair_dataset_receipt_transfer_binding(
+                run_id,
+                storage=storage,
+            )
     if not _all_receipt_path(run_id, storage_root=storage).is_file():
         return base
 
@@ -1063,12 +1097,131 @@ def prepare_all_workflow_receipt(
         storage=storage,
     )
     workflow_gate_sha256 = common.serialization.canonical_json_sha256(gate_payload)
+    package_records = datasets_receipt["packages"]
     receipt_path = _all_receipt_path(run_id, storage_root=storage)
     existing = _load_json(receipt_path, label="all-workflow receipt") if receipt_path.exists() else None
     if existing is not None and existing.get("workflow_result") == "success":
-        return validate_completed_workflow(run_id, storage_root=storage)
+        try:
+            return validate_completed_workflow(run_id, storage_root=storage)
+        except ValueError:
+            safe_rebuild_identity = {
+                "schema_kind": ALL_WORKFLOW_SCHEMA_KIND,
+                "schema_version": WORKFLOW_SCHEMA_VERSION,
+                "campaign_run_id": run_id,
+                "campaign_id": terminal["campaign_id"],
+                "git_commit": terminal["git_commit"],
+                "cpu_source_host": transfer["source_host"],
+                "cpu_source_root": transfer["source_storage_root"],
+                "transferred_file_count": transfer["transferred_file_count"],
+                "transferred_bytes": transfer["transferred_bytes"],
+                "transferred_files": _transferred_file_bindings(transfer),
+                "selected_batch_ids": [batch["batch_id"] for batch in terminal["batches"]],
+                "gpu_storage_root": str(storage),
+                "gpu_generation_destination": str(common.paths.get_generation_root(storage_root=storage)),
+                "dataset_ids": [record["dataset_id"] for record in package_records],
+                "dataset_package_hashes": [
+                    {
+                        "dataset_id": record["dataset_id"],
+                        "manifest_sha256": record["manifest_sha256"],
+                        "payload_sha256": record["payload_sha256"],
+                    }
+                    for record in package_records
+                ],
+                "package_inspection_results": [record["inspection"] for record in package_records],
+                "loader_smoke_results": [record["loader_smoke"] for record in package_records],
+                "cleanup_requested": False,
+                "cpu_source_directories": source_directories,
+                "cpu_source_file_count": len(eligible_files),
+                "cpu_bytes_reclaimable": sum(int(record["size_bytes"]) for record in eligible_files),
+                "cpu_bytes_reclaimed": 0,
+                "cpu_cleanup_receipt": None,
+                "generation_complete": {
+                    "status": "complete",
+                    "evidence": {
+                        "campaign_terminal_sha256": transfer["campaign_terminal_sha256"],
+                        "selected_batch_ids": gate_payload["selected_batch_ids"],
+                    },
+                },
+                "gpu_publication_complete": {
+                    "status": "complete",
+                    "evidence": {
+                        "destination": gate_payload["gpu_generation_destination"],
+                        "inventory_sha256": transfer["transfer_inventory_sha256"],
+                    },
+                },
+                "loader_smokes_complete": {
+                    "status": "complete",
+                    "evidence": {
+                        "count": len(package_records),
+                        "results": [record["loader_smoke"] for record in package_records],
+                    },
+                },
+                "cpu_cleanup_complete": {
+                    "status": "skipped_by_request",
+                    "evidence": None,
+                },
+            }
+            transfer_stage = existing.get("transfer_complete")
+            dataset_stage = existing.get("dataset_packages_complete")
+            stable_transfer_stage = (
+                {
+                    **transfer_stage,
+                    "evidence": {
+                        **transfer_stage["evidence"],
+                        "transfer_receipt_sha256": gate_payload["transfer_receipt_sha256"],
+                    },
+                }
+                if isinstance(transfer_stage, dict) and isinstance(transfer_stage.get("evidence"), dict)
+                else None
+            )
+            stable_dataset_stage = (
+                {
+                    **dataset_stage,
+                    "evidence": {
+                        **dataset_stage["evidence"],
+                        "dataset_receipt_sha256": gate_payload["dataset_receipt_sha256"],
+                    },
+                }
+                if isinstance(dataset_stage, dict) and isinstance(dataset_stage.get("evidence"), dict)
+                else None
+            )
+            expected_transfer_stage = {
+                "status": "complete",
+                "evidence": {
+                    "transfer_receipt_sha256": gate_payload["transfer_receipt_sha256"],
+                    "file_count": transfer["transferred_file_count"],
+                    "size_bytes": transfer["transferred_bytes"],
+                    "inventory_sha256": transfer["transfer_inventory_sha256"],
+                },
+            }
+            expected_dataset_stage = {
+                "status": "complete",
+                "evidence": {
+                    "dataset_receipt_sha256": gate_payload["dataset_receipt_sha256"],
+                    "dataset_ids": gate_payload["dataset_ids"],
+                },
+            }
+            variable_rebuild_keys = {
+                "workflow_gate_sha256",
+                "transfer_complete",
+                "dataset_packages_complete",
+                "recorded_at",
+                "ready_at",
+                "completed_at",
+                "workflow_result",
+            }
+            timestamps_are_valid = all(
+                isinstance(existing.get(key), str) and bool(existing[key]) for key in ("recorded_at", "ready_at", "completed_at")
+            )
+            if (
+                set(existing) != {*safe_rebuild_identity, *variable_rebuild_keys}
+                or any(existing.get(key) != value for key, value in safe_rebuild_identity.items())
+                or stable_transfer_stage != expected_transfer_stage
+                or stable_dataset_stage != expected_dataset_stage
+                or not timestamps_are_valid
+            ):
+                raise
     recorded_at = existing.get("recorded_at") if existing is not None else _utc_now()
-    package_records = datasets_receipt["packages"]
     cpu_stage_status = "pending" if cleanup_requested else "skipped_by_request"
     workflow_result = "ready_for_cpu_cleanup" if cleanup_requested else "success"
     receipt = {

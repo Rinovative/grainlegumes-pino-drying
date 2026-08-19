@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -241,7 +242,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=2,
-        pending_buffer=2,
+        pending_buffer=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     task = cluster.campaign_tasks(campaign)[0]
@@ -556,6 +557,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         "campaign_run_id": run_id,
         "git_commit": commit,
         "slurm_job_ids": [],
+        "submission_intent": None,
         "submission_config": {"maximum_failed_cases": 0},
         "state": "active",
     }
@@ -781,6 +783,71 @@ def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
         storage_root=storage,
     )
     assert unrelated_pending_is_ignored["slurm_job_ids"] == ["101", "102", "103", "104"]
+
+
+def test_feeder_refills_pending_buffer_after_one_pending_case(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Submit the next unsent case when one scheduler-pending case leaves buffer capacity."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=3,
+        pending_buffer=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    commit = "e" * 40
+    submitted = iter(("301", "302"))
+    scheduler_state: dict[str, list[str]] = {}
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(submitted))
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler(active=scheduler_state))
+    storage = tmp_path / "storage"
+    initial = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
+    manifest_path = campaign_evidence.campaign_run_manifest_path(initial["campaign_run_id"], storage_root=storage)
+    persisted = campaign_evidence.load_campaign_run(initial["campaign_run_id"], storage_root=storage)
+    persisted["submission_config"]["pending_buffer"] = 2
+    generation.campaign.common.serialization.atomic_write_json(manifest_path, persisted)
+
+    scheduler_state["301"] = ["301", "PENDING", "Resources", ""]
+    advanced = generation.campaign.feed_campaign(initial["campaign_run_id"], storage_root=storage)
+
+    assert advanced["slurm_job_ids"] == ["301", "302"]
+    assert advanced["submissions"][1]["case"]["case_id"] == cluster.campaign_tasks(campaign)[1].case_id
+
+
+def test_feeder_pending_jobs_do_not_consume_running_capacity(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fill four pending slots independently of a two-running-case cap."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=5,
+        pending_buffer=1,
+        max_running_cases=2,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    commit = "f" * 40
+    submitted = iter(("401", "402", "403", "404"))
+    scheduler_state: dict[str, list[str]] = {}
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(submitted))
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler(active=scheduler_state))
+    storage = tmp_path / "storage"
+    initial = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
+    manifest_path = campaign_evidence.campaign_run_manifest_path(initial["campaign_run_id"], storage_root=storage)
+    persisted = campaign_evidence.load_campaign_run(initial["campaign_run_id"], storage_root=storage)
+    persisted["submission_config"]["pending_buffer"] = 4
+    generation.campaign.common.serialization.atomic_write_json(manifest_path, persisted)
+
+    scheduler_state["401"] = ["401", "PENDING", "Resources", ""]
+    filled = generation.campaign.feed_campaign(initial["campaign_run_id"], storage_root=storage)
+
+    assert filled["slurm_job_ids"] == ["401", "402", "403", "404"]
+    assert filled["state"] == "active"
 
 
 def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
@@ -1093,6 +1160,97 @@ def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
     assert len(recovered["submissions"]) == 1
 
 
+def test_resume_recovers_next_case_intent_while_first_case_is_pending(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recover a lost second response before filling an active pending buffer."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=3,
+        pending_buffer=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    commit = "d" * 40
+    storage = tmp_path / "storage"
+    submitted = iter(("101",))
+    real_scheduler_evidence = generation.campaign._scheduler_evidence
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: _scheduler(),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_submit_case",
+        lambda *_args, **_kwargs: next(submitted),
+    )
+    initial = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+    manifest_path = campaign_evidence.campaign_run_manifest_path(
+        initial["campaign_run_id"],
+        storage_root=storage,
+    )
+    manifest = campaign_evidence.load_campaign_run(
+        initial["campaign_run_id"],
+        storage_root=storage,
+    )
+    manifest["submission_config"]["pending_buffer"] = 2
+    generation.campaign.common.serialization.atomic_write_json(manifest_path, manifest)
+
+    def lost_response(*_args: Any, **_kwargs: Any) -> str:
+        message = "synthetic lost second sbatch response"
+        raise OSError(message)
+
+    monkeypatch.setattr(generation.campaign, "_submit_case", lost_response)
+    with pytest.raises(OSError, match="lost second sbatch response"):
+        generation.campaign._submit_one(
+            manifest,
+            campaign,
+            tasks[1],
+            mode="initial",
+            storage_root=storage,
+        )
+    interrupted = campaign_evidence.load_campaign_run(
+        initial["campaign_run_id"],
+        storage_root=storage,
+    )
+    assert interrupted["submission_intent"] is not None
+    intent_job_name = interrupted["submissions"][-1]["job_name"]
+
+    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
+        if any(argument == f"--name={intent_job_name}" for argument in command):
+            return "202|PENDING|Resources", None
+        if command[0] == "squeue":
+            return "101|PENDING|Resources|\n202|PENDING|Resources|", None
+        if command[0] == "sacct":
+            return "", None
+        raise AssertionError(command)
+
+    monkeypatch.setattr(generation.campaign, "_scheduler_output", scheduler_output)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", real_scheduler_evidence)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_submit_case",
+        lambda *_args, **_kwargs: pytest.fail("resume duplicated the recovered case"),
+    )
+
+    resumed = generation.campaign.resume_campaign(
+        initial["campaign_run_id"],
+        storage_root=storage,
+    )
+
+    assert resumed["submission_intent"] is None
+    assert resumed["slurm_job_ids"] == ["101", "202"]
+    assert len(resumed["submissions"]) == 2
+
+
 def test_config_owned_plan_is_machine_parseable_and_read_only(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -1321,6 +1479,40 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
         "inventory_sha256": receipt["transfer_inventory_sha256"],
     }
 
+    authority = generation.campaign.campaign_transfer_authority(
+        run_id,
+        storage_root=destination,
+    )
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    repaired = generation.campaign.repair_transferred_campaign(
+        run_id,
+        source_host="cpu.example",
+        source_storage_root="/remote/storage",
+        authority=authority,
+        storage_root=destination,
+    )
+    assert repaired["status"] == "transfer_complete"
+    assert repaired["files"] == receipt["files"]
+    assert repaired["directories"] != receipt["directories"]
+
+    recovery_staging = workspace.create_transfer_staging(
+        storage_root=destination,
+        run_id=run_id,
+    )
+    for relative in relative_directories:
+        shutil.copytree(destination / relative, recovery_staging / relative)
+    missing_path = destination / relative_directories[0] / "payload-0.txt"
+    missing_path.unlink()
+    recovered = generation.campaign.publish_transferred_campaign(
+        run_id,
+        staging_root=recovery_staging,
+        destination_root=destination,
+        source_host="cpu.example",
+        source_storage_root="/remote/storage",
+    )
+    assert recovered["status"] == "transfer_complete"
+    assert missing_path.read_bytes() == b"payload-0\n"
+
     nested = destination / campaign_directory / "nested"
     nested.mkdir()
     nested_lock = nested / "dataset_packages_complete.lock"
@@ -1344,6 +1536,18 @@ def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
             plan=plan,
             storage_root=destination,
         )
+
+    source_bytes[relative_directories[0]]["payload-0.txt"] = b"mutated\n"
+    invalid_receipt = receipt_path.read_bytes()
+    with pytest.raises(RuntimeError, match="differs from the canonical CPU"):
+        generation.campaign.repair_transferred_campaign(
+            run_id,
+            source_host="cpu.example",
+            source_storage_root="/remote/storage",
+            authority=authority,
+            storage_root=destination,
+        )
+    assert receipt_path.read_bytes() == invalid_receipt
 
     unmarked = tmp_path / "unmarked staging"
     unmarked.mkdir()

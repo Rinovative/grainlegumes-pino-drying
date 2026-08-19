@@ -615,6 +615,24 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     transfer_plan.add_argument("--format", choices=("json", "tsv"), default="json")
     _add_storage_arguments(transfer_plan)
 
+    transfer_authority = subparsers.add_parser(
+        "campaign-transfer-authority",
+        help="report canonical CPU terminal and transfer-inventory identity",
+    )
+    transfer_authority.add_argument("campaign_run_id")
+    transfer_authority.add_argument("--format", choices=("json", "tsv"), default="json")
+    _add_storage_arguments(transfer_authority)
+
+    repair_transfer = subparsers.add_parser(
+        "repair-transferred-campaign",
+        help="reconstruct transfer evidence for an exact canonical host copy",
+    )
+    repair_transfer.add_argument("campaign_run_id")
+    repair_transfer.add_argument("--source-host", required=True)
+    repair_transfer.add_argument("--source-storage-root", required=True)
+    repair_transfer.add_argument("--authority-json", required=True)
+    _add_storage_arguments(repair_transfer)
+
     validate_publication = subparsers.add_parser(
         "validate-published-campaign",
         help="validate an exact GPU generation publication and transfer receipt",
@@ -1644,6 +1662,42 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                             )
                         )
                     )
+        return 0
+    if args.command == "campaign-transfer-authority":
+        authority = campaign_runtime.campaign_transfer_authority(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+        )
+        if args.format == "json":
+            print(json.dumps(authority, sort_keys=True))
+        else:
+            print(
+                "\t".join(
+                    (
+                        "transfer-authority",
+                        authority["campaign_run_id"],
+                        authority["campaign_id"],
+                        authority["git_commit"],
+                        str(authority["file_count"]),
+                        str(authority["size_bytes"]),
+                        authority["inventory_sha256"],
+                    )
+                )
+            )
+        return 0
+    if args.command == "repair-transferred-campaign":
+        authority = json.loads(args.authority_json)
+        if not isinstance(authority, dict):
+            message = "Transfer authority JSON must contain one object."
+            raise TypeError(message)
+        receipt = campaign_runtime.repair_transferred_campaign(
+            args.campaign_run_id,
+            source_host=args.source_host,
+            source_storage_root=args.source_storage_root,
+            authority=authority,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "validate-published-campaign":
         receipt = campaign_runtime.validate_transferred_campaign(

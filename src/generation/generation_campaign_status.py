@@ -237,9 +237,20 @@ def format_campaign_status_summary(
         raise ValueError(message)
     cases = _case_inventory(status)
     buckets = {name: [case for case in cases if _case_bucket(case) == name] for name in ("completed", "active", "pending", "failed")}
+    submission = status.get("submission_config")
+    submission_values = submission if isinstance(submission, dict) else {}
+    max_running = submission_values.get("max_running_cases")
+    max_running_text = "unlimited" if max_running is None else _text(max_running)
     lines = [
         f"Campaign: {_text(status.get('campaign_run_id'))}",
         f"State: {_text(status.get('campaign_state'))}",
+        (f"Execution: commit={_text(status.get('git_commit'))}  config_digest={_text(status.get('execution_config_digest'))}"),
+        (
+            "Resources: "
+            f"cores_per_case={_text(submission_values.get('cores_per_case'))}  "
+            f"pending_buffer={_text(submission_values.get('pending_buffer'))}  "
+            f"max_running_cases={max_running_text}"
+        ),
         (
             f"Cases: {len(buckets['completed'])}/{len(cases)} completed, "
             f"{len(buckets['active'])} active, {len(buckets['pending'])} pending, "

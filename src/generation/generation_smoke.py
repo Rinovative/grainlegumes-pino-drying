@@ -642,6 +642,7 @@ def find_compatible_completed_technical_smoke_run(
         message = f"Technical Smoke campaign metadata root is unsafe: {root}"
         raise ValueError(message)
     candidates: list[dict[str, Any]] = []
+    repairable: list[dict[str, str]] = []
     matching_invalid: list[dict[str, str]] = []
     for directory in sorted(root.iterdir()):
         if not directory.is_dir() or directory.is_symlink():
@@ -674,6 +675,19 @@ def find_compatible_completed_technical_smoke_run(
                 storage=storage,
             )
         except (FileNotFoundError, RuntimeError, TypeError, ValueError) as initial_error:
+            try:
+                campaign_runtime.validate_transferred_campaign(
+                    run_id,
+                    storage_root=storage,
+                )
+            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as transfer_error:
+                repairable.append(
+                    {
+                        "campaign_run_id": run_id,
+                        "error": f"transfer publication requires canonical-source repair: {transfer_error}",
+                    }
+                )
+                continue
             try:
                 for batch in expected.batches:
                     for case_index in batch.case_indices:
@@ -728,6 +742,20 @@ def find_compatible_completed_technical_smoke_run(
             }
         )
     if not candidates:
+        if len(repairable) > 1:
+            message = (
+                f"Multiple scientifically matching Technical Smoke runs require transfer repair; refusing an arbitrary recovery source: {repairable}"
+            )
+            raise RuntimeError(message)
+        if repairable:
+            selected = repairable[0]
+            return {
+                "schema_kind": "generation_compatible_technical_smoke_run",
+                "schema_version": 1,
+                "status": "compatible_repairable",
+                "campaign_digest": expected.campaign_digest,
+                **selected,
+            }
         if matching_invalid:
             message = (
                 "Scientifically matching completed Technical Smoke evidence "

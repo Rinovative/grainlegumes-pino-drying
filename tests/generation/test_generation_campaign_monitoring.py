@@ -330,6 +330,33 @@ def test_human_summary_shows_two_cases_and_bounds_only_automatic_inventory() -> 
     assert "1 additional active case(s) omitted" in bounded
 
 
+def test_human_summary_exposes_pinned_execution_resources() -> None:
+    """Render the persisted source and allocation identity for operators."""
+    status = {
+        "campaign_run_id": "transient_campaign__0123456789abcdef",
+        "campaign_state": "running",
+        "git_commit": "a" * 40,
+        "execution_config_digest": "b" * 64,
+        "submission_config": {
+            "cores_per_case": 8,
+            "pending_buffer": 2,
+            "max_running_cases": 3,
+        },
+        "cases": [],
+    }
+
+    rendered = status_service.format_campaign_status_summary(status)
+
+    assert f"commit={'a' * 40}" in rendered
+    assert f"config_digest={'b' * 64}" in rendered
+    assert "cores_per_case=8" in rendered
+    assert "pending_buffer=2" in rendered
+    assert "max_running_cases=3" in rendered
+
+    status["submission_config"]["max_running_cases"] = None
+    assert "max_running_cases=unlimited" in status_service.format_campaign_status_summary(status)
+
+
 def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
     """Render temporary licence capacity as an operational blocked section."""
     status = {
