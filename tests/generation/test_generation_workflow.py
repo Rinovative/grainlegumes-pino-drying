@@ -315,13 +315,20 @@ if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
   printf '%s\n' '/remote/home'
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
   printf '%s\n' "${FAKE_BENCHMARK_STATE}"
-elif [[ " $* " == *' core-benchmark-status '* ]]; then
+elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format monitor '* ]]; then
   failed=0
   [[ "${FAKE_BENCHMARK_STATE}" == complete ]] || failed=1
-  printf '{"state":"%s","successful_work_units":%s,"active_work_units":0,' \
-    "${FAKE_BENCHMARK_STATE}" "$((8 - failed))"
-  printf '"pending_work_units":0,"license_blocked_work_units":0,'
-  printf '"failed_work_units":%s,"total_work_units":8,"license_waits":[]}\n' "${failed}"
+  signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  printf 'campaign-monitor\t%s\t%s\t%s\n' "${FAKE_BENCHMARK_STATE}" "${signature}" "${signature}"
+  printf 'Benchmark: transient_core_scaling\nRun: %s\nState: %s\n' \
+    "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_BENCHMARK_STATE}"
+  printf 'Work units: successful=%s  running=0  scheduler_pending=0  license_blocked=0  never_started=0  failed=%s  total=8\n' \
+    "$((8 - failed))" "${failed}"
+elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format summary '* ]]; then
+  printf 'Benchmark: transient_core_scaling\nRun: %s\nState: %s\n' \
+    "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_BENCHMARK_STATE}"
+elif [[ " $* " == *' core-benchmark-status '* ]]; then
+  printf '{"state":"%s"}\n' "${FAKE_BENCHMARK_STATE}"
 elif [[ " $* " == *' core-benchmark-transfer-plan '* ]]; then
   printf 'benchmark\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_GIT_COMMIT}" "${FAKE_BENCHMARK_RELATIVE}" \
@@ -2466,7 +2473,7 @@ def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"benchmark_run_id={_BENCHMARK_RUN_ID}" in result.stdout
+    assert f"Run: {_BENCHMARK_RUN_ID}" in result.stdout
     assert "state=complete" in result.stdout
     assert remote_directory.is_dir()
     assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()

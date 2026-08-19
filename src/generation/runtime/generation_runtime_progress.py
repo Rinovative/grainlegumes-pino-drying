@@ -46,6 +46,7 @@ _PHASES: Final = frozenset(
         "transient_drying",
         "collecting_exports",
         "canonicalizing",
+        "validating",
         "publishing",
         "completed",
         "failed",
@@ -66,6 +67,17 @@ _OPTIONAL_KEYS: Final = (
     "nonlinear_failures",
     "nonlinear_iteration",
     "last_solver_log_update_at",
+)
+_COMMON_RECORD_KEYS: Final = frozenset(
+    {
+        "hostname",
+        "started_at",
+        "updated_at",
+        "elapsed_seconds",
+        "phase",
+        "terminal",
+        *_OPTIONAL_KEYS,
+    }
 )
 _RECORD_KEYS: Final = frozenset(
     {
@@ -536,6 +548,40 @@ def create_runtime_progress_reporter(
     return RuntimeProgressReporter(identity, path, stdout_path=stdout_path)
 
 
+def create_bound_runtime_progress_reporter(
+    identity: Mapping[str, Any],
+    path: Path | str,
+    *,
+    hostname: str | None = None,
+    stdout_path: Path | str | None = None,
+    started_at: datetime | None = None,
+) -> RuntimeProgressReporter:
+    """Create the common reporter for an already admitted work-unit identity."""
+    expected = dict(identity)
+    resolved_hostname = hostname or socket.gethostname()
+    if not resolved_hostname or any(character in resolved_hostname for character in "\r\n\t"):
+        message = "Runtime progress hostname must be non-empty text without control characters."
+        raise ValueError(message)
+    receipt_path = Path(path)
+    if receipt_path.is_symlink() or (receipt_path.exists() and not receipt_path.is_file()):
+        message = f"Runtime progress receipt is unsafe: {receipt_path}"
+        raise ValueError(message)
+    bound_identity = {**expected, "hostname": resolved_hostname}
+    if receipt_path.exists():
+        try:
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            message = f"Runtime progress receipt is malformed: {receipt_path}"
+            raise ValueError(message) from error
+        if not isinstance(existing, dict) or any(existing.get(key) != value for key, value in bound_identity.items()):
+            message = f"Runtime progress receipt identity conflicts: {receipt_path}"
+            raise ValueError(message)
+        if existing.get("terminal") is True:
+            message = f"Runtime progress receipt is already terminal: {receipt_path}"
+            raise FileExistsError(message)
+    return RuntimeProgressReporter(bound_identity, receipt_path, stdout_path=stdout_path, started_at=started_at)
+
+
 def _is_nonnegative_integer(value: object) -> bool:
     """Return whether a value is one nonnegative integer but not a boolean."""
     return not isinstance(value, bool) and isinstance(value, int) and value >= 0
@@ -547,8 +593,8 @@ def _is_nonnegative_number(value: object) -> bool:
 
 
 def _payload_is_supported(payload: object, expected: Mapping[str, Any]) -> bool:
-    """Return whether one loaded payload satisfies the progress schema."""
-    if not isinstance(payload, dict) or set(payload) != _RECORD_KEYS:
+    """Return whether one loaded payload satisfies the common progress schema."""
+    if not isinstance(payload, dict) or set(payload) != set(expected).union(_COMMON_RECORD_KEYS):
         return False
     if any(payload.get(key) != value for key, value in expected.items()):
         return False
@@ -591,6 +637,35 @@ def _payload_is_supported(payload: object, expected: Mapping[str, Any]) -> bool:
         and all(payload[key] is None or _is_nonnegative_number(payload[key]) for key in number_keys)
         and (log_updated_at is None or _parse_timestamp(log_updated_at) is not None)
     )
+
+
+def load_bound_runtime_progress(
+    identity: Mapping[str, Any],
+    path: Path | str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Load one common progress receipt for an admitted work-unit identity."""
+    try:
+        receipt_path = Path(path)
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return _unavailable("not_reported")
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if not _payload_is_supported(payload, identity):
+            return _unavailable("invalid_or_unsupported")
+        updated_at = _parse_timestamp(payload["updated_at"])
+        if updated_at is None:
+            return _unavailable("invalid_or_unsupported")
+        age = max(0.0, ((now or _utc_now()) - updated_at).total_seconds())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return _unavailable("invalid_or_unavailable")
+    return {
+        **payload,
+        "availability": "available",
+        "reason": None,
+        "age_seconds": age,
+        "stale": age > PROGRESS_STALE_AFTER_SECONDS,
+    }
 
 
 def load_runtime_progress(

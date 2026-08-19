@@ -2110,29 +2110,19 @@ monitor_generation_units() {
         esac
         ;;
       benchmark)
-        remote_cli resume-core-benchmark "$RUN_ID"           --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
-        local output record state successful active pending blocked failed total evidence extra
-        output="$(remote_cli core-benchmark-status "$RUN_ID"           --storage-root "$REMOTE_STORAGE_ROOT")" ||
+        remote_cli resume-core-benchmark "$RUN_ID" \
+          --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+        local output header state state_signature progress_signature detail extra
+        output="$(remote_cli core-benchmark-status "$RUN_ID" \
+          --storage-root "$REMOTE_STORAGE_ROOT" --format monitor)" ||
           fail 1 "Could not reconstruct benchmark work-unit status."
-        record="$(printf '%s' "$output" | local_python -c 'import json, sys
-value = json.load(sys.stdin)
-waits = value.get("license_waits", [])
-evidence = "-"
-if waits:
-    wait = waits[-1]
-    evidence = str(wait.get("raw_excerpt", "-"))
-evidence = evidence.replace("\t", " ").replace("\r", " ").replace("\n", " ")[:512]
-fields = (
-    value["state"], value["successful_work_units"],
-    value["active_work_units"], value["pending_work_units"],
-    value["license_blocked_work_units"], value["failed_work_units"],
-    value["total_work_units"], evidence,
-)
-print("\t".join(str(item) for item in fields))')" ||
-          fail 1 "Could not decode benchmark work-unit status."
-        IFS=$'\t' read -r state successful active pending blocked failed total evidence extra <<< "$record"
-        [[ -z "${extra:-}" ]] || fail 1 "Malformed benchmark status record."
-        generation_console_progress units 5 9 "Work units" RUNNING           "$state|$successful|$active|$pending|$blocked|$failed"           "benchmark_run_id=$RUN_ID successful=$successful active=$active pending=$pending license_blocked=$blocked failed=$failed total=$total"$'\n'"license_evidence=$evidence"
+        header="${output%%$'\n'*}"
+        detail="${output#*$'\n'}"
+        IFS=$'\t' read -r _monitor_record state state_signature progress_signature extra <<< "$header"
+        [[ "$_monitor_record" == "campaign-monitor" && -z "${extra:-}" ]] ||
+          fail 1 "Malformed benchmark monitor record."
+        generation_console_progress units 5 9 "Work units" RUNNING \
+          "$state_signature" "$detail" "$progress_signature"
         case "$state" in
           complete)
             disarm_campaign_interrupt
@@ -2749,7 +2739,7 @@ benchmark_status_report() {
   resolve_remote_layout
   printf 'Benchmark status:\n'
   remote_cli core-benchmark-status "${RUN_ID}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${REMOTE_STORAGE_ROOT}" --format summary
   printf 'CPU source status:\n'
   remote_cli core-benchmark-source-status "${RUN_ID}" \
     --storage-root "${REMOTE_STORAGE_ROOT}"

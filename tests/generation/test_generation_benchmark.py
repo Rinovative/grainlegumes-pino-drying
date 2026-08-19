@@ -139,6 +139,9 @@ def _success_records(
                     "resource": {
                         "peak_memory_bytes": peak_memory_bytes,
                         "peak_scratch_bytes": peak_scratch_bytes,
+                        "slurm_job_id": str(1000 + len(records)),
+                        "node": "node-a",
+                        "requested_cpus": variant.cores_per_case,
                     },
                     "license": {
                         "license_blocked_submission_count": license_blocks,
@@ -548,6 +551,7 @@ def test_benchmark_worker_calls_shared_executor_and_keeps_its_duration(
         "canonical_input_preparation_seconds": 0.25,
     }
     manifest = {
+        "benchmark_run_id": _RUN_ID,
         "git_commit": _COMMIT,
         "preflight": {"receipt_sha256": "f" * 64},
         "submission_history": [
@@ -556,6 +560,7 @@ def test_benchmark_worker_calls_shared_executor_and_keeps_its_duration(
                 "job_id": "123",
                 "variant_id": variant.variant_id,
                 "case_role": representative.case_role,
+                "work_unit_id": suite.work_unit_id(variant, 1),
                 "submitted_at": "2026-08-19T00:00:00+00:00",
             }
         ],
@@ -1264,3 +1269,89 @@ def test_benchmark_cancellation_targets_only_owned_active_jobs(
         ["scancel", "501"],
         ["scancel", "--signal=TERM", "--batch", "502"],
     ]
+
+
+def test_benchmark_work_units_use_disjoint_scheduler_and_submission_states(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Separate running jobs, Slurm PENDING jobs, and unsubmitted future waves."""
+    suite = _synthetic_suite(generation_config_factory)
+    records = _pending_records(suite)
+    current = suite.variant_wave_order()[0]
+    submissions = []
+    rows = []
+    for position, job_id in enumerate(("501", "502"), start=1):
+        representative = suite.representative_case(position)
+        submissions.append(
+            {
+                "role": "measure",
+                "job_id": job_id,
+                "variant_id": current.variant_id,
+                "case_role": representative.case_role,
+                "work_unit_id": suite.work_unit_id(current, position),
+            }
+        )
+        state = "RUNNING" if position == 1 else "PENDING"
+        rows.append(f"{job_id}|{state}|None|node-a|00:01:00")
+    manifest = {"benchmark_run_id": _RUN_ID, "submission_history": submissions}
+    scheduler = {"squeue": {"output": "\n".join(rows), "error": None}, "sacct": {"output": "", "error": None}}
+    directory = tmp_path / "benchmark"
+    directory.mkdir()
+
+    views = generation.benchmark._benchmark_work_unit_views(manifest, records, scheduler, directory=directory, suite=suite)
+    counts = {
+        state: sum(view["state"] == state for view in views)
+        for state in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+    }
+    assert counts == {
+        "successful": 0,
+        "running": 1,
+        "scheduler_pending": 1,
+        "license_blocked": 0,
+        "never_started": 6,
+        "failed": 0,
+    }
+    assert sum(counts.values()) == len(views) == 8
+    running = next(view for view in views if view["state"] == "running")
+    assert running["runtime_progress"]["reason"] == "not_reported"
+
+
+def test_partial_evaluation_uses_only_complete_waves(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep incomplete waves out of provisional and final recommendations."""
+    suite = _synthetic_suite(generation_config_factory)
+    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
+    successes = _success_records(suite, runtimes, queue_seconds=999.0, license_wait_seconds=888.0)
+    successful_by_unit = {record["work_unit_id"]: record for record in successes}
+    pending = _pending_records(suite)
+    manifest = {"submission_history": []}
+    scheduler = {"squeue": {"output": "", "error": None}, "sacct": {"output": "", "error": None}}
+    assert generation.benchmark._completed_wave_evaluation(suite, manifest, pending, scheduler) is None
+
+    first_two = {variant.variant_id for variant in suite.variant_wave_order()[:2]}
+    one_complete = [
+        successful_by_unit[record["work_unit_id"]] if record["variant_id"] == suite.variant_wave_order()[0].variant_id else record
+        for record in pending
+    ]
+    one = generation.benchmark._completed_wave_evaluation(suite, manifest, one_complete, scheduler)
+    assert one is not None
+    assert one["completed_wave_count"] == 1
+    assert len(one["variants"]) == 1
+    assert one["final_recommendation_available"] is False
+
+    two_complete = [successful_by_unit[record["work_unit_id"]] if record["variant_id"] in first_two else record for record in pending]
+    two = generation.benchmark._completed_wave_evaluation(suite, manifest, two_complete, scheduler)
+    assert two is not None
+    assert two["completed_wave_count"] == 2
+    assert {record["variant_id"] for record in two["variants"]} == first_two
+    assert two["recommended_cores_per_case"] in {variant.cores_per_case for variant in suite.variant_wave_order()[:2]}
+    assert two["final_recommendation_available"] is False
+
+    complete = generation.benchmark._completed_wave_evaluation(suite, manifest, successes, scheduler)
+    assert complete is not None
+    assert complete["completed_wave_count"] == 4
+    assert complete["final_recommendation_available"] is True

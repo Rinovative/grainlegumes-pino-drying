@@ -28,16 +28,6 @@ if TYPE_CHECKING:
 _MONITOR_RECORD_KIND = "campaign-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
-_PENDING_CASE_STATES = frozenset(
-    {
-        "pending",
-        "never_started",
-        "cancelled",
-        "interrupted",
-        "license_blocked",
-        "scheduler_unknown",
-    }
-)
 _FAILED_CASE_STATES = frozenset(
     {
         "failed",
@@ -115,13 +105,17 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
     """Return one aggregate presentation bucket for a canonical case state."""
     state = str(case.get("state"))
     if state == "successful":
-        return "completed"
+        return "successful"
     if state in _FAILED_CASE_STATES:
         return "failed"
-    if state == "active":
-        return "active"
-    if state in _PENDING_CASE_STATES:
-        return "pending"
+    if state in {"running", "active"}:
+        return "running"
+    if state == "license_blocked":
+        return "license_blocked"
+    if state in {"scheduler_pending", "pending"}:
+        return "scheduler_pending"
+    if state == "never_started":
+        return "never_started"
     return "failed"
 
 
@@ -141,35 +135,32 @@ def _case_heading(case: Mapping[str, Any], *, show_batch: bool) -> str:
 
 
 def _active_case_lines(case: Mapping[str, Any], *, show_batch: bool) -> list[str]:
-    """Return compact multiline raw evidence for one active case."""
+    """Return compact multiline raw evidence for one running work unit."""
     lines = [_case_heading(case, show_batch=show_batch)]
     runtime = _runtime_view(case)
     if runtime.get("availability") != "available":
         reason = _text(runtime.get("reason"))
-        lines.append(f"  phase=unavailable  runtime_progress={reason}")
+        lines.append(f"  phase=unavailable  parser_state={reason}  last_progress_update=unavailable")
         return lines
     phase = _text(runtime.get("phase"))
-    parser_state = runtime.get("parser_state")
-    if parser_state == "available" and runtime.get("simulated_time_seconds") is not None:
+    parser_state = _text(runtime.get("parser_state"))
+    progress = _format_comsol_stage(runtime.get("comsol_progress_percent")) if phase in {"stationary_airflow", "transient_drying"} else "unavailable"
+    lines.append(f"  state=running  phase={phase}  parser_state={parser_state}  progress={progress}")
+    if phase in {"stationary_airflow", "transient_drying"} and runtime.get("parser_state") == "available":
         lines.append(
             "  "
-            f"phase={phase}  sim_time={_format_simulated_time(runtime.get('simulated_time_seconds'))}  "
-            f"step={_format_step_size(runtime.get('step_size_seconds'))}"
-        )
-        lines.append(
-            "  "
-            f"order={_text(runtime.get('order'))}  Tfail={_text(runtime.get('time_failures'))}  "
-            f"NLfail={_text(runtime.get('nonlinear_failures'))}  updated={_format_age(runtime)}"
-        )
-    elif parser_state == "available" and runtime.get("nonlinear_iteration") is not None:
-        lines.append(
-            "  "
-            f"phase={phase}  nonlinear_iteration={_text(runtime.get('nonlinear_iteration'))}  "
-            f"COMSOL_stage={_format_comsol_stage(runtime.get('comsol_progress_percent'))}  "
-            f"updated={_format_age(runtime)}"
+            f"simulated_time={_format_simulated_time(runtime.get('simulated_time_seconds'))}  "
+            f"step={_text(runtime.get('step_index'))}  "
+            f"step_size={_format_step_size(runtime.get('step_size_seconds'))}"
         )
     else:
-        lines.append(f"  phase={phase}  solver=unavailable  updated={_format_age(runtime)}")
+        lines.append("  simulated_time=unavailable  step=unavailable  step_size=unavailable")
+    lines.append(
+        "  "
+        f"Tfail={_text(runtime.get('time_failures'))}  NLfail={_text(runtime.get('nonlinear_failures'))}  "
+        f"last_solver_update={_text(runtime.get('last_solver_log_update_at'))}  "
+        f"last_progress_update={_text(runtime.get('updated_at'))}  age={_format_age(runtime)}"
+    )
     return lines
 
 
@@ -236,7 +227,10 @@ def format_campaign_status_summary(
         message = "max_active_cases must be a positive integer or None."
         raise ValueError(message)
     cases = _case_inventory(status)
-    buckets = {name: [case for case in cases if _case_bucket(case) == name] for name in ("completed", "active", "pending", "failed")}
+    buckets = {
+        name: [case for case in cases if _case_bucket(case) == name]
+        for name in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+    }
     submission = status.get("submission_config")
     submission_values = submission if isinstance(submission, dict) else {}
     max_running = submission_values.get("max_running_cases")
@@ -252,13 +246,15 @@ def format_campaign_status_summary(
             f"max_running_cases={max_running_text}"
         ),
         (
-            f"Cases: {len(buckets['completed'])}/{len(cases)} completed, "
-            f"{len(buckets['active'])} active, {len(buckets['pending'])} pending, "
-            f"{len(buckets['failed'])} failed"
+            "Cases: "
+            f"successful={len(buckets['successful'])}  running={len(buckets['running'])}  "
+            f"scheduler_pending={len(buckets['scheduler_pending'])}  license_blocked={len(buckets['license_blocked'])}  "
+            f"never_started={len(buckets['never_started'])}  failed={len(buckets['failed'])}  total={len(cases)} "
+            f"({len(buckets['failed'])} failed)"
         ),
     ]
     show_batch = len({str(case.get("batch_name")) for case in cases}) > 1
-    active = buckets["active"]
+    active = buckets["running"]
     visible_active = active if max_active_cases is None else active[:max_active_cases]
     active_lines: list[str] = []
     for index, case in enumerate(visible_active):
@@ -268,13 +264,13 @@ def format_campaign_status_summary(
     omitted = len(active) - len(visible_active)
     if omitted:
         active_lines.append(f"... {omitted} additional active case(s) omitted")
-    _append_section(lines, "Active cases", active_lines)
-    license_blocked_records = [
-        _nonactive_case_line(case, show_batch=show_batch) for case in buckets["pending"] if case.get("state") == "license_blocked"
-    ]
-    pending_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["pending"] if case.get("state") != "license_blocked"]
+    _append_section(lines, "Running cases", active_lines)
+    license_blocked_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["license_blocked"]]
+    pending_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["scheduler_pending"]]
+    never_started_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["never_started"]]
     _append_section(lines, "License-blocked cases", license_blocked_records)
-    _append_section(lines, "Pending cases", pending_records)
+    _append_section(lines, "Scheduler-pending cases", pending_records)
+    _append_section(lines, "Never-started cases", never_started_records)
     _append_section(
         lines,
         "Failed cases",
@@ -283,7 +279,7 @@ def format_campaign_status_summary(
     _append_section(
         lines,
         "Completed cases",
-        [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["completed"]],
+        [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["successful"]],
     )
     return "\n".join(lines)
 
@@ -372,3 +368,126 @@ def format_campaign_monitor(
     )
     summary = format_campaign_status_summary(status, max_active_cases=max_active_cases)
     return f"{header}\n{summary}"
+
+
+def format_benchmark_status_summary(
+    status: Mapping[str, Any],
+    *,
+    max_active_cases: int | None = None,
+) -> str:
+    """Format benchmark status through the common work-unit presentation model."""
+    raw_units = status.get("work_units")
+    units = raw_units if isinstance(raw_units, list) and all(isinstance(item, dict) for item in raw_units) else []
+    normalized = [
+        {
+            **unit,
+            "case_id": f"{unit.get('variant_id', 'unavailable')} {unit.get('case_role', 'unavailable')}",
+            "batch_name": str(unit.get("variant_id", "unavailable")),
+        }
+        for unit in units
+    ]
+    categories = ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+    counts = {name: sum(unit.get("state") == name for unit in normalized) for name in categories}
+    wave = status.get("current_wave")
+    wave_values = wave if isinstance(wave, dict) else {}
+    current_variant = wave_values.get("variant_id")
+    current_units = [unit for unit in normalized if unit.get("variant_id") == current_variant]
+    current_counts = {name: sum(unit.get("state") == name for unit in current_units) for name in categories}
+    lines = [
+        f"Benchmark: {_text(status.get('suite_name'))}",
+        f"Run: {_text(status.get('benchmark_run_id'))}",
+        f"State: {_text(status.get('state'))}",
+        f"Wave: {_text(wave_values.get('wave_position'))}/{_text(status.get('wave_count'))}",
+        f"Current cores_per_case: {_text(wave_values.get('cores_per_case'))}",
+        f"Measurements: {counts['successful']}/{len(normalized)} successful",
+        "Work units: " + "  ".join(f"{name}={counts[name]}" for name in categories) + f"  total={len(normalized)}",
+    ]
+    if current_units:
+        lines.extend(
+            (
+                "",
+                "Current wave:",
+                f"  successful={current_counts['successful']}/{len(current_units)}",
+                f"  running={current_counts['running']}",
+                f"  scheduler_pending={current_counts['scheduler_pending']}",
+                f"  license_blocked={current_counts['license_blocked']}",
+                f"  elapsed={_text(status.get('current_wave_elapsed'))}",
+                f"  last_progress_timestamp={_text(status.get('last_progress_timestamp'))}",
+                f"  eta={_text(status.get('eta'))}",
+            )
+        )
+    running = [unit for unit in normalized if unit.get("state") == "running"]
+    visible_running = running if max_active_cases is None else running[:max_active_cases]
+    detail: list[str] = []
+    for index, unit in enumerate(visible_running):
+        if index:
+            detail.append("")
+        detail.extend(_active_case_lines(unit, show_batch=False))
+    omitted = len(running) - len(visible_running)
+    if omitted:
+        detail.append(f"... {omitted} additional running work unit(s) omitted")
+    _append_section(lines, "Running work units", detail)
+    wave_order = status.get("waves")
+    if isinstance(wave_order, list):
+        completed = [f"  {item.get('variant_id')}: complete" for item in wave_order if isinstance(item, dict) and item.get("state") == "complete"]
+        future = [
+            f"  {item.get('variant_id')}: never_started" for item in wave_order if isinstance(item, dict) and item.get("state") == "never_started"
+        ]
+        _append_section(lines, "Completed waves", completed)
+        _append_section(lines, "Future waves", future)
+    partial = status.get("partial_evaluation")
+    if isinstance(partial, dict):
+        lines.extend(("", "Partial wave evaluation (provisional):"))
+        variants = partial.get("variants")
+        if isinstance(variants, list):
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                lines.extend(
+                    (
+                        f"  {variant.get('variant_id')}:",
+                        f"    cores_per_case={_text(variant.get('cores_per_case'))}",
+                        f"    successful_measurement_count={_text(variant.get('successful_measurement_count'))}",
+                        f"    median_comsol_process_seconds={_text(variant.get('median_comsol_process_seconds'))}",
+                        f"    minimum_comsol_process_seconds={_text(variant.get('minimum_comsol_process_seconds'))}",
+                        f"    maximum_comsol_process_seconds={_text(variant.get('maximum_comsol_process_seconds'))}",
+                        f"    median_core_hours_per_case={_text(variant.get('median_core_hours_per_case'))}",
+                        f"    estimated_cases_per_node={_text(variant.get('estimated_cases_per_node'))}",
+                        f"    estimated_compute_only_cases_per_node_hour={_text(variant.get('estimated_cases_per_node_hour'))}",
+                        f"    scheduler_queue_seconds={_text(variant.get('scheduler_queue_seconds'))}",
+                        f"    license_wait_seconds={_text(variant.get('license_wait_seconds'))}",
+                        f"    license_probe_seconds={_text(variant.get('license_probe_seconds'))}",
+                        f"    observed_solver_concurrency={_text(variant.get('observed_peak_solver_concurrency'))}",
+                        f"    peak_memory_per_case_bytes={_text(variant.get('peak_memory_per_case_bytes'))}",
+                        f"    peak_scratch_per_case_bytes={_text(variant.get('peak_scratch_per_case_bytes'))}",
+                    )
+                )
+        lines.append(f"  provisional_recommendation={_text(partial.get('recommended_cores_per_case'))}")
+    return "\n".join(lines)
+
+
+def format_benchmark_monitor(status: Mapping[str, Any], *, max_active_cases: int) -> str:
+    """Format a rate-limit header and shared benchmark summary."""
+    raw_units = status.get("work_units")
+    units = raw_units if isinstance(raw_units, list) else []
+    normalized = [
+        {
+            **unit,
+            "case_id": unit.get("work_unit_id"),
+            "batch_name": unit.get("variant_id"),
+        }
+        for unit in units
+        if isinstance(unit, dict)
+    ]
+    common_status = {"campaign_state": status.get("state"), "cases": normalized}
+    state_signature, progress_signature = campaign_monitor_signatures(common_status)
+    benchmark_state = common.serialization.canonical_json_sha256(
+        {
+            "common_state_signature": state_signature,
+            "current_wave": status.get("current_wave"),
+            "waves": status.get("waves"),
+            "partial_evaluation": status.get("partial_evaluation"),
+        }
+    )
+    header = "\t".join((_MONITOR_RECORD_KIND, _text(status.get("state")), benchmark_state, progress_signature))
+    return f"{header}\n{format_benchmark_status_summary(status, max_active_cases=max_active_cases)}"

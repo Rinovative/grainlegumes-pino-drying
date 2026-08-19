@@ -438,3 +438,27 @@ def test_campaign_status_cli_reuses_summary_and_monitor_formatter(
     assert len(header.split("\t")) == 4
     assert header.startswith("campaign-monitor\trunning\t")
     assert rendered == summary
+
+
+def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_bound() -> None:
+    """Count every work unit once and hide stale solver values after solving."""
+    cases = [
+        {"case_id": "success", "batch_name": "batch", "state": "successful"},
+        _active_case("case_0001", "101", "node-a", 120.0),
+        {"case_id": "queued", "batch_name": "batch", "state": "pending", "latest_job_id": "102", "scheduler_state": "PENDING"},
+        {"case_id": "blocked", "batch_name": "batch", "state": "license_blocked"},
+        {"case_id": "unsent", "batch_name": "batch", "state": "never_started", "latest_job_id": None},
+        {"case_id": "failed", "batch_name": "batch", "state": "failed"},
+    ]
+    status = {"campaign_run_id": "run", "campaign_state": "running", "cases": cases}
+    rendered = status_service.format_campaign_status_summary(status)
+    for category in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed"):
+        assert f"{category}=1" in rendered
+    assert "total=6" in rendered
+
+    exporting = deepcopy(cases[1])
+    exporting["runtime_progress"]["phase"] = "collecting_exports"
+    exporting_text = status_service.format_campaign_status_summary({**status, "cases": [exporting]})
+    assert "phase=collecting_exports" in exporting_text
+    assert "progress=unavailable" in exporting_text
+    assert "simulated_time=unavailable" in exporting_text

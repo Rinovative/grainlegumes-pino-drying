@@ -312,7 +312,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     benchmark_status.add_argument("benchmark_run_id")
     benchmark_status.add_argument("--no-scheduler", action="store_true")
-    benchmark_status.add_argument("--format", choices=("json", "state"), default="json")
+    benchmark_status.add_argument("--format", choices=("json", "state", "summary", "monitor"), default="json")
     benchmark_status.add_argument("--storage-root", type=Path, required=True)
 
     resume_benchmark = subparsers.add_parser(
@@ -1309,6 +1309,10 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         if args.format == "state":
             print(status["state"])
+        elif args.format == "summary":
+            print(campaign_status_service.format_benchmark_status_summary(status))
+        elif args.format == "monitor":
+            print(campaign_status_service.format_benchmark_monitor(status, max_active_cases=8))
         else:
             print(json.dumps(status, sort_keys=True))
         return 0

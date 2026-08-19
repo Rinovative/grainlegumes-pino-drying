@@ -338,3 +338,29 @@ def test_monitoring_failure_does_not_change_the_simulated_case_path(
         expected_run_id=prepared.workspace_run_id,
         expected_case_id=prepared.bundle.case_id,
     )
+
+
+def test_bound_progress_uses_common_schema_validation_and_freshness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validate benchmark-shaped identities through the common v1 progress owner."""
+    identity = {
+        "schema_kind": "generation_campaign_runtime_progress",
+        "schema_version": 1,
+        "benchmark_run_id": "core_scaling_transient__0123456789abcdef",
+        "variant_id": "cores_08",
+        "cores_per_case": 8,
+        "case_role": "nominal",
+        "work_unit_id": "cores_08__measurement__nominal",
+        "slurm_job_id": "42",
+    }
+    receipt = tmp_path / "42.json"
+    started = datetime(2026, 8, 19, tzinfo=timezone.utc)
+    monkeypatch.setattr(progress, "_utc_now", lambda: started)
+    reporter = progress.create_bound_runtime_progress_reporter(identity, receipt, hostname="node-a", started_at=started)
+    assert reporter.update(phase="preparing", force=True)
+
+    loaded = progress.load_bound_runtime_progress(identity, receipt, now=started + timedelta(seconds=5))
+    assert loaded["availability"] == "available"
+    assert loaded["hostname"] == "node-a"
+    assert loaded["age_seconds"] == 5.0
+    assert loaded["schema_version"] == 1
+    assert progress.load_bound_runtime_progress({**identity, "case_role": "natural"}, receipt)["reason"] == "invalid_or_unsupported"

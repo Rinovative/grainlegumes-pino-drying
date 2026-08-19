@@ -368,7 +368,8 @@ The public administrative commands are:
 ./scripts/generation_workflow.sh background-list
 ```
 
-Status reports successful, active, pending, license-blocked, and failed units;
+Status reports successful, running, scheduler-pending, license-blocked,
+never-started, and failed units;
 current stage; CPU source; host publication; package/finalizer state; and the
 same-config continuation action. The first Ctrl+C after campaign launch requests
 graceful cancellation and keeps monitoring durable terminal evidence. A second

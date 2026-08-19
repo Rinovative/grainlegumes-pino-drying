@@ -52,6 +52,7 @@ from src.generation.publication import generation_publication_storage as storage
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_preparation as preparation_service
+from src.generation.runtime import generation_runtime_progress as progress_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
 
 if TYPE_CHECKING:
@@ -3355,6 +3356,15 @@ def run_core_benchmark_case(
         prepared: preparation_service.PreparedCase | None = None
         solver_start: float | None = None
         success: dict[str, Any]
+        progress_reporter = _benchmark_progress_reporter(
+            manifest,
+            directory=directory,
+            variant=variant,
+            case_role=representative.case_role,
+            work_unit_id=work_unit_id,
+            job_id=job_id,
+        )
+        progress_reporter.update(phase="preparing", force=True)
         try:
             prepared = preparation_service.prepare_case_work_directory(
                 suite.case_config,
@@ -3380,14 +3390,17 @@ def run_core_benchmark_case(
                     "SLURMD_NODENAME",
                     socket.gethostname(),
                 ),
+                progress_reporter=progress_reporter,
             )
             publication_start = time.monotonic()
+            progress_reporter.update(phase="validating", force=True)
             hdf5_identity = storage_service.validate_case_hdf5(
                 result.canonical_case.path,
                 expected_profile=profiles.TRANSIENT_DRYING_PROFILE,
             )
             publication_seconds = time.monotonic() - publication_start
             _validate_hdf5_scientific_identity(hdf5_identity, proof)
+            progress_reporter.update(phase="publishing", force=True)
             command_np = result.command[result.command.index("-np") + 1]
             completion_time = _utc_now()
             scheduler_timing = _scheduler_timing(
@@ -3470,7 +3483,9 @@ def run_core_benchmark_case(
                 success,
                 label="benchmark case success",
             )
+            progress_reporter.update(phase="completed", terminal=True)
         except BaseException as error:
+            progress_reporter.update(phase="failed", terminal=True)
             completion_time = _utc_now()
             scheduler_timing = _scheduler_timing(
                 submit_time=submit_time,
@@ -4101,7 +4116,7 @@ def _scheduler_evidence(job_ids: Sequence[str]) -> dict[str, Any]:
             "squeue",
             "--noheader",
             f"--jobs={selection}",
-            "--format=%i|%T|%R",
+            "--format=%i|%T|%R|%N|%M",
         ],
         "sacct": [
             "sacct",
@@ -4237,19 +4252,205 @@ def cancel_core_benchmark(
         return receipt
 
 
+def _benchmark_progress_identity(
+    manifest: Mapping[str, Any],
+    *,
+    variant: CoreBenchmarkVariant,
+    case_role: str,
+    work_unit_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """Bind common runtime progress to one measured benchmark submission."""
+    matches = [
+        item
+        for item in manifest["submission_history"]
+        if item.get("role") == "measure"
+        and item.get("job_id") == job_id
+        and item.get("work_unit_id") == work_unit_id
+        and item.get("variant_id") == variant.variant_id
+        and item.get("case_role") == case_role
+    ]
+    if len(matches) != 1:
+        message = "Benchmark runtime progress job is not bound to one exact work unit."
+        raise ValueError(message)
+    return {
+        "schema_kind": "generation_campaign_runtime_progress",
+        "schema_version": 1,
+        "benchmark_run_id": manifest["benchmark_run_id"],
+        "variant_id": variant.variant_id,
+        "cores_per_case": variant.cores_per_case,
+        "case_role": case_role,
+        "work_unit_id": work_unit_id,
+        "slurm_job_id": job_id,
+    }
+
+
+def _benchmark_progress_path(directory: Path, job_id: str, *, create: bool) -> Path:
+    """Return a bounded symlink-free benchmark progress receipt path."""
+    progress = directory / "progress"
+    if progress.is_symlink() or (progress.exists() and not progress.is_dir()):
+        message = "Benchmark progress directory is unsafe."
+        raise ValueError(message)
+    if create:
+        progress.mkdir(mode=0o700, exist_ok=True)
+    path = progress / f"{job_id}.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        message = "Benchmark progress receipt is unsafe."
+        raise ValueError(message)
+    return path
+
+
+def _benchmark_progress_reporter(
+    manifest: Mapping[str, Any],
+    *,
+    directory: Path,
+    variant: CoreBenchmarkVariant,
+    case_role: str,
+    work_unit_id: str,
+    job_id: str,
+) -> progress_service.RuntimeProgressReporter:
+    """Create the shared incremental reporter for one exact benchmark job."""
+    identity = _benchmark_progress_identity(manifest, variant=variant, case_role=case_role, work_unit_id=work_unit_id, job_id=job_id)
+    path = _benchmark_progress_path(directory, job_id, create=True)
+    return progress_service.create_bound_runtime_progress_reporter(
+        identity,
+        path,
+        hostname=os.environ.get("SLURMD_NODENAME", socket.gethostname()),
+    )
+
+
+def _load_benchmark_runtime_progress(directory: Path, identity: Mapping[str, Any], *, job_id: str) -> dict[str, Any]:
+    """Load common validated reporter evidence without affecting execution."""
+    try:
+        path = _benchmark_progress_path(directory, job_id, create=False)
+    except (OSError, TypeError, ValueError):
+        return {"availability": "unavailable", "reason": "invalid_or_unavailable", "age_seconds": None, "stale": None}
+    return progress_service.load_bound_runtime_progress(identity, path)
+
+
+def _benchmark_scheduler_rows(scheduler: Mapping[str, Any]) -> dict[str, dict[str, str | None]]:
+    """Return the one admitted live scheduler view keyed by owned job ID."""
+    rows: dict[str, dict[str, str | None]] = {}
+    for line in str(scheduler["squeue"]["output"]).splitlines():
+        try:
+            job_id, state, reason, node, elapsed = line.split("|", maxsplit=4)
+        except ValueError:
+            continue
+        if _JOB_ID_PATTERN.fullmatch(job_id) is not None:
+            rows[job_id] = {
+                "scheduler_state": state.strip().upper(),
+                "reason": reason or None,
+                "node": None if node in {"", "(null)", "N/A"} else node,
+                "elapsed": None if elapsed in {"", "N/A"} else elapsed,
+            }
+    return rows
+
+
+def _benchmark_work_unit_views(
+    manifest: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    scheduler: Mapping[str, Any],
+    *,
+    directory: Path,
+    suite: CoreBenchmarkSuite,
+) -> list[dict[str, Any]]:
+    """Return disjoint benchmark work-unit views from existing evidence only."""
+    live = _benchmark_scheduler_rows(scheduler)
+    views: list[dict[str, Any]] = []
+    for record in records:
+        variant = suite.variant(str(record["variant_id"]))
+        position = int(record["case_position"])
+        latest = _latest_work_unit_submission(manifest, variant_id=variant.variant_id, case_role=str(record["case_role"]))
+        job_id = None if latest is None else str(latest["job_id"])
+        scheduler_view = live.get(job_id or "", {})
+        state: str
+        if record["status"] == "success":
+            state = "successful"
+        elif record["status"] == "failed":
+            state = "failed"
+        elif job_id is None:
+            state = "never_started"
+        elif scheduler_view.get("scheduler_state") == "PENDING":
+            state = "scheduler_pending"
+        elif job_id in live:
+            state = "running"
+        elif _load_benchmark_license_wait(directory, suite, variant, position, run_id=str(manifest["benchmark_run_id"])) is not None:
+            state = "license_blocked"
+        else:
+            state = "failed"
+        views.append(
+            {
+                "work_unit_id": record["work_unit_id"],
+                "variant_id": variant.variant_id,
+                "cores_per_case": variant.cores_per_case,
+                "case_role": record["case_role"],
+                "state": state,
+                "latest_job_id": job_id,
+                "scheduler_state": scheduler_view.get("scheduler_state"),
+                "node": scheduler_view.get("node"),
+                "elapsed": scheduler_view.get("elapsed"),
+                "reason": scheduler_view.get("reason"),
+                "runtime_progress": (
+                    {"availability": "unavailable", "reason": "no_job", "age_seconds": None, "stale": None}
+                    if job_id is None
+                    else _load_benchmark_runtime_progress(
+                        directory,
+                        _benchmark_progress_identity(
+                            manifest,
+                            variant=variant,
+                            case_role=str(record["case_role"]),
+                            work_unit_id=str(record["work_unit_id"]),
+                            job_id=job_id,
+                        ),
+                        job_id=job_id,
+                    )
+                ),
+            }
+        )
+    return views
+
+
+def _completed_wave_evaluation(
+    suite: CoreBenchmarkSuite,
+    manifest: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    scheduler: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Evaluate only waves whose two measurements are successfully complete."""
+    wave_order = suite.variant_wave_order()
+    completed_variants = tuple(
+        variant
+        for variant in wave_order
+        if len(selected := [record for record in records if record.get("variant_id") == variant.variant_id]) == suite.representative_case_count
+        and all(record.get("status") == "success" for record in selected)
+    )
+    if not completed_variants:
+        return None
+    completed_ids = {variant.variant_id for variant in completed_variants}
+    completed_records = [record for record in records if record.get("variant_id") in completed_ids]
+    partial = summarize_core_benchmark_results(replace(suite, variants=completed_variants), completed_records)
+    _apply_controller_queue_to_summary(
+        partial,
+        _controller_scheduler_queue_accounting(manifest, records, scheduler),
+    )
+    partial["provisional"] = True
+    partial["completed_wave_count"] = len(completed_variants)
+    partial["final_recommendation_available"] = len(completed_variants) == len(wave_order)
+    return partial
+
+
 def core_benchmark_status(
     run_id: str,
     *,
     storage_root: Path | str,
     query_scheduler: bool = True,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Reconstruct precise wave-aware work-unit and scheduler state."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
     records = _result_records(directory, suite)
     success_count = sum(record["status"] == "success" for record in records)
-    failure_count = sum(record["status"] == "failed" for record in records)
-    pending_count = sum(record["status"] == "pending" for record in records)
     job_ids = [str(value) for value in manifest["measured_job_ids"]]
     scheduler = (
         _scheduler_evidence(job_ids)
@@ -4268,6 +4469,11 @@ def core_benchmark_status(
         for submission in manifest["submission_history"]
         if submission.get("role") == "measure" and str(submission.get("job_id")) in active_job_ids
     ]
+    work_units = _benchmark_work_unit_views(manifest, records, scheduler, directory=directory, suite=suite)
+    category_counts = {
+        name: sum(item["state"] == name for item in work_units)
+        for name in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+    }
     exhausted: list[dict[str, Any]] = []
     license_waits: list[dict[str, Any]] = []
     terminal_without_result: list[dict[str, Any]] = []
@@ -4354,18 +4560,57 @@ def core_benchmark_status(
         ),
         None,
     )
+    completed_variants = tuple(
+        variant
+        for variant in wave_order
+        if len(selected := [record for record in records if record.get("variant_id") == variant.variant_id]) == suite.representative_case_count
+        and all(record.get("status") == "success" for record in selected)
+    )
+    current_variant_id = None if current_wave is None else str(current_wave["variant_id"])
+    waves = [
+        {
+            "wave_position": position,
+            "variant_id": variant.variant_id,
+            "cores_per_case": variant.cores_per_case,
+            "state": ("complete" if variant in completed_variants else "current" if variant.variant_id == current_variant_id else "never_started"),
+        }
+        for position, variant in enumerate(wave_order, start=1)
+    ]
+    current_submissions = [
+        item for item in manifest["submission_history"] if item.get("role") == "measure" and item.get("variant_id") == current_variant_id
+    ]
+    status_now = now or datetime.now(timezone.utc)
+    current_wave_elapsed = None
+    if current_submissions:
+        submitted = min(_timestamp(str(item["submitted_at"]), label="benchmark submitted_at") for item in current_submissions)
+        current_wave_elapsed = str(timedelta(seconds=max(0, int((status_now - submitted).total_seconds()))))
+    progress_timestamps = [
+        str(runtime["updated_at"])
+        for unit in work_units
+        if unit.get("variant_id") == current_variant_id
+        and isinstance((runtime := unit.get("runtime_progress")), dict)
+        and runtime.get("availability") == "available"
+        and isinstance(runtime.get("updated_at"), str)
+    ]
+    submission_timestamps = [str(item["submitted_at"]) for item in current_submissions]
+    last_progress_timestamp = max((*progress_timestamps, *submission_timestamps), default=None)
+    partial_evaluation = _completed_wave_evaluation(suite, manifest, records, scheduler)
+
     return {
         "schema_kind": "generation_run_status",
         "schema_version": 1,
         "run_kind": "benchmark",
+        "suite_name": suite.suite_name,
         "benchmark_run_id": run_id,
         "state": state,
-        "successful_work_units": success_count,
-        "active_work_units": len(set(active_work_units)),
-        "pending_work_units": pending_count,
-        "license_blocked_work_units": len(blocked_waits),
-        "failed_work_units": failure_count,
+        "successful_work_units": category_counts["successful"],
+        "running_work_units": category_counts["running"],
+        "scheduler_pending_work_units": category_counts["scheduler_pending"],
+        "license_blocked_work_units": category_counts["license_blocked"],
+        "never_started_work_units": category_counts["never_started"],
+        "failed_work_units": category_counts["failed"],
         "total_work_units": len(records),
+        "work_units": work_units,
         "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
         "work_unit_failures": [*exhausted, *terminal_without_result],
         "license_waits": license_waits,
@@ -4376,6 +4621,13 @@ def core_benchmark_status(
         ),
         "scheduler": scheduler,
         "current_wave": current_wave,
+        "wave_count": len(wave_order),
+        "completed_wave_count": len(completed_variants),
+        "waves": waves,
+        "current_wave_elapsed": current_wave_elapsed,
+        "last_progress_timestamp": last_progress_timestamp,
+        "eta": "unavailable",
+        "partial_evaluation": partial_evaluation,
         "canary": {
             "variant_id": canary.variant_id,
             "cores_per_case": canary.cores_per_case,
@@ -5458,7 +5710,7 @@ def core_benchmark_source_status(
         source,
         ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
     )
-    active = bool(status["active_work_units"])
+    active = bool(status["running_work_units"] or status["scheduler_pending_work_units"])
     return {
         "schema_kind": "generation_run_source_status",
         "schema_version": 1,
