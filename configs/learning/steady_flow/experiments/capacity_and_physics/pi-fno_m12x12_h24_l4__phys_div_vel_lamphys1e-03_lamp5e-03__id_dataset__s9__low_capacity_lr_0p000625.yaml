@@ -4,10 +4,10 @@ run:
   seed: 9
   deterministic: true
   device: auto
-  suffix: low_capacity_lr_0p01
+  suffix: low_capacity_lr_0p000625
 
 data:
-  train_dataset: lhs_var80_seed3001
+  train_dataset: steady_flow__lentil+chickpea+kidney_bean__id
   ood_datasets:
     - lhs_var120_seed4001
   batch_size: 32
@@ -31,7 +31,7 @@ loss:
     weight: 1.0
   physics:
     enabled: true
-    continuity: div_eps_velocity
+    continuity: div_velocity
     derivatives:
       kind: physical
       extension: none
@@ -53,7 +53,7 @@ evaluation:
 
 optimizer:
   kind: adamw
-  lr: 1.0e-2
+  lr: 6.25e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

@@ -26,9 +26,13 @@ sampling:
       lentil: 160
       chickpea: 160
       kidney_bean: 160
-      field_pea: 60
+      field_pea: 40
       rapeseed: 40
-      sunflower_seed: 20
+      sunflower_seed: 40
+    parameter_ood:
+      lentil: 0
+      chickpea: 0
+      kidney_bean: 0
 membership:
   seed: 9250
   per_seen_material:
@@ -36,11 +40,15 @@ membership:
     validation: 16
     id_test: 16
 dataset_packages:
-- evaluation_regime: id
+- dataset_view: transient_drying
+  evaluation_regime: id
   source_role: seen
-- evaluation_regime: near_family_ood
+- dataset_view: transient_drying
+  evaluation_regime: near_family_ood
   source_role: near_family_ood
-- evaluation_regime: far_family_ood
+- dataset_view: transient_drying
+  evaluation_regime: far_family_ood
   source_role: far_family_ood
-- evaluation_regime: extreme_family_ood
+- dataset_view: transient_drying
+  evaluation_regime: extreme_family_ood
   source_role: extreme_family_ood

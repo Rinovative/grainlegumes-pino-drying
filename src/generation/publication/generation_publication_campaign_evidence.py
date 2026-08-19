@@ -17,15 +17,16 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_paths as path_contract
-from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
@@ -71,6 +72,7 @@ POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
     {
         "all_workflow.json",
         "cpu_source_cleanup.json",
+        "dataset_package_extensions",
         "dataset_packages_complete.json",
         "dataset_packages_complete.lock",
         "transfer_complete.json",
@@ -292,7 +294,7 @@ def _validate_submission_record(
             "error",
         }
         or record.get("submission_index") != index
-        or record.get("mode") not in {"initial", "resume", "license_retry", "explicit_retry"}
+        or record.get("mode") not in {"initial", "resume", "license_retry"}
         or not isinstance(record.get("recorded_at"), str)
         or not isinstance(record.get("case"), dict)
         or set(record["case"]) != {"batch_name", "batch_id", "case_index", "case_id"}
@@ -390,44 +392,58 @@ def load_campaign_run(
     return manifest
 
 
-def campaign_from_manifest(
+def current_campaign_from_manifest(
     manifest: Mapping[str, Any],
 ) -> config_service.CampaignConfig:
-    """Resolve the exact canonical, smoke, or pilot campaign execution view."""
+    """Resolve the current package requests over one unchanged simulation plan."""
     config_path = resolve_campaign_config_path(manifest["campaign_config"])
-    if manifest["campaign_name"] == (f"{profiles.TRANSIENT_DRYING_PROFILE}_{config_service.PILOT_CAMPAIGN_PURPOSE}"):
-        batch_records = manifest.get("batches")
-        counts = (
-            {record.get("case_count") for record in batch_records}
-            if isinstance(batch_records, list) and all(isinstance(record, dict) for record in batch_records)
-            else set()
-        )
-        if len(counts) != 1:
-            message = "Pilot campaign manifest has no uniform cases-per-material identity."
-            raise RuntimeError(message)
-        cases_per_material = next(iter(counts))
-        if isinstance(cases_per_material, bool) or not isinstance(
-            cases_per_material,
-            int,
-        ):
-            message = "Pilot campaign manifest cases-per-material identity is malformed."
-            raise RuntimeError(message)
-        campaign = config_service.load_campaign_config(
-            config_path,
-            pilot_cases_per_material=cases_per_material,
-        )
-    else:
-        campaign = config_service.load_campaign_config(config_path)
-        campaign = campaign.select_batches(tuple(manifest["selected_batch_names"]))
+    campaign = config_service.load_campaign_config(config_path)
+    campaign = campaign.select_batches(tuple(manifest["selected_batch_names"]))
     if (
         campaign.campaign_id != manifest["campaign_id"]
         or campaign.campaign_digest != manifest["campaign_digest"]
         or common.serialization.canonical_json_sha256(campaign.execution_values) != manifest["execution_config_digest"]
         or [batch.batch_name for batch in campaign.batches] != manifest["selected_batch_names"]
     ):
-        message = "Campaign configuration or execution-view identity changed after launch."
+        message = "Campaign simulation configuration or execution-view identity changed after launch."
         raise RuntimeError(message)
     return campaign
+
+
+def campaign_from_manifest(
+    manifest: Mapping[str, Any],
+) -> config_service.CampaignConfig:
+    """Resolve the launch-time package snapshot for ordinary run continuation."""
+    campaign = current_campaign_from_manifest(manifest)
+    snapshot = manifest.get("dataset_packages")
+    if not isinstance(snapshot, list) or not all(isinstance(package, dict) for package in snapshot):
+        message = "Campaign-run Dataset package snapshot is malformed."
+        raise TypeError(message)
+    current_by_name = {str(package["dataset_name"]): package for package in campaign.dataset_packages}
+    snapshot_names = [str(package.get("dataset_name")) for package in snapshot]
+    if len(snapshot_names) != len(set(snapshot_names)) or any(
+        current_by_name.get(name) != package for name, package in zip(snapshot_names, snapshot, strict=True)
+    ):
+        message = "Campaign launch-time Dataset package declarations were removed or changed."
+        raise RuntimeError(message)
+    packages = tuple(copy.deepcopy(snapshot))
+    return replace(
+        campaign,
+        evaluation_regimes=tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in packages)),
+        dataset_packages=packages,
+        package_request_digest=common.serialization.canonical_json_sha256(list(packages)),
+    )
+
+
+def current_campaign_for_run(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> config_service.CampaignConfig:
+    """Return current additive package requests for a persisted simulation run."""
+    return current_campaign_from_manifest(
+        load_campaign_run(run_id, storage_root=storage_root),
+    )
 
 
 def campaign_for_run(
@@ -469,10 +485,8 @@ def _relative_path_is_ignored(
     relative_path: str,
     ignored_relative_paths: frozenset[str],
 ) -> bool:
-    """Return whether one file is an ignored operational path."""
-    if relative_path in ignored_relative_paths:
-        return True
-    return RUNTIME_PROGRESS_DIRECTORY_NAME in ignored_relative_paths and relative_path.startswith(f"{RUNTIME_PROGRESS_DIRECTORY_NAME}/")
+    """Return whether one file is below an ignored operational path."""
+    return any(relative_path == ignored or relative_path.startswith(f"{ignored}/") for ignored in ignored_relative_paths)
 
 
 def transfer_inventory_from_plan(

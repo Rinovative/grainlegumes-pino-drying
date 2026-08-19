@@ -128,14 +128,19 @@ class FieldSpec:
 @dataclass(frozen=True, slots=True)
 class DatasetDefaults:
     """
-    Describe fallback dataset identifiers for configs that omit selection.
+    Describe non-executable task-level Dataset catalog references.
 
     Attributes
     ----------
     train : str
-        Fallback training dataset identifier.
+        Conventional training Dataset catalog reference.
     ood : tuple[str, ...]
-        Ordered fallback out-of-distribution dataset identifiers.
+        Ordered out-of-distribution Dataset catalog references.
+
+    Notes
+    -----
+    These references remain task metadata only. Executable experiments must
+    explicitly author exact training and evaluation Dataset IDs.
 
     Raises
     ------
@@ -456,7 +461,8 @@ class TaskSpec:
     normalization_axes : tuple[int, ...]
         Axes used to fit per-channel normalization.
     default_datasets : DatasetDefaults
-        Fallback train and OOD datasets used when a config omits selection.
+        Non-executable Dataset catalog references retained in the task contract.
+        Experiment resolution never uses them as implicit selection.
     preprocessing : PreprocessingSpec
         Task-owned preprocessing assumptions.
     data_losses : tuple[str, ...]

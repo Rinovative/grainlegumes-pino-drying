@@ -252,10 +252,10 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     retry_eligible = {"value": False}
     retry_active = {"value": False}
     completed = {"value": False}
-    retry_attempt = {
+    wait_record = {
         "classification": "temporary_license_capacity",
         "retry_budget_remaining": True,
-        "timestamp": "2026-01-01T00:00:00+00:00",
+        "first_blocked_at": "2026-01-01T00:00:00+00:00",
     }
 
     def fake_submit(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -279,12 +279,12 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
             accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids if job_id not in active},
         )
 
-    def latest_attempt(
+    def latest_wait(
         *_args: Any,
         job_id: str,
         **_kwargs: Any,
     ) -> dict[str, Any] | None:
-        return retry_attempt if job_id == "4101" else None
+        return wait_record if job_id == "4101" else None
 
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     monkeypatch.setattr(generation.campaign, "_scheduler_evidence", scheduler_evidence)
@@ -301,12 +301,12 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     )
     monkeypatch.setattr(
         generation.campaign.license_service,
-        "latest_attempt_for_job",
-        latest_attempt,
+        "latest_wait_for_job",
+        latest_wait,
     )
     monkeypatch.setattr(
         generation.campaign.license_service,
-        "retry_attempt_is_eligible",
+        "wait_record_is_eligible",
         lambda _attempt: retry_eligible["value"],
     )
     monkeypatch.setattr(
@@ -458,12 +458,12 @@ def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     assert len(submissions) == 1
 
 
-def test_current_failure_still_requires_explicit_retry(
+def test_current_failure_is_not_automatically_retried(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Never retry a failed scientific case without the explicit rerun path."""
+    """Never retry a failed scientific case during same-config continuation."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=1,
@@ -515,16 +515,6 @@ def test_current_failure_still_requires_explicit_retry(
     )
     assert unchanged["state"] == "completed_with_failures"
     assert submitted == []
-
-    retried = generation.campaign.retry_campaign_case(
-        run_id,
-        task.batch_name,
-        task.case_id,
-        storage_root=storage,
-    )
-    assert retried["slurm_job_ids"] == ["654"]
-    assert len(submitted) == 1
-    assert retried["submissions"][0]["mode"] == "explicit_retry"
 
 
 @pytest.mark.parametrize(

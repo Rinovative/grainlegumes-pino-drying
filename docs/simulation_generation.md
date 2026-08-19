@@ -1,607 +1,382 @@
 # Generation Workflow
 
-This is the operator guide for configuring, launching, monitoring, resuming,
-collecting, and cleaning up Generation campaigns. Scientific definitions,
-equations, parameter interpretation, and numerical-validation rationale live in
-the [scientific parameter reference](generation_parameter_reference.md).
+This guide describes the maintained Generation operator workflow. Scientific
+parameter definitions, equations, and evidence classifications live in the
+[scientific parameter reference](generation_parameter_reference.md).
 
-## Quick start
+## Operator model
 
-Run public workflow commands from the bare <code>hpc115</code> repository
-checkout.
+Run every maintained workflow from the bare `hpc115` checkout with one command:
 
-> Generation pins committed HEAD. Uncommitted development changes are ignored.
-> Commit a change before launch when Generation must use it.
+```bash
+./scripts/generation_workflow.sh run CONFIG [options]
+```
 
-The pinned source is used by the wrapper, local Docker commands, and remote CPU
-work. The configured <code>STORAGE_ROOT</code> remains the writable evidence
-root.
+The command resolves `schema_kind`, creates one immutable common run plan, and
+continues the matching deterministic run if evidence already exists. Foreground
+execution is the default. Generation pins the selected committed source; local
+uncommitted changes are ignored by the pinned execution copy.
 
-Set the common paths:
+The maintained entry configurations are:
 
-~~~bash
+| Workflow | Configuration | Planned work units |
+| --- | --- | ---: |
+| Paired Technical Smoke | `configs/generation/workflows/technical_smoke.yaml` | two ordinary two-case child campaigns |
+| Transient core benchmark | `configs/generation/benchmarks/transient_core_scaling/suite.yaml` | 8 successful measurements |
+| All-material pilot | `configs/generation/campaigns/transient_drying/material_pilot.yaml` | 18 cases |
+| Transient production | `configs/generation/campaigns/transient_drying/family_generalization.yaml` | 600 cases |
+| Airflow ID Dataset | `configs/generation/campaigns/steady_flow/id_dataset.yaml` | 1,050 cases |
+
+All authored Generation schemas and durable records use schema version `1`.
+
+Set the common paths once:
+
+```bash
 export STORAGE_ROOT="$(realpath ../storage)"
-STEADY_CAMPAIGN=configs/generation/campaigns/steady_flow/family_generalization.yaml
-TRANSIENT_CAMPAIGN=configs/generation/campaigns/transient_drying/family_generalization.yaml
-PILOT_CAMPAIGN=configs/generation/campaigns/transient_drying/pilot_check.yaml
-~~~
+SMOKE_CONFIG=configs/generation/workflows/technical_smoke.yaml
+BENCHMARK_CONFIG=configs/generation/benchmarks/transient_core_scaling/suite.yaml
+PILOT_CONFIG=configs/generation/campaigns/transient_drying/material_pilot.yaml
+TRANSIENT_CONFIG=configs/generation/campaigns/transient_drying/family_generalization.yaml
+AIRFLOW_ID_CONFIG=configs/generation/campaigns/steady_flow/id_dataset.yaml
+```
 
-1. Edit the authoritative YAML under <code>configs/generation</code>, review the
-   change, and commit it.
+Preview setup, inspect a plan, or perform the non-solving runtime preflight:
 
-2. Preview and perform setup for the exact committed source:
-
-~~~bash
+```bash
 ./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01
 ./scripts/generation_workflow.sh setup-cpu --cpu-host sricehpc01 --execute
-~~~
+./scripts/generation_workflow.sh run "$AIRFLOW_ID_CONFIG" --dry-run
+./scripts/generation_workflow.sh run "$AIRFLOW_ID_CONFIG"   --preflight-only --cpu-host sricehpc01
+```
 
-3. Validate configuration and run the non-solving preflight:
+Run any maintained workflow in the foreground:
 
-~~~bash
-./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config   "$STEADY_CAMPAIGN" --allow-incomplete
-./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config   "$TRANSIENT_CAMPAIGN" --allow-incomplete
-./scripts/generation_workflow.sh preflight "$STEADY_CAMPAIGN"
-./scripts/generation_workflow.sh preflight "$TRANSIENT_CAMPAIGN"
-~~~
+```bash
+./scripts/generation_workflow.sh run "$SMOKE_CONFIG" --cpu-host sricehpc01
+./scripts/generation_workflow.sh run "$BENCHMARK_CONFIG" --cpu-host sricehpc01
+./scripts/generation_workflow.sh run "$PILOT_CONFIG" --cpu-host sricehpc01
+./scripts/generation_workflow.sh run "$TRANSIENT_CONFIG" --cpu-host sricehpc01
+./scripts/generation_workflow.sh run "$AIRFLOW_ID_CONFIG" --cpu-host sricehpc01
+```
 
-Preflight submits one environment-only Slurm allocation. It starts no COMSOL
-solve.
+Technical Smoke is optional and is not a prerequisite for another run. The core
+benchmark is standalone and does not read Smoke evidence.
 
-4. Run the paired Technical Smoke and inspect its receipt:
+## Common plan and lifecycle
 
-~~~bash
-./scripts/generation_workflow.sh smoke --cpu-host sricehpc01
-~~~
+A validated campaign, benchmark suite, or ordered workflow resolves to one
+`GenerationRunPlan`. It contains the source commit, authored-config identity,
+scientific input identity, ordered child plans, work units, retention and
+collection policies, Dataset declarations, and scientific finalizers. Campaign
+cases and benchmark measurements share the same operational work-unit lifecycle.
+Configuration-specific code only resolves units and finalizers.
 
-The two profile workflows print <code>PROFILE COMPLETE</code>, not
-<code>DONE</code>. Exactly one top-level <code>DONE</code> is printed only after
-both profile publications, packages, fixed-value comparison, paired comparison,
-and the paired receipt validate.
+The common controller performs these stages in order when declared:
 
-5. Benchmark transient core counts independently of Technical Smoke:
+1. Resolve exact source, config, identity, and existing durable state.
+2. Validate local and CPU/runtime prerequisites.
+3. Materialize missing canonical inputs.
+4. Submit eligible work units and monitor the shared state model.
+5. Wait and retry genuine temporary license-capacity blocks.
+6. Validate and publish successful CPU results.
+7. Finalize CPU-owned evidence.
+8. Stop at `awaiting_collection` when collection is deferred.
+9. Otherwise transfer, validate, and atomically publish on the host.
+10. Build declared packages, run declared scientific finalizers, validate the
+   complete result, and apply guarded CPU retention.
 
-~~~bash
-./scripts/generation_workflow.sh benchmark-cores --cpu-host sricehpc01
-~~~
+The same config handles every continuation:
 
-The benchmark has its own exact-source/runtime preflight. Production-core
-repetition 1 is its measured canary and remains part of the final result; no
-extra COMSOL solve is added. Review the recommendation, record the selected
-<code>cluster.cores_per_case</code> in
-<code>configs/generation/execution/cluster_cpu.yaml</code>, and commit it. The
-benchmark does not edit Production configuration.
-
-6. Run the transient pilot:
-
-~~~bash
-./scripts/generation_workflow.sh pilot-check "$PILOT_CAMPAIGN"
-~~~
-
-Use <code>--cases-per-material 1</code> for the supported small diagnostic or
-<code>--keep-cpu-source</code> when retained CPU source is needed for diagnosis.
-
-7. Review readiness, then launch Production:
-
-~~~bash
-./scripts/docker_python.sh -m src.generation.cli.cli_generation readiness-report   "$STEADY_CAMPAIGN" "$TRANSIENT_CAMPAIGN" --run-static-sentinels
-./scripts/generation_workflow.sh all "$STEADY_CAMPAIGN"
-./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"
-~~~
-
-The <code>all</code> workflow enforces configuration, current Technical-Smoke,
-runtime, publication, Dataset, and cleanup gates for the selected profile.
-
-## Where do I change what?
-
-User decisions belong in configuration. Resolved values and identities belong
-in generated evidence.
-
-| Decision | Authoritative owner |
+| Existing state | `run CONFIG` behavior |
 | --- | --- |
-| Grid, time axis, fixed science, validation tolerances, storage contract | <code>configs/generation/common.yaml</code> |
-| Parameter meanings, units, transforms, sampling blocks, OOD eligibility | <code>configs/generation/registry.yaml</code> |
-| Material values, natural supports, OOD supports, source references | <code>configs/generation/materials/*.yaml</code> |
-| Boundary schedules and physical constraints | <code>configs/generation/operations/fixed_bed.yaml</code> |
-| Profile exports, mappings, and COMSOL template locator | <code>configs/generation/profiles/*.yaml</code> |
-| Expected template-byte digest | Adjacent <code>.sha256</code> sidecar |
-| Campaign purpose, roles, counts, membership, seeds, Dataset requests | <code>configs/generation/campaigns/&lt;profile&gt;/*.yaml</code> |
-| Resources, feeder, retries, timeout, retention, CPU site | <code>configs/generation/execution/cluster_cpu.yaml</code> |
-| Core-benchmark variants and repetitions | <code>configs/generation/benchmarks/transient_core_scaling/*.yaml</code> |
-| Scientific interpretation | [Scientific parameter reference](generation_parameter_reference.md) |
+| No matching evidence | Create the deterministic run and submit eligible work |
+| Active work | Attach to durable state and monitor without duplicate submission |
+| Pending or `license_blocked` | Continue the common retry/feeder policy |
+| CPU complete with deferred collection | Without `--defer-collection`, collect and continue |
+| Host publication complete | Build only missing declared packages/finalizers |
+| Smoke children complete | Reuse compatible children and perform the paired finalizer |
+| Benchmark input absent | Materialize it on the CPU login node before canary submission |
+| Complete | Revalidate and report `REUSED`/`COMPLETE` without new work or transfer |
+| Permanent scientific/configuration failure | Stop, report the blocker, and retain evidence |
 
-Use <code>validate-config --allow-incomplete</code>,
-<code>readiness-report</code>, and <code>plan</code> to inspect current resolved
-values. Do not copy derived inventories into this guide.
+## Collection and controller ownership
 
-### Updating a COMSOL template
+The collection modes are identical for every run kind:
 
-The selected profile YAML owns the repository-relative <code>template:</code>
-value. Its expected SHA-256 is the adjacent <code>.sha256</code> file. The
-transient template must read only <code>t</code>, <code>T_in_bc</code>, and
-<code>omega_in_bc</code> from the schedule table, derive inlet relative humidity
-after primitive interpolation, and continue exporting the solved
-<code>mt.phi</code> field.
+| Mode | Host transfer and finalizers | CPU source |
+| --- | --- | --- |
+| Default | Run automatically | Removed only after validated cleanup authorization |
+| `--keep-cpu-source` | Run automatically | Retained as an additional copy |
+| `--defer-collection` | Do not run | Retained as the exclusive copy |
 
-1. Save the intended <code>.mph</code> file and update the profile locator if it
-   was renamed.
-2. Regenerate the sidecar deliberately:
+`--keep-cpu-source` and `--defer-collection` are mutually exclusive. Complete a
+deferred run by invoking the same config without `--defer-collection`:
 
-~~~bash
-TEMPLATE="<value copied from the selected profile YAML>"
-SIDECAR="$(dirname "$TEMPLATE")/$(basename "$TEMPLATE" .mph).sha256"
-sha256sum -- "$TEMPLATE" | cut -d ' ' -f 1 > "$SIDECAR"
-~~~
+```bash
+./scripts/generation_workflow.sh run "$TRANSIENT_CONFIG"   --defer-collection --cpu-host sricehpc01
+./scripts/generation_workflow.sh run "$TRANSIENT_CONFIG"   --cpu-host sricehpc01
+```
 
-3. Run <code>validate-config --allow-incomplete</code>, the relevant static
-   checks, and Technical Smoke.
-4. Commit the profile, template, and sidecar together.
+Use `--background` when the host controller must survive terminal or SSH
+disconnection:
 
-Validation and execution never accept or rewrite a new digest automatically.
+```bash
+./scripts/generation_workflow.sh run "$AIRFLOW_ID_CONFIG"   --background --cpu-host sricehpc01
+```
 
-## Identity and execution safety
+The clean host checkout creates one commit-pinned `tmux` child with durable
+metadata and logs. Equivalent active controllers are reused. The printed
+workflow-session ID supports:
 
-Generation distinguishes case inputs, simulation batches, campaign science,
-campaign runs, Dataset packages, and operational provenance. Scientific identity
-is separate from storage paths, directory names, display labels, and
-configuration filenames.
-
-Planning, launch, feeding, and resume remain bound to the pinned commit.
-Completed readers verify persisted contracts and artifact bytes. Node-local
-scratch is temporary; do not manually delete CPU source or transfer evidence;
-use the gated cleanup command.
-
-## Foreground launch and background controllers
-
-<code>launch CAMPAIGN</code> is the submit-and-return primitive. It does not keep
-the remaining host workflow alive. Add <code>--background</code> to a complete
-controller command when host-side monitoring, collection, package construction,
-and finalization must continue inside a detached <code>tmux</code> session:
-
-~~~bash
-./scripts/generation_workflow.sh all "$TRANSIENT_CAMPAIGN"   --background --cpu-host sricehpc01
-./scripts/generation_workflow.sh benchmark-cores   --background --cpu-host sricehpc01
-~~~
-
-The stable host checkout must be clean and committed before background launch;
-this keeps the bootstrap script itself bound to the commit recorded for the
-session. Background execution is supported for <code>all</code>, <code>resume</code>,
-<code>smoke</code>, <code>benchmark-cores</code>, <code>pilot-check</code>,
-<code>collect</code>, <code>build-datasets</code>,
-<code>finalize-smoke</code>, and <code>collect-benchmark</code>. The child receives
-the exact source commit and exact argv with <code>--background</code> removed.
-Equivalent active controllers are reused safely instead of duplicated, and a
-background child cannot recursively create another session.
-
-A successful start prints the workflow session ID, tmux session, commit, host,
-PID when available, durable log, and exact commands. Save the printed ID:
-
-~~~bash
-WORKFLOW_SESSION_ID="$(./scripts/generation_workflow.sh benchmark-cores   --background --cpu-host sricehpc01 |   sed -n 's/^workflow_session_id=//p' | head -n 1)"
-~~~
-
-Inspect or attach later:
-
-~~~bash
+```bash
 ./scripts/generation_workflow.sh background-status "$WORKFLOW_SESSION_ID"
 ./scripts/generation_workflow.sh background-list
 TMUX_SESSION="$(./scripts/generation_workflow.sh   background-status "$WORKFLOW_SESSION_ID" | sed -n 's/^tmux_session=//p')"
 tmux attach-session -t "$TMUX_SESSION"
-LOG_PATH="$(./scripts/generation_workflow.sh   background-status "$WORKFLOW_SESSION_ID" | sed -n 's/^log=//p')"
-tail -n 100 -F "$LOG_PATH"
-~~~
+```
 
-Inside tmux, press <kbd>Ctrl+B</kbd>, release both keys, then press
-<kbd>D</kbd> to detach without stopping the workflow. Closing SSH or the parent
-terminal does not send campaign cancellation to the tmux child. Session metadata,
-logs, run IDs, final stage, and child exit code remain inspectable after tmux
-exits. A session does not survive a host reboot; inspect durable campaign evidence
-and run <code>resume RUN_ID --background</code> after reboot.
+Inside `tmux`, press Ctrl+B and then D to detach. A host reboot ends the
+controller but not durable run evidence; invoke the same config again.
 
-The old <code>--detach</code> flag is rejected with migration guidance. Use
-<code>launch CAMPAIGN</code> for submit-and-return or
-<code>all CAMPAIGN --background</code> for a complete detached controller.
+## Airflow ID Dataset campaign
 
-## Generate and inspect canonical inputs
+`configs/generation/campaigns/steady_flow/id_dataset.yaml` is the only primary
+Airflow training campaign. It has purpose `steady_flow_id_dataset` and contains
+one independent 350-row maximin Latin-hypercube design per material. Designs are
+not formed by merging smaller LHS runs.
 
-<code>generate-input-cases</code> publishes or exactly reuses canonical inputs
-without calling COMSOL or Slurm. A bounded exact-batch request is:
+| Material | Total | Train | Validation | ID test |
+| --- | ---: | ---: | ---: | ---: |
+| Lentil | 350 | 280 | 35 | 35 |
+| Chickpea | 350 | 280 | 35 | 35 |
+| Kidney Bean | 350 | 280 | 35 | 35 |
+| **Total** | **1,050** | **840** | **105** | **105** |
 
-~~~bash
-./scripts/docker_python.sh -m src.generation.cli.cli_generation generate-input-cases   "$TRANSIENT_CAMPAIGN"   --only-batch transient_drying__lentil__natural   --case-start 1 --case-count 10   --git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"
-~~~
+Every material therefore has the same case count and an exact 80/10/10 split.
+The campaign contains only seen materials and publishes one `steady_flow` ID
+package. Field Pea, Rapeseed, Sunflower Seed, and parameter-OOD cases are not
+eligible for Airflow training, validation, or ID-test model selection.
 
-Change only the selection arguments for common alternatives:
+The primary Airflow Dataset uses only this campaign. It does not compose samples
+from the transient production campaign or wait for another campaign source.
 
-| Selection | Arguments |
-| --- | --- |
-| Technical Runtime Smoke | <code>configs/generation/campaigns/transient_drying/technical_smoke.yaml --all-batches --all-cases</code> |
-| Every natural family batch | <code>"$TRANSIENT_CAMPAIGN" --all-batches --only-regime natural --all-cases</code> |
-| Validate without publication | Add <code>--dry-run</code> |
+## Transient production campaign
 
-[<code>generation_input_eda.ipynb</code>](../notebooks/generation_input_eda.ipynb)
-is read-only. It admits persisted canonical input manifests and never plans,
-generates, locks, publishes, or inspects completed solver output.
-
-Generate cases first, then rerun the notebook. Completed solver output belongs
-to completed-output EDA. Current ramp-disabled transient inputs persist the exact
-hourly primitive schedule from time zero; the notebook may evaluate denser
-display-only curves but never writes extra support. A deliberately ramp-enabled
-campaign adds its documented primitive rejoin row without changing regular
-output times. Four-column schedules containing <code>phi_in_bc</code> are stale
-and fail admission; regenerate those input cases under the current contract.
-Scientific startup and schedule semantics are owned by the
-[scientific parameter reference](generation_parameter_reference.md#inlet-schedule).
-
-## Operational stages
-
-Each attempt records five separate stages: solver, exports, conversion,
-diagnostics, and publication. Solver success does not imply that later stages
-succeeded. Structural validity, identities, required files, array shapes, finite
-required values, ordering, hashes, path containment, and atomic publication are
-blocking and fail closed. Finite scientific plausibility observations are
-advisory: they remain visible as complete quality-flag records but do not turn
-an otherwise valid processed publication into a failure.
-
-A configured target event may end a transient solve before the next regular
-output time. The accepted event state is a valid irregular final state when the
-time axis remains strictly increasing and the final status is consistent with
-the stop condition. This does not change the current ramp-disabled scientific
-configuration.
-
-### Technical Smoke
-
-<code>smoke</code> runs maintained steady and transient technical cases with real
-COMSOL. Before either profile is planned or launched, it prepares or reuses the
-exact commit-bound canonical inputs and requires their complete admission. It
-proves the configured technical path through retained exports, canonical HDF5,
-immutable packages, loader access, and the paired cross-profile comparison; it
-does not establish experimental or scientific validity.
-
-The transient sampled-scalar contract deliberately excludes
-<code>T_flow_ref</code> and the other steady conditioning constants. Their
-authoritative owner is <code>scientific_fixed_values</code>, persisted with
-<code>package_fixed</code> ownership in HDF5 provenance. Smoke reads those fixed
-values from that owner and reads only transient sampled values from
-<code>scalar/values</code>. A missing or inconsistent fixed value reports the run,
-profile, batch, case, artifact, and field instead of a bare key name.
-
-The normal successful sequence is:
-
-~~~text
-PROFILE COMPLETE:
-profile=steady_flow
-...
-PROFILE COMPLETE:
-profile=transient_drying
-...
-DONE: paired Technical Smoke and all workflow receipts validated
-~~~
-
-If both deferred profile runs have later been collected and packaged, rerun only
-the idempotent final comparison and receipt publication with:
-
-~~~bash
-./scripts/generation_workflow.sh finalize-smoke   "$STEADY_SMOKE_RUN_ID" "$TRANSIENT_SMOKE_RUN_ID"   --cpu-host sricehpc01
-~~~
-
-### Core benchmark
-
-<code>benchmark-cores</code> is a standalone performance workflow. Its identity
-contains the suite bytes, exact source commit, selected canonical case identity,
-COMSOL runtime identity, repetition count, and resource variants. It contains no
-Smoke receipt or digest, Dataset package, host publication, background session,
-or storage path. Its preflight verifies clean exact source, suite/config/runtime
-identity, executable/version, launch argv, scratch capability, and persistent
-storage capability without reading <code>real_smoke</code>.
-
-Production-core repetition 1 is submitted alone as the measured canary. Only a
-validated scientific success opens submission of the remaining serial
-measurements; temporary license capacity leaves it <code>license_blocked</code>,
-and scientific failure blocks later measurements. The canary is not repeated or
-excluded from the final summary. Retry one failed variant independently with
-<code>benchmark-cores --variant &lt;variant-id&gt;</code>.
-
-### Pilot
-
-<code>pilot-check</code> exercises natural-support cases across configured
-materials and retains a diagnostic receipt. Accepted work follows the configured
-gated cleanup policy; incomplete or invalid evidence is not cleanup-eligible.
-
-### First transient Production campaign
-
-The first paper campaign is a new 600-case design. It does not claim prefix
-identity with the earlier 120-case designs.
+`configs/generation/campaigns/transient_drying/family_generalization.yaml`
+contains the following independent physical cases:
 
 | Material and role | Cases | Train | Validation | ID test |
 | --- | ---: | ---: | ---: | ---: |
-| Lentil, Seen ID | 160 | 128 | 16 | 16 |
-| Chickpea, Seen ID | 160 | 128 | 16 | 16 |
-| Kidney Bean, Seen ID | 160 | 128 | 16 | 16 |
-| Field Pea, Near OOD | 60 | - | - | - |
-| Rapeseed, Far OOD | 40 | - | - | - |
-| Sunflower Seed, engineering stress | 20 | - | - | - |
+| Lentil, seen ID | 160 | 128 | 16 | 16 |
+| Chickpea, seen ID | 160 | 128 | 16 | 16 |
+| Kidney Bean, seen ID | 160 | 128 | 16 | 16 |
+| Field Pea, near-family OOD | 40 | - | - | - |
+| Rapeseed, far-family OOD | 40 | - | - | - |
+| Sunflower Seed, engineering stress | 40 | - | - | - |
 | Parameter OOD | 0 | - | - | - |
 | **Total** | **600** | **384** | **48** | **48** |
 
-Parameter-OOD configuration and the <code>param</code> Slurm regime code remain
-available for later campaigns; they are not part of this campaign.
+Parameter-OOD infrastructure remains available for future configs. Sunflower is
+an engineering stress set, not a literature-secure far-OOD set.
 
-### Production, attempt budget, and feeder breaker
+Every transient `case.h5` continues to expose both `steady_flow` and
+`transient_drying` learning views. Its stationary view contains the authoritative
+coordinates, permeability tensor, porosity, inlet pressure, pressure, and
+velocity fields. One transient physical case supplies one stationary view; time
+states are not counted as independent Airflow samples.
 
-Production uses one ordinary non-exclusive Slurm job per case. The total
-controlled attempt budget is 3600 seconds: ordinary compute ends at 3300 seconds,
-leaving a 300-second graceful-stop reserve inside that same hour. Slurm requests
-<code>01:05:00</code> only to allow worker publication and cleanup around the
-one-hour attempt. The COMSOL stop owner writes exactly <code>Stop 2\n</code>
-once to the status file, requests <code>Cancel</code>, and force-escalates only
-when the solver does not leave within the reserve.
+The transient campaign currently declares only `transient_drying` packages. Its
+stationary views are currently selected only for paired Airflow evaluation,
+support analysis, comparison against COMSOL, and later coupled
+Airflow-to-Drying evaluation. They do not enter the explicitly selected primary
+Airflow training, validation, or ID-test Dataset, so every transient physical
+case remains out of sample for the current Airflow operator.
 
-<code>maximum_failed_cases</code> is the sole feeder circuit breaker. A value
-<code>N</code> permits up to <code>N</code> distinct unresolved
-<code>failed</code> or <code>timed_out</code> cases and stops feeding new,
-never-started work at <code>N + 1</code>. Already active or pending jobs remain
-active and monitored. Export, conversion, publication, cancellation,
-interruption, license retry, warning, and quality-flag states do not count. The
-maintained value is <code>0</code>.
+A Dataset package is a neutral scientific artifact. Source simulation profile
+and requested learning view do not impose a universal training prohibition. A
+future transient-derived `steady_flow` package remains valid and may be used only
+when an experiment names its exact Dataset ID. Package existence, a train split,
+or a cross-profile source/view combination never selects a package
+automatically. Adding a package declaration to an already completed compatible
+campaign reuses the validated canonical `case.h5` publications and builds only
+the missing package; it creates no additional simulation work units.
 
-Temporary COMSOL capacity exhaustion is persisted as
-<code>license_blocked</code>, not scientific <code>failed</code>. It neither
-increments the scientific failure count nor consumes
-<code>maximum_failed_cases</code>. With
-<code>maximum_wait_seconds: null</code>, the controller uses bounded exponential
-backoff indefinitely until capacity becomes available or the operator cancels.
-The oldest eligible blocked case is retried before fresh work, with at most one
-active license probe per campaign; no compute allocation sleeps during backoff.
-Blocked age, receipts, job IDs, and retry history survive resume. Terminal
-license/configuration errors remain real failures. Current OST submissions use
-neither Slurm <code>--licenses</code> nor COMSOL <code>-usebatchlic</code>.
+## Material pilot and Technical Smoke
 
-There are no automatic reserve cases and no automatic rerun of scientific solver
-failures. A foreground controller is tied to its terminal; use
-<code>--background</code> when the complete host controller must survive terminal
-or SSH disconnection. Already submitted Slurm jobs continue independently.
+The all-material pilot contains Lentil, Chickpea, Kidney Bean, Field Pea,
+Rapeseed, and Sunflower Seed. It creates three cases per material: one nominal
+reference and two natural-pilot cases, for 18 cases total. The count is owned by
+YAML, and the declared material diagnostic runs in the common finalization
+stage.
 
-## Monitor campaigns
+The Technical Smoke workflow runs ordinary steady and transient child campaigns
+and then the paired finalizer. Completed children may be reused across source
+commits only when their scientific config, mapping contract, templates, runtime,
+and validated artifacts are compatible. If only a completed `case.h5` is invalid,
+Full-Retention source exports may reconstruct it in isolated scratch without
+running COMSOL. Recovery succeeds only when every retained input is hash-bound,
+the reconstructed bytes restore the immutable published HDF5 identity, and the
+whole campaign passes deep validation; a version-1 recovery receipt records the
+operation. Missing, changed, or insufficient evidence fails closed with a precise
+error. The paired finalizer reads source-export `logical_role`; it never reads a
+`role` fallback. Fixed `T_flow_ref`, `p_ref`, and `p_out` values remain owned by
+scientific fixed-value provenance.
 
-Inspect the full persisted case summary from <code>hpc115</code>:
+Exactly one top-level completion is printed after both children and the paired
+receipt validate. If children are already complete and only paired evidence is
+missing, invoking the workflow config performs no new COMSOL solves.
 
-~~~bash
-GENERATION_RUN_ID="<campaign_run_id>"
+## Core benchmark
+
+The benchmark is one fast production-oriented core-selection phase. It uses the
+same two deterministic scientific cases for every variant: one nominal/reference
+case and one nontrivial natural-support case. The variants are 4, 8, 16, and 32
+cores per case. Each wave runs its two cases concurrently, waits for both valid
+successful measurements, and only then enables the next wave. The configured
+production-core variant runs first; with the current 16-core setting the order is
+16, 4, 8, 32. The first two-case wave is both the canary and part of the final
+measurements, so there is no extra canary solve. The complete benchmark requires
+exactly eight successful COMSOL measurements. It has no separate serial phase,
+packed-node phase, or three-repetition design.
+
+Canonical inputs are materialized and admitted on the CPU login node through the
+normal input-preparation owner. The common controller owns submission,
+monitoring, automatic temporary-license retry, resume, collection, compact
+retention, and aggregation. Re-running the suite reuses both inputs and every
+valid successful work unit, then submits only missing or invalid units; no public
+variant-selection or manual retry workflow is required.
+
+For every work unit the report separates scheduler queue, license wait, license
+probe, canonical-input preparation, successful COMSOL process, export conversion,
+publication, and total controller elapsed time. The primary comparison is only
+`comsol_process_seconds`, beginning after allocation and successful license
+checkout when the successful COMSOL process starts, and ending when that process
+exits. Queue time, compute-slot waiting, license backoff, failed license probes,
+earlier attempts, host collection, Dataset publication, controller polling,
+conversion, and publication do not enter the primary runtime. License-only
+attempts produce no successful runtime, core-hour, throughput, or ranking
+observation.
+
+The summary reports the fastest individual solve, the lowest median core-hours
+per case, and the production recommendation separately. Compute-only estimated
+node throughput is
+`floor(cores_per_node / cores_per_case) * 3600 / median_comsol_process_seconds`.
+The recommendation maximizes that estimate among variants that pass available
+node-memory and scratch constraints. If no authoritative limit exists, the
+estimate requires operator review. Variants within five percent of the best
+throughput prefer lower median core-hours and then fewer cores. Scheduler and
+license waits are reported separately and never alter the compute ranking.
+Requested solver overlap and observed peak concurrency qualify the license
+evidence; lack of overlap does not imply poor CPU scaling.
+
+This replaces the former separate serial and packed-node benchmark concept. It
+estimates production packing from measured per-case solver time and does not
+fully measure an all-case packed node for every variant. The controller prints
+proposed `cores_per_case` and cases-per-node values for manual review and never
+edits production configuration. A real production recommendation exists only
+after this suite runs successfully on the CPU cluster.
+
+## License capacity and waiting
+
+A generic message containing only “could not obtain license” is not enough to
+trigger a retry. Temporary capacity requires the exact feature-bearing checkout
+message plus strong evidence such as `Licensed number of users already reached`,
+`License error -4`, or `FlexNet Licensing error: -4`. Missing features, invalid
+license configuration, server problems, expired features, and unknown license
+errors remain contextual hard failures.
+
+A valid terminal result wins over an earlier warning: COMSOL exit 0, complete
+validated exports and HDF5, and successful publication remain successful.
+A genuine pre-solve capacity event becomes `license_blocked`, does not count as a
+scientific failure, and does not consume `maximum_failed_cases`.
+
+The controller waits outside compute allocations with bounded exponential
+backoff. `maximum_wait_seconds: null` means it waits until capacity becomes
+available or the operator cancels. Oldest blocked work runs first, at most one
+license probe is active per top-level run, and fresh work cannot repeatedly
+leapfrog an eligible block. Campaigns and benchmarks use the same policy.
+Current OST Slurm exposes no verified license resources, so submissions use
+neither `sbatch --licenses` nor COMSOL `-usebatchlic`.
+
+Each blocked work unit owns one mutable `license_wait.json` with schema version
+1. It records work-unit and scientific identities, feature, error code, exact
+matched signatures, COMSOL exit code, solver-progress and export flags, first
+and latest blocked timestamps, retry count, latest and bounded recent job IDs,
+next retry time, cumulative wait, and a bounded raw excerpt. A new license-only
+event creates no scientific attempt directory and copies no canonical input.
+
+## Attempt retention
+
+Retention is based on failure stage, not campaign label:
+
+| Outcome | Retained evidence |
+| --- | --- |
+| License block before solver progress | One compact `license_wait.json`; no input CSV, model, exports, HDF5, or workspace copy |
+| Solver failure after progress | Bounded stdout/stderr, solver log, status, timing, command, resource and identity evidence |
+| Conversion failure with complete exports | Exact exports needed for conversion replay plus small runtime evidence |
+| Publication failure after valid HDF5 | `case.h5`, status, timing, and small provenance needed for replay |
+| Successful compact case | Canonical `case.h5`, bounded logs/status/timing/provenance, and `_SUCCESS`; no CSV or `solved.mph` |
+| Successful full Smoke/Pilot case | Validated successful diagnostics required by the full-retention policy |
+
+Smoke and Pilot do not implicitly give failed attempts full-workspace retention.
+Guarded reconciliation can compact an existing license-only attempt only after
+strong classification, proof that solver progress and unique exports are absent,
+and independent admission of its canonical input. It retains an immutable
+compaction audit and reports reclaimed bytes.
+
+## Storage, identity, and Dataset integrity
+
+`STORAGE_ROOT` is the sole storage-root override:
+
+```text
+STORAGE_ROOT/
+├── 01_generation/
+│   ├── raw/          # canonical generated inputs
+│   ├── processed/    # canonical successful case.h5 publications
+│   ├── attempts/     # bounded failed-attempt/replay evidence
+│   └── meta/         # run, transfer, benchmark, Smoke, and session evidence
+├── 02_datasets/
+│   ├── packages/     # immutable derived learning payloads/indexes
+│   ├── meta/         # package manifests and receipts
+│   └── .state/       # publication coordination
+└── 03_experiments/
+```
+
+Canonical HDF5 stays below `01_generation/processed`; Dataset packages never
+copy `case.h5`. Package publication verifies path containment, SHA-256,
+simulation profile, learning view, case identity, channel contract, units,
+shape, grid, and finite values before atomic publication. Loader smoke runs
+before CPU cleanup authorization.
+
+Scientific identity is separate from filenames, storage paths, display labels,
+and background-session identity. Exact resolved config, source commit, seeds,
+input and simulation identities, hashes, runtime evidence, and receipts bind each
+stage. Routine validation checks manifests, membership, sizes, and digest chains;
+deep validation rehashes and scientifically reopens retained payloads.
+
+## Status, cancellation, and cleanup
+
+The public administrative commands are:
+
+```bash
+./scripts/generation_workflow.sh status "$AIRFLOW_ID_CONFIG"
 ./scripts/generation_workflow.sh status "$GENERATION_RUN_ID"
-~~~
-
-The summary may report the active case, Slurm job, node, phase, simulated time,
-adaptive step, <code>Tfail</code>, and <code>NLfail</code>. These are observational
-progress indicators, not a convergence, completion, retry, or cleanup verdict.
-
-Useful durable locations are:
-
-- scheduler stdout/stderr: the campaign manifest's
-  <code>scheduler_log_directory</code>;
-- successful combined solver log:
-  <code>01_generation/processed/&lt;batch_storage_name&gt;/&lt;case_id&gt;/solver.log</code>;
-- immutable unsuccessful attempt evidence:
-  <code>01_generation/attempts/&lt;batch_storage_name&gt;/&lt;case_id&gt;/&lt;campaign_run_id&gt;/attempt_0001/</code>;
-- authoritative attempt identity, stage states, retention inventory, hashes,
-  metrics, and quality flags: that directory's <code>attempt.json</code>;
-- successful postprocessing replay and recovery-payload cleanup audit:
-  <code>replay.json</code>.
-
-Later attempts use <code>attempt_0002</code>, <code>attempt_0003</code>, and so
-on. Earlier attempts are immutable, and attempt directories never contain
-<code>_SUCCESS</code>.
-
-Use <code>campaign-status --format json</code> for the complete machine-readable
-case inventory.
-
-## Evidence, readiness, and retention
-
-<code>readiness-report</code> is the launch-state authority. Production is ready
-only when resolved campaigns, static checks, and current profile-specific
-Technical-Smoke evidence pass. All campaign-lifecycle receipts introduced by
-this workflow use schema version <code>1</code> and are admitted against their
-exact schema and identities.
-
-Technical Smoke and Pilot retain full unsuccessful-attempt bundles. Production
-retains compact logs, timings, provenance, metrics, and hashes while deliberately
-omitting unrelated large model and export files. Conversion failures retain the
-required exports temporarily; publication failures also retain the converted
-payload and publication evidence. A successful replay verifies processed
-publication, removes only the declared large temporary recovery payload, and
-keeps the small attempt and replay audit.
-
-Collection transfers the exact campaign-scoped attempt directories and their
-hashes along with raw, processed, batch metadata, and campaign metadata. It does
-not copy another campaign's attempt tree. The ordinary authorized CPU cleanup
-removes only its enumerated raw, processed, and batch-metadata source directories;
-canonical attempt directories remain protected.
-
-The post-publication I/O audit found that shared admission defaulted to full
-artifact hashing and HDF5 validation even when campaign finalization and status
-were re-admitting immutable prior cases. Validation depth is now explicit:
-<code>full</code> hashes and scientifically admits newly published content,
-<code>routine</code> checks exact membership, sizes, manifests, and digest chains
-without rereading the large <code>case.h5</code>, and <code>deep</code> rehashes and
-scientifically reopens every retained artifact. Normal campaign reconciliation
-uses routine validation; Technical Smoke deliberately performs one deep audit.
-Destination transfer verification still hashes destination bytes, and cleanup
-still requires the cryptographically verified destination. SHA-256 integrity was
-not replaced by timestamps.
-
-Timing evidence separates COMSOL, conversion, publication, post-publication
-validation, benchmark preflight/canary, and accumulated license wait. It also
-records source-export, solved-model scratch, HDF5, persistent, retained,
-recovery, scratch-peak, hashed, and copied bytes. Compact success requires both
-<code>direct_exports_retained_bytes</code> and
-<code>solved_model_retained_bytes</code> to be zero.
-
-Submission and attempt histories are append-only across resume. Every case and
-benchmark attempt names and hashes its immediate predecessor, keeps prior Slurm
-job IDs and bounded logs, and rejects gaps, conflicts, or rewritten history. A
-later success does not erase earlier license-blocked or failed receipts. Slurm
-names are readable and deterministic, for example
-<code>td-lentil-id-c0004-a01-8f31</code>,
-<code>td-fieldpea-near-c0004-a01-8f31</code>, and
-<code>td-bench-c16-r02-8f31</code>; the Slurm job ID remains authoritative.
-
-<code>01_generation</code> is the canonical simulation archive. The sole
-completed scientific case payload is <code>case.h5</code>; Dataset construction,
-trajectory indexing, one-step and rollout loading, static and state loading,
-EDA, training, and evaluation read HDF5 or immutable Dataset packages, never
-retained COMSOL CSV. Production <code>compact</code> cases contain
-<code>case.h5</code>, bounded logs, status, timing, provenance, and
-<code>_SUCCESS</code>, with no <code>comsol_exports/</code>,
-<code>solved.mph</code>, or CSV archive. Technical Smoke, Pilot, and explicit raw
-export audits use <code>full</code> retention. Complete exports may be held only
-under the retry/replay owner when conversion or publication recovery requires
-them.
-
-Immutable Dataset packages live only below
-<code>02_datasets/packages/&lt;dataset_id&gt;/</code>; metadata remains below
-<code>02_datasets/meta/</code>. A populated legacy
-<code>02_datasets/raw</code> is never read or migrated automatically. When the
-current package root is absent or empty, move it explicitly after inspection:
-
-~~~bash
-mv -- "$STORAGE_ROOT/02_datasets/raw" \
-       "$STORAGE_ROOT/02_datasets/packages"
-~~~
-
-If both roots contain data, the repository fails closed instead of merging or
-choosing one. The lifecycle-directory rename does not enter Dataset IDs, split
-fingerprints, package fingerprints, or scientific identities.
-
-Attempts are excluded from processed membership, batch success, Dataset
-identity, training readiness, and completed-output EDA. Processed status and
-attempt evidence retain stable batch, case, input-generation, case-input,
-simulation, campaign, source commit, and attempt keys for later outcome EDA;
-this workflow does not perform outcome-driven parameter analysis or automatic
-retuning.
-
-## Resume, retry, cancel, collect, and cleanup
-
-Resume reuses successful processed publications, submits permitted
-never-started work, and restarts cancelled or interrupted cases from time zero.
-It replays conversion or publication without COMSOL when the exact retained
-payload is valid. It does not silently rerun <code>failed</code>,
-<code>timed_out</code>, or <code>exports_failed</code> solver work. If no automatic
-action remains, it prints the explicit <code>retry-case</code> recovery guidance.
-
-~~~bash
-./scripts/generation_workflow.sh status "$GENERATION_RUN_ID"
-./scripts/generation_workflow.sh resume "$GENERATION_RUN_ID"
-./scripts/generation_workflow.sh retry-case \
-  "$GENERATION_RUN_ID" "<batch_name>" "<case_id>"
-~~~
-
-<code>retry-case</code> accepts only one eligible unresolved case, requires the
-original solver commit, template, science, canonical input generation, and case
-identities, and allocates a new immutable attempt. There is no
-<code>retry-all</code>. A terminal <code>completed_with_failures</code> campaign
-blocks terminal validation, collection, and Dataset publication until every case
-has a valid processed publication.
-
-The first Ctrl+C after campaign launch prints exactly:
-
-~~~text
-Graceful campaign cancellation requested.
-Press Ctrl+C again to force cancellation.
-~~~
-
-It persists <code>cancel_requested</code>, cancels pending jobs, signals running
-workers through the controlled-stop path, keeps rendering status, and waits for
-their durable terminal evidence. A second Ctrl+C invokes force cancellation and
-stops waiting. Before a run ID exists, no cancellation trap or receipt exists.
-The public commands use those same Python-owned paths:
-
-~~~bash
 ./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID"
 ./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID" --force
-~~~
-
-Collection modes are deliberately distinct:
-
-| Mode | Host transfer | Build packages | CPU source |
-| --- | --- | --- | --- |
-| default | yes | yes | removed only after existing cryptographic cleanup gates |
-| <code>--keep-cpu-source</code> | yes | yes | retained as an additional copy |
-| <code>--defer-collection</code> | no | no | retained as the exclusive copy; cleanup is not authorized |
-
-A deferred terminal report prints its campaign run ID, source commit, CPU host,
-remote storage root, completed/blocked/failed counts, retained bytes, and exact
-later commands. Transfer uses destination-local
-<code>$STORAGE_ROOT/.incoming/</code>, verifies the source inventory and SHA-256
-digest chain, and atomically renames verified directories into their final
-locations. It does not make a second full-content publication copy.
-
-Transfer and publish a successful terminal campaign, then build requested
-Datasets:
-
-~~~bash
-./scripts/generation_workflow.sh collect "$GENERATION_RUN_ID"
-./scripts/generation_workflow.sh build-datasets "$GENERATION_RUN_ID"
-~~~
-
-Preview cleanup, review the exact cryptographic authorization, then confirm:
-
-~~~bash
-./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID"
 ./scripts/generation_workflow.sh cleanup "$GENERATION_RUN_ID" --confirm
-~~~
+./scripts/generation_workflow.sh background-status "$WORKFLOW_SESSION_ID"
+./scripts/generation_workflow.sh background-list
+```
 
-Cleanup is destructive only for explicitly authorized CPU directories. Canonical
-GPU Generation, attempts, and Dataset publications remain intact.
+Status reports successful, active, pending, license-blocked, and failed units;
+current stage; CPU source; host publication; package/finalizer state; and the
+same-config continuation action. The first Ctrl+C after campaign launch requests
+graceful cancellation and keeps monitoring durable terminal evidence. A second
+Ctrl+C requests force cancellation. Before a run identity exists, no campaign
+cancellation is armed.
 
-## Command reference
+Cleanup is destructive only for the exact run-owned CPU directories admitted by
+its cryptographic authorization. It does not remove the canonical host
+publication, another run’s shared source, or another user’s files.
 
-All wrapper commands run on bare <code>hpc115</code>.
-
-| Command | Purpose |
-| --- | --- |
-| <code>setup-cpu [--execute]</code> | Preview or perform remote checkout/environment setup |
-| <code>preflight CAMPAIGN</code> | Check login and compute environment without a scientific solve |
-| <code>plan CAMPAIGN</code> | Print resolved Slurm work without launching |
-| <code>smoke [--background] [--defer-collection]</code> | Run the paired Technical-Smoke workflow |
-| <code>finalize-smoke STEADY_RUN TRANSIENT_RUN</code> | Idempotently finalize collected paired Smoke evidence |
-| <code>benchmark-cores [--variant ID] [--background] [--defer-collection]</code> | Run or resume standalone transient core scaling |
-| <code>collect-benchmark BENCHMARK_RUN</code> | Collect a deferred terminal benchmark |
-| <code>pilot-check CAMPAIGN</code> | Run the transient pilot lifecycle |
-| <code>launch CAMPAIGN</code> | Submit a campaign and return |
-| <code>all CAMPAIGN [--background]</code> | Run Production through Dataset receipts and gated cleanup |
-| <code>status [RUN_ID]</code> / <code>accounting RUN_ID</code> | Inspect workflow or scheduler evidence |
-| <code>resume RUN_ID [--background]</code> | Apply the reuse, restart, and postprocessing-replay matrix |
-| <code>retry-case RUN_ID BATCH CASE</code> | Explicitly rerun one eligible unresolved case |
-| <code>validate RUN_ID</code> | Revalidate terminal CPU evidence |
-| <code>collect RUN_ID [--background]</code> | Transfer and publish terminal Generation evidence |
-| <code>build-datasets RUN_ID [--background]</code> | Build/reuse requested immutable packages |
-| <code>background-status SESSION_ID</code> / <code>background-list</code> | Read durable detached-controller state |
-| <code>cancel RUN_ID [--force]</code> | Request graceful or force cancellation through the shared owner |
-| <code>cleanup RUN_ID [--confirm]</code> | Preview or execute authorized CPU-source cleanup |
-
-Run <code>./scripts/generation_workflow.sh --help</code> for complete current
-options. Resource and feeder decisions remain configuration-owned.
-
-## Troubleshooting
-
-- Exit status 2 from configuration, plan, or readiness means a fail-closed gate
-  remains. Follow the reported file and key.
-- If Technical Smoke fails, inspect retained case, export, mapping, and solver
-  evidence. Partial smoke evidence is not Production evidence.
-- Failed collection retains marked staging and CPU source. Use
-  <code>status</code> and <code>resume</code>; never move partial data into
-  <code>01_generation</code> manually.
-- <code>completed_with_failures</code> means no automatic resumable case remains.
-  Inspect the failed-case stage and use <code>retry-case</code> only for one
-  deliberately selected eligible case.
-- A benchmark refusal indicates a failed standalone preflight, canary,
-  repetition, or conflicting benchmark evidence. It never indicates missing
-  Smoke evidence. Use the printed recovery command.
-- Temporary license-capacity events remain <code>license_blocked</code> and retry
-  under the configured bounded-delay policy. A null maximum wait is indefinite;
-  terminal license or configuration failures require correction, not evidence
-  deletion.
-- If a configuration or source change is absent from a run, verify that it was
-  committed before the workflow invocation.
-
-The project entry point is the [README](../README.md).
+Run `./scripts/generation_workflow.sh --help` for the current option syntax.

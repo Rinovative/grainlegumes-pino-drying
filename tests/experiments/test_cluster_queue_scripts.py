@@ -546,41 +546,6 @@ def _assert_submission(
     return log_path
 
 
-def test_dataset_builder_runs_synchronously_without_gpu_queue(
-    tmp_path: Path,
-) -> None:
-    """Run the dataset builder in the bounded CPU-only container path."""
-    harness = _harness(tmp_path)
-
-    result = _run_job(
-        harness,
-        "build-datasets",
-        _CAMPAIGN_CONFIG_RELATIVE,
-    )
-
-    assert result.returncode == 0, result.stderr
-    docker = _capture_arguments(harness.docker_capture)
-    assert docker[:2] == ["run", "--rm"]
-    assert docker[docker.index("--network") + 1] == "none"
-    assert docker[docker.index("--user") + 1] == (f"{os.getuid()}:{os.getgid()}")
-    assert docker[docker.index("--workdir") + 1] == "/workspace/repo"
-    assert "--gpus" not in docker
-    assert f"type=bind,source={harness.repository},target=/workspace/repo,readonly" in docker
-    assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in docker
-    assert docker[-7:] == [
-        "python",
-        "-m",
-        "src.datasets.dataset_packages",
-        "build",
-        f"/workspace/repo/{_CAMPAIGN_CONFIG_RELATIVE}",
-        "--storage-root",
-        "/workspace/storage",
-    ]
-    assert not harness.nvidia_capture.exists()
-    assert not harness.runtsgpu_capture.exists()
-    assert not harness.path_docker_capture.exists()
-
-
 def test_direct_submission_uses_automatic_gpu_and_forwards_arguments(
     tmp_path: Path,
 ) -> None:

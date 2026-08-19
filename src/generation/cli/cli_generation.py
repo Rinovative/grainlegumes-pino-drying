@@ -33,6 +33,7 @@ from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_status as campaign_status_service
 from src.generation import generation_readiness as readiness_service
+from src.generation import generation_run as run_service
 from src.generation import generation_smoke as smoke_service
 from src.generation import generation_workflow as workflow_service
 from src.generation.cases import generation_cases_case as case_service
@@ -84,7 +85,6 @@ def _add_campaign_execution_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="skip the canonical extreme-family batches for this execution only",
     )
-    parser.add_argument("--pilot-cases-per-material", type=int)
     parser.add_argument("--git-commit", required=True)
     _add_storage_arguments(parser)
 
@@ -131,6 +131,14 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     list_background.add_argument("--storage-root", type=Path, required=True)
     list_background.add_argument("--active-tmux-session", action="append", default=[])
 
+    resolve_run = subparsers.add_parser(
+        "resolve-generation-run",
+        help="resolve one campaign, benchmark, or ordered workflow into the common immutable run plan",
+    )
+    resolve_run.add_argument("config", type=Path)
+    resolve_run.add_argument("--git-commit", required=True)
+    resolve_run.add_argument("--allow-incomplete", action="store_true")
+
     validate = subparsers.add_parser("validate-config", help="validate one generation configuration")
     validate.add_argument("config", type=Path)
     _add_batch_selection(validate, required=False)
@@ -174,6 +182,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     readiness.add_argument("--storage-root", type=Path)
     readiness.add_argument("--comsol-version-output")
 
+    compatible_smoke = subparsers.add_parser(
+        "find-compatible-technical-smoke-run",
+        help="find one dependency-compatible completed technical-smoke child",
+    )
+    compatible_smoke.add_argument("config", type=Path)
+    compatible_smoke.add_argument("--storage-root", type=Path, required=True)
+
     smoke_evidence = subparsers.add_parser(
         "technical-smoke-evidence-status",
         help="query successful technical-smoke evidence for one selected profile",
@@ -211,8 +226,15 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="resolve the same-case core-scaling suite without materializing inputs",
     )
     inspect_benchmark.add_argument("suite", type=Path)
-    inspect_benchmark.add_argument("--variant")
     inspect_benchmark.add_argument("--require-executable", action="store_true")
+
+    resolve_benchmark = subparsers.add_parser(
+        "resolve-core-benchmark-run",
+        help="resolve the deterministic benchmark runtime identity without mutation",
+    )
+    resolve_benchmark.add_argument("suite", type=Path)
+    resolve_benchmark.add_argument("--git-commit", required=True)
+    resolve_benchmark.add_argument("--comsol-version-output", required=True)
 
     preflight_benchmark = subparsers.add_parser(
         "preflight-core-benchmark",
@@ -235,11 +257,25 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     plan_benchmark.add_argument("suite", type=Path)
     plan_benchmark.add_argument("--git-commit", required=True)
-    plan_benchmark.add_argument("--variant")
     plan_benchmark.add_argument("--storage-root", type=Path, required=True)
     plan_benchmark.add_argument("--scratch-root", type=Path, required=True)
     plan_benchmark.add_argument("--comsol-version-output", required=True)
     plan_benchmark.add_argument(
+        "--comsol-executable-path",
+        type=Path,
+        required=True,
+    )
+
+    materialize_benchmark = subparsers.add_parser(
+        "materialize-core-benchmark-inputs",
+        help="materialize the canonical benchmark input without submitting work",
+    )
+    materialize_benchmark.add_argument("suite", type=Path)
+    materialize_benchmark.add_argument("--git-commit", required=True)
+    materialize_benchmark.add_argument("--storage-root", type=Path, required=True)
+    materialize_benchmark.add_argument("--scratch-root", type=Path, required=True)
+    materialize_benchmark.add_argument("--comsol-version-output", required=True)
+    materialize_benchmark.add_argument(
         "--comsol-executable-path",
         type=Path,
         required=True,
@@ -251,7 +287,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     submit_benchmark.add_argument("suite", type=Path)
     submit_benchmark.add_argument("--git-commit", required=True)
-    submit_benchmark.add_argument("--variant")
     submit_benchmark.add_argument("--storage-root", type=Path, required=True)
     submit_benchmark.add_argument("--scratch-root", type=Path, required=True)
     submit_benchmark.add_argument("--comsol-version-output", required=True)
@@ -261,27 +296,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         required=True,
     )
 
-    prepare_benchmark = subparsers.add_parser(
-        "prepare-core-benchmark-case",
-        help="materialize and prove the canonical benchmark case on a CPU node",
-    )
-    prepare_benchmark.add_argument("benchmark_run_id")
-    prepare_benchmark.add_argument("--storage-root", type=Path, required=True)
-    prepare_benchmark.add_argument("--work-root", type=Path, required=True)
-
     run_benchmark = subparsers.add_parser(
-        "run-core-benchmark-repetition",
-        help="run one isolated, identity-checked benchmark repetition",
+        "run-core-benchmark-case",
+        help="run one isolated, identity-checked benchmark representative case",
     )
     run_benchmark.add_argument("benchmark_run_id")
     run_benchmark.add_argument("variant_id")
-    run_benchmark.add_argument("repetition", type=int)
+    run_benchmark.add_argument("case_role")
     run_benchmark.add_argument("--storage-root", type=Path, required=True)
     run_benchmark.add_argument("--work-root", type=Path, required=True)
 
     benchmark_status = subparsers.add_parser(
         "core-benchmark-status",
-        help="reconstruct benchmark repetition and scheduler state",
+        help="reconstruct benchmark work-unit and scheduler state",
     )
     benchmark_status.add_argument("benchmark_run_id")
     benchmark_status.add_argument("--no-scheduler", action="store_true")
@@ -290,11 +317,18 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     resume_benchmark = subparsers.add_parser(
         "resume-core-benchmark",
-        help="submit only benchmark repetitions without successful evidence",
+        help="submit only benchmark cases without successful evidence",
     )
     resume_benchmark.add_argument("benchmark_run_id")
-    resume_benchmark.add_argument("--variant")
     resume_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    cancel_benchmark = subparsers.add_parser(
+        "cancel-core-benchmark",
+        help="cancel only Slurm jobs owned by one core benchmark",
+    )
+    cancel_benchmark.add_argument("benchmark_run_id")
+    cancel_benchmark.add_argument("--force", action="store_true")
+    cancel_benchmark.add_argument("--storage-root", type=Path, required=True)
 
     finalize_benchmark = subparsers.add_parser(
         "finalize-core-benchmark",
@@ -323,6 +357,47 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     publish_benchmark.add_argument("--expected-inventory-sha256", required=True)
     publish_benchmark.add_argument("--expected-file-count", type=int, required=True)
     publish_benchmark.add_argument("--expected-size-bytes", type=int, required=True)
+
+    benchmark_cleanup_authorization = subparsers.add_parser(
+        "core-benchmark-cleanup-authorization",
+        help="authorize cleanup from a validated host benchmark publication",
+    )
+    benchmark_cleanup_authorization.add_argument("benchmark_run_id")
+    benchmark_cleanup_authorization.add_argument("--format", choices=("json", "tsv"), default="json")
+    benchmark_cleanup_authorization.add_argument("--storage-root", type=Path, required=True)
+
+    cleanup_benchmark = subparsers.add_parser(
+        "cleanup-core-benchmark-source",
+        help="plan or execute one authorized benchmark CPU-source cleanup",
+    )
+    cleanup_benchmark.add_argument("benchmark_run_id")
+    cleanup_benchmark.add_argument("--source-host", required=True)
+    cleanup_benchmark.add_argument("--destination-storage-root", required=True)
+    cleanup_benchmark.add_argument("--expected-inventory-sha256", required=True)
+    cleanup_benchmark.add_argument("--expected-file-count", type=int, required=True)
+    cleanup_benchmark.add_argument("--expected-size-bytes", type=int, required=True)
+    cleanup_benchmark.add_argument("--authorization-sha256", required=True)
+    cleanup_benchmark.add_argument("--confirm", action="store_true")
+    cleanup_benchmark.add_argument("--storage-root", type=Path, required=True)
+
+    record_benchmark_cleanup = subparsers.add_parser(
+        "record-core-benchmark-cleanup",
+        help="bind a verified remote benchmark cleanup to host evidence",
+    )
+    record_benchmark_cleanup.add_argument("benchmark_run_id")
+    record_benchmark_cleanup.add_argument("--authorization-sha256", required=True)
+    record_benchmark_cleanup.add_argument("--cleanup-receipt-sha256", required=True)
+    record_benchmark_cleanup.add_argument("--reclaimed-bytes", type=int, required=True)
+    record_benchmark_cleanup.add_argument("--storage-root", type=Path, required=True)
+
+    benchmark_source_status = subparsers.add_parser(
+        "core-benchmark-source-status",
+        help="report benchmark CPU source and cleanup state",
+    )
+    benchmark_source_status.add_argument("benchmark_run_id")
+    benchmark_source_status.add_argument("--no-scheduler", action="store_true")
+    benchmark_source_status.add_argument("--format", choices=("json", "tsv"), default="json")
+    benchmark_source_status.add_argument("--storage-root", type=Path, required=True)
 
     validate_benchmark = subparsers.add_parser(
         "validate-core-benchmark",
@@ -512,15 +587,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     resume.add_argument("campaign_run_id")
     _add_storage_arguments(resume)
 
-    retry_case = subparsers.add_parser(
-        "retry-case",
-        help="explicitly rerun one selected unresolved scientific case",
-    )
-    retry_case.add_argument("campaign_run_id")
-    retry_case.add_argument("batch_name")
-    retry_case.add_argument("case_id")
-    _add_storage_arguments(retry_case)
-
     interruption = subparsers.add_parser(
         "record-worker-interruption",
         help="persist best-effort Slurm worker interruption evidence",
@@ -624,12 +690,26 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     validate_pilot.add_argument("--format", choices=("json", "summary"), default="json")
     _add_storage_arguments(validate_pilot)
 
+    compatible_campaign = subparsers.add_parser(
+        "find-compatible-campaign-source",
+        help="find one exact completed campaign for package-only continuation",
+    )
+    compatible_campaign.add_argument("config", type=Path)
+    compatible_campaign.add_argument("--storage-root", type=Path, required=True)
+
     build_datasets = subparsers.add_parser(
         "build-campaign-datasets",
-        help="build or reuse, inspect, and loader-smoke every declared package",
+        help="build the launch packages or only missing additive extensions",
     )
     build_datasets.add_argument("campaign_run_id")
     _add_storage_arguments(build_datasets)
+
+    validate_package_state = subparsers.add_parser(
+        "validate-campaign-package-state",
+        help="validate the immutable base and all current package extensions",
+    )
+    validate_package_state.add_argument("campaign_run_id")
+    _add_storage_arguments(validate_package_state)
 
     prepare_all = subparsers.add_parser(
         "prepare-all-workflow",
@@ -702,11 +782,11 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     workflow_failure = subparsers.add_parser(
         "record-workflow-failure",
-        help="persist one compact resumable all-workflow failure record",
+        help="persist one compact workflow failure record with continuation guidance",
     )
     workflow_failure.add_argument("campaign_run_id")
     workflow_failure.add_argument("--stage", required=True)
-    workflow_failure.add_argument("--resume-command", required=True)
+    workflow_failure.add_argument("--continuation-command", required=True)
     workflow_failure.add_argument("--cpu-bytes-retained", type=int, required=True)
     workflow_failure.add_argument(
         "--format",
@@ -929,7 +1009,7 @@ def _campaign_summary(
             "dataset_package_count": len(campaign.dataset_packages),
             "evaluation_regime": config_service.NO_EVALUATION_REGIME,
         }
-    else:
+    elif campaign.campaign_purpose == "technical_runtime_smoke":
         summary["technical_smoke_plan"] = {
             "material_inventory": material_inventory,
             "case_counts": case_counts["by_material"],
@@ -972,16 +1052,27 @@ def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
     if not require_workflow:
         return result
     workflow: dict[str, dict[str, dict[str, Any]]] = {}
-    for purpose in ("family_generalization", "technical_runtime_smoke"):
-        purpose_records = [record for record in records if record["campaign_purpose"] == purpose]
-        selected: dict[str, dict[str, Any]] = {}
-        for profile_kind in ("stationary", "transient"):
-            matches = [record for record in purpose_records if record["profile_kind"] == profile_kind]
-            if len(matches) != 1:
-                message = f"Host workflow requires exactly one {purpose!r} {profile_kind} campaign; discovered {len(matches)}."
-                raise ValueError(message)
-            selected[profile_kind] = matches[0]
-        workflow[purpose] = selected
+    smoke_records = [record for record in records if record["campaign_purpose"] == "technical_runtime_smoke"]
+    smoke: dict[str, dict[str, Any]] = {}
+    for profile_kind in ("stationary", "transient"):
+        matches = [record for record in smoke_records if record["profile_kind"] == profile_kind]
+        if len(matches) != 1:
+            message = f"Host workflow requires exactly one technical_runtime_smoke {profile_kind} campaign; discovered {len(matches)}."
+            raise ValueError(message)
+        smoke[profile_kind] = matches[0]
+    workflow["technical_runtime_smoke"] = smoke
+    primary_purposes = {
+        "stationary": config_service.STEADY_FLOW_ID_DATASET_PURPOSE,
+        "transient": "family_generalization",
+    }
+    primary: dict[str, dict[str, Any]] = {}
+    for profile_kind, purpose in primary_purposes.items():
+        matches = [record for record in records if record["campaign_purpose"] == purpose and record["profile_kind"] == profile_kind]
+        if len(matches) != 1:
+            message = f"Host workflow requires exactly one primary {profile_kind} campaign with purpose {purpose!r}; discovered {len(matches)}."
+            raise ValueError(message)
+        primary[profile_kind] = matches[0]
+    workflow["primary"] = primary
     selected_sites = {
         common.serialization.canonical_json_sha256(record["execution_site"]): record["execution_site"]
         for purpose_records in workflow.values()
@@ -997,6 +1088,14 @@ def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
 
 def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
+    if args.command == "resolve-generation-run":
+        run_plan = run_service.resolve_generation_run(
+            args.config,
+            source_commit=args.git_commit,
+            require_executable=not args.allow_incomplete,
+        )
+        print(json.dumps(run_plan.to_payload(), sort_keys=True))
+        return 0
     if args.command == "create-background-session":
         arguments = list(args.workflow_arguments)
         if arguments and arguments[0] == "--":
@@ -1070,6 +1169,13 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(report, sort_keys=True))
         return 0 if report["production_ready_for_user_launch"] else 2
+    if args.command == "find-compatible-technical-smoke-run":
+        report = smoke_service.find_compatible_completed_technical_smoke_run(
+            args.config,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
     if args.command == "technical-smoke-evidence-status":
         report = smoke_service.technical_smoke_evidence_status(
             args.config,
@@ -1111,10 +1217,17 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "inspect-core-benchmark":
         inspection = benchmark_service.inspect_core_benchmark(
             args.suite,
-            variant_id=args.variant,
             require_executable=args.require_executable,
         )
         print(json.dumps(inspection, sort_keys=True))
+        return 0
+    if args.command == "resolve-core-benchmark-run":
+        identity = benchmark_service.resolve_core_benchmark_runtime_identity(
+            args.suite,
+            git_commit=args.git_commit,
+            comsol_version_output=args.comsol_version_output,
+        )
+        print(json.dumps(identity, sort_keys=True))
         return 0
     if args.command == "preflight-core-benchmark":
         preflight = benchmark_service.preflight_core_benchmark(
@@ -1128,16 +1241,26 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(preflight, sort_keys=True))
         return 0
     if args.command == "plan-core-benchmark":
-        plan = benchmark_service.plan_core_benchmark(
+        benchmark_plan = benchmark_service.plan_core_benchmark(
             args.suite,
             git_commit=args.git_commit,
             storage_root=args.storage_root,
             scratch_root=args.scratch_root,
             comsol_version_output=args.comsol_version_output,
             comsol_executable_path=args.comsol_executable_path,
-            variant_id=args.variant,
         )
-        print(json.dumps(plan, sort_keys=True))
+        print(json.dumps(benchmark_plan, sort_keys=True))
+        return 0
+    if args.command == "materialize-core-benchmark-inputs":
+        manifest = benchmark_service.prepare_core_benchmark(
+            args.suite,
+            git_commit=args.git_commit,
+            storage_root=args.storage_root,
+            scratch_root=args.scratch_root,
+            comsol_version_output=args.comsol_version_output,
+            comsol_executable_path=args.comsol_executable_path,
+        )
+        print(json.dumps(manifest, sort_keys=True))
         return 0
     if args.command == "submit-core-benchmark":
         manifest = benchmark_service.submit_core_benchmark(
@@ -1147,23 +1270,14 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             scratch_root=args.scratch_root,
             comsol_version_output=args.comsol_version_output,
             comsol_executable_path=args.comsol_executable_path,
-            variant_id=args.variant,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0
-    if args.command == "prepare-core-benchmark-case":
-        path = benchmark_service.prepare_core_benchmark_case(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            work_root=args.work_root,
-        )
-        print(path)
-        return 0
-    if args.command == "run-core-benchmark-repetition":
-        result = benchmark_service.run_core_benchmark_repetition(
+    if args.command == "run-core-benchmark-case":
+        result = benchmark_service.run_core_benchmark_case(
             args.benchmark_run_id,
             args.variant_id,
-            args.repetition,
+            args.case_role,
             storage_root=args.storage_root,
             work_root=args.work_root,
         )
@@ -1184,9 +1298,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         manifest = benchmark_service.resume_core_benchmark(
             args.benchmark_run_id,
             storage_root=args.storage_root,
-            variant_id=args.variant,
         )
         print(json.dumps(manifest, sort_keys=True))
+        return 0
+    if args.command == "cancel-core-benchmark":
+        receipt = benchmark_service.cancel_core_benchmark(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            force=args.force,
+        )
+        print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "finalize-core-benchmark":
         summary = benchmark_service.finalize_core_benchmark(
@@ -1196,23 +1317,23 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(summary, sort_keys=True))
         return 0
     if args.command == "core-benchmark-transfer-plan":
-        plan = benchmark_service.core_benchmark_transfer_plan(
+        transfer_plan = benchmark_service.core_benchmark_transfer_plan(
             args.benchmark_run_id,
             storage_root=args.storage_root,
         )
         if args.format == "json":
-            print(json.dumps(plan, sort_keys=True))
+            print(json.dumps(transfer_plan, sort_keys=True))
         else:
             print(
                 "\t".join(
                     (
                         "benchmark",
-                        str(plan["benchmark_run_id"]),
-                        str(plan["git_commit"]),
-                        str(plan["relative_directory"]),
-                        str(plan["inventory"]["inventory_sha256"]),
-                        str(plan["inventory"]["file_count"]),
-                        str(plan["inventory"]["size_bytes"]),
+                        str(transfer_plan["benchmark_run_id"]),
+                        str(transfer_plan["git_commit"]),
+                        str(transfer_plan["relative_directory"]),
+                        str(transfer_plan["inventory"]["inventory_sha256"]),
+                        str(transfer_plan["inventory"]["file_count"]),
+                        str(transfer_plan["inventory"]["size_bytes"]),
                     )
                 )
             )
@@ -1229,6 +1350,78 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             expected_size_bytes=args.expected_size_bytes,
         )
         print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "core-benchmark-cleanup-authorization":
+        authorization = benchmark_service.core_benchmark_cleanup_authorization(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+        )
+        if args.format == "json":
+            print(json.dumps(authorization, sort_keys=True))
+        else:
+            inventory = authorization["inventory"]
+            print(
+                "\t".join(
+                    (
+                        "benchmark-cleanup-authorization",
+                        authorization["benchmark_run_id"],
+                        authorization["source_host"],
+                        authorization["source_storage_root"],
+                        authorization["destination_storage_root"],
+                        inventory["inventory_sha256"],
+                        str(inventory["file_count"]),
+                        str(inventory["size_bytes"]),
+                        authorization["authorization_sha256"],
+                    )
+                )
+            )
+        return 0
+    if args.command == "cleanup-core-benchmark-source":
+        receipt = benchmark_service.cleanup_core_benchmark_source(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            source_host=args.source_host,
+            destination_storage_root=args.destination_storage_root,
+            expected_inventory_sha256=args.expected_inventory_sha256,
+            expected_file_count=args.expected_file_count,
+            expected_size_bytes=args.expected_size_bytes,
+            authorization_sha256=args.authorization_sha256,
+            confirm=args.confirm,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "record-core-benchmark-cleanup":
+        receipt = benchmark_service.record_core_benchmark_cleanup(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            authorization_sha256=args.authorization_sha256,
+            cleanup_receipt_sha256=args.cleanup_receipt_sha256,
+            reclaimed_bytes=args.reclaimed_bytes,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "core-benchmark-source-status":
+        status = benchmark_service.core_benchmark_source_status(
+            args.benchmark_run_id,
+            storage_root=args.storage_root,
+            query_scheduler=not args.no_scheduler,
+        )
+        if args.format == "json":
+            print(json.dumps(status, sort_keys=True))
+        else:
+            print(
+                "\t".join(
+                    (
+                        "source-status",
+                        status["run_id"],
+                        status["run_state"],
+                        status["source_state"],
+                        str(status["reclaimable_bytes"]),
+                        status["cleanup_eligibility"],
+                        str(status["active_slurm"]),
+                    )
+                )
+            )
         return 0
     if args.command == "validate-core-benchmark":
         result = benchmark_service.validate_core_benchmark(
@@ -1378,15 +1571,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "resume-campaign":
         manifest = campaign_runtime.resume_campaign(
             args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(manifest, sort_keys=True))
-        return 0
-    if args.command == "retry-case":
-        manifest = campaign_runtime.retry_campaign_case(
-            args.campaign_run_id,
-            args.batch_name,
-            args.case_id,
             storage_root=args.storage_root,
         )
         print(json.dumps(manifest, sort_keys=True))
@@ -1578,12 +1762,26 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         else:
             print(pilot_service.terminal_summary(receipt))
         return 0
+    if args.command == "find-compatible-campaign-source":
+        report = workflow_service.find_compatible_completed_campaign_source(
+            args.config,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
     if args.command == "build-campaign-datasets":
         receipt = workflow_service.build_campaign_datasets(
             args.campaign_run_id,
             storage_root=args.storage_root,
         )
         print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "validate-campaign-package-state":
+        state = workflow_service.validate_campaign_package_state(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(state, sort_keys=True))
         return 0
     if args.command == "prepare-all-workflow":
         receipt = workflow_service.prepare_all_workflow_receipt(
@@ -1682,6 +1880,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                         "source-status",
                         str(status["campaign_run_id"]),
                         str(status["campaign_state"]),
+                        str(status["source_state"]),
                         str(status["reclaimable_bytes"]),
                         str(status["cleanup_eligibility"]),
                         str(status["active_slurm"]),
@@ -1703,7 +1902,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             args.campaign_run_id,
             storage_root=args.storage_root,
             stage=args.stage,
-            resume_command=args.resume_command,
+            continuation_command=args.continuation_command,
             cpu_bytes_retained=args.cpu_bytes_retained,
         )
         storage = workspace_service.resolve_storage_root(
@@ -1757,13 +1956,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         if args.skip_extreme_family_ood and args.only_batch is not None:
             message = "--skip-extreme-family-ood cannot be combined with --only-batch."
             raise ValueError(message)
-        if args.pilot_cases_per_material is not None and (args.skip_extreme_family_ood or args.only_batch is not None):
-            message = "--pilot-cases-per-material cannot be combined with --skip-extreme-family-ood or --only-batch."
-            raise ValueError(message)
-        campaign = config_service.load_campaign_config(
-            args.config,
-            pilot_cases_per_material=args.pilot_cases_per_material,
-        )
+        campaign = config_service.load_campaign_config(args.config)
         if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
             if args.skip_extreme_family_ood or args.only_batch is not None:
                 message = "Pilot-check campaigns do not support extreme-family skipping or batch selection."
@@ -1773,12 +1966,12 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 campaign = campaign.without_extreme_family_ood()
             campaign = campaign.select_batches(None if args.only_batch is None else (args.only_batch,))
         if args.command == "plan-campaign":
-            plan = campaign_runtime.plan_campaign(
+            campaign_plan = campaign_runtime.plan_campaign(
                 campaign,
                 git_commit=args.git_commit,
                 storage_root=args.storage_root,
             )
-            print(json.dumps(plan, sort_keys=True))
+            print(json.dumps(campaign_plan, sort_keys=True))
             return 0
         if args.command == "prepare-campaign-inputs":
             readiness = input_service.prepare_campaign_inputs(
@@ -1967,7 +2160,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
     previous_term: Any = None
-    if args.command in {"run-campaign-case", "run-core-benchmark-repetition"}:
+    if args.command in {"run-campaign-case", "run-core-benchmark-case"}:
         previous_term = signal.getsignal(signal.SIGTERM)
         signal.signal(
             signal.SIGTERM,

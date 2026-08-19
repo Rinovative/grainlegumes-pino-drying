@@ -80,9 +80,9 @@ flowchart TD
 
 | Workflow | Entry point | Guidance |
 | --- | --- | --- |
-| Generate COMSOL reference data | `./scripts/generation_workflow.sh` on bare `hpc115` | [Generation operations](docs/simulation_generation.md) |
+| Run or continue any Generation workflow | `./scripts/generation_workflow.sh run CONFIG` on bare `hpc115` | [Generation operations](docs/simulation_generation.md) |
 | Interpret Generation parameters and assumptions | Validated YAML under `configs/generation` | [Scientific parameter reference](docs/generation_parameter_reference.md) |
-| Build immutable Dataset packages | `./scripts/generation_workflow.sh build-datasets RUN_ID` | [Generation operations](docs/simulation_generation.md#command-reference) |
+| Publish declared immutable Dataset packages | Automatic stage of `run CONFIG` | [Generation operations](docs/simulation_generation.md#common-plan-and-lifecycle) |
 | Train, tune, and build artifacts | `src.experiments.cli` commands | Commands below and `configs/learning` |
 
 The stable package facades are `src.generation` and `src.datasets`. Reusable
@@ -113,14 +113,8 @@ Generation workflow commands run from the bare `hpc115` checkout. Start with:
 
 ```bash
 ./scripts/generation_workflow.sh --help
-./scripts/docker_python.sh -m src.generation.cli.cli_generation validate-config \
-  configs/generation/campaigns/transient_drying/family_generalization.yaml \
-  --allow-incomplete
-```
-
-The operations guide gives the safe sequence for CPU setup, preflight,
-Technical Smoke, benchmark, pilot, Production, resume, cancellation, and
-cleanup. Native execution requires an exact committed and clean Git state.
+./scripts/generation_workflow.sh run \
+  configs/generation/campaigns/steady_flow/id_dataset.yaml
 
 Inside the development container, the established learning commands are:
 
@@ -154,9 +148,8 @@ Generation source is retained independently of Dataset packages. Canonical
 completed science lives in <code>case.h5</code>; compact Production publications
 retain neither direct COMSOL CSV exports nor <code>solved.mph</code>. Cleanup of
 CPU source must use the gated Generation workflow; it never removes the
-canonical GPU-side publication. A populated legacy
-<code>02_datasets/raw</code> requires the explicit migration documented in the
-Generation operations guide and is never selected silently.
+canonical GPU-side publication. Immutable Dataset packages use the sole
+<code>02_datasets/packages</code> root.
 
 ## ✅ Maintained Validation
 

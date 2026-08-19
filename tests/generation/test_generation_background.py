@@ -61,7 +61,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
     fixed_now = datetime(2026, 8, 18, 15, 45, 1, tzinfo=timezone.utc)
     monkeypatch.setattr(background_service, "_utc_now", lambda: fixed_now)
     arguments = (
-        "all",
+        "run",
         "configs/generation/campaigns/transient_drying/family_generalization.yaml",
         "--git-commit",
         _COMMIT,
@@ -69,7 +69,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
     )
 
     created = background_service.create_background_session(
-        "all",
+        "run",
         arguments=arguments,
         source_commit=_COMMIT,
         storage_root=storage,
@@ -91,7 +91,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
     assert "--background" not in command_text
 
     reused = background_service.create_background_session(
-        "all",
+        "run",
         arguments=arguments,
         source_commit=_COMMIT,
         storage_root=storage,
@@ -120,7 +120,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
     assert status["final_stage"] == "FAILED: synthetic child result"
 
     relaunched = background_service.create_background_session(
-        "all",
+        "run",
         arguments=arguments,
         source_commit=_COMMIT,
         storage_root=storage,
@@ -172,7 +172,7 @@ def test_background_listing_is_read_only_when_no_session_root_exists(
 
     with pytest.raises(FileNotFoundError, match="Workflow-session root"):
         background_service.inspect_background_session(
-            "gw-20260818T154501Z-all-01234567",
+            "gw-20260818T154501Z-run-01234567",
             storage_root=storage,
             active_tmux_sessions=(),
         )
@@ -194,8 +194,8 @@ def test_background_session_rejects_recursive_or_unsupported_argv(tmp_path: Path
     }
     with pytest.raises(ValueError, match="launch-control"):
         background_service.create_background_session(
-            "all",
-            arguments=("all", "--background"),
+            "run",
+            arguments=("run", "--background"),
             **common,
         )
     with pytest.raises(ValueError, match="not supported"):

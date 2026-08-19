@@ -1,8 +1,8 @@
 #!/bin/bash -l
 set -euo pipefail
 
-if (( $# != 3 && $# != 5 )); then
-  printf 'Usage: %s REPOSITORY BENCHMARK_RUN_ID prepare | REPOSITORY BENCHMARK_RUN_ID measure VARIANT_ID REPETITION\n' "$0" >&2
+if (( $# != 4 )); then
+  printf 'Usage: %s REPOSITORY BENCHMARK_RUN_ID VARIANT_ID CASE_ROLE\n' "$0" >&2
   exit 2
 fi
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -19,9 +19,8 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 fi
 
 RUN_ID="$2"
-MODE="$3"
-VARIANT_ID="${4:-}"
-REPETITION="${5:-}"
+VARIANT_ID="$3"
+CASE_ROLE="$4"
 if [[ ! "${RUN_ID}" =~ ^core_scaling_transient__[0-9a-f]{16}$ ]]; then
   printf 'Benchmark run ID is malformed: %s\n' "${RUN_ID}" >&2
   exit 2
@@ -30,38 +29,19 @@ if [[ "${GENERATION_BENCHMARK_RUN_ID:-}" != "${RUN_ID}" ]]; then
   printf 'GENERATION_BENCHMARK_RUN_ID does not match the requested run.\n' >&2
   exit 2
 fi
-case "${MODE}" in
-  prepare)
-    [[ -z "${VARIANT_ID}" && -z "${REPETITION}" ]] || {
-      printf 'Preparation does not accept a variant or repetition.\n' >&2
-      exit 2
-    }
-    if [[ "${SLURM_CPUS_PER_TASK:-}" != 1 ]]; then
-      printf 'Benchmark preparation requires exactly one allocated CPU.\n' >&2
-      exit 2
-    fi
-    TASK_ID="prepare"
-    ;;
-  measure)
-    [[ "${VARIANT_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || {
-      printf 'Measured benchmark requires one safe variant ID.\n' >&2
-      exit 2
-    }
-    [[ "${REPETITION}" =~ ^[1-9][0-9]*$ ]] || {
-      printf 'Measured benchmark requires one positive repetition argument.\n' >&2
-      exit 2
-    }
-    [[ "${SLURM_CPUS_PER_TASK:-}" =~ ^[1-9][0-9]*$ ]] || {
-      printf 'Measured benchmark requires a positive cpus-per-task allocation.\n' >&2
-      exit 2
-    }
-    TASK_ID="${REPETITION}"
-    ;;
-  *)
-    printf 'Unsupported benchmark worker mode: %s\n' "${MODE}" >&2
-    exit 2
-    ;;
-esac
+if [[ ! "${VARIANT_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  printf 'Measured benchmark requires one safe variant ID.\n' >&2
+  exit 2
+fi
+if [[ ! "${CASE_ROLE}" =~ ^(nominal|natural)$ ]]; then
+  printf 'Measured benchmark case role must be nominal or natural.\n' >&2
+  exit 2
+fi
+if [[ ! "${SLURM_CPUS_PER_TASK:-}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Measured benchmark requires a positive cpus-per-task allocation.\n' >&2
+  exit 2
+fi
+TASK_ID="${CASE_ROLE}"
 
 REPOSITORY_ROOT="$1"
 PREREQUISITE_HELPER="${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
@@ -190,22 +170,13 @@ trap on_exit EXIT
   --storage-root "${STORAGE_ROOT}" >/dev/null
 MARKER_READY=true
 
-if [[ "${MODE}" == prepare ]]; then
-  COMMAND=(
-    "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation
-    prepare-core-benchmark-case "${RUN_ID}"
-    --storage-root "${STORAGE_ROOT}"
-    --work-root "${WORK_ROOT}"
-  )
-else
-  COMMAND=(
-    "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation
-    run-core-benchmark-repetition "${RUN_ID}" "${VARIANT_ID}"
-    "${REPETITION}"
-    --storage-root "${STORAGE_ROOT}"
-    --work-root "${WORK_ROOT}"
-  )
-fi
+COMMAND=(
+  "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation
+  run-core-benchmark-case "${RUN_ID}" "${VARIANT_ID}"
+  "${CASE_ROLE}"
+  --storage-root "${STORAGE_ROOT}"
+  --work-root "${WORK_ROOT}"
+)
 
 "${COMMAND[@]}" &
 CHILD_PID="$!"

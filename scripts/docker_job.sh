@@ -14,7 +14,6 @@ Usage:
   $0 train <experiment_config> [training options...] [--queue-gpu auto|INDEX] [--follow]
   $0 optuna <optuna_config> [Optuna options...] [--queue-gpu auto|INDEX] [--follow]
   $0 artifacts (--task TASK | --runs-root PATH) [artifact options...] [--queue-gpu auto|INDEX]
-  $0 build-datasets <generation_campaign_config>
 
 Workflows:
   train <experiment_config>
@@ -25,9 +24,6 @@ Workflows:
       Submit one Optuna study and return immediately. Persistent continuation uses study storage.
   artifacts (--task TASK | --runs-root PATH)
       Generate or validate analysis artifacts for completed runs and return immediately.
-  build-datasets <generation_campaign_config>
-      Build or exactly reuse every declared dataset package in the maintained container.
-      This synchronous CPU-only path does not use a GPU or the GPU task queue.
 
 GPU selection:
   omit --queue-gpu  in an interactive TTY, show usage, and prompt for one host GPU.
@@ -371,7 +367,7 @@ while (( $# > 0 )); do
       --queue-gpu=*)
         fail 2 "Use the documented form: --queue-gpu auto|INDEX."
         ;;
-      train|optuna|artifacts|build-datasets)
+      train|optuna|artifacts)
         JOB_TYPE="${argument}"
         shift
         ;;
@@ -460,24 +456,7 @@ case "${JOB_TYPE}" in
     fi
     resolve_artifact_selection "${SEMANTIC_ARGS[@]}"
     ;;
-  build-datasets)
-    if [[ "${FOLLOW_LOG}" == true || "${QUEUE_GPU_SEEN}" == true ]]; then
-      fail 2 "build-datasets is synchronous and does not accept --follow or --queue-gpu."
-    fi
-    if (( ${#SEMANTIC_ARGS[@]} != 1 )); then
-      fail 2 "build-datasets requires exactly one generation campaign config path."
-    fi
-    HOST_CONFIG_PATH="$(resolve_host_config_argument "${SEMANTIC_ARGS[0]}")"
-    SEMANTIC_ARGS[0]="$(translate_config_argument "${HOST_CONFIG_PATH}")"
-    CANONICAL_CONFIG_PATH="${SEMANTIC_ARGS[0]}"
-    ;;
 esac
-
-if [[ "${JOB_TYPE}" == build-datasets ]]; then
-  exec env STORAGE_ROOT="${STORAGE_DIR}" "${DOCKER_PYTHON}" \
-    -m src.datasets.dataset_packages build \
-    "${SEMANTIC_ARGS[0]}" --storage-root /workspace/storage
-fi
 
 if [[ "${FOLLOW_LOG}" == true ]] && ! command -v tail >/dev/null 2>&1; then
   fail 1 "tail is required for --follow but was not found on PATH."

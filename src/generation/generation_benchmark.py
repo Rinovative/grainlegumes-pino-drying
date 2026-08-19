@@ -3,13 +3,13 @@ generation_benchmark.py
 
 Own the isolated transient COMSOL core-scaling benchmark lifecycle.
 Responsibilities:
-  - Resolve one shared scientific case and exactly four resource-only variants
+  - Resolve two shared scientific cases and exactly four resource-only variants
   - Plan, submit, resume, execute, summarize, and transfer benchmark evidence
-  - Keep measured repetitions outside canonical scientific case publication
+  - Keep benchmark measurements outside canonical scientific case publication
 Design principles:
-  - One CPU-materialized proof binds every repeated solve to identical inputs
-  - Scientific identity and resource/repetition execution identity stay separate
-  - Successful repetition evidence is immutable and failed attempts are append-only
+  - CPU-materialized proofs bind every core wave to the same two exact inputs
+  - Scientific identity and resource work-unit identity stay separate
+  - Successful work-unit evidence is immutable and failed attempts are append-only
 This module does NOT:
   - Define scientific parameters, publish training cases, or modify production resources
   - Run on the bare control-plane host or treat isolated throughput as contention proof
@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
 import re
+import resource as resource_usage
 import shlex
 import shutil
 import socket
@@ -43,6 +45,7 @@ import yaml
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
+from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_storage as storage_service
@@ -61,9 +64,15 @@ BENCHMARK_PROOF_SCHEMA_KIND: Final = "generation_core_scaling_case_proof"
 BENCHMARK_RESULT_SCHEMA_KIND: Final = "generation_core_scaling_result"
 BENCHMARK_SUMMARY_SCHEMA_KIND: Final = "generation_core_scaling_summary"
 BENCHMARK_PREFLIGHT_SCHEMA_KIND: Final = "generation_core_scaling_preflight"
+BENCHMARK_CLEANUP_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_cleanup"
+BENCHMARK_CANCELLATION_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_cancellations"
 BENCHMARK_SCHEMA_VERSION: Final = 1
 BENCHMARK_FAMILY: Final = "core_scaling"
+BENCHMARK_TRANSFER_FILENAME: Final = "transfer_complete.json"
+BENCHMARK_LOCAL_CLEANUP_FILENAME: Final = "cpu_source_cleanup.json"
+_MAX_RECENT_JOB_IDS: Final = 16
 _BENCHMARK_VARIANT_COUNT: Final = 4
+_BENCHMARK_REPRESENTATIVE_CASE_ROLES: Final = ("nominal", "natural")
 _MAX_COMSOL_VERSION_EVIDENCE_BYTES: Final = 16 * 1024
 _MAX_SLURM_JOB_NAME_LENGTH: Final = 48
 _MAX_DIRTY_PATH_PREVIEW: Final = 5
@@ -83,34 +92,41 @@ _ACTIVE_SCHEDULER_STATES: Final = frozenset(
     }
 )
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
-_SUCCESS_TIMING_FIELDS: Final = frozenset(
+_WORK_UNIT_TIMING_FIELDS: Final = frozenset(
     {
-        "case_materialization",
-        "comsol_process",
-        "export_conversion",
-        "hdf5_admission",
-        "complete_case",
+        "scheduler_queue_seconds",
         "license_wait_seconds",
+        "license_probe_seconds",
+        "canonical_input_preparation_seconds",
+        "comsol_process_seconds",
+        "export_conversion_seconds",
+        "publication_seconds",
+        "total_controller_elapsed_seconds",
     }
 )
+_MAX_BENCHMARK_LOG_EXCERPT_BYTES: Final = 8 * 1024
 _SUMMARY_METRIC_FIELDS: Final = (
     "suite_name",
     "suite_digest",
-    "case",
-    "repetitions_per_variant",
+    "benchmark_mode",
+    "representative_cases",
+    "cases_per_variant",
+    "required_successful_measurements",
+    "cores_per_node",
     "variants",
-    "fastest_single_case",
-    "fastest_single_case_cores_per_case",
-    "best_parallel_efficiency",
-    "best_parallel_efficiency_cores_per_case",
-    "recommended_production_cores_per_case",
+    "fastest_single_case_cores",
+    "lowest_core_hours_cores",
+    "recommended_cores_per_case",
+    "recommended_estimated_cases_per_node",
     "recommended_production",
     "recommendation_basis",
+    "timing_contract",
+    "resource_limits",
+    "license_qualification",
     "production_interpretation",
-    "queue_wait_interpretation",
     "production_configuration_modified",
     "dataset_membership",
-    "benchmark_canary_seconds",
+    "canary_wave",
 )
 _RESERVED_SCHEDULER_OPTIONS: Final = (
     "--array",
@@ -136,6 +152,14 @@ _RESERVED_SCHEDULER_OPTIONS: Final = (
 
 
 @dataclass(frozen=True, slots=True)
+class CoreBenchmarkRepresentativeCase:
+    """One deterministic scientific case reused across every core-count wave."""
+
+    case_role: str
+    case_index: int
+
+
+@dataclass(frozen=True, slots=True)
 class CoreBenchmarkVariant:
     """One resource-only core-count variant declared by a small YAML file."""
 
@@ -146,7 +170,7 @@ class CoreBenchmarkVariant:
 
 @dataclass(frozen=True, slots=True)
 class CoreBenchmarkSuite:
-    """One resolved benchmark suite sharing a single scientific case."""
+    """One resolved benchmark suite sharing two deterministic scientific cases."""
 
     source_path: Path
     suite_name: str
@@ -154,8 +178,8 @@ class CoreBenchmarkSuite:
     case_campaign_path: Path
     case_campaign: config_service.CampaignConfig
     case_config: config_service.GenerationConfig
-    case_index: int
-    repetitions: int
+    representative_cases: tuple[CoreBenchmarkRepresentativeCase, ...]
+    maximum_work_unit_attempts: int
     variants: tuple[CoreBenchmarkVariant, ...]
     cores_per_node: int
     partition: str | None
@@ -165,6 +189,8 @@ class CoreBenchmarkSuite:
     production_cores_config_path: Path
     production_cores_key: str
     production_cores_per_case: int
+    node_memory_limit_bytes: int | None = None
+    node_scratch_limit_bytes: int | None = None
 
     def variant(self, variant_id: str) -> CoreBenchmarkVariant:
         """Return one configured variant by its stable identifier."""
@@ -193,16 +219,39 @@ class CoreBenchmarkSuite:
         )
         return f"{variant.variant_id}__{digest[:16]}"
 
-    def repetition_id(
+    @property
+    def representative_case_count(self) -> int:
+        """Return the fixed number of scientific cases measured in each wave."""
+        return len(self.representative_cases)
+
+    def representative_case(self, case_position: int) -> CoreBenchmarkRepresentativeCase:
+        """Return one representative case by its one-based stable position."""
+        if case_position < 1 or case_position > self.representative_case_count:
+            message = f"Benchmark representative case position must be in [1, {self.representative_case_count}], got {case_position}."
+            raise ValueError(message)
+        return self.representative_cases[case_position - 1]
+
+    def case_position(self, case_role: str) -> int:
+        """Return the one-based position for an exact representative-case role."""
+        safe_role = common.paths.validate_logical_name(
+            case_role,
+            label="benchmark representative case_role",
+        )
+        matches = [position for position, representative in enumerate(self.representative_cases, start=1) if representative.case_role == safe_role]
+        if len(matches) != 1:
+            available = ", ".join(item.case_role for item in self.representative_cases)
+            message = f"Unknown benchmark case role {case_role!r}; available: {available}."
+            raise ValueError(message)
+        return matches[0]
+
+    def work_unit_id(
         self,
         variant: CoreBenchmarkVariant,
-        repetition: int,
+        case_position: int,
     ) -> str:
-        """Return one execution-replicate identity."""
-        if repetition < 1 or repetition > self.repetitions:
-            message = f"Benchmark repetition must be in [1, {self.repetitions}], got {repetition}."
-            raise ValueError(message)
-        return f"{self.execution_id(variant)}__rep_{repetition:03d}"
+        """Return one resource-and-science work-unit identity."""
+        representative = self.representative_case(case_position)
+        return f"{self.execution_id(variant)}__{representative.case_role}"
 
     def canary_variant(self) -> CoreBenchmarkVariant:
         """Return the unique variant matching the production core setting."""
@@ -229,16 +278,22 @@ class CoreBenchmarkSuite:
             "comsol_executable": site["comsol_executable"],
             "wall_time": self.wall_time,
             "scheduler_options": list(self.scheduler_options),
-            "cases_per_measured_run": 1,
-            "maximum_concurrent_measured_runs": 1,
+            "cases_per_measured_wave": self.representative_case_count,
+            "maximum_concurrent_measured_runs": self.representative_case_count,
             "poll_interval_seconds": self.case_campaign.execution_values["submission"]["poll_interval_seconds"],
+            "maximum_work_unit_attempts": self.maximum_work_unit_attempts,
+            "node_memory_limit_bytes": self.node_memory_limit_bytes,
+            "node_scratch_limit_bytes": self.node_scratch_limit_bytes,
         }
 
-    def case_selection(self) -> dict[str, Any]:
-        """Return the compact deterministic case selection identity."""
-        assignment = self.case_config.case_assignment(self.case_index)
-        seed = self.case_config.case_seed(self.case_index)
+    def case_selection(self, case_position: int) -> dict[str, Any]:
+        """Return one compact deterministic representative-case identity."""
+        representative = self.representative_case(case_position)
+        case_index = representative.case_index
+        assignment = self.case_config.case_assignment(case_index)
+        seed = self.case_config.case_seed(case_index)
         return {
+            "case_role": representative.case_role,
             "campaign_config": _repository_relative(self.case_campaign_path),
             "campaign_id": self.case_campaign.campaign_id,
             "batch_name": self.case_config.batch_name,
@@ -246,8 +301,8 @@ class CoreBenchmarkSuite:
             "simulation_profile": self.case_config.profile.id,
             "material_family": self.case_config.material_family,
             "sampling_regime": self.case_config.sampling_regime,
-            "case_index": self.case_index,
-            "case_id": self.case_config.case_id(self.case_index),
+            "case_index": case_index,
+            "case_id": self.case_config.case_id(case_index),
             "case_seed": seed,
             "assignment": assignment,
             "scientific_config_digest": self.case_config.scientific_config_digest,
@@ -260,15 +315,26 @@ class CoreBenchmarkSuite:
             },
             "selection_digest": common.serialization.canonical_json_sha256(
                 {
+                    "case_role": representative.case_role,
                     "scientific_config_digest": self.case_config.scientific_config_digest,
                     "case_input_config_digest": self.case_config.case_input_config_digest,
-                    "case_index": self.case_index,
+                    "case_index": case_index,
                     "case_seed": seed,
                     "assignment": assignment,
                     "template_sha256": self.case_config.template_sha256,
                 }
             ),
         }
+
+    def case_selections(self) -> list[dict[str, Any]]:
+        """Return both representative cases in stable authored order."""
+        return [self.case_selection(case_position) for case_position in range(1, self.representative_case_count + 1)]
+
+    def variant_wave_order(self) -> tuple[CoreBenchmarkVariant, ...]:
+        """Return production cores first, then remaining core counts ascending."""
+        production = self.canary_variant()
+        remaining = tuple(variant for variant in sorted(self.variants, key=lambda item: item.cores_per_case) if variant != production)
+        return (production, *remaining)
 
 
 def _utc_now() -> str:
@@ -399,7 +465,7 @@ def _production_like_benchmark_config(
     return replace(config, execution_values=execution)
 
 
-def load_core_benchmark_suite(
+def load_core_benchmark_suite(  # noqa: C901, PLR0912, PLR0915 -- centralized suite validation
     path: Path | str,
     *,
     require_executable: bool = True,
@@ -413,8 +479,12 @@ def load_core_benchmark_suite(
             "schema_kind",
             "schema_version",
             "suite_name",
-            "case",
-            "repetitions",
+            "benchmark_mode",
+            "representative_cases",
+            "parallel_cases_per_variant",
+            "variant_execution",
+            "case_execution_within_variant",
+            "retry",
             "resources",
             "production_interpretation",
             "variants",
@@ -428,16 +498,79 @@ def load_core_benchmark_suite(
         suite["suite_name"],
         label="benchmark suite_name",
     )
-    case = _mapping(suite["case"], label="benchmark.case")
-    _exact_keys(
-        case,
-        {"campaign_config", "material_family", "sampling_regime", "case_index"},
-        label="benchmark.case",
+    if suite["benchmark_mode"] != "core_selection":
+        message = "benchmark.benchmark_mode must be 'core_selection'."
+        raise ValueError(message)
+    if suite["variant_execution"] != "sequential":
+        message = "benchmark.variant_execution must be 'sequential'."
+        raise ValueError(message)
+    if suite["case_execution_within_variant"] != "concurrent":
+        message = "benchmark.case_execution_within_variant must be 'concurrent'."
+        raise ValueError(message)
+    parallel_cases = _positive_integer(
+        suite["parallel_cases_per_variant"],
+        label="benchmark.parallel_cases_per_variant",
     )
-    campaign_path = _reference_path(
-        case["campaign_config"],
-        label="benchmark.case.campaign_config",
-    )
+    representative_values = suite["representative_cases"]
+    if not isinstance(representative_values, list) or len(representative_values) != len(_BENCHMARK_REPRESENTATIVE_CASE_ROLES):
+        message = "Core benchmarking requires exactly two representative cases."
+        raise ValueError(message)
+    if parallel_cases != len(representative_values):
+        message = "Core benchmarking must run both representative cases concurrently within each variant."
+        raise ValueError(message)
+
+    parsed_cases: list[tuple[str, Path, str, str, int]] = []
+    for index, raw_case in enumerate(representative_values):
+        case = _mapping(raw_case, label=f"benchmark.representative_cases[{index}]")
+        _exact_keys(
+            case,
+            {
+                "case_role",
+                "campaign_config",
+                "material_family",
+                "sampling_regime",
+                "case_index",
+            },
+            label=f"benchmark.representative_cases[{index}]",
+        )
+        case_role = common.paths.validate_logical_name(
+            case["case_role"],
+            label=f"benchmark.representative_cases[{index}].case_role",
+        )
+        campaign_path = _reference_path(
+            case["campaign_config"],
+            label=f"benchmark.representative_cases[{index}].campaign_config",
+        )
+        material_family = common.paths.validate_logical_name(
+            case["material_family"],
+            label=f"benchmark.representative_cases[{index}].material_family",
+        )
+        sampling_regime = common.paths.validate_logical_name(
+            case["sampling_regime"],
+            label=f"benchmark.representative_cases[{index}].sampling_regime",
+        )
+        case_index = _positive_integer(
+            case["case_index"],
+            label=f"benchmark.representative_cases[{index}].case_index",
+        )
+        parsed_cases.append(
+            (
+                case_role,
+                campaign_path,
+                material_family,
+                sampling_regime,
+                case_index,
+            )
+        )
+    roles = tuple(item[0] for item in parsed_cases)
+    if roles != _BENCHMARK_REPRESENTATIVE_CASE_ROLES:
+        message = f"Core benchmark representative case roles must be authored as {list(_BENCHMARK_REPRESENTATIVE_CASE_ROLES)}."
+        raise ValueError(message)
+    shared_selection = {(item[1], item[2], item[3]) for item in parsed_cases}
+    if len(shared_selection) != 1:
+        message = "Core benchmark representative cases must share one pilot campaign batch."
+        raise ValueError(message)
+    campaign_path, material_family, sampling_regime = next(iter(shared_selection))
     campaign = config_service.load_campaign_config(
         campaign_path,
         require_executable=require_executable,
@@ -448,24 +581,37 @@ def load_core_benchmark_suite(
     if campaign.dataset_packages:
         message = "The benchmark case campaign must declare no Dataset packages."
         raise ValueError(message)
-    material_family = common.paths.validate_logical_name(
-        case["material_family"],
-        label="benchmark case material_family",
-    )
-    sampling_regime = common.paths.validate_logical_name(
-        case["sampling_regime"],
-        label="benchmark case sampling_regime",
-    )
     case_config = campaign.require_batch(
         material_family=material_family,
         sampling_regime=sampling_regime,
     )
-    case_index = _positive_integer(case["case_index"], label="benchmark.case.case_index")
-    assignment = case_config.case_assignment(case_index)
-    if assignment.get("pilot_case_kind") != "nominal_reference":
-        message = "Core benchmarking requires the pilot campaign's canonical nominal_reference case."
+    representative_cases = tuple(
+        CoreBenchmarkRepresentativeCase(case_role=case_role, case_index=case_index)
+        for case_role, _path, _material, _regime, case_index in parsed_cases
+    )
+    if len({representative.case_index for representative in representative_cases}) != len(representative_cases):
+        message = "Core benchmark representative cases must use distinct case indices."
         raise ValueError(message)
+    expected_pilot_kinds = {"nominal": "nominal_reference", "natural": "natural_pilot"}
+    for representative in representative_cases:
+        assignment = case_config.case_assignment(representative.case_index)
+        if assignment.get("pilot_case_kind") != expected_pilot_kinds[representative.case_role]:
+            message = (
+                f"Benchmark case role {representative.case_role!r} does not select the required "
+                f"{expected_pilot_kinds[representative.case_role]!r} pilot case."
+            )
+            raise ValueError(message)
 
+    retry = _mapping(suite["retry"], label="benchmark.retry")
+    _exact_keys(
+        retry,
+        {"maximum_work_unit_attempts"},
+        label="benchmark.retry",
+    )
+    maximum_work_unit_attempts = _positive_integer(
+        retry["maximum_work_unit_attempts"],
+        label="benchmark.retry.maximum_work_unit_attempts",
+    )
     resources = _mapping(suite["resources"], label="benchmark.resources")
     _exact_keys(
         resources,
@@ -609,26 +755,32 @@ def load_core_benchmark_suite(
             f"cores_per_case={authored_cores}; found {len(matching_production_variants)}."
         )
         raise ValueError(message)
-    repetitions = _positive_integer(
-        suite["repetitions"],
-        label="benchmark.repetitions",
-    )
     digest_payload = {
         "schema_kind": BENCHMARK_SUITE_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "suite_name": suite_name,
-        "case": {
-            "campaign_config": _repository_relative(campaign_path),
-            "campaign_id": campaign.campaign_id,
-            "batch_id": case_config.batch_id,
-            "scientific_config_digest": case_config.scientific_config_digest,
-            "case_input_config_digest": case_config.case_input_config_digest,
-            "case_index": case_index,
-            "case_seed": case_config.case_seed(case_index),
-            "assignment": assignment,
-            "template_sha256": case_config.template_sha256,
+        "benchmark_mode": "core_selection",
+        "representative_cases": [
+            {
+                "case_role": representative.case_role,
+                "campaign_config": _repository_relative(campaign_path),
+                "campaign_id": campaign.campaign_id,
+                "batch_id": case_config.batch_id,
+                "scientific_config_digest": case_config.scientific_config_digest,
+                "case_input_config_digest": case_config.case_input_config_digest,
+                "case_index": representative.case_index,
+                "case_seed": case_config.case_seed(representative.case_index),
+                "assignment": case_config.case_assignment(representative.case_index),
+                "template_sha256": case_config.template_sha256,
+            }
+            for representative in representative_cases
+        ],
+        "parallel_cases_per_variant": parallel_cases,
+        "variant_execution": "sequential",
+        "case_execution_within_variant": "concurrent",
+        "retry": {
+            "maximum_work_unit_attempts": maximum_work_unit_attempts,
         },
-        "repetitions": repetitions,
         "resources": {
             "partition": partition,
             "wall_time": wall_time,
@@ -652,8 +804,8 @@ def load_core_benchmark_suite(
         case_campaign_path=campaign_path,
         case_campaign=campaign,
         case_config=_production_like_benchmark_config(case_config),
-        case_index=case_index,
-        repetitions=repetitions,
+        representative_cases=representative_cases,
+        maximum_work_unit_attempts=maximum_work_unit_attempts,
         variants=tuple(variants),
         cores_per_node=cores_per_node,
         partition=partition,
@@ -663,43 +815,77 @@ def load_core_benchmark_suite(
         production_cores_config_path=production_cores_config_path,
         production_cores_key=production_cores_key,
         production_cores_per_case=authored_cores,
+        node_memory_limit_bytes=None,
+        node_scratch_limit_bytes=None,
     )
 
 
 def inspect_core_benchmark(
     path: Path | str,
     *,
-    variant_id: str | None = None,
     require_executable: bool = False,
 ) -> dict[str, Any]:
-    """Return the compact same-case and resource contract without materializing inputs."""
+    """Return the compact two-case wave contract without materializing inputs."""
     suite = load_core_benchmark_suite(path, require_executable=require_executable)
-    variants = suite.variants if variant_id is None else (suite.variant(variant_id),)
+    wave_order = suite.variant_wave_order()
     return {
         "schema_kind": "generation_core_scaling_benchmark_inspection",
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
         "suite_config": _repository_relative(suite.source_path),
-        "case": suite.case_selection(),
-        "repetitions": suite.repetitions,
+        "benchmark_mode": "core_selection",
+        "representative_cases": suite.case_selections(),
+        "parallel_cases_per_variant": suite.representative_case_count,
+        "variant_execution": "sequential",
+        "case_execution_within_variant": "concurrent",
+        "required_successful_measurements": (len(suite.variants) * suite.representative_case_count),
         "resource_contract": suite.resource_contract(),
-        "canary": {
-            "variant_id": suite.canary_variant().variant_id,
-            "cores_per_case": suite.canary_variant().cores_per_case,
-            "repetition": 1,
+        "canary_wave": {
+            "variant_id": wave_order[0].variant_id,
+            "cores_per_case": wave_order[0].cores_per_case,
+            "case_roles": [item.case_role for item in suite.representative_cases],
+            "included_in_final_measurements": True,
         },
-        "variants": [
+        "variant_waves": [
             {
+                "wave_position": position,
                 "variant_id": variant.variant_id,
                 "source_path": _repository_relative(variant.source_path),
                 "cores_per_case": variant.cores_per_case,
                 "execution_id": suite.execution_id(variant),
             }
-            for variant in variants
+            for position, variant in enumerate(wave_order, start=1)
         ],
         "scientific_inputs_materialized": False,
         "dataset_membership": "none",
+    }
+
+
+def resolve_core_benchmark_runtime_identity(
+    path: Path | str,
+    *,
+    git_commit: str,
+    comsol_version_output: str,
+) -> dict[str, Any]:
+    """Resolve the deterministic runtime identity without persistent mutation."""
+    suite = load_core_benchmark_suite(path, require_executable=True)
+    version = _comsol_version_evidence(
+        comsol_version_output,
+        configured_executable=suite.resource_contract()["comsol_executable"],
+    )
+    run_id = core_benchmark_run_id(
+        suite,
+        git_commit=git_commit,
+        comsol_version=version,
+    )
+    return {
+        "schema_kind": "generation_core_scaling_benchmark_runtime_identity",
+        "schema_version": 1,
+        "benchmark_run_id": run_id,
+        "suite_digest": suite.suite_digest,
+        "git_commit": source_service.validate_git_commit(git_commit),
+        "comsol_version": version,
     }
 
 
@@ -787,20 +973,21 @@ def _benchmark_identity(
     ):
         message = "Benchmark COMSOL version evidence is malformed or inconsistent."
         raise ValueError(message)
-    case = suite.case_selection()
+    cases = suite.case_selections()
     return {
         "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "git_commit": commit,
         "suite_digest": suite.suite_digest,
-        "case_selection_digest": case["selection_digest"],
-        "scientific_config_digest": case["scientific_config_digest"],
-        "case_input_config_digest": case["case_input_config_digest"],
-        "template_sha256": case["template"]["sha256"],
-        "export_contract_sha256": case["export_contract_sha256"],
-        "execution_config_digest": case["execution_config_digest"],
+        "case_selection_digests": [case["selection_digest"] for case in cases],
+        "scientific_config_digest": suite.case_config.scientific_config_digest,
+        "case_input_config_digest": suite.case_config.case_input_config_digest,
+        "template_sha256": suite.case_config.template_sha256,
+        "export_contract_sha256": cases[0]["export_contract_sha256"],
+        "execution_config_digest": cases[0]["execution_config_digest"],
+        "variant_wave_order": [variant.variant_id for variant in suite.variant_wave_order()],
+        "representative_case_count": suite.representative_case_count,
         "variants": _variant_records(suite),
-        "repetitions": suite.repetitions,
         "comsol_version": version,
     }
 
@@ -1039,20 +1226,10 @@ def preflight_core_benchmark(
             run_id=run_id,
             storage_root=storage,
             log_directory=logs,
-            role="prepare",
-        ),
-        *[
-            build_core_benchmark_slurm_command(
-                suite,
-                run_id=run_id,
-                storage_root=storage,
-                log_directory=logs,
-                role="measure",
-                variant=variant,
-                repetition=repetition,
-            )
-            for variant, repetition in _measured_sequence(suite)
-        ],
+            variant=variant,
+            case_position=case_position,
+        )
+        for variant, case_position in _measured_sequence(suite)
     ]
     if any(argument == "--licenses" or argument.startswith("--licenses=") for command in commands for argument in command):
         message = "Standalone benchmark Slurm commands must not request --licenses."
@@ -1159,14 +1336,6 @@ def _variant_records(suite: CoreBenchmarkSuite) -> list[dict[str, Any]]:
     ]
 
 
-def _selected_variants(
-    suite: CoreBenchmarkSuite,
-    variant_id: str | None,
-) -> tuple[CoreBenchmarkVariant, ...]:
-    """Return all variants or one explicit recovery selection."""
-    return suite.variants if variant_id is None else (suite.variant(variant_id),)
-
-
 def _node_environment(suite: CoreBenchmarkSuite, run_id: str) -> list[str]:
     """Return exact environment bindings consumed by the compute-node script."""
     site = suite.case_campaign.execution_values["site"]
@@ -1181,16 +1350,11 @@ def _node_environment(suite: CoreBenchmarkSuite, run_id: str) -> list[str]:
 
 def _measured_sequence(
     suite: CoreBenchmarkSuite,
-    *,
-    variant_id: str | None = None,
 ) -> tuple[tuple[CoreBenchmarkVariant, int], ...]:
-    """Return canary-first order followed by remaining round-robin runs."""
-    variants = _selected_variants(suite, variant_id)
-    round_robin = tuple((variant, repetition) for repetition in range(1, suite.repetitions + 1) for variant in variants)
-    if variant_id is not None:
-        return round_robin
-    canary = (suite.canary_variant(), 1)
-    return (canary, *(item for item in round_robin if item != canary))
+    """Return both cases for each production-first sequential variant wave."""
+    return tuple(
+        (variant, case_position) for variant in suite.variant_wave_order() for case_position in range(1, suite.representative_case_count + 1)
+    )
 
 
 def build_core_benchmark_slurm_command(
@@ -1199,14 +1363,10 @@ def build_core_benchmark_slurm_command(
     run_id: str,
     storage_root: Path,
     log_directory: Path,
-    role: str,
-    variant: CoreBenchmarkVariant | None = None,
-    repetition: int | None = None,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
 ) -> list[str]:
-    """Build one ordinary preparation or measured Slurm job."""
-    if role not in {"prepare", "measure"}:
-        message = f"Unsupported core benchmark Slurm role: {role!r}."
-        raise ValueError(message)
+    """Build one ordinary measured benchmark Slurm job."""
     repository = common.paths.get_project_root().resolve()
     launcher = repository / "scripts" / "generation_benchmark_node.sh"
     if not launcher.is_file() or launcher.is_symlink():
@@ -1215,30 +1375,18 @@ def build_core_benchmark_slurm_command(
     if not storage_root.is_absolute() or not log_directory.is_absolute():
         message = "Benchmark Slurm storage and log roots must be absolute."
         raise ValueError(message)
+    suite.work_unit_id(variant, case_position)
     environment = _node_environment(suite, run_id)
-    if role == "prepare":
-        if variant is not None or repetition is not None:
-            message = "Preparation submission cannot select a variant or repetition."
-            raise ValueError(message)
-        cpus = 1
-        worker = [str(launcher), str(repository), run_id, "prepare"]
-        job_suffix = f"prep-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
-    else:
-        if variant is None or repetition is None:
-            message = "Measured benchmark submission requires one variant and repetition."
-            raise ValueError(message)
-        suite.repetition_id(variant, repetition)
-        cpus = variant.cores_per_case
-        worker = [
-            str(launcher),
-            str(repository),
-            run_id,
-            "measure",
-            variant.variant_id,
-            str(repetition),
-        ]
-        job_suffix = f"c{variant.cores_per_case:02d}-r{repetition:02d}-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
+    representative = suite.representative_case(case_position)
+    worker = [
+        str(launcher),
+        str(repository),
+        run_id,
+        variant.variant_id,
+        representative.case_role,
+    ]
     wrapped = shlex.join(["env", *environment, *worker])
+    job_suffix = f"c{variant.cores_per_case:02d}-{representative.case_role[:3]}-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
     job_name = f"td-bench-{job_suffix}"
     if len(job_name) > _MAX_SLURM_JOB_NAME_LENGTH or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", job_name) is None:
         message = f"Benchmark Slurm job name is unsafe or exceeds 48 characters: {job_name!r}."
@@ -1248,7 +1396,7 @@ def build_core_benchmark_slurm_command(
         "--parsable",
         "--nodes=1",
         "--ntasks=1",
-        f"--cpus-per-task={cpus}",
+        f"--cpus-per-task={variant.cores_per_case}",
         f"--chdir={repository}",
         f"--job-name={job_name}",
         "--export=ALL",
@@ -1270,38 +1418,31 @@ def _plan_payload(
     git_commit: str,
     storage: Path,
     preflight: Mapping[str, Any],
-    variant_id: str | None,
 ) -> dict[str, Any]:
-    """Build the canonical serial plan from benchmark-owned preflight."""
+    """Build the canonical two-case, four-wave benchmark plan."""
     run_id = str(preflight["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     logs = directory / "scheduler"
-    selected = _selected_variants(suite, variant_id)
-    sequence = _measured_sequence(suite, variant_id=variant_id)
-    prepare_command = build_core_benchmark_slurm_command(
-        suite,
-        run_id=run_id,
-        storage_root=storage,
-        log_directory=logs,
-        role="prepare",
-    )
-    measured_commands = [
+    sequence = _measured_sequence(suite)
+    work_unit_commands = [
         {
             "variant_id": variant.variant_id,
             "cores_per_case": variant.cores_per_case,
-            "repetition": repetition,
+            "case_position": case_position,
+            "case_role": suite.representative_case(case_position).case_role,
+            "work_unit_id": suite.work_unit_id(variant, case_position),
             "command": build_core_benchmark_slurm_command(
                 suite,
                 run_id=run_id,
                 storage_root=storage,
                 log_directory=logs,
-                role="measure",
                 variant=variant,
-                repetition=repetition,
+                case_position=case_position,
             ),
         }
-        for variant, repetition in sequence
+        for variant, case_position in sequence
     ]
+    wave_order = suite.variant_wave_order()
     return {
         "schema_kind": "generation_core_scaling_benchmark_plan",
         "schema_version": BENCHMARK_SCHEMA_VERSION,
@@ -1318,25 +1459,28 @@ def _plan_payload(
             "comsol_runtime": preflight["comsol_runtime"],
             "checks": preflight["checks"],
         },
-        "case": suite.case_selection(),
-        "repetitions": suite.repetitions,
+        "representative_cases": suite.case_selections(),
+        "parallel_cases_per_variant": suite.representative_case_count,
         "variants": _variant_records(suite),
-        "selected_variant_ids": [variant.variant_id for variant in selected],
-        "canary": {
-            "variant_id": suite.canary_variant().variant_id,
-            "cores_per_case": suite.canary_variant().cores_per_case,
-            "repetition": 1,
+        "variant_wave_order": [variant.variant_id for variant in wave_order],
+        "required_successful_measurements": len(sequence),
+        "canary_wave": {
+            "variant_id": wave_order[0].variant_id,
+            "cores_per_case": wave_order[0].cores_per_case,
+            "case_roles": [item.case_role for item in suite.representative_cases],
             "included_in_final_measurements": True,
+            "additional_canary_work_units": 0,
         },
-        "measurement_order": [
+        "measurement_waves": [
             {
-                "position": position,
+                "wave_position": wave_position,
                 "variant_id": variant.variant_id,
                 "cores_per_case": variant.cores_per_case,
-                "repetition": repetition,
-                "role": ("canary" if position == 1 and variant == suite.canary_variant() and repetition == 1 else "measurement"),
+                "depends_on_wave": None if wave_position == 1 else wave_position - 1,
+                "work_unit_ids": [suite.work_unit_id(variant, case_position) for case_position in range(1, suite.representative_case_count + 1)],
+                "case_execution": "concurrent",
             }
-            for position, (variant, repetition) in enumerate(sequence, start=1)
+            for wave_position, variant in enumerate(wave_order, start=1)
         ],
         "resource_contract": suite.resource_contract(),
         "paths": {
@@ -1344,16 +1488,21 @@ def _plan_payload(
             "benchmark_root": str(directory),
             "scheduler_logs": str(logs),
         },
-        "submission_commands": {
-            "prepare": prepare_command,
-            "measured_sequence": measured_commands,
+        "canonical_input_preparation": {
+            "execution_environment": "cpu_login",
+            "scheduler_job": False,
+            "proof_directory": "canonical_cases",
+            "case_count": suite.representative_case_count,
         },
+        "submission_commands": {"work_units": work_unit_commands},
         "isolation": {
             "scientific_cases_per_job": 1,
-            "maximum_active_benchmark_jobs": 1,
+            "maximum_active_benchmark_jobs": suite.representative_case_count,
             "scheduler_arrays": False,
-            "scheduler_dependencies": False,
+            "ordered_variant_waves": True,
+            "case_execution_within_variant": "concurrent",
             "queue_wait_primary_metric": False,
+            "license_wait_primary_metric": False,
         },
         "dataset_membership": "none",
     }
@@ -1367,7 +1516,6 @@ def plan_core_benchmark(
     scratch_root: Path | str,
     comsol_version_output: str,
     comsol_executable_path: Path | str,
-    variant_id: str | None = None,
 ) -> dict[str, Any]:
     """Run or reuse standalone preflight and return the canonical plan."""
     requested_commit = source_service.validate_git_commit(git_commit)
@@ -1386,7 +1534,6 @@ def plan_core_benchmark(
         git_commit=requested_commit,
         storage=storage,
         preflight=preflight,
-        variant_id=variant_id,
     )
 
 
@@ -1448,15 +1595,15 @@ def load_core_benchmark_manifest(
             "suite_config",
             "git_commit",
             "preflight",
-            "case",
-            "repetitions",
+            "representative_cases",
             "variants",
-            "canary",
-            "measurement_order",
+            "variant_wave_order",
+            "canary_wave",
+            "measurement_waves",
+            "required_successful_measurements",
             "resource_contract",
             "created_at",
             "state",
-            "preparation_job_ids",
             "measured_job_ids",
             "submission_history",
         },
@@ -1475,31 +1622,35 @@ def load_core_benchmark_manifest(
         label="benchmark manifest suite_config",
     )
     suite = load_core_benchmark_suite(suite_path, require_executable=True)
-    sequence = _measured_sequence(suite)
+    wave_order = suite.variant_wave_order()
     expected = {
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
-        "case": suite.case_selection(),
-        "repetitions": suite.repetitions,
+        "representative_cases": suite.case_selections(),
         "variants": _variant_records(suite),
-        "canary": {
-            "variant_id": suite.canary_variant().variant_id,
-            "cores_per_case": suite.canary_variant().cores_per_case,
-            "repetition": 1,
+        "variant_wave_order": [variant.variant_id for variant in wave_order],
+        "canary_wave": {
+            "variant_id": wave_order[0].variant_id,
+            "cores_per_case": wave_order[0].cores_per_case,
+            "case_roles": [item.case_role for item in suite.representative_cases],
             "included_in_final_measurements": True,
+            "additional_canary_work_units": 0,
         },
-        "measurement_order": [
+        "measurement_waves": [
             {
-                "position": position,
+                "wave_position": wave_position,
                 "variant_id": variant.variant_id,
                 "cores_per_case": variant.cores_per_case,
-                "repetition": repetition,
-                "role": ("canary" if position == 1 and variant == suite.canary_variant() and repetition == 1 else "measurement"),
+                "depends_on_wave": None if wave_position == 1 else wave_position - 1,
+                "work_unit_ids": [suite.work_unit_id(variant, case_position) for case_position in range(1, suite.representative_case_count + 1)],
+                "case_execution": "concurrent",
             }
-            for position, (variant, repetition) in enumerate(sequence, start=1)
+            for wave_position, variant in enumerate(wave_order, start=1)
         ],
+        "required_successful_measurements": (len(suite.variants) * suite.representative_case_count),
         "resource_contract": suite.resource_contract(),
     }
+
     if any(manifest.get(key) != value for key, value in expected.items()):
         message = f"Core benchmark manifest no longer matches current suite source: {run_id}"
         raise ValueError(message)
@@ -1544,10 +1695,10 @@ def _success_path(
     directory: Path,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
+    case_position: int,
 ) -> Path:
-    """Return the immutable success evidence path for one repetition."""
-    return directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, repetition) / "success.json"
+    """Return the immutable success evidence path for one case_position."""
+    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position) / "success.json"
 
 
 def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
@@ -1559,8 +1710,9 @@ def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
         "suite_digest",
         "variant_id",
         "execution_id",
-        "repetition",
-        "repetition_id",
+        "case_position",
+        "case_role",
+        "work_unit_id",
         "git_commit",
         "case_input_id",
         "simulation_case_id",
@@ -1573,7 +1725,7 @@ def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
         if attempt_path.name != f"attempt-{expected_index:04d}.json":
             message = f"Benchmark attempt history is not contiguous: {attempt_path}"
             raise ValueError(message)
-        payload = _load_json(attempt_path, label="benchmark repetition attempt")
+        payload = _load_json(attempt_path, label="benchmark case_position attempt")
         previous = payload.get("previous_attempt")
         if expected_index == 1:
             valid_previous = previous is None
@@ -1613,7 +1765,7 @@ def _validate_result_identity(
     *,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
+    case_position: int,
     status: str,
 ) -> None:
     """Validate identity fields shared by successful and failed attempts."""
@@ -1624,30 +1776,31 @@ def _validate_result_identity(
         "suite_digest": suite.suite_digest,
         "variant_id": variant.variant_id,
         "execution_id": suite.execution_id(variant),
-        "repetition": repetition,
-        "repetition_id": suite.repetition_id(variant, repetition),
+        "case_position": case_position,
+        "case_role": suite.representative_case(case_position).case_role,
+        "work_unit_id": suite.work_unit_id(variant, case_position),
         "scientific_config_digest": suite.case_config.scientific_config_digest,
         "template_sha256": suite.case_config.template_sha256,
         "cores_per_case": variant.cores_per_case,
     }
     if any(result.get(key) != value for key, value in expected.items()):
-        message = f"Benchmark {status} evidence conflicts for {expected['repetition_id']}."
+        message = f"Benchmark {status} evidence conflicts for {expected['work_unit_id']}."
         raise ValueError(message)
     if _BENCHMARK_RUN_ID_PATTERN.fullmatch(str(result.get("benchmark_run_id"))) is None:
-        message = f"Benchmark result has a malformed run ID for {expected['repetition_id']}."
+        message = f"Benchmark result has a malformed run ID for {expected['work_unit_id']}."
         raise ValueError(message)
     source_service.validate_git_commit(result.get("git_commit"))
     if _SHA256_PATTERN.fullmatch(str(result.get("benchmark_preflight_sha256"))) is None:
-        message = f"Benchmark result has malformed preflight identity for {expected['repetition_id']}."
+        message = f"Benchmark result has malformed preflight identity for {expected['work_unit_id']}."
         raise ValueError(message)
     for key in ("case_input_id", "simulation_case_id"):
         if _SHA256_PATTERN.fullmatch(str(result.get(key))) is None:
-            message = f"Benchmark result has malformed {key} for {expected['repetition_id']}."
+            message = f"Benchmark result has malformed {key} for {expected['work_unit_id']}."
             raise ValueError(message)
     attempt = result.get("attempt")
     previous = result.get("previous_attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
-        message = f"Benchmark result has an invalid attempt index for {expected['repetition_id']}."
+        message = f"Benchmark result has an invalid attempt index for {expected['work_unit_id']}."
         raise ValueError(message)
     valid_previous = (
         previous is None
@@ -1658,7 +1811,7 @@ def _validate_result_identity(
         and _SHA256_PATTERN.fullmatch(str(previous.get("receipt_sha256"))) is not None
     )
     if not valid_previous:
-        message = f"Benchmark result has an invalid attempt chain for {expected['repetition_id']}."
+        message = f"Benchmark result has an invalid attempt chain for {expected['work_unit_id']}."
         raise ValueError(message)
 
 
@@ -1667,9 +1820,9 @@ def _validate_resource_evidence(
     *,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
+    case_position: int,
 ) -> None:
-    """Validate the exact ordinary-job allocation and solver-core evidence."""
+    """Validate allocation plus observed per-case memory and scratch evidence."""
     resource = result.get("resource")
     expected_keys = {
         "node",
@@ -1678,9 +1831,11 @@ def _validate_resource_evidence(
         "allocated_cpus",
         "comsol_np",
         "slurm_job_id",
+        "peak_memory_bytes",
+        "peak_scratch_bytes",
     }
     if not isinstance(resource, dict) or set(resource) != expected_keys:
-        message = f"Benchmark resource evidence is missing for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark resource evidence is missing for {suite.work_unit_id(variant, case_position)}."
         raise TypeError(message)
     expected = {
         "requested_cpus": variant.cores_per_case,
@@ -1688,18 +1843,23 @@ def _validate_resource_evidence(
         "comsol_np": variant.cores_per_case,
     }
     if any(resource.get(key) != value for key, value in expected.items()):
-        message = f"Benchmark allocation evidence conflicts for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark allocation evidence conflicts for {suite.work_unit_id(variant, case_position)}."
         raise ValueError(message)
     if suite.partition is not None and resource.get("partition") != suite.partition:
-        message = f"Benchmark partition evidence conflicts for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark partition evidence conflicts for {suite.work_unit_id(variant, case_position)}."
         raise ValueError(message)
     node = resource.get("node")
     if not isinstance(node, str) or not node or any(character in node for character in "\r\n\t"):
-        message = f"Benchmark node evidence is malformed for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark node evidence is malformed for {suite.work_unit_id(variant, case_position)}."
         raise ValueError(message)
     if _JOB_ID_PATTERN.fullmatch(str(resource.get("slurm_job_id"))) is None:
-        message = f"Benchmark slurm_job_id is malformed for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark slurm_job_id is malformed for {suite.work_unit_id(variant, case_position)}."
         raise ValueError(message)
+    for key in ("peak_memory_bytes", "peak_scratch_bytes"):
+        value = resource.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            message = f"Benchmark {key} is malformed for {suite.work_unit_id(variant, case_position)}."
+            raise ValueError(message)
 
 
 def _timestamp(value: object, *, label: str) -> datetime:
@@ -1721,7 +1881,7 @@ def _timestamp(value: object, *, label: str) -> datetime:
 def _validate_scheduler_timing(
     result: Mapping[str, Any],
     *,
-    repetition_id: str,
+    work_unit_id: str,
 ) -> None:
     """Validate submit/start/completion and derived queue/turnaround timing."""
     timing = result.get("scheduler_timing")
@@ -1732,13 +1892,13 @@ def _validate_scheduler_timing(
         "queue_wait_s",
         "turnaround_s",
     }:
-        message = f"Benchmark scheduler timing is incomplete for {repetition_id}."
+        message = f"Benchmark scheduler timing is incomplete for {work_unit_id}."
         raise ValueError(message)
     submitted = _timestamp(timing["submit_time"], label="submit_time")
     started = _timestamp(timing["start_time"], label="start_time")
     completed = _timestamp(timing["completion_time"], label="completion_time")
     if started < submitted or completed < started:
-        message = f"Benchmark scheduler timestamps are out of order for {repetition_id}."
+        message = f"Benchmark scheduler timestamps are out of order for {work_unit_id}."
         raise ValueError(message)
     expected_queue = (started - submitted).total_seconds()
     expected_turnaround = (completed - submitted).total_seconds()
@@ -1750,7 +1910,7 @@ def _validate_scheduler_timing(
             or not math.isfinite(float(value))
             or not math.isclose(float(value), expected, rel_tol=1.0e-9, abs_tol=1.0e-6)
         ):
-            message = f"Benchmark {key} is inconsistent for {repetition_id}."
+            message = f"Benchmark {key} is inconsistent for {work_unit_id}."
             raise ValueError(message)
 
 
@@ -1779,47 +1939,139 @@ def _scheduler_timing(
     }
 
 
+def _validate_work_unit_timings(
+    result: Mapping[str, Any],
+    *,
+    work_unit_id: str,
+    success: bool,
+) -> None:
+    """Validate exact separated timings without mixing waits into solve time."""
+    timings = result.get("timings_seconds")
+    if not isinstance(timings, dict) or set(timings) != _WORK_UNIT_TIMING_FIELDS:
+        message = f"Benchmark timings are incomplete for {work_unit_id}."
+        raise ValueError(message)
+    optional = {"comsol_process_seconds", "export_conversion_seconds"}
+    for key, value in timings.items():
+        if not success and key in optional and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+            message = f"Benchmark {key} is malformed for {work_unit_id}."
+            raise ValueError(message)
+    if success and float(timings["comsol_process_seconds"]) <= 0.0:
+        message = f"Benchmark successful COMSOL runtime is invalid for {work_unit_id}."
+        raise ValueError(message)
+
+
+def _validate_success_support_evidence(
+    result: Mapping[str, Any],
+    *,
+    work_unit_id: str,
+) -> None:
+    """Validate successful solver interval, license, and bounded-log evidence."""
+    interval = result.get("solver_interval")
+    if not isinstance(interval, dict) or set(interval) != {"started_at", "ended_at"}:
+        message = f"Benchmark solver interval is missing for {work_unit_id}."
+        raise ValueError(message)
+    if _timestamp(interval["ended_at"], label="solver ended_at") < _timestamp(
+        interval["started_at"],
+        label="solver started_at",
+    ):
+        message = f"Benchmark solver interval is out of order for {work_unit_id}."
+        raise ValueError(message)
+    license_evidence = result.get("license")
+    expected_license_keys = {
+        "license_blocked_submission_count",
+        "license_wait_seconds",
+        "license_probe_seconds",
+        "scheduler_queue_seconds_before_success",
+        "detected_feature",
+        "detected_error_code",
+        "matched_signatures",
+        "raw_excerpt",
+        "successful_artifacts_override_prior_warning",
+    }
+    if not isinstance(license_evidence, dict) or set(license_evidence) != expected_license_keys:
+        message = f"Benchmark license evidence is missing for {work_unit_id}."
+        raise ValueError(message)
+    blocked = license_evidence["license_blocked_submission_count"]
+    if isinstance(blocked, bool) or not isinstance(blocked, int) or blocked < 0:
+        message = f"Benchmark license-block count is malformed for {work_unit_id}."
+        raise ValueError(message)
+    for key in (
+        "license_wait_seconds",
+        "license_probe_seconds",
+        "scheduler_queue_seconds_before_success",
+    ):
+        value = license_evidence[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+            message = f"Benchmark {key} is malformed for {work_unit_id}."
+            raise ValueError(message)
+    if license_evidence["successful_artifacts_override_prior_warning"] is not True:
+        message = f"Benchmark success precedence is missing for {work_unit_id}."
+        raise ValueError(message)
+    signatures = license_evidence["matched_signatures"]
+    if not isinstance(signatures, list) or not all(isinstance(item, str) and item for item in signatures):
+        message = f"Benchmark license signatures are malformed for {work_unit_id}."
+        raise ValueError(message)
+    optional_text = (
+        license_evidence["detected_feature"],
+        license_evidence["detected_error_code"],
+        license_evidence["raw_excerpt"],
+    )
+    if not all(item is None or isinstance(item, str) for item in optional_text):
+        message = f"Benchmark license details are malformed for {work_unit_id}."
+        raise ValueError(message)
+    solver_log = result.get("solver_log")
+    if not isinstance(solver_log, dict) or set(solver_log) != {
+        "sha256",
+        "size_bytes",
+        "excerpt",
+        "excerpt_truncated",
+    }:
+        message = f"Benchmark bounded solver-log evidence is missing for {work_unit_id}."
+        raise ValueError(message)
+    size = solver_log["size_bytes"]
+    if (
+        _SHA256_PATTERN.fullmatch(str(solver_log["sha256"])) is None
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+        or not isinstance(solver_log["excerpt"], str)
+        or not isinstance(solver_log["excerpt_truncated"], bool)
+        or len(solver_log["excerpt"].encode("utf-8")) > _MAX_BENCHMARK_LOG_EXCERPT_BYTES * 3
+    ):
+        message = f"Benchmark bounded solver-log evidence is malformed for {work_unit_id}."
+        raise ValueError(message)
+
+
 def _validate_success_result(
     result: Mapping[str, Any],
     *,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
+    case_position: int,
 ) -> None:
-    """Validate one immutable successful repetition identity and evidence."""
+    """Validate one immutable successful representative-case measurement."""
+    work_unit_id = suite.work_unit_id(variant, case_position)
     _validate_result_identity(
         result,
         suite=suite,
         variant=variant,
-        repetition=repetition,
+        case_position=case_position,
         status="success",
     )
     _validate_resource_evidence(
         result,
         suite=suite,
         variant=variant,
-        repetition=repetition,
+        case_position=case_position,
     )
-    _validate_scheduler_timing(
-        result,
-        repetition_id=suite.repetition_id(variant, repetition),
-    )
-    timings = result.get("timings_s")
-    if not isinstance(timings, dict) or set(timings) != _SUCCESS_TIMING_FIELDS:
-        message = f"Benchmark timings are incomplete for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
-    if any(
-        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0
-        for value in timings.values()
-    ):
-        message = f"Benchmark timings are malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
-    if float(timings["comsol_process"]) <= 0.0 or float(timings["complete_case"]) < float(timings["comsol_process"]):
-        message = f"Benchmark solve/complete timings are inconsistent for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
+    _validate_scheduler_timing(result, work_unit_id=work_unit_id)
+    _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=True)
+    _validate_success_support_evidence(result, work_unit_id=work_unit_id)
     hdf5 = result.get("hdf5")
     if not isinstance(hdf5, dict) or hdf5.get("retained_as_scientific_case") is not False:
-        message = f"Benchmark HDF5 isolation evidence is missing for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark HDF5 isolation evidence is missing for {work_unit_id}."
         raise ValueError(message)
     size = hdf5.get("size_bytes")
     identity = hdf5.get("identity")
@@ -1832,7 +2084,7 @@ def _validate_success_result(
         or identity.get("case_input_id") != result["case_input_id"]
         or identity.get("simulation_case_id") != result["simulation_case_id"]
     ):
-        message = f"Benchmark HDF5 evidence is malformed for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark HDF5 evidence is malformed for {work_unit_id}."
         raise ValueError(message)
 
 
@@ -1841,283 +2093,315 @@ def _validate_failure_result(
     *,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
+    case_position: int,
     attempts: Sequence[Path],
 ) -> None:
-    """Validate one append-only failed repetition attempt."""
+    """Validate one append-only failed scientific work-unit attempt."""
     del attempts
+    work_unit_id = suite.work_unit_id(variant, case_position)
     _validate_result_identity(
         result,
         suite=suite,
         variant=variant,
-        repetition=repetition,
+        case_position=case_position,
         status="failed",
     )
     _validate_resource_evidence(
         result,
         suite=suite,
         variant=variant,
-        repetition=repetition,
+        case_position=case_position,
     )
-    _validate_scheduler_timing(
-        result,
-        repetition_id=suite.repetition_id(variant, repetition),
-    )
-    timings = result.get("timings_s")
-    if not isinstance(timings, dict) or set(timings) != {
-        "case_materialization",
-        "complete_case",
-        "license_wait_seconds",
-    }:
-        message = f"Benchmark failure timings are malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
-    materialization = timings["case_materialization"]
-    complete = timings["complete_case"]
-    license_wait = timings["license_wait_seconds"]
-    if (
-        materialization is not None
-        and (
-            isinstance(materialization, bool)
-            or not isinstance(materialization, (int, float))
-            or not math.isfinite(float(materialization))
-            or float(materialization) < 0.0
-        )
-    ) or (
-        isinstance(complete, bool)
-        or not isinstance(complete, (int, float))
-        or not math.isfinite(float(complete))
-        or float(complete) < 0.0
-        or isinstance(license_wait, bool)
-        or not isinstance(license_wait, (int, float))
-        or not math.isfinite(float(license_wait))
-        or float(license_wait) < 0.0
-    ):
-        message = f"Benchmark failure timings are malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
+    _validate_scheduler_timing(result, work_unit_id=work_unit_id)
+    _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=False)
     error = result.get("error")
     if not isinstance(error, dict) or not isinstance(error.get("type"), str) or not error["type"] or not isinstance(error.get("message"), str):
-        message = f"Benchmark failure error evidence is malformed for {suite.repetition_id(variant, repetition)}."
+        message = f"Benchmark failure error evidence is malformed for {work_unit_id}."
         raise ValueError(message)
     if result.get("temporary_license_retry") is not None:
-        message = f"Temporary license capacity must remain operationally pending for {suite.repetition_id(variant, repetition)}."
+        message = f"Temporary license capacity must remain operationally pending for {work_unit_id}."
         raise ValueError(message)
 
 
-def _validate_pending_license_result(
-    result: Mapping[str, Any],
-    *,
+def _benchmark_license_wait_path(
+    directory: Path,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-    repetition: int,
-    attempts: Sequence[Path],
-) -> None:
-    """Validate one append-only pending temporary-license attempt."""
-    _validate_result_identity(
-        result,
-        suite=suite,
-        variant=variant,
-        repetition=repetition,
-        status="pending",
-    )
-    _validate_resource_evidence(
-        result,
-        suite=suite,
-        variant=variant,
-        repetition=repetition,
-    )
-    _validate_scheduler_timing(
-        result,
-        repetition_id=suite.repetition_id(variant, repetition),
-    )
-    timings = result.get("timings_s")
-    if not isinstance(timings, dict) or set(timings) != {
-        "case_materialization",
-        "complete_case",
-        "license_wait_seconds",
-    }:
-        message = f"Benchmark temporary-license timings are malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
-    license_wait = timings["license_wait_seconds"]
-    if (
-        isinstance(license_wait, bool)
-        or not isinstance(license_wait, (int, float))
-        or not math.isfinite(float(license_wait))
-        or float(license_wait) < 0.0
-    ):
-        message = f"Benchmark temporary-license wait is malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
-    retry_count, _, _exhausted = _validated_benchmark_license_retry_history(
-        suite.case_config,
-        attempts,
-        repetition_label=suite.repetition_id(variant, repetition),
-    )
-    if retry_count < 1:
-        message = f"Benchmark temporary-license evidence is malformed for {suite.repetition_id(variant, repetition)}."
-        raise ValueError(message)
+    case_position: int,
+) -> Path:
+    """Return the sole mutable license-wait record for one case_position."""
+    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position) / "license_wait.json"
 
 
-def _validated_benchmark_license_retry_history(
-    config: config_service.GenerationConfig,
-    attempts: Sequence[Path],
+def _benchmark_wait_timestamp(value: object, *, label: str) -> datetime:
+    """Return one timezone-aware benchmark wait timestamp."""
+    if not isinstance(value, str):
+        message = f"{label} must be a timezone-aware timestamp."
+        raise TypeError(message)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        message = f"{label} must be a timezone-aware timestamp."
+        raise ValueError(message) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        message = f"{label} must be a timezone-aware timestamp."
+        raise ValueError(message)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_benchmark_license_wait(
+    payload: object,
     *,
-    repetition_label: str,
-) -> tuple[int, float, bool]:
-    """Validate and summarize one append-only benchmark retry chain."""
-    _validate_benchmark_attempt_chain(attempts)
-    policy = config.execution_values["runtime"]["temporary_license_retry"]
+    run_id: str,
+    suite: CoreBenchmarkSuite,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
+    path: Path,
+) -> dict[str, Any]:
+    """Validate one compact benchmark operational wait record."""
+    work_unit_id = suite.work_unit_id(variant, case_position)
     expected_keys = {
+        "schema_kind",
+        "schema_version",
+        "benchmark_run_id",
+        "work_unit_id",
+        "suite_digest",
+        "variant_id",
+        "case_position",
+        "case_role",
+        "scientific_config_digest",
         "classification",
-        "detected_feature",
-        "detected_license_code",
+        "feature",
+        "error_code",
         "matched_signatures",
-        "retry_attempt_index",
+        "comsol_exit_code",
+        "solver_progress_started",
+        "expected_exports_exist",
+        "first_blocked_at",
+        "last_blocked_at",
+        "retry_count",
+        "latest_job_id",
+        "recent_job_ids",
+        "hostname",
+        "raw_excerpt",
         "delay_before_next_attempt_seconds",
         "cumulative_wait_seconds",
+        "cumulative_probe_seconds",
+        "cumulative_scheduler_queue_seconds",
         "retry_budget_remaining",
-        "next_eligible_at",
+        "next_retry_at",
     }
-    retry_count = 0
-    cumulative_wait = 0.0
-    exhausted = False
-    for attempt_path in attempts:
-        payload = _load_json(
-            attempt_path,
-            label="benchmark repetition attempt",
-        )
-        retry = payload.get("temporary_license_retry")
-        if retry is None:
-            continue
-        if exhausted:
-            message = f"Benchmark temporary-license retry history extends past exhaustion: {attempt_path}"
-            raise ValueError(message)
-        expected_index = retry_count + 1
-        expected_delay = license_service.bounded_retry_delay_seconds(
-            policy,
-            attempt_index=expected_index,
-            cumulative_wait_seconds=cumulative_wait,
-        )
-        expected_cumulative = cumulative_wait + expected_delay
-        expected_remaining = expected_delay > 0.0
-        detected_code = retry.get("detected_license_code") if isinstance(retry, dict) else None
-        signatures = retry.get("matched_signatures") if isinstance(retry, dict) else None
-        actual_index = retry.get("retry_attempt_index") if isinstance(retry, dict) else None
-        actual_delay = retry.get("delay_before_next_attempt_seconds") if isinstance(retry, dict) else None
-        actual_cumulative = retry.get("cumulative_wait_seconds") if isinstance(retry, dict) else None
-        valid_delay = (
-            not isinstance(actual_delay, bool)
-            and isinstance(actual_delay, (int, float))
-            and math.isfinite(float(actual_delay))
-            and float(actual_delay) == expected_delay
-        )
-        valid_cumulative = (
-            not isinstance(actual_cumulative, bool)
-            and isinstance(actual_cumulative, (int, float))
-            and math.isfinite(float(actual_cumulative))
-            and float(actual_cumulative) == expected_cumulative
-        )
-        if (
-            not isinstance(retry, dict)
-            or set(retry) != expected_keys
-            or retry.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
-            or not isinstance(retry.get("detected_feature"), str)
-            or not retry["detected_feature"]
-            or (detected_code is not None and not isinstance(detected_code, str))
-            or not isinstance(signatures, list)
-            or not signatures
-            or any(not isinstance(signature, str) or not signature for signature in signatures)
-            or isinstance(actual_index, bool)
-            or actual_index != expected_index
-            or not valid_delay
-            or not valid_cumulative
-            or retry.get("retry_budget_remaining") is not expected_remaining
-            or payload.get("status") != "pending"
-        ):
-            message = f"Benchmark temporary-license retry history is inconsistent: {attempt_path}"
-            raise ValueError(message)
-        recorded_at = _timestamp(payload.get("recorded_at"), label="recorded_at")
-        if expected_remaining:
-            eligible_at = _timestamp(
-                retry.get("next_eligible_at"),
-                label="temporary_license_retry.next_eligible_at",
-            )
-            if eligible_at != recorded_at + timedelta(seconds=expected_delay):
-                message = f"Benchmark temporary-license eligibility is inconsistent for {repetition_label}."
-                raise ValueError(message)
-        elif retry.get("next_eligible_at") is not None:
-            message = f"Benchmark exhausted retry eligibility is inconsistent for {repetition_label}."
-            raise ValueError(message)
-        retry_count = expected_index
-        cumulative_wait = expected_cumulative
-        exhausted = not expected_remaining
-    return retry_count, cumulative_wait, exhausted
-
-
-def _benchmark_license_retry_metadata(
-    config: config_service.GenerationConfig,
-    attempts: Sequence[Path],
-    evidence: license_service.TemporaryLicenseCapacityClassification,
-    *,
-    recorded_at: str,
-) -> dict[str, Any]:
-    """Return the next benchmark retry record from append-only prior attempts."""
-    policy = config.execution_values["runtime"]["temporary_license_retry"]
-    retry_count, prior_cumulative, exhausted = _validated_benchmark_license_retry_history(
-        config,
-        attempts,
-        repetition_label="benchmark repetition",
-    )
-    if exhausted:
-        message = "Benchmark temporary-license retry budget is already exhausted."
-        raise RuntimeError(message)
-    retry_index = retry_count + 1
-    delay = license_service.bounded_retry_delay_seconds(
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload.get("schema_kind") != "generation_temporary_license_wait"
+        or payload.get("schema_version") != 1
+        or payload.get("benchmark_run_id") != run_id
+        or payload.get("work_unit_id") != work_unit_id
+        or payload.get("suite_digest") != suite.suite_digest
+        or payload.get("variant_id") != variant.variant_id
+        or payload.get("case_position") != case_position
+        or payload.get("case_role") != suite.representative_case(case_position).case_role
+        or payload.get("scientific_config_digest") != suite.case_config.scientific_config_digest
+        or payload.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
+        or not isinstance(payload.get("feature"), str)
+        or not payload["feature"]
+        or (payload.get("error_code") is not None and not isinstance(payload["error_code"], str))
+        or not isinstance(payload.get("matched_signatures"), list)
+        or not payload["matched_signatures"]
+        or not all(isinstance(value, str) and value for value in payload["matched_signatures"])
+        or payload.get("solver_progress_started") is not False
+        or payload.get("expected_exports_exist") is not False
+        or not isinstance(payload.get("raw_excerpt"), str)
+        or not payload["raw_excerpt"]
+        or not isinstance(payload.get("hostname"), str)
+        or not payload["hostname"]
+        or not isinstance(payload.get("retry_budget_remaining"), bool)
+    ):
+        message = f"Benchmark license-wait evidence is malformed: {path}"
+        raise ValueError(message)
+    exit_code = payload.get("comsol_exit_code")
+    retry_count = payload.get("retry_count")
+    delay = payload.get("delay_before_next_attempt_seconds")
+    cumulative = payload.get("cumulative_wait_seconds")
+    cumulative_probe = payload.get("cumulative_probe_seconds")
+    cumulative_queue = payload.get("cumulative_scheduler_queue_seconds")
+    job_id = payload.get("latest_job_id")
+    recent_job_ids = payload.get("recent_job_ids")
+    if (
+        (exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)))
+        or isinstance(retry_count, bool)
+        or not isinstance(retry_count, int)
+        or retry_count < 1
+        or isinstance(delay, bool)
+        or not isinstance(delay, (int, float))
+        or float(delay) < 0.0
+        or isinstance(cumulative, bool)
+        or not isinstance(cumulative, (int, float))
+        or float(cumulative) < float(delay)
+        or isinstance(cumulative_probe, bool)
+        or not isinstance(cumulative_probe, (int, float))
+        or not math.isfinite(float(cumulative_probe))
+        or float(cumulative_probe) < 0.0
+        or isinstance(cumulative_queue, bool)
+        or not isinstance(cumulative_queue, (int, float))
+        or not math.isfinite(float(cumulative_queue))
+        or float(cumulative_queue) < 0.0
+        or not isinstance(job_id, str)
+        or _JOB_ID_PATTERN.fullmatch(job_id) is None
+        or not isinstance(recent_job_ids, list)
+        or not recent_job_ids
+        or len(recent_job_ids) > _MAX_RECENT_JOB_IDS
+        or len(recent_job_ids) != len(set(recent_job_ids))
+        or recent_job_ids[-1] != job_id
+        or not all(isinstance(value, str) and _JOB_ID_PATTERN.fullmatch(value) for value in recent_job_ids)
+    ):
+        message = f"Benchmark license-wait counters are malformed: {path}"
+        raise ValueError(message)
+    first = _benchmark_wait_timestamp(payload["first_blocked_at"], label="first_blocked_at")
+    last = _benchmark_wait_timestamp(payload["last_blocked_at"], label="last_blocked_at")
+    prior_cumulative = float(cumulative) - float(delay)
+    policy = suite.case_config.execution_values["runtime"]["temporary_license_retry"]
+    expected_delay = license_service.bounded_retry_delay_seconds(
         policy,
-        attempt_index=retry_index,
+        attempt_index=retry_count,
         cumulative_wait_seconds=prior_cumulative,
     )
-    cumulative = prior_cumulative + delay
-    recorded = _timestamp(recorded_at, label="recorded_at")
-    return {
-        "classification": evidence.classification,
-        "detected_feature": evidence.feature,
-        "detected_license_code": evidence.license_code,
-        "matched_signatures": list(evidence.matched_signatures),
-        "retry_attempt_index": retry_index,
-        "delay_before_next_attempt_seconds": delay,
-        "cumulative_wait_seconds": cumulative,
-        "retry_budget_remaining": delay > 0.0,
-        "next_eligible_at": ((recorded + timedelta(seconds=delay)).isoformat() if delay > 0.0 else None),
-    }
+    if last < first or float(delay) != expected_delay:
+        message = f"Benchmark license-wait timing is inconsistent: {path}"
+        raise ValueError(message)
+    if payload["retry_budget_remaining"]:
+        next_retry = _benchmark_wait_timestamp(payload["next_retry_at"], label="next_retry_at")
+        if float(delay) <= 0.0 or next_retry != last + timedelta(seconds=float(delay)):
+            message = f"Benchmark license-wait eligibility is inconsistent: {path}"
+            raise ValueError(message)
+    elif payload["next_retry_at"] is not None or float(delay) != 0.0:
+        message = f"Benchmark exhausted license-wait evidence is inconsistent: {path}"
+        raise ValueError(message)
+    return payload
 
 
-def _latest_benchmark_license_retry(
-    manifest: Mapping[str, Any],
-    suite: CoreBenchmarkSuite,
+def _load_benchmark_license_wait(
     directory: Path,
-) -> Mapping[str, Any] | None:
-    """Return pending retry evidence for the latest measured submission."""
-    if not manifest["submission_history"]:
+    suite: CoreBenchmarkSuite,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
+    *,
+    run_id: str,
+) -> dict[str, Any] | None:
+    """Load one benchmark wait record when present."""
+    path = _benchmark_license_wait_path(directory, suite, variant, case_position)
+    if not path.exists():
         return None
-    latest = manifest["submission_history"][-1]
-    repetitions = latest.get("repetitions")
-    if latest.get("role") != "measure" or not isinstance(repetitions, list) or len(repetitions) != 1:
-        return None
-    matches = [
-        record
-        for record in _result_records(directory, suite)
-        if record.get("variant_id") == latest.get("variant_id") and record.get("repetition") == repetitions[0]
-    ]
-    if len(matches) != 1 or matches[0].get("status") != "pending":
-        return None
-    retry = matches[0].get("temporary_license_retry")
-    return retry if isinstance(retry, dict) else None
+    if not path.is_file() or path.is_symlink():
+        message = f"Benchmark license-wait evidence is unsafe: {path}"
+        raise ValueError(message)
+    return _validate_benchmark_license_wait(
+        _load_json(path, label="benchmark license-wait evidence"),
+        run_id=run_id,
+        suite=suite,
+        variant=variant,
+        case_position=case_position,
+        path=path,
+    )
+
+
+def _record_benchmark_license_wait(
+    directory: Path,
+    suite: CoreBenchmarkSuite,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
+    error: license_service.TemporaryLicenseCapacityError,
+    *,
+    run_id: str,
+    job_id: str,
+    license_probe_seconds: float,
+    scheduler_queue_seconds: float,
+) -> dict[str, Any]:
+    """Update compact wait evidence with excluded probe and queue timings."""
+    for label, value in (
+        ("license_probe_seconds", license_probe_seconds),
+        ("scheduler_queue_seconds", scheduler_queue_seconds),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            message = f"Benchmark {label} must be finite and non-negative."
+            raise ValueError(message)
+    current = _load_benchmark_license_wait(
+        directory,
+        suite,
+        variant,
+        case_position,
+        run_id=run_id,
+    )
+    if current is not None and job_id in current["recent_job_ids"]:
+        message = f"Benchmark license wait already includes job {job_id}."
+        raise FileExistsError(message)
+    now = datetime.now(timezone.utc)
+    retry_count = 1 if current is None else int(current["retry_count"]) + 1
+    prior_cumulative = 0.0 if current is None else float(current["cumulative_wait_seconds"])
+    prior_probe = 0.0 if current is None else float(current["cumulative_probe_seconds"])
+    prior_queue = 0.0 if current is None else float(current["cumulative_scheduler_queue_seconds"])
+    policy = suite.case_config.execution_values["runtime"]["temporary_license_retry"]
+    delay = license_service.bounded_retry_delay_seconds(
+        policy,
+        attempt_index=retry_count,
+        cumulative_wait_seconds=prior_cumulative,
+    )
+    recent_job_ids = [] if current is None else [str(value) for value in current["recent_job_ids"]]
+    recent_job_ids.append(job_id)
+    recent_job_ids = recent_job_ids[-_MAX_RECENT_JOB_IDS:]
+    work_unit_id = suite.work_unit_id(variant, case_position)
+    payload = {
+        "schema_kind": "generation_temporary_license_wait",
+        "schema_version": 1,
+        "benchmark_run_id": run_id,
+        "work_unit_id": work_unit_id,
+        "suite_digest": suite.suite_digest,
+        "variant_id": variant.variant_id,
+        "case_position": case_position,
+        "case_role": suite.representative_case(case_position).case_role,
+        "scientific_config_digest": suite.case_config.scientific_config_digest,
+        "classification": error.evidence.classification,
+        "feature": error.evidence.feature,
+        "error_code": error.evidence.license_code,
+        "matched_signatures": list(error.evidence.matched_signatures),
+        "comsol_exit_code": error.exit_code,
+        "solver_progress_started": error.solver_progress_started,
+        "expected_exports_exist": error.expected_exports_exist,
+        "first_blocked_at": now.isoformat() if current is None else current["first_blocked_at"],
+        "last_blocked_at": now.isoformat(),
+        "retry_count": retry_count,
+        "latest_job_id": job_id,
+        "recent_job_ids": recent_job_ids,
+        "hostname": socket.gethostname(),
+        "raw_excerpt": error.evidence.raw_excerpt,
+        "delay_before_next_attempt_seconds": delay,
+        "cumulative_wait_seconds": prior_cumulative + delay,
+        "cumulative_probe_seconds": prior_probe + license_probe_seconds,
+        "cumulative_scheduler_queue_seconds": prior_queue + scheduler_queue_seconds,
+        "retry_budget_remaining": delay > 0.0,
+        "next_retry_at": (now + timedelta(seconds=delay)).isoformat() if delay > 0.0 else None,
+    }
+    path = _benchmark_license_wait_path(directory, suite, variant, case_position)
+    common.serialization.atomic_write_json(path, payload)
+    admitted = _load_benchmark_license_wait(
+        directory,
+        suite,
+        variant,
+        case_position,
+        run_id=run_id,
+    )
+    if admitted != payload:
+        message = f"Benchmark license-wait evidence did not re-admit: {path}"
+        raise RuntimeError(message)
+    return payload
 
 
 def _validate_materialized_case_proof(
     actual: Mapping[str, Any],
     expected: Mapping[str, Any],
 ) -> None:
-    """Require a measured materialization to equal the canonical case proof."""
+    """Require measured scratch inputs to equal one canonical case proof."""
     if actual != expected:
         message = "Measured benchmark materialization differs from the canonical case proof."
         raise RuntimeError(message)
@@ -2127,7 +2411,7 @@ def _validate_hdf5_scientific_identity(
     hdf5_identity: Mapping[str, Any],
     proof: Mapping[str, Any],
 ) -> None:
-    """Require admitted HDF5 output to retain the benchmark scientific identity."""
+    """Require admitted HDF5 output to retain benchmark scientific identity."""
     if hdf5_identity["case_input_id"] != proof["case_input_id"] or hdf5_identity["simulation_case_id"] != proof["simulation_case_id"]:
         message = "Benchmark HDF5 admission changed the canonical scientific identity."
         raise RuntimeError(message)
@@ -2152,117 +2436,64 @@ def _accounted_root_state(
     return None
 
 
-def _latest_submission_result_state(
-    manifest: Mapping[str, Any],
-    suite: CoreBenchmarkSuite,
-    directory: Path,
-) -> str:
-    """Return success, failed, pending, or absent for the latest submitted job."""
-    history = manifest["submission_history"]
-    if not history:
-        return "absent"
-    latest = history[-1]
-    if latest["role"] == "prepare":
-        return "success" if (directory / "canonical_case.json").is_file() else "pending"
-    variant_id = latest.get("variant_id")
-    repetitions = latest.get("repetitions")
-    if not isinstance(variant_id, str) or not isinstance(repetitions, list) or len(repetitions) != 1:
-        message = "Latest benchmark measured submission identity is malformed."
-        raise ValueError(message)
-    matches = [
-        record for record in _result_records(directory, suite) if record["variant_id"] == variant_id and record["repetition"] == repetitions[0]
-    ]
-    if len(matches) != 1:
-        message = "Latest benchmark submission does not resolve to one repetition."
-        raise RuntimeError(message)
-    return str(matches[0]["status"])
+def _active_benchmark_job_ids(scheduler: Mapping[str, Any]) -> frozenset[str]:
+    """Return exact active root job IDs from one admitted scheduler query."""
+    result: set[str] = set()
+    for line in str(scheduler["squeue"]["output"]).splitlines():
+        job_id, separator, _remainder = line.partition("|")
+        if separator and _JOB_ID_PATTERN.fullmatch(job_id) is not None:
+            result.add(job_id)
+    return frozenset(result)
 
 
-def _latest_job_is_terminal_without_result(
-    manifest: Mapping[str, Any],
-    suite: CoreBenchmarkSuite,
-    directory: Path,
-    scheduler: Mapping[str, Any],
-) -> bool:
-    """Return whether accounting proves the latest evidence-missing job terminal."""
-    if _latest_submission_result_state(manifest, suite, directory) != "pending":
-        return False
-    sacct = scheduler["sacct"]
-    if sacct["error"] is not None:
-        message = f"Could not reconcile the latest benchmark job through accounting: {sacct['error']}"
-        raise RuntimeError(message)
-    latest_job_id = str(manifest["submission_history"][-1]["job_id"])
-    state = _accounted_root_state(scheduler, job_id=latest_job_id)
-    return state is not None and state not in _ACTIVE_SCHEDULER_STATES
+def _scientific_failure_count(attempts: Sequence[Path]) -> int:
+    """Count only terminal scientific failures in one admitted attempt chain."""
+    _validate_benchmark_attempt_chain(attempts)
+    return sum(_load_json(path, label="benchmark work-unit attempt").get("status") == "failed" for path in attempts)
 
 
-def _pending_repetitions(
+def _work_unit_directory(
     directory: Path,
     suite: CoreBenchmarkSuite,
     variant: CoreBenchmarkVariant,
-) -> tuple[int, ...]:
-    """Return only repetitions without valid immutable success evidence."""
-    pending: list[int] = []
-    for repetition in range(1, suite.repetitions + 1):
-        path = _success_path(directory, suite, variant, repetition)
-        if path.exists():
-            _validate_success_result(
-                _load_json(path, label="benchmark repetition success"),
-                suite=suite,
-                variant=variant,
-                repetition=repetition,
-            )
-        else:
-            attempts = tuple(
-                sorted((directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, repetition)).glob("attempt-*.json"))
-            )
-            _, _, exhausted = _validated_benchmark_license_retry_history(
-                suite.case_config,
-                attempts,
-                repetition_label=suite.repetition_id(variant, repetition),
-            )
-            if not exhausted:
-                pending.append(repetition)
-    return tuple(pending)
+    case_position: int,
+) -> Path:
+    """Return one benchmark work-unit evidence directory."""
+    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position)
 
 
-def _canary_attempts(
+def _work_unit_attempts(
     directory: Path,
     suite: CoreBenchmarkSuite,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
 ) -> tuple[Path, ...]:
-    """Return append-only attempt receipts for the measured canary."""
-    variant = suite.canary_variant()
-    repetition_directory = directory / "runs" / suite.execution_id(variant) / suite.repetition_id(variant, 1)
-    return tuple(sorted(repetition_directory.glob("attempt-*.json")))
+    """Return one sorted immutable scientific-attempt chain."""
+    return tuple(
+        sorted(
+            _work_unit_directory(
+                directory,
+                suite,
+                variant,
+                case_position,
+            ).glob("attempt-*.json")
+        )
+    )
 
 
-def _validated_canary_result(
-    directory: Path,
-    suite: CoreBenchmarkSuite,
-    *,
-    run_id: str,
+def _latest_work_unit_submission(
     manifest: Mapping[str, Any],
-    proof: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Return a fully admitted canary success, or no success evidence."""
-    variant = suite.canary_variant()
-    path = _success_path(directory, suite, variant, 1)
-    if not path.is_file():
-        return None
-    result = _load_json(path, label="benchmark canary success")
-    _validate_success_result(
-        result,
-        suite=suite,
-        variant=variant,
-        repetition=1,
-    )
-    _validate_records_against_proof(
-        [result],
-        run_id=run_id,
-        manifest=manifest,
-        proof=proof,
-    )
-    return result
+    *,
+    variant_id: str,
+    case_role: str,
+) -> Mapping[str, Any] | None:
+    """Return the newest submission for one exact case-role work unit."""
+    matches = [
+        record
+        for record in manifest["submission_history"]
+        if record.get("role") == "measure" and record.get("variant_id") == variant_id and record.get("case_role") == case_role
+    ]
+    return None if not matches else matches[-1]
 
 
 def _persist_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
@@ -2270,194 +2501,25 @@ def _persist_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     common.serialization.atomic_write_json(path, dict(manifest))
 
 
-def _submit_pending(
+def _submit_benchmark_work_unit(
     manifest: dict[str, Any],
     suite: CoreBenchmarkSuite,
     *,
     storage: Path,
-    variant_id: str | None,
-) -> dict[str, Any]:
-    """Reconcile and submit at most one job in canonical serial order."""
+    logs: Path,
+    variant: CoreBenchmarkVariant,
+    case_position: int,
+) -> str:
+    """Submit and durably bind one ordinary case-role benchmark job."""
     run_id = str(manifest["benchmark_run_id"])
-    directory = core_benchmark_directory(run_id, storage_root=storage)
-    logs = directory / "scheduler"
-    logs.mkdir(parents=True, exist_ok=True)
-    persisted_job_ids = [
-        str(value)
-        for value in (
-            *manifest["preparation_job_ids"],
-            *manifest["measured_job_ids"],
-        )
-    ]
-    if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted_job_ids):
-        message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
-        raise ValueError(message)
-    if persisted_job_ids:
-        scheduler = _scheduler_evidence(persisted_job_ids)
-        queue = scheduler["squeue"]
-        if queue["error"] is not None:
-            message = f"Could not verify active benchmark jobs before resume: {queue['error']}"
-            raise RuntimeError(message)
-        if queue["output"]:
-            manifest["state"] = "submitted"
-            _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
-            return manifest
-        latest_result = _latest_submission_result_state(manifest, suite, directory)
-        latest_retry = _latest_benchmark_license_retry(
-            manifest,
-            suite,
-            directory,
-        )
-        if latest_retry is not None and (
-            not bool(latest_retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(latest_retry)
-        ):
-            manifest["state"] = "license_blocked"
-            _persist_manifest(
-                _manifest_path(run_id, storage_root=storage),
-                manifest,
-            )
-            return manifest
-        if latest_result == "pending" and not _latest_job_is_terminal_without_result(
-            manifest,
-            suite,
-            directory,
-            scheduler,
-        ):
-            manifest["state"] = "scheduler_unknown"
-            _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
-            return manifest
-    proof = directory / "canonical_case.json"
-    if not proof.is_file():
-        command = build_core_benchmark_slurm_command(
-            suite,
-            run_id=run_id,
-            storage_root=storage,
-            log_directory=logs,
-            role="prepare",
-        )
-        submitted_at = _utc_now()
-        preparation_job = _submit(
-            command,
-            git_commit=str(manifest["git_commit"]),
-            run_id=run_id,
-        )
-        manifest["preparation_job_ids"].append(preparation_job)
-        manifest["submission_history"].append(
-            {
-                "submitted_at": submitted_at,
-                "role": "prepare",
-                "variant_id": None,
-                "repetitions": [],
-                "command": command,
-                "job_id": preparation_job,
-            }
-        )
-        manifest["state"] = "submitted"
-        _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
-        return manifest
-    proof_payload = _load_case_proof(
-        run_id,
-        suite,
-        storage_root=storage,
-    )
-    canary = suite.canary_variant()
-    canary_success = _validated_canary_result(
-        directory,
-        suite,
-        run_id=run_id,
-        manifest=manifest,
-        proof=proof_payload,
-    )
-    canary_attempts = _canary_attempts(directory, suite)
-    if canary_success is None:
-        if canary_attempts:
-            latest_canary = _load_json(
-                canary_attempts[-1],
-                label="benchmark canary attempt",
-            )
-            if latest_canary.get("status") == "pending":
-                _validate_pending_license_result(
-                    latest_canary,
-                    suite=suite,
-                    variant=canary,
-                    repetition=1,
-                    attempts=canary_attempts,
-                )
-                retry = _mapping(
-                    latest_canary.get("temporary_license_retry"),
-                    label="benchmark canary temporary-license retry",
-                )
-                if not bool(retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(retry):
-                    manifest["state"] = "license_blocked"
-                    _persist_manifest(
-                        _manifest_path(run_id, storage_root=storage),
-                        manifest,
-                    )
-                    return manifest
-            elif latest_canary.get("status") == "failed":
-                _validate_failure_result(
-                    latest_canary,
-                    suite=suite,
-                    variant=canary,
-                    repetition=1,
-                    attempts=canary_attempts,
-                )
-                if variant_id != canary.variant_id:
-                    manifest["state"] = "canary_failed"
-                    _persist_manifest(
-                        _manifest_path(run_id, storage_root=storage),
-                        manifest,
-                    )
-                    return manifest
-            else:
-                message = "Benchmark canary attempt has an unsupported status."
-                raise ValueError(message)
-        else:
-            canary_submitted = any(
-                record.get("role") == "measure" and record.get("variant_id") == canary.variant_id and record.get("repetitions") == [1]
-                for record in manifest["submission_history"]
-            )
-            if canary_submitted and variant_id != canary.variant_id:
-                manifest["state"] = "canary_failed"
-                _persist_manifest(
-                    _manifest_path(run_id, storage_root=storage),
-                    manifest,
-                )
-                return manifest
-        next_execution: tuple[CoreBenchmarkVariant, int] | None = (canary, 1)
-    else:
-        next_execution = next(
-            (
-                (variant, repetition)
-                for variant, repetition in _measured_sequence(
-                    suite,
-                    variant_id=variant_id,
-                )
-                if repetition in _pending_repetitions(directory, suite, variant)
-            ),
-            None,
-        )
-    if next_execution is None:
-        remaining = sum(len(_pending_repetitions(directory, suite, variant)) for variant in suite.variants)
-        records = _result_records(directory, suite)
-        license_blocked = any(
-            record.get("status") == "pending"
-            and isinstance(record.get("temporary_license_retry"), dict)
-            and record["temporary_license_retry"].get("retry_budget_remaining") is False
-            for record in records
-        )
-        manifest["state"] = "license_blocked" if license_blocked else "complete" if remaining == 0 else "incomplete"
-        _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
-        return manifest
-    variant, repetition = next_execution
+    representative = suite.representative_case(case_position)
     command = build_core_benchmark_slurm_command(
         suite,
         run_id=run_id,
         storage_root=storage,
         log_directory=logs,
-        role="measure",
         variant=variant,
-        repetition=repetition,
+        case_position=case_position,
     )
     submitted_at = _utc_now()
     job_id = _submit(
@@ -2471,13 +2533,226 @@ def _submit_pending(
             "submitted_at": submitted_at,
             "role": "measure",
             "variant_id": variant.variant_id,
-            "repetitions": [repetition],
+            "case_position": case_position,
+            "case_role": representative.case_role,
+            "work_unit_id": suite.work_unit_id(variant, case_position),
             "command": command,
             "job_id": job_id,
         }
     )
-    manifest["state"] = "submitted"
+    manifest["state"] = "running"
     _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
+    return job_id
+
+
+def _submit_pending(
+    manifest: dict[str, Any],
+    suite: CoreBenchmarkSuite,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Submit eligible cases from only the first incomplete variant wave."""
+    run_id = str(manifest["benchmark_run_id"])
+    directory = core_benchmark_directory(run_id, storage_root=storage)
+    manifest_path = _manifest_path(run_id, storage_root=storage)
+    if manifest.get("state") in {"cancel_requested", "force_cancel_requested"}:
+        return manifest
+    logs = directory / "scheduler"
+    logs.mkdir(parents=True, exist_ok=True)
+    persisted_job_ids = [str(value) for value in manifest["measured_job_ids"]]
+    if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted_job_ids):
+        message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
+        raise ValueError(message)
+    scheduler = _scheduler_evidence(persisted_job_ids)
+    if scheduler["squeue"]["error"] is not None:
+        message = f"Could not verify active benchmark jobs before resume: {scheduler['squeue']['error']}"
+        raise RuntimeError(message)
+    active_job_ids = _active_benchmark_job_ids(scheduler)
+    proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
+    if not all(path.is_file() for path in proof_paths):
+        manifest["state"] = "inputs_ready"
+        _persist_manifest(manifest_path, manifest)
+        return manifest
+    proofs = _load_case_proofs(run_id, suite, storage_root=storage)
+    records = _result_records(directory, suite)
+    _validate_records_against_proof(
+        records,
+        run_id=run_id,
+        manifest=manifest,
+        proofs=proofs,
+    )
+    for wave_position, variant in enumerate(suite.variant_wave_order(), start=1):
+        wave_records = [record for record in records if record.get("variant_id") == variant.variant_id]
+        if all(record.get("status") == "success" for record in wave_records):
+            continue
+        exhausted: list[str] = []
+        eligible: list[int] = []
+        blocked = False
+        active = False
+        terminal_without_result = False
+        for case_position in range(1, suite.representative_case_count + 1):
+            representative = suite.representative_case(case_position)
+            record = next(item for item in wave_records if item.get("case_position") == case_position)
+            if record.get("status") == "success":
+                continue
+            attempts = _work_unit_attempts(
+                directory,
+                suite,
+                variant,
+                case_position,
+            )
+            if _scientific_failure_count(attempts) >= suite.maximum_work_unit_attempts:
+                exhausted.append(suite.work_unit_id(variant, case_position))
+                continue
+            latest = _latest_work_unit_submission(
+                manifest,
+                variant_id=variant.variant_id,
+                case_role=representative.case_role,
+            )
+            if latest is not None and str(latest["job_id"]) in active_job_ids:
+                active = True
+                continue
+            wait = _load_benchmark_license_wait(
+                directory,
+                suite,
+                variant,
+                case_position,
+                run_id=run_id,
+            )
+            if wait is not None and (not bool(wait["retry_budget_remaining"]) or not license_service.wait_record_is_eligible(wait)):
+                blocked = True
+                continue
+            if latest is not None and record.get("status") == "pending" and wait is None:
+                if scheduler["sacct"]["error"] is not None:
+                    message = f"Could not reconcile terminal benchmark work through accounting: {scheduler['sacct']['error']}"
+                    raise RuntimeError(message)
+                state = _accounted_root_state(
+                    scheduler,
+                    job_id=str(latest["job_id"]),
+                )
+                if state is None or state in _ACTIVE_SCHEDULER_STATES:
+                    active = True
+                    continue
+                terminal_without_result = True
+                continue
+            eligible.append(case_position)
+        if exhausted or terminal_without_result:
+            manifest["state"] = "canary_failed" if wave_position == 1 else "work_unit_failed"
+            _persist_manifest(manifest_path, manifest)
+            return manifest
+        for case_position in eligible:
+            _submit_benchmark_work_unit(
+                manifest,
+                suite,
+                storage=storage,
+                logs=logs,
+                variant=variant,
+                case_position=case_position,
+            )
+        manifest["state"] = "running" if eligible or active else "license_blocked" if blocked else "running"
+        _persist_manifest(manifest_path, manifest)
+        return manifest
+    manifest["state"] = "complete"
+    _persist_manifest(manifest_path, manifest)
+    return manifest
+
+
+def _prepare_core_benchmark_locked(
+    path: Path | str,
+    plan: Mapping[str, Any],
+    *,
+    storage: Path,
+    scratch_root: Path | str,
+) -> tuple[dict[str, Any], CoreBenchmarkSuite]:
+    """Materialize one manifest and canonical input while submission is locked."""
+    run_id = str(plan["benchmark_run_id"])
+    directory = core_benchmark_directory(run_id, storage_root=storage)
+    manifest_path = directory / "benchmark_manifest.json"
+    if manifest_path.exists():
+        manifest, suite = load_core_benchmark_manifest(
+            run_id,
+            storage_root=storage,
+        )
+        if manifest["state"] in {"cancel_requested", "force_cancel_requested"}:
+            scheduler = _scheduler_evidence(manifest["measured_job_ids"])
+            if scheduler["squeue"]["error"] is not None:
+                message = "Could not verify benchmark cancellation before explicit resume."
+                raise RuntimeError(message)
+            if scheduler["squeue"]["output"]:
+                return manifest, suite
+            manifest["state"] = "incomplete"
+            _persist_manifest(manifest_path, manifest)
+    else:
+        suite = load_core_benchmark_suite(path, require_executable=True)
+        manifest = {
+            "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "benchmark_run_id": run_id,
+            "suite_name": suite.suite_name,
+            "suite_digest": suite.suite_digest,
+            "suite_config": _repository_relative(suite.source_path),
+            "git_commit": plan["git_commit"],
+            "preflight": plan["preflight"],
+            "representative_cases": suite.case_selections(),
+            "variants": _variant_records(suite),
+            "variant_wave_order": plan["variant_wave_order"],
+            "canary_wave": plan["canary_wave"],
+            "measurement_waves": plan["measurement_waves"],
+            "required_successful_measurements": plan["required_successful_measurements"],
+            "resource_contract": suite.resource_contract(),
+            "created_at": _utc_now(),
+            "state": "preparing_inputs",
+            "measured_job_ids": [],
+            "submission_history": [],
+        }
+        _persist_manifest(manifest_path, manifest)
+    proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
+    if not all(path.is_file() for path in proof_paths):
+        try:
+            _materialize_core_benchmark_inputs(
+                run_id,
+                storage_root=storage,
+                work_root=scratch_root,
+            )
+        except Exception:
+            manifest["state"] = "input_preparation_failed"
+            _persist_manifest(manifest_path, manifest)
+            raise
+        manifest["state"] = "inputs_ready"
+        _persist_manifest(manifest_path, manifest)
+    return manifest, suite
+
+
+def prepare_core_benchmark(
+    path: Path | str,
+    *,
+    git_commit: str,
+    storage_root: Path | str,
+    scratch_root: Path | str,
+    comsol_version_output: str,
+    comsol_executable_path: Path | str,
+) -> dict[str, Any]:
+    """Materialize canonical benchmark input without submitting a measurement."""
+    plan = plan_core_benchmark(
+        path,
+        git_commit=git_commit,
+        storage_root=storage_root,
+        scratch_root=scratch_root,
+        comsol_version_output=comsol_version_output,
+        comsol_executable_path=comsol_executable_path,
+    )
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    run_id = str(plan["benchmark_run_id"])
+    directory = core_benchmark_directory(run_id, storage_root=storage)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = directory / "submission.lock"
+    with common.locking.exclusive_file_lock(lock, blocking=False):
+        manifest, _suite = _prepare_core_benchmark_locked(
+            path,
+            plan,
+            storage=storage,
+            scratch_root=scratch_root,
+        )
     return manifest
 
 
@@ -2489,9 +2764,8 @@ def submit_core_benchmark(
     scratch_root: Path | str,
     comsol_version_output: str,
     comsol_executable_path: Path | str,
-    variant_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist benchmark intent and submit isolated measured repetitions."""
+    """Reuse canonical login-node input, then submit one measured work unit."""
     plan = plan_core_benchmark(
         path,
         git_commit=git_commit,
@@ -2499,57 +2773,23 @@ def submit_core_benchmark(
         scratch_root=scratch_root,
         comsol_version_output=comsol_version_output,
         comsol_executable_path=comsol_executable_path,
-        variant_id=variant_id,
     )
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     run_id = str(plan["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     directory.mkdir(parents=True, exist_ok=True)
-    manifest_path = directory / "benchmark_manifest.json"
     lock = directory / "submission.lock"
     with common.locking.exclusive_file_lock(lock, blocking=False):
-        if manifest_path.exists():
-            manifest, suite = load_core_benchmark_manifest(
-                run_id,
-                storage_root=storage,
-            )
-            return _submit_pending(
-                manifest,
-                suite,
-                storage=storage,
-                variant_id=variant_id,
-            )
-        if variant_id is not None:
-            message = f"Explicit benchmark --variant retry requires an existing standalone run; no manifest exists for {run_id}."
-            raise FileNotFoundError(message)
-        suite = load_core_benchmark_suite(path, require_executable=True)
-        manifest = {
-            "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
-            "schema_version": BENCHMARK_SCHEMA_VERSION,
-            "benchmark_run_id": run_id,
-            "suite_name": suite.suite_name,
-            "suite_digest": suite.suite_digest,
-            "suite_config": _repository_relative(suite.source_path),
-            "git_commit": plan["git_commit"],
-            "preflight": plan["preflight"],
-            "case": suite.case_selection(),
-            "repetitions": suite.repetitions,
-            "variants": _variant_records(suite),
-            "canary": plan["canary"],
-            "measurement_order": plan["measurement_order"],
-            "resource_contract": suite.resource_contract(),
-            "created_at": _utc_now(),
-            "state": "submitting",
-            "preparation_job_ids": [],
-            "measured_job_ids": [],
-            "submission_history": [],
-        }
-        _persist_manifest(manifest_path, manifest)
+        manifest, suite = _prepare_core_benchmark_locked(
+            path,
+            plan,
+            storage=storage,
+            scratch_root=scratch_root,
+        )
         return _submit_pending(
             manifest,
             suite,
             storage=storage,
-            variant_id=variant_id,
         )
 
 
@@ -2557,9 +2797,8 @@ def resume_core_benchmark(
     run_id: str,
     *,
     storage_root: Path | str,
-    variant_id: str | None = None,
 ) -> dict[str, Any]:
-    """Submit only repetitions without successful immutable evidence."""
+    """Repair missing input readiness and submit the next measured work unit."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest_path = _manifest_path(run_id, storage_root=storage)
     lock = manifest_path.parent / "submission.lock"
@@ -2569,26 +2808,67 @@ def resume_core_benchmark(
             storage_root=storage,
         )
         _require_current_checkout(manifest)
+        proof_paths = tuple(_canonical_case_proof_path(manifest_path.parent, representative) for representative in suite.representative_cases)
+        if not all(path.is_file() for path in proof_paths):
+            preflight = _load_core_benchmark_preflight(
+                run_id,
+                suite=suite,
+                git_commit=str(manifest["git_commit"]),
+                storage_root=storage,
+            )
+            scratch = _mapping(
+                _mapping(
+                    preflight["storage_capabilities"],
+                    label="benchmark preflight storage capabilities",
+                )["scratch"],
+                label="benchmark preflight scratch capability",
+            )
+            try:
+                _materialize_core_benchmark_inputs(
+                    run_id,
+                    storage_root=storage,
+                    work_root=Path(str(scratch["path"])),
+                )
+            except Exception:
+                manifest["state"] = "input_preparation_failed"
+                _persist_manifest(manifest_path, manifest)
+                raise
+            manifest["state"] = "inputs_ready"
+            _persist_manifest(manifest_path, manifest)
         return _submit_pending(
             manifest,
             suite,
             storage=storage,
-            variant_id=variant_id,
         )
+
+
+def _canonical_case_proof_path(
+    directory: Path,
+    representative: CoreBenchmarkRepresentativeCase,
+) -> Path:
+    """Return one immutable representative-case proof path."""
+    return directory / "canonical_cases" / f"{representative.case_role}.json"
 
 
 def _proof_payload(
     suite: CoreBenchmarkSuite,
+    representative: CoreBenchmarkRepresentativeCase,
     prepared: preparation_service.PreparedCase,
+    *,
+    canonical_input_preparation_seconds: float,
 ) -> dict[str, Any]:
-    """Return the exact scientific byte identity shared by every measured run."""
+    """Return one exact scientific byte identity reused across all core waves."""
+    if not math.isfinite(canonical_input_preparation_seconds) or canonical_input_preparation_seconds < 0.0:
+        message = "Canonical benchmark input preparation timing is invalid."
+        raise ValueError(message)
     case = prepared.bundle.case_payload
     return {
         "schema_kind": BENCHMARK_PROOF_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "suite_digest": suite.suite_digest,
+        "case_role": representative.case_role,
         "case_id": prepared.bundle.case_id,
-        "case_index": suite.case_index,
+        "case_index": representative.case_index,
         "case_input_id": prepared.bundle.case_input_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "scientific_config_digest": case["scientific_config_digest"],
@@ -2600,6 +2880,7 @@ def _proof_payload(
         "input_files": case["input_files"],
         "case_payload_sha256": common.serialization.canonical_json_sha256(case),
         "template": case["template"],
+        "canonical_input_preparation_seconds": canonical_input_preparation_seconds,
     }
 
 
@@ -2619,55 +2900,97 @@ def _cleanup_prepared(
     )
 
 
-def prepare_core_benchmark_case(
+def _materialize_core_benchmark_inputs(
     run_id: str,
     *,
     storage_root: Path | str,
     work_root: Path | str,
-) -> Path:
-    """Materialize on a CPU node and publish the canonical same-case proof."""
+) -> tuple[Path, ...]:
+    """Materialize both canonical inputs on the CPU login node."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
     _require_current_checkout(manifest)
     if source_service.required_git_commit() != manifest["git_commit"]:
         message = "Benchmark preparation checkout does not match the launch commit."
         raise RuntimeError(message)
-    prepared: preparation_service.PreparedCase | None = None
-    try:
-        prepared = preparation_service.prepare_case_work_directory(
+    directory = core_benchmark_directory(run_id, storage_root=storage)
+    paths: list[Path] = []
+    for case_position in range(1, suite.representative_case_count + 1):
+        representative = suite.representative_case(case_position)
+        path = _canonical_case_proof_path(directory, representative)
+        if path.is_file():
+            _load_case_proof(
+                run_id,
+                suite,
+                case_position,
+                storage_root=storage,
+            )
+            paths.append(path)
+            continue
+        preparation_start = time.monotonic()
+        input_service.generate_input_cases(
             suite.case_config,
-            suite.case_index,
+            1,
+            case_start=representative.case_index,
             storage_root=storage,
-            work_root=work_root,
         )
-        proof = _proof_payload(suite, prepared)
-        path = core_benchmark_directory(run_id, storage_root=storage) / "canonical_case.json"
-        _write_immutable_json(path, proof, label="benchmark canonical-case proof")
-        return path
-    finally:
-        if prepared is not None:
-            _cleanup_prepared(prepared, storage=storage)
+        prepared: preparation_service.PreparedCase | None = None
+        try:
+            prepared = preparation_service.prepare_case_work_directory(
+                suite.case_config,
+                representative.case_index,
+                storage_root=storage,
+                work_root=work_root,
+            )
+            proof = _proof_payload(
+                suite,
+                representative,
+                prepared,
+                canonical_input_preparation_seconds=(time.monotonic() - preparation_start),
+            )
+            _write_immutable_json(
+                path,
+                proof,
+                label=f"benchmark canonical-case proof {representative.case_role}",
+            )
+            paths.append(path)
+        finally:
+            if prepared is not None:
+                _cleanup_prepared(prepared, storage=storage)
+    return tuple(paths)
 
 
 def _load_case_proof(
     run_id: str,
     suite: CoreBenchmarkSuite,
+    case_position: int,
     *,
     storage_root: Path | str,
 ) -> dict[str, Any]:
-    """Load and validate the CPU-materialized canonical input proof."""
-    path = core_benchmark_directory(run_id, storage_root=storage_root) / "canonical_case.json"
+    """Load and validate one CPU-materialized representative-case proof."""
+    representative = suite.representative_case(case_position)
+    path = _canonical_case_proof_path(
+        core_benchmark_directory(run_id, storage_root=storage_root),
+        representative,
+    )
     proof = _load_json(path, label="benchmark canonical-case proof")
     template = proof.get("template")
+    preparation_seconds = proof.get("canonical_input_preparation_seconds")
     if (
         proof.get("schema_kind") != BENCHMARK_PROOF_SCHEMA_KIND
         or proof.get("schema_version") != BENCHMARK_SCHEMA_VERSION
         or proof.get("suite_digest") != suite.suite_digest
-        or proof.get("case_index") != suite.case_index
+        or proof.get("case_role") != representative.case_role
+        or proof.get("case_index") != representative.case_index
+        or proof.get("case_id") != suite.case_config.case_id(representative.case_index)
         or proof.get("scientific_config_digest") != suite.case_config.scientific_config_digest
         or proof.get("case_input_config_digest") != suite.case_config.case_input_config_digest
         or not isinstance(template, dict)
         or template.get("sha256") != suite.case_config.template_sha256
+        or isinstance(preparation_seconds, bool)
+        or not isinstance(preparation_seconds, (int, float))
+        or not math.isfinite(float(preparation_seconds))
+        or float(preparation_seconds) < 0.0
     ):
         message = f"Benchmark canonical-case proof is invalid: {path}"
         raise ValueError(message)
@@ -2688,131 +3011,256 @@ def _measured_submission(
     *,
     job_id: str,
     variant_id: str,
-    repetition: int,
+    case_role: str,
 ) -> Mapping[str, Any]:
-    """Return the one persisted submission record for the current measured job."""
+    """Return the persisted submission for one exact case-role work unit."""
     matches = [
         record
         for record in manifest["submission_history"]
         if record.get("role") == "measure"
         and record.get("job_id") == job_id
         and record.get("variant_id") == variant_id
-        and record.get("repetitions") == [repetition]
+        and record.get("case_role") == case_role
     ]
     if len(matches) != 1:
-        message = "Current benchmark job is not bound to this exact repetition."
+        message = "Current benchmark job is not bound to this exact case-role work unit."
         raise RuntimeError(message)
     return matches[0]
 
 
-def run_core_benchmark_repetition(
+def _benchmark_peak_child_memory_bytes() -> int:
+    """Return Linux child-process peak resident memory in bytes."""
+    peak_kibibytes = resource_usage.getrusage(resource_usage.RUSAGE_CHILDREN).ru_maxrss
+    if not math.isfinite(float(peak_kibibytes)) or peak_kibibytes < 0:
+        message = "Benchmark child-process peak memory evidence is invalid."
+        raise RuntimeError(message)
+    return int(peak_kibibytes * 1024)
+
+
+def _benchmark_scratch_bytes(directory: Path) -> int:
+    """Return regular-file bytes in one symlink-free benchmark workspace."""
+    total = 0
+    for candidate in directory.rglob("*"):
+        if candidate.is_symlink():
+            message = f"Benchmark scratch contains a symbolic link: {candidate}"
+            raise RuntimeError(message)
+        if candidate.is_file():
+            total += candidate.stat().st_size
+    return total
+
+
+def _bounded_solver_log(path: Path) -> dict[str, Any]:
+    """Return a digest and bounded excerpt without retaining the full solver log."""
+    if not path.is_file() or path.is_symlink():
+        message = f"Benchmark solver log is missing or unsafe: {path}"
+        raise FileNotFoundError(message)
+    raw = path.read_bytes()
+    excerpt = raw[:_MAX_BENCHMARK_LOG_EXCERPT_BYTES].decode(
+        "utf-8",
+        errors="replace",
+    )
+    return {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": len(raw),
+        "excerpt": excerpt,
+        "excerpt_truncated": len(raw) > _MAX_BENCHMARK_LOG_EXCERPT_BYTES,
+    }
+
+
+def _successful_license_evidence(wait: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return compact license evidence while letting success remain authoritative."""
+    if wait is None:
+        return {
+            "license_blocked_submission_count": 0,
+            "license_wait_seconds": 0.0,
+            "license_probe_seconds": 0.0,
+            "scheduler_queue_seconds_before_success": 0.0,
+            "detected_feature": None,
+            "detected_error_code": None,
+            "matched_signatures": [],
+            "raw_excerpt": None,
+            "successful_artifacts_override_prior_warning": True,
+        }
+    return {
+        "license_blocked_submission_count": int(wait["retry_count"]),
+        "license_wait_seconds": float(wait["cumulative_wait_seconds"]),
+        "license_probe_seconds": float(wait["cumulative_probe_seconds"]),
+        "scheduler_queue_seconds_before_success": float(wait["cumulative_scheduler_queue_seconds"]),
+        "detected_feature": wait["feature"],
+        "detected_error_code": wait["error_code"],
+        "matched_signatures": list(wait["matched_signatures"]),
+        "raw_excerpt": wait["raw_excerpt"],
+        "successful_artifacts_override_prior_warning": True,
+    }
+
+
+def _total_controller_elapsed_seconds(
+    manifest: Mapping[str, Any],
+    *,
+    variant_id: str,
+    case_role: str,
+    completion_time: str,
+) -> float:
+    """Measure from the first submission through terminal successful evidence."""
+    submissions = [
+        _timestamp(record["submitted_at"], label="benchmark submitted_at")
+        for record in manifest["submission_history"]
+        if record.get("role") == "measure" and record.get("variant_id") == variant_id and record.get("case_role") == case_role
+    ]
+    if not submissions:
+        message = "Benchmark work unit lacks a persisted submission timestamp."
+        raise RuntimeError(message)
+    completed = _timestamp(completion_time, label="benchmark completion_time")
+    elapsed = (completed - min(submissions)).total_seconds()
+    if elapsed < 0.0:
+        message = "Benchmark controller elapsed timing is negative."
+        raise RuntimeError(message)
+    return elapsed
+
+
+def run_core_benchmark_case(
     run_id: str,
     variant_id: str,
-    repetition: int,
+    case_role: str,
     *,
     storage_root: Path | str,
     work_root: Path | str,
 ) -> dict[str, Any]:
-    """Materialize, identity-check, solve, admit, record, and clean one repetition."""
+    """Run one case-role measurement and retain compact performance evidence."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
     _require_current_checkout(manifest)
     start_time = _slurm_scheduler_start_time()
     variant = suite.variant(variant_id)
-    repetition_id = suite.repetition_id(variant, repetition)
+    case_position = suite.case_position(case_role)
+    representative = suite.representative_case(case_position)
+    work_unit_id = suite.work_unit_id(variant, case_position)
     if source_service.required_git_commit() != manifest["git_commit"]:
         message = "Benchmark worker checkout does not match the launch commit."
         raise RuntimeError(message)
     allocated_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     job_id = os.environ.get("SLURM_JOB_ID")
     if job_id is None or _JOB_ID_PATTERN.fullmatch(job_id) is None:
-        message = "Benchmark repetition requires one numeric SLURM_JOB_ID."
+        message = "Benchmark case work unit requires one numeric SLURM_JOB_ID."
         raise RuntimeError(message)
     submission = _measured_submission(
         manifest,
         job_id=job_id,
         variant_id=variant.variant_id,
-        repetition=repetition,
+        case_role=representative.case_role,
     )
     submit_time = str(submission["submitted_at"])
     if allocated_cpus is None or not allocated_cpus.isdigit() or int(allocated_cpus) != variant.cores_per_case:
         message = f"Benchmark Slurm allocation must exactly match cores_per_case; requested={variant.cores_per_case}, allocated={allocated_cpus!r}."
         raise RuntimeError(message)
-    proof = _load_case_proof(run_id, suite, storage_root=storage)
+    proof = _load_case_proof(
+        run_id,
+        suite,
+        case_position,
+        storage_root=storage,
+    )
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    repetition_directory = directory / "runs" / suite.execution_id(variant) / repetition_id
-    repetition_directory.mkdir(parents=True, exist_ok=True)
-    success_path = repetition_directory / "success.json"
-    lock_path = repetition_directory / "execution.lock"
+    work_unit_directory = directory / "runs" / suite.execution_id(variant) / work_unit_id
+    work_unit_directory.mkdir(parents=True, exist_ok=True)
+    success_path = work_unit_directory / "success.json"
+    lock_path = work_unit_directory / "execution.lock"
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        attempts = tuple(sorted(repetition_directory.glob("attempt-*.json")))
+        attempts = tuple(sorted(work_unit_directory.glob("attempt-*.json")))
         _validate_benchmark_attempt_chain(attempts)
         if success_path.exists():
             existing_success = _load_json(
                 success_path,
-                label="benchmark repetition success",
+                label="benchmark case success",
             )
             _validate_success_result(
                 existing_success,
                 suite=suite,
                 variant=variant,
-                repetition=repetition,
+                case_position=case_position,
             )
             return existing_success
         attempt_number = len(attempts) + 1
         previous_attempt = _benchmark_previous_attempt_reference(attempts)
-        _, prior_license_wait_seconds, _ = _validated_benchmark_license_retry_history(
-            suite.case_config,
-            attempts,
-            repetition_label=repetition_id,
+        prior_wait = _load_benchmark_license_wait(
+            directory,
+            suite,
+            variant,
+            case_position,
+            run_id=run_id,
         )
-        attempt_path = repetition_directory / f"attempt-{attempt_number:04d}.json"
+        license_evidence = _successful_license_evidence(prior_wait)
+        attempt_path = work_unit_directory / f"attempt-{attempt_number:04d}.json"
         prepared: preparation_service.PreparedCase | None = None
-        total_start = time.monotonic()
-        materialization_start = total_start
-        materialization_s: float | None = None
+        solver_start: float | None = None
         success: dict[str, Any]
         try:
             prepared = preparation_service.prepare_case_work_directory(
                 suite.case_config,
-                suite.case_index,
+                representative.case_index,
                 storage_root=storage,
                 work_root=work_root,
             )
-            materialization_s = time.monotonic() - materialization_start
-            actual_proof = _proof_payload(suite, prepared)
+            actual_proof = _proof_payload(
+                suite,
+                representative,
+                prepared,
+                canonical_input_preparation_seconds=float(proof["canonical_input_preparation_seconds"]),
+            )
             _validate_materialized_case_proof(actual_proof, proof)
+            solver_start = time.monotonic()
             result = runtime_service.execute_prepared_case(
                 suite.case_config,
                 prepared,
                 cores_per_case=variant.cores_per_case,
-                worker_slot=0,
+                worker_slot=case_position - 1,
                 scheduler_kind="slurm",
                 allocated_node=os.environ.get(
                     "SLURMD_NODENAME",
                     socket.gethostname(),
                 ),
             )
-            admission_start = time.monotonic()
+            publication_start = time.monotonic()
             hdf5_identity = storage_service.validate_case_hdf5(
                 result.canonical_case.path,
                 expected_profile=profiles.TRANSIENT_DRYING_PROFILE,
             )
-            hdf5_admission_s = time.monotonic() - admission_start
+            publication_seconds = time.monotonic() - publication_start
             _validate_hdf5_scientific_identity(hdf5_identity, proof)
             command_np = result.command[result.command.index("-np") + 1]
             completion_time = _utc_now()
+            scheduler_timing = _scheduler_timing(
+                submit_time=submit_time,
+                start_time=start_time,
+                completion_time=completion_time,
+            )
+            scheduler_queue_seconds = float(scheduler_timing["queue_wait_s"]) + float(license_evidence["scheduler_queue_seconds_before_success"])
+            timings = {
+                "scheduler_queue_seconds": scheduler_queue_seconds,
+                "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
+                "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
+                "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
+                "comsol_process_seconds": float(result.timing["runtime_s"]),
+                "export_conversion_seconds": float(result.timing["export_conversion_s"]),
+                "publication_seconds": publication_seconds,
+                "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(
+                    manifest,
+                    variant_id=variant.variant_id,
+                    case_role=representative.case_role,
+                    completion_time=completion_time,
+                ),
+            }
             success = {
                 "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
                 "schema_version": BENCHMARK_SCHEMA_VERSION,
                 "status": "success",
-                "recorded_at": _utc_now(),
+                "recorded_at": completion_time,
                 "benchmark_run_id": run_id,
                 "suite_digest": suite.suite_digest,
                 "variant_id": variant.variant_id,
                 "execution_id": suite.execution_id(variant),
-                "repetition": repetition,
-                "repetition_id": repetition_id,
+                "case_position": case_position,
+                "case_role": representative.case_role,
+                "work_unit_id": work_unit_id,
                 "attempt": attempt_number,
                 "previous_attempt": previous_attempt,
                 "git_commit": manifest["git_commit"],
@@ -2823,26 +3271,26 @@ def run_core_benchmark_repetition(
                 "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
                 "cores_per_case": variant.cores_per_case,
                 "resource": {
-                    "node": os.environ.get("SLURMD_NODENAME", socket.gethostname()),
+                    "node": os.environ.get(
+                        "SLURMD_NODENAME",
+                        socket.gethostname(),
+                    ),
                     "partition": os.environ.get("SLURM_JOB_PARTITION", suite.partition),
                     "requested_cpus": variant.cores_per_case,
                     "allocated_cpus": int(allocated_cpus),
                     "comsol_np": int(command_np),
                     "slurm_job_id": job_id,
+                    "peak_memory_bytes": _benchmark_peak_child_memory_bytes(),
+                    "peak_scratch_bytes": int(result.timing["scratch_peak_bytes"]),
                 },
-                "scheduler_timing": _scheduler_timing(
-                    submit_time=submit_time,
-                    start_time=start_time,
-                    completion_time=completion_time,
-                ),
-                "timings_s": {
-                    "case_materialization": materialization_s,
-                    "comsol_process": float(result.timing["runtime_s"]),
-                    "export_conversion": float(result.timing["export_conversion_s"]),
-                    "hdf5_admission": hdf5_admission_s,
-                    "complete_case": time.monotonic() - total_start,
-                    "license_wait_seconds": prior_license_wait_seconds,
+                "scheduler_timing": scheduler_timing,
+                "solver_interval": {
+                    "started_at": result.timing["started_at"],
+                    "ended_at": result.timing["ended_at"],
                 },
+                "timings_seconds": timings,
+                "license": license_evidence,
+                "solver_log": _bounded_solver_log(result.solver_log),
                 "hdf5": {
                     "sha256": common.serialization.file_sha256(result.canonical_case.path),
                     "size_bytes": result.canonical_case.path.stat().st_size,
@@ -2854,32 +3302,46 @@ def run_core_benchmark_repetition(
             _write_immutable_json(
                 success_path,
                 success,
-                label="benchmark repetition success",
+                label="benchmark case success",
             )
         except BaseException as error:
             completion_time = _utc_now()
-            retry_metadata = None
+            scheduler_timing = _scheduler_timing(
+                submit_time=submit_time,
+                start_time=start_time,
+                completion_time=completion_time,
+            )
             if isinstance(
                 error,
                 license_service.TemporaryLicenseCapacityError,
             ) and bool(suite.case_config.execution_values["runtime"]["temporary_license_retry"]["enabled"]):
-                retry_metadata = _benchmark_license_retry_metadata(
-                    suite.case_config,
-                    attempts,
-                    error.evidence,
-                    recorded_at=completion_time,
+                if solver_start is None:
+                    message = "Temporary license capacity was reported before solver launch."
+                    raise RuntimeError(message) from error
+                _record_benchmark_license_wait(
+                    directory,
+                    suite,
+                    variant,
+                    case_position,
+                    error,
+                    run_id=run_id,
+                    job_id=job_id,
+                    license_probe_seconds=time.monotonic() - solver_start,
+                    scheduler_queue_seconds=float(scheduler_timing["queue_wait_s"]),
                 )
+                raise
             failure = {
                 "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
                 "schema_version": BENCHMARK_SCHEMA_VERSION,
-                "status": ("pending" if retry_metadata is not None else "failed"),
+                "status": "failed",
                 "recorded_at": completion_time,
                 "benchmark_run_id": run_id,
                 "suite_digest": suite.suite_digest,
                 "variant_id": variant.variant_id,
                 "execution_id": suite.execution_id(variant),
-                "repetition": repetition,
-                "repetition_id": repetition_id,
+                "case_position": case_position,
+                "case_role": representative.case_role,
+                "work_unit_id": work_unit_id,
                 "attempt": attempt_number,
                 "previous_attempt": previous_attempt,
                 "git_commit": manifest["git_commit"],
@@ -2890,30 +3352,37 @@ def run_core_benchmark_repetition(
                 "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
                 "cores_per_case": variant.cores_per_case,
                 "resource": {
-                    "node": os.environ.get("SLURMD_NODENAME", socket.gethostname()),
+                    "node": os.environ.get(
+                        "SLURMD_NODENAME",
+                        socket.gethostname(),
+                    ),
                     "partition": os.environ.get("SLURM_JOB_PARTITION", suite.partition),
                     "requested_cpus": variant.cores_per_case,
                     "allocated_cpus": int(allocated_cpus),
                     "comsol_np": variant.cores_per_case,
                     "slurm_job_id": job_id,
+                    "peak_memory_bytes": _benchmark_peak_child_memory_bytes(),
+                    "peak_scratch_bytes": (0 if prepared is None else _benchmark_scratch_bytes(prepared.work_directory)),
                 },
-                "scheduler_timing": _scheduler_timing(
-                    submit_time=submit_time,
-                    start_time=start_time,
-                    completion_time=completion_time,
-                ),
-                "timings_s": {
-                    "case_materialization": materialization_s,
-                    "complete_case": time.monotonic() - total_start,
-                    "license_wait_seconds": prior_license_wait_seconds,
+                "scheduler_timing": scheduler_timing,
+                "timings_seconds": {
+                    "scheduler_queue_seconds": float(scheduler_timing["queue_wait_s"])
+                    + float(license_evidence["scheduler_queue_seconds_before_success"]),
+                    "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
+                    "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
+                    "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
+                    "comsol_process_seconds": None,
+                    "export_conversion_seconds": None,
+                    "publication_seconds": 0.0,
+                    "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(
+                        manifest,
+                        variant_id=variant.variant_id,
+                        case_role=representative.case_role,
+                        completion_time=completion_time,
+                    ),
                 },
-                "error": {
-                    "type": type(error).__name__,
-                    "message": str(error),
-                },
+                "error": {"type": type(error).__name__, "message": str(error)},
             }
-            if retry_metadata is not None:
-                failure["temporary_license_retry"] = retry_metadata
             if not attempt_path.exists():
                 _write_immutable_json(
                     attempt_path,
@@ -2931,38 +3400,73 @@ def _result_records(
     directory: Path,
     suite: CoreBenchmarkSuite,
 ) -> list[dict[str, Any]]:
-    """Return one latest terminal-or-pending record per configured repetition."""
+    """Return one latest terminal-or-pending record per configured case_position."""
     records: list[dict[str, Any]] = []
     for variant in suite.variants:
-        for repetition in range(1, suite.repetitions + 1):
-            repetition_id = suite.repetition_id(variant, repetition)
-            repetition_directory = directory / "runs" / suite.execution_id(variant) / repetition_id
-            success_path = repetition_directory / "success.json"
+        for case_position in range(1, suite.representative_case_count + 1):
+            work_unit_id = suite.work_unit_id(variant, case_position)
+            work_unit_directory = directory / "runs" / suite.execution_id(variant) / work_unit_id
+            success_path = work_unit_directory / "success.json"
             if success_path.is_file():
                 record = _load_json(
                     success_path,
-                    label="benchmark repetition success",
+                    label="benchmark case_position success",
                 )
                 _validate_success_result(
                     record,
                     suite=suite,
                     variant=variant,
-                    repetition=repetition,
+                    case_position=case_position,
                 )
                 records.append(record)
                 continue
-            attempts = tuple(sorted(repetition_directory.glob("attempt-*.json")))
-            if attempts:
-                attempt = _load_json(
+            attempts = tuple(sorted(work_unit_directory.glob("attempt-*.json")))
+            wait = _load_benchmark_license_wait(
+                directory,
+                suite,
+                variant,
+                case_position,
+                run_id=directory.name,
+            )
+            attempt = (
+                None
+                if not attempts
+                else _load_json(
                     attempts[-1],
-                    label="benchmark repetition attempt",
+                    label="benchmark case_position attempt",
                 )
+            )
+            if wait is not None and (
+                attempt is None
+                or _benchmark_wait_timestamp(
+                    wait["last_blocked_at"],
+                    label="last_blocked_at",
+                )
+                > _benchmark_wait_timestamp(
+                    attempt["recorded_at"],
+                    label="attempt recorded_at",
+                )
+            ):
+                records.append(
+                    {
+                        "status": "pending",
+                        "variant_id": variant.variant_id,
+                        "execution_id": suite.execution_id(variant),
+                        "case_position": case_position,
+                        "case_role": suite.representative_case(case_position).case_role,
+                        "work_unit_id": work_unit_id,
+                        "cores_per_case": variant.cores_per_case,
+                        "temporary_license_retry": wait,
+                    }
+                )
+                continue
+            if attempt is not None:
                 if attempt.get("status") == "failed":
                     _validate_failure_result(
                         attempt,
                         suite=suite,
                         variant=variant,
-                        repetition=repetition,
+                        case_position=case_position,
                         attempts=attempts,
                     )
                     records.append(attempt)
@@ -2972,18 +3476,8 @@ def _result_records(
                         attempt,
                         suite=suite,
                         variant=variant,
-                        repetition=repetition,
+                        case_position=case_position,
                     )
-                elif attempt.get("status") == "pending":
-                    _validate_pending_license_result(
-                        attempt,
-                        suite=suite,
-                        variant=variant,
-                        repetition=repetition,
-                        attempts=attempts,
-                    )
-                    records.append(attempt)
-                    continue
                 else:
                     message = f"Benchmark attempt has an unsupported status: {attempts[-1]}"
                     raise ValueError(message)
@@ -2992,12 +3486,34 @@ def _result_records(
                     "status": "pending",
                     "variant_id": variant.variant_id,
                     "execution_id": suite.execution_id(variant),
-                    "repetition": repetition,
-                    "repetition_id": repetition_id,
+                    "case_position": case_position,
+                    "case_role": suite.representative_case(case_position).case_role,
+                    "work_unit_id": work_unit_id,
                     "cores_per_case": variant.cores_per_case,
                 }
             )
     return records
+
+
+def _load_case_proofs(
+    run_id: str,
+    suite: CoreBenchmarkSuite,
+    *,
+    storage_root: Path | str,
+) -> dict[str, dict[str, Any]]:
+    """Load both canonical proofs keyed by exact representative-case role."""
+    return {
+        representative.case_role: _load_case_proof(
+            run_id,
+            suite,
+            case_position,
+            storage_root=storage_root,
+        )
+        for case_position, representative in enumerate(
+            suite.representative_cases,
+            start=1,
+        )
+    }
 
 
 def _validate_records_against_proof(
@@ -3005,24 +3521,51 @@ def _validate_records_against_proof(
     *,
     run_id: str,
     manifest: Mapping[str, Any],
-    proof: Mapping[str, Any],
+    proofs: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    """Bind every terminal attempt to the canonical case, source, and run."""
-    expected = {
-        "benchmark_run_id": run_id,
-        "git_commit": manifest["git_commit"],
-        "case_input_id": proof["case_input_id"],
-        "simulation_case_id": proof["simulation_case_id"],
-        "scientific_config_digest": proof["scientific_config_digest"],
-        "template_sha256": proof["template"]["sha256"],
-        "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
-    }
+    """Bind each terminal result to its exact nominal or natural proof."""
+    if set(proofs) != {item.case_role for item in manifest_case_roles(manifest)}:
+        message = "Benchmark canonical proof roles do not match the run manifest."
+        raise ValueError(message)
     for record in records:
         if record.get("status") == "pending" and "benchmark_run_id" not in record:
             continue
-        if any(record.get(key) != value for key, value in expected.items()):
-            message = f"Benchmark result is not bound to the canonical proof: {record.get('repetition_id')!r}."
+        case_role = record.get("case_role")
+        proof = proofs.get(str(case_role))
+        if proof is None:
+            message = f"Benchmark result has an unknown representative case role: {case_role!r}."
             raise ValueError(message)
+        expected = {
+            "benchmark_run_id": run_id,
+            "git_commit": manifest["git_commit"],
+            "case_role": case_role,
+            "case_input_id": proof["case_input_id"],
+            "simulation_case_id": proof["simulation_case_id"],
+            "scientific_config_digest": proof["scientific_config_digest"],
+            "template_sha256": proof["template"]["sha256"],
+            "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
+        }
+        if any(record.get(key) != value for key, value in expected.items()):
+            message = f"Benchmark result is not bound to the canonical proof: {record.get('work_unit_id')!r}."
+            raise ValueError(message)
+
+
+def manifest_case_roles(
+    manifest: Mapping[str, Any],
+) -> tuple[CoreBenchmarkRepresentativeCase, ...]:
+    """Return minimal typed case roles from an already-admitted run manifest."""
+    values = manifest["representative_cases"]
+    if not isinstance(values, list):
+        message = "Benchmark manifest representative_cases is malformed."
+        raise TypeError(message)
+    return tuple(
+        CoreBenchmarkRepresentativeCase(
+            case_role=str(value["case_role"]),
+            case_index=int(value["case_index"]),
+        )
+        for value in values
+        if isinstance(value, dict)
+    )
 
 
 def _production_interpretation(suite: CoreBenchmarkSuite) -> dict[str, Any]:
@@ -3047,201 +3590,315 @@ def _production_interpretation(suite: CoreBenchmarkSuite) -> dict[str, Any]:
         "campaign_config": _repository_relative(suite.production_campaign_path),
         "campaign_total_cases": campaign.total_case_count,
         "current_production_cores_per_case": cores,
+        "current_estimated_cases_per_node": suite.cores_per_node // cores,
+        "current_max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
         "cores_config": _repository_relative(suite.production_cores_config_path),
         "cores_key": suite.production_cores_key,
     }
+
+
+def _solver_overlap_metrics(
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[int, bool]:
+    """Return peak successful solver concurrency and two-case overlap."""
+    intervals = [
+        (
+            _timestamp(record["solver_interval"]["started_at"], label="solver started_at"),
+            _timestamp(record["solver_interval"]["ended_at"], label="solver ended_at"),
+        )
+        for record in records
+    ]
+    if not intervals:
+        return 0, False
+    peak = max(sum(start <= instant < end for start, end in intervals) for instant in (start for start, _end in intervals))
+    overlapped = len(intervals) == len(_BENCHMARK_REPRESENTATIVE_CASE_ROLES) and max(intervals[0][0], intervals[1][0]) < min(
+        intervals[0][1], intervals[1][1]
+    )
+    return max(1, peak), overlapped
+
+
+def _projected_resource_feasibility(
+    estimate: int,
+    limit: int | None,
+) -> str:
+    """Classify one projected node resource against an authoritative limit."""
+    if limit is None:
+        return "operator_review_required"
+    return "pass" if estimate <= limit else "fail"
+
+
+def _variant_resource_feasibility(memory: str, scratch: str) -> str:
+    """Combine independent memory and scratch feasibility classifications."""
+    if "fail" in {memory, scratch}:
+        return "fail"
+    if "operator_review_required" in {memory, scratch}:
+        return "operator_review_required"
+    return "pass"
+
+
+def _ordered_unique_text(values: Sequence[object]) -> list[str]:
+    """Return non-empty text values once in stable encounter order."""
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value or value in result:
+            continue
+        result.append(value)
+    return result
 
 
 def summarize_core_benchmark_results(
     suite: CoreBenchmarkSuite,
     records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Calculate latency, timing, scaling, and core-hour recommendation metrics."""
-    expected_count = len(suite.variants) * suite.repetitions
+    """Calculate separated runtime, throughput, resource, and license metrics."""
+    expected_count = len(suite.variants) * suite.representative_case_count
     if len(records) != expected_count:
-        message = f"Benchmark summary requires {expected_count} repetition records, got {len(records)}."
+        message = f"Benchmark summary requires {expected_count} work-unit records, got {len(records)}."
         raise ValueError(message)
     production = _production_interpretation(suite)
-    campaign_cases = int(production["campaign_total_cases"])
     by_variant: list[dict[str, Any]] = []
     for variant in suite.variants:
         selected = [record for record in records if record.get("variant_id") == variant.variant_id]
-        if len(selected) != suite.repetitions:
-            message = f"Benchmark records do not cover every repetition for {variant.variant_id!r}."
+        if len(selected) != suite.representative_case_count:
+            message = f"Benchmark records do not cover both cases for {variant.variant_id!r}."
             raise ValueError(message)
         successes = [record for record in selected if record.get("status") == "success"]
-        failed = [record for record in selected if record.get("status") == "failed"]
+        failures = [record for record in selected if record.get("status") == "failed"]
         pending = [record for record in selected if record.get("status") == "pending"]
-        solve_times = [float(record["timings_s"]["comsol_process"]) for record in successes]
-        total_times = [float(record["timings_s"]["complete_case"]) for record in successes]
-        queue_waits = [float(record["scheduler_timing"]["queue_wait_s"]) for record in successes]
-        turnarounds = [float(record["scheduler_timing"]["turnaround_s"]) for record in successes]
-        all_values = [*solve_times, *total_times, *queue_waits, *turnarounds]
-        if any(not math.isfinite(value) or value < 0.0 for value in all_values) or any(value <= 0.0 for value in solve_times):
-            message = f"Benchmark summary received invalid timings for {variant.variant_id!r}."
+        solve_times = [float(record["timings_seconds"]["comsol_process_seconds"]) for record in successes]
+        if any(not math.isfinite(value) or value <= 0.0 for value in solve_times):
+            message = f"Benchmark summary received invalid successful COMSOL timings for {variant.variant_id!r}."
             raise ValueError(message)
+        queue_wait = sum(float(record["timings_seconds"]["scheduler_queue_seconds"]) for record in successes)
+        license_wait = sum(float(record["timings_seconds"]["license_wait_seconds"]) for record in successes)
+        license_probe = sum(float(record["timings_seconds"]["license_probe_seconds"]) for record in successes)
+        conversion = sum(float(record["timings_seconds"]["export_conversion_seconds"]) for record in successes)
+        publication = sum(float(record["timings_seconds"]["publication_seconds"]) for record in successes)
+        preparation = sum(float(record["timings_seconds"]["canonical_input_preparation_seconds"]) for record in successes)
+        controller_elapsed = sum(float(record["timings_seconds"]["total_controller_elapsed_seconds"]) for record in successes)
+        operational_values = (
+            queue_wait,
+            license_wait,
+            license_probe,
+            conversion,
+            publication,
+            preparation,
+            controller_elapsed,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in operational_values):
+            message = f"Benchmark summary received invalid separated timing evidence for {variant.variant_id!r}."
+            raise ValueError(message)
+        license_records = [record["license"] for record in successes]
+        blocked_count = sum(int(value["license_blocked_submission_count"]) for value in license_records)
+        resources = [record["resource"] for record in successes]
+        peak_memory = max((int(value["peak_memory_bytes"]) for value in resources), default=0)
+        peak_scratch = max((int(value["peak_scratch_bytes"]) for value in resources), default=0)
+        cases_per_node = suite.cores_per_node // variant.cores_per_case
+        estimated_memory = cases_per_node * peak_memory
+        estimated_scratch = cases_per_node * peak_scratch
+        memory_feasibility = _projected_resource_feasibility(estimated_memory, suite.node_memory_limit_bytes)
+        scratch_feasibility = _projected_resource_feasibility(estimated_scratch, suite.node_scratch_limit_bytes)
+        resource_feasibility = _variant_resource_feasibility(memory_feasibility, scratch_feasibility)
+        concurrency, overlapped = _solver_overlap_metrics(successes)
         if solve_times:
-            median_solve = statistics.median(solve_times)
-            median_total = statistics.median(total_times)
-            core_hours = variant.cores_per_case * median_solve / 3600.0
-            metrics: dict[str, float | None] = {
-                "median_comsol_wall_s": median_solve,
-                "mean_comsol_wall_s": statistics.fmean(solve_times),
-                "minimum_comsol_wall_s": min(solve_times),
-                "maximum_comsol_wall_s": max(solve_times),
-                "sample_standard_deviation_comsol_wall_s": (statistics.stdev(solve_times) if len(solve_times) > 1 else None),
-                "median_total_case_wall_s": median_total,
-                "median_queue_wait_s": statistics.median(queue_waits),
-                "median_turnaround_s": statistics.median(turnarounds),
-                "median_core_hours_per_case": core_hours,
-                "cases_per_100_core_hours": 100.0 / core_hours,
-                "estimated_production_campaign_core_hours": campaign_cases * core_hours,
-            }
+            median_solve = float(statistics.median(solve_times))
+            median_core_hours = variant.cores_per_case * median_solve / 3600.0
+            node_throughput = cases_per_node * 3600.0 / median_solve
+            minimum_solve = min(solve_times)
+            maximum_solve = max(solve_times)
         else:
-            metrics = {
-                "median_comsol_wall_s": None,
-                "mean_comsol_wall_s": None,
-                "minimum_comsol_wall_s": None,
-                "maximum_comsol_wall_s": None,
-                "sample_standard_deviation_comsol_wall_s": None,
-                "median_total_case_wall_s": None,
-                "median_queue_wait_s": None,
-                "median_turnaround_s": None,
-                "median_core_hours_per_case": None,
-                "cases_per_100_core_hours": None,
-                "estimated_production_campaign_core_hours": None,
-            }
+            median_solve = None
+            median_core_hours = None
+            node_throughput = None
+            minimum_solve = None
+            maximum_solve = None
+        raw_excerpts = _ordered_unique_text([value["raw_excerpt"] for value in license_records])
         by_variant.append(
             {
                 "variant_id": variant.variant_id,
                 "execution_id": suite.execution_id(variant),
                 "cores_per_case": variant.cores_per_case,
-                "successful_repetitions": len(successes),
-                "failed_repetitions": len(failed),
-                "pending_repetitions": len(pending),
-                "individual_comsol_wall_s": solve_times,
-                "individual_total_case_wall_s": total_times,
-                "individual_queue_wait_s": queue_waits,
-                "individual_turnaround_s": turnarounds,
-                **metrics,
-                "speedup": None,
-                "parallel_efficiency": None,
+                "successful_measurement_count": len(successes),
+                "failed_measurement_count": len(failures),
+                "pending_measurement_count": len(pending),
+                "individual_comsol_process_seconds": solve_times,
+                "median_comsol_process_seconds": median_solve,
+                "minimum_comsol_process_seconds": minimum_solve,
+                "maximum_comsol_process_seconds": maximum_solve,
+                "median_core_hours_per_case": median_core_hours,
+                "estimated_cases_per_node": cases_per_node,
+                "estimated_cases_per_node_hour": node_throughput,
+                "throughput_label": "compute-only estimated node throughput",
+                "peak_memory_per_case_bytes": peak_memory,
+                "estimated_peak_memory_per_node_bytes": estimated_memory,
+                "peak_scratch_per_case_bytes": peak_scratch,
+                "estimated_peak_scratch_per_node_bytes": estimated_scratch,
+                "memory_feasibility": memory_feasibility,
+                "scratch_feasibility": scratch_feasibility,
+                "resource_feasibility": resource_feasibility,
+                "scheduler_queue_seconds": queue_wait,
+                "license_wait_seconds": license_wait,
+                "license_probe_seconds": license_probe,
+                "canonical_input_preparation_seconds": preparation,
+                "export_conversion_seconds": conversion,
+                "publication_seconds": publication,
+                "total_controller_elapsed_seconds": controller_elapsed,
+                "license_blocked_submission_count": blocked_count,
+                "detected_features": _ordered_unique_text([value["detected_feature"] for value in license_records]),
+                "detected_comsol_flexnet_codes": _ordered_unique_text([value["detected_error_code"] for value in license_records]),
+                "matched_signatures": _ordered_unique_text([signature for value in license_records for signature in value["matched_signatures"]]),
+                "bounded_raw_excerpts": [value[:_MAX_BENCHMARK_LOG_EXCERPT_BYTES] for value in raw_excerpts],
+                "observed_peak_solver_concurrency": concurrency,
+                "requested_cases_overlapped_in_solver_execution": overlapped,
             }
         )
-    reference = by_variant[0]
-    reference_median = reference["median_comsol_wall_s"]
-    reference_cores = int(reference["cores_per_case"])
-    if isinstance(reference_median, float):
-        for record in by_variant:
-            median = record["median_comsol_wall_s"]
-            if isinstance(median, float):
-                speedup = reference_median / median
-                record["speedup"] = speedup
-                record["parallel_efficiency"] = speedup / (int(record["cores_per_case"]) / reference_cores)
-    recommendation_pool = [
+    complete = [
         record
         for record in by_variant
-        if record["successful_repetitions"] == suite.repetitions and record["failed_repetitions"] == 0 and record["pending_repetitions"] == 0
+        if record["successful_measurement_count"] == suite.representative_case_count
+        and record["failed_measurement_count"] == 0
+        and record["pending_measurement_count"] == 0
     ]
-    fastest = (
-        min(
-            recommendation_pool,
-            key=lambda record: (
-                float(record["median_comsol_wall_s"]),
-                int(record["cores_per_case"]),
-            ),
-        )
-        if recommendation_pool
-        else None
+    fastest_measurement = min(
+        (
+            (runtime, int(record["cores_per_case"]), str(record["variant_id"]))
+            for record in complete
+            for runtime in record["individual_comsol_process_seconds"]
+        ),
+        default=None,
     )
-    efficiency_pool = [record for record in recommendation_pool if isinstance(record["parallel_efficiency"], float)]
-    best_efficiency = (
-        max(
-            efficiency_pool,
-            key=lambda record: (
-                float(record["parallel_efficiency"]),
-                -int(record["cores_per_case"]),
-            ),
-        )
-        if efficiency_pool
-        else None
-    )
-    recommended = (
+    fastest_cores = None if fastest_measurement is None else fastest_measurement[1]
+    core_efficient = (
         min(
-            recommendation_pool,
+            complete,
             key=lambda record: (
                 float(record["median_core_hours_per_case"]),
                 int(record["cores_per_case"]),
             ),
         )
-        if recommendation_pool
+        if complete
         else None
     )
-    canary_variant = suite.canary_variant()
-    canary_record = next(record for record in records if record.get("variant_id") == canary_variant.variant_id and record.get("repetition") == 1)
-    canary_timings = canary_record.get("timings_s")
-    benchmark_canary_seconds = (
-        float(canary_timings["complete_case"]) if canary_record.get("status") == "success" and isinstance(canary_timings, dict) else None
-    )
-    current_cores = int(production["current_production_cores_per_case"])
-    fastest_cores = None if fastest is None else int(fastest["cores_per_case"])
-    best_efficiency_cores = None if best_efficiency is None else int(best_efficiency["cores_per_case"])
-    recommended_cores = None if recommended is None else int(recommended["cores_per_case"])
-    production["recommended_difference_from_current_cores_per_case"] = None if recommended_cores is None else recommended_cores - current_cores
-    production["recommended_differs_from_current"] = None if recommended_cores is None else recommended_cores != current_cores
-    if recommended is None:
-        recommended_detail = None
+    lowest_core_hours_cores = None if core_efficient is None else int(core_efficient["cores_per_case"])
+    feasible = [record for record in complete if record["resource_feasibility"] != "fail"]
+    if feasible:
+        best_throughput = max(float(record["estimated_cases_per_node_hour"]) for record in feasible)
+        throughput_ties = [record for record in feasible if float(record["estimated_cases_per_node_hour"]) >= 0.95 * best_throughput]
+        recommended = min(
+            throughput_ties,
+            key=lambda record: (
+                float(record["median_core_hours_per_case"]),
+                int(record["cores_per_case"]),
+            ),
+        )
     else:
-        selected_cores = int(recommended["cores_per_case"])
-        recommended_detail = {
+        recommended = None
+    recommended_cores = None if recommended is None else int(recommended["cores_per_case"])
+    recommended_cases_per_node = None if recommended is None else int(recommended["estimated_cases_per_node"])
+    incomplete_license_concurrency = any(
+        record["license_blocked_submission_count"] > 0 and not record["requested_cases_overlapped_in_solver_execution"] for record in by_variant
+    )
+    all_overlap_observed = bool(by_variant) and all(record["requested_cases_overlapped_in_solver_execution"] for record in by_variant)
+    if incomplete_license_concurrency:
+        license_qualification = "compute recommendation valid; concurrent-license observation incomplete"
+    elif all_overlap_observed:
+        license_qualification = "compute recommendation valid; concurrent-license execution observed"
+    else:
+        license_qualification = "compute recommendation valid; requested solver overlap not observed"
+    production["recommended_difference_from_current_cores_per_case"] = (
+        None if recommended_cores is None else recommended_cores - int(production["current_production_cores_per_case"])
+    )
+    production["recommended_differs_from_current"] = (
+        None if recommended_cores is None else recommended_cores != int(production["current_production_cores_per_case"])
+    )
+    recommended_detail = (
+        None
+        if recommended is None
+        else {
             "variant_id": recommended["variant_id"],
-            "cores_per_case": selected_cores,
-            "median_comsol_wall_s": recommended["median_comsol_wall_s"],
-            "median_total_case_wall_s": recommended["median_total_case_wall_s"],
+            "cores_per_case": recommended_cores,
+            "estimated_cases_per_node": recommended_cases_per_node,
+            "estimated_cases_per_node_hour": recommended["estimated_cases_per_node_hour"],
+            "median_comsol_process_seconds": recommended["median_comsol_process_seconds"],
             "median_core_hours_per_case": recommended["median_core_hours_per_case"],
-            "speedup": recommended["speedup"],
-            "parallel_efficiency": recommended["parallel_efficiency"],
-            "current_production_cores_per_case": current_cores,
-            "difference_from_current_cores_per_case": selected_cores - current_cores,
-            "fastest_single_case_cores_per_case": fastest_cores,
-            "differs_from_fastest_single_case": selected_cores != fastest_cores,
+            "resource_feasibility": recommended["resource_feasibility"],
+            "license_qualification": license_qualification,
+            "proposed_configuration": {
+                "cores_per_case": recommended_cores,
+                "cases_per_node": recommended_cases_per_node,
+                "max_running_cases": production["current_max_running_cases"],
+            },
+            "manual_review_required": True,
         }
+    )
+    canary = suite.canary_variant()
     return {
         "schema_kind": BENCHMARK_SUMMARY_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
-        "case": suite.case_selection(),
-        "repetitions_per_variant": suite.repetitions,
+        "benchmark_mode": "core_selection",
+        "representative_cases": suite.case_selections(),
+        "cases_per_variant": suite.representative_case_count,
+        "required_successful_measurements": expected_count,
+        "cores_per_node": suite.cores_per_node,
         "variants": by_variant,
+        "fastest_single_case_cores": fastest_cores,
         "fastest_single_case": (
             None
-            if fastest is None
+            if fastest_measurement is None
             else {
-                "variant_id": fastest["variant_id"],
-                "cores_per_case": fastest_cores,
-                "median_comsol_wall_s": fastest["median_comsol_wall_s"],
+                "cores_per_case": fastest_measurement[1],
+                "variant_id": fastest_measurement[2],
+                "comsol_process_seconds": fastest_measurement[0],
             }
         ),
-        "fastest_single_case_cores_per_case": fastest_cores,
-        "best_parallel_efficiency": (
+        "lowest_core_hours_cores": lowest_core_hours_cores,
+        "lowest_core_hours": (
             None
-            if best_efficiency is None
+            if core_efficient is None
             else {
-                "variant_id": best_efficiency["variant_id"],
-                "cores_per_case": best_efficiency_cores,
-                "parallel_efficiency": best_efficiency["parallel_efficiency"],
+                "cores_per_case": lowest_core_hours_cores,
+                "variant_id": core_efficient["variant_id"],
+                "median_core_hours_per_case": core_efficient["median_core_hours_per_case"],
             }
         ),
-        "best_parallel_efficiency_cores_per_case": best_efficiency_cores,
-        "recommended_production_cores_per_case": recommended_cores,
+        "recommended_cores_per_case": recommended_cores,
+        "recommended_estimated_cases_per_node": recommended_cases_per_node,
         "recommended_production": recommended_detail,
-        "recommendation_basis": ("lowest median COMSOL core-hours per successful case; ties break to fewer cores"),
+        "recommendation_basis": (
+            "maximize compute-only estimated cases per node-hour among resource-feasible variants; "
+            "within 5% prefer lower median core-hours, then fewer cores"
+        ),
+        "timing_contract": {
+            "primary_runtime": "successful comsol_process_seconds only",
+            "excluded_from_ranking": [
+                "scheduler_queue_seconds",
+                "license_wait_seconds",
+                "license_probe_seconds",
+                "canonical_input_preparation_seconds",
+                "export_conversion_seconds",
+                "publication_seconds",
+                "total_controller_elapsed_seconds",
+            ],
+            "license_only_attempts_contribute_successful_runtime_observations": 0,
+        },
+        "resource_limits": {
+            "node_memory_limit_bytes": suite.node_memory_limit_bytes,
+            "node_scratch_limit_bytes": suite.node_scratch_limit_bytes,
+            "missing_limit_policy": "operator_review_required",
+        },
+        "license_qualification": license_qualification,
         "production_interpretation": production,
-        "queue_wait_interpretation": ("observed scheduler conditions only; excluded from solve, core-hour, and recommendation metrics"),
         "production_configuration_modified": False,
         "dataset_membership": "none",
-        "benchmark_canary_seconds": benchmark_canary_seconds,
+        "canary_wave": {
+            "variant_id": canary.variant_id,
+            "cores_per_case": canary.cores_per_case,
+            "case_roles": [item.case_role for item in suite.representative_cases],
+            "included_in_final_measurements": True,
+            "additional_canary_work_units": 0,
+        },
     }
 
 
@@ -3289,24 +3946,142 @@ def _scheduler_evidence(job_ids: Sequence[str]) -> dict[str, Any]:
     return {name: _scheduler_command_evidence(command) for name, command in commands.items()}
 
 
+def _active_benchmark_jobs(
+    manifest: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return exact pending and running job IDs owned by one benchmark."""
+    queue = _mapping(scheduler["squeue"], label="benchmark squeue evidence")
+    if queue.get("error") is not None:
+        message = f"Could not query active core benchmark jobs: {queue['error']}"
+        raise RuntimeError(message)
+    owned = {str(value) for value in manifest["measured_job_ids"]}
+    pending: list[str] = []
+    running: list[str] = []
+    for line in str(queue.get("output", "")).splitlines():
+        try:
+            job_id, state, _reason = line.split("|", maxsplit=2)
+        except ValueError as error:
+            message = f"Malformed active benchmark scheduler record: {line!r}."
+            raise ValueError(message) from error
+        if job_id not in owned or _JOB_ID_PATTERN.fullmatch(job_id) is None:
+            message = f"Scheduler returned an unowned benchmark job: {job_id!r}."
+            raise ValueError(message)
+        if state.strip().upper() in {"PENDING", "CONFIGURING"}:
+            pending.append(job_id)
+        else:
+            running.append(job_id)
+    return pending, running
+
+
+def cancel_core_benchmark(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Persist and request cancellation of exact benchmark-owned Slurm jobs."""
+    if not isinstance(force, bool):
+        message = "force must be boolean."
+        raise TypeError(message)
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    manifest_path = _manifest_path(run_id, storage_root=storage)
+    lock_path = manifest_path.parent / "submission.lock"
+    with common.locking.exclusive_file_lock(lock_path, blocking=True):
+        manifest, _suite = load_core_benchmark_manifest(
+            run_id,
+            storage_root=storage,
+        )
+        job_ids = [str(value) for value in manifest["measured_job_ids"]]
+        if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in job_ids):
+            message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
+            raise ValueError(message)
+        scheduler = _scheduler_evidence(job_ids)
+        pending_ids, running_ids = _active_benchmark_jobs(manifest, scheduler)
+        active_ids = [*pending_ids, *running_ids]
+        commands: list[list[str]] = []
+        if force and active_ids:
+            commands.append(["scancel", "--signal=KILL", "--full", *active_ids])
+        elif not force:
+            if pending_ids:
+                commands.append(["scancel", *pending_ids])
+            if running_ids:
+                commands.append(["scancel", "--signal=TERM", "--batch", *running_ids])
+
+        receipt_path = manifest_path.parent / "cancellations.json"
+        attempts: list[dict[str, Any]] = []
+        if receipt_path.exists():
+            receipt = _load_json(
+                receipt_path,
+                label="benchmark cancellation receipt",
+            )
+            if (
+                receipt.get("schema_kind") != BENCHMARK_CANCELLATION_SCHEMA_KIND
+                or receipt.get("schema_version") != 1
+                or receipt.get("benchmark_run_id") != run_id
+                or not isinstance(receipt.get("attempts"), list)
+            ):
+                message = f"Benchmark cancellation receipt is malformed: {receipt_path}"
+                raise ValueError(message)
+            attempts = list(receipt["attempts"])
+        attempt: dict[str, Any] = {
+            "recorded_at": _utc_now(),
+            "mode": "force" if force else "graceful",
+            "pending_job_ids": pending_ids,
+            "running_job_ids": running_ids,
+            "commands": [],
+        }
+        receipt = {
+            "schema_kind": BENCHMARK_CANCELLATION_SCHEMA_KIND,
+            "schema_version": 1,
+            "benchmark_run_id": run_id,
+            "attempts": [*attempts, attempt],
+        }
+        common.serialization.atomic_write_json(receipt_path, receipt)
+        manifest["state"] = "force_cancel_requested" if force else "cancel_requested"
+        _persist_manifest(manifest_path, manifest)
+
+        command_results: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for command in commands:
+            result = subprocess.run(  # noqa: S603 -- validated persisted numeric Slurm IDs
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            command_results.append(
+                {
+                    "command": command,
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout.strip(),
+                    "stderr": result.stderr.strip(),
+                }
+            )
+            if result.returncode != 0:
+                failures.append(result.stderr.strip() or f"{command[0]} exit {result.returncode}")
+        attempt["commands"] = command_results
+        common.serialization.atomic_write_json(receipt_path, receipt)
+        if failures:
+            message = f"Slurm benchmark cancellation failed after its request was persisted: {failures}"
+            raise RuntimeError(message)
+        return receipt
+
+
 def core_benchmark_status(
     run_id: str,
     *,
     storage_root: Path | str,
     query_scheduler: bool = True,
 ) -> dict[str, Any]:
-    """Reconstruct repetition completion and optional scheduler state."""
+    """Reconstruct precise wave-aware work-unit and scheduler state."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
     records = _result_records(directory, suite)
     success_count = sum(record["status"] == "success" for record in records)
     failure_count = sum(record["status"] == "failed" for record in records)
     pending_count = sum(record["status"] == "pending" for record in records)
-    canary = suite.canary_variant()
-    canary_failed = any(
-        record.get("status") == "failed" and record.get("variant_id") == canary.variant_id and record.get("repetition") == 1 for record in records
-    )
-    job_ids = [*manifest["preparation_job_ids"], *manifest["measured_job_ids"]]
+    job_ids = [str(value) for value in manifest["measured_job_ids"]]
     scheduler = (
         _scheduler_evidence(job_ids)
         if query_scheduler
@@ -3318,133 +4093,192 @@ def core_benchmark_status(
     if query_scheduler and scheduler["squeue"]["error"] is not None:
         message = f"Could not query active core benchmark jobs: {scheduler['squeue']['error']}"
         raise RuntimeError(message)
-    latest_retry = _latest_benchmark_license_retry(
-        manifest,
-        suite,
-        directory,
-    )
-    if scheduler["squeue"]["output"]:
-        state = "running"
-    elif latest_retry is not None and (
-        not bool(latest_retry["retry_budget_remaining"]) or not license_service.retry_attempt_is_eligible(latest_retry)
-    ):
-        state = "license_blocked"
-    elif latest_retry is not None:
-        state = "incomplete"
+    active_job_ids = _active_benchmark_job_ids(scheduler) if query_scheduler else frozenset()
+    active_work_units = [
+        str(submission["work_unit_id"])
+        for submission in manifest["submission_history"]
+        if submission.get("role") == "measure" and str(submission.get("job_id")) in active_job_ids
+    ]
+    exhausted: list[dict[str, Any]] = []
+    license_waits: list[dict[str, Any]] = []
+    terminal_without_result: list[dict[str, Any]] = []
+    for record in records:
+        if record["status"] == "success":
+            continue
+        variant = suite.variant(str(record["variant_id"]))
+        case_position = int(record["case_position"])
+        representative = suite.representative_case(case_position)
+        attempts = _work_unit_attempts(directory, suite, variant, case_position)
+        failure_attempts = _scientific_failure_count(attempts)
+        if failure_attempts >= suite.maximum_work_unit_attempts:
+            exhausted.append(
+                {
+                    "variant_id": variant.variant_id,
+                    "case_role": representative.case_role,
+                    "work_unit_id": record["work_unit_id"],
+                    "failure_attempts": failure_attempts,
+                    "maximum_work_unit_attempts": suite.maximum_work_unit_attempts,
+                }
+            )
+            continue
+        latest = _latest_work_unit_submission(
+            manifest,
+            variant_id=variant.variant_id,
+            case_role=representative.case_role,
+        )
+        latest_active = latest is not None and str(latest["job_id"]) in active_job_ids
+        wait = _load_benchmark_license_wait(
+            directory,
+            suite,
+            variant,
+            case_position,
+            run_id=run_id,
+        )
+        if wait is not None and not latest_active:
+            license_waits.append(wait)
+        if query_scheduler and latest is not None and not latest_active and record["status"] == "pending" and wait is None:
+            if scheduler["sacct"]["error"] is not None:
+                message = f"Could not reconcile terminal benchmark work through accounting: {scheduler['sacct']['error']}"
+                raise RuntimeError(message)
+            accounted = _accounted_root_state(scheduler, job_id=str(latest["job_id"]))
+            if accounted is not None and accounted not in _ACTIVE_SCHEDULER_STATES:
+                terminal_without_result.append(
+                    {
+                        "variant_id": variant.variant_id,
+                        "case_role": representative.case_role,
+                        "work_unit_id": record["work_unit_id"],
+                        "scheduler_state": accounted,
+                    }
+                )
+    proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
+    inputs_ready = all(path.is_file() for path in proof_paths)
+    canary = suite.canary_variant()
+    canary_work_units = {suite.work_unit_id(canary, case_position) for case_position in range(1, suite.representative_case_count + 1)}
+    canary_failed = any(item["work_unit_id"] in canary_work_units for item in (*exhausted, *terminal_without_result))
+    blocked_waits = [wait for wait in license_waits if not bool(wait["retry_budget_remaining"]) or not license_service.wait_record_is_eligible(wait)]
+    if manifest["state"] in {"cancel_requested", "force_cancel_requested"}:
+        state = "cancelled"
+    elif not inputs_ready:
+        state = "inputs_ready"
     elif success_count == len(records):
         state = "complete"
     elif canary_failed:
         state = "canary_failed"
-    elif failure_count:
-        state = "retry_required"
-    elif query_scheduler and manifest["submission_history"] and _latest_submission_result_state(manifest, suite, directory) == "pending":
-        terminal_without_result = _latest_job_is_terminal_without_result(
-            manifest,
-            suite,
-            directory,
-            scheduler,
-        )
-        latest = manifest["submission_history"][-1]
-        latest_is_canary = latest.get("role") == "measure" and latest.get("variant_id") == canary.variant_id and latest.get("repetitions") == [1]
-        state = (
-            "canary_failed" if terminal_without_result and latest_is_canary else "retry_required" if terminal_without_result else "scheduler_unknown"
-        )
+    elif exhausted or terminal_without_result:
+        state = "work_unit_failed"
+    elif active_work_units:
+        state = "running"
+    elif blocked_waits:
+        state = "license_blocked"
     else:
-        state = "incomplete"
-    retry_repetitions = [
-        {
-            "variant_id": record["variant_id"],
-            "repetition": record["repetition"],
-            "repetition_id": record["repetition_id"],
-            "evidence_status": "failed",
-        }
-        for record in records
-        if record["status"] == "failed"
-    ]
-    if state == "retry_required" and not retry_repetitions:
-        latest = manifest["submission_history"][-1]
-        latest_repetitions = latest.get("repetitions")
-        if latest.get("role") == "measure" and isinstance(latest_repetitions, list) and len(latest_repetitions) == 1:
-            variant = suite.variant(str(latest.get("variant_id")))
-            repetition = int(latest_repetitions[0])
-            retry_repetitions.append(
-                {
-                    "variant_id": variant.variant_id,
-                    "repetition": repetition,
-                    "repetition_id": suite.repetition_id(variant, repetition),
-                    "evidence_status": "terminal_without_result",
-                }
-            )
+        state = "running"
+    wave_order = suite.variant_wave_order()
+    current_wave = next(
+        (
+            {
+                "wave_position": position,
+                "variant_id": variant.variant_id,
+                "cores_per_case": variant.cores_per_case,
+            }
+            for position, variant in enumerate(wave_order, start=1)
+            if not all(record.get("status") == "success" for record in records if record.get("variant_id") == variant.variant_id)
+        ),
+        None,
+    )
     return {
+        "schema_kind": "generation_run_status",
+        "schema_version": 1,
+        "run_kind": "benchmark",
         "benchmark_run_id": run_id,
         "state": state,
-        "successful_repetitions": success_count,
-        "failed_repetitions": failure_count,
-        "pending_repetitions": pending_count,
-        "total_repetitions": len(records),
-        "retry_repetitions": retry_repetitions,
+        "successful_work_units": success_count,
+        "active_work_units": len(set(active_work_units)),
+        "pending_work_units": pending_count,
+        "license_blocked_work_units": len(blocked_waits),
+        "failed_work_units": failure_count,
+        "total_work_units": len(records),
+        "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
+        "work_unit_failures": [*exhausted, *terminal_without_result],
+        "license_waits": license_waits,
         "scheduler": scheduler,
+        "current_wave": current_wave,
         "canary": {
             "variant_id": canary.variant_id,
             "cores_per_case": canary.cores_per_case,
-            "repetition": 1,
-            "validated": any(
-                record.get("status") == "success" and record.get("variant_id") == canary.variant_id and record.get("repetition") == 1
-                for record in records
-            ),
+            "case_roles": [item.case_role for item in suite.representative_cases],
+            "work_unit_ids": sorted(canary_work_units),
+            "included_in_final_measurements": True,
+            "additional_work_units": 0,
+            "validated": all(record.get("status") == "success" for record in records if record.get("variant_id") == canary.variant_id),
         },
-        "suggested_next_command": (
-            f"finalize-core-benchmark {run_id}"
-            if state == "complete"
-            else f"resume-core-benchmark {run_id} --variant {canary.variant_id}"
-            if state == "canary_failed"
-            else f"resume-core-benchmark {run_id}"
-            if state in {"retry_required", "incomplete"}
-            else f"core-benchmark-status {run_id}"
+        "resume_action": (
+            "none; terminal benchmark evidence is complete" if state == "complete" else f"rerun generation_workflow.sh run {manifest['suite_config']}"
         ),
     }
 
 
 def _results_csv(records: Sequence[Mapping[str, Any]]) -> str:
-    """Serialize one stable per-repetition timing and resource table."""
+    """Serialize stable per-work-unit timing, resource, and license evidence."""
     stream = StringIO(newline="")
-    fields = (
+    fields: tuple[str, ...] = (
         "variant_id",
         "cores_per_case",
-        "repetition",
-        "repetition_id",
+        "case_position",
+        "case_role",
+        "work_unit_id",
         "status",
         "attempt",
-        "submit_time",
-        "start_time",
-        "completion_time",
-        "queue_wait_s",
-        "turnaround_s",
-        "comsol_process_s",
-        "case_materialization_s",
-        "export_conversion_s",
-        "hdf5_admission_s",
-        "complete_case_s",
+        "scheduler_queue_seconds",
+        "license_wait_seconds",
+        "license_probe_seconds",
+        "canonical_input_preparation_seconds",
+        "comsol_process_seconds",
+        "export_conversion_seconds",
+        "publication_seconds",
+        "total_controller_elapsed_seconds",
         "core_hours",
+        "solver_started_at",
+        "solver_ended_at",
         "node",
         "partition",
         "requested_cpus",
         "allocated_cpus",
         "comsol_np",
         "slurm_job_id",
+        "peak_memory_bytes",
+        "peak_scratch_bytes",
+        "license_blocked_submission_count",
+        "detected_feature",
+        "detected_comsol_flexnet_code",
+        "matched_signatures",
+        "license_raw_excerpt",
+        "solver_log_sha256",
+        "solver_log_size_bytes",
+        "solver_log_excerpt",
+        "hdf5_sha256",
+        "hdf5_size_bytes",
     )
-    writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+    writer: csv.DictWriter[str] = csv.DictWriter(
+        stream,
+        fieldnames=fields,
+        lineterminator="\n",
+    )
     writer.writeheader()
     for record in records:
-        timings_value = record.get("timings_s")
+        timings_value = record.get("timings_seconds")
         timings = timings_value if isinstance(timings_value, dict) else {}
-        scheduler_value = record.get("scheduler_timing")
-        scheduler = scheduler_value if isinstance(scheduler_value, dict) else {}
         resource_value = record.get("resource")
         resource = resource_value if isinstance(resource_value, dict) else {}
-        complete = timings.get("complete_case")
+        license_value = record.get("license")
+        license_evidence = license_value if isinstance(license_value, dict) else {}
+        interval_value = record.get("solver_interval")
+        interval = interval_value if isinstance(interval_value, dict) else {}
+        solver_log_value = record.get("solver_log")
+        solver_log = solver_log_value if isinstance(solver_log_value, dict) else {}
+        hdf5_value = record.get("hdf5")
+        hdf5 = hdf5_value if isinstance(hdf5_value, dict) else {}
         cores = record.get("cores_per_case")
-        solve = timings.get("comsol_process")
+        solve = timings.get("comsol_process_seconds")
         core_hours = (
             float(solve) * int(cores) / 3600.0
             if isinstance(solve, (int, float)) and not isinstance(solve, bool) and isinstance(cores, int) and not isinstance(cores, bool)
@@ -3454,27 +4288,33 @@ def _results_csv(records: Sequence[Mapping[str, Any]]) -> str:
             {
                 "variant_id": record.get("variant_id"),
                 "cores_per_case": cores,
-                "repetition": record.get("repetition"),
-                "repetition_id": record.get("repetition_id"),
+                "case_position": record.get("case_position"),
+                "case_role": record.get("case_role"),
+                "work_unit_id": record.get("work_unit_id"),
                 "status": record.get("status"),
                 "attempt": record.get("attempt"),
-                "submit_time": scheduler.get("submit_time"),
-                "start_time": scheduler.get("start_time"),
-                "completion_time": scheduler.get("completion_time"),
-                "queue_wait_s": scheduler.get("queue_wait_s"),
-                "turnaround_s": scheduler.get("turnaround_s"),
-                "comsol_process_s": timings.get("comsol_process"),
-                "case_materialization_s": timings.get("case_materialization"),
-                "export_conversion_s": timings.get("export_conversion"),
-                "hdf5_admission_s": timings.get("hdf5_admission"),
-                "complete_case_s": complete,
+                **{field: timings.get(field) for field in _WORK_UNIT_TIMING_FIELDS},
                 "core_hours": core_hours,
+                "solver_started_at": interval.get("started_at"),
+                "solver_ended_at": interval.get("ended_at"),
                 "node": resource.get("node"),
                 "partition": resource.get("partition"),
                 "requested_cpus": resource.get("requested_cpus"),
                 "allocated_cpus": resource.get("allocated_cpus"),
                 "comsol_np": resource.get("comsol_np"),
                 "slurm_job_id": resource.get("slurm_job_id"),
+                "peak_memory_bytes": resource.get("peak_memory_bytes"),
+                "peak_scratch_bytes": resource.get("peak_scratch_bytes"),
+                "license_blocked_submission_count": license_evidence.get("license_blocked_submission_count"),
+                "detected_feature": license_evidence.get("detected_feature"),
+                "detected_comsol_flexnet_code": license_evidence.get("detected_error_code"),
+                "matched_signatures": ",".join(license_evidence.get("matched_signatures", [])),
+                "license_raw_excerpt": license_evidence.get("raw_excerpt"),
+                "solver_log_sha256": solver_log.get("sha256"),
+                "solver_log_size_bytes": solver_log.get("size_bytes"),
+                "solver_log_excerpt": solver_log.get("excerpt"),
+                "hdf5_sha256": hdf5.get("sha256"),
+                "hdf5_size_bytes": hdf5.get("size_bytes"),
             }
         )
     return stream.getvalue()
@@ -3491,64 +4331,69 @@ def _format_metric(value: object) -> str:
 
 
 def core_benchmark_markdown(summary: Mapping[str, Any]) -> str:
-    """Render one concise human-readable benchmark summary."""
+    """Render the fast core-selection evidence without mixing operational waits."""
     lines = [
-        f"# Core-scaling benchmark: {summary['suite_name']}",
+        f"# Core-selection benchmark: {summary['suite_name']}",
         "",
-        "All rows measure the same canonical transient case in globally serial ordinary jobs.",
-        "Queue wait records observed scheduler conditions and does not affect the recommendation.",
+        "Two deterministic scientific cases are measured concurrently in each of four sequential core-count waves.",
+        "The first production-core wave is both the canary and two final measurements; there is no additional canary or second phase.",
+        "Queue, license wait, and license-probe time are reported separately and do not affect compute ranking.",
         "",
         (
-            "| cores | successes | failures | median solve (s) | median case (s) | "
-            "median queue (s) | median turnaround (s) | speedup | efficiency | "
-            "COMSOL core-hours/case | cases/100 core-hours | campaign core-hours |"
+            "| cores | successes | median COMSOL (s) | min (s) | max (s) | "
+            "core-hours/case | cases/node | cases/node-hour | queue (s) | license wait (s) | "
+            "memory/case (bytes) | scratch/case (bytes) | peak solver concurrency | overlap | feasibility |"
         ),
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :--- |",
     ]
     for record in summary["variants"]:
         values = (
             record["cores_per_case"],
-            record["successful_repetitions"],
-            record["failed_repetitions"],
-            _format_metric(record["median_comsol_wall_s"]),
-            _format_metric(record["median_total_case_wall_s"]),
-            _format_metric(record["median_queue_wait_s"]),
-            _format_metric(record["median_turnaround_s"]),
-            _format_metric(record["speedup"]),
-            _format_metric(record["parallel_efficiency"]),
+            record["successful_measurement_count"],
+            _format_metric(record["median_comsol_process_seconds"]),
+            _format_metric(record["minimum_comsol_process_seconds"]),
+            _format_metric(record["maximum_comsol_process_seconds"]),
             _format_metric(record["median_core_hours_per_case"]),
-            _format_metric(record["cases_per_100_core_hours"]),
-            _format_metric(record["estimated_production_campaign_core_hours"]),
+            record["estimated_cases_per_node"],
+            _format_metric(record["estimated_cases_per_node_hour"]),
+            _format_metric(record["scheduler_queue_seconds"]),
+            _format_metric(record["license_wait_seconds"]),
+            record["peak_memory_per_case_bytes"],
+            record["peak_scratch_per_case_bytes"],
+            record["observed_peak_solver_concurrency"],
+            "yes" if record["requested_cases_overlapped_in_solver_execution"] else "no",
+            record["resource_feasibility"],
         )
         lines.append("| " + " | ".join(str(value) for value in values) + " |")
-    production = summary["production_interpretation"]
     recommended = summary["recommended_production"]
-    lines.extend(["", "## Recommended production setting", ""])
+    lines.extend(
+        [
+            "",
+            "## Conclusions",
+            "",
+            f"- Fastest individual solve: {summary['fastest_single_case_cores']} cores per case.",
+            f"- Lowest median core-hours: {summary['lowest_core_hours_cores']} cores per case.",
+        ]
+    )
     if recommended is None:
-        lines.append("No recommendation is available until at least one core variant has all configured repetitions successful.")
+        lines.append("- Production recommendation: unavailable until all eight measurements and resource checks are valid.")
     else:
+        proposal = recommended["proposed_configuration"]
         lines.extend(
             [
-                f"- cores_per_case = {recommended['cores_per_case']}",
-                f"- Basis: {summary['recommendation_basis']}.",
-                f"- Median COMSOL runtime: {_format_metric(recommended['median_comsol_wall_s'])} s.",
-                f"- Median complete-case runtime: {_format_metric(recommended['median_total_case_wall_s'])} s.",
-                f"- Median COMSOL core-hours per case: {_format_metric(recommended['median_core_hours_per_case'])}.",
-                f"- Speedup: {_format_metric(recommended['speedup'])}.",
-                f"- Parallel efficiency: {_format_metric(recommended['parallel_efficiency'])}.",
-                (f"- Difference from current production cores per case: {recommended['difference_from_current_cores_per_case']:+d}."),
-                (f"- Fastest-single-case setting: {recommended['fastest_single_case_cores_per_case']} cores per case."),
+                f"- Compute-based production recommendation: {recommended['cores_per_case']} cores per case.",
+                f"- Estimated cases per node: {recommended['estimated_cases_per_node']}.",
+                f"- Proposed cores_per_case: {proposal['cores_per_case']}.",
+                f"- Proposed cases_per_node: {proposal['cases_per_node']}.",
+                f"- Proposed max_running_cases: {proposal['max_running_cases']}.",
+                "- Apply only after manual review; no production configuration was edited.",
             ]
         )
     lines.extend(
         [
-            "",
-            f"- Fastest single case cores per case: {summary['fastest_single_case_cores_per_case']}",
-            (f"- Best parallel efficiency cores per case: {summary['best_parallel_efficiency_cores_per_case']}"),
-            (f"- Production estimate target: {production['campaign_total_cases']} cases from {production['campaign_config']}"),
-            "- Campaign estimates are compute core-hours, not guaranteed wall-clock completion times.",
-            (f"- Apply only after review: {production['cores_config']} -> {production['cores_key']}"),
-            "- Production configuration changed automatically: no.",
+            f"- License qualification: {summary['license_qualification']}.",
+            f"- Basis: {summary['recommendation_basis']}.",
+            "- Throughput is a compute-only estimate from per-case solver time, not a fully packed-node measurement.",
             "- Dataset membership: none.",
             "",
         ]
@@ -3573,24 +4418,39 @@ def _archive_summary(directory: Path) -> None:
         shutil.copy2(path, destination / path.name)
 
 
+def _proof_identities(
+    suite: CoreBenchmarkSuite,
+    proofs: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return exact ordered identities for both canonical benchmark inputs."""
+    return [
+        {
+            "case_role": representative.case_role,
+            "case_input_id": proofs[representative.case_role]["case_input_id"],
+            "simulation_case_id": proofs[representative.case_role]["simulation_case_id"],
+            "case_payload_sha256": proofs[representative.case_role]["case_payload_sha256"],
+        }
+        for representative in suite.representative_cases
+    ]
+
+
 def _validate_summary_identity(
     summary: Mapping[str, Any],
     *,
     run_id: str,
     suite: CoreBenchmarkSuite,
     manifest: Mapping[str, Any],
-    proof: Mapping[str, Any],
+    proofs: Mapping[str, Mapping[str, Any]],
     records: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Bind one summary revision to immutable benchmark source evidence."""
+    """Bind one summary revision to both inputs and all terminal evidence."""
     expected_identity = {
         "schema_kind": BENCHMARK_SUMMARY_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "benchmark_run_id": run_id,
         "git_commit": manifest["git_commit"],
         "template_sha256": suite.case_config.template_sha256,
-        "case_input_id": proof["case_input_id"],
-        "simulation_case_id": proof["simulation_case_id"],
+        "representative_case_identities": _proof_identities(suite, proofs),
         "preflight": manifest["preflight"],
         "result_set_digest": common.serialization.canonical_json_sha256(records),
     }
@@ -3623,16 +4483,16 @@ def _validate_summary_payload(
     run_id: str,
     suite: CoreBenchmarkSuite,
     manifest: Mapping[str, Any],
-    proof: Mapping[str, Any],
+    proofs: Mapping[str, Mapping[str, Any]],
     records: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Bind one terminal summary to its source, case, and recomputed metrics."""
+    """Bind one terminal summary to both inputs and recomputed metrics."""
     _validate_summary_identity(
         summary,
         run_id=run_id,
         suite=suite,
         manifest=manifest,
-        proof=proof,
+        proofs=proofs,
         records=records,
     )
     if not _summary_metrics_match(summary, suite, records):
@@ -3667,30 +4527,29 @@ def finalize_core_benchmark(
     *,
     storage_root: Path | str,
 ) -> dict[str, Any]:
-    """Publish deterministic aggregate evidence after every repetition attempted."""
+    """Publish aggregate evidence only after all eight measurements succeed."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    scheduler = _scheduler_evidence([*manifest["preparation_job_ids"], *manifest["measured_job_ids"]])
+    scheduler = _scheduler_evidence(manifest["measured_job_ids"])
     if scheduler["squeue"]["error"] is not None:
         message = f"Could not verify terminal benchmark jobs before finalization: {scheduler['squeue']['error']}"
         raise RuntimeError(message)
     if scheduler["squeue"]["output"]:
         message = "Core benchmark cannot finalize while persisted Slurm jobs remain active."
         raise RuntimeError(message)
-    proof = _load_case_proof(run_id, suite, storage_root=storage_root)
+    proofs = _load_case_proofs(run_id, suite, storage_root=storage_root)
     records = _result_records(directory, suite)
     _validate_records_against_proof(
         records,
         run_id=run_id,
         manifest=manifest,
-        proof=proof,
+        proofs=proofs,
     )
-    pending = [record["repetition_id"] for record in records if record["status"] == "pending"]
-    if pending:
-        message = f"Core benchmark cannot finalize while repetitions remain pending: {pending}."
+    incomplete = [record["work_unit_id"] for record in records if record["status"] != "success"]
+    if incomplete:
+        message = f"Core benchmark requires eight valid successes before finalization; incomplete={incomplete}."
         raise RuntimeError(message)
     result_set_digest = common.serialization.canonical_json_sha256(records)
-    terminal_state = "complete" if all(record["status"] == "success" for record in records) else "complete_with_failures"
     current = directory / "summary.json"
     if current.exists():
         existing = _load_json(current, label="core benchmark summary")
@@ -3700,7 +4559,7 @@ def finalize_core_benchmark(
                 run_id=run_id,
                 suite=suite,
                 manifest=manifest,
-                proof=proof,
+                proofs=proofs,
                 records=records,
             )
             if _summary_metrics_match(existing, suite, records):
@@ -3710,7 +4569,7 @@ def finalize_core_benchmark(
                     records,
                     repair_missing=True,
                 )
-                manifest["state"] = terminal_state
+                manifest["state"] = "complete"
                 _persist_manifest(
                     _manifest_path(run_id, storage_root=storage_root),
                     manifest,
@@ -3722,8 +4581,7 @@ def finalize_core_benchmark(
             "benchmark_run_id": run_id,
             "git_commit": manifest["git_commit"],
             "template_sha256": suite.case_config.template_sha256,
-            "case_input_id": proof["case_input_id"],
-            "simulation_case_id": proof["simulation_case_id"],
+            "representative_case_identities": _proof_identities(suite, proofs),
             "preflight": manifest["preflight"],
             "scheduler_accounting": scheduler["sacct"],
             "result_set_digest": result_set_digest,
@@ -3737,7 +4595,7 @@ def finalize_core_benchmark(
         directory / "summary.md",
         core_benchmark_markdown(summary),
     )
-    manifest["state"] = terminal_state
+    manifest["state"] = "complete"
     _persist_manifest(_manifest_path(run_id, storage_root=storage_root), manifest)
     return summary
 
@@ -3795,23 +4653,23 @@ def validate_core_benchmark(
     *,
     storage_root: Path | str,
 ) -> dict[str, Any]:
-    """Validate same-case proof, terminal records, summaries, and namespace isolation."""
+    """Validate both case proofs, eight successes, summaries, and isolation."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    proof = _load_case_proof(run_id, suite, storage_root=storage_root)
+    proofs = _load_case_proofs(run_id, suite, storage_root=storage_root)
     records = _result_records(directory, suite)
     _validate_records_against_proof(
         records,
         run_id=run_id,
         manifest=manifest,
-        proof=proof,
+        proofs=proofs,
     )
-    if any(record["status"] == "pending" for record in records):
-        message = f"Core benchmark {run_id!r} still has pending repetitions."
+    incomplete = [record["work_unit_id"] for record in records if record["status"] != "success"]
+    if incomplete:
+        message = f"Core benchmark {run_id!r} does not have eight valid successes: {incomplete}."
         raise RuntimeError(message)
-    expected_state = "complete" if all(record["status"] == "success" for record in records) else "complete_with_failures"
-    if manifest["state"] != expected_state:
-        message = f"Core benchmark manifest is not terminally consistent: {manifest['state']!r}."
+    if manifest["state"] != "complete":
+        message = f"Core benchmark manifest is not complete: {manifest['state']!r}."
         raise ValueError(message)
     summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
     _validate_summary_payload(
@@ -3819,7 +4677,7 @@ def validate_core_benchmark(
         run_id=run_id,
         suite=suite,
         manifest=manifest,
-        proof=proof,
+        proofs=proofs,
         records=records,
     )
     _validate_or_repair_summary_outputs(
@@ -3836,16 +4694,15 @@ def validate_core_benchmark(
         raise ValueError(message)
     inventory = _directory_inventory(
         directory,
-        ignored_names=frozenset({"transfer_complete.json"}),
+        ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
     )
     return {
-        "status": manifest["state"],
+        "status": "complete",
         "benchmark_run_id": run_id,
         "suite_digest": suite.suite_digest,
-        "case_input_id": proof["case_input_id"],
-        "simulation_case_id": proof["simulation_case_id"],
-        "successful_repetitions": sum(record["status"] == "success" for record in records),
-        "failed_repetitions": sum(record["status"] == "failed" for record in records),
+        "representative_case_identities": _proof_identities(suite, proofs),
+        "successful_measurements": len(records),
+        "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
         "namespace": str(directory),
         "dataset_membership": "none",
         "inventory": inventory,
@@ -3946,7 +4803,7 @@ def publish_transferred_core_benchmark(
     if target.exists():
         target_inventory = _directory_inventory(
             target,
-            ignored_names=frozenset({"transfer_complete.json"}),
+            ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
         )
         if target_inventory != inventory:
             message = f"Existing benchmark publication conflicts: {target}"
@@ -3961,7 +4818,7 @@ def publish_transferred_core_benchmark(
             message = "Benchmark inventory changed during atomic incoming publication."
             raise RuntimeError(message)
     validate_core_benchmark(run_id, storage_root=destination)
-    receipt_path = target / "transfer_complete.json"
+    receipt_path = target / BENCHMARK_TRANSFER_FILENAME
     if receipt_path.exists():
         existing = _load_json(receipt_path, label="benchmark transfer receipt")
         identity = {
@@ -3994,3 +4851,338 @@ def publish_transferred_core_benchmark(
         label="benchmark transfer receipt",
     )
     return receipt
+
+
+def _benchmark_cleanup_receipt_path(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> Path:
+    """Return durable CPU cleanup evidence outside the removable source."""
+    safe_id = common.paths.validate_logical_name(run_id, label="benchmark_run_id")
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    return common.paths.get_generation_meta_root(storage_root=storage) / "benchmark_cleanup" / f"{safe_id}.json"
+
+
+def _benchmark_transfer_receipt(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> dict[str, Any]:
+    """Load one exact host transfer receipt after validating its publication."""
+    validated = validate_core_benchmark(run_id, storage_root=storage_root)
+    directory = core_benchmark_directory(run_id, storage_root=storage_root)
+    receipt = _load_json(
+        directory / BENCHMARK_TRANSFER_FILENAME,
+        label="benchmark transfer receipt",
+    )
+    if (
+        set(receipt)
+        != {
+            "schema_kind",
+            "schema_version",
+            "status",
+            "recorded_at",
+            "benchmark_run_id",
+            "source_host",
+            "source_storage_root",
+            "destination_storage_root",
+            "inventory",
+            "source_removed",
+        }
+        or receipt.get("schema_kind") != "generation_core_scaling_benchmark_transfer"
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "transfer_complete"
+        or receipt.get("benchmark_run_id") != run_id
+        or receipt.get("destination_storage_root") != str(workspace_service.resolve_storage_root(storage_root, create=False))
+        or receipt.get("inventory") != validated["inventory"]
+        or receipt.get("source_removed") is not False
+        or not isinstance(receipt.get("source_host"), str)
+        or not receipt["source_host"]
+        or not isinstance(receipt.get("source_storage_root"), str)
+        or not Path(receipt["source_storage_root"]).is_absolute()
+    ):
+        message = f"Benchmark transfer receipt is invalid: {directory}"
+        raise ValueError(message)
+    return receipt
+
+
+def core_benchmark_cleanup_authorization(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> dict[str, Any]:
+    """Build a hash-bound authorization from the validated host publication."""
+    receipt = _benchmark_transfer_receipt(run_id, storage_root=storage_root)
+    inventory = {key: receipt["inventory"][key] for key in ("inventory_sha256", "file_count", "size_bytes")}
+    identity = {
+        "benchmark_run_id": run_id,
+        "source_host": receipt["source_host"],
+        "source_storage_root": receipt["source_storage_root"],
+        "destination_storage_root": receipt["destination_storage_root"],
+        "inventory": inventory,
+    }
+    return {
+        "schema_kind": "generation_core_scaling_benchmark_cleanup_authorization",
+        "schema_version": 1,
+        **identity,
+        "authorization_sha256": common.serialization.canonical_json_sha256(identity),
+    }
+
+
+def _validate_benchmark_cleanup_identity(
+    inventory: Mapping[str, Any],
+    *,
+    run_id: str,
+    storage: Path,
+    source_host: str,
+    destination_storage_root: str,
+    expected_inventory_sha256: str,
+    expected_file_count: int,
+    expected_size_bytes: int,
+    authorization_sha256: str,
+) -> dict[str, Any]:
+    """Return the canonical cleanup identity after exact argument validation."""
+    _validate_expected_transfer_inventory(
+        inventory,
+        expected_sha256=expected_inventory_sha256,
+        expected_file_count=expected_file_count,
+        expected_size_bytes=expected_size_bytes,
+    )
+    exact_inventory = {
+        "inventory_sha256": expected_inventory_sha256,
+        "file_count": expected_file_count,
+        "size_bytes": expected_size_bytes,
+    }
+    identity = {
+        "benchmark_run_id": run_id,
+        "source_host": source_host,
+        "source_storage_root": str(storage),
+        "destination_storage_root": destination_storage_root,
+        "inventory": exact_inventory,
+    }
+    expected_authorization = common.serialization.canonical_json_sha256(identity)
+    if (
+        not source_host
+        or any(character in source_host for character in "\r\n\t")
+        or not Path(destination_storage_root).is_absolute()
+        or Path(destination_storage_root) == Path("/")
+        or authorization_sha256 != expected_authorization
+    ):
+        message = "Benchmark cleanup authorization identity is invalid."
+        raise ValueError(message)
+    return identity
+
+
+def cleanup_core_benchmark_source(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+    source_host: str,
+    destination_storage_root: str,
+    expected_inventory_sha256: str,
+    expected_file_count: int,
+    expected_size_bytes: int,
+    authorization_sha256: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Plan or transactionally delete one transferred terminal CPU source."""
+    if not isinstance(confirm, bool):
+        message = "Benchmark cleanup confirm flag must be boolean."
+        raise TypeError(message)
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    receipt_path = _benchmark_cleanup_receipt_path(run_id, storage_root=storage)
+    lock_path = receipt_path.with_suffix(".lock")
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    with common.locking.exclusive_file_lock(lock_path, blocking=True):
+        existing: dict[str, Any] | None = None
+        if receipt_path.exists():
+            existing = _load_json(receipt_path, label="benchmark CPU cleanup receipt")
+            if (
+                existing.get("schema_kind") != BENCHMARK_CLEANUP_SCHEMA_KIND
+                or existing.get("schema_version") != 1
+                or existing.get("benchmark_run_id") != run_id
+                or existing.get("authorization_sha256") != authorization_sha256
+                or existing.get("status") not in {"deleting", "complete"}
+            ):
+                message = f"Benchmark cleanup receipt conflicts: {receipt_path}"
+                raise FileExistsError(message)
+            if existing["status"] == "complete":
+                return {
+                    **existing,
+                    "receipt_sha256": common.serialization.file_sha256(receipt_path),
+                }
+        source = core_benchmark_directory(run_id, storage_root=storage)
+        quarantine = source.parent / f".cleanup-{run_id}"
+        if source.exists() and quarantine.exists():
+            message = "Benchmark source and cleanup quarantine both exist."
+            raise RuntimeError(message)
+        if source.exists():
+            validated = validate_core_benchmark(run_id, storage_root=storage)
+            identity = _validate_benchmark_cleanup_identity(
+                validated["inventory"],
+                run_id=run_id,
+                storage=storage,
+                source_host=source_host,
+                destination_storage_root=destination_storage_root,
+                expected_inventory_sha256=expected_inventory_sha256,
+                expected_file_count=expected_file_count,
+                expected_size_bytes=expected_size_bytes,
+                authorization_sha256=authorization_sha256,
+            )
+            manifest, _suite = load_core_benchmark_manifest(run_id, storage_root=storage)
+            scheduler = _scheduler_evidence(manifest["measured_job_ids"])
+            if scheduler["squeue"]["error"] is not None:
+                message = "Benchmark cleanup cannot prove scheduler inactivity."
+                raise RuntimeError(message)
+            if scheduler["squeue"]["output"]:
+                message = "Benchmark cleanup is blocked by active Slurm work."
+                raise RuntimeError(message)
+        elif existing is not None and quarantine.exists():
+            identity = _validate_benchmark_cleanup_identity(
+                existing["inventory"],
+                run_id=run_id,
+                storage=storage,
+                source_host=source_host,
+                destination_storage_root=destination_storage_root,
+                expected_inventory_sha256=expected_inventory_sha256,
+                expected_file_count=expected_file_count,
+                expected_size_bytes=expected_size_bytes,
+                authorization_sha256=authorization_sha256,
+            )
+        else:
+            message = f"Benchmark source is missing without complete cleanup evidence: {source}"
+            raise FileNotFoundError(message)
+        if not confirm:
+            return {
+                "schema_kind": BENCHMARK_CLEANUP_SCHEMA_KIND,
+                "schema_version": 1,
+                "status": "authorized",
+                **identity,
+                "authorization_sha256": authorization_sha256,
+                "reclaimed_bytes": 0,
+            }
+        pending = {
+            "schema_kind": BENCHMARK_CLEANUP_SCHEMA_KIND,
+            "schema_version": 1,
+            "status": "deleting",
+            "recorded_at": _utc_now(),
+            "completed_at": None,
+            **identity,
+            "authorization_sha256": authorization_sha256,
+            "reclaimed_bytes": 0,
+        }
+        common.serialization.atomic_write_json(receipt_path, pending)
+        if source.exists():
+            source.replace(quarantine)
+        if not quarantine.is_dir() or quarantine.is_symlink():
+            message = f"Benchmark cleanup quarantine is unsafe: {quarantine}"
+            raise RuntimeError(message)
+        shutil.rmtree(quarantine)
+        completed = {
+            **pending,
+            "status": "complete",
+            "completed_at": _utc_now(),
+            "reclaimed_bytes": expected_size_bytes,
+        }
+        common.serialization.atomic_write_json(receipt_path, completed)
+        return {
+            **completed,
+            "receipt_sha256": common.serialization.file_sha256(receipt_path),
+        }
+
+
+def record_core_benchmark_cleanup(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+    authorization_sha256: str,
+    cleanup_receipt_sha256: str,
+    reclaimed_bytes: int,
+) -> dict[str, Any]:
+    """Bind remote cleanup evidence to the validated host publication."""
+    authorization = core_benchmark_cleanup_authorization(run_id, storage_root=storage_root)
+    if (
+        authorization_sha256 != authorization["authorization_sha256"]
+        or _SHA256_PATTERN.fullmatch(cleanup_receipt_sha256) is None
+        or isinstance(reclaimed_bytes, bool)
+        or not isinstance(reclaimed_bytes, int)
+        or reclaimed_bytes != authorization["inventory"]["size_bytes"]
+    ):
+        message = "Benchmark cleanup completion evidence is invalid."
+        raise ValueError(message)
+    directory = core_benchmark_directory(run_id, storage_root=storage_root)
+    receipt = {
+        "schema_kind": "generation_core_scaling_benchmark_host_cleanup",
+        "schema_version": 1,
+        "status": "complete",
+        "recorded_at": _utc_now(),
+        "benchmark_run_id": run_id,
+        "authorization_sha256": authorization_sha256,
+        "cleanup_receipt_sha256": cleanup_receipt_sha256,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+    _write_immutable_json(
+        directory / BENCHMARK_LOCAL_CLEANUP_FILENAME,
+        receipt,
+        label="benchmark host cleanup receipt",
+    )
+    validate_core_benchmark(run_id, storage_root=storage_root)
+    return receipt
+
+
+def core_benchmark_source_status(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+    query_scheduler: bool = True,
+) -> dict[str, Any]:
+    """Report the common CPU source-storage state for one benchmark."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    cleanup_path = _benchmark_cleanup_receipt_path(run_id, storage_root=storage)
+    if cleanup_path.is_file() and not cleanup_path.is_symlink():
+        cleanup = _load_json(cleanup_path, label="benchmark CPU cleanup receipt")
+        if (
+            cleanup.get("schema_kind") != BENCHMARK_CLEANUP_SCHEMA_KIND
+            or cleanup.get("schema_version") != 1
+            or cleanup.get("benchmark_run_id") != run_id
+            or cleanup.get("status") != "complete"
+        ):
+            message = f"Benchmark CPU cleanup receipt is invalid: {cleanup_path}"
+            raise ValueError(message)
+        return {
+            "schema_kind": "generation_run_source_status",
+            "schema_version": 1,
+            "run_kind": "benchmark",
+            "run_id": run_id,
+            "run_state": "complete",
+            "source_state": "cleaned",
+            "reclaimable_bytes": 0,
+            "cleanup_eligibility": "already_cleaned",
+            "active_slurm": False,
+        }
+    source = core_benchmark_directory(run_id, storage_root=storage)
+    if not source.is_dir() or source.is_symlink():
+        message = f"Benchmark source is missing without cleanup evidence: {source}"
+        raise FileNotFoundError(message)
+    status = core_benchmark_status(
+        run_id,
+        storage_root=storage,
+        query_scheduler=query_scheduler,
+    )
+    inventory = _directory_inventory(
+        source,
+        ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
+    )
+    active = bool(status["active_work_units"])
+    return {
+        "schema_kind": "generation_run_source_status",
+        "schema_version": 1,
+        "run_kind": "benchmark",
+        "run_id": run_id,
+        "run_state": status["state"],
+        "source_state": "retained" if status["state"] == "complete" else "active",
+        "reclaimable_bytes": inventory["size_bytes"],
+        "cleanup_eligibility": ("eligible" if status["state"] == "complete" and not active else "not_terminal_or_active"),
+        "active_slurm": active,
+    }

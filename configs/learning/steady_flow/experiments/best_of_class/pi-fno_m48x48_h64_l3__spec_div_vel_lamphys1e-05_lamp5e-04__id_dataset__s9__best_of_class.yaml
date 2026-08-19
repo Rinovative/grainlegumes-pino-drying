@@ -2,12 +2,12 @@ task: steady_flow
 
 run:
   seed: 9
-  deterministic: true
+  deterministic: false
   device: auto
-  suffix: lr_0p01
+  suffix: best_of_class
 
 data:
-  train_dataset: lhs_var80_seed3001
+  train_dataset: steady_flow__lentil+chickpea+kidney_bean__id
   ood_datasets:
     - lhs_var120_seed4001
   batch_size: 32
@@ -17,7 +17,7 @@ model:
   params:
     n_modes: [48, 48]
     hidden_channels: 64
-    n_layers: 4
+    n_layers: 3
     lifting_channel_ratio: 2
     projection_channel_ratio: 2
     fno_skip: linear
@@ -29,8 +29,28 @@ loss:
     kind: relative_h1
     space: normalized
     weight: 1.0
+
   physics:
-    enabled: false
+    enabled: true
+    continuity: div_velocity
+
+    derivatives:
+      kind: spectral
+      extension: reflect
+
+    interior_crop: 2
+
+    residual_weight:
+      target: 1.0489343501429863e-05
+      warmup:
+        kind: linear
+        epochs: 300
+
+    boundary_weight:
+      target: 5.043350930442693e-04
+      warmup:
+        kind: linear
+        epochs: 300
 
 evaluation:
   objective:
@@ -38,16 +58,16 @@ evaluation:
 
 optimizer:
   kind: adamw
-  lr: 1.0e-2
-  weight_decay: 1.0e-4
+  lr: 4.3682304700764195e-04
+  weight_decay: 1.0e-04
   betas: [0.9, 0.999]
-  second_moment_floor: 1.0e-6
+  second_moment_floor: 1.0e-06
 
 scheduler:
   kind: reduce_on_plateau
   factor: 0.5
   patience: 20
-  min_lr: 1.0e-5
+  min_lr: 1.0e-05
 
 training:
   epochs: 600

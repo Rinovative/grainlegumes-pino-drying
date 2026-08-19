@@ -34,7 +34,7 @@ experiment:
     suffix: optuna
 
   data:
-    train_dataset: lhs_var80_seed3001
+    train_dataset: steady_flow__lentil+chickpea+kidney_bean__id
     ood_datasets:
       - lhs_var120_seed4001
     batch_size: 32

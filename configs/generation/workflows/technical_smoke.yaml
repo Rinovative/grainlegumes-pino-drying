@@ -1,0 +1,8 @@
+schema_kind: generation_workflow
+schema_version: 1
+workflow_name: technical_smoke
+children:
+- configs/generation/campaigns/steady_flow/technical_smoke.yaml
+- configs/generation/campaigns/transient_drying/technical_smoke.yaml
+finalizers:
+- paired_technical_smoke

@@ -134,7 +134,10 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         query_count["value"] += 1
         return scheduler
 
-    retry = {"retry_budget_remaining": True}
+    wait = {
+        "retry_budget_remaining": True,
+        "first_blocked_at": "2026-01-01T00:00:00+00:00",
+    }
     monkeypatch.setattr(generation.campaign.campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
     monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_run_directory", lambda *_args, **_kwargs: run_directory)
@@ -151,10 +154,10 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     )
     monkeypatch.setattr(
         generation.campaign.license_service,
-        "latest_attempt_for_job",
-        lambda *_args, job_id, **_kwargs: retry if job_id == "104" else None,
+        "latest_wait_for_job",
+        lambda *_args, job_id, **_kwargs: wait if job_id == "104" else None,
     )
-    monkeypatch.setattr(generation.campaign.license_service, "retry_attempt_is_eligible", lambda _attempt: True)
+    monkeypatch.setattr(generation.campaign.license_service, "wait_record_is_eligible", lambda _attempt: True)
     monkeypatch.setattr(
         generation.campaign.progress_service,
         "load_runtime_progress",

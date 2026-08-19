@@ -1,4 +1,4 @@
-# ruff: noqa: S101, S603, PLR2004
+# ruff: noqa: E501, S101, S603, PLR2004
 """Host workflow lifecycle tests using fake Docker, remote, Slurm, and COMSOL."""
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from src.generation.cli import cli_generation
 pytestmark = pytest.mark.integration
 
 _COMMIT = "a" * 40
-_RUN_ID = "steady_flow_family_generalization__0123456789abcdef"
+_RUN_ID = "steady_flow_steady_flow_id_dataset_v1__0123456789abcdef"
 _BENCHMARK_RUN_ID = "core_scaling_transient__fedcba9876543210"
 _SMOKE_SHA = "7" * 64
 _BATCH_NAME = generation.cases.config.build_batch_name(
@@ -63,11 +63,12 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     shutil.copyfile(repository / "scripts/docker_python.sh", docker_python)
     docker_python.chmod(docker_python.stat().st_mode | 0o111)
     for relative in (
-        "configs/generation/campaigns/steady_flow/family_generalization.yaml",
+        "configs/generation/campaigns/steady_flow/id_dataset.yaml",
         "configs/generation/campaigns/steady_flow/technical_smoke.yaml",
         "configs/generation/campaigns/transient_drying/family_generalization.yaml",
         "configs/generation/campaigns/transient_drying/technical_smoke.yaml",
-        "configs/generation/campaigns/transient_drying/pilot_check.yaml",
+        "configs/generation/campaigns/transient_drying/material_pilot.yaml",
+        "configs/generation/workflows/technical_smoke.yaml",
     ):
         source = repository / relative
         destination = project / relative
@@ -314,12 +315,19 @@ if [[ "${payload}" == *'${HOME}'* && "${payload}" != *'root="$1"'* ]]; then
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format state '* ]]; then
   printf '%s\n' "${FAKE_BENCHMARK_STATE}"
 elif [[ " $* " == *' core-benchmark-status '* ]]; then
-  printf '%s\n' '{"state":"retry_required","retry_repetitions":[{"variant_id":"cores_16","repetition":2,"evidence_status":"failed"}]}'
+  failed=0
+  [[ "${FAKE_BENCHMARK_STATE}" == complete ]] || failed=1
+  printf '{"state":"%s","successful_work_units":%s,"active_work_units":0,' \
+    "${FAKE_BENCHMARK_STATE}" "$((8 - failed))"
+  printf '"pending_work_units":0,"license_blocked_work_units":0,'
+  printf '"failed_work_units":%s,"total_work_units":8,"license_waits":[]}\n' "${failed}"
 elif [[ " $* " == *' core-benchmark-transfer-plan '* ]]; then
   printf 'benchmark\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_GIT_COMMIT}" "${FAKE_BENCHMARK_RELATIVE}" \
     "${FAKE_BENCHMARK_INVENTORY_SHA}" "${FAKE_BENCHMARK_FILE_COUNT}" \
     "${FAKE_BENCHMARK_SIZE_BYTES}"
+elif [[ " $* " == *' materialize-core-benchmark-inputs '* ]]; then
+  printf '{"benchmark_run_id":"%s","state":"inputs_ready"}\n' "${FAKE_BENCHMARK_RUN_ID}"
 elif [[ " $* " == *' submit-core-benchmark '* ]]; then
   printf '{"benchmark_run_id":"%s","state":"submitted"}\n' "${FAKE_BENCHMARK_RUN_ID}"
 elif [[ " $* " == *' plan-core-benchmark '* ]]; then
@@ -345,9 +353,10 @@ elif [[ " $* " == *' campaign-transfer-plan '* ]]; then
   printf '%b' "${FAKE_TRANSFER_PLAN}"
 elif [[ " $* " == *' campaign-source-status '* ]]; then
   if [[ -f "${FAKE_REMOTE_CLEANED_FILE}" ]]; then
-    printf 'source-status\t%s\tsource_cleanup_complete\t0\talready_complete\tFalse\n' "${FAKE_RUN_ID}"
+    printf 'source-status\t%s\tcomplete\tcleaned\t0\talready_complete\tFalse\n' "${FAKE_RUN_ID}"
   else
-    printf 'source-status\t%s\t%s\t%s\tineligible\tFalse\n'       "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
+    printf 'source-status\t%s\trunning\t%s\t%s\tineligible\tFalse\n' \
+      "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
   fi
 elif [[ " $* " == *' campaign-status '* \
   && "${FAKE_CAMPAIGN_STATUS_FAIL:-false}" == true ]]; then
@@ -493,6 +502,65 @@ if [[ " $* " == *' list-campaigns '* ]]; then
   printf '%s\n' '{}'
   exit 0
 fi
+if [[ " $* " == *' resolve-generation-run '* ]]; then
+  arguments=("$@")
+  config=''
+  for ((index=0; index<${#arguments[@]}; index++)); do
+    if [[ "${arguments[index]}" == resolve-generation-run ]]; then
+      config="${arguments[index+1]}"
+      break
+    fi
+  done
+  case "${config}" in
+    *'/configs/generation/workflows/technical_smoke.yaml')
+      : > "${FAKE_SMOKE_WORKFLOW_FILE}"
+      printf '%s\n' workflow configs/generation/workflows/technical_smoke.yaml - - > "${FAKE_RUN_PLAN_FILE}"
+      printf '%s\n' '{"run_kind":"workflow","identity":"workflow__0123456789abcdef","config_path":"configs/generation/workflows/technical_smoke.yaml","children":[],"units":[]}'
+      ;;
+    *'/configs/generation/benchmarks/transient_core_scaling/suite.yaml')
+      printf '%s\n' benchmark configs/generation/benchmarks/transient_core_scaling/suite.yaml - - > "${FAKE_RUN_PLAN_FILE}"
+      printf '%s\n' '{"run_kind":"benchmark","identity":"benchmark_plan__0123456789abcdef","config_path":"configs/generation/benchmarks/transient_core_scaling/suite.yaml","children":[],"units":[]}'
+      ;;
+    *'/configs/generation/campaigns/transient_drying/material_pilot.yaml')
+      printf '%s\n' campaign configs/generation/campaigns/transient_drying/material_pilot.yaml pilot_check transient_drying > "${FAKE_RUN_PLAN_FILE}"
+      printf '%s\n' '{"run_kind":"campaign","identity":"steady_flow_steady_flow_id_dataset_v1__0123456789abcdef","config_path":"configs/generation/campaigns/transient_drying/material_pilot.yaml","children":[],"units":[{"metadata":{"campaign_purpose":"pilot_check","simulation_profile":"transient_drying"}}]}'
+      ;;
+    *'/configs/generation/campaigns/'*'/technical_smoke.yaml')
+      profile=steady_flow
+      [[ "${config}" != *'/transient_drying/'* ]] || profile=transient_drying
+      relative="configs/generation/campaigns/${profile}/technical_smoke.yaml"
+      printf '%s\n' campaign "${relative}" technical_runtime_smoke "${profile}" > "${FAKE_RUN_PLAN_FILE}"
+      printf '{"run_kind":"campaign","identity":"%s","config_path":"%s","children":[],"units":[{"metadata":{"campaign_purpose":"technical_runtime_smoke","simulation_profile":"%s"}}]}\n' "${FAKE_RUN_ID}" "${relative}" "${profile}"
+      ;;
+    *'/configs/generation/campaigns/transient_drying/family_generalization.yaml')
+      printf '%s\n' campaign configs/generation/campaigns/transient_drying/family_generalization.yaml family_generalization transient_drying > "${FAKE_RUN_PLAN_FILE}"
+      printf '%s\n' '{"run_kind":"campaign","identity":"steady_flow_steady_flow_id_dataset_v1__0123456789abcdef","config_path":"configs/generation/campaigns/transient_drying/family_generalization.yaml","children":[],"units":[{"metadata":{"campaign_purpose":"family_generalization","simulation_profile":"transient_drying"}}]}'
+      ;;
+    *)
+      printf '%s\n' campaign configs/generation/campaigns/steady_flow/id_dataset.yaml steady_flow_id_dataset steady_flow > "${FAKE_RUN_PLAN_FILE}"
+      printf '%s\n' '{"run_kind":"campaign","identity":"steady_flow_steady_flow_id_dataset_v1__0123456789abcdef","config_path":"configs/generation/campaigns/steady_flow/id_dataset.yaml","children":[],"units":[{"metadata":{"campaign_purpose":"steady_flow_id_dataset","simulation_profile":"steady_flow"}}]}'
+      ;;
+  esac
+  exit 0
+fi
+if [[ " $* " == *' find-compatible-technical-smoke-run '* ]]; then
+  printf '%s\n' '{"status":"missing","campaign_run_id":null}'
+  exit 0
+fi
+if [[ " $* " == *' find-compatible-campaign-source '* ]]; then
+  compatible_state="${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}"
+  if [[ "${compatible_state}" == missing     && -f "${FAKE_DATASETS_COMPLETE_FILE}"     && -f "${FAKE_WORKFLOW_COMPLETE_FILE}"     && ! -f "${FAKE_PACKAGE_STATE_READY_FILE}" ]]; then
+    compatible_state=extension_required
+  fi
+  if [[ "${compatible_state}" == missing ]]; then
+    printf '%s\n' '{"status":"missing","campaign_run_id":null}'
+  else
+    printf '{"status":"compatible_complete","campaign_run_id":"%s",' "${FAKE_RUN_ID}"
+    printf '"package_state":"%s","artifact_set_sha256":"%s"}\n' \
+      "${compatible_state}" "${FAKE_INVENTORY_SHA}"
+  fi
+  exit 0
+fi
 if [[ " $* " == *' validate-config '* ]]; then
   arguments=("$@")
   config=''
@@ -510,19 +578,27 @@ if [[ " $* " == *' validate-config '* ]]; then
   fi
   purpose=family_generalization
   [[ " $* " != *'/technical_smoke.yaml'* ]] || purpose=technical_runtime_smoke
-  [[ " $* " != *'/pilot_check.yaml'* ]] || purpose=pilot_check
+  [[ " $* " != *'/material_pilot.yaml'* ]] || purpose=pilot_check
   printf '%s\n' "${purpose}" > "${FAKE_CAMPAIGN_PURPOSE_FILE}"
+fi
+if [[ " $* " == *' resolve-core-benchmark-run '* ]]; then
+  printf '{"benchmark_run_id":"%s"}\n' "${FAKE_BENCHMARK_RUN_ID}"
+  exit 0
 fi
 if [[ " $* " == *' inspect-core-benchmark '* ]]; then
   printf '%s\n' \
     '{"suite_name":"transient_core_scaling",'\
 '"suite_digest":"8888888888888888888888888888888888888888888888888888888888888888",'\
-'"repetitions":3,"resource_contract":{"cpu_host":"fixture.cluster","scheduler":"slurm",'\
+'"benchmark_mode":"core_selection","parallel_cases_per_variant":2,'\
+'"required_successful_measurements":8,'\
+'"representative_cases":[{"case_role":"nominal"},{"case_role":"natural"}],'\
+'"resource_contract":{"cpu_host":"fixture.cluster","scheduler":"slurm",'\
 '"partition":"standard","cores_per_node":32,"python_module":"Python/3.10",'\
 '"comsol_module":"Comsol/v6.4","python_executable":"python","comsol_executable":"comsol","poll_interval_seconds":1},'\
-'"variants":[{"variant_id":"cores_04","cores_per_case":4},'\
-'{"variant_id":"cores_08","cores_per_case":8},{"variant_id":"cores_16","cores_per_case":16},'\
-'{"variant_id":"cores_32","cores_per_case":32}]}'
+'"variant_waves":[{"wave_position":1,"variant_id":"cores_16","cores_per_case":16},'\
+'{"wave_position":2,"variant_id":"cores_04","cores_per_case":4},'\
+'{"wave_position":3,"variant_id":"cores_08","cores_per_case":8},'\
+'{"wave_position":4,"variant_id":"cores_32","cores_per_case":32}]}'
   exit 0
 fi
 if [[ " $* " == *' create-background-session '* ]]; then
@@ -540,8 +616,8 @@ if [[ " $* " == *' create-background-session '* ]]; then
       printf '%s\n' "${argument}" >> "${FAKE_BACKGROUND_CHILD_ARGUMENTS_FILE}"
     fi
   done
-  session_id='gw-20260818T154501Z-all-01234567'
-  tmux_name='gw-all-154501-01234567'
+  session_id='gw-20260818T154501Z-run-01234567'
+  tmux_name='gw-run-154501-01234567'
   directory="${storage}/01_generation/meta/workflow_sessions/${session_id}"
   mkdir -p "${directory}"
   command_path="${directory}/command.sh"
@@ -558,21 +634,21 @@ if [[ " $* " == *' create-background-session '* ]]; then
   exit 0
 fi
 if [[ " $* " == *' inspect-background-session '* ]]; then
-  printf '{"workflow_session_id":"gw-20260818T154501Z-all-01234567",'
-  printf '"source_commit":"%s","subcommand":"all",' "${FAKE_GIT_COMMIT}"
+  printf '{"workflow_session_id":"gw-20260818T154501Z-run-01234567",'
+  printf '"source_commit":"%s","subcommand":"run",' "${FAKE_GIT_COMMIT}"
   if [[ "${FAKE_TMUX_IMMEDIATE_EXIT:-false}" == true ]]; then
-    printf '"tmux_session_name":"gw-all-154501-01234567","tmux_active":false,'
+    printf '"tmux_session_name":"gw-run-154501-01234567","tmux_active":false,'
     printf '"workflow_state":"completed","exit_code":0,'
     printf '"started_at":"2026-08-18T15:45:01+00:00","ended_at":"2026-08-18T15:45:02+00:00",'
     printf '"campaign_run_ids":[],"benchmark_run_ids":[],"final_stage":"DONE: synthetic",'
   else
-    printf '"tmux_session_name":"gw-all-154501-01234567","tmux_active":true,'
+    printf '"tmux_session_name":"gw-run-154501-01234567","tmux_active":true,'
     printf '"workflow_state":"running","exit_code":null,'
     printf '"started_at":"2026-08-18T15:45:01+00:00","ended_at":null,'
     printf '"campaign_run_ids":[],"benchmark_run_ids":[],"final_stage":"running",'
   fi
   printf '"log_path":"%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
-  printf '%s\n' 'gw-20260818T154501Z-all-01234567/workflow.log"}'
+  printf '%s\n' 'gw-20260818T154501Z-run-01234567/workflow.log"}'
   exit 0
 fi
 if [[ " $* " == *' list-background-sessions '* ]]; then
@@ -580,14 +656,42 @@ if [[ " $* " == *' list-background-sessions '* ]]; then
   exit 0
 fi
 if [[ " $* " == *' -c '* ]]; then
-  cat >/dev/null
-  if [[ " $* " == *'keys = ("status"'* ]]; then
-    printf 'created\tgw-20260818T154501Z-all-01234567\tgw-all-154501-01234567\t%s\t' \
+  payload="$(cat)"
+  if [[ " $* " == *'plan = json.load'* ]]; then
+    mapfile -t plan < "${FAKE_RUN_PLAN_FILE}"
+    kind="${plan[0]}"; config="${plan[1]}"; purpose="${plan[2]}"; profile="${plan[3]}"
+    if [[ "${kind}" == workflow ]]; then
+      printf 'plan\tworkflow\tworkflow__0123456789abcdef\t%s\t-\t-\t2\n' "${config}"
+      printf 'child\tconfigs/generation/campaigns/steady_flow/technical_smoke.yaml\t%s\ttechnical_runtime_smoke\tsteady_flow\t%s\n' "${FAKE_RUN_ID}" "${FAKE_TRANSFER_SHA}"
+      printf 'child\tconfigs/generation/campaigns/transient_drying/technical_smoke.yaml\t%s\ttechnical_runtime_smoke\ttransient_drying\t%s\n' "${FAKE_RUN_ID}" "${FAKE_DATASET_SHA}"
+    elif [[ "${kind}" == benchmark ]]; then
+      printf 'plan\tbenchmark\tbenchmark_plan__0123456789abcdef\t%s\t-\t-\t0\n' "${config}"
+    else
+      printf 'plan\tcampaign\t%s\t%s\t%s\t%s\t0\n' "${FAKE_RUN_ID}" "${config}" "${purpose}" "${profile}"
+    fi
+  elif [[ " $* " == *'value.get("package_state"'* ]]; then
+    compatible_state="${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}"
+    if [[ "${compatible_state}" == missing \
+      && -f "${FAKE_DATASETS_COMPLETE_FILE}" \
+      && -f "${FAKE_WORKFLOW_COMPLETE_FILE}" \
+      && ! -f "${FAKE_PACKAGE_STATE_READY_FILE}" ]]; then
+      compatible_state=extension_required
+    fi
+    if [[ "${compatible_state}" == missing ]]; then
+      printf 'missing\t-\t-\t-\n'
+    else
+      printf 'compatible_complete\t%s\t%s\t%s\n' \
+        "${FAKE_RUN_ID}" "${compatible_state}" "${FAKE_INVENTORY_SHA}"
+    fi
+  elif [[ " $* " == *'reason = str(value.get'* ]]; then
+    printf 'complete\t-\n'
+  elif [[ " $* " == *'keys = ("status"'* ]]; then
+    printf 'created\tgw-20260818T154501Z-run-01234567\tgw-run-154501-01234567\t%s\t' \
       "${FAKE_GIT_COMMIT}"
     printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
-    printf 'gw-20260818T154501Z-all-01234567/workflow.log\t'
+    printf 'gw-20260818T154501Z-run-01234567/workflow.log\t'
     printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
-    printf 'gw-20260818T154501Z-all-01234567/command.sh\tsynthetic-host\n'
+    printf 'gw-20260818T154501Z-run-01234567/command.sh\tsynthetic-host\n'
   elif [[ " $* " == *'fields = (value["workflow_state"]'* ]]; then
     if [[ "${FAKE_TMUX_IMMEDIATE_EXIT:-false}" == true ]]; then
       printf 'completed\t0\tDONE: synthetic\n'
@@ -595,15 +699,22 @@ if [[ " $* " == *' -c '* ]]; then
       printf 'running\t-\trunning\n'
     fi
   elif [[ " $* " == *'keys = ("workflow_session_id"'* ]]; then
-    printf 'gw-20260818T154501Z-all-01234567\t%s\tall\t' "${FAKE_GIT_COMMIT}"
-    printf 'gw-all-154501-01234567\ttrue\trunning\t-\t'
+    printf 'gw-20260818T154501Z-run-01234567\t%s\trun\t' "${FAKE_GIT_COMMIT}"
+    printf 'gw-run-154501-01234567\ttrue\trunning\t-\t'
     printf '2026-08-18T15:45:01+00:00\t-\t-\t-\trunning\t'
     printf '%s/01_generation/meta/workflow_sessions/' "${STORAGE_ROOT}"
-    printf 'gw-20260818T154501Z-all-01234567/workflow.log\n'
+    printf 'gw-20260818T154501Z-run-01234567/workflow.log\n'
   elif [[ " $* " == *'sessions = json.load'* ]]; then
     printf '%s\n' 'No background workflow sessions.'
+  elif [[ " $* " == *'waits = value.get("license_waits"'* ]]; then
+    failed=0
+    [[ "${FAKE_BENCHMARK_STATE}" == complete ]] || failed=1
+    printf '%s\t%s\t0\t0\t0\t%s\t8\t-\n' \
+      "${FAKE_BENCHMARK_STATE}" "$((8 - failed))" "${failed}"
+  elif [[ " $* " == *'["benchmark_run_id"]'* ]]; then
+    printf '%s\n' "${FAKE_BENCHMARK_RUN_ID}"
   elif [[ " $* " == *'resource = value'* ]]; then
-    printf 'benchmark\ttransient_core_scaling\t%s\t3\t4,8,16,32\tfixture.cluster\t'\
+    printf 'benchmark\ttransient_core_scaling\t%s\t8\t2\t16,4,8,32\tfixture.cluster\t'\
 'slurm\tstandard\t32\tPython/3.10\tComsol/v6.4\tpython\tcomsol\t1\n' \
       '8888888888888888888888888888888888888888888888888888888888888888'
   elif [[ " $* " == *'valid = value'* ]]; then
@@ -618,7 +729,7 @@ if [[ " $* " == *' -c '* ]]; then
 'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' \
       "${catalog_prefix}configs/generation/campaigns/steady_flow/technical_smoke.yaml" \
       "${catalog_prefix}configs/generation/campaigns/transient_drying/technical_smoke.yaml" \
-      "${catalog_prefix}configs/generation/campaigns/steady_flow/family_generalization.yaml" \
+      "${catalog_prefix}configs/generation/campaigns/steady_flow/id_dataset.yaml" \
       "${catalog_prefix}configs/generation/campaigns/transient_drying/family_generalization.yaml"
   elif [[ " $* " == *'counts = tuple'* ]]; then
     printf 'pilot\tpilot_check\t4\t20\n'
@@ -672,12 +783,17 @@ elif [[ " $* " == *' publish-transferred-campaign '* ]]; then
 elif [[ " $* " == *' cleanup-transfer-staging '* ]]; then
   [[ -z "${directory}" || ! -d "${directory}" ]] || rm -r -- "${directory}"
   printf '%s\n' '{"mode":"delete"}'
+elif [[ " $* " == *' cleanup-pilot-staging '* ]]; then
+  printf 'pilot-staging-cleanup\tcomplete\tTrue\t0\t%s\n' "${FAKE_CLEANUP_RECEIPT_SHA}"
 elif [[ " $* " == *' build-campaign-datasets '* ]]; then
   if [[ "${FAKE_BUILD_FAIL:-false}" == true ]]; then
     printf '%s\n' 'synthetic dataset build failed' >&2
     exit 5
   fi
-  : > "${FAKE_DATASETS_COMPLETE_FILE}"
+  if [[ "${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}" != extension_required ]]; then
+    : > "${FAKE_DATASETS_COMPLETE_FILE}"
+  fi
+  : > "${FAKE_PACKAGE_STATE_READY_FILE}"
   printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
 elif [[ " $* " == *' prepare-all-workflow '* ]]; then
   : > "${FAKE_WORKFLOW_READY_FILE}"
@@ -687,8 +803,14 @@ elif [[ " $* " == *' prepare-all-workflow '* ]]; then
   else
     printf '%s\n' '{"workflow_result":"ready_for_cpu_cleanup","cpu_cleanup_complete":{"status":"pending"}}'
   fi
+elif [[ " $* " == *' validate-campaign-package-state '* ]]; then
+  [[ -f "${FAKE_PACKAGE_STATE_READY_FILE}" ]]
+  printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
 elif [[ " $* " == *' validate-all-workflow '* ]]; then
   [[ -f "${FAKE_WORKFLOW_COMPLETE_FILE}" ]]
+  if [[ -f "${FAKE_SMOKE_WORKFLOW_FILE}" ]]; then
+    rm -f -- "${FAKE_WORKFLOW_COMPLETE_FILE}"
+  fi
   printf '%s\n' '{"workflow_result":"success"}'
 elif [[ " $* " == *' cpu-cleanup-authorization '* ]]; then
   printf 'authorization\t%s\tcpu.example\t/remote/generation root/storage\t%s\t%s\t%s\t%s\t%s\t4\t%s\n' \
@@ -730,6 +852,8 @@ fi
             "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             "FAKE_COMMAND_LOG": str(log),
             "FAKE_CAMPAIGN_PURPOSE_FILE": str(state_root / "campaign-purpose"),
+            "FAKE_RUN_PLAN_FILE": str(state_root / "run-plan"),
+            "FAKE_SMOKE_WORKFLOW_FILE": str(state_root / "smoke-workflow"),
             "FAKE_GIT_COMMIT": _COMMIT,
             "FAKE_GIT_STATUS": "",
             "FAKE_COMMITTED_ROOT": str(committed_project),
@@ -754,6 +878,7 @@ fi
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
             "FAKE_CAMPAIGN_STATE": "successful",
+            "FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE": "missing",
             "FAKE_CAMPAIGN_STATUS_FAIL": "false",
             "FAKE_CAMPAIGN_STATES": "",
             "FAKE_CAMPAIGN_PROGRESS_SIGNATURES": "",
@@ -775,6 +900,7 @@ fi
             "FAKE_GPU_PUBLISHED_FILE": str(state_root / "gpu-published"),
             "FAKE_BENCHMARK_PUBLISHED_FILE": str(state_root / "benchmark-published"),
             "FAKE_DATASETS_COMPLETE_FILE": str(state_root / "datasets-complete"),
+            "FAKE_PACKAGE_STATE_READY_FILE": str(state_root / "package-state-ready"),
             "FAKE_WORKFLOW_READY_FILE": str(state_root / "workflow-ready"),
             "FAKE_WORKFLOW_COMPLETE_FILE": str(state_root / "workflow-complete"),
             "FAKE_REMOTE_CLEANED_FILE": str(state_root / "remote-cleaned"),
@@ -935,14 +1061,19 @@ def _remote_options() -> list[str]:
     ]
 
 
-def _selection_options() -> list[str]:
-    """Return one valid configured-campaign batch selection."""
-    return ["--only-batch", _BATCH_NAME]
-
-
 def _campaign(workflow: Path) -> Path:
     """Return the copied campaign configuration."""
-    return workflow.parent.parent / "configs/generation/campaigns/steady_flow/family_generalization.yaml"
+    return workflow.parent.parent / "configs/generation/campaigns/steady_flow/id_dataset.yaml"
+
+
+def _smoke_workflow(workflow: Path) -> Path:
+    """Return the copied paired Technical Smoke workflow configuration."""
+    return workflow.parent.parent / "configs/generation/workflows/technical_smoke.yaml"
+
+
+def _benchmark_suite(workflow: Path) -> Path:
+    """Return the copied core-scaling benchmark suite configuration."""
+    return workflow.parent.parent / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
 
 
 def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
@@ -976,8 +1107,8 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
         encoding="utf-8",
     )
     environment["FAKE_TRANSFER_PLAN"] = (
-        f"campaign\tsteady_flow_family_generalization\t{_COMMIT}\t{campaign_directory}"
-        "\tconfigs/generation/campaigns/steady_flow/family_generalization.yaml\n"
+        f"campaign\tsteady_flow_steady_flow_id_dataset_v1\t{_COMMIT}\t{campaign_directory}"
+        "\tconfigs/generation/campaigns/steady_flow/id_dataset.yaml\n"
         f"batch\t{_BATCH_NAME}\t{batch_id}\t1\t{meta_directory}\t{raw_directory}\t{processed_directory}\n"
         f"attempt\t{_BATCH_NAME}\t{attempt_directory}\n"
     )
@@ -993,10 +1124,11 @@ def test_campaign_source_status_cli_emits_positional_tsv(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Keep the source-status producer to one parseable six-field TSV record."""
+    """Keep the source-status producer to one parseable seven-field TSV record."""
     status = {
         "campaign_run_id": _RUN_ID,
         "campaign_state": "active",
+        "source_state": "retained",
         "reclaimable_bytes": 1234,
         "cleanup_eligibility": "ineligible",
         "active_slurm": True,
@@ -1023,13 +1155,14 @@ def test_campaign_source_status_cli_emits_positional_tsv(
     captured = capsys.readouterr()
     assert captured.err == ""
     fields = captured.out.rstrip("\n").split("\t")
-    assert len(fields) == 6
+    assert len(fields) == 7
     assert fields[0] == "source-status"
     assert fields[1] == _RUN_ID
     assert fields[2] == "active"
-    assert int(fields[3]) == status["reclaimable_bytes"]
-    assert fields[4] == status["cleanup_eligibility"]
-    assert fields[5] == str(status["active_slurm"])
+    assert fields[3] == "retained"
+    assert int(fields[4]) == status["reclaimable_bytes"]
+    assert fields[5] == status["cleanup_eligibility"]
+    assert fields[6] == str(status["active_slurm"])
 
 
 def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> None:
@@ -1045,7 +1178,7 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
 
     result = _run(
         workflow,
-        ["all", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(campaign), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1056,7 +1189,7 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     assert f"Campaign: {_RUN_ID}" in result.stdout
     assert any(line.startswith("      case_0001") for line in result.stdout.splitlines())
     assert any(line.startswith("        phase=transient_drying") for line in result.stdout.splitlines())
-    assert "dataset_id=synthetic" in result.stdout
+    assert "declared packages and finalizers validated" in result.stdout
     assert not any(line.lstrip().startswith("{") and line.rstrip().endswith("}") for line in result.stdout.splitlines())
     assert Path(environment["FAKE_SUBMISSION_FILE"]).read_text(encoding="utf-8") == "591776\n"
     assert "reused=0 generated=1" in result.stdout
@@ -1080,7 +1213,7 @@ def test_foreground_interrupts_request_graceful_then_force_cancellation(
     process = _run_interruptible(
         workflow,
         [
-            "all",
+            "run",
             str(_campaign(workflow)),
             *_remote_options(),
             "--keep-cpu-source",
@@ -1115,7 +1248,7 @@ def test_interrupt_before_campaign_launch_writes_no_cancellation_request(
     process = _run_interruptible(
         workflow,
         [
-            "all",
+            "run",
             str(_campaign(workflow)),
             *_remote_options(),
             "--keep-cpu-source",
@@ -1135,10 +1268,10 @@ def test_interrupt_before_campaign_launch_writes_no_cancellation_request(
     assert " cancel-campaign " not in log_text
 
 
-def test_resume_reapplies_the_matrix_until_campaign_success(
+def test_same_config_run_reapplies_the_matrix_until_campaign_success(
     tmp_path: Path,
 ) -> None:
-    """Apply multiple replay or restart decisions without falling back to feed."""
+    """Continue multiple replay or restart decisions through the same config."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
     environment["FAKE_CAMPAIGN_STATES"] = "feeding,feeding,successful"
@@ -1146,7 +1279,7 @@ def test_resume_reapplies_the_matrix_until_campaign_success(
 
     result = _run(
         workflow,
-        ["resume", _RUN_ID, *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1156,10 +1289,10 @@ def test_resume_reapplies_the_matrix_until_campaign_success(
     assert " feed-campaign " not in log_text
 
 
-def test_public_cancel_force_and_retry_case_forward_exact_owners(
+def test_public_cancel_force_cancels_only_the_owned_campaign(
     tmp_path: Path,
 ) -> None:
-    """Expose force cancellation and one-case explicit retry without retry-all."""
+    """Expose force cancellation as a distinct administrative action."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
 
     cancelled = _run(
@@ -1167,26 +1300,11 @@ def test_public_cancel_force_and_retry_case_forward_exact_owners(
         ["cancel", _RUN_ID, "--force", *_remote_options()],
         environment,
     )
-    retried = _run(
-        workflow,
-        [
-            "retry-case",
-            _RUN_ID,
-            _BATCH_NAME,
-            "case_00001",
-            *_remote_options(),
-        ],
-        environment,
-    )
 
     assert cancelled.returncode == 0, cancelled.stderr
-    assert retried.returncode == 0, retried.stderr
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count(" cancel-campaign ") == 1
     assert log_text.count(" --force") == 1
-    assert log_text.count(" retry-case ") == 1
-    assert " case_00001 " in log_text
-    assert "retry-all" not in log_text
 
 
 def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: Path) -> None:
@@ -1198,7 +1316,7 @@ def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: 
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
         environment,
     )
 
@@ -1210,7 +1328,7 @@ def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: 
     plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
     submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
     assert prepare_index < plan_index < submit_index
-    assert "state=cpu_terminal_awaiting_collection" in result.stdout
+    assert "state=awaiting_collection" in result.stdout
     assert "rsync-start" not in log_text
     assert "<build-campaign-datasets>" not in log_text
     assert "cleanup-campaign-source" not in log_text
@@ -1223,12 +1341,12 @@ def test_invalid_canonical_inputs_abort_before_plan_or_submission(tmp_path: Path
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
     assert result.returncode != 0
-    assert "Canonical input preparation failed before campaign planning or launch." in result.stderr
+    assert "Canonical campaign input preparation failed before submission." in result.stderr
     log_text = log.read_text(encoding="utf-8")
     assert "prepare-campaign-inputs" in log_text
     assert "plan-campaign" not in log_text
@@ -1239,11 +1357,11 @@ def test_pilot_prepares_canonical_inputs_before_plan_and_submission(tmp_path: Pa
     """Keep pilot input readiness ahead of every planning or launch side effect."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
-    campaign = workflow.parent.parent / "configs/generation/campaigns/transient_drying/pilot_check.yaml"
+    campaign = workflow.parent.parent / "configs/generation/campaigns/transient_drying/material_pilot.yaml"
 
     result = _run(
         workflow,
-        ["pilot-check", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(campaign), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1266,7 +1384,7 @@ def test_license_blocked_campaign_polling_reaches_publication_without_failure_ev
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1289,7 +1407,7 @@ def test_unchanged_campaign_states_are_coalesced(tmp_path: Path) -> None:
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1326,7 +1444,7 @@ def test_changed_solver_progress_is_rendered_only_after_the_minimum_interval(tmp
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
@@ -1342,7 +1460,7 @@ def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Pa
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
 
-    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+    result = _run(workflow, ["run", str(_smoke_workflow(workflow)), "--keep-cpu-source"], environment)
 
     assert result.returncode == 0, result.stderr
     development_root = workflow.parent.parent
@@ -1367,13 +1485,11 @@ def test_smoke_translates_logical_campaigns_across_all_path_domains(tmp_path: Pa
     assert "submit-campaign" in log_text
 
 
-def test_production_plan_requires_only_selected_profile_evidence(tmp_path: Path) -> None:
-    """Scope the readiness gate to the selected campaign profile."""
-    cases = (
-        ("transient_drying", True),
-        ("steady_flow", False),
-    )
-    for index, (rejected_profile, expected_success) in enumerate(cases):
+def test_dry_run_resolves_the_config_without_runtime_smoke_gates(
+    tmp_path: Path,
+) -> None:
+    """Keep immutable plan inspection independent of remote runtime evidence."""
+    for index, rejected_profile in enumerate(("transient_drying", "steady_flow")):
         root = tmp_path / f"case-{index}"
         root.mkdir()
         workflow, log, environment, _storage, _mirror = _harness(root)
@@ -1381,13 +1497,13 @@ def test_production_plan_requires_only_selected_profile_evidence(tmp_path: Path)
 
         result = _run(
             workflow,
-            ["plan", str(_campaign(workflow)), *_remote_options()],
+            ["run", str(_campaign(workflow)), "--dry-run", *_remote_options()],
             environment,
         )
 
-        assert (result.returncode == 0) is expected_success, result.stderr
-        evidence_lines = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("technical-smoke-evidence-profile")]
-        assert evidence_lines == ["technical-smoke-evidence-profile <steady_flow>"]
+        assert result.returncode == 0, result.stderr
+        assert '"run_kind":"campaign"' in result.stdout
+        assert "technical-smoke-evidence-profile" not in log.read_text(encoding="utf-8")
 
 
 def test_combined_smoke_records_and_checks_both_profile_evidence(tmp_path: Path) -> None:
@@ -1395,7 +1511,7 @@ def test_combined_smoke_records_and_checks_both_profile_evidence(tmp_path: Path)
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
 
-    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+    result = _run(workflow, ["run", str(_smoke_workflow(workflow)), "--keep-cpu-source"], environment)
 
     assert result.returncode == 0, result.stderr
     log_lines = log.read_text(encoding="utf-8").splitlines()
@@ -1421,7 +1537,7 @@ def test_failed_technical_smoke_publishes_no_profile_evidence(tmp_path: Path) ->
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     environment["FAKE_BUILD_FAIL"] = "true"
 
-    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+    result = _run(workflow, ["run", str(_smoke_workflow(workflow)), "--keep-cpu-source"], environment)
 
     assert result.returncode != 0
     log_text = log.read_text(encoding="utf-8")
@@ -1482,8 +1598,9 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
     result = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(campaign),
+            "--dry-run",
             "--cpu-host",
             "cpu.example",
             "--remote-root",
@@ -1546,7 +1663,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     environment["FAKE_UNTRACKED_SOURCE_PATH"] = untracked.relative_to(project).as_posix()
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
 
-    result = _run(workflow, ["smoke", "--keep-cpu-source"], environment)
+    result = _run(workflow, ["run", str(_smoke_workflow(workflow)), "--keep-cpu-source"], environment)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr.count(f"Source: committed HEAD {commit}") == 1
@@ -1557,9 +1674,9 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     assert log_text.count("submit-campaign") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text
     assert "<finalize-real-smoke>" in log_text
-    assert result.stdout.count("PROFILE COMPLETE:") == 2
+    assert result.stdout.count("reused=0 generated=1") == 2
     assert result.stdout.count("DONE:") == 1
-    assert result.stdout.rstrip().endswith("DONE: paired Technical Smoke and all workflow receipts validated")
+    assert "run_identity=workflow__0123456789abcdef state=complete" in result.stdout.splitlines()[-1]
     assert f"local-python-commit <{commit}>" in log_text
     assert "Dirty untracked source reached local Python." not in result.stderr
     assert "Local Python did not receive the committed Generation source." not in result.stderr
@@ -1571,38 +1688,16 @@ def test_smoke_finalization_failure_prints_no_top_level_done(tmp_path: Path) -> 
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     environment["FAKE_FINALIZE_SMOKE_FAIL"] = "true"
 
-    result = _run(workflow, ["smoke", *_remote_options()], environment)
+    result = _run(
+        workflow,
+        ["run", str(_smoke_workflow(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
 
     assert result.returncode != 0
-    assert result.stdout.count("PROFILE COMPLETE:") == 2
+    assert result.stdout.count("reused=0 generated=1") >= 1
     assert "DONE:" not in result.stdout
     assert "Could not atomically finalize paired Technical Smoke evidence" in result.stderr
-
-
-def test_finalize_smoke_is_explicit_idempotent_and_never_submits(tmp_path: Path) -> None:
-    """Finalize one explicit pair repeatedly without Slurm or COMSOL work."""
-    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
-    steady_run_id = _RUN_ID
-    transient_run_id = "synthetic_transient__fedcba9876543210"
-    arguments = [
-        "finalize-smoke",
-        steady_run_id,
-        transient_run_id,
-        *_remote_options(),
-    ]
-
-    first = _run(workflow, arguments, environment)
-    first_log = log.read_text(encoding="utf-8")
-    first_finalize_count = first_log.count("<finalize-real-smoke>")
-    second = _run(workflow, arguments, environment)
-
-    assert first.returncode == second.returncode == 0
-    assert first.stdout.count("DONE:") == second.stdout.count("DONE:") == 1
-    assert first_finalize_count > 0
-    log_text = log.read_text(encoding="utf-8")
-    assert log_text.count("<finalize-real-smoke>") == 2 * first_finalize_count
-    assert "submit-campaign" not in log_text
-    assert "submit-core-benchmark" not in log_text
 
 
 def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) -> None:
@@ -1617,8 +1712,9 @@ def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) ->
     environment["FAKE_DOCKER_CONTINUE_FILE"] = str(continuation)
     command = [
         str(workflow),
-        "plan",
+        "run",
         str(_campaign(workflow)),
+        "--dry-run",
         "--cpu-host",
         "cpu.example",
         "--remote-root",
@@ -1659,7 +1755,7 @@ def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) ->
             process.communicate(timeout=5)
 
     assert process.returncode == 0, stderr
-    assert json.loads(stdout.splitlines()[-1])["state"] == "planned"
+    assert json.loads(stdout.splitlines()[-1])["run_kind"] == "campaign"
     assert stderr.splitlines()[:2] == [
         f"Source: committed HEAD {commit_a}",
         "Local worktree: clean",
@@ -1677,8 +1773,9 @@ def test_concurrent_workflows_own_independent_clean_sources(tmp_path: Path) -> N
     project, source_probe, commit = _initialize_real_repository(workflow, environment)
     command = [
         str(workflow),
-        "plan",
+        "run",
         str(_campaign(workflow)),
+        "--dry-run",
         "--cpu-host",
         "cpu.example",
         "--remote-root",
@@ -1756,8 +1853,9 @@ def test_source_setup_failure_reports_frozen_commit_before_remote_work(tmp_path:
     result = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(_campaign(workflow)),
+            "--dry-run",
             "--cpu-host",
             "cpu.example",
             "--remote-root",
@@ -1786,8 +1884,9 @@ def test_committed_parser_failure_cleans_its_pinned_source(tmp_path: Path) -> No
     result = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(_campaign(workflow)),
+            "--dry-run",
             "--unsupported-after-handoff",
         ],
         environment,
@@ -1823,8 +1922,9 @@ exec "${FAKE_REAL_RM}" "$@"
     result = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(_campaign(workflow)),
+            "--dry-run",
             "--cpu-host",
             "cpu.example",
             "--remote-root",
@@ -1851,8 +1951,9 @@ def test_exact_requested_commit_validation_survives_dirty_safe_source_resolution
     _project, _source_probe, commit = _initialize_real_repository(workflow, environment)
     mismatch = ("f" * 40) if commit != ("f" * 40) else ("e" * 40)
     common = [
-        "plan",
+        "run",
         str(_campaign(workflow)),
+        "--dry-run",
         "--cpu-host",
         "cpu.example",
         "--remote-root",
@@ -1881,13 +1982,13 @@ def test_repository_admission_rejects_escape_ambiguous_and_container_paths(tmp_p
         "../outside.yaml",
         "../../outside.yaml",
         str(outside),
-        "./configs/generation/campaigns/steady_flow/family_generalization.yaml",
+        "./configs/generation/campaigns/steady_flow/id_dataset.yaml",
         str(symlink),
-        "/workspace/repo/configs/generation/campaigns/steady_flow/family_generalization.yaml",
+        "/workspace/repo/configs/generation/campaigns/steady_flow/id_dataset.yaml",
     )
 
     for campaign in arguments:
-        result = _run(workflow, ["plan", campaign, *_remote_options()], environment)
+        result = _run(workflow, ["run", campaign, "--dry-run", *_remote_options()], environment)
         assert result.returncode == 2, (campaign, result.stderr)
 
     assert "ssh-start" not in log.read_text(encoding="utf-8")
@@ -1900,7 +2001,7 @@ def test_captured_launch_stops_when_login_preflight_fails(tmp_path: Path) -> Non
 
     result = _run(
         workflow,
-        ["launch", str(_campaign(workflow)), *_remote_options()],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
 
@@ -1911,22 +2012,23 @@ def test_captured_launch_stops_when_login_preflight_fails(tmp_path: Path) -> Non
     assert "submit-campaign" not in log_text
 
 
-def test_preflight_passes_admitted_checkout_to_relocated_worker(tmp_path: Path) -> None:
-    """Bind the compute worker to the admitted repository and launch commit."""
+def test_preflight_validates_admitted_cpu_runtime_without_submission(tmp_path: Path) -> None:
+    """Validate the admitted CPU runtime without creating scientific work."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
 
     result = _run(
         workflow,
-        ["preflight", str(_campaign(workflow)), *_remote_options()],
+        ["run", str(_campaign(workflow)), "--preflight-only", *_remote_options()],
         environment,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "job=12345 evidence=/remote/preflight/fixture" in result.stdout
+    assert "PREFLIGHT COMPLETE:" in result.stdout
+    assert "COMSOL=COMSOL Multiphysics 6.4.0.293" in result.stdout
     log_text = log.read_text(encoding="utf-8")
-    assert '--export="ALL,GENERATION_GIT_COMMIT=${commit}"' in log_text
-    assert '"${repository}/scripts/generation_cpu_smoke.sh"' in log_text
-    assert '"${repository}" "${venv}"' in log_text
+    assert "generation_cpu_login_preflight.sh" in log_text
+    assert "submit-campaign" not in log_text
+    assert "sbatch" not in log_text
 
 
 def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -> None:
@@ -1964,65 +2066,97 @@ def test_local_docker_failure_stops_before_remote_mutation(tmp_path: Path) -> No
     assert "ssh-start" not in log.read_text(encoding="utf-8")
 
 
-def test_plan_launch_and_current_option_validation(tmp_path: Path) -> None:
-    """Keep planning machine-readable, launchable, and strict for current options."""
+def test_unified_run_modes_and_option_validation(tmp_path: Path) -> None:
+    """Keep dry-run machine-readable, execution resumable, and options strict."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     plan = _run(
         workflow,
-        ["plan", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
+        ["run", str(_campaign(workflow)), "--dry-run", *_remote_options()],
         environment,
     )
     assert plan.returncode == 0, plan.stderr
     plan_record = json.loads(plan.stdout.splitlines()[-1])
-    assert plan_record["filesystem_mutated"] is False
+    assert plan_record["run_kind"] == "campaign"
 
     logical_campaign = _campaign(workflow).relative_to(workflow.parent.parent).as_posix()
-    logical_plan = _run(workflow, ["plan", logical_campaign, *_remote_options()], environment)
+    logical_plan = _run(workflow, ["run", logical_campaign, "--dry-run", *_remote_options()], environment)
     assert logical_plan.returncode == 0, logical_plan.stderr
 
     configured = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(_campaign(workflow)),
+            "--dry-run",
             *_remote_options(),
             "--only-batch",
             "future.profile::batch",
         ],
         environment,
     )
-    assert configured.returncode == 0, configured.stderr
-    assert " future.profile::batch plan-campaign " in log.read_text(encoding="utf-8")
+    assert configured.returncode == 2
+    assert "Unsupported option: --only-batch" in configured.stderr
 
     incompatible = _run(
         workflow,
         [
-            "plan",
+            "run",
             str(_campaign(workflow)),
+            "--dry-run",
             *_remote_options(),
-            *_selection_options(),
             "--skip-extreme-family-ood",
         ],
         environment,
     )
     assert incompatible.returncode == 2
 
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
     launch = _run(
         workflow,
-        ["launch", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
     assert launch.returncode == 0, launch.stderr
-    assert f'{{"campaign_run_id":"{_RUN_ID}"' in launch.stdout
+    assert launch.stdout.count("DONE:") == 1
     assert f"Campaign: {_RUN_ID}" in launch.stdout
     assert "submit-campaign" in log.read_text(encoding="utf-8")
 
     rejected = _run(
         workflow,
-        ["plan", str(_campaign(workflow)), *_remote_options(), "--unsupported-option"],
+        ["run", str(_campaign(workflow)), "--dry-run", *_remote_options(), "--unsupported-option"],
         environment,
     )
     assert rejected.returncode == 2
+
+
+def test_removed_specialized_starts_fail_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    """Keep one public start boundary with concise run-CONFIG guidance."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    removed = (
+        "all",
+        "launch",
+        "resume",
+        "smoke",
+        "finalize-smoke",
+        "benchmark-cores",
+        "collect-benchmark",
+        "pilot-check",
+        "collect",
+        "build-datasets",
+        "retry-case",
+    )
+
+    for command in removed:
+        log.write_text("", encoding="utf-8")
+        result = _run(workflow, [command, *_remote_options()], environment)
+        assert result.returncode == 2
+        assert f"Unsupported subcommand: {command}" in result.stderr
+        assert "run CONFIG" in result.stderr
+        log_text = log.read_text(encoding="utf-8")
+        assert "ssh-start" not in log_text
+        assert "docker-start" not in log_text
 
 
 def test_remote_campaign_launch_binds_pinned_commit_to_environment_and_cli(
@@ -2033,7 +2167,7 @@ def test_remote_campaign_launch_binds_pinned_commit_to_environment_and_cli(
 
     result = _run(
         workflow,
-        ["launch", str(_campaign(workflow)), *_remote_options()],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
         environment,
     )
 
@@ -2051,10 +2185,10 @@ def test_remote_campaign_launch_binds_pinned_commit_to_environment_and_cli(
     assert sum("campaign-status" in line for line in command_lines) == 1
 
 
-def test_remote_campaign_monitoring_binds_pinned_commit_to_status_and_feed(
+def test_remote_campaign_monitoring_binds_pinned_commit_to_resume_feed(
     tmp_path: Path,
 ) -> None:
-    """Bind status and feeding to the same pinned remote Python source."""
+    """Bind status and automatic resume feeding to one pinned remote source."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_SOURCE_STATE"] = "active"
     environment["FAKE_CAMPAIGN_STATES"] = "successful"
@@ -2062,14 +2196,15 @@ def test_remote_campaign_monitoring_binds_pinned_commit_to_status_and_feed(
 
     result = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
     assert result.returncode == 0, result.stderr
     log_text = log.read_text(encoding="utf-8")
     assert "campaign-status" in log_text
-    assert sum("feed-campaign" in line for line in log_text.splitlines()) == 1
+    assert sum("resume-campaign" in line for line in log_text.splitlines()) == 1
+    assert "feed-campaign" not in log_text
     assert f" {_COMMIT} " in log_text
     assert 'commit="$4"' in log_text
     assert 'export GENERATION_GIT_COMMIT="${commit}"' in log_text
@@ -2085,16 +2220,16 @@ def test_initial_status_failure_retains_submitted_run_for_safe_inspection(
 
     failed = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
         environment,
     )
 
     assert failed.returncode != 0
-    assert "Campaign was submitted, but initial status reconstruction failed." in failed.stderr
-    assert f"campaign_run_id={_RUN_ID}" in failed.stderr
-    assert "FAILED: initial campaign status reconstruction" in failed.stderr
+    assert "Synthetic initial campaign status failure." in failed.stderr
+    assert f"campaign_run_id: {_RUN_ID}" in failed.stderr
+    assert "FAILED: common work-unit monitoring" in failed.stderr
     assert "Remote launch failed." not in failed.stderr
-    assert "./scripts/generation_workflow.sh resume" in failed.stderr
+    assert "generation_workflow.sh run" in failed.stderr
     first_log = log.read_text(encoding="utf-8")
     assert sum("submit-campaign" in line for line in first_log.splitlines()) == 1
     submission_file = Path(environment["FAKE_SUBMISSION_FILE"])
@@ -2111,7 +2246,7 @@ def test_initial_status_failure_retains_submitted_run_for_safe_inspection(
 
 
 def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -> None:
-    """Exercise benchmark submission, publication, and one-variant recovery."""
+    """Exercise benchmark input readiness, submission, and publication."""
     workflow, log, environment, _storage, mirror = _harness(tmp_path)
     environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     relative = environment["FAKE_BENCHMARK_RELATIVE"]
@@ -2119,7 +2254,11 @@ def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -
     remote_directory.mkdir(parents=True)
     (remote_directory / "summary.json").write_text("{}\n", encoding="utf-8")
 
-    result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
+    result = _run(
+        workflow,
+        ["run", str(_benchmark_suite(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
 
     assert result.returncode == 0, result.stderr
     assert f"benchmark_run_id={_BENCHMARK_RUN_ID}" in result.stdout
@@ -2127,41 +2266,39 @@ def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -
     assert remote_directory.is_dir()
     assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()
     log_text = log.read_text(encoding="utf-8")
+    assert "materialize-core-benchmark-inputs" in log_text
     assert "submit-core-benchmark" in log_text
+    assert log_text.index("materialize-core-benchmark-inputs") < log_text.index("submit-core-benchmark")
     assert "publish-transferred-core-benchmark" in log_text
     assert "<build-campaign-datasets>" not in log_text
     assert f"<--expected-inventory-sha256>\n<{_BENCHMARK_INVENTORY_SHA}>" in log_text
     assert f"<--expected-file-count>\n<{_BENCHMARK_FILE_COUNT}>" in log_text
     assert f"<--expected-size-bytes>\n<{_BENCHMARK_SIZE_BYTES}>" in log_text
 
-    recovered = _run(
-        workflow,
-        ["benchmark-cores", "--variant", "cores_08", *_remote_options()],
-        environment,
-    )
-    assert recovered.returncode == 0, recovered.stderr
-    assert "<--variant>\n<cores_08>" in log.read_text(encoding="utf-8")
-
 
 def test_core_benchmark_failure_does_not_finalize(tmp_path: Path) -> None:
     """Stop a failed benchmark before terminal publication."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
-    environment["FAKE_BENCHMARK_STATE"] = "retry_required"
+    environment["FAKE_BENCHMARK_STATE"] = "work_unit_failed"
 
-    result = _run(workflow, ["benchmark-cores", *_remote_options()], environment)
+    result = _run(
+        workflow,
+        ["run", str(_benchmark_suite(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
 
     assert result.returncode != 0
     assert "<finalize-core-benchmark>" not in log.read_text(encoding="utf-8")
 
 
-def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_path: Path) -> None:
+def test_automatic_collection_is_non_destructive_and_failure_retains_staging(tmp_path: Path) -> None:
     """Protect safe transfer, source retention, and retryable failed publication."""
     workflow, log, environment, storage, mirror = _harness(tmp_path)
     environment["FAKE_LOGIN_PREFLIGHT_STDOUT"] = "true"
     source_directories = _seed_transfer(mirror, environment)
     collected = _run(
         workflow,
-        ["collect", _RUN_ID, "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
+        ["run", str(_campaign(workflow)), "--keep-cpu-source", "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
         environment,
     )
 
@@ -2180,7 +2317,7 @@ def test_collect_is_non_destructive_and_publication_failure_retains_staging(tmp_
     failed_environment["FAKE_PUBLISH_FAIL"] = "true"
     failed = _run(
         failed_workflow,
-        ["collect", _RUN_ID, "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
+        ["run", str(_campaign(failed_workflow)), "--keep-cpu-source", "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
         failed_environment,
     )
 
@@ -2196,7 +2333,7 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
     source_directories = _seed_transfer(mirror, environment)
     complete = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
 
@@ -2222,10 +2359,9 @@ def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(t
     retained = _run(
         retained_workflow,
         [
-            "all",
+            "run",
             str(_campaign(retained_workflow)),
             *_remote_options(),
-            *_selection_options(),
             "--keep-cpu-source",
         ],
         retained_environment,
@@ -2242,7 +2378,7 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     environment["FAKE_BUILD_FAIL"] = "true"
     failed = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
 
@@ -2250,7 +2386,6 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert "dataset build" in failed.stderr.lower()
     assert "workflow_failures/failure-0001.json" in failed.stderr
     assert "local canonical=" in failed.stderr
-    assert "./scripts/generation_workflow.sh resume" in failed.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
     assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()
     first_log = log.read_text(encoding="utf-8")
@@ -2259,7 +2394,7 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     environment["FAKE_BUILD_FAIL"] = "false"
     resumed = _run(
         workflow,
-        ["resume", _RUN_ID, "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
     assert resumed.returncode == 0, resumed.stderr
@@ -2272,7 +2407,7 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     cleanup_count = after_resume.count("cleanup-campaign-source")
     repeated = _run(
         workflow,
-        ["resume", _RUN_ID, "--cpu-host", "cpu.example", "--remote-root", "/remote/generation root"],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
     assert repeated.returncode == 0, repeated.stderr
@@ -2281,40 +2416,55 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert final_log.count("cleanup-campaign-source") == cleanup_count
 
 
-def test_partial_remote_failure_and_removed_detach_never_cleanup(tmp_path: Path) -> None:
-    """Preserve source on failure and reject the removed detach mode before launch."""
+def test_package_only_resume_builds_no_generation_work_units(tmp_path: Path) -> None:
+    """Reuse one completed host source without CPU or COMSOL lifecycle work."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    base_receipt = Path(environment["FAKE_DATASETS_COMPLETE_FILE"])
+    base_receipt.write_text("immutable-base\n", encoding="utf-8")
+    Path(environment["FAKE_WORKFLOW_COMPLETE_FILE"]).touch()
+    environment["FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE"] = "extension_required"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert base_receipt.read_text(encoding="utf-8") == "immutable-base\n"
+    assert Path(environment["FAKE_PACKAGE_STATE_READY_FILE"]).is_file()
+    log_text = log.read_text(encoding="utf-8")
+    assert "<find-compatible-campaign-source>" in log_text
+    assert "<build-campaign-datasets>" in log_text
+    for forbidden in (
+        "<prepare-campaign-inputs>",
+        "<plan-campaign>",
+        "<submit-campaign>",
+        "<resume-campaign>",
+        "<publish-transferred-campaign>",
+        "<prepare-all-workflow>",
+        "cleanup-campaign-source",
+        "<record-cpu-cleanup>",
+        "rsync-start",
+    ):
+        assert forbidden not in log_text
+
+
+def test_partial_remote_failure_never_cleans_cpu_source(tmp_path: Path) -> None:
+    """Preserve the CPU source when a campaign has a permanent unit failure."""
     workflow, _log, environment, _storage, mirror = _harness(tmp_path)
     source_directories = _seed_transfer(mirror, environment)
     environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
     environment["FAKE_SOURCE_STATE"] = "completed_with_failures"
     partial = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), *_selection_options()],
+        ["run", str(_campaign(workflow)), *_remote_options()],
         environment,
     )
 
     assert partial.returncode != 0
-    assert "No resumable cases remain." in partial.stderr
-    assert "Use retry-case for an explicit failed or timed-out case." in partial.stderr
+    assert "permanent scientific or postprocessing failure" in partial.stderr
     assert all((mirror / relative).is_dir() for relative in source_directories)
-
-    detached_root = tmp_path / "detached"
-    detached_root.mkdir()
-    detached_workflow, detached_log, detached_environment, _storage, detached_mirror = _harness(detached_root)
-    detached_directories = _seed_transfer(detached_mirror, detached_environment)
-    detached = _run(
-        detached_workflow,
-        ["all", str(_campaign(detached_workflow)), *_remote_options(), *_selection_options(), "--detach"],
-        detached_environment,
-    )
-
-    assert detached.returncode == 2
-    assert "--detach is no longer supported" in detached.stderr
-    assert "generation_workflow.sh launch CAMPAIGN" in detached.stderr
-    assert "generation_workflow.sh all CAMPAIGN --background" in detached.stderr
-    assert all((detached_mirror / relative).is_dir() for relative in detached_directories)
-    detached_text = detached_log.read_text(encoding="utf-8") if detached_log.exists() else ""
-    assert "submit-campaign" not in detached_text
 
 
 @pytest.mark.parametrize("collection_mode", ["--defer-collection", "--keep-cpu-source"])
@@ -2328,7 +2478,7 @@ def test_background_launch_starts_one_exact_tmux_child(
     result = _run(
         workflow,
         [
-            "all",
+            "run",
             str(campaign),
             *_remote_options(),
             collection_mode,
@@ -2339,15 +2489,15 @@ def test_background_launch_starts_one_exact_tmux_child(
 
     assert result.returncode == 0, result.stderr
     assert "BACKGROUND STARTED" in result.stdout
-    assert "workflow_session_id=gw-20260818T154501Z-all-01234567" in result.stdout
-    assert "tmux attach-session -t gw-all-154501-01234567" in result.stdout
+    assert "workflow_session_id=gw-20260818T154501Z-run-01234567" in result.stdout
+    assert "tmux attach-session -t gw-run-154501-01234567" in result.stdout
     assert "press Ctrl+B, then D" in result.stdout
-    assert "background-status gw-20260818T154501Z-all-01234567" in result.stdout
+    assert "background-status gw-20260818T154501Z-run-01234567" in result.stdout
     assert "tail -n 100 -F" in result.stdout
     state_root = Path(environment["FAKE_TMUX_START_COUNT_FILE"]).parent
     assert (state_root / "tmux-start-count").read_text(encoding="utf-8").strip() == "1"
     child_arguments = (state_root / "background-child-arguments").read_text(encoding="utf-8").splitlines()
-    assert child_arguments[0] == "all"
+    assert child_arguments[0] == "run"
     assert str(campaign) in child_arguments
     assert collection_mode in child_arguments
     assert "--background" not in child_arguments
@@ -2358,7 +2508,7 @@ def test_background_launch_starts_one_exact_tmux_child(
     environment["FAKE_GIT_STATUS"] = " M unrelated-development-file\n"
     status = _run(
         workflow,
-        ["background-status", "gw-20260818T154501Z-all-01234567"],
+        ["background-status", "gw-20260818T154501Z-run-01234567"],
         environment,
     )
     assert status.returncode == 0, status.stderr
@@ -2377,7 +2527,7 @@ def test_background_launch_requires_a_clean_stable_host_checkout(tmp_path: Path)
     result = _run(
         workflow,
         [
-            "all",
+            "run",
             str(_campaign(workflow)),
             *_remote_options(),
             "--defer-collection",
@@ -2400,7 +2550,7 @@ def test_background_launch_accepts_an_immediately_completed_child(tmp_path: Path
     result = _run(
         workflow,
         [
-            "all",
+            "run",
             str(_campaign(workflow)),
             *_remote_options(),
             "--defer-collection",
@@ -2411,26 +2561,26 @@ def test_background_launch_accepts_an_immediately_completed_child(tmp_path: Path
 
     assert result.returncode == 0, result.stderr
     assert "BACKGROUND COMPLETED" in result.stdout
-    assert "workflow_session_id=gw-20260818T154501Z-all-01234567" in result.stdout
+    assert "workflow_session_id=gw-20260818T154501Z-run-01234567" in result.stdout
     assert "exit_code=0" in result.stdout
     assert "final_stage=DONE: synthetic" in result.stdout
     assert "tmux attach-session" not in result.stdout
 
 
-def test_background_launch_rejects_unsupported_command_and_recursion(tmp_path: Path) -> None:
-    """Reject unsupported or recursively detached controller invocations before tmux."""
+def test_background_launch_rejects_administration_and_recursion(tmp_path: Path) -> None:
+    """Reject administrative or recursively detached controller invocations."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
     unsupported = _run(
         workflow,
-        ["preflight", str(_campaign(workflow)), *_remote_options(), "--background"],
+        ["status", _RUN_ID, *_remote_options(), "--background"],
         environment,
     )
     assert unsupported.returncode == 2
-    assert "--background is not supported for preflight" in unsupported.stderr
+    assert "--background is supported only by run CONFIG" in unsupported.stderr
     environment["GENERATION_WORKFLOW_BACKGROUND_CHILD"] = "1"
     recursive = _run(
         workflow,
-        ["all", str(_campaign(workflow)), *_remote_options(), "--background"],
+        ["run", str(_campaign(workflow)), *_remote_options(), "--background"],
         environment,
     )
     assert recursive.returncode == 2

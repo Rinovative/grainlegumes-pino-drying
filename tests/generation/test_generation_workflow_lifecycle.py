@@ -211,7 +211,7 @@ def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(
         _RUN_ID,
         storage_root=storage,
         stage="synthetic transfer",
-        resume_command="./scripts/generation_workflow.sh resume synthetic",
+        continuation_command="./scripts/generation_workflow.sh run configs/generation/campaigns/steady_flow/id_dataset.yaml",
         cpu_bytes_retained=17,
     )
     first_bytes = first.read_bytes()
@@ -219,7 +219,7 @@ def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(
         _RUN_ID,
         storage_root=storage,
         stage="synthetic publication",
-        resume_command="./scripts/generation_workflow.sh resume synthetic",
+        continuation_command="./scripts/generation_workflow.sh run configs/generation/campaigns/steady_flow/id_dataset.yaml",
         cpu_bytes_retained=17,
     )
 

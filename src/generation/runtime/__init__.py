@@ -31,6 +31,7 @@ Provides:
 - request_runtime_cancellation: gracefully stop active worker solvers
 - request_runtime_force_cancellation: force-stop active worker solvers
 - replay_case_postprocessing: conversion/publication replay without COMSOL
+- repair_completed_case_hdf5_from_retained_exports: hash-bound completed-HDF5 repair
 - case_lock_path: persistent case-lock path resolution
 - raw_case_directory: canonical raw case-directory resolution
 - processed_case_directory: canonical processed case-directory resolution
@@ -41,10 +42,7 @@ Provides:
 - collect_exports: explicit raw-export collection
 - execute_prepared_case: isolated solver execution and conversion
 - prepare_case_work_directory: isolated case-workspace preparation
-- case_failure_path: persistent case-failure path resolution
-- case_failure_artifacts_directory: retained failure-artifact path resolution
 - record_case_failure: durable failed-case evidence publication
-- clear_case_failure: validated failure-evidence cleanup
 - case_failure_is_recorded: failed-case evidence admission
 - validate_completed_case: completed-case publication validation
 - completed_case_is_valid: completed-case validity inspection
@@ -86,11 +84,8 @@ if TYPE_CHECKING:
         TerminalCaseEvidence,
         admit_terminal_batch,
         batch_meta_directory,
-        case_failure_artifacts_directory,
         case_failure_is_recorded,
-        case_failure_path,
         case_lock_path,
-        clear_case_failure,
         collect_exports,
         completed_case_is_valid,
         execute_prepared_case,
@@ -100,6 +95,7 @@ if TYPE_CHECKING:
         publish_completed_case,
         raw_case_directory,
         record_case_failure,
+        repair_completed_case_hdf5_from_retained_exports,
         replay_case_postprocessing,
         request_runtime_cancellation,
         request_runtime_force_cancellation,
@@ -145,11 +141,8 @@ _BATCH_EXPORTS = frozenset(
         "TerminalCaseEvidence",
         "admit_terminal_batch",
         "batch_meta_directory",
-        "case_failure_artifacts_directory",
         "case_failure_is_recorded",
-        "case_failure_path",
         "case_lock_path",
-        "clear_case_failure",
         "collect_exports",
         "completed_case_is_valid",
         "execute_prepared_case",
@@ -159,6 +152,7 @@ _BATCH_EXPORTS = frozenset(
         "publish_completed_case",
         "raw_case_directory",
         "record_case_failure",
+        "repair_completed_case_hdf5_from_retained_exports",
         "replay_case_postprocessing",
         "request_runtime_cancellation",
         "request_runtime_force_cancellation",
@@ -198,11 +192,8 @@ __all__ = [
     "batch",
     "batch_meta_directory",
     "build_comsol_command",
-    "case_failure_artifacts_directory",
     "case_failure_is_recorded",
-    "case_failure_path",
     "case_lock_path",
-    "clear_case_failure",
     "cluster",
     "collect_exports",
     "completed_case_is_valid",
@@ -219,6 +210,7 @@ __all__ = [
     "publish_completed_case",
     "raw_case_directory",
     "record_case_failure",
+    "repair_completed_case_hdf5_from_retained_exports",
     "replay_case_postprocessing",
     "request_runtime_cancellation",
     "request_runtime_force_cancellation",

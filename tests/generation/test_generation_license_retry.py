@@ -164,34 +164,33 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         1,
         storage_root=storage,
     )
-    attempts = license_service.load_temporary_license_attempts(
+    wait = license_service.load_temporary_license_wait(
         config,
         1,
         campaign_run_id=run_id,
         storage_root=storage,
     )
-    assert len(attempts) == 1
+    assert wait is not None
     retry_policy = config.execution_values["runtime"]["temporary_license_retry"]
-    assert attempts[0]["slurm_job_id"] == "701"
-    assert attempts[0]["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
-    assert attempts[0]["retry_budget_remaining"] is True
-    blocked_attempt = attempt_service.latest_case_attempt(
-        config,
-        1,
-        run_id,
-        storage_root=storage,
+    assert wait["latest_job_id"] == "701"
+    assert wait["recent_job_ids"] == ["701"]
+    assert wait["retry_count"] == 1
+    assert wait["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
+    assert wait["retry_budget_remaining"] is True
+    assert wait["feature"] == "Brinkman Equations (br)"
+    assert wait["error_code"] == "-4,132"
+    assert wait["solver_progress_started"] is False
+    assert wait["expected_exports_exist"] is False
+    assert "Licensed number of users already reached" in wait["raw_excerpt"]
+    assert (
+        attempt_service.latest_case_attempt(
+            config,
+            1,
+            run_id,
+            storage_root=storage,
+        )
+        is None
     )
-    assert blocked_attempt is not None
-    assert blocked_attempt.payload["case_state"] == "license_blocked"
-    assert blocked_attempt.payload["previous_attempt"] is None
-    cleanup = attempt_service.attempt_cleanup_evidence(blocked_attempt)
-    assert cleanup is not None
-    assert cleanup["status"] == "complete"
-    assert not generation.runtime.case_failure_artifacts_directory(
-        config,
-        1,
-        storage_root=storage,
-    ).exists()
 
     monkeypatch.delenv("FAKE_COMSOL_MODE")
     monkeypatch.setenv("SLURM_JOB_ID", "702")
@@ -213,7 +212,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
             run_id,
             storage_root=storage,
         )
-        == blocked_attempt
+        is None
     )
     assert generation.runtime.completed_case_is_valid(
         config,
@@ -221,15 +220,63 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         storage_root=storage,
     )
     assert (
-        len(
-            license_service.load_temporary_license_attempts(
-                config,
-                1,
-                campaign_run_id=run_id,
-                storage_root=storage,
-            )
+        license_service.load_temporary_license_wait(
+            config,
+            1,
+            campaign_run_id=run_id,
+            storage_root=storage,
         )
-        == 1
+        is not None
+    )
+
+
+@pytest.mark.integration
+def test_valid_success_overrides_an_earlier_license_warning(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a complete validated result successful despite an earlier warning."""
+    config_path, _template = generation_config_factory(
+        executable=fake_comsol,
+        scheduler_kind="slurm",
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(
+        config,
+        1,
+        storage_root=storage,
+    )
+    run_id = "license-warning__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    monkeypatch.setenv("SLURM_JOB_ID", "751")
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "success_with_license_warning")
+
+    outcome = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=1,
+        scheduler_kind="slurm",
+        storage_root=storage,
+        work_root=tmp_path / "work",
+    )
+
+    assert outcome.status == "completed"
+    assert generation.runtime.completed_case_is_valid(
+        config,
+        1,
+        storage_root=storage,
+    )
+    assert not license_service.load_temporary_license_wait(
+        config,
+        1,
+        campaign_run_id=run_id,
+        storage_root=storage,
     )
 
 
@@ -255,42 +302,44 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     error = _capacity_error(tmp_path)
     next_job = 801
-    while True:
+    observed: list[dict[str, Any]] = []
+    for _retry in range(100):
         monkeypatch.setenv("SLURM_JOB_ID", str(next_job))
-        license_service.record_temporary_license_capacity_attempt(
+        license_service.record_temporary_license_wait(
             config,
             1,
             error,
             storage_root=storage,
         )
-        attempts = license_service.load_temporary_license_attempts(
+        wait = license_service.load_temporary_license_wait(
             config,
             1,
             campaign_run_id=run_id,
             storage_root=storage,
         )
-        if not attempts[-1]["retry_budget_remaining"]:
+        assert wait is not None
+        observed.append(dict(wait))
+        if not wait["retry_budget_remaining"]:
             break
         next_job += 1
-        if len(attempts) > 100:
-            pytest.fail("Synthetic retry policy did not exhaust within 100 attempts")
+    else:
+        pytest.fail("Synthetic retry policy did not exhaust within 100 attempts")
 
-    assert len(attempts) >= 2
-    assert attempts[-2]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
-    assert attempts[-2]["retry_budget_remaining"] is True
-    assert attempts[-1]["delay_before_next_attempt_seconds"] == 0.0
-    assert attempts[-1]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
-    assert attempts[-1]["retry_budget_remaining"] is False
-    assert attempts[-1]["next_eligible_at"] is None
-    latest = license_service.latest_attempt_for_job(
+    assert observed[-2]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
+    assert observed[-2]["retry_budget_remaining"] is True
+    assert observed[-1]["delay_before_next_attempt_seconds"] == 0.0
+    assert observed[-1]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
+    assert observed[-1]["retry_budget_remaining"] is False
+    assert observed[-1]["next_retry_at"] is None
+    latest = license_service.latest_wait_for_job(
         config,
         1,
         campaign_run_id=run_id,
-        job_id=attempts[-1]["slurm_job_id"],
+        job_id=wait["latest_job_id"],
         storage_root=storage,
     )
     assert latest is not None
-    assert latest["first_blocked_at"] == attempts[0]["timestamp"]
+    assert latest["first_blocked_at"] == observed[0]["first_blocked_at"]
 
 
 @pytest.mark.integration
@@ -347,10 +396,10 @@ def test_license_retry_cleanup_failure_becomes_terminal(
         1,
         storage_root=storage,
     )
-    receipt = license_service.load_temporary_license_attempts(
+    receipt = license_service.load_temporary_license_wait(
         config,
         1,
         campaign_run_id=run_id,
         storage_root=storage,
     )
-    assert len(receipt) == 1
+    assert receipt is not None

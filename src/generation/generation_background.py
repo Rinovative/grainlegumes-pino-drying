@@ -42,19 +42,7 @@ _SESSION_ID_PATTERN: Final = re.compile(r"gw-[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+-[0-9a
 _SAFE_SUBCOMMAND_PATTERN: Final = re.compile(r"[a-z][a-z0-9-]*")
 _RUN_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]+__[0-9a-f]{16}")
 _BENCHMARK_RUN_ID_PATTERN: Final = re.compile(r"core_scaling_transient__[0-9a-f]{16}")
-_SUPPORTED_SUBCOMMANDS: Final = frozenset(
-    {
-        "all",
-        "resume",
-        "smoke",
-        "benchmark-cores",
-        "pilot-check",
-        "collect",
-        "build-datasets",
-        "finalize-smoke",
-        "collect-benchmark",
-    }
-)
+_SUPPORTED_SUBCOMMANDS: Final = frozenset({"run"})
 _SESSION_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -134,7 +122,6 @@ def _safe_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
         not values
         or any(not isinstance(value, str) or not value or any(character in value for character in "\x00\r\n") for value in values)
         or "--background" in values
-        or "--detach" in values
     ):
         message = "Background workflow argv is empty, unsafe, or still contains a launch-control flag."
         raise ValueError(message)

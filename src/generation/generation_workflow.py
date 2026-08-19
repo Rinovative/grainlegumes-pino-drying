@@ -29,6 +29,7 @@ from src import common
 from . import generation_campaign as campaign_runtime
 from .cases import generation_cases_config as config_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
+from .runtime import generation_runtime_batch as batch_runtime
 from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
@@ -39,6 +40,9 @@ DATASET_RECEIPT_FILENAME: Final = "dataset_packages_complete.json"
 ALL_WORKFLOW_RECEIPT_FILENAME: Final = "all_workflow.json"
 CPU_CLEANUP_RECEIPT_FILENAME: Final = "cpu_source_cleanup.json"
 DATASET_RECEIPT_SCHEMA_KIND: Final = "generation_dataset_packages_complete"
+DATASET_EXTENSION_DIRECTORY_NAME: Final = "dataset_package_extensions"
+DATASET_EXTENSION_SCHEMA_KIND: Final = "generation_dataset_package_extension"
+PACKAGE_STATE_SCHEMA_KIND: Final = "generation_campaign_package_state"
 ALL_WORKFLOW_SCHEMA_KIND: Final = "generation_all_workflow"
 CPU_CLEANUP_SCHEMA_KIND: Final = "generation_cpu_source_cleanup"
 CPU_CLEANUP_TRANSACTION_SCHEMA_KIND: Final = "generation_cpu_source_cleanup_transaction"
@@ -132,6 +136,46 @@ def _dataset_receipt_lock_path(run_id: str, *, storage_root: Path) -> Path:
     return common.paths.get_generation_state_root(storage_root=storage_root) / "dataset-package-locks" / f"{safe_id}.lock"
 
 
+def _dataset_extension_lock_path(
+    run_id: str,
+    package_plan: Mapping[str, Any],
+    *,
+    storage_root: Path,
+) -> Path:
+    """Return the lock dedicated to one package-extension request."""
+    safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
+    digest = common.serialization.canonical_json_sha256(dict(package_plan))
+    return common.paths.get_generation_state_root(storage_root=storage_root) / "dataset-package-extension-locks" / f"{safe_id}-{digest}.lock"
+
+
+def _dataset_extension_directory(run_id: str, *, storage_root: Path) -> Path:
+    """Return the immutable per-package extension receipt directory."""
+    return (
+        campaign_evidence.campaign_run_directory(
+            run_id,
+            storage_root=storage_root,
+        )
+        / DATASET_EXTENSION_DIRECTORY_NAME
+    )
+
+
+def _dataset_extension_path(
+    run_id: str,
+    package_plan: Mapping[str, Any],
+    *,
+    storage_root: Path,
+) -> Path:
+    """Return one content-addressed package-extension receipt path."""
+    digest = common.serialization.canonical_json_sha256(dict(package_plan))
+    return (
+        _dataset_extension_directory(
+            run_id,
+            storage_root=storage_root,
+        )
+        / f"{digest}.json"
+    )
+
+
 def _all_receipt_path(run_id: str, *, storage_root: Path) -> Path:
     """Return the all-workflow receipt path."""
     return campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root) / ALL_WORKFLOW_RECEIPT_FILENAME
@@ -152,7 +196,7 @@ def _package_runtime_evidence(
 
     manifest = package_service.load_package_manifest(dataset_id, storage_root=storage_root)
     inspection = package_service.inspect_dataset_package(dataset_id, storage_root=storage_root)
-    membership = "train" if manifest["evaluation_regime"] == "id" and manifest["campaign_purpose"] == "family_generalization" else None
+    membership = "train" if manifest["evaluation_regime"] == "id" and manifest["training_eligible"] is True else None
     smoke = {
         f"workers_{num_workers}": package_service.smoke_dataset_package(
             dataset_id,
@@ -250,6 +294,276 @@ def _validate_package_record(
     return dict(record)
 
 
+def _package_key(value: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Return one normalized package request or record identity."""
+    return (
+        str(value["dataset_name"]),
+        str(value["dataset_view"]),
+        str(value["evaluation_regime"]),
+    )
+
+
+def _package_binding(record: Mapping[str, Any]) -> dict[str, str]:
+    """Return immutable payload and manifest evidence for one package."""
+    return {
+        "dataset_id": str(record["dataset_id"]),
+        "manifest_sha256": str(record["manifest_sha256"]),
+        "payload_sha256": str(record["payload_sha256"]),
+    }
+
+
+def _campaign_source_artifact_identity(
+    campaign: config_service.CampaignConfig,
+    *,
+    storage_root: Path,
+) -> dict[str, Any]:
+    """Return a digest over every admitted batch and canonical HDF5 artifact."""
+    batches: list[dict[str, Any]] = []
+    case_count = 0
+    for batch in campaign.batches:
+        terminal = batch_runtime.admit_terminal_batch(
+            batch.batch_storage_name,
+            storage_root=storage_root,
+            validation_depth="routine",
+        )
+        if (
+            terminal.batch_id != batch.batch_id
+            or terminal.batch_identity != batch.batch_identity
+            or terminal.simulation_profile != campaign.profile.id
+        ):
+            message = f"Terminal batch {batch.batch_name!r} disagrees with the package-extension simulation plan."
+            raise RuntimeError(message)
+        cases: list[dict[str, Any]] = []
+        for case in terminal.cases:
+            artifact = case.artifact("processed", "case.h5")
+            cases.append(
+                {
+                    **case.record_payload(),
+                    "case_hdf5_size_bytes": artifact.size_bytes,
+                    "case_hdf5_sha256": artifact.sha256,
+                }
+            )
+        case_count += len(cases)
+        batches.append(
+            {
+                "batch_name": batch.batch_name,
+                "batch_id": batch.batch_id,
+                "batch_identity": batch.batch_identity,
+                "manifest_sha256": terminal.manifest_sha256,
+                "scientific_config_digest": terminal.scientific_config_digest,
+                "simulation_profile": terminal.simulation_profile,
+                "template": {
+                    "relative_path": terminal.template_relative_path,
+                    "sha256": terminal.template_sha256,
+                },
+                "export_contract_sha256": terminal.export_contract_sha256,
+                "available_learning_views": list(terminal.available_learning_views),
+                "cases": cases,
+            }
+        )
+    payload = {
+        "campaign_digest": campaign.campaign_digest,
+        "campaign_id": campaign.campaign_id,
+        "simulation_profile": campaign.profile.id,
+        "membership": campaign.membership,
+        "batches": batches,
+    }
+    return {
+        "artifact_set_sha256": common.serialization.canonical_json_sha256(payload),
+        "batch_count": len(batches),
+        "case_count": case_count,
+        "batch_manifests": [
+            {
+                "batch_id": batch["batch_id"],
+                "manifest_sha256": batch["manifest_sha256"],
+            }
+            for batch in batches
+        ],
+    }
+
+
+def _id_companion_binding(
+    plan: Mapping[str, Any],
+    *,
+    current_plans: tuple[dict[str, Any], ...],
+    records: Mapping[tuple[str, str, str], dict[str, Any]],
+) -> dict[str, str] | None:
+    """Return the published ID companion bound to one non-ID extension."""
+    if plan["evaluation_regime"] == "id":
+        return None
+    candidates = tuple(
+        candidate for candidate in current_plans if candidate["dataset_view"] == plan["dataset_view"] and candidate["evaluation_regime"] == "id"
+    )
+    if len(candidates) != 1:
+        message = f"Package extension {plan['dataset_name']!r} requires exactly one declared ID leakage companion for the same Dataset view."
+        raise ValueError(message)
+    companion = records.get(_package_key(candidates[0]))
+    if companion is None:
+        message = f"Package extension {plan['dataset_name']!r} requires its ID companion to be valid before publication."
+        raise RuntimeError(message)
+    return _package_binding(companion)
+
+
+def _validate_package_extension(
+    run_id: str,
+    plan: Mapping[str, Any],
+    *,
+    storage_root: Path,
+    base_receipt: Mapping[str, Any],
+    workflow_receipt: Mapping[str, Any],
+    source_artifact_set: Mapping[str, Any],
+    id_companion: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """Validate one immutable additive package receipt and its exact source."""
+    path = _dataset_extension_path(
+        run_id,
+        plan,
+        storage_root=storage_root,
+    )
+    receipt = _load_json(path, label="Dataset package extension receipt")
+    package = receipt.get("package")
+    required = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "completed_at",
+        "campaign_run_id",
+        "campaign_id",
+        "campaign_digest",
+        "source_git_commit",
+        "selected_batch_ids",
+        "transfer_receipt_sha256",
+        "base_dataset_receipt_sha256",
+        "base_all_workflow_receipt_sha256",
+        "package_plan",
+        "package_plan_digest",
+        "source_artifact_set",
+        "id_companion",
+        "cpu_source_cleanup_reopened",
+        "package",
+    }
+    plan_digest = common.serialization.canonical_json_sha256(dict(plan))
+    validated_package = _validate_package_record(
+        package,
+        storage_root=storage_root,
+    )
+    if (
+        set(receipt) != required
+        or receipt.get("schema_kind") != DATASET_EXTENSION_SCHEMA_KIND
+        or receipt.get("schema_version") != WORKFLOW_SCHEMA_VERSION
+        or receipt.get("status") != "complete"
+        or not isinstance(receipt.get("completed_at"), str)
+        or not receipt["completed_at"]
+        or receipt.get("campaign_run_id") != run_id
+        or receipt.get("campaign_id") != base_receipt["campaign_id"]
+        or receipt.get("campaign_digest") != base_receipt["campaign_digest"]
+        or receipt.get("source_git_commit") != base_receipt["git_commit"]
+        or receipt.get("selected_batch_ids") != base_receipt["selected_batch_ids"]
+        or receipt.get("transfer_receipt_sha256") != base_receipt["transfer_receipt_sha256"]
+        or receipt.get("base_dataset_receipt_sha256") != common.serialization.file_sha256(_dataset_receipt_path(run_id, storage_root=storage_root))
+        or receipt.get("base_all_workflow_receipt_sha256") != common.serialization.file_sha256(_all_receipt_path(run_id, storage_root=storage_root))
+        or receipt.get("package_plan") != dict(plan)
+        or receipt.get("package_plan_digest") != plan_digest
+        or receipt.get("source_artifact_set") != dict(source_artifact_set)
+        or receipt.get("id_companion") != (None if id_companion is None else dict(id_companion))
+        or receipt.get("cpu_source_cleanup_reopened") is not False
+        or _package_key(validated_package) != _package_key(plan)
+        or workflow_receipt.get("workflow_result") != "success"
+    ):
+        message = f"Dataset package extension receipt is invalid: {path}"
+        raise ValueError(message)
+    return validated_package
+
+
+def validate_campaign_package_state(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate the historical base plus every currently requested extension."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    base = validate_dataset_packages_receipt(
+        run_id,
+        storage_root=storage,
+    )
+    launch_campaign = campaign_evidence.campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    current_campaign = campaign_evidence.current_campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    current_plans = tuple(dict(plan) for plan in current_campaign.dataset_packages)
+    current_by_key = {_package_key(plan): plan for plan in current_plans}
+    launch_by_key = {_package_key(plan): dict(plan) for plan in launch_campaign.dataset_packages}
+    if any(current_by_key.get(key) != plan for key, plan in launch_by_key.items()):
+        message = "Current campaign removed or changed a launch-time Dataset package."
+        raise RuntimeError(message)
+    records = {_package_key(record): dict(record) for record in base["packages"]}
+    if set(records) != set(launch_by_key):
+        message = "Historical Dataset package receipt disagrees with the launch snapshot."
+        raise RuntimeError(message)
+    extension_paths: list[str] = []
+    missing_plans = tuple(plan for plan in current_plans if _package_key(plan) not in records)
+    if missing_plans:
+        workflow = validate_completed_workflow(
+            run_id,
+            storage_root=storage,
+        )
+        source_artifact_set = _campaign_source_artifact_identity(
+            current_campaign,
+            storage_root=storage,
+        )
+        ordered_missing = tuple(
+            sorted(
+                missing_plans,
+                key=lambda plan: plan["evaluation_regime"] != "id",
+            )
+        )
+        for plan in ordered_missing:
+            companion = _id_companion_binding(
+                plan,
+                current_plans=current_plans,
+                records=records,
+            )
+            record = _validate_package_extension(
+                run_id,
+                plan,
+                storage_root=storage,
+                base_receipt=base,
+                workflow_receipt=workflow,
+                source_artifact_set=source_artifact_set,
+                id_companion=companion,
+            )
+            records[_package_key(plan)] = record
+            extension_paths.append(
+                _dataset_extension_path(
+                    run_id,
+                    plan,
+                    storage_root=storage,
+                )
+                .relative_to(storage)
+                .as_posix()
+            )
+    ordered_records = [records[_package_key(plan)] for plan in current_plans]
+    if len({record["dataset_id"] for record in ordered_records}) != len(ordered_records):
+        message = "Current campaign package state resolves duplicate Dataset IDs."
+        raise RuntimeError(message)
+    return {
+        "schema_kind": PACKAGE_STATE_SCHEMA_KIND,
+        "schema_version": WORKFLOW_SCHEMA_VERSION,
+        "status": "complete",
+        "campaign_run_id": run_id,
+        "campaign_digest": current_campaign.campaign_digest,
+        "package_request_digest": current_campaign.package_request_digest,
+        "declared_package_count": len(current_plans),
+        "base_dataset_receipt_sha256": common.serialization.file_sha256(_dataset_receipt_path(run_id, storage_root=storage)),
+        "packages": ordered_records,
+        "extension_receipts": extension_paths,
+    }
+
+
 def validate_dataset_packages_receipt(
     run_id: str,
     *,
@@ -303,8 +617,8 @@ def validate_dataset_packages_receipt(
         message = f"Dataset package completion receipt is invalid: {receipt_path}"
         raise ValueError(message)
     validated = [_validate_package_record(record, storage_root=storage) for record in packages]
-    declared = {(str(plan["dataset_view"]), str(plan["evaluation_regime"])) for plan in campaign.dataset_packages}
-    observed = {(str(record["dataset_view"]), str(record["evaluation_regime"])) for record in validated}
+    declared = {_package_key(plan) for plan in campaign.dataset_packages}
+    observed = {_package_key(record) for record in validated}
     if observed != declared or len({record["dataset_id"] for record in validated}) != len(validated):
         message = f"Dataset receipt does not cover each declared package exactly once: {receipt_path}"
         raise ValueError(message)
@@ -316,50 +630,325 @@ def build_campaign_datasets(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Build or exactly reuse, inspect, and loader-smoke every declared package."""
+    """Build the launch package set or only missing additive extensions."""
     from src.datasets import packages as package_service  # noqa: PLC0415
 
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
-    terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
-    campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
-    if terminal["dataset_packages"] != list(campaign.dataset_packages):
-        message = "Terminal campaign dataset declarations differ from the repository campaign."
+    terminal = campaign_runtime.validate_terminal_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    launch_campaign = campaign_evidence.campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    if terminal["dataset_packages"] != list(launch_campaign.dataset_packages):
+        message = "Terminal campaign Dataset declarations differ from the launch snapshot."
         raise RuntimeError(message)
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
+    if not receipt_path.exists():
+        lock_path = _dataset_receipt_lock_path(run_id, storage_root=storage)
+        with common.locking.exclusive_file_lock(lock_path, blocking=False):
+            if not receipt_path.exists():
+                pilot_pre_cleanup_sha256 = None
+                if launch_campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
+                    pilot_service.validate_pilot_pre_cleanup(
+                        run_id,
+                        storage_root=storage,
+                        require_live_evidence=True,
+                    )
+                    pilot_pre_cleanup_sha256 = common.serialization.file_sha256(
+                        pilot_service.pilot_check_directory(
+                            run_id,
+                            storage_root=storage,
+                        )
+                        / pilot_service.PILOT_PRE_CLEANUP_FILENAME
+                    )
+                results = package_service.build_campaign_packages(
+                    launch_campaign,
+                    storage_root=storage,
+                )
+                package_records = [_package_record(result, storage_root=storage) for result in results]
+                receipt = {
+                    "schema_kind": DATASET_RECEIPT_SCHEMA_KIND,
+                    "schema_version": WORKFLOW_SCHEMA_VERSION,
+                    "status": "complete",
+                    "completed_at": _utc_now(),
+                    "campaign_run_id": run_id,
+                    "campaign_id": launch_campaign.campaign_id,
+                    "campaign_digest": launch_campaign.campaign_digest,
+                    "git_commit": terminal["git_commit"],
+                    "selected_batch_ids": [batch["batch_id"] for batch in terminal["batches"]],
+                    "declared_package_count": len(launch_campaign.dataset_packages),
+                    "transfer_receipt_sha256": common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage)),
+                    "pilot_pre_cleanup_receipt_sha256": (pilot_pre_cleanup_sha256),
+                    "packages": package_records,
+                }
+                common.serialization.atomic_write_json(receipt_path, receipt)
+        return validate_dataset_packages_receipt(
+            run_id,
+            storage_root=storage,
+        )
+
     lock_path = _dataset_receipt_lock_path(run_id, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        if receipt_path.exists():
-            return validate_dataset_packages_receipt(run_id, storage_root=storage)
-        pilot_pre_cleanup_sha256 = None
-        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
-            pilot_service.validate_pilot_pre_cleanup(
+        base = validate_dataset_packages_receipt(
+            run_id,
+            storage_root=storage,
+        )
+    if not _all_receipt_path(run_id, storage_root=storage).is_file():
+        return base
+
+    current_campaign = campaign_evidence.current_campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    current_plans = tuple(dict(plan) for plan in current_campaign.dataset_packages)
+    records = {_package_key(record): dict(record) for record in base["packages"]}
+    missing = tuple(plan for plan in current_plans if _package_key(plan) not in records)
+    if not missing:
+        return validate_campaign_package_state(
+            run_id,
+            storage_root=storage,
+        )
+
+    workflow = validate_completed_workflow(
+        run_id,
+        storage_root=storage,
+    )
+    source_artifact_set = _campaign_source_artifact_identity(
+        current_campaign,
+        storage_root=storage,
+    )
+    ordered_missing = tuple(sorted(missing, key=lambda plan: plan["evaluation_regime"] != "id"))
+    for plan in ordered_missing:
+        companion = _id_companion_binding(
+            plan,
+            current_plans=current_plans,
+            records=records,
+        )
+        extension_path = _dataset_extension_path(
+            run_id,
+            plan,
+            storage_root=storage,
+        )
+        extension_lock = _dataset_extension_lock_path(
+            run_id,
+            plan,
+            storage_root=storage,
+        )
+        with common.locking.exclusive_file_lock(extension_lock, blocking=False):
+            if not extension_path.exists():
+                result = package_service.build_dataset_package(
+                    current_campaign,
+                    str(plan["dataset_view"]),
+                    str(plan["evaluation_regime"]),
+                    storage_root=storage,
+                )
+                package_record = _package_record(
+                    result,
+                    storage_root=storage,
+                )
+                extension = {
+                    "schema_kind": DATASET_EXTENSION_SCHEMA_KIND,
+                    "schema_version": WORKFLOW_SCHEMA_VERSION,
+                    "status": "complete",
+                    "completed_at": _utc_now(),
+                    "campaign_run_id": run_id,
+                    "campaign_id": base["campaign_id"],
+                    "campaign_digest": base["campaign_digest"],
+                    "source_git_commit": base["git_commit"],
+                    "selected_batch_ids": base["selected_batch_ids"],
+                    "transfer_receipt_sha256": base["transfer_receipt_sha256"],
+                    "base_dataset_receipt_sha256": (common.serialization.file_sha256(receipt_path)),
+                    "base_all_workflow_receipt_sha256": (common.serialization.file_sha256(_all_receipt_path(run_id, storage_root=storage))),
+                    "package_plan": plan,
+                    "package_plan_digest": (common.serialization.canonical_json_sha256(plan)),
+                    "source_artifact_set": source_artifact_set,
+                    "id_companion": companion,
+                    "cpu_source_cleanup_reopened": False,
+                    "package": package_record,
+                }
+                extension_path.parent.mkdir(parents=True, exist_ok=True)
+                common.serialization.atomic_write_json(
+                    extension_path,
+                    extension,
+                )
+            record = _validate_package_extension(
+                run_id,
+                plan,
+                storage_root=storage,
+                base_receipt=base,
+                workflow_receipt=workflow,
+                source_artifact_set=source_artifact_set,
+                id_companion=companion,
+            )
+        records[_package_key(plan)] = record
+    return validate_campaign_package_state(
+        run_id,
+        storage_root=storage,
+    )
+
+
+def find_compatible_completed_campaign_source(
+    campaign_path: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Find one exact transferred base eligible for package-only continuation."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    expected = config_service.load_campaign_config(
+        campaign_path,
+        require_executable=True,
+    )
+    root = (
+        common.paths.get_generation_meta_root(
+            storage_root=storage,
+        )
+        / "campaigns"
+    )
+    missing = {
+        "schema_kind": "generation_compatible_campaign_source",
+        "schema_version": WORKFLOW_SCHEMA_VERSION,
+        "status": "missing",
+        "campaign_digest": expected.campaign_digest,
+        "package_request_digest": expected.package_request_digest,
+        "campaign_run_id": None,
+    }
+    if not root.exists():
+        return missing
+    if not root.is_dir() or root.is_symlink():
+        message = f"Generation campaign metadata root is unsafe: {root}"
+        raise ValueError(message)
+    expected_path = expected.source_path.resolve()
+    expected_batches = [batch.batch_id for batch in expected.batches]
+    candidates: list[dict[str, Any]] = []
+    matching_invalid: list[dict[str, str]] = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir() or directory.is_symlink():
+            message = f"Generation campaign metadata contains an unsafe entry: {directory}"
+            raise ValueError(message)
+        run_id = common.paths.validate_logical_name(
+            directory.name,
+            label="campaign_run_id",
+        )
+        try:
+            manifest = campaign_evidence.load_campaign_run(
                 run_id,
                 storage_root=storage,
-                require_live_evidence=True,
             )
-            pilot_pre_cleanup_sha256 = common.serialization.file_sha256(
-                pilot_service.pilot_check_directory(run_id, storage_root=storage) / pilot_service.PILOT_PRE_CLEANUP_FILENAME
+        except (FileNotFoundError, TypeError, ValueError):
+            continue
+        try:
+            configured_path = campaign_evidence.resolve_campaign_config_path(manifest["campaign_config"])
+        except (FileNotFoundError, TypeError, ValueError):
+            continue
+        if (
+            configured_path != expected_path
+            or manifest.get("campaign_id") != expected.campaign_id
+            or manifest.get("campaign_digest") != expected.campaign_digest
+            or manifest.get("selected_batch_names") != [batch.batch_name for batch in expected.batches]
+            or manifest.get("state") != "complete"
+            or not (directory / ALL_WORKFLOW_RECEIPT_FILENAME).is_file()
+        ):
+            continue
+        try:
+            terminal = campaign_runtime.validate_terminal_campaign(
+                run_id,
+                storage_root=storage,
             )
-        results = package_service.build_campaign_packages(campaign, storage_root=storage)
-        package_records = [_package_record(result, storage_root=storage) for result in results]
-        receipt = {
-            "schema_kind": DATASET_RECEIPT_SCHEMA_KIND,
-            "schema_version": WORKFLOW_SCHEMA_VERSION,
-            "status": "complete",
-            "completed_at": _utc_now(),
-            "campaign_run_id": run_id,
-            "campaign_id": campaign.campaign_id,
-            "campaign_digest": campaign.campaign_digest,
-            "git_commit": terminal["git_commit"],
-            "selected_batch_ids": [batch["batch_id"] for batch in terminal["batches"]],
-            "declared_package_count": len(campaign.dataset_packages),
-            "transfer_receipt_sha256": common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage)),
-            "pilot_pre_cleanup_receipt_sha256": pilot_pre_cleanup_sha256,
-            "packages": package_records,
-        }
-        common.serialization.atomic_write_json(receipt_path, receipt)
-    return validate_dataset_packages_receipt(run_id, storage_root=storage)
+            transfer = campaign_runtime.validate_transferred_campaign(
+                run_id,
+                storage_root=storage,
+            )
+            workflow = validate_completed_workflow(
+                run_id,
+                storage_root=storage,
+            )
+            launch = campaign_evidence.campaign_for_run(
+                run_id,
+                storage_root=storage,
+            )
+            current = campaign_evidence.current_campaign_for_run(
+                run_id,
+                storage_root=storage,
+            )
+            artifact_set = _campaign_source_artifact_identity(
+                current,
+                storage_root=storage,
+            )
+        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+            matching_invalid.append({"campaign_run_id": run_id, "error": str(error)})
+            continue
+        if [batch["batch_id"] for batch in terminal["batches"]] != expected_batches:
+            matching_invalid.append(
+                {
+                    "campaign_run_id": run_id,
+                    "error": "completed batch inventory differs from the requested simulation plan",
+                }
+            )
+            continue
+        launch_keys = {_package_key(plan) for plan in launch.dataset_packages}
+        extension_paths = [
+            _dataset_extension_path(
+                run_id,
+                plan,
+                storage_root=storage,
+            )
+            for plan in current.dataset_packages
+            if _package_key(plan) not in launch_keys
+        ]
+        unsafe_paths = [path for path in extension_paths if path.is_symlink() or (path.exists() and not path.is_file())]
+        if unsafe_paths:
+            matching_invalid.append(
+                {
+                    "campaign_run_id": run_id,
+                    "error": f"unsafe Dataset extension receipt paths: {unsafe_paths}",
+                }
+            )
+            continue
+        if any(not path.exists() for path in extension_paths):
+            package_status = "extension_required"
+        else:
+            try:
+                validate_campaign_package_state(
+                    run_id,
+                    storage_root=storage,
+                )
+            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+                matching_invalid.append({"campaign_run_id": run_id, "error": str(error)})
+                continue
+            package_status = "complete"
+        candidates.append(
+            {
+                "campaign_run_id": run_id,
+                "source_git_commit": terminal["git_commit"],
+                "artifact_set_sha256": artifact_set["artifact_set_sha256"],
+                "transfer_inventory_sha256": transfer["transfer_inventory_sha256"],
+                "base_all_workflow_sha256": common.serialization.file_sha256(_all_receipt_path(run_id, storage_root=storage)),
+                "cpu_source_state": workflow["cpu_cleanup_complete"]["status"],
+                "package_state": package_status,
+            }
+        )
+    if not candidates:
+        if matching_invalid:
+            message = f"Scientifically matching completed campaign evidence is not safe for package-only reuse: {matching_invalid}"
+            raise RuntimeError(message)
+        return missing
+    if len(candidates) != 1:
+        candidate_ids = [candidate["campaign_run_id"] for candidate in candidates]
+        message = f"More than one compatible completed campaign source exists; explicit source selection is required: {candidate_ids}."
+        raise RuntimeError(message)
+    selected = candidates[0]
+    return {
+        "schema_kind": "generation_compatible_campaign_source",
+        "schema_version": WORKFLOW_SCHEMA_VERSION,
+        "status": "compatible_complete",
+        "campaign_digest": expected.campaign_digest,
+        "package_request_digest": expected.package_request_digest,
+        **selected,
+    }
 
 
 def _cleanup_directory_records(
@@ -1714,13 +2303,13 @@ def record_workflow_failure(
     *,
     storage_root: Path | str,
     stage: str,
-    resume_command: str,
+    continuation_command: str,
     cpu_bytes_retained: int,
 ) -> Path:
     """Persist and re-admit one append-only compact workflow failure record."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
     safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    if not stage or not resume_command or cpu_bytes_retained < 0:
+    if not stage or not continuation_command or cpu_bytes_retained < 0:
         message = "Workflow failure evidence is incomplete."
         raise ValueError(message)
     campaign_evidence.load_campaign_run(safe_id, storage_root=storage)
@@ -1748,7 +2337,7 @@ def record_workflow_failure(
             "schema_version": WORKFLOW_SCHEMA_VERSION,
             "campaign_run_id": safe_id,
             "stage": stage,
-            "resume_command": resume_command,
+            "continuation_command": continuation_command,
             "cpu_bytes_retained": cpu_bytes_retained,
             "recorded_at": _utc_now(),
         }
@@ -1809,7 +2398,8 @@ def campaign_source_status(
         campaign_metadata_bytes = _tree_size(campaign_directory)
         return {
             "campaign_run_id": run_id,
-            "campaign_state": "source_cleanup_complete",
+            "campaign_state": "successful",
+            "source_state": "cleaned",
             "transfer_status": "transferred_and_cleaned",
             "cleanup_eligibility": "already_complete",
             "active_slurm": False,
@@ -1852,11 +2442,18 @@ def campaign_source_status(
         else "ineligible"
     )
     transfer_status = "gpu_receipt_present" if (campaign_directory / "transfer_complete.json").is_file() else "not_recorded_on_this_host"
+    if terminal and transfer_status == "gpu_receipt_present":
+        source_state = "retained"
+    elif terminal:
+        source_state = "awaiting_collection"
+    else:
+        source_state = "active"
     source_bytes = sum(int(record["size_bytes"]) for record in directory_records)
     campaign_metadata_bytes = _tree_size(campaign_directory)
     return {
         "campaign_run_id": run_id,
         "campaign_state": state,
+        "source_state": source_state,
         "transfer_status": transfer_status,
         "cleanup_eligibility": cleanup_eligibility,
         "active_slurm": active,
@@ -1886,6 +2483,7 @@ def _safe_campaign_source_status(
         return {
             "campaign_run_id": run_id,
             "campaign_state": "invalid",
+            "source_state": "invalid",
             "error": str(error),
             "reclaimable_bytes": 0,
             "size_bytes": 0,

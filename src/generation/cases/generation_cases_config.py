@@ -40,6 +40,7 @@ from src.generation.contracts.generation_contracts_vocabulary import (
     NO_EVALUATION_REGIME,
     PILOT_CAMPAIGN_PURPOSE,
     SPLIT_NAMES,
+    STEADY_FLOW_ID_DATASET_PURPOSE,
 )
 
 from . import generation_cases_sampling as sampling_service
@@ -267,6 +268,7 @@ class CampaignConfig:
     source_path: Path
     campaign_name: str
     campaign_digest: str
+    package_request_digest: str
     campaign_id: str
     campaign_purpose: str
     evaluation_regimes: tuple[str, ...]
@@ -385,7 +387,9 @@ class CampaignConfig:
             self,
             total_case_count=sum(len(batch.case_indices) for batch in selected),
             batches=selected,
+            evaluation_regimes=tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in packages)),
             dataset_packages=packages,
+            package_request_digest=common.serialization.canonical_json_sha256(list(packages)),
         )
 
     def without_extreme_family_ood(self) -> CampaignConfig:
@@ -1484,7 +1488,7 @@ def _validate_batch_counts(
             material_family: _integer(
                 raw[material_family],
                 label=f"campaign.sampling.counts.{regime}.{material_family}",
-                minimum=1,
+                minimum=0 if regime == "parameter_ood" else 1,
             )
             for material_family in ordered_materials
         }
@@ -1630,18 +1634,22 @@ def _validate_dataset_packages(
         message = "campaign.dataset_packages must be a non-empty list."
         raise GenerationConfigError(message)
     declarations: list[dict[str, Any]] = []
-    declared_pairs: set[tuple[str, str]] = set()
+    declared_pairs: set[tuple[str | None, str, str]] = set()
     for index, raw in enumerate(value):
         label = f"campaign.dataset_packages[{index}]"
         package = _mapping(raw, label=label)
         _exact_keys(
             package,
             required={"evaluation_regime", "source_role"},
-            optional=set(),
+            optional={"dataset_view"},
             label=label,
         )
         regime = package["evaluation_regime"]
         source_role = package["source_role"]
+        dataset_view = package.get("dataset_view")
+        if dataset_view is not None and dataset_view not in profile.available_learning_views:
+            message = f"{label}.dataset_view must be one of {list(profile.available_learning_views)}, got {dataset_view!r}."
+            raise GenerationConfigError(message)
         if not isinstance(regime, str) or regime not in EVALUATION_REGIMES:
             message = f"{label}.evaluation_regime must be one of {list(EVALUATION_REGIMES)}."
             raise GenerationConfigError(message)
@@ -1655,9 +1663,9 @@ def _validate_dataset_packages(
         if not material_roles[source_role]:
             message = f"{label}.source_role {source_role!r} has no materials."
             raise GenerationConfigError(message)
-        pair = (regime, source_role)
+        pair = (dataset_view, regime, source_role)
         if pair in declared_pairs:
-            message = f"campaign.dataset_packages repeats regime/source-role pair {pair}."
+            message = f"campaign.dataset_packages repeats view/regime/source-role declaration {pair}."
             raise GenerationConfigError(message)
         declared_pairs.add(pair)
         _package_source_count(
@@ -1669,13 +1677,15 @@ def _validate_dataset_packages(
         declarations.append(package)
 
     packages: list[dict[str, Any]] = []
-    for dataset_view in profile.available_learning_views:
-        for declaration in declarations:
+    for declaration in declarations:
+        declared_view = declaration.get("dataset_view")
+        dataset_views = profile.available_learning_views if declared_view is None else (declared_view,)
+        for dataset_view in dataset_views:
             regime = str(declaration["evaluation_regime"])
             source_role = str(declaration["source_role"])
             package_materials = material_roles[source_role]
-            family_campaign = campaign_purpose == "family_generalization"
-            is_id = regime == "id" and family_campaign
+            learning_campaign = campaign_purpose in {"family_generalization", STEADY_FLOW_ID_DATASET_PURPOSE}
+            is_id = regime == "id" and learning_campaign
             package = {
                 **copy.deepcopy(declaration),
                 "dataset_view": dataset_view,
@@ -1692,7 +1702,7 @@ def _validate_dataset_packages(
                     "train": is_id,
                     "validation": is_id,
                     "id_test": is_id,
-                    "parameter_ood": regime == "parameter_ood" and family_campaign,
+                    "parameter_ood": regime == "parameter_ood" and campaign_purpose == "family_generalization",
                 },
             }
             if is_id:
@@ -2394,9 +2404,9 @@ def _validate_campaign_header(
     if purpose not in CAMPAIGN_PURPOSES:
         message = f"campaign.campaign_purpose must be one of {list(CAMPAIGN_PURPOSES)}."
         raise GenerationConfigError(message)
-    if purpose == "family_generalization":
+    if purpose in {"family_generalization", STEADY_FLOW_ID_DATASET_PURPOSE}:
         if "membership" not in campaign or "paired_equivalence_seed" in campaign:
-            message = "Family-generalization campaigns require membership and prohibit paired_equivalence_seed."
+            message = f"Learning campaign {purpose!r} requires membership and prohibits paired_equivalence_seed."
             raise GenerationConfigError(message)
     elif purpose == "technical_runtime_smoke":
         if "membership" in campaign or "paired_equivalence_seed" not in campaign:
@@ -2648,7 +2658,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     path: Path | str,
     *,
     require_executable: bool = True,
-    pilot_cases_per_material: int | None = None,
 ) -> CampaignConfig:
     """Resolve one campaign, every subbatch, and every immutable dataset plan."""
     source_path = Path(path).expanduser().resolve()
@@ -2700,9 +2709,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     campaign_purpose = str(campaign["campaign_purpose"])
     if campaign_purpose == PILOT_CAMPAIGN_PURPOSE and profile.id != profiles.TRANSIENT_DRYING_PROFILE:
         message = "Pilot-check campaigns require the transient_drying profile."
-        raise GenerationConfigError(message)
-    if pilot_cases_per_material is not None and campaign_purpose != PILOT_CAMPAIGN_PURPOSE:
-        message = "pilot_cases_per_material applies only to a dedicated pilot-check campaign."
         raise GenerationConfigError(message)
     execution = _validate_execution(
         _load_yaml(
@@ -2764,15 +2770,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             label="campaign.sampling.cases_per_material",
             minimum=1,
         )
-        selected_count = (
-            configured_pilot_cases_per_material
-            if pilot_cases_per_material is None
-            else _integer(
-                pilot_cases_per_material,
-                label="pilot_cases_per_material",
-                minimum=1,
-            )
-        )
+        selected_count = configured_pilot_cases_per_material
         pilot_case_semantics = _mapping(
             sampling["case_semantics"],
             label="campaign.sampling.case_semantics",
@@ -2898,6 +2896,8 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
     batches: list[GenerationConfig] = []
     for sampling_regime in sampling_regimes:
         for material_family, count in counts[sampling_regime].items():
+            if count == 0:
+                continue
             material_role = role_by_material[material_family]
             evaluation_regime = (
                 NO_EVALUATION_REGIME
@@ -2953,7 +2953,7 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         "simulation_profile": profile.id,
         "materials": list(campaign["materials"]),
         "material_roles": {name: list(values) for name, values in material_roles.items()},
-        "evaluation_regimes": list(evaluation_regimes),
+        "evaluation_regimes": list(dict.fromkeys(batch.evaluation_regime for batch in batches)),
         "material_memberships": {name: list(values) for name, values in material_memberships.items()},
         "membership": copy.deepcopy(membership),
         "sampling_method": sampling["method"],
@@ -2966,7 +2966,6 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
         "paired_equivalence_seed": paired_equivalence_seed,
         "total_case_count": total_case_count,
         "batch_ids": [batch.batch_id for batch in batches],
-        "dataset_packages": list(dataset_packages),
         "duplicate_case_input_policy": duplicate_case_input_policy,
     }
     if campaign_purpose == PILOT_CAMPAIGN_PURPOSE:
@@ -2979,10 +2978,12 @@ def load_campaign_config(  # noqa: PLR0912, PLR0915 -- one centralized campaign 
             "evaluation_regime": NO_EVALUATION_REGIME,
         }
     campaign_digest = common.serialization.canonical_json_sha256(campaign_scientific)
+    package_request_digest = common.serialization.canonical_json_sha256(list(dataset_packages))
     return CampaignConfig(
         source_path=source_path,
         campaign_name=campaign_name,
         campaign_digest=campaign_digest,
+        package_request_digest=package_request_digest,
         campaign_id=campaign_id,
         campaign_purpose=campaign_purpose,
         evaluation_regimes=evaluation_regimes,

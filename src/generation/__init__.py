@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from . import generation_benchmark as benchmark
     from . import generation_campaign as campaign
     from . import generation_readiness as readiness
+    from . import generation_run as run
     from . import generation_smoke as smoke
     from . import generation_workflow as workflow
 
@@ -34,6 +35,7 @@ _MODULES = {
     "contracts": "contracts",
     "publication": "publication",
     "readiness": "generation_readiness",
+    "run": "generation_run",
     "runtime": "runtime",
     "smoke": "generation_smoke",
     "validation": "validation",
@@ -46,6 +48,7 @@ __all__ = [
     "contracts",
     "publication",
     "readiness",
+    "run",
     "runtime",
     "smoke",
     "validation",

@@ -78,7 +78,7 @@ def test_transient_smoke_reads_fixed_airflow_values_from_scientific_provenance(
             data=json.dumps(
                 {
                     "global.csv": {
-                        "role": "global_timeseries",
+                        "logical_role": "global_timeseries",
                         "sha256": "a" * 64,
                         "size_bytes": 1,
                     }
@@ -623,6 +623,188 @@ def test_smoke_evidence_requires_complete_success_and_is_profile_scoped(
     )
     assert partial["status"] == "technical_smoke_evidence_invalid"
     assert "every required case" in partial["reason"]
+
+
+def test_compatible_completed_smoke_run_reuses_validated_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Select a scientifically identical completed child without new solves."""
+    storage = tmp_path / "storage"
+    run_id = "steady_flow_technical_smoke_v1__0123456789abcdef"
+    run_directory = storage / "01_generation/meta/campaigns" / run_id
+    run_directory.mkdir(parents=True)
+    (run_directory / generation.workflow.ALL_WORKFLOW_RECEIPT_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    config_path = generation.smoke.common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        config_path,
+        require_executable=True,
+    )
+    manifest = {
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "selected_batch_names": [batch.batch_name for batch in campaign.batches],
+        "state": "complete",
+    }
+    batch = campaign.batches[0]
+    cases = tuple(_validated_case_summary(batch, case_index) for case_index in batch.case_indices)
+    monkeypatch.setattr(
+        generation.smoke.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        generation.smoke,
+        "_validate_campaign",
+        lambda *_args, **_kwargs: (
+            campaign,
+            {"git_commit": "a" * 40},
+            {"cpu_cleanup_complete": {"status": "skipped_by_request"}},
+            cases,
+        ),
+    )
+
+    result = generation.smoke.find_compatible_completed_technical_smoke_run(
+        config_path,
+        storage_root=storage,
+    )
+
+    assert result["status"] == "compatible_complete"
+    assert result["campaign_run_id"] == run_id
+    assert result["cpu_source_state"] == "skipped_by_request"
+
+
+def test_compatible_smoke_discovery_repairs_then_revalidates_completed_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revalidate all artifacts after retained-export HDF5 reconstruction."""
+    storage = tmp_path / "storage"
+    run_id = "steady_flow_technical_smoke_v1__abcdef0123456789"
+    run_directory = storage / "01_generation/meta/campaigns" / run_id
+    run_directory.mkdir(parents=True)
+    (run_directory / generation.workflow.ALL_WORKFLOW_RECEIPT_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    config_path = generation.smoke.common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        config_path,
+        require_executable=True,
+    )
+    manifest = {
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "selected_batch_names": [batch.batch_name for batch in campaign.batches],
+        "state": "complete",
+    }
+    batch = campaign.batches[0]
+    cases = tuple(_validated_case_summary(batch, case_index) for case_index in batch.case_indices)
+    validation_phases: list[str] = []
+    repair_calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        generation.smoke.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+
+    def validate_after_repair(*_args: Any, **_kwargs: Any) -> Any:
+        validation_phases.append("initial" if not validation_phases else "post-repair")
+        if len(validation_phases) == 1:
+            message = "synthetic corrupt case.h5"
+            raise ValueError(message)
+        return (
+            campaign,
+            {"git_commit": "a" * 40},
+            {"cpu_cleanup_complete": {"status": "skipped_by_request"}},
+            cases,
+        )
+
+    def repair_case(candidate: Any, case_index: int, **_kwargs: Any) -> dict[str, Any]:
+        repair_calls.append((candidate.batch_id, case_index))
+        case_id = candidate.case_id(case_index)
+        return {
+            "status": "complete",
+            "batch_id": candidate.batch_id,
+            "case_id": case_id,
+            "receipt": f"reconstructions/{candidate.batch_id}/{case_id}.json",
+        }
+
+    monkeypatch.setattr(generation.smoke, "_validate_campaign", validate_after_repair)
+    monkeypatch.setattr(
+        generation.smoke.runtime_service,
+        "repair_completed_case_hdf5_from_retained_exports",
+        repair_case,
+    )
+
+    result = generation.smoke.find_compatible_completed_technical_smoke_run(
+        config_path,
+        storage_root=storage,
+    )
+
+    expected_calls = [(candidate.batch_id, case_index) for candidate in campaign.batches for case_index in candidate.case_indices]
+    assert validation_phases == ["initial", "post-repair"]
+    assert repair_calls == expected_calls
+    assert result["status"] == "compatible_complete"
+    assert len(result["hdf5_reconstructions"]) == len(expected_calls)
+
+
+def test_compatible_smoke_discovery_fails_closed_for_matching_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse to hide corrupt host evidence for matching Smoke science."""
+    storage = tmp_path / "storage"
+    run_id = "steady_flow_technical_smoke_v1__fedcba9876543210"
+    run_directory = storage / "01_generation/meta/campaigns" / run_id
+    run_directory.mkdir(parents=True)
+    (run_directory / generation.workflow.ALL_WORKFLOW_RECEIPT_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    config_path = generation.smoke.common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/technical_smoke.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        config_path,
+        require_executable=True,
+    )
+    manifest = {
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "selected_batch_names": [batch.batch_name for batch in campaign.batches],
+        "state": "complete",
+    }
+    monkeypatch.setattr(
+        generation.smoke.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+
+    def reject_corrupt_candidate(*_args: Any, **_kwargs: Any) -> Any:
+        message = "synthetic corrupt case.h5"
+        raise ValueError(message)
+
+    monkeypatch.setattr(
+        generation.smoke,
+        "_validate_campaign",
+        reject_corrupt_candidate,
+    )
+    monkeypatch.setattr(
+        generation.smoke.runtime_service,
+        "repair_completed_case_hdf5_from_retained_exports",
+        reject_corrupt_candidate,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be safely reused") as caught:
+        generation.smoke.find_compatible_completed_technical_smoke_run(
+            config_path,
+            storage_root=storage,
+        )
+    assert run_id in str(caught.value)
+    assert "synthetic corrupt case.h5" in str(caught.value)
 
 
 @pytest.mark.parametrize(

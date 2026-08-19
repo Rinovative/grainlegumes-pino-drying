@@ -1262,6 +1262,11 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     except ValueError as error:
         msg = f"config.task: {error}"
         raise ConfigError(msg) from error
+    authored_data = _as_mapping(user_config.get("data"), path="data")
+    missing_dataset_ids = [key for key in ("train_dataset", "ood_datasets") if key not in authored_data]
+    if missing_dataset_ids:
+        msg = f"Experiment data must explicitly select exact Dataset IDs; missing={missing_dataset_ids}."
+        raise ConfigError(msg)
 
     effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
     effective["task"] = task_id

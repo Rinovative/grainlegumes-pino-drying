@@ -24,7 +24,6 @@ import csv
 import hashlib
 import json
 import re
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,7 +64,6 @@ _SHARED_FIELD_NAMES: Final = (
 _AIRFLOW_FIELD_NAMES: Final = domain.fields.STATE_FIELDS
 _MINIMUM_CONTRASTING_CASES: Final = 2
 _EXPECTED_PROFILE_COUNT: Final = 2
-_GIT_SHA_LENGTH: Final = 40
 _SHA256_LENGTH: Final = 64
 _COMSOL_EXACT_VERSION_PATTERN: Final = re.compile(r"(?<![0-9.])([0-9]+(?:[.][0-9]+){2,3})(?![0-9.])")
 _TECHNICAL_SMOKE_EVIDENCE_KEYS: Final = frozenset(
@@ -94,7 +92,7 @@ _RECEIPT_KEYS: Final = frozenset(
         "schema_version",
         "status",
         "recorded_at",
-        "git_commit",
+        "scientific_git_commits",
         "material_family_inventory",
         "source_binding",
         "templates",
@@ -289,7 +287,7 @@ def _export_inventory(
     records: list[dict[str, Any]] = []
     for relative_path in sorted(source_exports):
         identity = source_exports[relative_path]
-        role = str(identity["role"])
+        role = str(identity["logical_role"])
         contract = contracts.get(role)
         if contract is None:
             message = f"Raw export uses undeclared role {role!r}."
@@ -476,7 +474,7 @@ def _case_evidence(
         message = f"Technical smoke case lacks successful native Slurm evidence: {config.case_id(case_index)}."
         raise RuntimeError(message)
     if config.execution_values["retention_policy"] != "full":
-        message = "Technical smoke execution must use full attempt and solved-model retention."
+        message = "Technical smoke execution must use full source-export and solved-model retention."
         raise RuntimeError(message)
     solved = processed / comsol_service.RETAINED_MODEL_FILENAME
     if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
@@ -572,7 +570,7 @@ def _validate_campaign(
     dict[str, Any],
     tuple[_CaseEvidence, ...],
 ]:
-    """Validate one retained technical-smoke workflow."""
+    """Validate one completed technical-smoke workflow and its host artifacts."""
     workflow = workflow_service.validate_completed_workflow(
         run_id,
         storage_root=storage,
@@ -594,10 +592,9 @@ def _validate_campaign(
         or batch is None
         or len(batch.case_indices) < _MINIMUM_CONTRASTING_CASES
         or batch.sampling_regime != "natural"
-        or workflow["cleanup_requested"] is not False
-        or workflow["cpu_cleanup_complete"] != {"status": "skipped_by_request", "evidence": None}
+        or workflow["cpu_cleanup_complete"]["status"] not in {"complete", "skipped_by_request"}
     ):
-        message = f"Campaign run {run_id!r} is not a retained {expected_profile!r} technical smoke with at least two natural cases."
+        message = f"Campaign run {run_id!r} is not a completed {expected_profile!r} technical smoke with at least two natural cases."
         raise ValueError(message)
     cases = tuple(
         _case_evidence(
@@ -616,6 +613,149 @@ def _validate_campaign(
         message = f"Technical smoke {expected_profile!r} reused a simulation identity."
         raise RuntimeError(message)
     return campaign, terminal, workflow, cases
+
+
+def find_compatible_completed_technical_smoke_run(
+    campaign_path: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return one completed child run with identical scientific dependencies."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    expected = config_service.load_campaign_config(
+        campaign_path,
+        require_executable=True,
+    )
+    if expected.campaign_purpose != TECHNICAL_SMOKE_PURPOSE:
+        message = "Compatible Smoke discovery requires a technical_runtime_smoke campaign."
+        raise ValueError(message)
+    root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
+    if not root.exists():
+        return {
+            "schema_kind": "generation_compatible_technical_smoke_run",
+            "schema_version": 1,
+            "status": "missing",
+            "campaign_digest": expected.campaign_digest,
+            "campaign_run_id": None,
+        }
+    if not root.is_dir() or root.is_symlink():
+        message = f"Technical Smoke campaign metadata root is unsafe: {root}"
+        raise ValueError(message)
+    candidates: list[dict[str, Any]] = []
+    matching_invalid: list[dict[str, str]] = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir() or directory.is_symlink():
+            message = f"Technical Smoke campaign metadata contains an unsafe entry: {directory}"
+            raise ValueError(message)
+        run_id = common.paths.validate_logical_name(
+            directory.name,
+            label="campaign_run_id",
+        )
+        try:
+            manifest = campaign_evidence.load_campaign_run(
+                run_id,
+                storage_root=storage,
+            )
+        except (FileNotFoundError, TypeError, ValueError):
+            continue
+        if (
+            manifest["campaign_id"] != expected.campaign_id
+            or manifest["campaign_digest"] != expected.campaign_digest
+            or manifest["selected_batch_names"] != [batch.batch_name for batch in expected.batches]
+            or manifest.get("state") != "complete"
+            or not (directory / workflow_service.ALL_WORKFLOW_RECEIPT_FILENAME).is_file()
+        ):
+            continue
+        reconstructions: list[dict[str, Any]] = []
+        try:
+            campaign, terminal, workflow, cases = _validate_campaign(
+                run_id,
+                expected_profile=expected.profile.id,
+                storage=storage,
+            )
+        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as initial_error:
+            try:
+                for batch in expected.batches:
+                    for case_index in batch.case_indices:
+                        recovery = runtime_service.repair_completed_case_hdf5_from_retained_exports(
+                            batch,
+                            case_index,
+                            campaign_run_id=run_id,
+                            storage_root=storage,
+                        )
+                        if recovery["status"] == "complete":
+                            reconstructions.append(recovery)
+                campaign, terminal, workflow, cases = _validate_campaign(
+                    run_id,
+                    expected_profile=expected.profile.id,
+                    storage=storage,
+                )
+            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as recovery_error:
+                matching_invalid.append(
+                    {
+                        "campaign_run_id": run_id,
+                        "error": (f"initial validation: {initial_error}; retained-export recovery: {recovery_error}"),
+                    }
+                )
+                continue
+        if campaign.campaign_digest != expected.campaign_digest:
+            continue
+        artifact_identity = common.serialization.canonical_json_sha256(
+            [
+                {
+                    "case_input_id": case.record["case_input_id"],
+                    "simulation_case_id": case.record["simulation_case_id"],
+                    "hdf5_sha256": case.record["hdf5"]["sha256"],
+                    "publication_provenance_sha256": case.record["publication"]["provenance_sha256"],
+                }
+                for case in cases
+            ]
+        )
+        candidates.append(
+            {
+                "campaign_run_id": run_id,
+                "git_commit": terminal["git_commit"],
+                "artifact_identity": artifact_identity,
+                "cpu_source_state": workflow["cpu_cleanup_complete"]["status"],
+                "hdf5_reconstructions": [
+                    {
+                        "batch_id": record["batch_id"],
+                        "case_id": record["case_id"],
+                        "receipt": record["receipt"],
+                    }
+                    for record in reconstructions
+                ],
+            }
+        )
+    if not candidates:
+        if matching_invalid:
+            message = (
+                "Scientifically matching completed Technical Smoke evidence "
+                "cannot be safely reused or reconstructed from its current host "
+                f"artifacts: {matching_invalid}"
+            )
+            raise RuntimeError(message)
+        return {
+            "schema_kind": "generation_compatible_technical_smoke_run",
+            "schema_version": 1,
+            "status": "missing",
+            "campaign_digest": expected.campaign_digest,
+            "campaign_run_id": None,
+        }
+    identities = {str(candidate["artifact_identity"]) for candidate in candidates}
+    if len(identities) != 1:
+        message = (
+            "Scientifically compatible completed Technical Smoke runs have different validated artifact identities; refusing an arbitrary reuse."
+        )
+        raise RuntimeError(message)
+    selected = candidates[-1]
+    return {
+        "schema_kind": "generation_compatible_technical_smoke_run",
+        "schema_version": 1,
+        "status": "compatible_complete",
+        "campaign_digest": expected.campaign_digest,
+        **selected,
+    }
 
 
 def parse_comsol_exact_version(version_output: str) -> str:
@@ -1326,21 +1466,6 @@ def _template_binding(
     }
 
 
-def _repository_commit() -> str:
-    """Return the current exact repository commit."""
-    result = subprocess.run(  # noqa: S603 -- fixed Git argument vector
-        ["git", "-C", str(common.paths.get_project_root()), "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    commit = result.stdout.strip()
-    if len(commit) != _GIT_SHA_LENGTH or any(character not in "0123456789abcdef" for character in commit):
-        message = f"Repository commit is malformed: {commit!r}."
-        raise ValueError(message)
-    return commit
-
-
 def _campaign_record(
     run_id: str,
     campaign: config_service.CampaignConfig,
@@ -1458,11 +1583,10 @@ def _build_payload(
         steady_campaign,
         transient_campaign,
     )
-    commits = {steady_terminal["git_commit"], transient_terminal["git_commit"]}
-    current_commit = _repository_commit()
-    if commits != {current_commit}:
-        message = "Technical smoke runs and current repository do not share one exact Git commit."
-        raise RuntimeError(message)
+    scientific_git_commits = {
+        profiles.STEADY_FLOW_PROFILE: steady_terminal["git_commit"],
+        profiles.TRANSIENT_DRYING_PROFILE: transient_terminal["git_commit"],
+    }
     comsol_contract = _paired_comsol_contract((steady_campaign, transient_campaign))
     if not isinstance(comsol_version_output, str) or not preflight_service.reported_version_matches(
         comsol_version_output,
@@ -1483,7 +1607,7 @@ def _build_payload(
         "schema_version": REAL_SMOKE_SCHEMA_VERSION,
         "status": "observations_complete_no_scientific_acceptance_threshold",
         "recorded_at": recorded_at,
-        "git_commit": current_commit,
+        "scientific_git_commits": scientific_git_commits,
         "material_family_inventory": [steady_batch.material_family],
         "source_binding": _source_binding((steady_campaign, transient_campaign)),
         "templates": _template_binding((steady_campaign, transient_campaign)),

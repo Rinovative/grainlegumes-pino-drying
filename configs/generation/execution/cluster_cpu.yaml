@@ -12,6 +12,7 @@ runtime:
     maximum_wait_seconds: null
 retention:
   family_generalization: compact
+  steady_flow_id_dataset: compact
   technical_runtime_smoke: full
   pilot_check: full
 submission:
@@ -19,7 +20,7 @@ submission:
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:
-  cores_per_case: 16
+  cores_per_case: 8
   wall_time: "01:05:00"
   scheduler_options: []
 site:

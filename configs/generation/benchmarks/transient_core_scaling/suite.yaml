@@ -1,12 +1,23 @@
 schema_kind: generation_core_scaling_benchmark_suite
 schema_version: 1
 suite_name: transient_core_scaling
-case:
-  campaign_config: configs/generation/campaigns/transient_drying/pilot_check.yaml
+benchmark_mode: core_selection
+representative_cases:
+- case_role: nominal
+  campaign_config: configs/generation/campaigns/transient_drying/material_pilot.yaml
   material_family: lentil
   sampling_regime: natural
   case_index: 1
-repetitions: 3
+- case_role: natural
+  campaign_config: configs/generation/campaigns/transient_drying/material_pilot.yaml
+  material_family: lentil
+  sampling_regime: natural
+  case_index: 2
+parallel_cases_per_variant: 2
+variant_execution: sequential
+case_execution_within_variant: concurrent
+retry:
+  maximum_work_unit_attempts: 2
 resources:
   partition: null
   wall_time: null

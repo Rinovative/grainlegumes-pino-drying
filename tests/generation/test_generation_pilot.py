@@ -59,14 +59,9 @@ def pilot_campaign_path(generation_config_factory: Any) -> Path:
     return path
 
 
-def _pilot(
-    campaign_path: Path,
-    cases_per_material: int,
-) -> config_service.CampaignConfig:
-    return config_service.load_campaign_config(
-        campaign_path,
-        pilot_cases_per_material=cases_per_material,
-    )
+def _pilot(campaign_path: Path) -> config_service.CampaignConfig:
+    """Load the YAML-owned three-case-per-material pilot contract."""
+    return config_service.load_campaign_config(campaign_path)
 
 
 def _canonical_case_result(
@@ -150,24 +145,22 @@ def test_pilot_planning_and_nominal_sampling_are_technical_only(
     pilot_campaign_path: Path,
 ) -> None:
     """Protect configured-family counts, technical-only membership, and explicit nominals."""
-    one = _pilot(pilot_campaign_path, 1)
-    three = _pilot(pilot_campaign_path, 3)
-    assert one.total_case_count == len(one.material_inventory)
-    assert three.total_case_count == 3 * len(three.material_inventory)
-    assert one.dataset_packages == three.dataset_packages == ()
-    assert one.campaign_purpose == three.campaign_purpose == "pilot_check"
-    assert one.evaluation_regimes == three.evaluation_regimes == ()
-    assert one.membership == three.membership == {}
-    assert all(not members for members in three.material_memberships.values())
-    assert tuple(batch.material_family for batch in three.batches) == three.material_inventory
-    for batch in three.batches:
+    campaign = _pilot(pilot_campaign_path)
+    assert campaign.total_case_count == 3 * len(campaign.material_inventory)
+    assert campaign.dataset_packages == ()
+    assert campaign.campaign_purpose == "pilot_check"
+    assert campaign.evaluation_regimes == ()
+    assert campaign.membership == {}
+    assert all(not members for members in campaign.material_memberships.values())
+    assert tuple(batch.material_family for batch in campaign.batches) == campaign.material_inventory
+    for batch in campaign.batches:
         assert [batch.case_assignment(index)["pilot_case_kind"] for index in batch.case_indices] == [
             "nominal_reference",
             "natural_pilot",
             "natural_pilot",
         ]
         assert all(batch.case_assignment(index)["ood_group"] is None for index in batch.case_indices)
-    batch = three.batches[0]
+    batch = campaign.batches[0]
     nominal = sampling_service.sample_case(batch, 1)
     natural = sampling_service.sample_case(batch, 2)
     registry = batch.scientific_values["material"]["parameter_registry"]
@@ -182,7 +175,7 @@ def test_pilot_nominal_fails_closed_without_an_explicit_value(
     pilot_campaign_path: Path,
 ) -> None:
     """Protect fail-closed nominal construction without hidden midpoints."""
-    batch = _pilot(pilot_campaign_path, 1).batches[0]
+    batch = _pilot(pilot_campaign_path).batches[0]
     scientific = json.loads(json.dumps(batch.scientific_values))
     scientific["material"]["parameter_registry"]["T_in_base"].pop("nominal")
     malformed = replace(batch, scientific_values=scientific)
@@ -540,13 +533,13 @@ def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     )
 
 
-def test_failed_pilot_retains_full_attempt_before_scratch_disappears(
+def test_failed_pilot_retains_bounded_attempt_before_scratch_disappears(
     pilot_campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retain a full hash-admitted pilot attempt before scratch disappears."""
-    batch = _pilot(pilot_campaign_path, 1).batches[0]
+    """Retain bounded hash-admitted pilot evidence before scratch disappears."""
+    batch = _pilot(pilot_campaign_path).batches[0]
     storage = tmp_path / "storage"
     input_service.generate_input_cases(batch, 1, storage_root=storage)
     prepared = runtime_service.prepare_case_work_directory(
@@ -592,14 +585,15 @@ def test_failed_pilot_retains_full_attempt_before_scratch_disappears(
         1,
         storage_root=storage,
     )
-    assert attempt.payload["retention_policy"] == "full"
+    assert attempt.payload["retention_policy"] == "compact"
+    retained = attempt.payload["retained_inventory"]
     assert {
-        "payload/case.json",
-        "payload/model.mph",
         "payload/runtime/solver.log",
         "payload/runtime/status.json",
-        "payload/exports/partial.csv",
-    }.issubset(attempt.payload["retained_inventory"])
+    }.issubset(retained)
+    assert "payload/case.json" not in retained
+    assert "payload/model.mph" not in retained
+    assert "payload/exports/partial.csv" not in retained
     shutil.rmtree(prepared.work_directory)
     assert runtime_service.case_failure_is_recorded(
         batch,
@@ -622,8 +616,20 @@ def test_pilot_terminal_references_canonical_attempt_without_copying_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep one in-place attempt authority for a failed pilot case."""
-    campaign = _pilot(pilot_campaign_path, 1)
-    batch = campaign.batches[0]
+    campaign = _pilot(pilot_campaign_path)
+    full_batch = campaign.batches[0]
+    batch = replace(
+        full_batch,
+        case_indices=(1,),
+        assignments={1: full_batch.assignments[1]},
+    )
+    campaign = replace(
+        campaign,
+        material_roles={role: (batch.material_family,) if role == batch.material_role else () for role in config_service.MATERIAL_ROLES},
+        material_memberships={batch.material_family: ()},
+        total_case_count=1,
+        batches=(batch,),
+    )
     run_id = "pilot-attempt-terminal"
     storage = tmp_path / "storage"
     input_service.generate_input_cases(batch, 1, storage_root=storage)

@@ -154,13 +154,14 @@ def _campaign_command(runtime_script: Path, repository: Path) -> list[str]:
 
 
 def _benchmark_command(runtime_script: Path, repository: Path) -> list[str]:
-    """Return one relocated benchmark preparation-worker startup command."""
+    """Return one relocated benchmark measurement-worker startup command."""
     return [
         "/bin/bash",
         str(runtime_script),
         str(repository),
         _BENCHMARK_RUN_ID,
-        "prepare",
+        "cores_04",
+        "nominal",
     ]
 
 
@@ -385,7 +386,7 @@ def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) 
 
 
 def test_benchmark_worker_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
-    """Start benchmark preparation from a spool copy with no sibling helper."""
+    """Start a benchmark measurement from a spool copy with no sibling helper."""
     repository = _fake_checkout(tmp_path)
     runtime_script = _spooled_script(repository, "generation_benchmark_node.sh", tmp_path)
     environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
@@ -416,7 +417,8 @@ def test_benchmark_worker_is_independent_of_slurm_spool_location(tmp_path: Path)
 
     assert result.returncode == 0, result.stderr
     assert "check=exact-worker-checkout status=pass" in result.stdout
-    assert "prepare-core-benchmark-case" in log.read_text(encoding="utf-8")
+    log_text = log.read_text(encoding="utf-8")
+    assert "run-core-benchmark-case" in log_text
     _assert_canonical_venv_validation(log)
     assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
 

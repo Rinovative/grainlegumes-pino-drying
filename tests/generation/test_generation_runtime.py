@@ -646,49 +646,6 @@ def test_attempt_from_another_campaign_is_not_current(
     assert old_attempt is not None
 
 
-def test_malformed_or_symlinked_failure_receipt_fails_closed(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """Reject unreadable current-state objects and unsafe receipt paths."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    config = generation.cases.config.load_generation_config(
-        config_path,
-        only_batch=_natural_batch_name("steady_flow"),
-    )
-    malformed_storage = tmp_path / "malformed storage"
-    malformed = generation.runtime.case_failure_path(
-        config,
-        1,
-        storage_root=malformed_storage,
-    )
-    malformed.parent.mkdir(parents=True)
-    malformed.write_text("{", encoding="utf-8")
-    with pytest.raises(ValueError, match="Could not read case failure evidence"):
-        generation.runtime.case_failure_is_recorded(
-            config,
-            1,
-            storage_root=malformed_storage,
-        )
-
-    symlink_storage = tmp_path / "symlink storage"
-    symlink = generation.runtime.case_failure_path(
-        config,
-        1,
-        storage_root=symlink_storage,
-    )
-    symlink.parent.mkdir(parents=True)
-    target = tmp_path / "foreign failure.json"
-    target.write_text("{}\n", encoding="utf-8")
-    symlink.symlink_to(target)
-    with pytest.raises(ValueError, match="evidence is unsafe"):
-        generation.runtime.case_failure_is_recorded(
-            config,
-            1,
-            storage_root=symlink_storage,
-        )
-
-
 @pytest.mark.integration
 def test_attempt_history_is_append_only_across_failure_and_success(
     generation_config_factory: Any,
@@ -808,7 +765,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     assert failed_attempt.payload["failure_stage"] == "solver"
     assert failed_attempt.payload["process_exit_code"] == 7
     assert failed_attempt.payload["template"]["sha256"] == config.template_sha256
-    assert failed_attempt.payload["retention_policy"] == "full"
+    assert failed_attempt.payload["retention_policy"] == "compact"
     assert "payload/runtime/solver.log" in failed_attempt.payload["retained_inventory"]
     cleanup = json.loads((failed_attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
     assert cleanup["status"] == "complete"
@@ -1291,7 +1248,9 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
     assert attempt.payload["case_state"] == "cancelled"
     assert attempt.payload["failure_stage"] == "solver"
     assert attempt.payload["process_exit_code"] is not None
-    assert (attempt.directory / "payload" / "solved.mph.status").read_text(encoding="utf-8") == "Stop 2\n"
+    assert attempt.payload["retention_policy"] == "compact"
+    assert not (attempt.directory / "payload" / "solved.mph.status").exists()
+    assert "payload/runtime/stop.json" in attempt.payload["retained_inventory"]
     stop = json.loads((attempt.directory / "payload/runtime/stop.json").read_text(encoding="utf-8"))
     assert stop["reason"] == "cancelled"
     cleanup = json.loads((attempt.directory / "cleanup.json").read_text(encoding="utf-8"))

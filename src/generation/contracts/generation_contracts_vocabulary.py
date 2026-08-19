@@ -26,6 +26,7 @@ EvaluationRegime: TypeAlias = Literal[
 ]
 
 PILOT_CAMPAIGN_PURPOSE = "pilot_check"
+STEADY_FLOW_ID_DATASET_PURPOSE = "steady_flow_id_dataset"
 NO_EVALUATION_REGIME = "not_applicable"
 ID_MEMBERSHIPS: tuple[IdMembership, ...] = ("train", "validation", "id_test")
 SPLIT_NAMES = (
@@ -49,4 +50,9 @@ MATERIAL_ROLES = (
     "far_family_ood",
     "extreme_family_ood",
 )
-CAMPAIGN_PURPOSES = ("family_generalization", "technical_runtime_smoke", PILOT_CAMPAIGN_PURPOSE)
+CAMPAIGN_PURPOSES = (
+    "family_generalization",
+    STEADY_FLOW_ID_DATASET_PURPOSE,
+    "technical_runtime_smoke",
+    PILOT_CAMPAIGN_PURPOSE,
+)

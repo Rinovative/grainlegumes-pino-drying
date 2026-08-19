@@ -162,11 +162,11 @@ def test_stage_states_preserve_postsolver_success() -> None:
     assert publication["publication_state"] == "failed"
 
 
-def test_full_retention_preserves_complete_attempt_evidence(
+def test_full_success_policy_does_not_expand_smoke_failure_evidence(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Retain complete attempt evidence for an explicit full policy."""
+    """Keep failed Smoke evidence bounded while retaining conversion replay inputs."""
     config, storage, prepared = _configured_case(
         generation_config_factory,
         tmp_path,
@@ -184,13 +184,142 @@ def test_full_retention_preserves_complete_attempt_evidence(
 
     purpose = str(config.scientific_values["campaign_purpose"])
     assert config.execution_values["retention_profiles"][purpose] == "full"
-    assert attempt.payload["retention_policy"] == "full"
+    assert attempt.payload["retention_policy"] == "compact_conversion_recovery"
     retained = attempt.payload["retained_inventory"]
-    assert "payload/model.mph" in retained
-    assert "payload/solved.mph" in retained
+    assert "payload/model.mph" not in retained
+    assert "payload/solved.mph" not in retained
+    assert "payload/case.json" not in retained
+    assert "payload/runtime/solver.log" in retained
     assert all(f"payload/{relative}" in retained for relative in exported)
     assert attempt.replay_available
     assert not any(path.name == "_SUCCESS" for path in attempt.directory.rglob("*"))
+
+
+def _publish_oversized_license_attempt(
+    config: Any,
+    storage: Path,
+    prepared: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> attempt_service.AttemptEvidence:
+    """Synthesize one pre-cleanup full license payload for compaction tests."""
+
+    def retain_all(
+        _config: Any,
+        *,
+        failure_stage: str,
+        work_directory: Path | None,
+    ) -> tuple[str, tuple[Path, ...], tuple[Path, ...], list[str]]:
+        assert failure_stage == "solver"
+        assert work_directory is not None
+        paths = tuple(
+            candidate.relative_to(work_directory)
+            for candidate in sorted(work_directory.rglob("*"))
+            if candidate.is_file() and not candidate.is_symlink()
+        )
+        return "full", paths, (), []
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(attempt_service, "_retention_paths", retain_all)
+        return _publish(
+            config,
+            storage,
+            prepared,
+            case_state="license_blocked",
+            failure_stage="solver",
+        )
+
+
+def _license_wait(attempt: attempt_service.AttemptEvidence) -> dict[str, Any]:
+    """Return compact strong license evidence bound to one synthetic license-only attempt."""
+    return {
+        "campaign_run_id": _RUN_ID,
+        "batch_id": attempt.payload["batch_id"],
+        "case_id": attempt.payload["case_id"],
+        "scientific_config_digest": attempt.payload["scientific_config_digest"],
+        "classification": generation.runtime.license.TEMPORARY_LICENSE_CAPACITY,
+        "feature": "Brinkman Equations (br)",
+        "error_code": "-4",
+        "matched_signatures": ["License error: -4"],
+        "solver_progress_started": False,
+        "expected_exports_exist": False,
+        "raw_excerpt": ("Could not obtain license for 'Brinkman Equations (br)'.\nLicensed number of users already reached.\nLicense error: -4."),
+        "retry_budget_remaining": True,
+    }
+
+
+def test_license_only_full_payload_is_safely_compacted(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reclaim copied full-retention inputs while preserving immutable audit evidence."""
+    config, storage, prepared = _configured_case(
+        generation_config_factory,
+        tmp_path,
+        campaign_purpose="technical_runtime_smoke",
+    )
+    license_text = "Could not obtain license for 'Brinkman Equations (br)'.\nLicensed number of users already reached.\nLicense error: -4."
+    prepared.runtime_directory.joinpath("solver.log").write_text(license_text, encoding="utf-8")
+    prepared.runtime_directory.joinpath("stdout.log").write_text(license_text, encoding="utf-8")
+    attempt = _publish_oversized_license_attempt(
+        config,
+        storage,
+        prepared,
+        monkeypatch,
+    )
+    original_receipt = attempt.receipt_path.read_bytes()
+    assert any(path.name == "case.json" for path in (attempt.directory / "payload").rglob("*"))
+
+    audit = attempt_service.compact_license_only_attempt_payload(
+        config,
+        1,
+        _RUN_ID,
+        _license_wait(attempt),
+        storage_root=storage,
+    )
+
+    assert audit is not None
+    assert audit["status"] == "complete"
+    assert audit["reclaimed_bytes"] > 0
+    assert attempt.receipt_path.read_bytes() == original_receipt
+    assert not (attempt.directory / "payload").exists()
+    assert attempt_service.load_attempt(attempt.directory).payload == attempt.payload
+
+
+def test_license_cleanup_refuses_unique_scientific_output(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a license-only attempt intact whenever canonical HDF5 output is present."""
+    config, storage, prepared = _configured_case(
+        generation_config_factory,
+        tmp_path,
+        campaign_purpose="technical_runtime_smoke",
+    )
+    prepared.runtime_directory.joinpath("solver.log").write_text(
+        "Could not obtain license for 'Brinkman Equations (br)'. Licensed number of users already reached. License error: -4.",
+        encoding="utf-8",
+    )
+    prepared.runtime_directory.joinpath("case.h5").write_bytes(b"unique scientific output")
+    attempt = _publish_oversized_license_attempt(
+        config,
+        storage,
+        prepared,
+        monkeypatch,
+    )
+
+    assert (
+        attempt_service.compact_license_only_attempt_payload(
+            config,
+            1,
+            _RUN_ID,
+            _license_wait(attempt),
+            storage_root=storage,
+        )
+        is None
+    )
+    assert (attempt.directory / "payload/runtime/case.h5").read_bytes() == b"unique scientific output"
 
 
 def test_attempt_admission_requires_exact_version_one_schema(

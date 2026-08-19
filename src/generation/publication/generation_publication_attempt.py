@@ -4,12 +4,12 @@ generation_publication_attempt.py
 Publish and admit durable unsuccessful Generation attempt evidence.
 Responsibilities:
   - Resolve collision-safe campaign, case, and attempt storage paths
-  - Derive purpose- and failure-stage-specific retained artifact inventories
+  - Derive failure-stage-specific retained artifact inventories
   - Atomically publish hash-inventoried attempt receipts and replay payloads
   - Admit current attempt evidence and append replay-completion audits
 Design principles:
   - Attempt paths are operational locators and never scientific identities
-  - Smoke and Pilot retain full evidence while Production retains bounded payloads
+  - Failed work remains bounded even when successful campaign cases use full retention
   - Replay payload cleanup never rewrites the original attempt receipt
 This module does NOT:
   - Execute COMSOL, derive campaign terminality, or publish processed cases
@@ -18,6 +18,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -45,7 +46,8 @@ REPLAY_SCHEMA_KIND: Final = "generation_case_attempt_replay"
 REPLAY_SCHEMA_VERSION: Final = 1
 CLEANUP_SCHEMA_KIND: Final = "generation_case_attempt_cleanup"
 CLEANUP_SCHEMA_VERSION: Final = 1
-_FULL_RETENTION_PURPOSES: Final = frozenset({"technical_runtime_smoke", "pilot_check"})
+LICENSE_COMPACTION_SCHEMA_KIND: Final = "generation_license_attempt_compaction"
+LICENSE_COMPACTION_SCHEMA_VERSION: Final = 1
 _CASE_STATES: Final = frozenset(
     {
         "failed",
@@ -166,6 +168,22 @@ _CLEANUP_RECEIPT_KEYS: Final = frozenset(
         "status",
         "reclaimed_bytes",
         "error",
+        "recorded_at",
+    }
+)
+_LICENSE_COMPACTION_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "campaign_run_id",
+        "batch_id",
+        "case_id",
+        "attempt_index",
+        "attempt_receipt_sha256",
+        "license_wait_identity",
+        "removed_inventory",
+        "reclaimed_bytes",
         "recorded_at",
     }
 )
@@ -311,12 +329,6 @@ def _attempt_index(
             message = f"attempt_index must be a positive integer, got {requested!r}."
             raise ValueError(message)
         return requested
-    environment_value = os.environ.get("GENERATION_ATTEMPT_INDEX")
-    if environment_value is not None:
-        if not environment_value.isdigit() or int(environment_value) < 1:
-            message = "GENERATION_ATTEMPT_INDEX must be a positive integer when supplied."
-            raise ValueError(message)
-        return int(environment_value)
     root = common.paths.resolve_generation_attempt_case_directory(
         config.batch_storage_name,
         config.case_id(case_index),
@@ -430,22 +442,9 @@ def _export_paths(
     return tuple(dict.fromkeys(paths)), complete
 
 
-def _full_paths(work_directory: Path) -> tuple[Path, ...]:
-    """Return every available ordinary non-symlink work artifact."""
-    paths: list[Path] = []
-    for candidate in sorted(work_directory.rglob("*")):
-        if candidate.is_symlink():
-            message = f"Full attempt retention rejects symbolic links: {candidate}"
-            raise ValueError(message)
-        if candidate.is_file():
-            paths.append(candidate.relative_to(work_directory))
-    return tuple(paths)
-
-
 def _retention_paths(
     config: GenerationConfig,
     *,
-    campaign_purpose: str,
     failure_stage: str,
     work_directory: Path | None,
 ) -> tuple[str, tuple[Path, ...], tuple[Path, ...], list[str]]:
@@ -453,9 +452,6 @@ def _retention_paths(
     if work_directory is None:
         return "compact", (), (), ["case_workspace"]
     export_paths, _exports_complete = _export_paths(config, work_directory)
-    if campaign_purpose in _FULL_RETENTION_PURPOSES:
-        full_retained = _full_paths(work_directory)
-        return "full", full_retained, (), []
     retained: list[Path] = [relative for relative in _SMALL_RUNTIME_PATHS if _ordinary_source(work_directory, relative) is not None]
     temporary: list[Path] = []
     policy = "compact"
@@ -656,7 +652,7 @@ def publish_case_attempt(
     quality_flags: Sequence[DiagnosticRecord] = (),
     input_generation_id: str | None = None,
 ) -> AttemptEvidence:
-    """Atomically publish one purpose-derived unsuccessful attempt bundle."""
+    """Atomically publish one stage-derived unsuccessful attempt bundle."""
     if not reason:
         message = "Attempt failure reason must be non-empty."
         raise ValueError(message)
@@ -704,7 +700,6 @@ def publish_case_attempt(
     )
     policy, retained_paths, temporary_paths, omitted = _retention_paths(
         config,
-        campaign_purpose=purpose,
         failure_stage=failure_stage,
         work_directory=work_directory,
     )
@@ -1039,6 +1034,46 @@ def _validate_cleanup_audit(
     return payload
 
 
+def _license_compaction_audit(
+    directory: Path,
+    *,
+    attempt_payload: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, frozenset[str]]:
+    """Admit optional crash-safe cleanup evidence for a license-only payload."""
+    path = directory / "license_compaction.json"
+    if not path.exists():
+        return None, frozenset()
+    payload = _load_json(path, label="license-attempt compaction audit")
+    removed = payload.get("removed_inventory")
+    if (
+        set(payload) != _LICENSE_COMPACTION_KEYS
+        or payload.get("schema_kind") != LICENSE_COMPACTION_SCHEMA_KIND
+        or payload.get("schema_version") != LICENSE_COMPACTION_SCHEMA_VERSION
+        or payload.get("status") not in {"pending", "complete"}
+        or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
+        or payload.get("batch_id") != attempt_payload["batch_id"]
+        or payload.get("case_id") != attempt_payload["case_id"]
+        or payload.get("attempt_index") != attempt_payload["attempt_index"]
+        or payload.get("attempt_receipt_sha256") != common.serialization.file_sha256(directory / "attempt.json")
+        or not isinstance(payload.get("license_wait_identity"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["license_wait_identity"]) is None
+        or not isinstance(removed, dict)
+        or set(removed) != set(attempt_payload["retained_inventory"])
+        or any(removed[key] != attempt_payload["retained_inventory"][key] for key in removed)
+        or not isinstance(payload.get("reclaimed_bytes"), int)
+        or isinstance(payload.get("reclaimed_bytes"), bool)
+        or payload["reclaimed_bytes"] < 0
+        or not _nonempty_text(payload.get("recorded_at"))
+    ):
+        message = f"License-attempt compaction audit is invalid: {path}"
+        raise ValueError(message)
+    expected_bytes = sum(int(identity["size_bytes"]) for identity in removed.values())
+    if payload["status"] == "complete" and payload["reclaimed_bytes"] != expected_bytes:
+        message = f"License-attempt reclaimed bytes disagree with its inventory: {path}"
+        raise ValueError(message)
+    return payload, frozenset(str(value) for value in removed)
+
+
 def _validate_attempt_chain(
     directory: Path,
     payload: Mapping[str, Any],
@@ -1094,7 +1129,18 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
         attempt_payload=payload,
     )
     _validate_cleanup_audit(root, attempt_payload=payload)
+    compaction, compacted = _license_compaction_audit(
+        root,
+        attempt_payload=payload,
+    )
     for relative, identity in inventory.items():
+        if relative in compacted:
+            compacted_path = root / relative
+            if compaction is not None and compaction["status"] == "complete" and compacted_path.exists():
+                message = f"License compaction claims a payload was removed but it still exists: {relative}"
+                raise ValueError(message)
+            if not compacted_path.exists():
+                continue
         if relative in removed:
             if replay_cleanup_state == "complete" and (root / relative).exists():
                 message = f"Replay audit claims a retained payload was removed but it still exists: {relative}"
@@ -1161,6 +1207,157 @@ def attempt_cleanup_evidence(
         attempt.directory,
         attempt_payload=attempt.payload,
     )
+
+
+def compact_license_only_attempt_payload(
+    config: GenerationConfig,
+    case_index: int,
+    campaign_run_id: str,
+    license_wait: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None,
+) -> dict[str, Any] | None:
+    """Remove only hash-verified duplicate payload from one license-only attempt."""
+    from src.generation.runtime import generation_runtime_license as license_service  # noqa: PLC0415
+
+    storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
+    root = common.paths.resolve_generation_attempt_case_directory(
+        config.batch_storage_name,
+        config.case_id(case_index),
+        campaign_run_id,
+        storage_root=storage,
+    )
+    if not root.is_dir() or root.is_symlink():
+        return None
+    candidates = sorted(
+        (
+            entry
+            for entry in root.iterdir()
+            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
+        ),
+        key=lambda entry: int(entry.name[8:]),
+    )
+    if not candidates:
+        return None
+    attempt = load_attempt(candidates[-1])
+    existing, _removed = _license_compaction_audit(
+        attempt.directory,
+        attempt_payload=attempt.payload,
+    )
+    if existing is not None and existing["status"] == "complete":
+        return existing
+    payload = attempt.payload
+    expected_stage_states = {
+        "solver_state": "license_blocked",
+        "exports_state": "not_started",
+        "conversion_state": "not_started",
+        "diagnostics_state": "not_started",
+        "publication_state": "not_started",
+    }
+    if (
+        payload.get("case_state") != "license_blocked"
+        or payload.get("failure_stage") != "solver"
+        or any(payload.get(key) != value for key, value in expected_stage_states.items())
+        or payload.get("postprocessing_replay_available") is not False
+        or payload.get("replay_required_payload") != []
+        or license_wait.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
+        or license_wait.get("campaign_run_id") != campaign_run_id
+        or license_wait.get("batch_id") != config.batch_id
+        or license_wait.get("case_id") != config.case_id(case_index)
+        or license_wait.get("scientific_config_digest") != config.scientific_config_digest
+        or license_wait.get("solver_progress_started", False) is not False
+        or license_wait.get("expected_exports_exist", False) is not False
+    ):
+        return None
+    reference = input_service.admit_persisted_input_case(
+        config,
+        case_index,
+        str(payload["input_generation_id"]),
+        storage_root=storage,
+    )
+    if reference.case_directory.relative_to(storage).as_posix() != payload["canonical_raw_case"]:
+        message = f"License-only attempt canonical input is not independently admitted: {attempt.directory}"
+        raise ValueError(message)
+    inventory = payload["retained_inventory"]
+    if not isinstance(inventory, dict):
+        message = f"License-only attempt inventory is malformed: {attempt.receipt_path}"
+        raise TypeError(message)
+    export_root = Path(config.scientific_values["output_contract"]["exports_root"])
+    forbidden_prefix = f"payload/{export_root.as_posix()}/"
+    forbidden = [
+        relative
+        for relative in inventory
+        if relative == "payload/runtime/case.h5" or relative.startswith(forbidden_prefix) or Path(relative).name == "_SUCCESS"
+    ]
+    if forbidden:
+        return None
+    raw_excerpt = license_wait.get("raw_excerpt")
+    if not isinstance(raw_excerpt, str) or not raw_excerpt:
+        evidence_parts: list[str] = []
+        for relative in (
+            "payload/runtime/solver.log",
+            "payload/runtime/stdout.log",
+            "payload/runtime/stderr.log",
+        ):
+            path = attempt.directory / relative
+            if path.is_file() and not path.is_symlink():
+                evidence_parts.append(path.read_text(encoding="utf-8", errors="replace"))
+        raw_excerpt = "\n".join(evidence_parts)
+    classification = license_service.classify_temporary_license_capacity(raw_excerpt)
+    if classification is None or license_service.solver_progress_started(raw_excerpt):
+        return None
+    feature = license_wait.get("feature")
+    error_code = license_wait.get("error_code")
+    if classification.feature != feature or classification.license_code != error_code:
+        return None
+    wait_identity = common.serialization.canonical_json_sha256(dict(license_wait))
+    removed_inventory = copy.deepcopy(inventory)
+    reclaimed_bytes = sum(int(identity["size_bytes"]) for identity in removed_inventory.values())
+    audit = {
+        "schema_kind": LICENSE_COMPACTION_SCHEMA_KIND,
+        "schema_version": LICENSE_COMPACTION_SCHEMA_VERSION,
+        "status": "pending",
+        "campaign_run_id": campaign_run_id,
+        "batch_id": config.batch_id,
+        "case_id": config.case_id(case_index),
+        "attempt_index": payload["attempt_index"],
+        "attempt_receipt_sha256": common.serialization.file_sha256(attempt.receipt_path),
+        "license_wait_identity": wait_identity,
+        "removed_inventory": removed_inventory,
+        "reclaimed_bytes": 0,
+        "recorded_at": _utc_now(),
+    }
+    audit_path = attempt.directory / "license_compaction.json"
+    if existing is None:
+        common.serialization.atomic_write_json(audit_path, audit)
+    elif existing["license_wait_identity"] != wait_identity or existing["removed_inventory"] != removed_inventory:
+        message = f"License-only compaction continuation conflicts with its pending audit: {audit_path}"
+        raise ValueError(message)
+    for relative, identity in removed_inventory.items():
+        path = attempt.directory / relative
+        if not path.exists():
+            continue
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not path.resolve().is_relative_to(attempt.directory.resolve())
+            or path.stat().st_size != identity["size_bytes"]
+            or common.serialization.file_sha256(path) != identity["sha256"]
+        ):
+            message = f"License-only cleanup payload changed after admission: {path}"
+            raise ValueError(message)
+        path.unlink()
+    payload_root = attempt.directory / "payload"
+    if payload_root.is_dir() and not payload_root.is_symlink():
+        for directory in sorted((path for path in payload_root.rglob("*") if path.is_dir()), reverse=True):
+            with suppress(OSError):
+                directory.rmdir()
+        with suppress(OSError):
+            payload_root.rmdir()
+    complete = {**audit, "status": "complete", "reclaimed_bytes": reclaimed_bytes, "recorded_at": _utc_now()}
+    common.serialization.atomic_write_json(audit_path, complete)
+    load_attempt(attempt.directory)
+    return complete
 
 
 def latest_case_attempt(

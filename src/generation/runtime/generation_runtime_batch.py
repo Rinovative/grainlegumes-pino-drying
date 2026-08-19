@@ -6,7 +6,7 @@ Responsibilities:
   - Execute safe one-node COMSOL commands and retain complete runtime evidence
   - Collect explicit raw adapters and convert them to canonical case.h5
   - Publish non-authoritative case phases without changing solver outcomes
-  - Publish cases and admit terminal batches through immutable typed evidence
+  - Publish cases, recover hash-bound Full-Retention HDF5, and admit terminal batches
 Design principles:
   - Scientific configuration and execution provenance are physically separate
   - Successful CSV and solved-model retention is explicit and off by default
@@ -48,6 +48,9 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.contracts import generation_contracts_templates as templates
 from src.generation.publication import generation_publication_attempt as attempt_service
+from src.generation.publication import (
+    generation_publication_campaign_evidence as campaign_evidence,
+)
 from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol as comsol_service
@@ -62,6 +65,8 @@ if TYPE_CHECKING:
 
 PUBLICATION_SCHEMA_VERSION = 1
 BATCH_MANIFEST_SCHEMA_VERSION = 1
+_SMOKE_HDF5_RECONSTRUCTION_SCHEMA_KIND: Final = "generation_smoke_hdf5_reconstruction"
+_SMOKE_HDF5_RECONSTRUCTION_SCHEMA_VERSION: Final = 1
 _BATCH_MANIFEST_SCHEMA_KIND: Final = "simulation_batch_manifest"
 _BATCH_SUCCESS_SCHEMA_KIND: Final = "simulation_batch_success"
 _CASE_PUBLICATION_SCHEMA_KIND: Final = "simulation_case_publication"
@@ -201,8 +206,6 @@ _FAILURE_EXECUTION_KEYS = frozenset(
     }
 )
 _FAILURE_STAGES = frozenset({"input", "solver", "exports", "conversion", "publication"})
-_LEGACY_FAILURE_STAGES = frozenset({"input", "solver", "export", "conversion", "invalid_result"})
-_FailureEvidenceState = Literal["absent", "current", "stale"]
 
 
 class CaseExecutionError(RuntimeError):
@@ -647,13 +650,13 @@ def _prior_license_wait_seconds(
     campaign_run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID")
     if campaign_run_id is None:
         return 0.0
-    attempts = license_service.load_temporary_license_attempts(
+    wait = license_service.load_temporary_license_wait(
         config,
         int(prepared.bundle.case_payload["case_index"]),
         campaign_run_id=campaign_run_id,
         storage_root=prepared.storage_root,
     )
-    return 0.0 if not attempts else float(attempts[-1]["cumulative_wait_seconds"])
+    return 0.0 if wait is None else float(wait["cumulative_wait_seconds"])
 
 
 def _state_batch_root(config: config_contract.GenerationConfig, *, storage_root: Path | str | None) -> Path:
@@ -989,6 +992,26 @@ def _write_solver_log(prepared: PreparedCase) -> Path:
     path = prepared.runtime_directory / "solver.log"
     common.serialization.atomic_write_text(path, payload)
     return path
+
+
+def _expected_exports_exist(
+    config: config_contract.GenerationConfig,
+    work_directory: Path,
+) -> bool:
+    """Return whether every required configured export already exists."""
+    export_root = work_directory / str(config.scientific_values["output_contract"]["exports_root"])
+    if not export_root.is_dir() or export_root.is_symlink():
+        return False
+    for contract in config.scientific_values["output_contract"]["exports"]:
+        if contract["required"] is not True:
+            continue
+        pattern = contract.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return False
+        matches = tuple(candidate for candidate in export_root.glob(pattern) if candidate.is_file() and not candidate.is_symlink())
+        if not matches or (contract["allow_multiple"] is not True and len(matches) != 1):
+            return False
+    return True
 
 
 def _workspace_regular_file_bytes(directory: Path) -> int:
@@ -1371,8 +1394,18 @@ def execute_prepared_case(
             exit_code=exit_code,
             timed_out=True,
         )
-    license_evidence = license_service.classify_temporary_license_capacity(solver_log.read_text(encoding="utf-8", errors="replace"))
-    if license_evidence is not None:
+    captured_solver_text = solver_log.read_text(encoding="utf-8", errors="replace")
+    license_evidence = license_service.classify_temporary_license_capacity(
+        captured_solver_text,
+    )
+    solver_progress_started = license_service.solver_progress_started(
+        captured_solver_text,
+    )
+    expected_exports_exist = _expected_exports_exist(
+        config,
+        prepared.work_directory,
+    )
+    if license_evidence is not None and not solver_progress_started and not expected_exports_exist:
         message = f"COMSOL could not obtain temporary floating-license capacity for {license_evidence.feature!r}."
         raise license_service.TemporaryLicenseCapacityError(
             message,
@@ -1380,6 +1413,8 @@ def execute_prepared_case(
             command=tuple(command),
             exit_code=exit_code,
             evidence=license_evidence,
+            solver_progress_started=solver_progress_started,
+            expected_exports_exist=expected_exports_exist,
         )
     if exit_code != 0:
         msg = f"COMSOL case exited with status {exit_code}."
@@ -1631,140 +1666,6 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         raise RuntimeError(message)
 
 
-def case_failure_path(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Return the persistent private failure-evidence path for one case."""
-    return (
-        common.paths.resolve_generation_failure_directory(
-            config.batch_storage_name,
-            config.case_id(case_index),
-            storage_root=storage_root,
-        )
-        / "failure.json"
-    )
-
-
-def case_failure_artifacts_directory(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Return the private compact failure-artifact directory for one case."""
-    return (
-        common.paths.resolve_generation_failure_directory(
-            config.batch_storage_name,
-            config.case_id(case_index),
-            storage_root=storage_root,
-        )
-        / "artifacts"
-    )
-
-
-def _case_failure_identity(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    execution_run_id: str | None = None,
-    git_commit: str | None = None,
-) -> dict[str, Any]:
-    """Return the exact scientific and execution identity of one failure receipt."""
-    run_id = (
-        workspace_service.workspace_run_id(config)
-        if execution_run_id is None
-        else common.paths.validate_logical_name(
-            execution_run_id,
-            label="failure execution_run_id",
-        )
-    )
-    commit = source_service.required_git_commit() if git_commit is None else source_service.validate_git_commit(git_commit)
-    return {
-        "simulation_profile": config.profile.id,
-        "batch_id": config.batch_id,
-        "batch_identity": config.batch_identity,
-        "scientific_config_digest": config.scientific_config_digest,
-        "case_id": config.case_id(case_index),
-        "case_index": case_index,
-        "git_commit": commit,
-        "execution_run_id": run_id,
-        "template_sha256": config.template_sha256,
-    }
-
-
-def _validate_case_failure_path_safety(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None,
-) -> tuple[Path, Path]:
-    """Return failure paths after rejecting non-ordinary or symlinked state."""
-    path = case_failure_path(config, case_index, storage_root=storage_root)
-    artifacts = case_failure_artifacts_directory(
-        config,
-        case_index,
-        storage_root=storage_root,
-    )
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        message = f"Case failure evidence is unsafe: {path}"
-        raise ValueError(message)
-    if artifacts.is_symlink() or (artifacts.exists() and not artifacts.is_dir()):
-        message = f"Case failure artifact path is unsafe: {artifacts}"
-        raise ValueError(message)
-    if artifacts.exists():
-        for artifact in artifacts.rglob("*"):
-            if artifact.is_symlink():
-                message = f"Case failure retained artifacts contain a symbolic link: {artifact}"
-                raise ValueError(message)
-    return path, artifacts
-
-
-def _validate_case_failure_identity_fields(
-    payload: Mapping[str, Any],
-    *,
-    path: Path,
-) -> None:
-    """Reject malformed identity fields in a current-schema failure receipt."""
-    try:
-        source_service.validate_git_commit(payload.get("git_commit"))
-        common.paths.validate_logical_name(
-            payload.get("simulation_profile"),
-            label="failure simulation_profile",
-        )
-        common.paths.validate_logical_name(
-            payload.get("batch_id"),
-            label="failure batch_id",
-        )
-        common.paths.validate_logical_name(
-            payload.get("execution_run_id"),
-            label="failure execution_run_id",
-        )
-    except (TypeError, ValueError) as error:
-        message = f"Case failure evidence identity is invalid: {path}"
-        raise ValueError(message) from error
-    case_index = payload.get("case_index")
-    if (
-        isinstance(case_index, bool)
-        or not isinstance(case_index, int)
-        or case_index < 1
-        or not isinstance(payload.get("case_id"), str)
-        or _CASE_ID_PATTERN.fullmatch(payload["case_id"]) is None
-        or any(
-            not isinstance(payload.get(key), str) or _SHA256_PATTERN.fullmatch(payload[key]) is None
-            for key in (
-                "batch_identity",
-                "scientific_config_digest",
-                "template_sha256",
-            )
-        )
-    ):
-        message = f"Case failure evidence identity is invalid: {path}"
-        raise ValueError(message)
-
-
 def _optional_json_object(path: Path) -> dict[str, Any] | None:
     """Load one optional non-symlink JSON object for failure evidence."""
     if not path.is_file() or path.is_symlink():
@@ -1774,88 +1675,6 @@ def _optional_json_object(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
-
-
-def _failure_input_evidence(
-    config: config_contract.GenerationConfig,
-    work_directory: Path | None,
-) -> dict[str, Any]:
-    """Return declared and observed exact input identities."""
-    if work_directory is None:
-        return {"declared": {}, "observed": {}}
-    case_payload = _optional_json_object(work_directory / "case.json")
-    declared = case_payload.get("input_files", {}) if isinstance(case_payload, dict) else {}
-    if not isinstance(declared, dict):
-        declared = {}
-    observed: dict[str, dict[str, Any]] = {}
-    expected_names = {"fields.csv"}
-    if config.profile.id == "transient_drying":
-        expected_names.update({"scalars.csv", "schedule.csv"})
-    for name in sorted(expected_names | set(declared)):
-        path = work_directory / name
-        if path.is_file() and not path.is_symlink():
-            observed[name] = {
-                "sha256": common.serialization.file_sha256(path),
-                "size_bytes": path.stat().st_size,
-            }
-    return {"declared": declared, "observed": observed}
-
-
-def _failure_log_tail(work_directory: Path | None) -> dict[str, str] | None:
-    """Return a compact UTF-8 tail from the best available case-local log."""
-    if work_directory is None:
-        return None
-    candidates = (
-        work_directory / "runtime" / "solver.log",
-        work_directory / "runtime" / "stderr.log",
-        work_directory / "runtime" / "stdout.log",
-    )
-    for path in candidates:
-        if not path.is_file() or path.is_symlink():
-            continue
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        tail = "\n".join(lines[-80:])
-        return {"source": path.name, "text": tail[-16384:]}
-    return None
-
-
-def _failure_missing_artifacts(
-    config: config_contract.GenerationConfig,
-    error: BaseException,
-    work_directory: Path | None,
-) -> list[str]:
-    """Return exact missing or invalid runtime artifacts known at failure."""
-    declared = getattr(error, "missing_or_invalid_artifacts", ())
-    missing = {str(item) for item in declared if str(item)}
-    if work_directory is None:
-        missing.add("case_workspace")
-        return sorted(missing)
-    required = {comsol_service.WORK_MODEL_FILENAME, "case.json", "fields.csv"}
-    if config.profile.id == "transient_drying":
-        required.update({"scalars.csv", "schedule.csv"})
-    for name in required:
-        path = work_directory / name
-        if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
-            missing.add(name)
-    if config.execution_values["retention_policy"] == "full":
-        solved = work_directory / comsol_service.RETAINED_MODEL_FILENAME
-        if not solved.is_file() or solved.is_symlink() or solved.stat().st_size <= 0:
-            missing.add(comsol_service.RETAINED_MODEL_FILENAME)
-    exports_root = work_directory / config.scientific_values["output_contract"]["exports_root"]
-    for contract in config.scientific_values["output_contract"]["exports"]:
-        role = str(contract["role"])
-        pattern = contract.get("pattern")
-        if not isinstance(pattern, str) or not pattern:
-            missing.add(f"export:{role}:unresolved_mapping")
-            continue
-        matches = [
-            candidate
-            for candidate in exports_root.glob(pattern)
-            if candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size > 0
-        ]
-        if contract["required"] and not matches:
-            missing.add(f"export:{role}")
-    return sorted(missing)
 
 
 def _failure_execution_evidence(
@@ -2008,12 +1827,12 @@ def _report_technical_smoke_failure_artifacts(
     failure_path: Path,
     storage_root: Path,
 ) -> None:
-    """Print the visible full attempt path for one failed Technical Smoke."""
+    """Print the visible bounded attempt path for one failed Technical Smoke."""
     del case_index, storage_root
     if config.scientific_values.get("campaign_purpose") != "technical_runtime_smoke":
         return
     evidence = attempt_service.load_attempt(failure_path.parent)
-    print("Retained full attempt evidence:", evidence.directory, file=sys.stderr)
+    print("Retained attempt evidence:", evidence.directory, file=sys.stderr)
 
 
 def _complete_failure_cleanup(
@@ -2027,410 +1846,15 @@ def _complete_failure_cleanup(
     if status not in {"complete", "failed", "not_created"}:
         message = f"Completed scratch cleanup status is invalid: {status!r}"
         raise ValueError(message)
-    if path.name == "attempt.json":
-        attempt_service.record_attempt_cleanup(
-            attempt_service.load_attempt(path.parent),
-            status=status,
-            reclaimed_bytes=reclaimed_bytes,
-            error=error,
-        )
-        return
-    payload = _load_json_object(path, label="legacy case failure evidence")
-    payload["scratch_cleanup"] = {
-        "status": status,
-        "reclaimed_bytes": reclaimed_bytes,
-        "error": error,
-    }
-    common.serialization.atomic_write_json(path, payload)
-
-
-def clear_case_failure(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None = None,
-) -> None:
-    """Preserve append-only attempt and legacy failure evidence unchanged."""
-    del config, case_index, storage_root
-
-
-def _forbidden_failure_artifact_paths(
-    config: config_contract.GenerationConfig,
-    retained: Mapping[str, Any],
-    *,
-    allow_diagnostics: bool,
-) -> set[str]:
-    """Return receipt-declared paths forbidden by resolved retention policy."""
-    retain_full_attempt = config.execution_values["retention_policy"] == "full"
-    allowed_paths: set[str] = set()
-    if retain_full_attempt:
-        allowed_paths.update(
-            {
-                "case.json",
-                "fields.csv",
-                "runtime/solver.log",
-                "runtime/stdout.log",
-                "runtime/stderr.log",
-                "runtime/execution_provenance.json",
-                "runtime/timing.json",
-                "runtime/status.json",
-                "export_inventory.json",
-            }
-        )
-        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-            allowed_paths.update({"scalars.csv", "schedule.csv"})
-    export_contracts = tuple(
-        contract
-        for contract in config.scientific_values["output_contract"]["exports"]
-        if isinstance(contract.get("pattern"), str) and contract["pattern"]
+    if path.name != "attempt.json":
+        message = f"Case failure cleanup requires an attempt receipt: {path}"
+        raise ValueError(message)
+    attempt_service.record_attempt_cleanup(
+        attempt_service.load_attempt(path.parent),
+        status=status,
+        reclaimed_bytes=reclaimed_bytes,
+        error=error,
     )
-    if retain_full_attempt:
-        allowed_paths.add(comsol_service.RETAINED_MODEL_FILENAME)
-    if allow_diagnostics:
-        allowed_paths.update(
-            {
-                "diagnostics/initial_state_diagnostic.json",
-                "diagnostics/initial_state_diagnostic.csv",
-                "diagnostics/bulk_moisture_consistency_diagnostic.json",
-            }
-        )
-    forbidden_paths: set[str] = set()
-    export_role_counts: dict[str, int] = {}
-    for relative_value in retained:
-        relative = Path(relative_value)
-        export_relative = Path(*relative.parts[1:]) if relative.parts and relative.parts[0] == "exports" else None
-        matching_contracts = (
-            [contract for contract in export_contracts if export_relative is not None and export_relative.match(str(contract["pattern"]))]
-            if retain_full_attempt
-            else []
-        )
-        configured_export = len(matching_contracts) == 1
-        if configured_export:
-            role = str(matching_contracts[0]["role"])
-            export_role_counts[role] = export_role_counts.get(role, 0) + 1
-        if relative_value not in allowed_paths and not configured_export:
-            forbidden_paths.add(relative_value)
-    for contract in export_contracts:
-        role = str(contract["role"])
-        if not contract["allow_multiple"] and export_role_counts.get(role, 0) > 1:
-            forbidden_paths.update(
-                relative
-                for relative in retained
-                if Path(relative).parts and Path(relative).parts[0] == "exports" and Path(*Path(relative).parts[1:]).match(str(contract["pattern"]))
-            )
-    return forbidden_paths
-
-
-def _validate_failure_retained_artifacts(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    retained: Any,
-    *,
-    storage_root: Path | str | None,
-    failure_path: Path,
-    diagnostic_complete: bool,
-    retention_failed: bool,
-    diagnostics_allowed: bool,
-) -> None:
-    """Validate exact compact artifact membership for one failed case."""
-    artifacts_root = case_failure_artifacts_directory(
-        config,
-        case_index,
-        storage_root=storage_root,
-    )
-    if not isinstance(retained, dict):
-        message = f"Case failure retained-artifact evidence is invalid: {failure_path}"
-        raise TypeError(message)
-    if not retained:
-        if artifacts_root.exists():
-            message = f"Undeclared case failure artifacts exist: {artifacts_root}"
-            raise ValueError(message)
-        return
-    if not artifacts_root.is_dir() or artifacts_root.is_symlink():
-        message = f"Case failure retained artifacts are missing or unsafe: {artifacts_root}"
-        raise ValueError(message)
-    forbidden_paths = _forbidden_failure_artifact_paths(
-        config,
-        retained,
-        allow_diagnostics=(diagnostic_complete or (retention_failed and diagnostics_allowed)),
-    )
-    if forbidden_paths:
-        message = f"Case failure retained artifacts violate resolved retention policy: {failure_path}; forbidden={sorted(forbidden_paths)}"
-        raise ValueError(message)
-    actual_paths: set[str] = set()
-    for artifact in artifacts_root.rglob("*"):
-        if artifact.is_symlink():
-            message = f"Case failure retained artifacts contain a symbolic link: {artifact}"
-            raise ValueError(message)
-        if artifact.is_file():
-            actual_paths.add(artifact.relative_to(artifacts_root).as_posix())
-    if actual_paths != set(retained):
-        message = f"Case failure retained-artifact membership changed: {artifacts_root}"
-        raise ValueError(message)
-    for relative_value, identity in retained.items():
-        relative = Path(relative_value)
-        artifact = (artifacts_root / relative).resolve()
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or not artifact.is_relative_to(artifacts_root.resolve())
-            or not isinstance(identity, dict)
-            or set(identity) != {"sha256", "size_bytes"}
-            or artifact.stat().st_size != identity["size_bytes"]
-            or common.serialization.file_sha256(artifact) != identity["sha256"]
-        ):
-            message = f"Case failure retained-artifact identity is invalid: {artifact}"
-            raise ValueError(message)
-
-
-def _validate_failure_diagnostics(
-    config: config_contract.GenerationConfig,
-    *,
-    failure_state: Any,
-    diagnostics: Any,
-    retained: Any,
-    retention_failed: bool,
-    failure_path: Path,
-) -> None:
-    """Validate the closed set of secondary failed-case diagnostic evidence."""
-    if not isinstance(diagnostics, dict) or not isinstance(retained, dict):
-        message = f"Case failure diagnostic evidence is invalid: {failure_path}"
-        raise TypeError(message)
-    specifications = {
-        "transient_initial_state": {
-            "paths": {
-                "json_relative_path": ("diagnostics/initial_state_diagnostic.json"),
-                "csv_relative_path": ("diagnostics/initial_state_diagnostic.csv"),
-            },
-        },
-        "transient_bulk_moisture": {
-            "paths": {
-                "json_relative_path": ("diagnostics/bulk_moisture_consistency_diagnostic.json"),
-            },
-        },
-    }
-    if set(diagnostics).difference(specifications):
-        message = f"Case failure diagnostic evidence has unknown members: {failure_path}"
-        raise ValueError(message)
-    applicable = (
-        failure_state == "failed"
-        and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
-        and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
-    )
-    if not applicable and diagnostics:
-        message = f"Case failure diagnostic evidence violates execution policy: {failure_path}"
-        raise ValueError(message)
-    if retention_failed:
-        if diagnostics:
-            message = f"Failed retention cannot claim current diagnostic evidence: {failure_path}"
-            raise ValueError(message)
-        return
-    if applicable and set(diagnostics) != set(specifications):
-        message = f"Case failure diagnostic evidence violates execution policy: {failure_path}"
-        raise ValueError(message)
-    declared_paths: set[str] = set()
-    for name, specification in specifications.items():
-        record = diagnostics.get(name)
-        if record is None:
-            continue
-        paths = specification["paths"]
-        expected_keys = {"status", "error", *paths}
-        if not isinstance(record, dict) or set(record) != expected_keys:
-            message = f"{name} diagnostic evidence is invalid: {failure_path}"
-            raise ValueError(message)
-        status = record.get("status")
-        error = record.get("error")
-        if status == "complete":
-            if error is not None:
-                message = f"Completed {name} diagnostic evidence is invalid: {failure_path}"
-                raise ValueError(message)
-            for key, expected_path in paths.items():
-                if record.get(key) != expected_path or expected_path not in retained:
-                    message = f"Completed {name} diagnostic evidence is invalid: {failure_path}"
-                    raise ValueError(message)
-                declared_paths.add(expected_path)
-        elif status == "failed":
-            if not isinstance(error, str) or not error or any(record.get(key) is not None for key in paths):
-                message = f"Failed {name} diagnostic evidence is invalid: {failure_path}"
-                raise ValueError(message)
-        elif status == "inputs_unavailable":
-            if error is not None or any(record.get(key) is not None for key in paths):
-                message = f"Unavailable {name} diagnostic evidence is invalid: {failure_path}"
-                raise ValueError(message)
-        else:
-            message = f"{name} diagnostic status is invalid: {failure_path}"
-            raise ValueError(message)
-    retained_paths = {str(relative) for relative in retained if str(relative).startswith("diagnostics/")}
-    if retained_paths != declared_paths:
-        message = f"Case failure diagnostic artifact membership is inconsistent: {failure_path}"
-        raise ValueError(message)
-
-
-def _case_failure_evidence_state(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None = None,
-    execution_run_id: str | None = None,
-    git_commit: str | None = None,
-) -> _FailureEvidenceState:
-    """Classify absent, current, and stale failure evidence from the canonical contract."""
-    path, artifacts_root = _validate_case_failure_path_safety(
-        config,
-        case_index,
-        storage_root=storage_root,
-    )
-    if not path.exists():
-        return "stale" if artifacts_root.exists() else "absent"
-    payload = _load_json_object(path, label="case failure evidence")
-    schema_kind = payload.get("schema_kind")
-    schema_version = payload.get("schema_version")
-    if (
-        not isinstance(schema_kind, str)
-        or not schema_kind
-        or isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version < 1
-    ):
-        message = f"Case failure evidence identity is invalid: {path}"
-        raise ValueError(message)
-    if schema_kind != CASE_FAILURE_SCHEMA_KIND or schema_version != CASE_FAILURE_SCHEMA_VERSION:
-        return "stale"
-    if "execution_run_id" not in payload:
-        return "stale"
-    if set(payload) != _CASE_FAILURE_KEYS:
-        message = f"Case failure evidence identity is invalid: {path}"
-        raise ValueError(message)
-    _validate_case_failure_identity_fields(payload, path=path)
-    expected_identity = _case_failure_identity(
-        config,
-        case_index,
-        execution_run_id=execution_run_id,
-        git_commit=git_commit,
-    )
-    if any(payload.get(key) != value for key, value in expected_identity.items()):
-        return "stale"
-    if payload.get("state") not in {"failed", "cancelled"} or payload.get("failure_stage") not in _LEGACY_FAILURE_STAGES:
-        message = f"Case failure evidence outcome is invalid: {path}"
-        raise ValueError(message)
-    execution = payload.get("execution")
-    error = payload.get("error")
-    if (
-        not isinstance(execution, dict)
-        or set(execution) != _FAILURE_EXECUTION_KEYS
-        or not isinstance(execution.get("worker_slot"), int)
-        or isinstance(execution.get("worker_slot"), bool)
-        or not isinstance(execution.get("scheduler_kind"), str)
-        or not isinstance(execution.get("hostname"), str)
-        or not isinstance(execution.get("command"), list)
-        or not all(isinstance(argument, str) for argument in execution.get("command", []))
-        or not isinstance(execution.get("timed_out"), bool)
-        or not isinstance(execution.get("configured_modules"), list)
-    ):
-        message = f"Case failure execution evidence is invalid: {path}"
-        raise ValueError(message)
-    if (
-        not isinstance(error, dict)
-        or set(error) != {"type", "message"}
-        or not isinstance(error["type"], str)
-        or not isinstance(error["message"], str)
-    ):
-        message = f"Case failure error evidence is invalid: {path}"
-        raise ValueError(message)
-    work_directory = payload.get("work_directory")
-    if work_directory is not None and (not isinstance(work_directory, str) or not work_directory or not Path(work_directory).is_absolute()):
-        message = f"Case failure work-directory evidence is invalid: {path}"
-        raise ValueError(message)
-    inputs = payload.get("input_files")
-    if (
-        not isinstance(inputs, dict)
-        or set(inputs) != {"declared", "observed"}
-        or not isinstance(inputs["declared"], dict)
-        or not isinstance(inputs["observed"], dict)
-    ):
-        message = f"Case failure input identity evidence is invalid: {path}"
-        raise ValueError(message)
-    missing = payload.get("missing_or_invalid_artifacts")
-    if not isinstance(missing, list) or not all(isinstance(item, str) and item for item in missing):
-        message = f"Case failure artifact evidence is invalid: {path}"
-        raise ValueError(message)
-    export_diagnostics = payload.get("export_diagnostics")
-    if not isinstance(export_diagnostics, list) or any(
-        not isinstance(record, dict)
-        or set(record)
-        != {
-            "role",
-            "declared_pattern",
-            "matched_relative_paths",
-            "available_relative_paths",
-            "observations",
-        }
-        or not isinstance(record["role"], str)
-        or not isinstance(record["matched_relative_paths"], list)
-        or not isinstance(record["available_relative_paths"], list)
-        or not isinstance(record["observations"], list)
-        for record in export_diagnostics
-    ):
-        message = f"Case failure export diagnostics are invalid: {path}"
-        raise ValueError(message)
-    log_tail = payload.get("log_tail")
-    if log_tail is not None and (
-        not isinstance(log_tail, dict) or set(log_tail) != {"source", "text"} or not all(isinstance(value, str) for value in log_tail.values())
-    ):
-        message = f"Case failure log-tail evidence is invalid: {path}"
-        raise ValueError(message)
-    retained = payload.get("retained_artifacts")
-    diagnostics = payload.get("failure_diagnostics")
-    diagnostic_complete = isinstance(diagnostics, dict) and any(
-        isinstance(record, dict) and record.get("status") == "complete" for record in diagnostics.values()
-    )
-    diagnostics_allowed = (
-        payload.get("state") == "failed"
-        and config.scientific_values.get("campaign_purpose") == "technical_runtime_smoke"
-        and config.profile.id == profiles.TRANSIENT_DRYING_PROFILE
-    )
-    _validate_failure_retained_artifacts(
-        config,
-        case_index,
-        retained,
-        storage_root=storage_root,
-        failure_path=path,
-        diagnostic_complete=diagnostic_complete,
-        retention_failed=payload.get("retention_error") is not None,
-        diagnostics_allowed=diagnostics_allowed,
-    )
-    retention_error = payload.get("retention_error")
-    if retention_error is not None and (
-        not isinstance(retention_error, dict)
-        or set(retention_error) != {"type", "message", "prior_artifacts_preserved"}
-        or not all(isinstance(retention_error.get(key), str) and retention_error[key] for key in ("type", "message"))
-        or not isinstance(retention_error.get("prior_artifacts_preserved"), bool)
-        or retention_error["prior_artifacts_preserved"] != bool(retained)
-        or diagnostics
-    ):
-        message = f"Case failure retention-error evidence is invalid: {path}"
-        raise ValueError(message)
-    _validate_failure_diagnostics(
-        config,
-        failure_state=payload.get("state"),
-        diagnostics=diagnostics,
-        retained=retained,
-        retention_failed=retention_error is not None,
-        failure_path=path,
-    )
-    cleanup = payload.get("scratch_cleanup")
-    if (
-        not isinstance(cleanup, dict)
-        or set(cleanup) != {"status", "reclaimed_bytes", "error"}
-        or cleanup.get("status") not in {"pending", "complete", "failed", "not_created"}
-        or not isinstance(cleanup.get("reclaimed_bytes"), int)
-        or isinstance(cleanup.get("reclaimed_bytes"), bool)
-        or cleanup.get("reclaimed_bytes", -1) < 0
-        or (cleanup.get("error") is not None and not isinstance(cleanup.get("error"), str))
-    ):
-        message = f"Case failure scratch-cleanup evidence is invalid: {path}"
-        raise ValueError(message)
-    return "current"
 
 
 def case_failure_is_recorded(
@@ -2441,7 +1865,7 @@ def case_failure_is_recorded(
     execution_run_id: str | None = None,
     git_commit: str | None = None,
 ) -> bool:
-    """Validate current attempt evidence, with read-only legacy compatibility."""
+    """Validate authoritative append-only attempt evidence for one case."""
     run_id = (
         workspace_service.workspace_run_id(config)
         if execution_run_id is None
@@ -2460,35 +1884,14 @@ def case_failure_is_recorded(
             create=False,
         ),
     )
-    if attempt is not None:
-        cleanup = attempt_service.attempt_cleanup_evidence(attempt)
-        return (
-            (attempt.payload["case_state"] != "license_blocked" or (cleanup is not None and cleanup["status"] == "failed"))
-            and attempt.payload["campaign_run_id"] == run_id
-            and attempt.payload["solver_git_commit"] == commit
-        )
+    if attempt is None:
+        return False
+    cleanup = attempt_service.attempt_cleanup_evidence(attempt)
     return (
-        _case_failure_evidence_state(
-            config,
-            case_index,
-            storage_root=storage_root,
-            execution_run_id=run_id,
-            git_commit=commit,
-        )
-        == "current"
+        (attempt.payload["case_state"] != "license_blocked" or (cleanup is not None and cleanup["status"] == "failed"))
+        and attempt.payload["campaign_run_id"] == run_id
+        and attempt.payload["solver_git_commit"] == commit
     )
-
-
-def _retire_stale_case_failure(
-    config: config_contract.GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str | None = None,
-    execution_run_id: str | None = None,
-    git_commit: str | None = None,
-) -> None:
-    """Preserve historical attempt and legacy evidence before a new attempt."""
-    del config, case_index, storage_root, execution_run_id, git_commit
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -3039,6 +2442,405 @@ def validate_completed_case(
         case_index=case_index,
     )
     return dict(processed.provenance)
+
+
+def _retained_export_hdf5_repair_evidence(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    processed: Path,
+) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any], float]:
+    """Admit every completed-publication byte except the invalid HDF5 payload."""
+    if config.execution_values["retention_policy"] != "full":
+        message = "Completed HDF5 reconstruction requires Full-Retention source exports."
+        raise RuntimeError(message)
+    if not processed.is_dir() or processed.is_symlink():
+        message = f"Completed HDF5 reconstruction source is missing or unsafe: {processed}"
+        raise FileNotFoundError(message)
+    success_path = processed / "_SUCCESS"
+    provenance_path = processed / "provenance.json"
+    success = _load_json_object(success_path, label="completed case success marker")
+    provenance = _load_json_object(provenance_path, label="completed case publication provenance")
+    input_generation_id, raw_evidence = _admit_processed_raw_publication(processed, provenance)
+    case_payload = raw_evidence.case_payload
+    _require_case_payload_matches_config(
+        case_payload,
+        directory=raw_evidence.directory,
+        config=config,
+        case_index=case_index,
+    )
+    case_id = config.case_id(case_index)
+    expected_success = {
+        "stage": "processed",
+        "batch_id": config.batch_id,
+        "case_id": case_id,
+        "case_input_id": case_payload["case_input_id"],
+        "simulation_case_id": case_payload["simulation_case_id"],
+    }
+    if (
+        set(success) != _CASE_SUCCESS_KEYS
+        or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
+        or success.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or any(success.get(key) != value for key, value in expected_success.items())
+        or success.get("provenance_sha256") != _safe_file_sha256(provenance_path, label="completed case publication provenance")
+    ):
+        message = f"Completed HDF5 reconstruction success identity is invalid: {processed}"
+        raise RuntimeError(message)
+    expected_publication = {
+        "stage": "processed",
+        "simulation_profile": config.profile.id,
+        "batch_id": config.batch_id,
+        "batch_identity": config.batch_identity,
+        "case_id": case_id,
+        "case_input_id": case_payload["case_input_id"],
+        "simulation_case_id": case_payload["simulation_case_id"],
+        "material_family": config.material_family,
+        "git_commit": case_payload["git_commit"],
+        "input_generation_id": input_generation_id,
+        "template_sha256": config.template_sha256,
+        "scientific_config_digest": config.scientific_config_digest,
+        "export_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
+        "available_learning_views": list(config.profile.available_learning_views),
+        "airflow_source": config.profile.airflow_source,
+        "retention_policy": "full",
+    }
+    if any(provenance.get(key) != value for key, value in expected_publication.items()):
+        message = f"Completed HDF5 reconstruction publication identity is invalid: {processed}"
+        raise RuntimeError(message)
+    raw_artifacts = provenance.get("artifacts")
+    if not isinstance(raw_artifacts, dict) or "case.h5" not in raw_artifacts:
+        message = f"Completed HDF5 reconstruction lacks a bound case.h5 identity: {processed}"
+        raise RuntimeError(message)
+    artifacts: dict[str, dict[str, Any]] = {}
+    for relative, identity in raw_artifacts.items():
+        relative_path = Path(relative) if isinstance(relative, str) else Path()
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not isinstance(identity, dict)
+            or set(identity) != {"sha256", "size_bytes"}
+        ):
+            message = f"Completed HDF5 reconstruction artifact identity is malformed: {relative!r}."
+            raise RuntimeError(message)
+        digest = _require_sha256(identity["sha256"], label=f"reconstruction artifact {relative!r} sha256")
+        size_bytes = identity["size_bytes"]
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            message = f"Completed HDF5 reconstruction artifact size is malformed: {relative!r}."
+            raise RuntimeError(message)
+        artifacts[relative] = {"sha256": digest, "size_bytes": size_bytes}
+    if any(candidate.is_symlink() for candidate in processed.rglob("*")):
+        message = f"Completed HDF5 reconstruction source contains symbolic links: {processed}"
+        raise RuntimeError(message)
+    actual = {
+        candidate.relative_to(processed).as_posix()
+        for candidate in processed.rglob("*")
+        if candidate.is_file() and candidate.name not in {"provenance.json", "_SUCCESS"}
+    }
+    if actual != set(artifacts):
+        message = (
+            "Completed HDF5 reconstruction source membership differs from immutable provenance: "
+            f"missing={sorted(set(artifacts) - actual)}, extra={sorted(actual - set(artifacts))}."
+        )
+        raise RuntimeError(message)
+    required = {
+        "case.h5",
+        "solver.log",
+        "timing.json",
+        "status.json",
+        "execution_provenance.json",
+        "processing_provenance.json",
+    }
+    _require_processed_publication_layout(
+        processed,
+        artifact_names=set(artifacts),
+        required=required,
+        retention_policy="full",
+    )
+    if not required.issubset(artifacts):
+        message = f"Completed HDF5 reconstruction source lacks required runtime evidence: {processed}"
+        raise RuntimeError(message)
+    for relative, identity in artifacts.items():
+        candidate = processed / relative
+        if relative == "case.h5":
+            if not candidate.is_file() or candidate.is_symlink():
+                message = f"Invalid completed HDF5 is unavailable for atomic repair: {candidate}"
+                raise FileNotFoundError(message)
+            continue
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or candidate.stat().st_size != identity["size_bytes"]
+            or common.serialization.file_sha256(candidate) != identity["sha256"]
+        ):
+            message = f"Non-HDF5 reconstruction source artifact changed: {candidate}"
+            raise RuntimeError(message)
+    timing = _load_json_object(processed / "timing.json", label="completed case timing")
+    execution = _load_json_object(
+        processed / "execution_provenance.json",
+        label="completed case execution provenance",
+    )
+    status = _load_json_object(processed / "status.json", label="completed case status")
+    runtime_seconds = timing.get("runtime_s")
+    execution_result = execution.get("result")
+    if (
+        isinstance(runtime_seconds, bool)
+        or not isinstance(runtime_seconds, (int, float))
+        or not 0.0 <= float(runtime_seconds) < float("inf")
+        or timing.get("git_commit") != case_payload["git_commit"]
+        or execution.get("git_commit") != case_payload["git_commit"]
+        or not isinstance(execution_result, dict)
+        or execution_result.get("state") != "succeeded"
+        or status.get("solver_success") is not True
+    ):
+        message = f"Completed HDF5 reconstruction runtime evidence is not successful: {processed}"
+        raise RuntimeError(message)
+    export_artifacts = {
+        relative.removeprefix("comsol_exports/"): identity for relative, identity in artifacts.items() if relative.startswith("comsol_exports/")
+    }
+    if not export_artifacts:
+        message = f"Completed HDF5 reconstruction has no retained source exports: {processed}"
+        raise RuntimeError(message)
+    return case_payload, input_generation_id, artifacts["case.h5"], export_artifacts, float(runtime_seconds)
+
+
+def _completed_hdf5_reconstruction_receipt_path(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    storage_root: Path,
+) -> Path:
+    """Bind one repair to its exact completed campaign and safe receipt path."""
+    manifest = campaign_evidence.load_campaign_run(
+        campaign_run_id,
+        storage_root=storage_root,
+    )
+    campaign = campaign_evidence.campaign_from_manifest(manifest)
+    if (
+        manifest.get("campaign_run_id") != campaign_run_id
+        or manifest.get("state") != "complete"
+        or campaign.campaign_purpose != "technical_runtime_smoke"
+        or config.scientific_values["campaign_purpose"] != "technical_runtime_smoke"
+    ):
+        message = "Completed HDF5 reconstruction requires the exact terminal Technical Smoke campaign owner."
+        raise RuntimeError(message)
+    try:
+        owned = campaign.batch(config.batch_name)
+    except ValueError as error:
+        message = "Completed HDF5 reconstruction batch is not owned by the campaign run."
+        raise RuntimeError(message) from error
+    if (
+        owned.batch_id != config.batch_id
+        or owned.batch_identity != config.batch_identity
+        or owned.scientific_config_digest != config.scientific_config_digest
+        or case_index not in owned.case_indices
+    ):
+        message = "Completed HDF5 reconstruction config differs from its campaign owner."
+        raise RuntimeError(message)
+    run_directory = campaign_evidence.campaign_run_directory(
+        campaign_run_id,
+        storage_root=storage_root,
+    )
+    if not run_directory.is_dir() or run_directory.is_symlink():
+        message = f"Completed HDF5 reconstruction campaign evidence is missing or unsafe: {run_directory}"
+        raise FileNotFoundError(message)
+    receipt_root = run_directory / "hdf5_reconstructions"
+    if receipt_root.exists() and (not receipt_root.is_dir() or receipt_root.is_symlink()):
+        message = f"Completed HDF5 reconstruction receipt root is unsafe: {receipt_root}"
+        raise ValueError(message)
+    receipt_directory = receipt_root / config.batch_id
+    if receipt_directory.exists() and (not receipt_directory.is_dir() or receipt_directory.is_symlink()):
+        message = f"Completed HDF5 reconstruction receipt directory is unsafe: {receipt_directory}"
+        raise ValueError(message)
+    receipt = receipt_directory / f"{config.case_id(case_index)}.json"
+    if receipt.exists() and (not receipt.is_file() or receipt.is_symlink()):
+        message = f"Completed HDF5 reconstruction receipt is unsafe: {receipt}"
+        raise ValueError(message)
+    return receipt
+
+
+def _repair_completed_case_hdf5_from_retained_exports_locked(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    storage_root: Path | str | None = None,
+    work_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Reconstruct one invalid completed Full-Retention HDF5 without COMSOL."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    run_id = common.paths.validate_logical_name(campaign_run_id, label="campaign_run_id")
+    processed = processed_case_directory(config, case_index, storage_root=storage)
+    receipt = _completed_hdf5_reconstruction_receipt_path(
+        config,
+        case_index,
+        campaign_run_id=run_id,
+        storage_root=storage,
+    )
+    try:
+        admitted = validate_completed_case(
+            config,
+            case_index,
+            storage_root=storage,
+            validation_depth="deep",
+        )
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as validation_error:
+        initial_error = str(validation_error)
+    else:
+        return {
+            "schema_kind": _SMOKE_HDF5_RECONSTRUCTION_SCHEMA_KIND,
+            "schema_version": _SMOKE_HDF5_RECONSTRUCTION_SCHEMA_VERSION,
+            "status": "already_valid",
+            "campaign_run_id": run_id,
+            "batch_id": config.batch_id,
+            "case_id": config.case_id(case_index),
+            "case_hdf5_sha256": admitted["artifacts"]["case.h5"]["sha256"],
+            "receipt": None,
+        }
+    case_payload, input_generation_id, expected_hdf5, export_artifacts, runtime_seconds = _retained_export_hdf5_repair_evidence(
+        config,
+        case_index,
+        processed,
+    )
+    prepared: PreparedCase | None = None
+
+    def complete_repair(active: PreparedCase) -> dict[str, Any]:
+        """Install one exact reconstruction and record no-solver provenance."""
+        for relative, identity in export_artifacts.items():
+            source = processed / "comsol_exports" / relative
+            destination = active.exports_directory / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            if (
+                destination.is_symlink()
+                or destination.stat().st_size != identity["size_bytes"]
+                or common.serialization.file_sha256(destination) != identity["sha256"]
+            ):
+                message = f"Retained export changed during HDF5 reconstruction: {source}"
+                raise RuntimeError(message)
+        exports = collect_exports(config, active)
+        observed_exports = {export.relative_path.as_posix() for export in exports}
+        if observed_exports != set(export_artifacts):
+            message = (
+                "Retained exports do not exactly satisfy the current conversion contract: "
+                f"missing={sorted(set(export_artifacts) - observed_exports)}, "
+                f"extra={sorted(observed_exports - set(export_artifacts))}."
+            )
+            raise RuntimeError(message)
+        reconstructed = storage_service.convert_exports_to_hdf5(
+            config,
+            case_payload,
+            exports,
+            scalar_handoff=active.bundle.scalar_handoff,
+            work_directory=active.work_directory,
+            runtime_directory=active.runtime_directory,
+            runtime_seconds=runtime_seconds,
+        )
+        reconstructed_sha256 = common.serialization.file_sha256(reconstructed.path)
+        if reconstructed.path.stat().st_size != expected_hdf5["size_bytes"] or reconstructed_sha256 != expected_hdf5["sha256"]:
+            message = (
+                "Retained exports reconstructed a valid HDF5, but its bytes do not match "
+                "the immutable completed-publication identity; safe in-place repair is impossible."
+            )
+            raise RuntimeError(message)
+
+        def install_reconstructed_hdf5(temporary: Path) -> None:
+            """Copy exact reconstructed bytes into an atomic publication path."""
+            shutil.copy2(reconstructed.path, temporary)
+
+        common.serialization.atomic_path_write(
+            processed / "case.h5",
+            install_reconstructed_hdf5,
+        )
+        validate_completed_case(
+            config,
+            case_index,
+            storage_root=storage,
+            validation_depth="deep",
+        )
+        recovery = {
+            "schema_kind": _SMOKE_HDF5_RECONSTRUCTION_SCHEMA_KIND,
+            "schema_version": _SMOKE_HDF5_RECONSTRUCTION_SCHEMA_VERSION,
+            "status": "complete",
+            "campaign_run_id": run_id,
+            "batch_id": config.batch_id,
+            "case_id": config.case_id(case_index),
+            "case_input_id": case_payload["case_input_id"],
+            "simulation_case_id": case_payload["simulation_case_id"],
+            "scientific_config_digest": config.scientific_config_digest,
+            "original_validation_error": initial_error,
+            "source_exports": {relative: dict(identity) for relative, identity in sorted(export_artifacts.items())},
+            "reconstructed_hdf5_sha256": reconstructed_sha256,
+            "comsol_executed": False,
+            "processing_git_commit": source_service.required_git_commit(),
+            "recorded_at": _utc_now(),
+        }
+        if receipt.exists():
+            existing = _load_json_object(receipt, label="Smoke HDF5 reconstruction receipt")
+            comparable = {key: value for key, value in existing.items() if key not in {"original_validation_error", "recorded_at"}}
+            expected = {key: value for key, value in recovery.items() if key not in {"original_validation_error", "recorded_at"}}
+            if comparable != expected:
+                message = f"Existing Smoke HDF5 reconstruction receipt conflicts: {receipt}"
+                raise FileExistsError(message)
+        else:
+            common.serialization.atomic_write_json(receipt, recovery)
+        return {
+            **recovery,
+            "receipt": receipt.relative_to(storage).as_posix(),
+        }
+
+    try:
+        prepared = prepare_case_work_directory(
+            config,
+            case_index,
+            storage_root=storage,
+            work_root=work_root,
+            input_generation_id=input_generation_id,
+        )
+        return complete_repair(prepared)
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as recovery_error:
+        message = (
+            f"Completed case {config.batch_id}/{config.case_id(case_index)} has invalid HDF5 evidence "
+            f"and retained-export reconstruction failed without COMSOL; initial validation: {initial_error}; "
+            f"recovery: {recovery_error}"
+        )
+        raise RuntimeError(message) from recovery_error
+    finally:
+        if prepared is not None and prepared.work_directory.exists():
+            _cleanup_case_attempt(
+                config,
+                case_index,
+                work_directory=prepared.work_directory,
+                work_root=prepared.work_root,
+                run_id=prepared.workspace_run_id,
+                storage_root=storage,
+            )
+
+
+def repair_completed_case_hdf5_from_retained_exports(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    storage_root: Path | str | None = None,
+    work_root: Path | str | None = None,
+    blocking_lock: bool = True,
+) -> dict[str, Any]:
+    """Reconstruct one run-bound Full-Retention HDF5 under its case lock."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    with common.locking.exclusive_file_lock(
+        case_lock_path(config, case_index, storage_root=storage),
+        blocking=blocking_lock,
+    ):
+        return _repair_completed_case_hdf5_from_retained_exports_locked(
+            config,
+            case_index,
+            campaign_run_id=campaign_run_id,
+            storage_root=storage,
+            work_root=work_root,
+        )
 
 
 def completed_case_is_valid(
@@ -3627,7 +3429,6 @@ def run_case(
     lock_path = case_lock_path(config, case_index, storage_root=storage)
     with common.locking.exclusive_file_lock(lock_path, blocking=blocking_lock):
         if completed_case_is_valid(config, case_index, storage_root=storage):
-            clear_case_failure(config, case_index, storage_root=storage)
             _update_runtime_progress(progress_reporter, phase="completed", terminal=True)
             return CaseRunOutcome(
                 status="skipped",
@@ -3639,11 +3440,6 @@ def run_case(
                 ),
                 work_directory=None,
             )
-        _retire_stale_case_failure(
-            config,
-            case_index,
-            storage_root=storage,
-        )
         prepared: PreparedCase | None = None
         failure_stage = "input"
         try:
@@ -3703,23 +3499,11 @@ def run_case(
                 )
             elif temporary_license_error is not None and retry_enabled:
                 try:
-                    retry_path = license_service.record_temporary_license_capacity_attempt(
+                    retry_path = license_service.record_temporary_license_wait(
                         config,
                         case_index,
                         temporary_license_error,
                         storage_root=storage,
-                    )
-                    failure_path = record_case_failure(
-                        config,
-                        case_index,
-                        temporary_license_error,
-                        worker_slot=worker_slot,
-                        scheduler_kind=scheduler_kind,
-                        allocated_node=allocated_node,
-                        work_directory=attempt_directory,
-                        storage_root=storage,
-                        scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
-                        failure_stage="solver",
                     )
                 except Exception as retry_error:  # noqa: BLE001 -- failed provenance is terminal
                     failure_path = record_case_failure(
@@ -3729,7 +3513,7 @@ def run_case(
                         worker_slot=worker_slot,
                         scheduler_kind=scheduler_kind,
                         allocated_node=allocated_node,
-                        work_directory=attempt_directory,
+                        work_directory=None,
                         storage_root=storage,
                         scratch_cleanup_status=("pending" if attempt_directory is not None else "not_created"),
                         failure_stage="solver",
@@ -3772,7 +3556,7 @@ def run_case(
                             worker_slot=worker_slot,
                             scheduler_kind=scheduler_kind,
                             allocated_node=allocated_node,
-                            work_directory=attempt_directory,
+                            work_directory=None,
                             storage_root=storage,
                             scratch_cleanup_status="pending",
                             failure_stage="solver",
@@ -3807,7 +3591,6 @@ def run_case(
                     flush=True,
                 )
             raise
-        clear_case_failure(config, case_index, storage_root=storage)
         try:
             _cleanup_case_attempt(
                 config,

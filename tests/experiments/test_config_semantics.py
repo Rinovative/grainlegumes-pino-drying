@@ -39,6 +39,18 @@ def test_minimal_direct_config_resolves_and_preserves_user_values(
     assert resolved["evaluation"]["objective"]["id"] == "normalized_group_macro_rmse"
 
 
+@pytest.mark.parametrize("dataset_key", ["train_dataset", "ood_datasets"])
+def test_training_and_evaluation_require_exact_dataset_ids(
+    dataset_key: str,
+) -> None:
+    """Reject implicit selection from whatever Dataset packages happen to exist."""
+    raw = configs.direct_config()
+    raw["data"].pop(dataset_key)
+
+    with pytest.raises((TypeError, ValueError), match=dataset_key):
+        experiments.config.loader.resolve_config(raw)
+
+
 def test_minimal_physics_config_preserves_explicit_semantics() -> None:
     """Propagate explicitly supplied formulation and weight values unchanged."""
     raw = configs.direct_config(physics_enabled=True)

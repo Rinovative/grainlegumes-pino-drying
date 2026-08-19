@@ -256,11 +256,6 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
     assert first_cleanup is not None
     assert first_cleanup["status"] == "complete"
     first_receipt = first.receipt_path.read_bytes()
-    assert not generation.runtime.case_failure_path(
-        config,
-        1,
-        storage_root=storage,
-    ).exists()
     assert not generation.runtime.completed_case_is_valid(
         config,
         1,

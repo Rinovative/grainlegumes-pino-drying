@@ -5,11 +5,11 @@ Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
   - Provide generic run, data-loader, optimizer, scheduler, and training defaults
-  - Project task dataset fallbacks, losses, and metric definitions into config defaults
+  - Project task losses and metric definitions into generic config defaults
   - Return serializable defaults for strict experiment resolution
 
 Design principles:
-  - Explicit experiment data selection overrides TaskSpec dataset fallbacks
+  - Exact training and evaluation Dataset IDs are explicit experiment inputs
   - Task-fixed scientific semantics come exclusively from the registered TaskSpec
   - Runtime defaults remain independent of concrete task field names
   - Semantic identifiers are distinct from Python implementation class names
@@ -129,7 +129,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Serializable runtime defaults with task dataset fallbacks and semantics.
+        Serializable runtime defaults with task-owned scientific semantics.
 
     Raises
     ------
@@ -140,11 +140,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
     task = domain.tasks.registry.get_task(task_id)
     return {
         "run": RUN_DEFAULTS,
-        "data": {
-            "train_dataset": task.default_datasets.train,
-            "ood_datasets": list(task.default_datasets.ood),
-            **DATA_RUNTIME_DEFAULTS,
-        },
+        "data": dict(DATA_RUNTIME_DEFAULTS),
         "loss": {
             "data": {
                 "kind": task.data_losses[0],

@@ -722,6 +722,7 @@ def _task_state(
     scheduler: Mapping[str, Any],
     *,
     storage_root: Path | str | None,
+    compact_license_attempt_payloads: bool = False,
 ) -> dict[str, Any]:
     """Reconcile one case from processed, attempt, and exact scheduler evidence."""
     batch = campaign.batch(task.batch_name)
@@ -784,7 +785,7 @@ def _task_state(
             reason = str(unknown_records[-1]["job_id"])
         else:
             if latest_submission is not None:
-                retry_attempt = license_service.latest_attempt_for_job(
+                retry_attempt = license_service.latest_wait_for_job(
                     batch,
                     task.case_index,
                     campaign_run_id=str(manifest["campaign_run_id"]),
@@ -792,10 +793,7 @@ def _task_state(
                     storage_root=storage_root,
                 )
             if retry_attempt is not None:
-                first_blocked_at = retry_attempt.get(
-                    "first_blocked_at",
-                    retry_attempt.get("timestamp"),
-                )
+                first_blocked_at = retry_attempt["first_blocked_at"]
                 if first_blocked_at is not None and not isinstance(first_blocked_at, str):
                     message = f"Temporary-license first blocked timestamp is malformed for {task.case_id}."
                     raise TypeError(message)
@@ -836,13 +834,21 @@ def _task_state(
                         if retry_attempt is None:
                             message = f"License-blocked attempt lacks its retry receipt: {attempt.receipt_path}"
                             raise ValueError(message)
+                        if compact_license_attempt_payloads:
+                            attempt_service.compact_license_only_attempt_payload(
+                                batch,
+                                task.case_index,
+                                str(manifest["campaign_run_id"]),
+                                retry_attempt,
+                                storage_root=storage_root,
+                            )
                         license_wait_exhausted = not bool(retry_attempt["retry_budget_remaining"])
-                        license_retry_eligible = not license_wait_exhausted and license_service.retry_attempt_is_eligible(retry_attempt)
+                        license_retry_eligible = not license_wait_exhausted and license_service.wait_record_is_eligible(retry_attempt)
             elif retry_attempt is not None:
                 state = "license_blocked"
                 reason = license_service.TEMPORARY_LICENSE_CAPACITY
                 license_wait_exhausted = not bool(retry_attempt["retry_budget_remaining"])
-                license_retry_eligible = not license_wait_exhausted and license_service.retry_attempt_is_eligible(retry_attempt)
+                license_retry_eligible = not license_wait_exhausted and license_service.wait_record_is_eligible(retry_attempt)
             elif batch_runtime.case_failure_is_recorded(
                 batch,
                 task.case_index,
@@ -851,7 +857,7 @@ def _task_state(
                 git_commit=str(manifest["git_commit"]),
             ):
                 state = "failed"
-                reason = "legacy_case_failure_evidence"
+                reason = "case_failure_evidence"
                 failure_stage = "solver"
                 pipeline["solver_state"] = "failed"
             elif latest_accounted is not None:
@@ -909,6 +915,7 @@ def _reconciled(
     scheduler: Mapping[str, Any],
     *,
     storage_root: Path | str | None,
+    compact_license_attempt_payloads: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Return task views plus exact pending/running counts for this campaign."""
     task_views = [
@@ -918,6 +925,7 @@ def _reconciled(
             task,
             scheduler,
             storage_root=storage_root,
+            compact_license_attempt_payloads=compact_license_attempt_payloads,
         )
         for task in cluster_service.campaign_tasks(campaign)
     ]
@@ -951,7 +959,7 @@ def _submit_one(
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
     """Persist one intent, submit one case, and atomically persist its job ID."""
-    if mode not in {"initial", "resume", "license_retry", "explicit_retry"}:
+    if mode not in {"initial", "resume", "license_retry"}:
         message = f"Unsupported campaign submission mode: {mode!r}."
         raise ValueError(message)
     index = len(manifest["submissions"]) + 1
@@ -1059,6 +1067,7 @@ def feed_campaign(
             campaign,
             scheduler,
             storage_root=storage_root,
+            compact_license_attempt_payloads=True,
         )
         successful = [view for view in task_views if view["state"] == "successful"]
         if len(successful) == len(task_views):
@@ -1178,7 +1187,15 @@ def submit_campaign(
         )
         if path.exists():
             existing = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
-            immutable_keys = set(intent).difference({"slurm_job_ids", "submissions", "submission_intent", "state"})
+            immutable_keys = set(intent).difference(
+                {
+                    "dataset_packages",
+                    "slurm_job_ids",
+                    "submissions",
+                    "submission_intent",
+                    "state",
+                }
+            )
             if any(existing[key] != intent[key] for key in immutable_keys):
                 message = f"Existing campaign-run manifest conflicts with {run_id!r}."
                 raise FileExistsError(message)
@@ -1231,6 +1248,7 @@ def resume_campaign(
             campaign,
             scheduler,
             storage_root=storage_root,
+            compact_license_attempt_payloads=True,
         )
         if pending_jobs or running_jobs:
             manifest["state"] = "active"
@@ -1339,95 +1357,6 @@ def resume_campaign(
             campaign,
             task,
             mode=("resume" if restart_view["state"] in {"cancelled", "interrupted"} else "initial"),
-            storage_root=storage_root,
-        )
-
-
-def retry_campaign_case(
-    run_id: str,
-    batch_name: str,
-    case_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> dict[str, Any]:
-    """Explicitly submit one selected unresolved scientific case from time zero."""
-    match = _CASE_ID_PATTERN.fullmatch(case_id)
-    if match is None:
-        message = f"retry-case requires a canonical case ID, got {case_id!r}."
-        raise ValueError(message)
-    case_index = int(match.group(1))
-    if case_index < 1:
-        message = f"retry-case requires a positive case index, got {case_id!r}."
-        raise ValueError(message)
-    run_directory = campaign_evidence.campaign_run_directory(
-        run_id,
-        storage_root=storage_root,
-    )
-    lock_path = run_directory / "submission.lock"
-    with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        manifest = campaign_evidence.load_campaign_run(
-            run_id,
-            storage_root=storage_root,
-        )
-        current_commit = _repository_commit()
-        if current_commit != manifest["git_commit"]:
-            message = f"Explicit solver retry requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
-            raise RuntimeError(message)
-        campaign = campaign_evidence.campaign_from_manifest(manifest)
-        task = cluster_service.require_campaign_task(
-            campaign,
-            batch_name=batch_name,
-            case_index=case_index,
-        )
-        if task.case_id != case_id:
-            message = f"retry-case identity mismatch for {batch_name}/{case_id}."
-            raise ValueError(message)
-        scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
-        _require_scheduler_evidence(scheduler)
-        task_views, _pending_jobs, _running_jobs = _reconciled(
-            manifest,
-            campaign,
-            scheduler,
-            storage_root=storage_root,
-        )
-        matches = [view for view in task_views if view["batch_name"] == batch_name and view["case_id"] == case_id]
-        if len(matches) != 1:
-            message = f"Campaign has no unique retry target {batch_name}/{case_id}."
-            raise RuntimeError(message)
-        view = matches[0]
-        if view["state"] == "successful":
-            message = f"Successful case cannot be retried: {batch_name}/{case_id}."
-            raise ValueError(message)
-        if view["state"] in {
-            "active",
-            "pending",
-            "scheduler_unknown",
-            "license_blocked",
-        }:
-            message = f"Case is still active or operationally retrying: {batch_name}/{case_id}."
-            raise RuntimeError(message)
-        if view["state"] in {"cancelled", "interrupted", "never_started"}:
-            message = f"Case {batch_name}/{case_id} belongs to normal campaign resume."
-            raise ValueError(message)
-        if view["state"] in {"conversion_failed", "publication_failed"} and view["postprocessing_replay_available"] is True:
-            message = f"Case {batch_name}/{case_id} has valid postprocessing replay evidence; use resume."
-            raise ValueError(message)
-        eligible = {
-            "failed",
-            "timed_out",
-            "exports_failed",
-            "conversion_failed",
-            "publication_failed",
-        }
-        if view["state"] not in eligible:
-            message = f"Case {batch_name}/{case_id} is not eligible for explicit retry from state {view['state']!r}."
-            raise ValueError(message)
-        manifest["state"] = "active"
-        return _submit_one(
-            manifest,
-            campaign,
-            task,
-            mode="explicit_retry",
             storage_root=storage_root,
         )
 

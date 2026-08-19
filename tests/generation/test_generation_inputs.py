@@ -10,11 +10,14 @@ import numpy as np
 import pytest
 import yaml
 
-from src import common, generation
+from src import common, domain, generation
 from src.datasets.packages import dataset_packages_planning as package_planning
 from src.generation.cases import generation_cases_fields as fields
 from src.generation.cases import generation_cases_sampling as sampling
 from src.generation.cases import generation_cases_seeding as seeding
+from src.generation.publication import (
+    generation_publication_campaign_evidence as campaign_evidence,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,11 +35,11 @@ def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() ->
 
     assert case_counts == {
         ("chickpea", "natural"): 160,
-        ("field_pea", "natural"): 60,
+        ("field_pea", "natural"): 40,
         ("kidney_bean", "natural"): 160,
         ("lentil", "natural"): 160,
         ("rapeseed", "natural"): 40,
-        ("sunflower_seed", "natural"): 20,
+        ("sunflower_seed", "natural"): 40,
     }
     assert campaign.total_case_count == 600
     assert campaign.membership["per_seen_material"] == {
@@ -50,12 +53,220 @@ def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() ->
         "id_test": 48,
     }
     assert all(batch.sampling_regime != "parameter_ood" for batch in campaign.batches)
+    assert campaign.profile.available_learning_views == ("steady_flow", "transient_drying")
+    assert {package["dataset_view"] for package in campaign.dataset_packages} == {"transient_drying"}
     assert {package["evaluation_regime"] for package in campaign.dataset_packages} == {
         "id",
         "near_family_ood",
         "far_family_ood",
         "extreme_family_ood",
     }
+
+
+def test_steady_flow_id_dataset_is_independent_and_balanced() -> None:
+    """Protect the standalone Airflow ID Dataset and its exact 80/10/10 splits."""
+    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/id_dataset.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        campaign_path,
+        require_executable=False,
+    )
+    counts = {batch.material_family: len(batch.case_indices) for batch in campaign.batches}
+    airflow_designs = [batch.scientific_values["sampling"]["blocks"]["airflow"] for batch in campaign.batches]
+
+    assert campaign.campaign_purpose == "steady_flow_id_dataset"
+    assert len(campaign.batches) == 3
+    assert all(batch.sampling_regime == "natural" for batch in campaign.batches)
+    assert campaign.profile.id == "steady_flow"
+    assert counts == {"lentil": 350, "chickpea": 350, "kidney_bean": 350}
+    assert campaign.total_case_count == 1050
+    assert len(airflow_designs) == 3
+    assert all(batch.scientific_values["sampling"]["method"] == "lhs" for batch in campaign.batches)
+    assert all(tuple(batch.scientific_values["sampling"]["blocks"]) == ("airflow",) for batch in campaign.batches)
+    assert len({design["design_seed"] for design in airflow_designs}) == 3
+    assert len({design["design_sha256"] for design in airflow_designs}) == 3
+    assert all(sorted(design["permutation"]) == list(range(350)) for design in airflow_designs)
+    assert campaign.membership["per_seen_material"] == {
+        "train": 280,
+        "validation": 35,
+        "id_test": 35,
+    }
+    assert {name: count * len(campaign.material_roles["seen"]) for name, count in campaign.membership["per_seen_material"].items()} == {
+        "train": 840,
+        "validation": 105,
+        "id_test": 105,
+    }
+    assert campaign.material_roles["near_family_ood"] == ()
+    assert campaign.material_roles["far_family_ood"] == ()
+    assert campaign.material_roles["extreme_family_ood"] == ()
+    assert len(campaign.dataset_packages) == 1
+    package = campaign.dataset_packages[0]
+    assert package["dataset_view"] == "steady_flow"
+    assert package["evaluation_regime"] == "id"
+    assert package["materials"] == ["lentil", "chickpea", "kidney_bean"]
+    assert "sources" not in package
+
+
+def test_cross_profile_stationary_view_is_neutral_and_train_capable(
+    generation_config_factory: Any,
+) -> None:
+    """Derive membership from the declared package, not source/view equality."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        campaign_purpose="family_generalization",
+        natural_count=3,
+    )
+
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    by_view = {package["dataset_view"]: package for package in campaign.dataset_packages}
+
+    assert by_view["transient_drying"]["split_eligibility"] == {
+        "train": True,
+        "validation": True,
+        "id_test": True,
+        "parameter_ood": False,
+    }
+    stationary = by_view["steady_flow"]
+    assert stationary["split_eligibility"] == {
+        "train": True,
+        "validation": True,
+        "id_test": True,
+        "parameter_ood": False,
+    }
+    assert stationary["membership"] == by_view["transient_drying"]["membership"]
+    assert "intended_usage" not in stationary
+    assert "evaluation_only" not in stationary
+    assert "training_forbidden" not in stationary
+
+
+def test_package_only_cross_profile_request_preserves_simulation_identity(
+    generation_config_factory: Any,
+) -> None:
+    """Separate additive Dataset requests from immutable simulation identity."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        campaign_purpose="family_generalization",
+        natural_count=3,
+    )
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    authored["dataset_packages"] = [
+        {
+            "dataset_view": "transient_drying",
+            "evaluation_regime": "id",
+            "source_role": "seen",
+        }
+    ]
+    config_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+    base = generation.cases.config.load_campaign_config(config_path)
+
+    authored["dataset_packages"].append(
+        {
+            "dataset_view": "steady_flow",
+            "evaluation_regime": "id",
+            "source_role": "seen",
+        }
+    )
+    config_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+    extended = generation.cases.config.load_campaign_config(config_path)
+
+    assert extended.campaign_digest == base.campaign_digest
+    assert extended.package_request_digest != base.package_request_digest
+    assert [batch.batch_id for batch in extended.batches] == [batch.batch_id for batch in base.batches]
+    assert {package["dataset_view"] for package in extended.dataset_packages} == {"steady_flow", "transient_drying"}
+
+
+def test_active_campaign_keeps_its_launch_package_snapshot(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep additive package requests out of in-flight solver continuation."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        campaign_purpose="family_generalization",
+        natural_count=3,
+    )
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    authored["dataset_packages"] = [
+        {
+            "dataset_view": "transient_drying",
+            "evaluation_regime": "id",
+            "source_role": "seen",
+        }
+    ]
+    config_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+    launched = generation.cases.config.load_campaign_config(config_path)
+    manifest = {
+        "campaign_config": "configs/generation/campaigns/test.yaml",
+        "campaign_id": launched.campaign_id,
+        "campaign_digest": launched.campaign_digest,
+        "execution_config_digest": common.serialization.canonical_json_sha256(launched.execution_values),
+        "selected_batch_names": [batch.batch_name for batch in launched.batches],
+        "dataset_packages": list(launched.dataset_packages),
+    }
+
+    authored["dataset_packages"].append(
+        {
+            "dataset_view": "steady_flow",
+            "evaluation_regime": "id",
+            "source_role": "seen",
+        }
+    )
+    config_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "resolve_campaign_config_path",
+        lambda _value: config_path,
+    )
+
+    active = campaign_evidence.campaign_from_manifest(manifest)
+    current = campaign_evidence.current_campaign_from_manifest(manifest)
+
+    assert [package["dataset_view"] for package in active.dataset_packages] == ["transient_drying"]
+    assert {package["dataset_view"] for package in current.dataset_packages} == {
+        "steady_flow",
+        "transient_drying",
+    }
+    assert active.campaign_digest == current.campaign_digest
+    assert active.package_request_digest != current.package_request_digest
+
+
+def test_only_independent_seen_campaign_owns_airflow_training_membership() -> None:
+    """Keep transient and OOD physical cases outside Airflow model selection."""
+    campaign_root = common.paths.get_project_root() / "configs/generation/campaigns"
+    campaigns = generation.cases.config.discover_campaign_configs(
+        campaign_root,
+        require_executable=False,
+    )
+    training_packages = [
+        (campaign, package)
+        for campaign in campaigns
+        for package in campaign.dataset_packages
+        if package["dataset_view"] == "steady_flow" and package["split_eligibility"]["train"]
+    ]
+
+    assert len(training_packages) == 1
+    campaign, package = training_packages[0]
+    assert campaign.campaign_purpose == "steady_flow_id_dataset"
+    assert campaign.profile.id == "steady_flow"
+    assert package["materials"] == ["lentil", "chickpea", "kidney_bean"]
+    assert package["membership"]["totals"] == {
+        "train": 840,
+        "validation": 105,
+        "id_test": 105,
+    }
+    assert package["dataset_name"] == ("steady_flow__lentil+chickpea+kidney_bean__id")
+    assert domain.tasks.registry.get_task("steady_flow").default_datasets.train == (package["dataset_name"])
 
 
 def test_semantic_seed_derivation_is_version_bound() -> None:

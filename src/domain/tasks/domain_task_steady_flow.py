@@ -6,7 +6,7 @@ Declare the authoritative steady two-dimensional porous-flow task contract.
 Responsibilities:
   - Exact ordered steady-flow input and output fields
   - Field units, stored representations, tensor axes, and preprocessing
-  - Fallback datasets for omitted config selection, semantic metrics, losses, and physics
+  - Non-executable Dataset catalog references, semantic metrics, losses, and physics
 
 Design principles:
   - The declaration is immutable and contains only canonical identifiers
@@ -75,7 +75,7 @@ STEADY_FLOW = TaskSpec(
     operator_axes=(2, 3),
     normalization_axes=(0, 2, 3),
     default_datasets=DatasetDefaults(
-        train="lhs_var80_seed3001",
+        train="steady_flow__lentil+chickpea+kidney_bean__id",
         ood=("lhs_var120_seed4001",),
     ),
     preprocessing=PreprocessingSpec(
