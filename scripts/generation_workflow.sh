@@ -54,6 +54,10 @@ WORKFLOW_FAILURE_EVIDENCE=""
 CAMPAIGN_INTERRUPT_ACTIVE=false
 CAMPAIGN_INTERRUPT_COUNT=0
 DEFER_COLLECTION=false
+CONSOLE_CHANGED_PROGRESS_SECONDS="${GENERATION_CONSOLE_CHANGED_PROGRESS_SECONDS:-60}"
+CONSOLE_HEARTBEAT_SECONDS="${GENERATION_CONSOLE_HEARTBEAT_SECONDS:-120}"
+COMPOSITE_CHILD_MODE=false
+PAIRED_SMOKE_RECEIPT=""
 
 usage() {
   cat >&2 <<EOF
@@ -103,15 +107,16 @@ generation_console_stage() {
 generation_console_progress() {
   local key="$1" index="$2" total="$3" label="$4" status="$5"
   local signature="$6" detail="${7:-}" detail_signature="${8:-$6}" now
-  local changed_progress_seconds=60 heartbeat_seconds=300
+  validate_positive "console changed-progress interval" "${CONSOLE_CHANGED_PROGRESS_SECONDS}"
+  validate_positive "console heartbeat interval" "${CONSOLE_HEARTBEAT_SECONDS}"
   now="$(date +%s)"
   if [[ "${CONSOLE_PROGRESS_KEY}" == "${key}" && "${CONSOLE_PROGRESS_SIGNATURE}" == "${signature}" ]]; then
     if [[ "${CONSOLE_PROGRESS_DETAIL_SIGNATURE}" == "${detail_signature}" ]]; then
-      if (( now - CONSOLE_PROGRESS_RENDERED_AT < heartbeat_seconds )); then
+      if (( now - CONSOLE_PROGRESS_RENDERED_AT < CONSOLE_HEARTBEAT_SECONDS )); then
         return
       fi
       detail="${detail}${detail:+$'\n'}heartbeat=unchanged"
-    elif (( now - CONSOLE_PROGRESS_RENDERED_AT < changed_progress_seconds )); then
+    elif (( now - CONSOLE_PROGRESS_RENDERED_AT < CONSOLE_CHANGED_PROGRESS_SECONDS )); then
       return
     fi
   fi
@@ -120,6 +125,67 @@ generation_console_progress() {
   CONSOLE_PROGRESS_SIGNATURE="${signature}"
   CONSOLE_PROGRESS_DETAIL_SIGNATURE="${detail_signature}"
   CONSOLE_PROGRESS_RENDERED_AT="${now}"
+}
+
+generation_console_elapsed() {
+  local elapsed="$1"
+  validate_nonnegative "heartbeat elapsed seconds" "${elapsed}"
+  printf "%02d:%02d:%02d" \
+    "$((elapsed / 3600))" "$(((elapsed % 3600) / 60))" "$((elapsed % 60))"
+}
+
+generation_run_with_heartbeat() {
+  local key="$1" index="$2" total="$3" label="$4" operation="$5"
+  local progress_detail="${6:-}"
+  shift 6
+  validate_positive "console heartbeat interval" "${CONSOLE_HEARTBEAT_SECONDS}"
+  (( $# > 0 )) || fail 2 "Heartbeat execution requires one command."
+  local started_seconds="${SECONDS}" command_pid heartbeat_pid status
+  "$@" &
+  command_pid=$!
+  (
+    local elapsed last_progress_at detail current_run child_run sleep_pid=""
+    heartbeat_stop() {
+      [[ -z "${sleep_pid}" ]] || kill "${sleep_pid}" 2>/dev/null || true
+      exit 0
+    }
+    trap heartbeat_stop TERM INT
+    while true; do
+      sleep "${CONSOLE_HEARTBEAT_SECONDS}" &
+      sleep_pid=$!
+      wait "${sleep_pid}" || exit 0
+      sleep_pid=""
+      kill -0 "${command_pid}" 2>/dev/null || exit 0
+      elapsed="$((SECONDS - started_seconds))"
+      last_progress_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      current_run="${RUN_PLAN_ID:-${RUN_ID:-unknown}}"
+      child_run="${RUN_ID:-}"
+      detail="stage=${label}"
+      printf -v detail "%s\nrun_id=%s" "${detail}" "${current_run}"
+      if [[ -n "${child_run}" && "${child_run}" != "${current_run}" ]]; then
+        printf -v detail "%s\nchild_run=%s" "${detail}" "${child_run}"
+      fi
+      printf -v detail "%s\nelapsed=%s" \
+        "${detail}" "$(generation_console_elapsed "${elapsed}")"
+      printf -v detail "%s\noperation=%s\nlast_progress_at=%s" \
+        "${detail}" "${operation}" "${last_progress_at}"
+      [[ -z "${progress_detail}" ]] || \
+        printf -v detail "%s\n%s" "${detail}" "${progress_detail}"
+      printf -v detail "%s\nheartbeat=active\neta=unavailable" "${detail}"
+      generation_console_progress \
+        "${key}" "${index}" "${total}" "${label}" RUNNING \
+        "${operation}" "${detail}" "${operation}:${elapsed}" >&2
+    done
+  ) &
+  heartbeat_pid=$!
+  if wait "${command_pid}"; then
+    status=0
+  else
+    status=$?
+  fi
+  kill "${heartbeat_pid}" 2>/dev/null || true
+  wait "${heartbeat_pid}" 2>/dev/null || true
+  return "${status}"
 }
 
 generation_console_warning() {
@@ -1176,29 +1242,51 @@ finalize_smoke_runs() {
   resolve_local_python
   resolve_remote_layout
   verify_remote_setup_for_output >/dev/null
-  local comsol_version steady_evidence transient_evidence receipt
+  local comsol_version steady_evidence transient_evidence smoke_children
   comsol_version="$(remote_comsol_version)"
-  steady_evidence="$(local_cli finalize-technical-smoke-evidence "${stationary_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+  printf -v smoke_children "children=%s,%s" \
+    "${stationary_run_id}" "${transient_run_id}"
+  RUN_ID="${stationary_run_id}"
+  steady_evidence="$(generation_run_with_heartbeat \
+    "profile-smoke-${stationary_run_id}" 8 9 "Paired finalizer" \
+    "validating steady-flow Technical Smoke evidence" \
+    "current_child=${stationary_run_id}" \
+    local_cli finalize-technical-smoke-evidence "${stationary_run_id}" \
+      --comsol-version-output "${comsol_version}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not finalize steady-flow Technical Smoke evidence for ${stationary_run_id}."
   steady_evidence="$(container_path_to_host "${steady_evidence}")"
   sync_technical_smoke_evidence \
     "${steady_evidence}" "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
-  transient_evidence="$(local_cli finalize-technical-smoke-evidence "${transient_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+  RUN_ID="${transient_run_id}"
+  transient_evidence="$(generation_run_with_heartbeat \
+    "profile-smoke-${transient_run_id}" 8 9 "Paired finalizer" \
+    "validating transient-drying Technical Smoke evidence" \
+    "current_child=${transient_run_id}" \
+    local_cli finalize-technical-smoke-evidence "${transient_run_id}" \
+      --comsol-version-output "${comsol_version}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not finalize transient-drying Technical Smoke evidence for ${transient_run_id}."
   transient_evidence="$(container_path_to_host "${transient_evidence}")"
   sync_technical_smoke_evidence \
     "${transient_evidence}" "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
-  receipt="$(local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
-    --comsol-version-output "${comsol_version}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+  PAIRED_SMOKE_RECEIPT="$(generation_run_with_heartbeat \
+    "paired-smoke-${RUN_PLAN_ID}" 8 9 "Paired finalizer" \
+    "building and validating paired Smoke payload" "${smoke_children}" \
+    local_cli finalize-real-smoke "${stationary_run_id}" "${transient_run_id}" \
+      --comsol-version-output "${comsol_version}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not atomically finalize paired Technical Smoke evidence."
-  receipt="$(container_path_to_host "${receipt}")"
-  local_cli validate-real-smoke "${receipt}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-    fail 1 "Paired Technical Smoke receipt did not validate after finalization: ${receipt}"
+  PAIRED_SMOKE_RECEIPT="$(container_path_to_host "${PAIRED_SMOKE_RECEIPT}")"
+  generation_run_with_heartbeat \
+    "paired-smoke-validation-${RUN_PLAN_ID}" 8 9 "Paired finalizer" \
+    "validating the current paired Smoke receipt" "${smoke_children}" \
+    local_cli validate-real-smoke "${PAIRED_SMOKE_RECEIPT}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Paired Technical Smoke receipt did not validate after finalization: ${PAIRED_SMOKE_RECEIPT}"
   printf 'Profile technical-smoke evidence: %s and %s\n' \
     "${steady_evidence}" "${transient_evidence}"
-  printf 'Paired technical runtime diagnostic receipt: %s\n' "${receipt}"
+  printf 'Paired technical runtime diagnostic receipt: %s\n' "${PAIRED_SMOKE_RECEIPT}"
   printf 'Paired Technical Smoke children validated: %s and %s.\n' \
     "${stationary_run_id}" "${transient_run_id}"
 }
@@ -1262,6 +1350,10 @@ local_cli() {
   local_python -m "${GENERATION_MODULE}" "$@"
 }
 
+local_cli_quiet() {
+  local_cli "$@" >/dev/null 2>&1
+}
+
 container_path_to_host() {
   local value="$1"
   local relative
@@ -1298,7 +1390,11 @@ validate_transfer_path() {
 }
 
 gpu_publication_is_valid() {
-  local_cli validate-published-campaign "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1
+  generation_run_with_heartbeat \
+    "host-publication-existing-${RUN_ID}" 6 9 "Host publication" \
+    "validating existing host inventory" "" \
+    local_cli_quiet validate-published-campaign "${RUN_ID}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}"
 }
 
 repair_existing_campaign_publication() {
@@ -1360,24 +1456,37 @@ collect_campaign() {
   local directory
   for directory in "${directories[@]}"; do validate_transfer_path "${directory}"; done
   require_command rsync "campaign transfer"
-  local staging receipt
+  local staging receipt directory_index=0 directory_total transfer_progress
   staging="$(local_cli create-transfer-staging "${RUN_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not create marked transfer staging."
   staging="$(container_path_to_host "${staging}")"
   printf 'Transfer staging: %s\n' "${staging}"
+  directory_total="${#directories[@]}"
   for directory in "${directories[@]}"; do
-    rsync -a --protect-args --relative --exclude='.state/' --exclude='work/' \
-      "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${directory}" "${staging}/" ||
+    directory_index="$((directory_index + 1))"
+    printf -v transfer_progress \
+      "directories_completed=%s/%s\ncurrent_artifact=%s" \
+      "$((directory_index - 1))" "${directory_total}" "${directory}"
+    generation_run_with_heartbeat \
+      "host-transfer-${RUN_ID}-${directory_index}" 6 9 "Host publication" \
+      "transferring ${directory}" "${transfer_progress}" \
+      rsync -a --protect-args --relative --exclude='.state/' --exclude='work/' \
+        "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${directory}" "${staging}/" ||
       fail 1 "Transfer failed; staging retained at ${staging}."
   done
   if [[ "${PILOT_MODE}" == true ]]; then
     local_cli record-pilot-staging-inventory "${RUN_ID}" --staging-root "${staging}" >/dev/null ||
       fail 1 "Could not record exact pilot transfer-staging storage."
   fi
-  receipt="$(local_cli publish-transferred-campaign "${RUN_ID}" \
-    --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
-    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}")" ||
+  printf -v transfer_progress \
+    "directories_completed=%s/%s" "${directory_total}" "${directory_total}"
+  receipt="$(generation_run_with_heartbeat \
+    "host-publication-validate-${RUN_ID}" 6 9 "Host publication" \
+    "validating destination inventory and hashes" "${transfer_progress}" \
+    local_cli publish-transferred-campaign "${RUN_ID}" \
+      --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
+      --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}")" ||
     fail 1 "GPU publication validation failed; staging retained at ${staging}."
   if [[ "${PILOT_MODE}" != true ]]; then
     local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
@@ -1391,7 +1500,11 @@ collect_campaign() {
 build_datasets() {
   resolve_local_python
   resolve_local_storage
-  local_cli build-campaign-datasets "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}"
+  generation_run_with_heartbeat \
+    "dataset-packages-${RUN_ID}" 7 9 "Packages/finalizer" \
+    "building Dataset packages and loader smoke evidence" "" \
+    local_cli build-campaign-datasets "${RUN_ID}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}"
 }
 
 remote_campaign_monitor() {
@@ -1454,13 +1567,19 @@ deferred_campaign_report() {
 prepare_all_receipt() {
   local -a arguments=(prepare-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
   [[ "${KEEP_CPU_SOURCE}" != true ]] || arguments+=(--keep-cpu-source)
-  local_cli "${arguments[@]}"
+  generation_run_with_heartbeat \
+    "workflow-gates-${RUN_ID}" 8 9 "Retention policy" \
+    "validating immutable host and Dataset workflow gates" "" \
+    local_cli "${arguments[@]}"
 }
 
 read_cleanup_authorization() {
   local line kind authorization_destination_host extra
-  line="$(local_cli cpu-cleanup-authorization "${RUN_ID}" --format tsv \
-    --storage-root "${LOCAL_STORAGE_ROOT}")"
+  line="$(generation_run_with_heartbeat \
+    "cleanup-authorization-${RUN_ID}" 8 9 "Retention policy" \
+    "validating cleanup authorization inventory" "" \
+    local_cli cpu-cleanup-authorization "${RUN_ID}" --format tsv \
+      --storage-root "${LOCAL_STORAGE_ROOT}")"
   IFS=$'\t' read -r kind AUTHORIZATION_SHA AUTH_SOURCE_HOST AUTH_SOURCE_ROOT \
     AUTH_DESTINATION_ROOT AUTH_TRANSFER_SHA AUTH_DATASET_SHA AUTH_WORKFLOW_SHA \
     AUTH_SOURCE_INVENTORY_SHA AUTH_SOURCE_FILE_COUNT AUTH_SOURCE_BYTES extra <<< "${line}"
@@ -1502,7 +1621,12 @@ confirm_cpu_cleanup() {
   read_cleanup_authorization
   remote_cleanup_arguments
   local line kind cleanup_status cleanup_mode cleanup_auth reclaimed receipt_sha extra
-  line="$(remote_cli "${CLEANUP_ARGUMENTS[@]}" --confirm --format tsv)"
+  local cleanup_progress
+  printf -v cleanup_progress "bytes_completed=0/%s" "${AUTH_SOURCE_BYTES}"
+  line="$(generation_run_with_heartbeat \
+    "cpu-cleanup-${RUN_ID}" 8 9 "Retention policy" \
+    "removing the exact authorized CPU source" "${cleanup_progress}" \
+    remote_cli "${CLEANUP_ARGUMENTS[@]}" --confirm --format tsv)"
   IFS=$'\t' read -r kind cleanup_status cleanup_mode cleanup_auth reclaimed receipt_sha extra <<< "${line}"
   [[ "${kind}" == cleanup && "${cleanup_status}" == complete \
     && "${cleanup_auth}" == "${AUTHORIZATION_SHA}" && -z "${extra:-}" ]] ||
@@ -1510,9 +1634,13 @@ confirm_cpu_cleanup() {
   validate_nonnegative "CPU reclaimed bytes" "${reclaimed}"
   validate_digest "${receipt_sha}"
   [[ "${reclaimed}" == "${AUTH_SOURCE_BYTES}" ]] || fail 1 "CPU reclaimed bytes differ from authorization."
-  local_cli record-cpu-cleanup "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" \
-    --authorization-sha256 "${AUTHORIZATION_SHA}" \
-    --cleanup-receipt-sha256 "${receipt_sha}" --reclaimed-bytes "${reclaimed}"
+  generation_run_with_heartbeat \
+    "cleanup-record-${RUN_ID}" 8 9 "Retention policy" \
+    "recording and revalidating cleanup completion" \
+    "bytes_completed=${reclaimed}/${AUTH_SOURCE_BYTES}" \
+    local_cli record-cpu-cleanup "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" \
+      --authorization-sha256 "${AUTHORIZATION_SHA}" \
+      --cleanup-receipt-sha256 "${receipt_sha}" --reclaimed-bytes "${reclaimed}"
   CPU_BYTES_RETAINED=0
   CPU_BYTES_RECLAIMED="${reclaimed}"
   CPU_CLEANUP_RECEIPT_SHA="${receipt_sha}"
@@ -2278,21 +2406,52 @@ apply_leaf_retention() {
   esac
 }
 
+prepare_leaf_for_parent() {
+  [[ "$RUN_KIND" == campaign ]] ||
+    fail 2 "Only campaign children support parent-owned retention."
+  ALL_STAGE="validated child gates awaiting parent finalization"
+  generation_console_stage 8 9 "Retention policy" RUNNING
+  prepare_all_receipt >/dev/null
+  generation_console_stage 8 9 "Retention policy" DEFERRED \
+    "parent-owned cleanup waits for paired finalization and parent validation"
+  generation_console_stage 9 9 "Child validation" RUNNING
+  generation_run_with_heartbeat \
+    "parent-gate-packages-$RUN_ID" 9 9 "Child validation" \
+    "validating required Dataset package state" "" \
+    local_cli validate-campaign-package-state "$RUN_ID" \
+      --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+  LEAF_STATE=ready_for_parent
+  generation_console_stage 9 9 "Child validation" OK \
+    "run_id=$RUN_ID host and required package gates complete"
+}
+
 validate_leaf_result() {
   case "$RUN_KIND" in
     campaign)
-      local_cli validate-all-workflow "$RUN_ID" \
-        --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
-      local_cli validate-campaign-package-state "$RUN_ID" \
-        --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
-      if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
-        local_cli validate-pilot-check "$RUN_ID" --require-cleanup-complete \
+      generation_run_with_heartbeat \
+        "final-workflow-$RUN_ID" 9 9 "Final validation" \
+        "validating terminal workflow and cleanup evidence" "" \
+        local_cli validate-all-workflow "$RUN_ID" \
           --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+      generation_run_with_heartbeat \
+        "final-packages-$RUN_ID" 9 9 "Final validation" \
+        "validating current Dataset package state" "" \
+        local_cli validate-campaign-package-state "$RUN_ID" \
+          --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+      if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
+        generation_run_with_heartbeat \
+          "final-pilot-$RUN_ID" 9 9 "Final validation" \
+          "validating pilot cleanup evidence" "" \
+          local_cli validate-pilot-check "$RUN_ID" --require-cleanup-complete \
+            --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
       fi
       ;;
     benchmark)
-      local_cli validate-core-benchmark "$RUN_ID" \
-        --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+      generation_run_with_heartbeat \
+        "final-benchmark-$RUN_ID" 9 9 "Final validation" \
+        "validating core benchmark publication" "" \
+        local_cli validate-core-benchmark "$RUN_ID" \
+          --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
       ;;
     *) fail 2 "Unsupported terminal-validation adapter: $RUN_KIND" ;;
   esac
@@ -2324,6 +2483,10 @@ run_leaf_plan() {
     generation_console_stage 7 9 "Packages/finalizer" RUNNING
     build_leaf_packages_and_finalizers
     generation_console_stage 7 9 "Packages/finalizer" OK "$LEAF_PACKAGE_DETAIL"
+    if [[ "$COMPOSITE_CHILD_MODE" == true ]]; then
+      prepare_leaf_for_parent
+      return
+    fi
     generation_console_stage 8 9 "Retention policy" REUSED \
       "historical CPU cleanup policy and receipts remain unchanged"
     ALL_STAGE="terminal package-extension validation"
@@ -2355,6 +2518,10 @@ run_leaf_plan() {
     generation_console_stage 7 9 "Packages/finalizer" RUNNING
     build_leaf_packages_and_finalizers
     generation_console_stage 7 9 "Packages/finalizer" OK "$LEAF_PACKAGE_DETAIL"
+    if [[ "$COMPOSITE_CHILD_MODE" == true ]]; then
+      prepare_leaf_for_parent
+      return
+    fi
     ALL_STAGE="reconstructed workflow receipt and guarded CPU retention policy"
     generation_console_stage 8 9 "Retention policy" RUNNING
     apply_leaf_retention
@@ -2400,6 +2567,10 @@ run_leaf_plan() {
   generation_console_stage 7 9 "Packages/finalizer" RUNNING
   build_leaf_packages_and_finalizers
   generation_console_stage 7 9 "Packages/finalizer" OK "$LEAF_PACKAGE_DETAIL"
+  if [[ "$COMPOSITE_CHILD_MODE" == true ]]; then
+    prepare_leaf_for_parent
+    return
+  fi
 
   ALL_STAGE="workflow receipt and guarded CPU retention policy"
   generation_console_stage 8 9 "Retention policy" RUNNING
@@ -2417,7 +2588,9 @@ run_leaf_plan() {
 run_workflow_plan() {
   local index
   WORKFLOW_CHILD_RUN_IDS=()
-  local workflow_result=REUSED
+  PAIRED_SMOKE_RECEIPT=""
+  local workflow_result=REUSED workflow_children
+  COMPOSITE_CHILD_MODE=true
   for ((index=0; index<RUN_CHILD_COUNT; index++)); do
     run_leaf_plan campaign \
       "${RUN_CHILD_CONFIGS[index]}" "${RUN_CHILD_IDENTITIES[index]}" \
@@ -2427,26 +2600,76 @@ run_workflow_plan() {
       workflow_result=OK
     fi
     case "$LEAF_STATE" in
-      complete) ;;
+      complete|ready_for_parent) ;;
       awaiting_collection)
         WORKFLOW_STATE="$LEAF_STATE"
         ;;
       *) fail 1 "Workflow child returned unsupported state: $LEAF_STATE" ;;
     esac
   done
+  COMPOSITE_CHILD_MODE=false
   if [[ "${WORKFLOW_STATE:-}" == awaiting_collection ]]; then
     printf 'AWAITING: workflow=%s state=awaiting_collection\n' "$RUN_PLAN_ID"
     return
   fi
   (( ${#WORKFLOW_CHILD_RUN_IDS[@]} == 2 )) ||
-    fail 1 "Paired Technical Smoke requires exactly two completed children."
+    fail 1 "Paired Technical Smoke requires exactly two host-complete children."
+  printf -v workflow_children "children=%s,%s" \
+    "${WORKFLOW_CHILD_RUN_IDS[0]}" "${WORKFLOW_CHILD_RUN_IDS[1]}"
+
   ALL_STAGE="paired Technical Smoke finalizer"
   generation_console_stage 8 9 "Paired finalizer" RUNNING
-  finalize_smoke_runs     "${WORKFLOW_CHILD_RUN_IDS[0]}" "${WORKFLOW_CHILD_RUN_IDS[1]}"
-  generation_console_stage 8 9 "Paired finalizer" OK     "workflow=$RUN_PLAN_ID"
-  local_cli validate-real-smoke --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
-  generation_console_stage 9 9 "Final validation" OK     "workflow=$RUN_PLAN_ID children=${WORKFLOW_CHILD_RUN_IDS[*]}"
+  finalize_smoke_runs \
+    "${WORKFLOW_CHILD_RUN_IDS[0]}" "${WORKFLOW_CHILD_RUN_IDS[1]}"
+  ALL_STAGE="complete parent workflow validation before cleanup"
+  generation_run_with_heartbeat \
+    "parent-validation-$RUN_PLAN_ID" 8 9 "Paired finalizer" \
+    "validating complete paired workflow before cleanup" "${workflow_children}" \
+    local_cli validate-real-smoke "$PAIRED_SMOKE_RECEIPT" \
+      --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+  generation_console_stage 8 9 "Paired finalizer" OK \
+    "workflow=$RUN_PLAN_ID ${workflow_children} parent_success=true"
+
+  for ((index=0; index<RUN_CHILD_COUNT; index++)); do
+    RUN_KIND=campaign
+    RUN_ID="${WORKFLOW_CHILD_RUN_IDS[index]}"
+    RUN_LEAF_CONFIG="${RUN_CHILD_CONFIGS[index]}"
+    CAMPAIGN_PURPOSE="${RUN_CHILD_PURPOSES[index]}"
+    RUN_LEAF_PROFILE="${RUN_CHILD_PROFILES[index]}"
+    ALL_STAGE="parent-authorized child CPU retention policy"
+    generation_console_stage 8 9 "Retention policy" RUNNING \
+      "parent_success=true child_run=$RUN_ID"
+    apply_leaf_retention
+    generation_console_stage 8 9 "Retention policy" OK \
+      "child_run=$RUN_ID keep_cpu_source=$KEEP_CPU_SOURCE reclaimed_bytes=$CPU_BYTES_RECLAIMED"
+  done
+
+  for ((index=0; index<RUN_CHILD_COUNT; index++)); do
+    RUN_KIND=campaign
+    RUN_ID="${WORKFLOW_CHILD_RUN_IDS[index]}"
+    RUN_LEAF_CONFIG="${RUN_CHILD_CONFIGS[index]}"
+    CAMPAIGN_PURPOSE="${RUN_CHILD_PURPOSES[index]}"
+    RUN_LEAF_PROFILE="${RUN_CHILD_PROFILES[index]}"
+    ALL_STAGE="terminal child validation after parent-owned retention"
+    generation_console_stage 9 9 "Final validation" RUNNING \
+      "child_run=$RUN_ID"
+    validate_leaf_result
+    generation_console_stage 9 9 "Final validation" OK \
+      "child_run=$RUN_ID parent_success=true"
+  done
+
+  ALL_STAGE="paired receipt stability after parent-owned retention"
+  generation_console_stage 9 9 "Final validation" RUNNING \
+    "workflow=$RUN_PLAN_ID post_cleanup=true"
+  generation_run_with_heartbeat \
+    "post-cleanup-parent-validation-$RUN_PLAN_ID" 9 9 "Final validation" \
+    "revalidating paired receipt after child retention" "${workflow_children}" \
+    local_cli validate-real-smoke "$PAIRED_SMOKE_RECEIPT" \
+      --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+  generation_console_stage 9 9 "Final validation" OK \
+    "workflow=$RUN_PLAN_ID ${workflow_children} post_cleanup=true"
   LEAF_RESULT="$workflow_result"
+  LEAF_STATE=complete
   WORKFLOW_STATE=complete
 }
 

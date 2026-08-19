@@ -776,6 +776,14 @@ for ((index=0; index<${#arguments[@]}; index++)); do
   esac
 done
 if [[ " $* " == *' validate-real-smoke '* ]]; then
+  if [[ "${FAKE_TARGET_VALIDATION_FAIL_AFTER_FIRST:-false}" == true \
+    && " $* " == *'/smoke_receipts/current.json '* ]]; then
+    validation_count=0
+    [[ ! -f "${FAKE_TARGET_VALIDATION_COUNT_FILE}" ]] || \
+      read -r validation_count < "${FAKE_TARGET_VALIDATION_COUNT_FILE}"
+    printf '%s\n' "$((validation_count + 1))" > "${FAKE_TARGET_VALIDATION_COUNT_FILE}"
+    (( validation_count == 0 )) || exit 4
+  fi
   receipt="${storage}/01_generation/meta/smoke_receipts/current.json"
   mkdir -p "$(dirname "${receipt}")"
   printf '%s\n' '{}' > "${receipt}"
@@ -800,6 +808,9 @@ elif [[ " $* " == *' publish-transferred-core-benchmark '* ]]; then
 elif [[ " $* " == *' core-benchmark-summary '* ]]; then
   printf '%s\n' '# Synthetic local core benchmark summary'
 elif [[ " $* " == *' publish-transferred-campaign '* ]]; then
+  if [[ "${FAKE_PUBLISH_DELAY_SECONDS:-0}" != 0 ]]; then
+    sleep "${FAKE_PUBLISH_DELAY_SECONDS}"
+  fi
   if [[ "${FAKE_PUBLISH_FAIL:-false}" == true ]]; then
     printf '%s\n' 'synthetic destination hash validation failed' >&2
     exit 4
@@ -823,7 +834,8 @@ elif [[ " $* " == *' build-campaign-datasets '* ]]; then
   printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
 elif [[ " $* " == *' prepare-all-workflow '* ]]; then
   : > "${FAKE_WORKFLOW_READY_FILE}"
-  if [[ " $* " == *' --keep-cpu-source '* ]]; then
+  if [[ " $* " == *' --keep-cpu-source '* \
+    && ( ! -f "${FAKE_SMOKE_WORKFLOW_FILE}" || -f "${FAKE_PARENT_FINALIZED_FILE}" ) ]]; then
     : > "${FAKE_WORKFLOW_COMPLETE_FILE}"
     printf '%s\n' '{"workflow_result":"success","cpu_cleanup_complete":{"status":"skipped_by_request"}}'
   else
@@ -834,7 +846,9 @@ elif [[ " $* " == *' validate-campaign-package-state '* ]]; then
   printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
 elif [[ " $* " == *' validate-all-workflow '* ]]; then
   [[ -f "${FAKE_WORKFLOW_COMPLETE_FILE}" ]]
-  if [[ -f "${FAKE_SMOKE_WORKFLOW_FILE}" ]]; then
+  if [[ -f "${FAKE_SMOKE_WORKFLOW_FILE}" \
+    && ! -f "${FAKE_PARENT_FINALIZED_FILE}" \
+    && "${FAKE_PRESERVE_WORKFLOW_COMPLETE:-false}" != true ]]; then
     rm -f -- "${FAKE_WORKFLOW_COMPLETE_FILE}"
   fi
   printf '%s\n' '{"workflow_result":"success"}'
@@ -856,9 +870,13 @@ elif [[ " $* " == *' finalize-technical-smoke-evidence '* ]]; then
   printf '%s\n' '{}' > "${evidence}"
   printf '/workspace/storage/01_generation/meta/campaigns/%s/technical_smoke_evidence.json\n' "${run_id}"
 elif [[ " $* " == *' finalize-real-smoke '* ]]; then
+  if [[ "${FAKE_FINALIZE_SMOKE_DELAY_SECONDS:-0}" != 0 ]]; then
+    sleep "${FAKE_FINALIZE_SMOKE_DELAY_SECONDS}"
+  fi
   if [[ "${FAKE_FINALIZE_SMOKE_FAIL:-false}" == true ]]; then
     exit 4
   fi
+  : > "${FAKE_PARENT_FINALIZED_FILE}"
   printf '%s\n' '/workspace/storage/01_generation/meta/smoke_receipts/current.json'
 elif [[ " $* " == *' record-workflow-failure '* ]]; then
   run_id="${arguments[3]}"
@@ -930,6 +948,8 @@ fi
             "FAKE_PACKAGE_STATE_READY_FILE": str(state_root / "package-state-ready"),
             "FAKE_WORKFLOW_READY_FILE": str(state_root / "workflow-ready"),
             "FAKE_WORKFLOW_COMPLETE_FILE": str(state_root / "workflow-complete"),
+            "FAKE_PARENT_FINALIZED_FILE": str(state_root / "parent-finalized"),
+            "FAKE_TARGET_VALIDATION_COUNT_FILE": str(state_root / "target-validation-count"),
             "FAKE_REMOTE_CLEANED_FILE": str(state_root / "remote-cleaned"),
             "FAKE_SOURCE_DIRECTORIES_FILE": str(source_directories_file),
             "FAKE_LOCAL_PYTHON": str(local_python),
@@ -1728,6 +1748,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     assert log_text.count("submit-campaign") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text
     assert "<finalize-real-smoke>" in log_text
+    assert "<cpu-cleanup-authorization>" not in log_text
     assert result.stdout.count("reused=0 generated=1") == 2
     assert result.stdout.count("DONE:") == 1
     assert "run_identity=workflow__0123456789abcdef state=complete" in result.stdout.splitlines()[-1]
@@ -1737,14 +1758,14 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
 
 
 def test_smoke_finalization_failure_prints_no_top_level_done(tmp_path: Path) -> None:
-    """Do not announce top-level success before paired finalization succeeds."""
-    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
-    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    """Retain both CPU children when paired finalization does not succeed."""
+    workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
     environment["FAKE_FINALIZE_SMOKE_FAIL"] = "true"
 
     result = _run(
         workflow,
-        ["run", str(_smoke_workflow(workflow)), *_remote_options(), "--keep-cpu-source"],
+        ["run", str(_smoke_workflow(workflow)), *_remote_options()],
         environment,
     )
 
@@ -1752,6 +1773,136 @@ def test_smoke_finalization_failure_prints_no_top_level_done(tmp_path: Path) -> 
     assert result.stdout.count("reused=0 generated=1") >= 1
     assert "DONE:" not in result.stdout
     assert "Could not atomically finalize paired Technical Smoke evidence" in result.stderr
+    continuation = next(line for line in result.stderr.splitlines() if "generation_workflow.sh run" in line)
+    assert "technical_smoke.yaml" in continuation
+    assert all((mirror / relative).is_dir() for relative in source_directories)
+    log_text = log.read_text(encoding="utf-8")
+    assert "<cpu-cleanup-authorization>" not in log_text
+    assert "cleanup-campaign-source" not in log_text
+    assert "<record-cpu-cleanup>" not in log_text
+
+
+def test_parent_validation_targets_just_finalized_receipt_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Do not let an unrelated valid receipt authorize child cleanup."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
+    unrelated = storage / "01_generation/meta/smoke_receipts/unrelated.json"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("{}\n", encoding="utf-8")
+    environment["FAKE_TARGET_VALIDATION_FAIL_AFTER_FIRST"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_smoke_workflow(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "DONE:" not in result.stdout
+    assert Path(environment["FAKE_TARGET_VALIDATION_COUNT_FILE"]).read_text(encoding="utf-8").strip() == "2"
+    assert all((mirror / relative).is_dir() for relative in source_directories)
+    log_text = log.read_text(encoding="utf-8")
+    assert "<cpu-cleanup-authorization>" not in log_text
+    assert "cleanup-campaign-source" not in log_text
+
+
+def test_smoke_cleanup_follows_parent_receipt_and_survives_retention(
+    tmp_path: Path,
+) -> None:
+    """Authorize child cleanup only after the paired receipt validates."""
+    workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
+
+    result = _run(
+        workflow,
+        ["run", str(_smoke_workflow(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
+    assert (mirror / source_directories[3]).is_dir()
+    log_text = log.read_text(encoding="utf-8")
+    finalizer = log_text.index("<finalize-real-smoke>")
+    cleanup = log_text.index("<cpu-cleanup-authorization>")
+    pre_cleanup_validation = log_text.rfind("<validate-real-smoke>", 0, cleanup)
+    cleanup_record = log_text.rfind("<record-cpu-cleanup>")
+    post_cleanup_validation = log_text.find("<validate-real-smoke>", cleanup_record)
+    assert finalizer < pre_cleanup_validation < cleanup < cleanup_record
+    assert post_cleanup_validation > cleanup_record
+    assert result.stdout.count("DONE:") == 1
+
+
+def test_smoke_defer_collection_stops_before_host_finalization_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Retain both composite children when collection is explicitly deferred."""
+    workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
+
+    result = _run(
+        workflow,
+        [
+            "run",
+            str(_smoke_workflow(workflow)),
+            *_remote_options(),
+            "--defer-collection",
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "state=awaiting_collection" in result.stdout
+    assert "DONE:" not in result.stdout
+    assert all((mirror / relative).is_dir() for relative in source_directories)
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count("submit-campaign") == 2
+    for forbidden in (
+        "rsync-start",
+        "<build-campaign-datasets>",
+        "<finalize-real-smoke>",
+        "<validate-real-smoke>",
+        "<cpu-cleanup-authorization>",
+        "cleanup-campaign-source",
+    ):
+        assert forbidden not in log_text
+
+
+def test_completed_cpu_cleaned_smoke_children_reach_parent_without_new_work(
+    tmp_path: Path,
+) -> None:
+    """Reuse completed children and run only paired downstream finalization."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    Path(environment["FAKE_DATASETS_COMPLETE_FILE"]).touch()
+    Path(environment["FAKE_PACKAGE_STATE_READY_FILE"]).touch()
+    Path(environment["FAKE_WORKFLOW_COMPLETE_FILE"]).touch()
+    Path(environment["FAKE_REMOTE_CLEANED_FILE"]).touch()
+    Path(environment["FAKE_SOURCE_DIRECTORIES_FILE"]).write_text("", encoding="utf-8")
+    environment["FAKE_COMPATIBLE_SMOKE_STATUS"] = "compatible_complete"
+    environment["FAKE_PRESERVE_WORKFLOW_COMPLETE"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_smoke_workflow(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "<finalize-real-smoke>" in log_text
+    assert "<validate-real-smoke>" in log_text
+    for forbidden in (
+        "<prepare-campaign-inputs>",
+        "<plan-campaign>",
+        "<submit-campaign>",
+        "<resume-campaign>",
+        "<publish-transferred-campaign>",
+        "<build-campaign-datasets>",
+    ):
+        assert forbidden not in log_text
+    assert result.stdout.count("DONE:") == 1
 
 
 def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) -> None:
@@ -2343,6 +2494,77 @@ def test_core_benchmark_failure_does_not_finalize(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "<finalize-core-benchmark>" not in log.read_text(encoding="utf-8")
+
+
+def test_slow_host_publication_emits_heartbeat_and_fast_path_is_quiet(
+    tmp_path: Path,
+) -> None:
+    """Emit bounded semantic progress only while host publication is slow."""
+    workflow, _log, environment, _storage, mirror = _harness(tmp_path)
+    _seed_transfer(mirror, environment)
+    environment["FAKE_PUBLISH_DELAY_SECONDS"] = "2"
+    environment["GENERATION_CONSOLE_HEARTBEAT_SECONDS"] = "1"
+
+    slow = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert slow.returncode == 0, slow.stderr
+    assert "stage=Host publication" in slow.stderr
+    assert "operation=validating destination inventory and hashes" in slow.stderr
+    assert "directories_completed=5/5" in slow.stderr
+    assert "elapsed=" in slow.stderr
+    assert "last_progress_at=" in slow.stderr
+    assert "heartbeat=active" in slow.stderr
+    assert "eta=unavailable" in slow.stderr
+
+    fast_root = tmp_path / "fast"
+    fast_root.mkdir()
+    fast_workflow, _log, fast_environment, _storage, fast_mirror = _harness(fast_root)
+    _seed_transfer(fast_mirror, fast_environment)
+    fast_environment["GENERATION_CONSOLE_HEARTBEAT_SECONDS"] = "1"
+
+    fast = _run(
+        fast_workflow,
+        [
+            "run",
+            str(_campaign(fast_workflow)),
+            *_remote_options(),
+            "--keep-cpu-source",
+        ],
+        fast_environment,
+    )
+
+    assert fast.returncode == 0, fast.stderr
+    assert "heartbeat=active" not in fast.stderr
+
+
+def test_slow_paired_finalization_emits_parent_and_child_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """Report paired receipt progress with stable parent and child identity."""
+    workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_FINALIZE_SMOKE_DELAY_SECONDS"] = "2"
+    environment["GENERATION_CONSOLE_HEARTBEAT_SECONDS"] = "1"
+
+    result = _run(
+        workflow,
+        ["run", str(_smoke_workflow(workflow)), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "stage=Paired finalizer" in result.stderr
+    assert "run_id=workflow__0123456789abcdef" in result.stderr
+    assert f"child_run={_RUN_ID}" in result.stderr
+    assert "operation=building and validating paired Smoke payload" in result.stderr
+    assert "elapsed=" in result.stderr
+    assert "last_progress_at=" in result.stderr
+    assert "heartbeat=active" in result.stderr
+    assert "eta=unavailable" in result.stderr
 
 
 def test_automatic_collection_is_non_destructive_and_failure_retains_staging(tmp_path: Path) -> None:

@@ -137,6 +137,9 @@ def test_post_transfer_operational_paths_do_not_change_campaign_transfer_identit
     progress_directory = campaign / campaign_evidence.RUNTIME_PROGRESS_DIRECTORY_NAME
     progress_directory.mkdir()
     (progress_directory / "123.json").write_text("{}\n", encoding="utf-8")
+    failure_directory = campaign / "workflow_failures"
+    failure_directory.mkdir()
+    (failure_directory / "failure-0001.json").write_text("{}\n", encoding="utf-8")
 
     assert (
         campaign_evidence.directory_identity(

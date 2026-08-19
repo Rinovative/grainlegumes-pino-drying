@@ -8,7 +8,7 @@ Responsibilities:
   - Require contrasting terminal steady and transient Slurm cases
   - Bind retained inputs, exports, HDF5, packages, loaders, and source identities
   - Report paired airflow differences and transient mass-balance observations
-  - Write and revalidate one immutable runtime-validation receipt
+  - Publish current paired evidence with immutable stale-receipt history
 Design principles:
   - Existing campaign and all-workflow receipts remain the lifecycle authorities
   - Equivalence and mass balance are reported without invented pass tolerances
@@ -65,6 +65,21 @@ _AIRFLOW_FIELD_NAMES: Final = domain.fields.STATE_FIELDS
 _MINIMUM_CONTRASTING_CASES: Final = 2
 _EXPECTED_PROFILE_COUNT: Final = 2
 _SHA256_LENGTH: Final = 64
+_MAX_MISMATCH_PATHS: Final = 24
+_REPAIR_SCHEMA_KIND: Final = "vp2_real_runtime_smoke_repair"
+_MISMATCH_CATEGORIES: Final = frozenset(
+    {
+        "scientific_source_binding",
+        "template_binding",
+        "case_artifact_binding",
+        "dataset_package_binding",
+        "workflow_gate_binding",
+        "cpu_retention_state",
+        "timestamps",
+        "job_ids",
+        "other_lifecycle_metadata",
+    }
+)
 _COMSOL_EXACT_VERSION_PATTERN: Final = re.compile(r"(?<![0-9.])([0-9]+(?:[.][0-9]+){2,3})(?![0-9.])")
 _TECHNICAL_SMOKE_EVIDENCE_KEYS: Final = frozenset(
     {
@@ -122,6 +137,23 @@ class _CaseEvidence:
     schedule: np.ndarray | None
     global_values: np.ndarray | None
     initial_state: dict[str, np.ndarray]
+
+
+class _StaleRealSmokeReceiptError(ValueError):
+    """Carry one validated current payload for fail-closed receipt repair."""
+
+    def __init__(
+        self,
+        *,
+        receipt: dict[str, Any],
+        expected: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> None:
+        message = f"Real runtime-smoke receipt is stale: {json.dumps(diagnostics, sort_keys=True)}"
+        super().__init__(message)
+        self.receipt = receipt
+        self.expected = expected
+        self.diagnostics = diagnostics
 
 
 def _utc_now() -> str:
@@ -571,7 +603,7 @@ def _validate_campaign(
     tuple[_CaseEvidence, ...],
 ]:
     """Validate one completed technical-smoke workflow and its host artifacts."""
-    workflow = workflow_service.validate_completed_workflow(
+    workflow = workflow_service.validate_all_workflow_receipt(
         run_id,
         storage_root=storage,
     )
@@ -592,7 +624,7 @@ def _validate_campaign(
         or batch is None
         or len(batch.case_indices) < _MINIMUM_CONTRASTING_CASES
         or batch.sampling_regime != "natural"
-        or workflow["cpu_cleanup_complete"]["status"] not in {"complete", "skipped_by_request"}
+        or workflow["cpu_cleanup_complete"]["status"] not in {"pending", "complete", "skipped_by_request"}
     ):
         message = f"Campaign run {run_id!r} is not a completed {expected_profile!r} technical smoke with at least two natural cases."
         raise ValueError(message)
@@ -1440,43 +1472,19 @@ def _mass_balance_case(case: _CaseEvidence) -> dict[str, Any]:
 def _source_binding(
     campaigns: Sequence[config_service.CampaignConfig],
 ) -> dict[str, Any]:
-    """Return exact source-file and resolved-campaign identities."""
-    repository = common.paths.get_project_root().resolve()
-    source_paths = {source_path.resolve() for campaign in campaigns for source_path in campaign.source_files}
-    records = []
-    for path in sorted(source_paths):
-        if not path.is_file() or path.is_symlink():
-            message = f"Required smoke source is missing or unsafe: {path}"
-            raise FileNotFoundError(message)
-        try:
-            relative_path = path.relative_to(repository).as_posix()
-        except ValueError as error:
-            message = f"Smoke source escapes the configured project root: {path}"
-            raise ValueError(message) from error
-        records.append(
-            {
-                "relative_path": relative_path,
-                "sha256": common.serialization.file_sha256(path),
-                "size_bytes": path.stat().st_size,
-            }
-        )
-    campaign_records = [
+    """Return resolved scientific identities without mutable source-byte bindings."""
+    records = [
         {
             "campaign_id": campaign.campaign_id,
             "campaign_digest": campaign.campaign_digest,
             "simulation_profile": campaign.profile.id,
+            "batch_ids": [batch.batch_id for batch in campaign.batches],
         }
         for campaign in campaigns
     ]
     return {
-        "files": records,
-        "resolved_campaigns": campaign_records,
-        "bundle_digest": common.serialization.canonical_json_sha256(
-            {
-                "files": records,
-                "resolved_campaigns": campaign_records,
-            }
-        ),
+        "resolved_campaigns": records,
+        "bundle_digest": common.serialization.canonical_json_sha256(records),
     }
 
 
@@ -1500,22 +1508,22 @@ def _campaign_record(
     terminal: Mapping[str, Any],
     workflow: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return campaign, terminal, mapping, and lifecycle identity evidence."""
+    """Return resolved scientific, workflow-gate, and requested-retention evidence."""
     return {
         "campaign_run_id": run_id,
         "campaign_id": campaign.campaign_id,
-        "campaign_name": campaign.campaign_name,
         "campaign_purpose": campaign.campaign_purpose,
         "campaign_digest": campaign.campaign_digest,
-        "campaign_config": terminal["campaign_config"],
-        "campaign_config_sha256": common.serialization.file_sha256(campaign.source_path),
         "profile": campaign.profile.id,
         "selected_batch_ids": [batch["batch_id"] for batch in terminal["batches"]],
         "git_commit": terminal["git_commit"],
         "slurm_job_ids": list(terminal["slurm_job_ids"]),
         "dataset_ids": list(workflow["dataset_ids"]),
         "workflow_gate_sha256": workflow["workflow_gate_sha256"],
-        "cpu_source_retention": workflow["cpu_cleanup_complete"],
+        "cpu_source_retention": {
+            "cleanup_requested": workflow["cleanup_requested"],
+            "policy": ("cleanup_after_parent_success" if workflow["cleanup_requested"] else "retain_by_request"),
+        },
     }
 
 
@@ -1539,7 +1547,7 @@ def _profile_mapping_binding(campaigns: Sequence[config_service.CampaignConfig])
 
 
 def _dataset_records(workflows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Return exact package hashes, inspections, and two-worker smoke evidence."""
+    """Return launch-time required package hashes, inspections, and loader evidence."""
     records: list[dict[str, Any]] = []
     for workflow in workflows:
         for dataset_id, package_hash, inspection, loader_smoke in zip(
@@ -1581,11 +1589,18 @@ def _paired_comsol_contract(
     if version is None:
         message = f"Configured COMSOL module must expose a version suffix: {module!r}."
         raise ValueError(message)
-    return {
-        "module": module,
-        "executable": executable,
-        "required_version": version,
-    }
+    return {"module": module, "executable": executable, "required_version": version}
+
+
+def _json_normalize(value: Any) -> Any:
+    """Normalize rebuilt values to JSON-persisted container types."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_normalize(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _build_payload(
@@ -1596,29 +1611,17 @@ def _build_payload(
     recorded_at: str,
     comsol_version_output: str,
 ) -> dict[str, Any]:
-    """Recompute the complete receipt payload except its self-digest."""
+    """Recompute every immutable paired receipt binding except its self-digest."""
     steady_campaign, steady_terminal, steady_workflow, steady_cases = _validate_campaign(
-        steady_run_id,
-        expected_profile=profiles.STEADY_FLOW_PROFILE,
-        storage=storage,
+        steady_run_id, expected_profile=profiles.STEADY_FLOW_PROFILE, storage=storage
     )
     transient_campaign, transient_terminal, transient_workflow, transient_cases = _validate_campaign(
-        transient_run_id,
-        expected_profile=profiles.TRANSIENT_DRYING_PROFILE,
-        storage=storage,
+        transient_run_id, expected_profile=profiles.TRANSIENT_DRYING_PROFILE, storage=storage
     )
-    steady_batch, transient_batch = _paired_smoke_batches(
-        steady_campaign,
-        transient_campaign,
-    )
-    scientific_git_commits = {
-        profiles.STEADY_FLOW_PROFILE: steady_terminal["git_commit"],
-        profiles.TRANSIENT_DRYING_PROFILE: transient_terminal["git_commit"],
-    }
+    steady_batch, transient_batch = _paired_smoke_batches(steady_campaign, transient_campaign)
     comsol_contract = _paired_comsol_contract((steady_campaign, transient_campaign))
     if not isinstance(comsol_version_output, str) or not preflight_service.reported_version_matches(
-        comsol_version_output,
-        comsol_contract["required_version"],
+        comsol_version_output, comsol_contract["required_version"]
     ):
         message = f"Real-smoke receipt version output does not report configured COMSOL version {comsol_contract['required_version']!r}."
         raise ValueError(message)
@@ -1626,24 +1629,35 @@ def _build_payload(
     if len(source_hosts) != 1:
         message = "Paired technical smoke runs came from different CPU hosts."
         raise RuntimeError(message)
-    steady_variation = _variation_report(steady_cases, profile_id=profiles.STEADY_FLOW_PROFILE)
-    transient_variation = _variation_report(transient_cases, profile_id=profiles.TRANSIENT_DRYING_PROFILE)
     all_cases = (*steady_cases, *transient_cases)
-    profile_mappings = _profile_mapping_binding((steady_campaign, transient_campaign))
+    campaign_records = [
+        _campaign_record(
+            steady_run_id,
+            steady_campaign,
+            steady_terminal,
+            steady_workflow,
+        ),
+        _campaign_record(
+            transient_run_id,
+            transient_campaign,
+            transient_terminal,
+            transient_workflow,
+        ),
+    ]
     payload: dict[str, Any] = {
         "schema_kind": REAL_SMOKE_SCHEMA_KIND,
         "schema_version": REAL_SMOKE_SCHEMA_VERSION,
         "status": "observations_complete_no_scientific_acceptance_threshold",
         "recorded_at": recorded_at,
-        "scientific_git_commits": scientific_git_commits,
+        "scientific_git_commits": {
+            profiles.STEADY_FLOW_PROFILE: steady_terminal["git_commit"],
+            profiles.TRANSIENT_DRYING_PROFILE: transient_terminal["git_commit"],
+        },
         "material_family_inventory": [steady_batch.material_family],
         "source_binding": _source_binding((steady_campaign, transient_campaign)),
         "templates": _template_binding((steady_campaign, transient_campaign)),
-        "profile_mappings": profile_mappings,
-        "campaigns": [
-            _campaign_record(steady_run_id, steady_campaign, steady_terminal, steady_workflow),
-            _campaign_record(transient_run_id, transient_campaign, transient_terminal, transient_workflow),
-        ],
+        "profile_mappings": _profile_mapping_binding((steady_campaign, transient_campaign)),
+        "campaigns": campaign_records,
         "cases": [case.record for case in all_cases],
         "comsol": {
             "required_version": comsol_contract["required_version"],
@@ -1658,9 +1672,9 @@ def _build_payload(
         },
         "dataset_packages": _dataset_records((steady_workflow, transient_workflow)),
         "cpu_source_retention": {
-            "steady": steady_workflow["cpu_cleanup_complete"],
-            "transient": transient_workflow["cpu_cleanup_complete"],
-            "review_required_before_cleanup": True,
+            "steady": campaign_records[0]["cpu_source_retention"],
+            "transient": campaign_records[1]["cpu_source_retention"],
+            "parent_success_required_before_cleanup": True,
         },
         "template_equivalence": _equivalence_report(
             steady_cases,
@@ -1673,14 +1687,17 @@ def _build_payload(
             "cases": [_mass_balance_case(case) for case in transient_cases],
             "acceptance_tolerance": None,
         },
-        "acceptance_tolerances": {
-            "template_equivalence": None,
-            "mass_balance": None,
-        },
+        "acceptance_tolerances": {"template_equivalence": None, "mass_balance": None},
     }
-    payload["campaigns"][0]["input_variation"] = steady_variation
-    payload["campaigns"][1]["input_variation"] = transient_variation
-    return payload
+    payload["campaigns"][0]["input_variation"] = _variation_report(
+        steady_cases,
+        profile_id=profiles.STEADY_FLOW_PROFILE,
+    )
+    payload["campaigns"][1]["input_variation"] = _variation_report(
+        transient_cases,
+        profile_id=profiles.TRANSIENT_DRYING_PROFILE,
+    )
+    return _json_normalize(payload)
 
 
 def real_smoke_receipt_path(
@@ -1689,30 +1706,131 @@ def real_smoke_receipt_path(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Return the canonical immutable receipt path for one paired smoke."""
-    steady = common.paths.validate_logical_name(steady_run_id, label="steady_campaign_run_id")
-    transient = common.paths.validate_logical_name(transient_run_id, label="transient_campaign_run_id")
+    """Return the canonical current receipt path for one paired smoke."""
+    steady = common.paths.validate_logical_name(
+        steady_run_id,
+        label="steady_campaign_run_id",
+    )
+    transient = common.paths.validate_logical_name(
+        transient_run_id,
+        label="transient_campaign_run_id",
+    )
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    return common.paths.get_generation_meta_root(storage_root=storage) / "real_smoke" / f"{steady}--{transient}.json"
+    filename = f"{steady}--{transient}.json"
+    return common.paths.get_generation_meta_root(storage_root=storage) / "real_smoke" / filename
 
 
-def validate_real_smoke_receipt(
-    path: Path | str,
-    *,
-    storage_root: Path | str | None = None,
+def _mismatch_category(location: str) -> str:
+    """Classify one differing receipt path by durable ownership."""
+    if "workflow_gate" in location:
+        return "workflow_gate_binding"
+    if "cpu_source_retention" in location or location.endswith("/cleanup_requested"):
+        return "cpu_retention_state"
+    if "job_id" in location or location.startswith("/slurm"):
+        return "job_ids"
+    if location.endswith("_at") or "/recorded_at" in location or "timestamp" in location:
+        return "timestamps"
+    if location.startswith("/dataset_packages") or "/dataset_ids" in location or "loader_smoke" in location or "package_inspection" in location:
+        return "dataset_package_binding"
+    if location.startswith("/cases"):
+        return "case_artifact_binding"
+    if location.startswith(("/templates", "/profile_mappings")):
+        return "template_binding"
+    if location.startswith(
+        (
+            "/source_binding",
+            "/scientific_git_commits",
+            "/material_family_inventory",
+            "/campaigns",
+        )
+    ):
+        return "scientific_source_binding"
+    return "other_lifecycle_metadata"
+
+
+def _receipt_diagnostics(
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    expected: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Recompute every durable binding and validate one immutable receipt."""
-    receipt_path = Path(path).expanduser().resolve()
-    receipt = _json_object(receipt_path, label="real runtime-smoke receipt")
+    """Return bounded JSON-path mismatch evidence for stale receipt repair."""
+    paths: list[str] = []
+    categories: set[str] = set()
+    difference_count = 0
+
+    def record(location: str) -> None:
+        nonlocal difference_count
+        difference_count += 1
+        normalized_location = location or "/"
+        categories.add(_mismatch_category(normalized_location))
+        if len(paths) < _MAX_MISMATCH_PATHS:
+            paths.append(normalized_location)
+
+    def visit(left: Any, right: Any, location: str) -> None:
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            for key in sorted(set(left) | set(right)):
+                child = f"{location}/{key}"
+                if key not in left or key not in right:
+                    record(child)
+                else:
+                    visit(left[key], right[key], child)
+            return
+        if isinstance(left, list) and isinstance(right, list):
+            for index in range(max(len(left), len(right))):
+                child = f"{location}/{index}"
+                if index >= len(left) or index >= len(right):
+                    record(child)
+                else:
+                    visit(left[index], right[index], child)
+            return
+        if left != right:
+            record(location)
+
+    visit(receipt, expected, "")
+
+    expected_digest = expected.get("receipt_digest")
+    if not isinstance(expected_digest, str):
+        message = "Current paired receipt payload lacks its expected digest."
+        raise TypeError(message)
+    return {
+        "receipt_path": str(receipt_path),
+        "receipt_file_sha256": common.serialization.file_sha256(receipt_path),
+        "receipt_declared_digest": receipt.get("receipt_digest"),
+        "current_expected_digest": expected_digest,
+        "mismatch_categories": sorted(categories),
+        "difference_count": difference_count,
+        "differing_json_paths": paths,
+        "differences_truncated": difference_count > len(paths),
+        "repair_safe": True,
+        "next_automatic_action": ("preserve stale bytes and atomically publish the validated current receipt"),
+    }
+
+
+def _receipt_contract(
+    path: Path,
+    *,
+    storage: Path,
+    require_canonical_path: bool,
+) -> tuple[dict[str, Any], str, str]:
+    """Load one exact schema-v1 receipt and return its paired run identities."""
+    receipt = _json_object(path, label="real runtime-smoke receipt")
     if (
         set(receipt) != _RECEIPT_KEYS
         or receipt.get("schema_kind") != REAL_SMOKE_SCHEMA_KIND
         or receipt.get("schema_version") != REAL_SMOKE_SCHEMA_VERSION
     ):
-        message = f"Real runtime-smoke receipt schema is invalid: {receipt_path}"
+        message = f"Real runtime-smoke receipt schema is invalid: {path}"
+        raise ValueError(message)
+    declared_digest = receipt.get("receipt_digest")
+    if not isinstance(declared_digest, str) or re.fullmatch(r"[0-9a-f]{64}", declared_digest) is None:
+        message = f"Real runtime-smoke receipt self-digest is malformed: {path}"
         raise ValueError(message)
     campaigns = receipt.get("campaigns")
-    if not isinstance(campaigns, list) or len(campaigns) != _EXPECTED_PROFILE_COUNT:
+    if (
+        not isinstance(campaigns, list)
+        or len(campaigns) != _EXPECTED_PROFILE_COUNT
+        or not all(isinstance(campaign, Mapping) for campaign in campaigns)
+    ):
         message = "Real runtime-smoke receipt must bind exactly two campaigns."
         raise ValueError(message)
     steady_run_id = campaigns[0].get("campaign_run_id")
@@ -1720,47 +1838,388 @@ def validate_real_smoke_receipt(
     if not isinstance(steady_run_id, str) or not isinstance(transient_run_id, str):
         message = "Real runtime-smoke campaign run IDs are missing."
         raise TypeError(message)
-    expected_path = real_smoke_receipt_path(steady_run_id, transient_run_id, storage_root=storage_root)
-    if receipt_path != expected_path:
-        message = f"Real runtime-smoke receipt is outside its canonical immutable path: {receipt_path}"
-        raise ValueError(message)
-    comsol = receipt.get("comsol")
-    recorded_at = receipt.get("recorded_at")
-    if not isinstance(comsol, dict) or not isinstance(comsol.get("version_output"), str) or not isinstance(recorded_at, str) or not recorded_at:
-        message = "Real runtime-smoke timestamp or COMSOL evidence is malformed."
-        raise TypeError(message)
-    expected = _build_payload(
+    canonical = real_smoke_receipt_path(
         steady_run_id,
         transient_run_id,
-        storage=workspace_service.resolve_storage_root(storage_root, create=False),
-        recorded_at=recorded_at,
-        comsol_version_output=comsol["version_output"],
+        storage_root=storage,
     )
-    digest = common.serialization.canonical_json_sha256(expected)
-    expected["receipt_digest"] = digest
-    if receipt != expected:
-        message = f"Real runtime-smoke receipt no longer matches current artifacts or source: {receipt_path}"
+    if require_canonical_path and path != canonical:
+        message = f"Real runtime-smoke receipt is outside its canonical current path: {path}"
         raise ValueError(message)
-    return receipt
+    return receipt, steady_run_id, transient_run_id
+
+
+def _expected_receipt(
+    receipt: Mapping[str, Any],
+    steady_run_id: str,
+    transient_run_id: str,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Build one current receipt from authoritative host artifacts."""
+    comsol = receipt.get("comsol")
+    recorded_at = receipt.get("recorded_at")
+    if not isinstance(comsol, Mapping) or not isinstance(comsol.get("version_output"), str) or not isinstance(recorded_at, str) or not recorded_at:
+        message = "Real runtime-smoke timestamp or COMSOL evidence is malformed."
+        raise TypeError(message)
+    expected = _json_normalize(
+        _build_payload(
+            steady_run_id,
+            transient_run_id,
+            storage=storage,
+            recorded_at=recorded_at,
+            comsol_version_output=comsol["version_output"],
+        )
+    )
+    expected["receipt_digest"] = common.serialization.canonical_json_sha256(expected)
+    return expected
+
+
+def _validate_real_smoke_receipt(
+    path: Path,
+    *,
+    storage: Path,
+    require_canonical_path: bool,
+) -> dict[str, Any]:
+    """Validate one canonical or content-addressed receipt against current artifacts."""
+    receipt, steady_run_id, transient_run_id = _receipt_contract(
+        path,
+        storage=storage,
+        require_canonical_path=require_canonical_path,
+    )
+    expected = _expected_receipt(
+        receipt,
+        steady_run_id,
+        transient_run_id,
+        storage=storage,
+    )
+    normalized = _json_normalize(receipt)
+    if normalized != expected:
+        diagnostics = _receipt_diagnostics(path, normalized, expected)
+        raise _StaleRealSmokeReceiptError(
+            receipt=normalized,
+            expected=expected,
+            diagnostics=diagnostics,
+        )
+    return normalized
+
+
+def validate_real_smoke_receipt(
+    path: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Recompute and validate one canonical current paired receipt."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    receipt_path = Path(path).expanduser().resolve()
+    return _validate_real_smoke_receipt(
+        receipt_path,
+        storage=storage,
+        require_canonical_path=True,
+    )
+
+
+def _validate_persisted_receipt_payload(
+    path: Path,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one atomic JSON round trip without rehashing host artifacts."""
+    persisted = _json_normalize(_json_object(path, label="persisted real runtime-smoke receipt"))
+    if persisted != expected:
+        message = f"Persisted real runtime-smoke receipt differs after publication: {path}"
+        raise RuntimeError(message)
+    digest = persisted.get("receipt_digest")
+    payload = dict(persisted)
+    payload.pop("receipt_digest", None)
+    if not isinstance(digest, str) or common.serialization.canonical_json_sha256(payload) != digest:
+        message = f"Persisted real runtime-smoke receipt self-digest is invalid: {path}"
+        raise RuntimeError(message)
+    return persisted
+
+
+def _write_immutable_bytes(path: Path, payload: bytes, *, label: str) -> None:
+    """Publish exact bytes once or require an existing identical immutable copy."""
+    if path.exists():
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != payload:
+            message = f"{label} conflicts with existing immutable evidence: {path}"
+            raise RuntimeError(message)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    common.serialization.atomic_write_bytes(path, payload)
+    if path.read_bytes() != payload:
+        message = f"{label} changed during atomic publication: {path}"
+        raise RuntimeError(message)
+
+
+def _repair_paths(
+    path: Path,
+    stale_bytes: bytes,
+    replacement_digest: str,
+) -> tuple[Path, Path, Path]:
+    """Return content-addressed history, replacement, and linkage paths."""
+    root = path.parent / "receipt_repairs" / path.stem
+    stale_digest = hashlib.sha256(stale_bytes).hexdigest()
+    link_name = f"{stale_digest}--{replacement_digest}.json"
+    return (
+        root / "history" / f"{stale_digest}.json",
+        root / "replacements" / f"{replacement_digest}.json",
+        root / "links" / link_name,
+    )
+
+
+def _repair_linkage(
+    *,
+    canonical_path: Path,
+    history_path: Path,
+    replacement_path: Path,
+    stale_receipt: Mapping[str, Any],
+    stale_bytes: bytes,
+    replacement: Mapping[str, Any],
+    diagnostics: Mapping[str, Any],
+    storage: Path,
+) -> dict[str, Any]:
+    """Return the durable relationship between stale and replacement evidence."""
+    replacement_digest = replacement.get("receipt_digest")
+    if not isinstance(replacement_digest, str):
+        message = "Replacement paired receipt lacks its self-digest."
+        raise TypeError(message)
+    stale_recorded_at = stale_receipt.get("recorded_at")
+    replacement_recorded_at = replacement.get("recorded_at")
+    if not isinstance(stale_recorded_at, str) or not stale_recorded_at or not isinstance(replacement_recorded_at, str) or not replacement_recorded_at:
+        message = "Paired receipt repair timestamps are incomplete."
+        raise TypeError(message)
+    return {
+        "schema_kind": _REPAIR_SCHEMA_KIND,
+        "schema_version": REAL_SMOKE_SCHEMA_VERSION,
+        "status": "replacement_published",
+        "canonical_receipt_relative_path": _relative(
+            canonical_path,
+            storage=storage,
+        ),
+        "history_relative_path": _relative(history_path, storage=storage),
+        "replacement_relative_path": _relative(
+            replacement_path,
+            storage=storage,
+        ),
+        "stale_receipt_file_sha256": hashlib.sha256(stale_bytes).hexdigest(),
+        "stale_receipt_declared_digest": stale_receipt.get("receipt_digest"),
+        "replacement_receipt_digest": replacement_digest,
+        "replacement_file_sha256": common.serialization.file_sha256(replacement_path),
+        "reason": ("canonical_receipt_stale_but_current_authoritative_artifacts_valid"),
+        "mismatch_categories": diagnostics["mismatch_categories"],
+        "mismatch_paths": diagnostics["differing_json_paths"],
+        "difference_count": diagnostics["difference_count"],
+        "stale_recorded_at": stale_recorded_at,
+        "replacement_recorded_at": replacement_recorded_at,
+    }
+
+
+def _publish_repair_link(
+    path: Path,
+    stable_linkage: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish one idempotent immutable repair link with one recorded timestamp."""
+    if path.exists():
+        existing = _json_object(path, label="real runtime-smoke repair linkage")
+        repaired_at = existing.get("repaired_at")
+        expected = {**stable_linkage, "repaired_at": repaired_at}
+        if not isinstance(repaired_at, str) or not repaired_at or existing != expected:
+            message = f"Real runtime-smoke repair linkage conflicts: {path}"
+            raise RuntimeError(message)
+        return existing
+    linkage = {**stable_linkage, "repaired_at": _utc_now()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    common.serialization.atomic_write_json(path, linkage)
+    if _json_object(path, label="real runtime-smoke repair linkage") != linkage:
+        message = f"Real runtime-smoke repair linkage changed after publication: {path}"
+        raise RuntimeError(message)
+    return linkage
+
+
+def _repair_relative_file(
+    value: object,
+    *,
+    storage: Path,
+    label: str,
+) -> Path:
+    """Resolve one safe storage-relative regular file from repair evidence."""
+    if not isinstance(value, str) or not value:
+        message = f"{label} must be one storage-relative path."
+        raise TypeError(message)
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        message = f"{label} is unsafe: {value!r}"
+        raise ValueError(message)
+    path = (storage / relative).resolve()
+    if not path.is_relative_to(storage) or not path.is_file() or path.is_symlink():
+        message = f"{label} is missing or unsafe: {path}"
+        raise FileNotFoundError(message)
+    return path
+
+
+def _validate_repair_link(
+    path: Path,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Validate one historical stale receipt and its immutable replacement link."""
+    link = _json_object(path, label="real runtime-smoke repair linkage")
+    required = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "canonical_receipt_relative_path",
+        "history_relative_path",
+        "replacement_relative_path",
+        "stale_receipt_file_sha256",
+        "stale_receipt_declared_digest",
+        "replacement_receipt_digest",
+        "replacement_file_sha256",
+        "reason",
+        "mismatch_categories",
+        "mismatch_paths",
+        "difference_count",
+        "stale_recorded_at",
+        "replacement_recorded_at",
+        "repaired_at",
+    }
+    digest_fields = (
+        "stale_receipt_file_sha256",
+        "stale_receipt_declared_digest",
+        "replacement_receipt_digest",
+        "replacement_file_sha256",
+    )
+    categories = link.get("mismatch_categories")
+    mismatch_paths = link.get("mismatch_paths")
+    difference_count = link.get("difference_count")
+    if (
+        set(link) != required
+        or link.get("schema_kind") != _REPAIR_SCHEMA_KIND
+        or link.get("schema_version") != REAL_SMOKE_SCHEMA_VERSION
+        or link.get("status") != "replacement_published"
+        or link.get("reason") != "canonical_receipt_stale_but_current_authoritative_artifacts_valid"
+        or any(not isinstance(link.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", link[field]) is None for field in digest_fields)
+        or not isinstance(categories, list)
+        or not categories
+        or any(not isinstance(category, str) or category not in _MISMATCH_CATEGORIES for category in categories)
+        or categories != sorted(set(categories))
+        or not isinstance(mismatch_paths, list)
+        or len(mismatch_paths) > _MAX_MISMATCH_PATHS
+        or any(not isinstance(location, str) or not location.startswith("/") for location in mismatch_paths)
+        or not isinstance(difference_count, int)
+        or isinstance(difference_count, bool)
+        or difference_count <= 0
+        or difference_count < len(mismatch_paths)
+        or any(
+            not isinstance(link.get(field), str) or not link[field]
+            for field in (
+                "stale_recorded_at",
+                "replacement_recorded_at",
+                "repaired_at",
+            )
+        )
+    ):
+        message = f"Real runtime-smoke repair linkage is malformed: {path}"
+        raise ValueError(message)
+
+    canonical_path = _repair_relative_file(
+        link["canonical_receipt_relative_path"],
+        storage=storage,
+        label="canonical paired receipt",
+    )
+    history_path = _repair_relative_file(
+        link["history_relative_path"],
+        storage=storage,
+        label="stale receipt history",
+    )
+    replacement_path = _repair_relative_file(
+        link["replacement_relative_path"],
+        storage=storage,
+        label="replacement receipt",
+    )
+    stale_digest = link["stale_receipt_file_sha256"]
+    replacement_digest = link["replacement_receipt_digest"]
+    repair_root = canonical_path.parent / "receipt_repairs" / canonical_path.stem
+    expected_history_path = repair_root / "history" / f"{stale_digest}.json"
+    expected_replacement_path = repair_root / "replacements" / f"{replacement_digest}.json"
+    expected_link_path = repair_root / "links" / f"{stale_digest}--{replacement_digest}.json"
+    if history_path != expected_history_path or replacement_path != expected_replacement_path or path.resolve() != expected_link_path:
+        message = f"Real runtime-smoke repair paths are not content-addressed: {path}"
+        raise ValueError(message)
+
+    history_file_digest = common.serialization.file_sha256(history_path)
+    replacement_file_digest = common.serialization.file_sha256(replacement_path)
+    if history_file_digest != stale_digest or replacement_file_digest != link["replacement_file_sha256"]:
+        message = f"Real runtime-smoke repair file digest is invalid: {path}"
+        raise RuntimeError(message)
+
+    stale_receipt, stale_steady, stale_transient = _receipt_contract(
+        history_path,
+        storage=storage,
+        require_canonical_path=False,
+    )
+    replacement, replacement_steady, replacement_transient = _receipt_contract(
+        replacement_path,
+        storage=storage,
+        require_canonical_path=False,
+    )
+    _, canonical_steady, canonical_transient = _receipt_contract(
+        canonical_path,
+        storage=storage,
+        require_canonical_path=True,
+    )
+    if (
+        (stale_steady, stale_transient) != (replacement_steady, replacement_transient)
+        or (replacement_steady, replacement_transient) != (canonical_steady, canonical_transient)
+        or stale_receipt.get("receipt_digest") != link["stale_receipt_declared_digest"]
+        or stale_receipt.get("recorded_at") != link["stale_recorded_at"]
+        or replacement.get("recorded_at") != link["replacement_recorded_at"]
+    ):
+        message = f"Real runtime-smoke repair receipt relationship is invalid: {path}"
+        raise RuntimeError(message)
+
+    replacement_payload = dict(replacement)
+    replacement_payload.pop("receipt_digest")
+    if (
+        replacement.get("receipt_digest") != replacement_digest
+        or common.serialization.canonical_json_sha256(replacement_payload) != replacement_digest
+    ):
+        message = f"Real runtime-smoke historical replacement is invalid: {path}"
+        raise RuntimeError(message)
+    return {
+        "status": "historical_stale_receipt",
+        "link_path": str(path),
+        "history_path": str(history_path),
+        "stale_receipt_file_sha256": history_file_digest,
+        "stale_receipt_declared_digest": link["stale_receipt_declared_digest"],
+        "replacement_path": str(replacement_path),
+        "replacement_receipt_digest": replacement_digest,
+        "reason": link["reason"],
+        "repaired_at": link["repaired_at"],
+    }
 
 
 def validate_current_real_smoke_receipts(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Require at least one immutable real-smoke receipt valid for current source."""
+    """Report valid current receipts, historical stale receipts, and invalid evidence."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     root = common.paths.get_generation_meta_root(storage_root=storage) / "real_smoke"
     if not root.is_dir() or root.is_symlink():
         message = f"No safe real runtime-smoke receipt directory exists: {root}"
         raise FileNotFoundError(message)
-    candidates = tuple(sorted(path for path in root.glob("*.json") if path.is_file() and not path.is_symlink()))
+    current = tuple(sorted(path for path in root.glob("*.json") if path.is_file() and not path.is_symlink()))
     valid: list[dict[str, Any]] = []
     invalid: list[dict[str, str]] = []
-    for candidate in candidates:
+    for candidate in current:
         try:
-            receipt = validate_real_smoke_receipt(candidate, storage_root=storage)
-        except (OSError, TypeError, ValueError) as error:  # noqa: PERF203 -- isolate stale receipts
+            receipt = _validate_real_smoke_receipt(
+                candidate,
+                storage=storage,
+                require_canonical_path=True,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:  # noqa: PERF203
             invalid.append({"path": str(candidate), "error": str(error)})
         else:
             valid.append(
@@ -1770,16 +2229,122 @@ def validate_current_real_smoke_receipts(
                     "campaign_run_ids": [str(campaign["campaign_run_id"]) for campaign in receipt["campaigns"]],
                 }
             )
+    historical: list[dict[str, Any]] = []
+    for link_path in sorted(root.glob("receipt_repairs/*/links/*.json")):
+        if not link_path.is_file() or link_path.is_symlink():
+            invalid.append(
+                {
+                    "path": str(link_path),
+                    "error": "repair linkage is missing or unsafe",
+                }
+            )
+            continue
+        try:
+            historical.append(
+                _validate_repair_link(
+                    link_path,
+                    storage=storage,
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            invalid.append({"path": str(link_path), "error": str(error)})
     if not valid:
-        message = f"No real runtime-smoke receipt is valid for current source; candidates={len(candidates)}, invalid={invalid}."
+        message = f"No real runtime-smoke receipt is valid for current source; current_candidates={len(current)}, unrecoverable_invalid={invalid}."
         raise ValueError(message)
     return {
         "schema_kind": "vp2_current_real_runtime_smoke_receipts",
-        "schema_version": 1,
+        "schema_version": REAL_SMOKE_SCHEMA_VERSION,
         "status": "current_runtime_evidence_complete",
-        "valid_receipts": valid,
-        "invalid_or_stale_receipts": invalid,
+        "valid_current_receipts": valid,
+        "historical_stale_receipts": historical,
+        "unrecoverable_invalid_receipts": invalid,
     }
+
+
+def _finalize_real_smoke_locked(
+    steady_run_id: str,
+    transient_run_id: str,
+    *,
+    comsol_version_output: str,
+    storage: Path,
+    path: Path,
+) -> Path:
+    """Publish or repair one paired receipt while holding its writer lock."""
+    if path.exists():
+        try:
+            _validate_real_smoke_receipt(
+                path,
+                storage=storage,
+                require_canonical_path=True,
+            )
+        except _StaleRealSmokeReceiptError as error:
+            stale_bytes = path.read_bytes()
+            stale_receipt = error.receipt
+            payload = error.expected
+            diagnostics = error.diagnostics
+            if hashlib.sha256(stale_bytes).hexdigest() != diagnostics["receipt_file_sha256"]:
+                message = f"Real runtime-smoke receipt changed during repair: {path}"
+                raise RuntimeError(message) from None
+        else:
+            return path
+    else:
+        stale_bytes = None
+        stale_receipt = None
+        diagnostics = None
+        payload = _json_normalize(
+            _build_payload(
+                steady_run_id,
+                transient_run_id,
+                storage=storage,
+                recorded_at=_utc_now(),
+                comsol_version_output=comsol_version_output,
+            )
+        )
+        payload["receipt_digest"] = common.serialization.canonical_json_sha256(payload)
+
+    if stale_bytes is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        common.serialization.atomic_write_json(path, payload)
+        _validate_persisted_receipt_payload(path, payload)
+        return path
+
+    if stale_receipt is None or diagnostics is None:
+        message = "Stale paired receipt repair evidence is incomplete."
+        raise RuntimeError(message)
+    replacement_digest = payload.get("receipt_digest")
+    if not isinstance(replacement_digest, str):
+        message = "Replacement paired receipt digest is missing."
+        raise TypeError(message)
+    history_path, replacement_path, link_path = _repair_paths(
+        path,
+        stale_bytes,
+        replacement_digest,
+    )
+    _write_immutable_bytes(
+        history_path,
+        stale_bytes,
+        label="stale real runtime-smoke receipt history",
+    )
+    if replacement_path.exists():
+        _validate_persisted_receipt_payload(replacement_path, payload)
+    else:
+        replacement_path.parent.mkdir(parents=True, exist_ok=True)
+        common.serialization.atomic_write_json(replacement_path, payload)
+        _validate_persisted_receipt_payload(replacement_path, payload)
+    stable_linkage = _repair_linkage(
+        canonical_path=path,
+        history_path=history_path,
+        replacement_path=replacement_path,
+        stale_receipt=stale_receipt,
+        stale_bytes=stale_bytes,
+        replacement=payload,
+        diagnostics=diagnostics,
+        storage=storage,
+    )
+    _publish_repair_link(link_path, stable_linkage)
+    common.serialization.atomic_write_json(path, payload)
+    _validate_persisted_receipt_payload(path, payload)
+    return path
 
 
 def finalize_real_smoke(
@@ -1789,21 +2354,22 @@ def finalize_real_smoke(
     comsol_version_output: str,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Write or validate the immutable paired real-runtime smoke receipt."""
+    """Publish, reuse, or fail-closed repair one canonical paired smoke receipt."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    path = real_smoke_receipt_path(steady_run_id, transient_run_id, storage_root=storage)
-    if path.exists():
-        validate_real_smoke_receipt(path, storage_root=storage)
-        return path
-    payload = _build_payload(
+    path = real_smoke_receipt_path(
         steady_run_id,
         transient_run_id,
-        storage=storage,
-        recorded_at=_utc_now(),
-        comsol_version_output=comsol_version_output,
+        storage_root=storage,
     )
-    payload["receipt_digest"] = common.serialization.canonical_json_sha256(payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    common.serialization.atomic_write_json(path, payload)
-    validate_real_smoke_receipt(path, storage_root=storage)
-    return path
+    lock_path = common.paths.resolve_artifact_lock_path(
+        path,
+        storage_root=storage,
+    )
+    with common.locking.exclusive_file_lock(lock_path, blocking=False):
+        return _finalize_real_smoke_locked(
+            steady_run_id,
+            transient_run_id,
+            comsol_version_output=comsol_version_output,
+            storage=storage,
+            path=path,
+        )

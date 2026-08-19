@@ -1,4 +1,4 @@
-# ruff: noqa: S101, SLF001
+# ruff: noqa: ARG001, EM101, S101, SLF001, TRY003
 """Profile smoke-evidence and paired runtime diagnostic contracts."""
 
 from __future__ import annotations
@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import h5py
@@ -259,7 +260,7 @@ def _patch_finalizer_dependencies(
     )
     monkeypatch.setattr(
         generation.smoke.workflow_service,
-        "validate_completed_workflow",
+        "validate_all_workflow_receipt",
         validate_workflow,
     )
     monkeypatch.setattr(
@@ -623,6 +624,412 @@ def test_smoke_evidence_requires_complete_success_and_is_profile_scoped(
     )
     assert partial["status"] == "technical_smoke_evidence_invalid"
     assert "every required case" in partial["reason"]
+
+
+def _paired_receipt_payload(recorded_at: str) -> dict[str, Any]:
+    """Return a compact authoritative paired receipt payload."""
+    return {
+        "schema_kind": generation.smoke.REAL_SMOKE_SCHEMA_KIND,
+        "schema_version": generation.smoke.REAL_SMOKE_SCHEMA_VERSION,
+        "status": "observations_complete_no_scientific_acceptance_threshold",
+        "recorded_at": recorded_at,
+        "scientific_git_commits": {"steady_flow": "a" * 40, "transient_drying": "b" * 40},
+        "material_family_inventory": ["synthetic"],
+        "source_binding": {"resolved_campaigns": [], "bundle_digest": "c" * 64},
+        "templates": {},
+        "profile_mappings": {},
+        "campaigns": [
+            {"campaign_run_id": "steady-smoke", "workflow_gate_sha256": "d" * 64},
+            {"campaign_run_id": "transient-smoke", "workflow_gate_sha256": "e" * 64},
+        ],
+        "cases": [{"hdf5": {"identity": {"available_learning_views": ("field",)}}}],
+        "comsol": {"version_output": "COMSOL Multiphysics 6.4.0.293"},
+        "slurm": {"case_job_ids": ["1"]},
+        "dataset_packages": [{"dataset_id": "required", "payload_sha256": "f" * 64}],
+        "cpu_source_retention": {
+            "steady": {"cleanup_requested": True},
+            "transient": {"cleanup_requested": True},
+            "parent_success_required_before_cleanup": True,
+        },
+        "template_equivalence": {},
+        "mass_balance": {},
+        "acceptance_tolerances": {},
+    }
+
+
+def test_real_smoke_receipt_reuses_normalized_current_and_repairs_stale_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normalize JSON types and repair stale current evidence without rerunning science."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+
+    def build_payload(
+        _steady: str,
+        _transient: str,
+        *,
+        storage: Path,
+        recorded_at: str,
+        comsol_version_output: str,
+    ) -> dict[str, Any]:
+        assert storage.is_dir()
+        assert comsol_version_output.startswith("COMSOL")
+        return _paired_receipt_payload(recorded_at)
+
+    monkeypatch.setattr(generation.smoke, "_build_payload", build_payload)
+    atomic_write = generation.smoke.common.serialization.atomic_write_json
+    writes: list[Path] = []
+
+    def record_write(destination: Path | str, payload: Any, *, indent: int = 2) -> Path:
+        writes.append(Path(destination))
+        return atomic_write(destination, payload, indent=indent)
+
+    monkeypatch.setattr(generation.smoke.common.serialization, "atomic_write_json", record_write)
+    path = generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+    original = path.read_bytes()
+    assert generation.smoke.validate_real_smoke_receipt(path, storage_root=storage)["cases"][0]["hdf5"]["identity"]["available_learning_views"] == [
+        "field"
+    ]
+    assert (
+        generation.smoke.finalize_real_smoke(
+            "steady-smoke", "transient-smoke", comsol_version_output="COMSOL Multiphysics 6.4.0.293", storage_root=storage
+        )
+        == path
+    )
+    assert path.read_bytes() == original
+    assert writes == [path]
+
+    stale = json.loads(original)
+    stale["cases"][0]["hdf5"]["identity"]["available_learning_views"] = ["stale"]
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    generation.smoke.finalize_real_smoke(
+        "steady-smoke", "transient-smoke", comsol_version_output="COMSOL Multiphysics 6.4.0.293", storage_root=storage
+    )
+    history, replacement, link = generation.smoke._repair_paths(
+        path, stale_bytes, generation.smoke.validate_real_smoke_receipt(path, storage_root=storage)["receipt_digest"]
+    )
+    assert history.read_bytes() == stale_bytes
+    assert replacement.is_file()
+    linkage = json.loads(link.read_text(encoding="utf-8"))
+    assert linkage["stale_receipt_file_sha256"] == generation.smoke.hashlib.sha256(stale_bytes).hexdigest()
+    assert "case_artifact_binding" in linkage["mismatch_categories"]
+    status = generation.smoke.validate_current_real_smoke_receipts(storage_root=storage)
+    assert len(status["valid_current_receipts"]) == 1
+    assert status["historical_stale_receipts"][0]["history_path"] == str(history)
+    assert writes[-3:] == [replacement, link, path]
+    repair_write_count = len(writes)
+    assert (
+        generation.smoke.finalize_real_smoke(
+            "steady-smoke",
+            "transient-smoke",
+            comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+            storage_root=storage,
+        )
+        == path
+    )
+    assert len(writes) == repair_write_count
+
+    linkage["canonical_receipt_relative_path"] = "01_generation/meta/real_smoke/missing.json"
+    link.write_text(json.dumps(linkage), encoding="utf-8")
+    invalid_status = generation.smoke.validate_current_real_smoke_receipts(storage_root=storage)
+    assert invalid_status["historical_stale_receipts"] == []
+    assert invalid_status["unrecoverable_invalid_receipts"][0]["path"] == str(link)
+
+
+@pytest.mark.parametrize(
+    "artifact_failure",
+    [
+        "required case.h5 hash is invalid",
+        "required raw export hash is invalid",
+        "required Dataset package hash is invalid",
+    ],
+)
+def test_real_smoke_repair_fails_closed_before_history_on_authoritative_artifact_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_failure: str,
+) -> None:
+    """Do not mutate stale receipt history when required current evidence is invalid."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    healthy = True
+
+    def build_payload(
+        _steady: str,
+        _transient: str,
+        *,
+        storage: Path,
+        recorded_at: str,
+        comsol_version_output: str,
+    ) -> dict[str, Any]:
+        if not healthy:
+            raise ValueError(artifact_failure)
+        return _paired_receipt_payload(recorded_at)
+
+    monkeypatch.setattr(generation.smoke, "_build_payload", build_payload)
+    path = generation.smoke.finalize_real_smoke(
+        "steady-smoke", "transient-smoke", comsol_version_output="COMSOL Multiphysics 6.4.0.293", storage_root=storage
+    )
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    receipt["dataset_packages"][0]["payload_sha256"] = "0" * 64
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+    healthy = False
+    with pytest.raises(ValueError, match="required"):
+        generation.smoke.finalize_real_smoke(
+            "steady-smoke", "transient-smoke", comsol_version_output="COMSOL Multiphysics 6.4.0.293", storage_root=storage
+        )
+    assert path.read_bytes() == stale_bytes
+    assert not (path.parent / "receipt_repairs").exists()
+
+
+def test_real_smoke_boundary_ignores_cleanup_completion_and_additive_packages() -> None:
+    """Bind requested policy and launch packages without mutable cleanup state."""
+    campaign: Any = SimpleNamespace(
+        campaign_id="campaign-id",
+        campaign_purpose="technical_runtime_smoke",
+        campaign_digest="a" * 64,
+        profile=SimpleNamespace(id="steady_flow"),
+        batches=[SimpleNamespace(batch_id="batch-id")],
+        source_files=(Path("mutable.yaml"),),
+        dataset_packages=({"dataset_name": "required"},),
+    )
+    terminal = {
+        "batches": [{"batch_id": "batch-id"}],
+        "git_commit": "b" * 40,
+        "slurm_job_ids": ["11"],
+    }
+    pending = {
+        "dataset_ids": ["required"],
+        "workflow_gate_sha256": "c" * 64,
+        "cleanup_requested": True,
+        "cpu_cleanup_complete": {"status": "pending", "evidence": None},
+    }
+    complete = {
+        **pending,
+        "cpu_cleanup_complete": {
+            "status": "complete",
+            "evidence": {"receipt_sha256": "d" * 64},
+        },
+        "cpu_bytes_reclaimed": 10_000,
+    }
+
+    assert generation.smoke._campaign_record(
+        "run-id",
+        campaign,
+        terminal,
+        pending,
+    ) == generation.smoke._campaign_record(
+        "run-id",
+        campaign,
+        terminal,
+        complete,
+    )
+
+    additive: Any = SimpleNamespace(
+        **{
+            **campaign.__dict__,
+            "source_files": (Path("mutated.yaml"),),
+            "dataset_packages": (
+                {"dataset_name": "required"},
+                {"dataset_name": "unrelated-extension"},
+            ),
+        }
+    )
+    assert generation.smoke._source_binding((campaign,)) == generation.smoke._source_binding((additive,))
+    workflow_with_extension_metadata = {
+        **pending,
+        "dataset_package_hashes": [
+            {
+                "dataset_id": "required",
+                "manifest_sha256": "e" * 64,
+                "payload_sha256": "f" * 64,
+            }
+        ],
+        "package_inspection_results": [{"status": "valid"}],
+        "loader_smoke_results": [{"workers_0": "pass", "workers_2": "pass"}],
+        "current_additive_packages": ["unrelated-extension"],
+    }
+    required = generation.smoke._dataset_records((workflow_with_extension_metadata,))
+    assert [record["dataset_id"] for record in required] == ["required"]
+
+
+def test_real_smoke_diagnostics_classify_bounded_json_paths(tmp_path: Path) -> None:
+    """Report each receipt ownership category without unbounded payload output."""
+    expected = generation.smoke._json_normalize(_paired_receipt_payload("2026-08-19T00:00:00+00:00"))
+    expected["receipt_digest"] = generation.smoke.common.serialization.canonical_json_sha256(expected)
+    receipt = copy.deepcopy(expected)
+    receipt["recorded_at"] = "2026-08-20T00:00:00+00:00"
+    receipt["source_binding"]["bundle_digest"] = "0" * 64
+    receipt["templates"]["steady_flow"] = {"sha256": "1" * 64}
+    receipt["cases"][0]["hdf5"]["identity"]["available_learning_views"] = ["changed"]
+    receipt["dataset_packages"][0]["payload_sha256"] = "2" * 64
+    receipt["campaigns"][0]["workflow_gate_sha256"] = "3" * 64
+    receipt["cpu_source_retention"]["steady"]["cleanup_requested"] = False
+    receipt["slurm"]["case_job_ids"] = ["2"]
+    receipt["mass_balance"] = {"changed": True}
+    receipt["cases"].extend(copy.deepcopy(receipt["cases"][0]) for _ in range(generation.smoke._MAX_MISMATCH_PATHS))
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    diagnostics = generation.smoke._receipt_diagnostics(
+        receipt_path,
+        receipt,
+        expected,
+    )
+
+    expected_categories = {
+        "scientific_source_binding",
+        "template_binding",
+        "case_artifact_binding",
+        "dataset_package_binding",
+        "workflow_gate_binding",
+        "cpu_retention_state",
+        "timestamps",
+        "job_ids",
+        "other_lifecycle_metadata",
+    }
+    assert set(diagnostics["mismatch_categories"]) == expected_categories
+    assert diagnostics["difference_count"] > generation.smoke._MAX_MISMATCH_PATHS
+    assert diagnostics["differences_truncated"] is True
+    assert diagnostics["repair_safe"] is True
+    assert len(diagnostics["differing_json_paths"]) == generation.smoke._MAX_MISMATCH_PATHS
+
+
+def test_interrupted_real_smoke_replacement_remains_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leave stale canonical bytes and a validated replacement after interruption."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+
+    def build_payload(
+        _steady: str,
+        _transient: str,
+        *,
+        storage: Path,
+        recorded_at: str,
+        comsol_version_output: str,
+    ) -> dict[str, Any]:
+        return _paired_receipt_payload(recorded_at)
+
+    monkeypatch.setattr(generation.smoke, "_build_payload", build_payload)
+    path = generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+    stale = json.loads(path.read_text(encoding="utf-8"))
+    stale["cases"][0]["hdf5"]["identity"]["available_learning_views"] = ["stale"]
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    stale_bytes = path.read_bytes()
+
+    atomic_write = generation.smoke.common.serialization.atomic_write_json
+    interrupt_canonical = True
+
+    def interrupt_after_link(
+        destination: Path | str,
+        payload: Any,
+        *,
+        indent: int = 2,
+    ) -> Path:
+        target = Path(destination)
+        if interrupt_canonical and target == path and (path.parent / "receipt_repairs").exists():
+            raise OSError("synthetic interruption before canonical replacement")
+        return atomic_write(target, payload, indent=indent)
+
+    monkeypatch.setattr(
+        generation.smoke.common.serialization,
+        "atomic_write_json",
+        interrupt_after_link,
+    )
+    with pytest.raises(OSError, match="synthetic interruption"):
+        generation.smoke.finalize_real_smoke(
+            "steady-smoke",
+            "transient-smoke",
+            comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+            storage_root=storage,
+        )
+    assert path.read_bytes() == stale_bytes
+    repairs = path.parent / "receipt_repairs" / path.stem
+    replacements = list((repairs / "replacements").glob("*.json"))
+    links = list((repairs / "links").glob("*.json"))
+    assert len(replacements) == 1
+    assert len(links) == 1
+
+    interrupt_canonical = False
+    generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+    assert generation.smoke.validate_real_smoke_receipt(
+        path,
+        storage_root=storage,
+    )["cases"][0]["hdf5"]["identity"]["available_learning_views"] == ["field"]
+
+
+def test_real_smoke_repair_history_survives_a_later_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every historical link valid when current evidence changes again."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    current_view = ["field"]
+
+    def build_payload(
+        _steady: str,
+        _transient: str,
+        *,
+        storage: Path,
+        recorded_at: str,
+        comsol_version_output: str,
+    ) -> dict[str, Any]:
+        payload = _paired_receipt_payload(recorded_at)
+        payload["cases"][0]["hdf5"]["identity"]["available_learning_views"] = tuple(current_view)
+        return payload
+
+    monkeypatch.setattr(generation.smoke, "_build_payload", build_payload)
+    path = generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+    stale = json.loads(path.read_text(encoding="utf-8"))
+    stale["cases"][0]["hdf5"]["identity"]["available_learning_views"] = ["stale"]
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+
+    current_view[:] = ["field-next"]
+    generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+
+    status = generation.smoke.validate_current_real_smoke_receipts(storage_root=storage)
+    expected_history_count = 2
+    assert len(status["valid_current_receipts"]) == 1
+    assert len(status["historical_stale_receipts"]) == expected_history_count
+    assert status["unrecoverable_invalid_receipts"] == []
 
 
 def test_compatible_completed_smoke_run_reuses_validated_artifacts(

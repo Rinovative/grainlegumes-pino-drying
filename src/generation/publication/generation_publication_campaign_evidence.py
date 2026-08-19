@@ -78,6 +78,7 @@ POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
         "transfer_complete.json",
         TECHNICAL_SMOKE_EVIDENCE_FILENAME,
         RUNTIME_PROGRESS_DIRECTORY_NAME,
+        "workflow_failures",
     }
 )
 
