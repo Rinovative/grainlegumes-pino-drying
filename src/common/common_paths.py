@@ -143,6 +143,11 @@ def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path
     return get_generation_root(storage_root=storage_root) / ".state"
 
 
+def get_generation_real_smoke_locks_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return persistent Generation lock anchors for paired smoke receipts."""
+    return get_generation_state_root(storage_root=storage_root) / "real_smoke" / "locks"
+
+
 def get_generation_input_locks_root(*, storage_root: Path | str | None = None) -> Path:
     """Return canonical raw-input batch lock anchors."""
     return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "locks"
@@ -439,6 +444,17 @@ def resolve_run_lock_path(
     canonical_run = Path(run_dir).expanduser().resolve(strict=False)
     digest = hashlib.sha256(os.fsencode(canonical_run)).hexdigest()
     return get_run_locks_root(storage_root=storage_root) / f"run-{digest}.lock"
+
+
+def resolve_generation_real_smoke_lock_path(
+    receipt_path: Path | str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one canonical paired-smoke receipt lock in Generation state."""
+    canonical_receipt = Path(receipt_path).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(os.fsencode(canonical_receipt)).hexdigest()
+    return get_generation_real_smoke_locks_root(storage_root=storage_root) / f"receipt-{digest}.lock"
 
 
 def resolve_artifact_lock_path(

@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -228,6 +229,390 @@ def _prepare_submission_test(
         ],
     )
     return directory
+
+
+@pytest.mark.parametrize(
+    ("value", "status", "started_at"),
+    [
+        (None, "unavailable", None),
+        ("1787097600", "available", "2026-08-19T00:00:00+00:00"),
+        ("not-a-timestamp", "invalid", None),
+        ("0", "invalid", None),
+    ],
+)
+def test_slurm_start_time_environment_is_optional_bounded_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    status: str,
+    started_at: str | None,
+) -> None:
+    """Keep worker execution independent of optional Slurm start-time environment."""
+    if value is None:
+        monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
+    else:
+        monkeypatch.setenv("SLURM_JOB_START_TIME", value)
+    evidence = generation.benchmark._slurm_scheduler_start_time_evidence()
+    assert evidence["status"] == status
+    assert evidence["started_at"] == started_at
+    assert evidence["raw_value"] == value
+
+
+def test_oversized_numeric_slurm_start_time_is_bounded_invalid_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject arbitrarily long numeric environment text without aborting the worker."""
+    monkeypatch.setenv("SLURM_JOB_START_TIME", "9" * 10000)
+    evidence = generation.benchmark._slurm_scheduler_start_time_evidence()
+    assert evidence["status"] == "invalid"
+    assert evidence["started_at"] is None
+    assert evidence["raw_value"] == "9" * generation.benchmark._MAX_SLURM_ENV_VALUE_CHARACTERS
+
+
+def test_summary_successful_measurements_reject_tampering_and_truncation(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind optional controller evidence exactly to terminal success records."""
+    suite = _synthetic_suite(generation_config_factory)
+    records = [
+        {
+            "status": "success",
+            "work_unit_id": "unit-1",
+            "variant_id": "cores_04",
+            "case_role": "nominal",
+            "resource": {
+                "slurm_job_id": "101",
+                "node": "node01",
+                "requested_cpus": 4,
+            },
+            "timings_seconds": {
+                "comsol_process_seconds": 12.5,
+                "license_wait_seconds": 0.0,
+                "export_conversion_seconds": 1.0,
+                "publication_seconds": 0.5,
+            },
+        }
+    ]
+    manifest = {
+        "git_commit": _COMMIT,
+        "preflight": {"receipt_sha256": "b" * 64},
+        "submission_history": [
+            {"role": "measure", "variant_id": "cores_04", "case_role": "nominal", "job_id": "100"},
+            {"role": "measure", "variant_id": "cores_04", "case_role": "nominal", "job_id": "101"},
+        ],
+    }
+    scheduler_accounting = {
+        "output": ("100|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:03\n101|COMPLETED|0:0|2026-08-19T00:01:00|2026-08-19T00:01:05"),
+        "error": None,
+    }
+    measurements = generation.benchmark._controller_scheduler_queue_accounting(
+        manifest,
+        records,
+        {"sacct": scheduler_accounting},
+    )
+    monkeypatch.setattr(generation.benchmark, "_proof_identities", lambda *_args: [])
+    summary = {
+        "schema_kind": generation.benchmark.BENCHMARK_SUMMARY_SCHEMA_KIND,
+        "schema_version": 1,
+        "benchmark_run_id": _RUN_ID,
+        "git_commit": _COMMIT,
+        "template_sha256": suite.case_config.template_sha256,
+        "representative_case_identities": [],
+        "preflight": manifest["preflight"],
+        "result_set_digest": common.serialization.canonical_json_sha256(records),
+        "scheduler_accounting": scheduler_accounting,
+        "successful_measurements": measurements,
+        "generated_at": "2026-08-19T00:00:00+00:00",
+    }
+    generation.benchmark._validate_summary_identity(
+        summary,
+        run_id=_RUN_ID,
+        suite=suite,
+        manifest=manifest,
+        proofs={},
+        records=records,
+    )
+    tampered = {**summary, "successful_measurements": [dict(measurements[0])]}
+    tampered["successful_measurements"][0]["comsol_process_seconds"] = 99.0
+    with pytest.raises(ValueError, match="stale or incomplete"):
+        generation.benchmark._validate_summary_identity(
+            tampered,
+            run_id=_RUN_ID,
+            suite=suite,
+            manifest=manifest,
+            proofs={},
+            records=records,
+        )
+    truncated = {**summary, "successful_measurements": []}
+    with pytest.raises(ValueError, match="stale or incomplete"):
+        generation.benchmark._validate_summary_identity(
+            truncated,
+            run_id=_RUN_ID,
+            suite=suite,
+            manifest=manifest,
+            proofs={},
+            records=records,
+        )
+
+
+def test_summary_accounting_reconciliation_only_upgrades_availability() -> None:
+    """Upgrade derived queue evidence without regressing or inventing history."""
+    unavailable = [{"work_unit_id": "unit-1", "scheduler_queue_availability": "unavailable"}]
+    available = [{"work_unit_id": "unit-1", "scheduler_queue_availability": "available"}]
+    assert generation.benchmark._has_strictly_more_available_queue_measurements(
+        unavailable,
+        available,
+    )
+    assert not generation.benchmark._has_strictly_more_available_queue_measurements(
+        available,
+        unavailable,
+    )
+    assert not generation.benchmark._has_strictly_more_available_queue_measurements(
+        None,
+        available,
+    )
+
+
+def test_finalize_same_result_refreshes_only_improved_queue_accounting(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Refresh derived evidence when terminal accounting becomes more complete."""
+    suite = _synthetic_suite(generation_config_factory)
+    records = _success_records(
+        suite,
+        {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)},
+    )
+    submissions: list[dict[str, Any]] = []
+    for index, record in enumerate(records, start=1):
+        job_id = str(100 + index)
+        record["resource"].update(
+            {
+                "slurm_job_id": job_id,
+                "node": "node01",
+                "requested_cpus": record["cores_per_case"],
+            }
+        )
+        submissions.append(
+            {
+                "role": "measure",
+                "variant_id": record["variant_id"],
+                "case_role": record["case_role"],
+                "job_id": job_id,
+            }
+        )
+    manifest = {
+        "benchmark_run_id": _RUN_ID,
+        "git_commit": _COMMIT,
+        "preflight": {"receipt_sha256": "a" * 64},
+        "measured_job_ids": [item["job_id"] for item in submissions],
+        "submission_history": submissions,
+        "state": "running",
+    }
+    directory = generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=tmp_path)
+    directory.mkdir(parents=True)
+    immutable_success = directory / "runs" / "immutable-success.json"
+    immutable_success.parent.mkdir()
+    immutable_success.write_text('{"immutable": true}\n', encoding="utf-8")
+    unavailable_scheduler = {"sacct": {"output": "", "error": "not yet available"}}
+    unavailable_measurements = generation.benchmark._controller_scheduler_queue_accounting(
+        manifest,
+        records,
+        unavailable_scheduler,
+    )
+    initial = generation.benchmark.summarize_core_benchmark_results(suite, records)
+    generation.benchmark._apply_controller_queue_to_summary(
+        initial,
+        unavailable_measurements,
+    )
+    initial.update(
+        {
+            "schema_kind": generation.benchmark.BENCHMARK_SUMMARY_SCHEMA_KIND,
+            "schema_version": 1,
+            "benchmark_run_id": _RUN_ID,
+            "git_commit": _COMMIT,
+            "template_sha256": suite.case_config.template_sha256,
+            "representative_case_identities": [],
+            "preflight": manifest["preflight"],
+            "scheduler_accounting": unavailable_scheduler["sacct"],
+            "successful_measurements": unavailable_measurements,
+            "result_set_digest": common.serialization.canonical_json_sha256(records),
+            "generated_at": "2026-08-19T00:00:00+00:00",
+        }
+    )
+    common.serialization.atomic_write_json(directory / "summary.json", initial)
+    common.serialization.atomic_write_text(
+        directory / "runs.csv",
+        generation.benchmark._results_csv(
+            records,
+            queue_by_work_unit=generation.benchmark._controller_queue_by_work_unit(
+                unavailable_measurements,
+            ),
+        ),
+    )
+    common.serialization.atomic_write_text(
+        directory / "summary.md",
+        generation.benchmark.core_benchmark_markdown(initial),
+    )
+    scheduler_rows = "\n".join(f"{item['job_id']}|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05" for item in submissions)
+    scheduler = {
+        "squeue": {"output": "", "error": None},
+        "sacct": {"output": scheduler_rows, "error": None},
+    }
+    monkeypatch.setattr(
+        generation.benchmark,
+        "load_core_benchmark_manifest",
+        lambda *_args, **_kwargs: (manifest, suite),
+    )
+    monkeypatch.setattr(generation.benchmark, "_scheduler_evidence", lambda *_args: scheduler)
+    monkeypatch.setattr(generation.benchmark, "_load_case_proofs", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args: records)
+    monkeypatch.setattr(generation.benchmark, "_validate_records_against_proof", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(generation.benchmark, "_validate_summary_identity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(generation.benchmark, "_persist_manifest", lambda *_args, **_kwargs: None)
+    refreshed = generation.benchmark.finalize_core_benchmark(_RUN_ID, storage_root=tmp_path)
+    persisted = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    assert refreshed == persisted
+    assert all(item["scheduler_queue_availability"] == "available" for item in persisted["successful_measurements"])
+    assert persisted["result_set_digest"] == initial["result_set_digest"]
+    assert persisted["schema_version"] == 1
+    assert immutable_success.read_bytes() == b'{"immutable": true}\n'
+    for before, after in zip(initial["variants"], persisted["variants"], strict=True):
+        assert {key: value for key, value in before.items() if key != "scheduler_queue_seconds"} == {
+            key: value for key, value in after.items() if key != "scheduler_queue_seconds"
+        }
+    history = directory / "summary_history" / "revision-0001"
+    assert (history / "summary.json").is_file()
+    assert (history / "runs.csv").is_file()
+    assert (history / "summary.md").is_file()
+    stable_bytes = (directory / "summary.json").read_bytes()
+    scheduler["sacct"] = {"output": "", "error": "temporarily unavailable"}
+    assert generation.benchmark.finalize_core_benchmark(_RUN_ID, storage_root=tmp_path) == persisted
+    assert (directory / "summary.json").read_bytes() == stable_bytes
+    assert len(list((directory / "summary_history").iterdir())) == 1
+
+
+def test_controller_accounting_includes_prior_license_submission_queues() -> None:
+    """Derive queue duration only from exact root accounting rows."""
+    scheduler = {
+        "sacct": {
+            "error": None,
+            "output": (
+                "101|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05|2026-08-19T00:01:00\n"
+                "102|COMPLETED|0:0|2026-08-19T00:02:00|2026-08-19T00:02:07|2026-08-19T00:03:00\n"
+                "102.batch|COMPLETED|0:0|2026-08-19T00:02:00|2026-08-19T00:02:07|2026-08-19T00:03:00\n"
+                "103|RUNNING|0:0|2026-08-19T00:04:00|2026-08-19T00:04:02|Unknown"
+            ),
+        }
+    }
+    assert generation.benchmark._accounted_queue_seconds(scheduler, ["101", "102"]) == 12.0
+    assert generation.benchmark._accounted_queue_seconds(scheduler, ["101", "999"]) is None
+    assert generation.benchmark._accounted_queue_seconds(scheduler, ["103"]) is None
+
+
+def test_historical_success_attempt_without_success_record_remains_pending(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Require published success evidence before counting a terminal attempt as success."""
+    suite = _synthetic_suite(generation_config_factory)
+    variant = suite.canary_variant()
+    directory = generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=tmp_path)
+    attempt = directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, 1) / "attempt-0001.json"
+    attempt.parent.mkdir(parents=True)
+    attempt.write_text('{"status": "success"}\n', encoding="utf-8")
+    monkeypatch.setattr(generation.benchmark, "_validate_success_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(generation.benchmark, "_load_benchmark_license_wait", lambda *_args, **_kwargs: None)
+    records = generation.benchmark._result_records(directory, suite)
+    record = next(item for item in records if item["work_unit_id"] == suite.work_unit_id(variant, 1))
+    assert record["status"] == "pending"
+
+
+def test_benchmark_worker_calls_shared_executor_and_keeps_its_duration(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Admit a successful measurement without a Slurm start-time environment."""
+    suite = _synthetic_suite(generation_config_factory)
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    variant = suite.canary_variant()
+    representative = suite.representative_case(1)
+    proof = {
+        "case_input_id": "d" * 64,
+        "simulation_case_id": "e" * 64,
+        "scientific_config_digest": suite.case_config.scientific_config_digest,
+        "canonical_input_preparation_seconds": 0.25,
+    }
+    manifest = {
+        "git_commit": _COMMIT,
+        "preflight": {"receipt_sha256": "f" * 64},
+        "submission_history": [
+            {
+                "role": "measure",
+                "job_id": "123",
+                "variant_id": variant.variant_id,
+                "case_role": representative.case_role,
+                "submitted_at": "2026-08-19T00:00:00+00:00",
+            }
+        ],
+    }
+    output = tmp_path / "case.h5"
+    output.write_bytes(b"synthetic")
+    log = tmp_path / "solver.log"
+    log.write_text("solver completed\n", encoding="utf-8")
+    prepared = SimpleNamespace(work_directory=tmp_path / "work")
+    result = SimpleNamespace(
+        canonical_case=SimpleNamespace(path=output),
+        command=("comsol", "-np", str(variant.cores_per_case)),
+        timing={
+            "runtime_s": 99.0,
+            "comsol_process_seconds": 12.5,
+            "export_conversion_s": 7.0,
+            "export_conversion_seconds": 1.0,
+            "scratch_peak_bytes": 2,
+            "started_at": "2026-08-19T00:00:10+00:00",
+            "ended_at": "2026-08-19T00:00:22+00:00",
+        },
+        solver_log=log,
+    )
+    calls: list[object] = []
+    monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", str(variant.cores_per_case))
+    monkeypatch.setattr(generation.benchmark, "load_core_benchmark_manifest", lambda *_args, **_kwargs: (manifest, suite))
+    monkeypatch.setattr(generation.benchmark, "_require_current_checkout", lambda *_args: None)
+    monkeypatch.setattr(generation.benchmark.source_service, "required_git_commit", lambda: _COMMIT)
+    monkeypatch.setattr(generation.benchmark, "_load_case_proof", lambda *_args, **_kwargs: proof)
+    monkeypatch.setattr(generation.benchmark.preparation_service, "prepare_case_work_directory", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(generation.benchmark, "_proof_payload", lambda *_args, **_kwargs: proof)
+    monkeypatch.setattr(generation.benchmark, "_validate_materialized_case_proof", lambda *_args: None)
+    monkeypatch.setattr(generation.benchmark.runtime_service, "execute_prepared_case", lambda *_args, **_kwargs: calls.append(1) or result)
+    monkeypatch.setattr(generation.benchmark.storage_service, "validate_case_hdf5", lambda *_args, **_kwargs: dict(proof))
+    monkeypatch.setattr(generation.benchmark, "_validate_hdf5_scientific_identity", lambda *_args: None)
+    monkeypatch.setattr(generation.benchmark, "_benchmark_peak_child_memory_bytes", lambda: 0)
+    monkeypatch.setattr(generation.benchmark, "_cleanup_prepared", lambda *_args, **_kwargs: 0)
+    record = generation.benchmark.run_core_benchmark_case(
+        _RUN_ID,
+        variant.variant_id,
+        representative.case_role,
+        storage_root=storage,
+        work_root=tmp_path / "work-root",
+    )
+    assert calls == [1]
+    assert record["timings_seconds"]["comsol_process_seconds"] == 12.5
+    assert record["timings_seconds"]["export_conversion_seconds"] == 1.0
+    assert record["timings_seconds"]["scheduler_queue_seconds"] is None
+    accounting = generation.benchmark._controller_scheduler_queue_accounting(
+        manifest,
+        [record],
+        {"sacct": {"error": None, "output": "123|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05"}},
+    )
+    assert accounting[0]["slurm_job_id"] == "123"
+    assert record["worker_interval"]["slurm_job_start_time"]["status"] == "unavailable"
 
 
 def test_resource_change_preserves_both_case_identities(

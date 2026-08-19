@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import json
+import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -655,6 +657,97 @@ def _paired_receipt_payload(recorded_at: str) -> dict[str, Any]:
         "mass_balance": {},
         "acceptance_tolerances": {},
     }
+
+
+def test_real_smoke_receipt_lock_uses_generation_state_and_releases_on_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep paired receipt coordination in Generation state without identity effects."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    monkeypatch.setattr(
+        generation.smoke,
+        "_build_payload",
+        lambda *_args, recorded_at, **_kwargs: _paired_receipt_payload(recorded_at),
+    )
+    path = generation.smoke.real_smoke_receipt_path(
+        "steady-smoke",
+        "transient-smoke",
+        storage_root=storage,
+    )
+    lock_path = generation.smoke.common.paths.resolve_generation_real_smoke_lock_path(
+        path,
+        storage_root=storage,
+    )
+    other_lock = generation.smoke.common.paths.resolve_generation_real_smoke_lock_path(
+        path.with_name("other.json"),
+        storage_root=storage,
+    )
+    assert lock_path.parent == storage / "01_generation/.state/real_smoke/locks"
+    assert lock_path != other_lock
+    with (
+        generation.smoke.common.locking.exclusive_file_lock(
+            lock_path,
+            blocking=False,
+        ),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        future = executor.submit(
+            generation.smoke.finalize_real_smoke,
+            "steady-smoke",
+            "transient-smoke",
+            comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+            storage_root=storage,
+        )
+        with pytest.raises(generation.smoke.common.locking.FileLockUnavailableError):
+            future.result()
+    finalized = generation.smoke.finalize_real_smoke(
+        "steady-smoke",
+        "transient-smoke",
+        comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+        storage_root=storage,
+    )
+    receipt_bytes = finalized.read_bytes()
+    receipt_digest = generation.smoke.validate_real_smoke_receipt(
+        finalized,
+        storage_root=storage,
+    )["receipt_digest"]
+    assert lock_path.is_file()
+    assert lock_path.stat().st_size == 0
+    assert stat.S_IMODE(lock_path.stat().st_mode) == stat.S_IRUSR | stat.S_IWUSR
+    assert not (storage / "03_experiments/.state").exists()
+    assert (
+        generation.smoke.common.paths.resolve_generation_real_smoke_lock_path(
+            finalized,
+            storage_root=storage,
+        )
+        == lock_path
+    )
+    assert finalized.read_bytes() == receipt_bytes
+    assert (
+        generation.smoke.validate_real_smoke_receipt(
+            finalized,
+            storage_root=storage,
+        )["receipt_digest"]
+        == receipt_digest
+    )
+    with generation.smoke.common.locking.exclusive_file_lock(lock_path, blocking=False):
+        pass
+    monkeypatch.setattr(
+        generation.smoke,
+        "_finalize_real_smoke_locked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic failure")),
+    )
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        generation.smoke.finalize_real_smoke(
+            "steady-smoke",
+            "transient-smoke",
+            comsol_version_output="COMSOL Multiphysics 6.4.0.293",
+            storage_root=storage,
+        )
+    with generation.smoke.common.locking.exclusive_file_lock(lock_path, blocking=False):
+        pass
 
 
 def test_real_smoke_receipt_reuses_normalized_current_and_repairs_stale_bytes(

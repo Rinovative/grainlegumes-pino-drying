@@ -75,6 +75,8 @@ _BENCHMARK_VARIANT_COUNT: Final = 4
 _BENCHMARK_REPRESENTATIVE_CASE_ROLES: Final = ("nominal", "natural")
 _MAX_COMSOL_VERSION_EVIDENCE_BYTES: Final = 16 * 1024
 _MAX_SLURM_JOB_NAME_LENGTH: Final = 48
+_MAX_SLURM_ENV_VALUE_CHARACTERS: Final = 128
+_SACCT_QUEUE_FIELDS: Final = 5
 _MAX_DIRTY_PATH_PREVIEW: Final = 5
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _BENCHMARK_RUN_ID_PATTERN: Final = re.compile(r"core_scaling_transient__[0-9a-f]{16}")
@@ -342,18 +344,55 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _slurm_scheduler_start_time() -> str:
-    """Return the scheduler-owned start timestamp for the current job."""
+def _slurm_scheduler_start_time_evidence() -> dict[str, str | None]:
+    """Return bounded optional worker environment corroboration."""
     raw = os.environ.get("SLURM_JOB_START_TIME")
-    if raw is None or _JOB_ID_PATTERN.fullmatch(raw) is None or int(raw) < 1:
-        message = "Benchmark timing requires Slurm's positive SLURM_JOB_START_TIME timestamp."
-        raise RuntimeError(message)
+    bounded_raw = None if raw is None else raw[:_MAX_SLURM_ENV_VALUE_CHARACTERS]
+    if raw is None:
+        return {
+            "status": "unavailable",
+            "raw_value": None,
+            "started_at": None,
+            "warning": "environment variable is absent",
+        }
+    if _JOB_ID_PATTERN.fullmatch(raw) is None:
+        return {
+            "status": "invalid",
+            "raw_value": bounded_raw,
+            "started_at": None,
+            "warning": "value is not a positive integer timestamp",
+        }
     try:
-        started = datetime.fromtimestamp(int(raw), tz=timezone.utc)
-    except (OverflowError, OSError, ValueError) as error:
-        message = "Benchmark SLURM_JOB_START_TIME is outside the supported timestamp range."
-        raise RuntimeError(message) from error
-    return started.isoformat()
+        timestamp = int(raw)
+    except ValueError:
+        return {
+            "status": "invalid",
+            "raw_value": bounded_raw,
+            "started_at": None,
+            "warning": "value cannot be converted to a supported timestamp",
+        }
+    if timestamp < 1:
+        return {
+            "status": "invalid",
+            "raw_value": bounded_raw,
+            "started_at": None,
+            "warning": "value is not positive",
+        }
+    try:
+        started = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return {
+            "status": "invalid",
+            "raw_value": bounded_raw,
+            "started_at": None,
+            "warning": "value is outside the supported timestamp range",
+        }
+    return {
+        "status": "available",
+        "raw_value": bounded_raw,
+        "started_at": started.isoformat(),
+        "warning": None,
+    }
 
 
 def _mapping(value: object, *, label: str) -> dict[str, Any]:
@@ -1878,65 +1917,98 @@ def _timestamp(value: object, *, label: str) -> datetime:
     return parsed
 
 
+def _finite_nonnegative(value: object) -> bool:
+    """Return whether one optional evidence value is finite and non-negative."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) >= 0.0
+
+
 def _validate_scheduler_timing(
     result: Mapping[str, Any],
     *,
     work_unit_id: str,
 ) -> None:
-    """Validate submit/start/completion and derived queue/turnaround timing."""
+    """Validate scheduler evidence while allowing unavailable worker queue time."""
     timing = result.get("scheduler_timing")
-    if not isinstance(timing, dict) or set(timing) != {
-        "submit_time",
-        "start_time",
-        "completion_time",
-        "queue_wait_s",
-        "turnaround_s",
-    }:
+    expected_keys = {"submit_time", "start_time", "completion_time", "queue_wait_s", "turnaround_s"}
+    if not isinstance(timing, dict) or set(timing) != expected_keys:
         message = f"Benchmark scheduler timing is incomplete for {work_unit_id}."
         raise ValueError(message)
     submitted = _timestamp(timing["submit_time"], label="submit_time")
-    started = _timestamp(timing["start_time"], label="start_time")
     completed = _timestamp(timing["completion_time"], label="completion_time")
-    if started < submitted or completed < started:
-        message = f"Benchmark scheduler timestamps are out of order for {work_unit_id}."
-        raise ValueError(message)
-    expected_queue = (started - submitted).total_seconds()
-    expected_turnaround = (completed - submitted).total_seconds()
-    for key, expected in (("queue_wait_s", expected_queue), ("turnaround_s", expected_turnaround)):
-        value = timing[key]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or not math.isclose(float(value), expected, rel_tol=1.0e-9, abs_tol=1.0e-6)
-        ):
-            message = f"Benchmark {key} is inconsistent for {work_unit_id}."
+    started = timing["start_time"]
+    queue_wait = timing["queue_wait_s"]
+    if started is None or queue_wait is None:
+        if started is not None or queue_wait is not None:
+            message = f"Benchmark scheduler queue evidence is inconsistent for {work_unit_id}."
             raise ValueError(message)
+        expected_turnaround = (completed - submitted).total_seconds()
+    else:
+        started_at = _timestamp(started, label="start_time")
+        if started_at < submitted or completed < started_at:
+            message = f"Benchmark scheduler timestamps are out of order for {work_unit_id}."
+            raise ValueError(message)
+        expected_queue = (started_at - submitted).total_seconds()
+        if not _finite_nonnegative(queue_wait) or not math.isclose(float(queue_wait), expected_queue, rel_tol=1.0e-9, abs_tol=1.0e-6):
+            message = f"Benchmark queue_wait_s is inconsistent for {work_unit_id}."
+            raise ValueError(message)
+        expected_turnaround = (completed - submitted).total_seconds()
+    turnaround = timing["turnaround_s"]
+    if not _finite_nonnegative(turnaround) or not math.isclose(float(turnaround), expected_turnaround, rel_tol=1.0e-9, abs_tol=1.0e-6):
+        message = f"Benchmark turnaround_s is inconsistent for {work_unit_id}."
+        raise ValueError(message)
 
 
 def _scheduler_timing(
     *,
     submit_time: str,
-    start_time: str,
     completion_time: str,
 ) -> dict[str, Any]:
-    """Return derived queue-wait and turnaround evidence."""
+    """Return worker scheduler evidence without claiming unavailable queue timing."""
     submitted = _timestamp(submit_time, label="submit_time")
-    started = _timestamp(start_time, label="start_time")
     completed = _timestamp(completion_time, label="completion_time")
-    if started < submitted:
-        started = submitted
-        start_time = submit_time
-    if completed < started:
-        message = "Benchmark completion time precedes start time."
+    if completed < submitted:
+        message = "Benchmark completion time precedes submission time."
         raise RuntimeError(message)
     return {
         "submit_time": submit_time,
-        "start_time": start_time,
+        "start_time": None,
         "completion_time": completion_time,
-        "queue_wait_s": (started - submitted).total_seconds(),
+        "queue_wait_s": None,
         "turnaround_s": (completed - submitted).total_seconds(),
     }
+
+
+def _validate_worker_interval(result: Mapping[str, Any], *, work_unit_id: str) -> None:
+    """Validate optional schema-v1 worker UTC and environment provenance."""
+    interval = result.get("worker_interval")
+    if interval is None:
+        return
+    if not isinstance(interval, dict) or set(interval) != {"started_at", "ended_at", "slurm_job_start_time"}:
+        message = f"Benchmark worker interval is malformed for {work_unit_id}."
+        raise ValueError(message)
+    if _timestamp(interval["ended_at"], label="worker ended_at") < _timestamp(interval["started_at"], label="worker started_at"):
+        message = f"Benchmark worker interval is out of order for {work_unit_id}."
+        raise ValueError(message)
+    evidence = interval["slurm_job_start_time"]
+    if not isinstance(evidence, dict) or set(evidence) != {"status", "raw_value", "started_at", "warning"}:
+        message = f"Benchmark Slurm start-time evidence is malformed for {work_unit_id}."
+        raise ValueError(message)
+    status = evidence["status"]
+    raw_value = evidence["raw_value"]
+    started_at = evidence["started_at"]
+    warning = evidence["warning"]
+    if (
+        status not in {"available", "unavailable", "invalid"}
+        or (status == "available") != isinstance(started_at, str)
+        or (status == "unavailable") != (raw_value is None)
+        or (status == "available") != (warning is None)
+        or (raw_value is not None and (not isinstance(raw_value, str) or len(raw_value) > _MAX_SLURM_ENV_VALUE_CHARACTERS))
+        or (warning is not None and (not isinstance(warning, str) or len(warning) > _MAX_SLURM_ENV_VALUE_CHARACTERS))
+    ):
+        message = f"Benchmark Slurm start-time evidence is inconsistent for {work_unit_id}."
+        raise ValueError(message)
+    if isinstance(started_at, str):
+        _timestamp(started_at, label="SLURM_JOB_START_TIME")
 
 
 def _validate_work_unit_timings(
@@ -1950,14 +2022,14 @@ def _validate_work_unit_timings(
     if not isinstance(timings, dict) or set(timings) != _WORK_UNIT_TIMING_FIELDS:
         message = f"Benchmark timings are incomplete for {work_unit_id}."
         raise ValueError(message)
-    optional = {"comsol_process_seconds", "export_conversion_seconds"}
+    optional = {"scheduler_queue_seconds", "comsol_process_seconds", "export_conversion_seconds"}
     for key, value in timings.items():
-        if not success and key in optional and value is None:
+        if key in optional and value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+        if not _finite_nonnegative(value):
             message = f"Benchmark {key} is malformed for {work_unit_id}."
             raise ValueError(message)
-    if success and float(timings["comsol_process_seconds"]) <= 0.0:
+    if success and (timings["comsol_process_seconds"] is None or float(timings["comsol_process_seconds"]) <= 0.0):
         message = f"Benchmark successful COMSOL runtime is invalid for {work_unit_id}."
         raise ValueError(message)
 
@@ -2003,7 +2075,9 @@ def _validate_success_support_evidence(
         "scheduler_queue_seconds_before_success",
     ):
         value = license_evidence[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+        if key == "scheduler_queue_seconds_before_success" and value is None:
+            continue
+        if not _finite_nonnegative(value):
             message = f"Benchmark {key} is malformed for {work_unit_id}."
             raise ValueError(message)
     if license_evidence["successful_artifacts_override_prior_warning"] is not True:
@@ -2067,6 +2141,7 @@ def _validate_success_result(
         case_position=case_position,
     )
     _validate_scheduler_timing(result, work_unit_id=work_unit_id)
+    _validate_worker_interval(result, work_unit_id=work_unit_id)
     _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=True)
     _validate_success_support_evidence(result, work_unit_id=work_unit_id)
     hdf5 = result.get("hdf5")
@@ -2113,6 +2188,7 @@ def _validate_failure_result(
         case_position=case_position,
     )
     _validate_scheduler_timing(result, work_unit_id=work_unit_id)
+    _validate_worker_interval(result, work_unit_id=work_unit_id)
     _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=False)
     error = result.get("error")
     if not isinstance(error, dict) or not isinstance(error.get("type"), str) or not error["type"] or not isinstance(error.get("message"), str):
@@ -2243,10 +2319,7 @@ def _validate_benchmark_license_wait(
         or not isinstance(cumulative_probe, (int, float))
         or not math.isfinite(float(cumulative_probe))
         or float(cumulative_probe) < 0.0
-        or isinstance(cumulative_queue, bool)
-        or not isinstance(cumulative_queue, (int, float))
-        or not math.isfinite(float(cumulative_queue))
-        or float(cumulative_queue) < 0.0
+        or (cumulative_queue is not None and not _finite_nonnegative(cumulative_queue))
         or not isinstance(job_id, str)
         or _JOB_ID_PATTERN.fullmatch(job_id) is None
         or not isinstance(recent_job_ids, list)
@@ -2316,16 +2389,15 @@ def _record_benchmark_license_wait(
     run_id: str,
     job_id: str,
     license_probe_seconds: float,
-    scheduler_queue_seconds: float,
+    scheduler_queue_seconds: float | None,
 ) -> dict[str, Any]:
-    """Update compact wait evidence with excluded probe and queue timings."""
-    for label, value in (
-        ("license_probe_seconds", license_probe_seconds),
-        ("scheduler_queue_seconds", scheduler_queue_seconds),
-    ):
-        if not math.isfinite(value) or value < 0.0:
-            message = f"Benchmark {label} must be finite and non-negative."
-            raise ValueError(message)
+    """Update compact wait evidence with excluded probe and optional queue timing."""
+    if not _finite_nonnegative(license_probe_seconds):
+        message = "Benchmark license_probe_seconds must be finite and non-negative."
+        raise ValueError(message)
+    if scheduler_queue_seconds is not None and not _finite_nonnegative(scheduler_queue_seconds):
+        message = "Benchmark scheduler_queue_seconds must be finite and non-negative."
+        raise ValueError(message)
     current = _load_benchmark_license_wait(
         directory,
         suite,
@@ -2340,7 +2412,7 @@ def _record_benchmark_license_wait(
     retry_count = 1 if current is None else int(current["retry_count"]) + 1
     prior_cumulative = 0.0 if current is None else float(current["cumulative_wait_seconds"])
     prior_probe = 0.0 if current is None else float(current["cumulative_probe_seconds"])
-    prior_queue = 0.0 if current is None else float(current["cumulative_scheduler_queue_seconds"])
+    prior_queue = (0.0 if scheduler_queue_seconds is not None else None) if current is None else current["cumulative_scheduler_queue_seconds"]
     policy = suite.case_config.execution_values["runtime"]["temporary_license_retry"]
     delay = license_service.bounded_retry_delay_seconds(
         policy,
@@ -2378,7 +2450,9 @@ def _record_benchmark_license_wait(
         "delay_before_next_attempt_seconds": delay,
         "cumulative_wait_seconds": prior_cumulative + delay,
         "cumulative_probe_seconds": prior_probe + license_probe_seconds,
-        "cumulative_scheduler_queue_seconds": prior_queue + scheduler_queue_seconds,
+        "cumulative_scheduler_queue_seconds": (
+            None if prior_queue is None or scheduler_queue_seconds is None else float(prior_queue) + scheduler_queue_seconds
+        ),
         "retry_budget_remaining": delay > 0.0,
         "next_retry_at": (now + timedelta(seconds=delay)).isoformat() if delay > 0.0 else None,
     }
@@ -2434,6 +2508,93 @@ def _accounted_root_state(
             state, _separator, _remaining_fields = remainder.partition("|")
             return _normalized_scheduler_state(state)
     return None
+
+
+def _accounting_timestamp(value: str) -> datetime | None:
+    """Parse one optional Slurm accounting timestamp without relabeling its zone."""
+    if value in {"", "Unknown", "N/A"}:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed
+
+
+def _accounted_queue_seconds(scheduler: Mapping[str, Any], job_ids: Sequence[str]) -> float | None:
+    """Derive queue duration from exact terminal root-job accounting rows."""
+    if scheduler["sacct"]["error"] is not None:
+        return None
+    requested = set(job_ids)
+    rows: dict[str, float] = {}
+    for line in str(scheduler["sacct"]["output"]).splitlines():
+        fields = line.split("|")
+        if len(fields) < _SACCT_QUEUE_FIELDS or fields[0] not in requested:
+            continue
+        state = _normalized_scheduler_state(fields[1])
+        submitted = _accounting_timestamp(fields[3])
+        started = _accounting_timestamp(fields[4])
+        if state in _ACTIVE_SCHEDULER_STATES or submitted is None or started is None or started < submitted:
+            continue
+        rows[fields[0]] = (started - submitted).total_seconds()
+    if set(rows) != requested:
+        return None
+    return sum(rows.values())
+
+
+def _controller_scheduler_queue_accounting(
+    manifest: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    scheduler: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Report terminal accounting queue evidence for every successful work unit."""
+    evidence: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("status") != "success":
+            continue
+        submissions = [
+            str(submission["job_id"])
+            for submission in manifest["submission_history"]
+            if submission.get("role") == "measure"
+            and submission.get("variant_id") == record.get("variant_id")
+            and submission.get("case_role") == record.get("case_role")
+        ]
+        queue_seconds = _accounted_queue_seconds(scheduler, submissions) if submissions else None
+        timings = _mapping(record["timings_seconds"], label="benchmark timings")
+        resource = _mapping(record["resource"], label="benchmark resource")
+        evidence.append(
+            {
+                "work_unit_id": record["work_unit_id"],
+                "variant_id": record["variant_id"],
+                "case_role": record["case_role"],
+                "slurm_job_id": resource["slurm_job_id"],
+                "job_ids": submissions,
+                "node": resource["node"],
+                "requested_cpus": resource["requested_cpus"],
+                "comsol_process_seconds": timings["comsol_process_seconds"],
+                "scheduler_queue_seconds": queue_seconds,
+                "scheduler_queue_availability": "available" if queue_seconds is not None else "unavailable",
+                "license_wait_seconds": timings["license_wait_seconds"],
+                "export_conversion_seconds": timings["export_conversion_seconds"],
+                "publication_seconds": timings["publication_seconds"],
+            }
+        )
+    return evidence
+
+
+def _controller_queue_by_work_unit(accounting: Sequence[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Return controller-owned queue timing keyed by work unit."""
+    return {str(item["work_unit_id"]): item["scheduler_queue_seconds"] for item in accounting}
+
+
+def _apply_controller_queue_to_summary(summary: dict[str, Any], accounting: Sequence[Mapping[str, Any]]) -> None:
+    """Overlay terminal accounting queue totals onto derived summary variants."""
+    queues = _controller_queue_by_work_unit(accounting)
+    for variant in summary["variants"]:
+        work_units = [item["work_unit_id"] for item in accounting if item["variant_id"] == variant["variant_id"]]
+        values = [queues[work_unit_id] for work_unit_id in work_units]
+        available_values = [value for value in values if value is not None]
+        variant["scheduler_queue_seconds"] = sum(available_values) if values and len(available_values) == len(values) else None
 
 
 def _active_benchmark_job_ids(scheduler: Mapping[str, Any]) -> frozenset[str]:
@@ -3074,7 +3235,7 @@ def _successful_license_evidence(wait: Mapping[str, Any] | None) -> dict[str, An
             "license_blocked_submission_count": 0,
             "license_wait_seconds": 0.0,
             "license_probe_seconds": 0.0,
-            "scheduler_queue_seconds_before_success": 0.0,
+            "scheduler_queue_seconds_before_success": None,
             "detected_feature": None,
             "detected_error_code": None,
             "matched_signatures": [],
@@ -3085,7 +3246,7 @@ def _successful_license_evidence(wait: Mapping[str, Any] | None) -> dict[str, An
         "license_blocked_submission_count": int(wait["retry_count"]),
         "license_wait_seconds": float(wait["cumulative_wait_seconds"]),
         "license_probe_seconds": float(wait["cumulative_probe_seconds"]),
-        "scheduler_queue_seconds_before_success": float(wait["cumulative_scheduler_queue_seconds"]),
+        "scheduler_queue_seconds_before_success": wait["cumulative_scheduler_queue_seconds"],
         "detected_feature": wait["feature"],
         "detected_error_code": wait["error_code"],
         "matched_signatures": list(wait["matched_signatures"]),
@@ -3130,7 +3291,8 @@ def run_core_benchmark_case(
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
     _require_current_checkout(manifest)
-    start_time = _slurm_scheduler_start_time()
+    worker_started_at = _utc_now()
+    start_time_evidence = _slurm_scheduler_start_time_evidence()
     variant = suite.variant(variant_id)
     case_position = suite.case_position(case_role)
     representative = suite.representative_case(case_position)
@@ -3230,17 +3392,16 @@ def run_core_benchmark_case(
             completion_time = _utc_now()
             scheduler_timing = _scheduler_timing(
                 submit_time=submit_time,
-                start_time=start_time,
                 completion_time=completion_time,
             )
-            scheduler_queue_seconds = float(scheduler_timing["queue_wait_s"]) + float(license_evidence["scheduler_queue_seconds_before_success"])
+            scheduler_queue_seconds = None
             timings = {
                 "scheduler_queue_seconds": scheduler_queue_seconds,
                 "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
                 "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
                 "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
-                "comsol_process_seconds": float(result.timing["runtime_s"]),
-                "export_conversion_seconds": float(result.timing["export_conversion_s"]),
+                "comsol_process_seconds": float(result.timing["comsol_process_seconds"]),
+                "export_conversion_seconds": float(result.timing["export_conversion_seconds"]),
                 "publication_seconds": publication_seconds,
                 "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(
                     manifest,
@@ -3284,6 +3445,11 @@ def run_core_benchmark_case(
                     "peak_scratch_bytes": int(result.timing["scratch_peak_bytes"]),
                 },
                 "scheduler_timing": scheduler_timing,
+                "worker_interval": {
+                    "started_at": worker_started_at,
+                    "ended_at": completion_time,
+                    "slurm_job_start_time": start_time_evidence,
+                },
                 "solver_interval": {
                     "started_at": result.timing["started_at"],
                     "ended_at": result.timing["ended_at"],
@@ -3308,7 +3474,6 @@ def run_core_benchmark_case(
             completion_time = _utc_now()
             scheduler_timing = _scheduler_timing(
                 submit_time=submit_time,
-                start_time=start_time,
                 completion_time=completion_time,
             )
             if isinstance(
@@ -3327,7 +3492,7 @@ def run_core_benchmark_case(
                     run_id=run_id,
                     job_id=job_id,
                     license_probe_seconds=time.monotonic() - solver_start,
-                    scheduler_queue_seconds=float(scheduler_timing["queue_wait_s"]),
+                    scheduler_queue_seconds=None,
                 )
                 raise
             failure = {
@@ -3365,9 +3530,13 @@ def run_core_benchmark_case(
                     "peak_scratch_bytes": (0 if prepared is None else _benchmark_scratch_bytes(prepared.work_directory)),
                 },
                 "scheduler_timing": scheduler_timing,
+                "worker_interval": {
+                    "started_at": worker_started_at,
+                    "ended_at": completion_time,
+                    "slurm_job_start_time": start_time_evidence,
+                },
                 "timings_seconds": {
-                    "scheduler_queue_seconds": float(scheduler_timing["queue_wait_s"])
-                    + float(license_evidence["scheduler_queue_seconds_before_success"]),
+                    "scheduler_queue_seconds": None,
                     "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
                     "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
                     "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
@@ -3669,7 +3838,8 @@ def summarize_core_benchmark_results(
         if any(not math.isfinite(value) or value <= 0.0 for value in solve_times):
             message = f"Benchmark summary received invalid successful COMSOL timings for {variant.variant_id!r}."
             raise ValueError(message)
-        queue_wait = sum(float(record["timings_seconds"]["scheduler_queue_seconds"]) for record in successes)
+        queue_values = [record["timings_seconds"]["scheduler_queue_seconds"] for record in successes]
+        queue_wait = None if any(value is None for value in queue_values) else sum(float(value) for value in queue_values)
         license_wait = sum(float(record["timings_seconds"]["license_wait_seconds"]) for record in successes)
         license_probe = sum(float(record["timings_seconds"]["license_probe_seconds"]) for record in successes)
         conversion = sum(float(record["timings_seconds"]["export_conversion_seconds"]) for record in successes)
@@ -3677,7 +3847,6 @@ def summarize_core_benchmark_results(
         preparation = sum(float(record["timings_seconds"]["canonical_input_preparation_seconds"]) for record in successes)
         controller_elapsed = sum(float(record["timings_seconds"]["total_controller_elapsed_seconds"]) for record in successes)
         operational_values = (
-            queue_wait,
             license_wait,
             license_probe,
             conversion,
@@ -4200,6 +4369,11 @@ def core_benchmark_status(
         "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
         "work_unit_failures": [*exhausted, *terminal_without_result],
         "license_waits": license_waits,
+        "successful_measurements": _controller_scheduler_queue_accounting(
+            manifest,
+            records,
+            scheduler,
+        ),
         "scheduler": scheduler,
         "current_wave": current_wave,
         "canary": {
@@ -4217,7 +4391,11 @@ def core_benchmark_status(
     }
 
 
-def _results_csv(records: Sequence[Mapping[str, Any]]) -> str:
+def _results_csv(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    queue_by_work_unit: Mapping[str, float | None] | None = None,
+) -> str:
     """Serialize stable per-work-unit timing, resource, and license evidence."""
     stream = StringIO(newline="")
     fields: tuple[str, ...] = (
@@ -4293,7 +4471,14 @@ def _results_csv(records: Sequence[Mapping[str, Any]]) -> str:
                 "work_unit_id": record.get("work_unit_id"),
                 "status": record.get("status"),
                 "attempt": record.get("attempt"),
-                **{field: timings.get(field) for field in _WORK_UNIT_TIMING_FIELDS},
+                **{
+                    field: (
+                        queue_by_work_unit.get(str(record.get("work_unit_id")), timings.get(field))
+                        if field == "scheduler_queue_seconds" and queue_by_work_unit is not None
+                        else timings.get(field)
+                    )
+                    for field in _WORK_UNIT_TIMING_FIELDS
+                },
                 "core_hours": core_hours,
                 "solver_started_at": interval.get("started_at"),
                 "solver_ended_at": interval.get("ended_at"),
@@ -4461,6 +4646,19 @@ def _validate_summary_identity(
     if not isinstance(accounting, dict) or set(accounting) != {"output", "error"}:
         message = "Core benchmark scheduler accounting evidence is malformed."
         raise TypeError(message)
+    queue_accounting = summary.get("successful_measurements")
+    if queue_accounting is not None:
+        if not isinstance(queue_accounting, list):
+            message = "Core benchmark successful-measurement evidence is malformed."
+            raise TypeError(message)
+        expected_measurements = _controller_scheduler_queue_accounting(
+            manifest,
+            records,
+            {"sacct": accounting},
+        )
+        if queue_accounting != expected_measurements:
+            message = "Core benchmark successful-measurement evidence is stale or incomplete."
+            raise ValueError(message)
     generated_at = summary.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at or any(character in generated_at for character in "\r\n\t"):
         message = "Core benchmark summary timestamp is malformed."
@@ -4474,6 +4672,9 @@ def _summary_metrics_match(
 ) -> bool:
     """Return whether derived metrics match the current campaign interpretation."""
     recomputed = summarize_core_benchmark_results(suite, records)
+    accounting = summary.get("successful_measurements")
+    if isinstance(accounting, list):
+        _apply_controller_queue_to_summary(recomputed, accounting)
     return all(summary.get(key) == recomputed[key] for key in _SUMMARY_METRIC_FIELDS)
 
 
@@ -4509,7 +4710,14 @@ def _validate_or_repair_summary_outputs(
 ) -> None:
     """Validate deterministic summary views and create only missing retry output."""
     expected = {
-        "runs.csv": _results_csv(records),
+        "runs.csv": _results_csv(
+            records,
+            queue_by_work_unit=(
+                _controller_queue_by_work_unit(summary["successful_measurements"])
+                if isinstance(summary.get("successful_measurements"), list)
+                else None
+            ),
+        ),
         "summary.md": core_benchmark_markdown(summary),
     }
     for name, content in expected.items():
@@ -4520,6 +4728,41 @@ def _validate_or_repair_summary_outputs(
         if not path.is_file() or path.is_symlink() or path.read_text(encoding="utf-8") != content:
             message = f"Core benchmark derived output is stale or unsafe: {path}"
             raise ValueError(message)
+
+
+def _has_strictly_more_available_queue_measurements(
+    existing: object,
+    fresh: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether fresh accounting adds queue evidence without regression."""
+    if not isinstance(existing, list):
+        return False
+    existing_by_work_unit = {
+        item.get("work_unit_id"): item for item in existing if isinstance(item, dict) and isinstance(item.get("work_unit_id"), str)
+    }
+    fresh_by_work_unit = {item.get("work_unit_id"): item for item in fresh if isinstance(item.get("work_unit_id"), str)}
+    if len(existing_by_work_unit) != len(existing) or set(existing_by_work_unit) != set(fresh_by_work_unit):
+        return False
+    existing_available = {
+        work_unit_id for work_unit_id, item in existing_by_work_unit.items() if item.get("scheduler_queue_availability") == "available"
+    }
+    fresh_available = {work_unit_id for work_unit_id, item in fresh_by_work_unit.items() if item.get("scheduler_queue_availability") == "available"}
+    return existing_available < fresh_available
+
+
+def _refresh_summary_queue_accounting(
+    existing: Mapping[str, Any],
+    fresh: Sequence[Mapping[str, Any]],
+    scheduler_accounting: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one derived-summary revision with fresher controller queue evidence."""
+    refreshed = dict(existing)
+    refreshed["variants"] = [dict(variant) for variant in existing["variants"]]
+    _apply_controller_queue_to_summary(refreshed, fresh)
+    refreshed["successful_measurements"] = [dict(item) for item in fresh]
+    refreshed["scheduler_accounting"] = dict(scheduler_accounting)
+    refreshed["generated_at"] = _utc_now()
+    return refreshed
 
 
 def finalize_core_benchmark(
@@ -4563,6 +4806,41 @@ def finalize_core_benchmark(
                 records=records,
             )
             if _summary_metrics_match(existing, suite, records):
+                fresh_accounting = _controller_scheduler_queue_accounting(
+                    manifest,
+                    records,
+                    scheduler,
+                )
+                if _has_strictly_more_available_queue_measurements(
+                    existing.get("successful_measurements"),
+                    fresh_accounting,
+                ):
+                    refreshed = _refresh_summary_queue_accounting(
+                        existing,
+                        fresh_accounting,
+                        scheduler["sacct"],
+                    )
+                    _archive_summary(directory)
+                    common.serialization.atomic_write_text(
+                        directory / "runs.csv",
+                        _results_csv(
+                            records,
+                            queue_by_work_unit=_controller_queue_by_work_unit(
+                                fresh_accounting,
+                            ),
+                        ),
+                    )
+                    common.serialization.atomic_write_json(current, refreshed)
+                    common.serialization.atomic_write_text(
+                        directory / "summary.md",
+                        core_benchmark_markdown(refreshed),
+                    )
+                    manifest["state"] = "complete"
+                    _persist_manifest(
+                        _manifest_path(run_id, storage_root=storage_root),
+                        manifest,
+                    )
+                    return refreshed
                 _validate_or_repair_summary_outputs(
                     directory,
                     existing,
@@ -4576,6 +4854,8 @@ def finalize_core_benchmark(
                 )
                 return existing
     summary = summarize_core_benchmark_results(suite, records)
+    queue_accounting = _controller_scheduler_queue_accounting(manifest, records, scheduler)
+    _apply_controller_queue_to_summary(summary, queue_accounting)
     summary.update(
         {
             "benchmark_run_id": run_id,
@@ -4584,12 +4864,16 @@ def finalize_core_benchmark(
             "representative_case_identities": _proof_identities(suite, proofs),
             "preflight": manifest["preflight"],
             "scheduler_accounting": scheduler["sacct"],
+            "successful_measurements": queue_accounting,
             "result_set_digest": result_set_digest,
             "generated_at": _utc_now(),
         }
     )
     _archive_summary(directory)
-    common.serialization.atomic_write_text(directory / "runs.csv", _results_csv(records))
+    common.serialization.atomic_write_text(
+        directory / "runs.csv",
+        _results_csv(records, queue_by_work_unit=_controller_queue_by_work_unit(queue_accounting)),
+    )
     common.serialization.atomic_write_json(current, summary)
     common.serialization.atomic_write_text(
         directory / "summary.md",

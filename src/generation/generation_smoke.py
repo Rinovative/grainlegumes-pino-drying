@@ -2361,7 +2361,7 @@ def finalize_real_smoke(
         transient_run_id,
         storage_root=storage,
     )
-    lock_path = common.paths.resolve_artifact_lock_path(
+    lock_path = common.paths.resolve_generation_real_smoke_lock_path(
         path,
         storage_root=storage,
     )
