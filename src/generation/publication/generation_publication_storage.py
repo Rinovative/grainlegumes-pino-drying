@@ -212,58 +212,127 @@ def _static_fields(
     return x_axis, y_axis, arrays
 
 
+def _bounded_time_values(values: np.ndarray, *, limit: int = 8) -> list[float]:
+    """Return a bounded, JSON-compatible view of one time collection."""
+    return [float(value) for value in values[:limit]]
+
+
+def _transient_time_error(
+    time_contract: Mapping[str, Any],
+    values: np.ndarray,
+    *,
+    duplicate_times: list[float] | None = None,
+    nonfinite_count: int = 0,
+    nonmonotonic_pairs: list[tuple[float, float]] | None = None,
+    missing_expected: list[float] | None = None,
+    unexpected_inside_horizon: list[float] | None = None,
+    post_horizon: list[float] | None = None,
+    exact_stop_candidate: float | None = None,
+    final_status_consistency: str = "not_checked",
+) -> None:
+    """Raise one bounded error containing the complete time-axis evidence."""
+    expected = np.asarray(time_contract["regular_times"], dtype=np.float64)
+    duplicate_times = [] if duplicate_times is None else duplicate_times
+    nonmonotonic_pairs = [] if nonmonotonic_pairs is None else nonmonotonic_pairs
+    missing_expected = [] if missing_expected is None else missing_expected
+    unexpected_inside_horizon = [] if unexpected_inside_horizon is None else unexpected_inside_horizon
+    post_horizon = [] if post_horizon is None else post_horizon
+    finite = values[np.isfinite(values)] if values.ndim == 1 else np.empty(0, dtype=np.float64)
+    details = {
+        "expected_start_h": float(time_contract["start"]),
+        "expected_stop_h": float(time_contract["stop"]),
+        "regular_state_count": int(expected.size),
+        "minimum_exported_time_h": None if not finite.size else float(np.min(finite)),
+        "maximum_exported_time_h": None if not finite.size else float(np.max(finite)),
+        "duplicate_times_h": duplicate_times[:8],
+        "nonfinite_time_count": nonfinite_count,
+        "nonmonotonic_pairs_h": nonmonotonic_pairs[:8],
+        "missing_expected_times_h": missing_expected[:8],
+        "unexpected_inside_horizon_times_h": unexpected_inside_horizon[:8],
+        "post_horizon_times_h": post_horizon[:8],
+        "exact_stop_candidate_h": exact_stop_candidate,
+        "final_status_consistency": final_status_consistency,
+    }
+    message = "Transient state-time contract violation: " + json.dumps(details, sort_keys=True, separators=(",", ":"))
+    raise ValueError(message)
+
+
 def _classify_transient_times(
     times: np.ndarray,
     time_contract: Mapping[str, Any],
-) -> tuple[np.ndarray, np.ndarray, int | None]:
-    """Classify solver times as configured regular nodes plus one exact stop."""
+) -> tuple[np.ndarray, np.ndarray, int | None, int | None]:
+    """Classify configured states, one exact stop, and one ignorable final overshoot."""
     values = np.asarray(times, dtype=np.float64)
     start = float(time_contract["start"])
     stop = float(time_contract["stop"])
     interval = float(time_contract["interval"])
+    expected = np.asarray(time_contract["regular_times"], dtype=np.float64)
     tolerance = time_classification_tolerance(time_contract)
-    maximum_index = len(time_contract["regular_times"]) - 1
-    if (
-        values.ndim != 1
-        or values.size < 1
-        or not np.isfinite(values).all()
-        or np.any(np.diff(values) <= 0.0)
-        or abs(float(values[0]) - start) > tolerance
-        or float(values[-1]) > stop + tolerance
-    ):
-        msg = "Transient state times must be finite, increasing, begin at the configured start, and not exceed the configured stop."
-        raise ValueError(msg)
-    regular_by_index: dict[int, int] = {}
-    irregular_positions: list[int] = []
+    if values.ndim != 1 or not values.size:
+        _transient_time_error(time_contract, values, nonfinite_count=int(values.size) if values.ndim == 1 else 0)
+    nonfinite_count = int(np.count_nonzero(~np.isfinite(values)))
+    pairs = [
+        (float(values[index]), float(values[index + 1]))
+        for index in range(max(values.size - 1, 0))
+        if not np.isfinite(values[index]) or not np.isfinite(values[index + 1]) or values[index + 1] <= values[index]
+    ]
+    if nonfinite_count or pairs or abs(float(values[0]) - start) > tolerance:
+        _transient_time_error(time_contract, values, nonfinite_count=nonfinite_count, nonmonotonic_pairs=pairs)
+
+    positions_by_regular: dict[int, list[int]] = {}
+    inside: list[int] = []
+    beyond: list[int] = []
     for position, value in enumerate(values):
         regular_index = round((float(value) - start) / interval)
         regular_value = start + regular_index * interval
-        if 0 <= regular_index <= maximum_index and abs(float(value) - regular_value) <= tolerance:
-            if regular_index in regular_by_index:
-                msg = f"Transient export contains duplicate regular state index {regular_index}."
-                raise ValueError(msg)
-            regular_by_index[regular_index] = position
+        if 0 <= regular_index < expected.size and abs(float(value) - regular_value) <= tolerance:
+            positions_by_regular.setdefault(regular_index, []).append(position)
+        elif float(value) > stop + tolerance:
+            beyond.append(position)
         else:
-            irregular_positions.append(position)
-    if len(irregular_positions) > 1:
-        msg = "Transient export may contain at most one exact irregular stop state."
-        raise ValueError(msg)
-    if not regular_by_index or 0 not in regular_by_index:
-        msg = "Transient export must contain at least the configured initial state."
-        raise ValueError(msg)
-    regular_indices = sorted(regular_by_index)
-    if regular_indices != list(range(regular_indices[-1] + 1)):
-        msg = "Regular transient states must form a contiguous configured prefix."
-        raise ValueError(msg)
-    regular_positions = np.asarray([regular_by_index[index] for index in regular_indices], dtype=np.int64)
-    regular_times = start + np.asarray(regular_indices, dtype=np.float64) * interval
-    irregular_position = irregular_positions[0] if irregular_positions else None
-    if irregular_position is not None:
-        irregular_time = float(values[irregular_position])
-        if irregular_position != values.size - 1 or irregular_time <= float(regular_times[-1]) + tolerance:
-            msg = "The optional irregular state must be final and follow the last regular state."
-            raise ValueError(msg)
-    return regular_times, regular_positions, irregular_position
+            inside.append(position)
+    duplicates = [float(expected[index]) for index, positions in positions_by_regular.items() if len(positions) > 1]
+    missing_indices = [index for index in range(expected.size) if index not in positions_by_regular]
+    missing = [float(expected[index]) for index in missing_indices]
+    if duplicates:
+        _transient_time_error(time_contract, values, duplicate_times=duplicates, missing_expected=missing)
+    if not positions_by_regular or 0 not in positions_by_regular:
+        _transient_time_error(time_contract, values, missing_expected=missing, unexpected_inside_horizon=_bounded_time_values(values[inside]))
+    regular_indices = sorted(positions_by_regular)
+    prefix = list(range(regular_indices[-1] + 1))
+    if regular_indices != prefix:
+        _transient_time_error(time_contract, values, missing_expected=missing, unexpected_inside_horizon=_bounded_time_values(values[inside]))
+    if len(inside) > 1 or len(beyond) > 1 or (inside and beyond):
+        _transient_time_error(
+            time_contract,
+            values,
+            missing_expected=missing,
+            unexpected_inside_horizon=_bounded_time_values(values[inside]),
+            post_horizon=_bounded_time_values(values[beyond]),
+        )
+    exact_position = inside[0] if inside else None
+    post_position = beyond[0] if beyond else None
+    if exact_position is not None:
+        exact_time = float(values[exact_position])
+        if exact_position != values.size - 1 or exact_time <= float(expected[regular_indices[-1]]) + tolerance:
+            _transient_time_error(
+                time_contract,
+                values,
+                missing_expected=missing,
+                unexpected_inside_horizon=[exact_time],
+                exact_stop_candidate=exact_time,
+            )
+    if post_position is not None:
+        post_time = float(values[post_position])
+        if post_position != values.size - 1 or missing or regular_indices != list(range(expected.size)):
+            _transient_time_error(
+                time_contract,
+                values,
+                missing_expected=missing,
+                post_horizon=[post_time],
+            )
+    regular_positions = np.asarray([positions_by_regular[index][0] for index in regular_indices], dtype=np.int64)
+    return expected[regular_indices], regular_positions, exact_position, post_position
 
 
 def _axis_index(value: float, axis: np.ndarray, *, label: str) -> int:
@@ -286,7 +355,7 @@ def _transient_fields(
     *,
     x_axis: np.ndarray,
     y_axis: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray | None, float | None, np.ndarray | None]:
     """Stream one native wide export into regular and diagnostic state arrays."""
     contract = _contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)
     paths = _role_paths(exports, profiles.TRANSIENT_RAW_EXPORT_ROLE)
@@ -325,7 +394,7 @@ def _transient_fields(
         [float(first_row[group.column_index(source_t)]) for group in groups],
         dtype=np.float64,
     )
-    regular_times, regular_positions, irregular_position = _classify_transient_times(
+    regular_times, regular_positions, irregular_position, post_horizon_position = _classify_transient_times(
         observed_numeric_times,
         config.scientific_values["time"],
     )
@@ -344,6 +413,15 @@ def _transient_fields(
     exact_stop_fields = (
         None
         if irregular_position is None
+        else np.full(
+            (len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
+            np.nan,
+            dtype=np.float64,
+        )
+    )
+    post_horizon_fields = (
+        None
+        if post_horizon_position is None
         else np.full(
             (len(profiles.TRANSIENT_FIELD_NAMES), y_axis.size, x_axis.size),
             np.nan,
@@ -385,25 +463,34 @@ def _transient_fields(
                 raise ValueError(message)
             if state_index in regular_target:
                 target = regular_fields[regular_target[state_index]]
-            else:
-                if state_index != irregular_position or exact_stop_fields is None:
-                    message = "Transient state ownership is inconsistent with regular/exact-stop classification."
-                    raise RuntimeError(message)
+            elif state_index == irregular_position and exact_stop_fields is not None:
                 target = exact_stop_fields
+            elif state_index == post_horizon_position and post_horizon_fields is not None:
+                # Retain the excluded state only long enough to validate raw final evidence.
+                target = post_horizon_fields
+            else:
+                message = "Transient state ownership is inconsistent with canonical time classification."
+                raise RuntimeError(message)
             for field_index, logical in enumerate(profiles.TRANSIENT_FIELD_NAMES):
                 target[field_index, y_index, x_index] = row[group.column_index(source_by_logical[logical])]
     if row_count != table.row_count:
         message = f"Native wide transient streaming lost numeric rows: inspected={table.row_count}, converted={row_count}."
         raise RuntimeError(message)
-    if not occupied.all() or not np.isfinite(regular_fields).all() or (exact_stop_fields is not None and not np.isfinite(exact_stop_fields).all()):
-        message = "Native wide transient export contains an incomplete grid or non-finite canonical fields."
+    if (
+        not occupied.all()
+        or not np.isfinite(regular_fields).all()
+        or (exact_stop_fields is not None and not np.isfinite(exact_stop_fields).all())
+        or (post_horizon_fields is not None and not np.isfinite(post_horizon_fields).all())
+    ):
+        message = "Native wide transient export contains an incomplete grid or non-finite admitted fields."
         raise ValueError(message)
     numeric_regular = observed_numeric_times[regular_positions]
     if not np.allclose(numeric_regular, regular_times, rtol=0.0, atol=time_tolerance):
         message = "Native wide transient regular numeric times disagree with the configured schedule prefix."
         raise ValueError(message)
     exact_stop_time = None if irregular_position is None else float(observed_numeric_times[irregular_position])
-    return regular_times, regular_fields, exact_stop_time, exact_stop_fields
+    post_horizon_time = None if post_horizon_position is None else float(observed_numeric_times[post_horizon_position])
+    return regular_times, regular_fields, exact_stop_time, exact_stop_fields, post_horizon_time, post_horizon_fields
 
 
 def _ordered_values(config: GenerationConfig, exports: Sequence[Any], role: str, names: tuple[str, ...]) -> np.ndarray:
@@ -677,6 +764,132 @@ def _global_range_diagnostics(
             )
         )
     return records
+
+
+def _derived_final_status_values(
+    static_fields: np.ndarray,
+    state_fields: np.ndarray,
+    global_row: np.ndarray,
+    *,
+    state_time: float,
+    f_surf: float,
+) -> dict[str, float]:
+    """Derive one complete final-status row from aligned field and global evidence."""
+    state_names = profiles.TRANSIENT_FIELD_NAMES
+    final_water = domain.moisture.granular_water_content(
+        state_fields[state_names.index("w_surf")],
+        state_fields[state_names.index("w_int")],
+        f_surf,
+    )
+    rho_bu_dry = static_fields[profiles.TRANSIENT_STATIC_FIELD_NAMES.index("rho_bu_dry")]
+    final_x_wb = domain.moisture.wet_basis_moisture(final_water, rho_bu_dry)
+    return {
+        "t_final": state_time,
+        "f_wet_dm_final": float(global_row[profiles.GLOBAL_FIELD_NAMES.index("f_wet_dm")]),
+        "X_wb_bulk_final": float(global_row[profiles.GLOBAL_FIELD_NAMES.index("X_wb_bulk")]),
+        "X_wb_max_final": float(np.max(final_x_wb)),
+        "T_min_final": float(np.min(state_fields[state_names.index("T")])),
+        "T_max_final": float(np.max(state_fields[state_names.index("T")])),
+        "phi_min_final": float(np.min(state_fields[state_names.index("phi")])),
+        "phi_max_final": float(np.max(state_fields[state_names.index("phi")])),
+    }
+
+
+def _admit_transient_output_horizon(
+    config: GenerationConfig,
+    regular_time: np.ndarray,
+    static_fields: np.ndarray,
+    regular_fields: np.ndarray,
+    exact_stop_time: float | None,
+    exact_stop_fields: np.ndarray | None,
+    post_horizon_time: float | None,
+    post_horizon_fields: np.ndarray | None,
+    global_values: np.ndarray,
+    final_status: np.ndarray,
+    *,
+    f_surf: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate then exclude one structurally admitted post-horizon state."""
+    if (post_horizon_time is None) != (post_horizon_fields is None):
+        message = "Post-horizon time and fields must either both be present or both be absent."
+        raise ValueError(message)
+    if post_horizon_time is None or post_horizon_fields is None:
+        return global_values, final_status
+    time_contract = config.scientific_values["time"]
+    tolerance = time_classification_tolerance(time_contract)
+    canonical_time = _combined_state_time(regular_time, exact_stop_time, exact_stop_fields)
+    raw_time = np.concatenate((canonical_time, np.asarray([post_horizon_time], dtype=np.float64)))
+    global_time = global_values[:, profiles.GLOBAL_FIELD_NAMES.index("t")]
+    if global_values.shape != (raw_time.size, len(profiles.GLOBAL_FIELD_NAMES)) or not np.allclose(
+        global_time,
+        raw_time,
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        _transient_time_error(
+            time_contract,
+            raw_time,
+            post_horizon=[post_horizon_time],
+            final_status_consistency="global_axis_conflicts_with_raw_export",
+        )
+    expected_state_shape = (
+        len(profiles.TRANSIENT_FIELD_NAMES),
+        static_fields.shape[-2],
+        static_fields.shape[-1],
+    )
+    if post_horizon_fields.shape != expected_state_shape or not np.isfinite(post_horizon_fields).all():
+        _transient_time_error(
+            time_contract,
+            raw_time,
+            post_horizon=[post_horizon_time],
+            final_status_consistency="raw_post_horizon_fields_invalid",
+        )
+    if final_status.shape != (1, len(profiles.FINAL_STATUS_FIELDS)):
+        _transient_time_error(
+            time_contract,
+            raw_time,
+            post_horizon=[post_horizon_time],
+            final_status_consistency="raw_final_status_shape_invalid",
+        )
+    raw_expected = _derived_final_status_values(
+        static_fields,
+        post_horizon_fields,
+        global_values[-1],
+        state_time=post_horizon_time,
+        f_surf=f_surf,
+    )
+    raw_observed = dict(zip(profiles.FINAL_STATUS_FIELDS, final_status[0], strict=True))
+    inconsistent = [
+        name
+        for name in profiles.FINAL_STATUS_FIELDS
+        if not np.isclose(
+            float(raw_observed[name]),
+            raw_expected[name],
+            rtol=0.0 if name == "t_final" else 1.0e-6,
+            atol=tolerance if name == "t_final" else 1.0e-9,
+        )
+    ]
+    if inconsistent:
+        _transient_time_error(
+            time_contract,
+            raw_time,
+            post_horizon=[post_horizon_time],
+            final_status_consistency="raw_final_status_conflicts_with_raw_post_horizon_state:" + ",".join(inconsistent),
+        )
+
+    canonical_global = global_values[:-1].copy()
+    canonical_final = final_status.copy()
+    final_state = regular_fields[-1] if exact_stop_fields is None else exact_stop_fields
+    canonical_values = _derived_final_status_values(
+        static_fields,
+        final_state,
+        canonical_global[-1],
+        state_time=float(canonical_time[-1]),
+        f_surf=f_surf,
+    )
+    for index, name in enumerate(profiles.FINAL_STATUS_FIELDS):
+        canonical_final[0, index] = canonical_values[name]
+    return canonical_global, canonical_final
 
 
 def _transient_output_diagnostics(
@@ -972,6 +1185,7 @@ def _status(
     *,
     transient_time: np.ndarray | None,
     exact_stop_time: float | None,
+    post_horizon_time: float | None,
     final_status: np.ndarray | None,
     global_values: np.ndarray | None,
     runtime_seconds: float,
@@ -1014,14 +1228,19 @@ def _status(
         "t_last_regular": last_regular,
         "has_exact_stop_state": exact_stop_time is not None,
         "exact_stop_state_time": exact_stop_time,
+        "post_horizon_export_state_ignored": post_horizon_time is not None,
+        "ignored_post_horizon_state_time": post_horizon_time,
         "n_regular_states": regular_states,
         "n_regular_steps": max(regular_states - 1, 0),
+        "raw_export_state_count": regular_states + int(exact_stop_time is not None) + int(post_horizon_time is not None),
+        "canonical_state_count": regular_states + int(exact_stop_time is not None),
         "f_wet_dm_final": wet_final,
         "runtime_s": float(runtime_seconds),
         "units": {
             "t_stop_exact": "h",
             "t_last_regular": "h",
             "exact_stop_state_time": "h",
+            "ignored_post_horizon_state_time": "h",
             "f_wet_dm_final": "1",
             "runtime_s": "s",
         },
@@ -2194,7 +2413,7 @@ def reconstruct_transient_initial_state(
         _DiagnosticExport(transient_path, profiles.TRANSIENT_RAW_EXPORT_ROLE),
     )
     x_axis, y_axis, stationary_fields = _static_fields(config, exports)
-    regular_time, transient_states, exact_stop_time, _exact_stop_fields = _transient_fields(
+    regular_time, transient_states, exact_stop_time, _exact_stop_fields, _post_horizon_time, _post_horizon_fields = _transient_fields(
         config,
         exports,
         x_axis=x_axis,
@@ -2257,12 +2476,15 @@ def reconstruct_transient_bulk_moisture(
             raise FileNotFoundError(message)
     exports = tuple(_DiagnosticExport(paths[name], roles[name]) for name in paths)
     x_axis, y_axis, stationary_fields = _static_fields(config, exports)
-    regular_time, regular_fields, exact_stop_time, exact_stop_fields = _transient_fields(
+    regular_time, regular_fields, exact_stop_time, exact_stop_fields, post_horizon_time, _post_horizon_fields = _transient_fields(
         config,
         exports,
         x_axis=x_axis,
         y_axis=y_axis,
     )
+    if post_horizon_time is not None:
+        message = "Bulk-moisture reconstruction requires final-status evidence before admitting a discarded post-horizon state."
+        raise ValueError(message)
     global_values = _ordered_values(
         config,
         exports,
@@ -2344,12 +2566,16 @@ def convert_exports_to_hdf5(
     transient_fields: np.ndarray | None = None
     exact_stop_time: float | None = None
     exact_stop_fields: np.ndarray | None = None
+    post_horizon_time: float | None = None
+    post_horizon_fields: np.ndarray | None = None
     schedule_values: np.ndarray | None = None
     global_values: np.ndarray | None = None
     final_status: np.ndarray | None = None
+    raw_global_shape: tuple[int, int] | None = None
+    raw_final_status_shape: tuple[int, int] | None = None
     diagnostics: list[validation_policy.DiagnosticRecord] = _solver_diagnostics(solver_metrics)
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-        transient_time, transient_fields, exact_stop_time, exact_stop_fields = _transient_fields(
+        transient_time, transient_fields, exact_stop_time, exact_stop_fields, post_horizon_time, post_horizon_fields = _transient_fields(
             config,
             exports,
             x_axis=x_axis,
@@ -2366,6 +2592,21 @@ def convert_exports_to_hdf5(
             msg = "Global diagnostic time must be strictly increasing."
             raise ValueError(msg)
         final_status = _ordered_values(config, exports, profiles.FINAL_STATUS_EXPORT_ROLE, profiles.FINAL_STATUS_FIELDS)
+        raw_global_shape = global_values.shape
+        raw_final_status_shape = final_status.shape
+        global_values, final_status = _admit_transient_output_horizon(
+            config,
+            transient_time,
+            static_fields,
+            transient_fields,
+            exact_stop_time,
+            exact_stop_fields,
+            post_horizon_time,
+            post_horizon_fields,
+            global_values,
+            final_status,
+            f_surf=f_surf,
+        )
         diagnostics.extend(
             _transient_output_diagnostics(
                 config,
@@ -2389,7 +2630,7 @@ def convert_exports_to_hdf5(
         if transient_time is None or global_values is None or final_status is None:
             message = "Transient conversion completed without source-shape evidence."
             raise RuntimeError(message)
-        state_count = int(transient_time.size + (exact_stop_time is not None))
+        state_count = int(transient_time.size + (exact_stop_time is not None) + (post_horizon_time is not None))
         role_shapes.update(
             {
                 profiles.TRANSIENT_RAW_EXPORT_ROLE: (
@@ -2397,12 +2638,12 @@ def convert_exports_to_hdf5(
                     state_count * len(_contract(config, profiles.TRANSIENT_RAW_EXPORT_ROLE)["columns"]),
                 ),
                 profiles.GLOBAL_EXPORT_ROLE: (
-                    int(global_values.shape[0]),
-                    int(global_values.shape[1]),
+                    int(raw_global_shape[0] if raw_global_shape is not None else global_values.shape[0]),
+                    int(raw_global_shape[1] if raw_global_shape is not None else global_values.shape[1]),
                 ),
                 profiles.FINAL_STATUS_EXPORT_ROLE: (
-                    int(final_status.shape[0]),
-                    int(final_status.shape[1]),
+                    int(raw_final_status_shape[0] if raw_final_status_shape is not None else final_status.shape[0]),
+                    int(raw_final_status_shape[1] if raw_final_status_shape is not None else final_status.shape[1]),
                 ),
             }
         )
@@ -2444,6 +2685,7 @@ def convert_exports_to_hdf5(
         config,
         transient_time=transient_time,
         exact_stop_time=exact_stop_time,
+        post_horizon_time=post_horizon_time,
         final_status=final_status,
         global_values=global_values,
         runtime_seconds=runtime_seconds,

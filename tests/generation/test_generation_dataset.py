@@ -190,6 +190,58 @@ def test_compact_case_builds_and_loads_package_without_direct_exports(
     assert sample["y"].shape[0] == task.out_channels
 
 
+def test_transient_case_publishes_distinct_dual_view_dataset_ids(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """Bind both advertised views to one canonical HDF5 without copying it."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+        natural_count=1,
+        retain_raw_csv=False,
+        retain_solved_model=False,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.require_batch(material_family="lentil", sampling_regime="natural")
+    storage = tmp_path / "dual-view-storage"
+    generation.cases.input_generation.generate_input_cases(batch, 1, storage_root=storage)
+    outcome = generation.runtime.run_case(
+        batch,
+        1,
+        cores_per_case=1,
+        storage_root=storage,
+        work_root=tmp_path / "dual-view-work",
+    )
+    generation.runtime.finalize_batch(batch, storage_root=storage)
+
+    transient = datasets.packages.build_dataset_package(
+        campaign,
+        "transient_drying",
+        "id",
+        storage_root=storage,
+    )
+    steady = datasets.packages.build_dataset_package(
+        campaign,
+        "steady_flow",
+        "id",
+        storage_root=storage,
+    )
+
+    assert transient["dataset_id"] != steady["dataset_id"]
+    assert Path(transient["manifest_path"]).parent != Path(steady["manifest_path"]).parent
+    transient_manifest = datasets.packages.load_package_manifest(transient["dataset_id"], storage_root=storage)
+    steady_manifest = datasets.packages.load_package_manifest(steady["dataset_id"], storage_root=storage)
+    transient_source = transient_manifest["source_case_identities"][0]
+    steady_source = steady_manifest["source_case_identities"][0]
+    assert transient_source["source_relative_path"] == steady_source["source_relative_path"]
+    assert transient_source["case_hdf5_sha256"] == steady_source["case_hdf5_sha256"]
+    assert storage / transient_source["source_relative_path"] == outcome.processed_directory / "case.h5"
+    package_root = common.paths.get_dataset_packages_root(storage_root=storage)
+    assert not tuple(package_root.rglob("case.h5"))
+
+
 def test_steady_flow_publishes_hdf5_and_immutable_technical_package(
     generation_config_factory: Any,
     fake_comsol: Path,

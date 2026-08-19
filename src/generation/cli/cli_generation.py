@@ -1453,14 +1453,18 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "core-benchmark-summary":
-        summary = benchmark_service.load_core_benchmark_summary(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-        )
         if args.format == "json":
+            summary = benchmark_service.load_core_benchmark_summary(
+                args.benchmark_run_id,
+                storage_root=args.storage_root,
+            )
             print(json.dumps(summary, sort_keys=True))
         else:
-            print(benchmark_service.core_benchmark_markdown(summary), end="")
+            markdown = benchmark_service.load_core_benchmark_markdown(
+                args.benchmark_run_id,
+                storage_root=args.storage_root,
+            )
+            print(markdown, end="")
         return 0
     if args.command == "preflight":
         report = preflight_service.run_cpu_preflight(

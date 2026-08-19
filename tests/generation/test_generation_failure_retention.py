@@ -345,6 +345,7 @@ def test_attempt_admission_requires_exact_version_one_schema(
     assert {
         attempt_service.ATTEMPT_SCHEMA_VERSION,
         attempt_service.REPLAY_SCHEMA_VERSION,
+        attempt_service.REPLAY_FAILURE_SCHEMA_VERSION,
         attempt_service.CLEANUP_SCHEMA_VERSION,
         generation.publication.storage.STATUS_SCHEMA_VERSION,
     } == {1}

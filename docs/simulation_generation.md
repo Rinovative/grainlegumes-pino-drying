@@ -179,27 +179,41 @@ contains the following independent physical cases:
 Parameter-OOD infrastructure remains available for future configs. Sunflower is
 an engineering stress set, not a literature-secure far-OOD set.
 
+Transient publication admits the configured regular schedule and the existing
+optional final exact-stop state inside the horizon. One additional solver state
+strictly after `t_max` is admitted only when every regular state through `t_max`
+is present exactly once and raw transient, global-timeseries, and final-status
+evidence all agree. That one state is recorded but excluded from canonical
+fields, time, global values, and final outcome. A target crossing only after the
+horizon therefore cannot change `target_reached`; the canonical status remains
+`hit_t_max=true`, `t_stop_exact=t_max`, and `has_exact_stop_state=false`. Missing,
+duplicate, nonfinite, nonmonotonic, interior-irregular, multiple post-horizon, or
+conflicting final evidence remains a conversion failure with bounded time-axis
+diagnostics.
+
 Every transient `case.h5` continues to expose both `steady_flow` and
 `transient_drying` learning views. Its stationary view contains the authoritative
 coordinates, permeability tensor, porosity, inlet pressure, pressure, and
 velocity fields. One transient physical case supplies one stationary view; time
 states are not counted as independent Airflow samples.
 
-The transient campaign currently declares only `transient_drying` packages. Its
-stationary views are currently selected only for paired Airflow evaluation,
-support analysis, comparison against COMSOL, and later coupled
-Airflow-to-Drying evaluation. They do not enter the explicitly selected primary
-Airflow training, validation, or ID-test Dataset, so every transient physical
-case remains out of sample for the current Airflow operator.
+The transient campaign intentionally declares both `transient_drying` and
+`steady_flow` packages for ID, near-family OOD, far-family OOD, and extreme-family
+OOD regimes. Dataset ownership includes the learning view, evaluation regime,
+source role, and exact hash-bound source-case set, so corresponding packages
+receive distinct content-addressed Dataset IDs and directories. Both views refer
+to the same canonical `case.h5` sources; those HDF5 files are never copied into
+`02_datasets/packages`.
 
 A Dataset package is a neutral scientific artifact. Source simulation profile
 and requested learning view do not impose a universal training prohibition. A
-future transient-derived `steady_flow` package remains valid and may be used only
-when an experiment names its exact Dataset ID. Package existence, a train split,
-or a cross-profile source/view combination never selects a package
-automatically. Adding a package declaration to an already completed compatible
-campaign reuses the validated canonical `case.h5` publications and builds only
-the missing package; it creates no additional simulation work units.
+transient-derived `steady_flow` package is used only when an experiment names its
+exact Dataset ID. Package existence, a train split, or a cross-profile
+source/view combination never selects a package automatically. The independent
+1,050-case Steady-Flow campaign remains the primary Airflow training source.
+Adding a package declaration to an already completed compatible campaign reuses
+the validated canonical `case.h5` publications and builds only the missing
+package; it creates no additional simulation work units.
 
 ## Material pilot and Technical Smoke
 
@@ -232,9 +246,11 @@ The benchmark is one fast production-oriented core-selection phase. It uses the
 same two deterministic scientific cases for every variant: one nominal/reference
 case and one nontrivial natural-support case. The variants are 4, 8, 16, and 32
 cores per case. Each wave runs its two cases concurrently, waits for both valid
-successful measurements, and only then enables the next wave. The configured
-production-core variant runs first; with the current 16-core setting the order is
-16, 4, 8, 32. The first two-case wave is both the canary and part of the final
+successful measurements, and only then enables the next wave. The resolved
+production-core variant runs first; the maintained production configuration
+currently uses 16 cores per case, so its variant is the canary wave. Remaining
+variant order comes from the resolved run plan rather than a hardcoded list. The
+first two-case wave is both the canary and part of the final
 measurements, so there is no extra canary solve. The complete benchmark requires
 exactly eight successful COMSOL measurements. It has no separate serial phase,
 packed-node phase, or three-repetition design.
@@ -292,11 +308,16 @@ scientific failure, and does not consume `maximum_failed_cases`.
 
 The controller waits outside compute allocations with bounded exponential
 backoff. `maximum_wait_seconds: null` means it waits until capacity becomes
-available or the operator cancels. Oldest blocked work runs first, at most one
-license probe is active per top-level run, and fresh work cannot repeatedly
-leapfrog an eligible block. Campaigns and benchmarks use the same policy.
-Current OST Slurm exposes no verified license resources, so submissions use
-neither `sbatch --licenses` nor COMSOL `-usebatchlic`.
+available or the operator cancels. A blocked case whose `next_retry_at` is in the
+future never suppresses fresh admission. The oldest eligible block receives the
+next suitable slot, but fresh cases fill any remaining pending capacity. At most
+one retry remains an unresolved license probe. Once job-bound parser evidence
+shows stationary or transient solver progress after checkout, that job is an
+ordinary running case and releases the probe gate. License-only attempts never
+consume the solver failure budget or benchmark measurements. Campaigns and
+benchmarks use the same policy. Current OST Slurm exposes no verified license
+resources, so submissions use neither `sbatch --licenses` nor COMSOL
+`-usebatchlic`.
 
 Each blocked work unit owns one mutable `license_wait.json` with schema version
 1. It records work-unit and scientific identities, feature, error code, exact
@@ -323,6 +344,27 @@ Guarded reconciliation can compact an existing license-only attempt only after
 strong classification, proof that solver progress and unique exports are absent,
 and independent admission of its canonical input. It retains an immutable
 compaction audit and reports reclaimed bytes.
+
+Postprocessing replay is independent from Slurm admission and runs only after
+normal pending capacity is filled. A failed replay appends schema-version-1
+`replay_failure.json` evidence bound to its source/predecessor receipts, the exact
+future replay payload membership and hashes, the converter dependency, and the
+output and time contracts. The same identities become `replay_blocked` instead
+of being retried on every monitor poll; a relevant dependency or contract change
+makes the retained payload eligible again. Historical attempts and replay
+failures remain immutable, and replay constructs neither a COMSOL command nor a
+Slurm solver submission. A new source-pinned campaign first reuses globally
+validated canonical successes, then discovers the newest identity-compatible
+historical conversion/publication attempt in place. Replay continues that old
+attempt chain while preserving the old solver commit and recording the new
+processing commit. Historical solver failures are not misclassified as replay:
+they remain genuine solver work for the new run.
+
+Unexpected `solved.mph.status` content is never overwritten. The retained failure
+reason reports the owned path, accepted content class, bounded actual excerpt and
+size, ownership evidence, solver exit code after controlled termination, required
+export presence, and current replay availability. Incomplete evidence remains a
+solver failure; no success is inferred from a marker alone.
 
 ## Storage, identity, and Dataset integrity
 
@@ -369,12 +411,63 @@ The public administrative commands are:
 ```
 
 Status reports successful, running, scheduler-pending, license-blocked,
-never-started, and failed units;
-current stage; CPU source; host publication; package/finalizer state; and the
+never-started, and failed units. Active and problematic cases receive compact,
+actionable detail, while never-started work is grouped in resolved campaign-plan
+order so output scales with materials or benchmark variants rather than case
+count. For example:
+
+```text
+Campaign: material_pilot__0123456789abcdef
+State: running
+Execution: commit=a1b2c3d4  config_digest=9f8e7d6c
+Resources: cores_per_case=16  pending_buffer=2  max_running_cases=3
+Cases: successful=5  running=1  scheduler_pending=1  license_blocked=1  never_started=9  failed=1  total=18
+
+Running cases:
+case_0002  batch=kidney_bean  job=629565  node=hpc119  elapsed=40:41
+  phase=transient_drying  progress=4%
+  simulated_time=0.03486 h  step=220  step_size=1.053 s
+  Tfail=0  NLfail=106
+  last_solver_update=2026-08-19T19:11:41Z  age=4 s ago
+
+Scheduler-pending cases:
+case_0003  batch=kidney_bean  job=629844
+  queue_age=00:09  reason=PENDING  cores=16
+
+License-blocked cases:
+case_0001  batch=kidney_bean  job=629820
+  feature="Equilibrium Moisture Transport in Porous Media"
+  code=-4,132  retry=1  next_retry=2026-08-20T00:07:09Z
+  cumulative_wait=60 s
+  reason=temporary_license_capacity
+
+Failed cases:
+case_0004  batch=chickpea  job=629553  elapsed=18:41
+  state=conversion_failed  stage=conversion  solver=succeeded
+  replay=eligible
+  reason="Transient state time exceeds configured stop."
+  evidence=.../attempt_0001/attempt.json
+
+Never started:
+  field_pea: 3
+  rapeseed: 3
+  sunflower_seed: 3
+  total: 9
+```
+
+The default terminal view intentionally omits raw excerpts, signature arrays,
+complete internal paths, and full replay or postprocessing records. Complete
+machine-oriented evidence remains in the existing JSON files, including
+`license_wait.json` and referenced failure evidence. Status still reports the
+current stage, CPU source, host publication, package/finalizer state, and the
 same-config continuation action. The first Ctrl+C after campaign launch requests
 graceful cancellation and keeps monitoring durable terminal evidence. A second
 Ctrl+C requests force cancellation. Before a run identity exists, no campaign
 cancellation is armed.
+
+The first Ctrl+C after campaign launch requests graceful cancellation and keeps
+monitoring durable terminal evidence. A second Ctrl+C requests force
+cancellation. Before a run identity exists, no campaign cancellation is armed.
 
 Cleanup is destructive only for the exact run-owned CPU directories admitted by
 its cryptographic authorization. It does not remove the canonical host

@@ -1310,6 +1310,16 @@ def execute_prepared_case(
                 )
                 exit_code = stop_result.exit_code
                 timed_out = stop_result.timed_out
+            except stop_service.UnexpectedStopStatusContentError as error:
+                terminated_exit_code = _terminate_solver_and_wait(process)
+                raise error.with_runtime_evidence(
+                    exit_code=terminated_exit_code,
+                    required_exports_present=_expected_exports_exist(
+                        config,
+                        prepared.work_directory,
+                    ),
+                    replay_available=False,
+                ) from error
             except BaseException:
                 _terminate_solver_and_wait(process)
                 raise
@@ -2941,16 +2951,97 @@ def publish_completed_case(
     return processed_destination
 
 
+def _current_replay_identities(
+    config: config_contract.GenerationConfig,
+) -> dict[str, str]:
+    """Return the narrow conversion and configured replay contract identities."""
+    converter_path = Path(storage_service.__file__).resolve()
+    if not converter_path.is_file() or converter_path.is_symlink():
+        message = f"Replay converter dependency is missing or unsafe: {converter_path}"
+        raise RuntimeError(message)
+    return {
+        "converter_dependency_sha256": common.serialization.file_sha256(converter_path),
+        "output_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["output_contract"]),
+        "time_contract_sha256": common.serialization.canonical_json_sha256(config.scientific_values["time"]),
+    }
+
+
+def _replay_failure_attempt_count(attempt: attempt_service.AttemptEvidence) -> int:
+    """Return the validated number of replay-failure receipts in one case history."""
+    count = 0
+    for directory in attempt.directory.parent.iterdir():
+        if (
+            directory.is_dir()
+            and not directory.is_symlink()
+            and directory.name.startswith("attempt_")
+            and directory.name[8:].isdigit()
+            and (directory / "replay_failure.json").exists()
+        ):
+            attempt_service.load_attempt(directory)
+            count += 1
+    return count
+
+
+def replay_case_postprocessing_status(
+    config: config_contract.GenerationConfig,
+    attempt: attempt_service.AttemptEvidence | None,
+) -> dict[str, Any]:
+    """Return read-only replay eligibility without constructing a solver workspace."""
+    identities = _current_replay_identities(config)
+    if attempt is None:
+        return {
+            "eligible": False,
+            "blocked": False,
+            "reason": "no_attempt",
+            "evidence_path": None,
+            "attempt_count": 0,
+            "identities": identities,
+        }
+    failure = attempt_service.replay_failure_evidence(attempt)
+    evidence_path = attempt.directory / "replay_failure.json" if failure is not None else None
+    count = _replay_failure_attempt_count(attempt)
+    if not attempt.replay_available:
+        return {
+            "eligible": False,
+            "blocked": False,
+            "reason": "payload_unavailable",
+            "evidence_path": None if evidence_path is None else str(evidence_path),
+            "attempt_count": count,
+            "identities": identities,
+        }
+    if failure is not None and all(failure[key] == value for key, value in identities.items()):
+        return {
+            "eligible": False,
+            "blocked": True,
+            "reason": "unchanged_replay_identity",
+            "evidence_path": str(evidence_path),
+            "attempt_count": count,
+            "identities": identities,
+        }
+    return {
+        "eligible": True,
+        "blocked": False,
+        "reason": "identity_changed" if failure is not None else "eligible",
+        "evidence_path": None if evidence_path is None else str(evidence_path),
+        "attempt_count": count,
+        "identities": identities,
+    }
+
+
 def _require_replay_attempt_identity(
     config: config_contract.GenerationConfig,
     case_index: int,
     attempt: attempt_service.AttemptEvidence,
     *,
+    campaign_run_id: str,
     storage_root: Path,
 ) -> str:
     """Require one attempt to remain bound to exact canonical case science."""
     expected = {
-        "campaign_run_id": workspace_service.workspace_run_id(config),
+        "campaign_run_id": common.paths.validate_logical_name(
+            campaign_run_id,
+            label="replay campaign_run_id",
+        ),
         "batch_storage_name": config.batch_storage_name,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -3102,7 +3193,7 @@ def _record_replay_failure(
     return attempt_service.publish_case_attempt(
         config,
         case_index,
-        campaign_run_id=workspace_service.workspace_run_id(config),
+        campaign_run_id=str(source_attempt.payload["campaign_run_id"]),
         case_state=case_state,
         failure_stage=failure_stage,
         reason=f"Postprocessing replay failed: {error}",
@@ -3130,6 +3221,7 @@ def replay_case_postprocessing(
     config: config_contract.GenerationConfig,
     case_index: int,
     *,
+    source_campaign_run_id: str | None = None,
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
     blocking_lock: bool = True,
@@ -3149,7 +3241,14 @@ def replay_case_postprocessing(
                 work_directory=None,
                 message="Case is already successfully processed.",
             )
-        run_id = workspace_service.workspace_run_id(config)
+        run_id = (
+            workspace_service.workspace_run_id(config)
+            if source_campaign_run_id is None
+            else common.paths.validate_logical_name(
+                source_campaign_run_id,
+                label="source_campaign_run_id",
+            )
+        )
         attempt = attempt_service.latest_case_attempt(
             config,
             case_index,
@@ -3168,15 +3267,25 @@ def replay_case_postprocessing(
             config,
             case_index,
             attempt,
+            campaign_run_id=run_id,
             storage_root=storage,
         )
-        if not attempt.replay_available:
+        replay_status = replay_case_postprocessing_status(config, attempt)
+        if replay_status["blocked"]:
+            return CaseRunOutcome(
+                status="replay_blocked",
+                case_id=config.case_id(case_index),
+                processed_directory=processed,
+                work_directory=None,
+                message="Replay is blocked until its converter or output/time contract changes.",
+            )
+        if not replay_status["eligible"]:
             return CaseRunOutcome(
                 status="replay_unavailable",
                 case_id=config.case_id(case_index),
                 processed_directory=processed,
                 work_directory=None,
-                message=("Required postprocessing replay artifacts are unavailable or already consumed."),
+                message="Required postprocessing replay artifacts are unavailable or already consumed.",
             )
         prepared = prepare_case_work_directory(
             config,
@@ -3243,6 +3352,14 @@ def replay_case_postprocessing(
                 error,
                 prepared,
                 storage_root=storage,
+            )
+            attempt_service.record_replay_failure(
+                recorded_failure,
+                attempt,
+                converter_dependency_sha256=replay_status["identities"]["converter_dependency_sha256"],
+                output_contract_sha256=replay_status["identities"]["output_contract_sha256"],
+                time_contract_sha256=replay_status["identities"]["time_contract_sha256"],
+                error=error,
             )
             raise
         else:

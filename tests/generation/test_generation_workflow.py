@@ -2475,6 +2475,8 @@ def test_high_level_core_benchmark_preserves_transfer_contract(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     assert f"Run: {_BENCHMARK_RUN_ID}" in result.stdout
     assert "state=complete" in result.stdout
+    assert result.stdout.count("# Synthetic local core benchmark summary") == 1
+    assert result.stdout.index("# Synthetic local core benchmark summary") < result.stdout.index("DONE:")
     assert remote_directory.is_dir()
     assert Path(environment["FAKE_BENCHMARK_PUBLISHED_FILE"]).is_file()
     log_text = log.read_text(encoding="utf-8")

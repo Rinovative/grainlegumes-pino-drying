@@ -20,7 +20,7 @@ submission:
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:
-  cores_per_case: 4
+  cores_per_case: 16
   wall_time: "01:05:00"
   scheduler_options: []
 site:

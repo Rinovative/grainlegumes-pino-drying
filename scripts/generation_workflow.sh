@@ -2447,6 +2447,17 @@ validate_leaf_result() {
   esac
 }
 
+print_validated_leaf_result() {
+  case "$RUN_KIND" in
+    benchmark)
+      local_cli core-benchmark-summary "$RUN_ID" --format markdown \
+        --storage-root "$LOCAL_STORAGE_ROOT"
+      ;;
+    campaign) ;;
+    *) fail 2 "Unsupported validated-result presentation adapter: $RUN_KIND" ;;
+  esac
+}
+
 run_leaf_plan() {
   RUN_KIND="$1"
   RUN_LEAF_CONFIG="$2"
@@ -2456,6 +2467,7 @@ run_leaf_plan() {
   resolve_leaf_plan
   if [[ "$LEAF_STATE" == complete ]]; then
     generation_console_stage 2 9 "Existing state" REUSED "$LEAF_EXISTING_DETAIL"
+    print_validated_leaf_result
     return
   fi
   generation_console_stage 2 9 "Existing state" OK "$LEAF_EXISTING_DETAIL"
@@ -2519,6 +2531,7 @@ run_leaf_plan() {
       "keep_cpu_source=$KEEP_CPU_SOURCE reclaimed_bytes=$CPU_BYTES_RECLAIMED"
     ALL_STAGE="terminal repaired workflow validation"
     validate_leaf_result
+    print_validated_leaf_result
     LEAF_STATE=complete
     generation_console_stage 9 9 "Final validation" OK \
       "run_id=$RUN_ID kind=$RUN_KIND transfer_repair=true"
@@ -2570,6 +2583,7 @@ run_leaf_plan() {
 
   ALL_STAGE="terminal common workflow validation"
   validate_leaf_result
+  print_validated_leaf_result
   LEAF_STATE=complete
   generation_console_stage 9 9 "Final validation" OK \
     "run_id=$RUN_ID kind=$RUN_KIND"

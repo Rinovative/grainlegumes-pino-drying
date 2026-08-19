@@ -158,3 +158,74 @@ def test_stop_paths_reject_symbolic_links_and_invalid_timing(tmp_path: Path) -> 
         stop_service.derive_stop_status_path(work_directory)
     with pytest.raises(ValueError, match="0 < graceful_stop_reserve_seconds < timeout_seconds"):
         stop_service.validate_stop_timing(timeout_seconds=3600.0, graceful_stop_reserve_seconds=3600.0)
+
+
+def test_unexpected_status_content_is_preserved_with_bounded_diagnostics(tmp_path: Path) -> None:
+    """Never replace unknown owned content and report only one bounded excerpt."""
+    work_directory = _workspace(tmp_path)
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    original = "unexpected solver-owned marker " + "x" * 500
+    status_path.write_text(original, encoding="utf-8")
+    clock = _Clock()
+    controller = stop_service.SolverStopController(
+        _Process(clock),
+        work_directory,
+        timeout_seconds=10.0,
+        graceful_stop_reserve_seconds=2.0,
+        monotonic_clock=clock,
+    )
+
+    with pytest.raises(stop_service.UnexpectedStopStatusContentError) as caught:
+        controller.request_graceful_stop("timeout")
+
+    _require(status_path.read_text(encoding="utf-8") == original, "Unknown text status content was overwritten.")
+    diagnostics = json.loads(str(caught.value).split(": ", maxsplit=1)[1])
+    _require(diagnostics["status_path"] == str(status_path), "Status diagnostics lost the exact path.")
+    _require(
+        diagnostics["expected_content_class"] == "exact_command_or_admitted_predecessor",
+        "Status diagnostics lost the accepted-content contract.",
+    )
+    _require(diagnostics["actual_content_class"] == "unexpected_utf8_text", "Unexpected text was misclassified.")
+    _require(diagnostics["actual_content_excerpt"] == original[:160], "Status excerpt was not bounded exactly.")
+    _require(diagnostics["actual_content_excerpt_truncated"] is True, "Truncated status content was not identified.")
+    _require(diagnostics["file_size"] == len(original.encode("utf-8")), "Status byte size was not preserved.")
+    _require(
+        diagnostics["ownership_evidence"] == "derived_regular_file_below_owned_active_workspace",
+        "Owned workspace evidence was not explicit.",
+    )
+    _require(diagnostics["solver_exit_code"] is None, "Pre-termination diagnostics invented a solver exit code.")
+    _require(diagnostics["required_exports_present"] is None, "Pre-termination diagnostics invented export evidence.")
+    _require(diagnostics["replay_available"] is None, "Pre-termination diagnostics invented replay evidence.")
+
+    enriched = caught.value.with_runtime_evidence(
+        exit_code=-signal.SIGTERM,
+        required_exports_present=False,
+        replay_available=False,
+    )
+    enriched_diagnostics = json.loads(str(enriched).split(": ", maxsplit=1)[1])
+    _require(enriched_diagnostics["solver_exit_code"] == -signal.SIGTERM, "Solver exit evidence was not retained.")
+    _require(enriched_diagnostics["required_exports_present"] is False, "Missing export evidence was not retained.")
+    _require(enriched_diagnostics["replay_available"] is False, "Unavailable replay evidence was not retained.")
+
+
+def test_non_utf8_status_content_is_preserved_and_classified(tmp_path: Path) -> None:
+    """Classify a short binary marker without decoding or overwriting it."""
+    work_directory = _workspace(tmp_path)
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    original = b"\xff\xfe"
+    status_path.write_bytes(original)
+    controller = stop_service.SolverStopController(
+        _Process(_Clock()),
+        work_directory,
+        timeout_seconds=10.0,
+        graceful_stop_reserve_seconds=2.0,
+        monotonic_clock=_Clock(),
+    )
+
+    with pytest.raises(stop_service.UnexpectedStopStatusContentError) as caught:
+        controller.request_graceful_stop("cancelled")
+
+    _require(status_path.read_bytes() == original, "Unknown binary status content was overwritten.")
+    diagnostics = json.loads(str(caught.value).split(": ", maxsplit=1)[1])
+    _require(diagnostics["actual_content_class"] == "invalid_utf8_bytes", "Binary status content was misclassified.")
+    _require(diagnostics["actual_content_excerpt"] == original.hex(), "Binary status excerpt was not safely encoded.")

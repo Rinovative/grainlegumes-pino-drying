@@ -4595,6 +4595,26 @@ def core_benchmark_status(
     submission_timestamps = [str(item["submitted_at"]) for item in current_submissions]
     last_progress_timestamp = max((*progress_timestamps, *submission_timestamps), default=None)
     partial_evaluation = _completed_wave_evaluation(suite, manifest, records, scheduler)
+    final_summary: dict[str, Any] | None = None
+    final_markdown_path = directory / "summary.md"
+    if state == "complete":
+        summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
+        markdown = _load_validated_core_benchmark_markdown(
+            final_markdown_path,
+            summary,
+        )
+        recommended = summary.get("recommended_production")
+        recommended_values = recommended if isinstance(recommended, dict) else {}
+        final_summary = {
+            "path": str(final_markdown_path),
+            "markdown": markdown,
+            "fastest_single_case_cores": summary.get("fastest_single_case_cores"),
+            "lowest_core_hours_cores": summary.get("lowest_core_hours_cores"),
+            "recommended_cores_per_case": summary.get("recommended_cores_per_case"),
+            "estimated_cases_per_node": recommended_values.get("estimated_cases_per_node"),
+            "estimated_compute_only_cases_per_node_hour": recommended_values.get("estimated_cases_per_node_hour"),
+            "license_qualification": summary.get("license_qualification"),
+        }
 
     return {
         "schema_kind": "generation_run_status",
@@ -4628,6 +4648,7 @@ def core_benchmark_status(
         "last_progress_timestamp": last_progress_timestamp,
         "eta": "unavailable",
         "partial_evaluation": partial_evaluation,
+        "final_summary": final_summary,
         "canary": {
             "variant_id": canary.variant_id,
             "cores_per_case": canary.cores_per_case,
@@ -5152,6 +5173,35 @@ def load_core_benchmark_summary(
         message = f"Core benchmark summary schema is invalid: {run_id}"
         raise ValueError(message)
     return summary
+
+
+def _load_validated_core_benchmark_markdown(
+    path: Path,
+    summary: Mapping[str, Any],
+) -> str:
+    """Read one safe persisted Markdown summary and verify its canonical bytes."""
+    if not path.is_file() or path.is_symlink():
+        message = f"Core benchmark Markdown summary is missing or unsafe: {path}"
+        raise ValueError(message)
+    markdown = path.read_text(encoding="utf-8")
+    if markdown != core_benchmark_markdown(summary):
+        message = f"Core benchmark Markdown summary is inconsistent: {path}"
+        raise ValueError(message)
+    return markdown
+
+
+def load_core_benchmark_markdown(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> str:
+    """Load persisted terminal Markdown after validating it against the summary."""
+    directory = core_benchmark_directory(run_id, storage_root=storage_root)
+    summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
+    return _load_validated_core_benchmark_markdown(
+        directory / "summary.md",
+        summary,
+    )
 
 
 def _directory_inventory(

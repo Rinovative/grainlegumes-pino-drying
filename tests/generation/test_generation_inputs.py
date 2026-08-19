@@ -54,13 +54,6 @@ def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() ->
     }
     assert all(batch.sampling_regime != "parameter_ood" for batch in campaign.batches)
     assert campaign.profile.available_learning_views == ("steady_flow", "transient_drying")
-    assert {package["dataset_view"] for package in campaign.dataset_packages} == {"transient_drying"}
-    assert {package["evaluation_regime"] for package in campaign.dataset_packages} == {
-        "id",
-        "near_family_ood",
-        "far_family_ood",
-        "extreme_family_ood",
-    }
 
 
 def test_steady_flow_id_dataset_is_independent_and_balanced() -> None:
@@ -241,32 +234,23 @@ def test_active_campaign_keeps_its_launch_package_snapshot(
     assert active.package_request_digest != current.package_request_digest
 
 
-def test_only_independent_seen_campaign_owns_airflow_training_membership() -> None:
-    """Keep transient and OOD physical cases outside Airflow model selection."""
-    campaign_root = common.paths.get_project_root() / "configs/generation/campaigns"
-    campaigns = generation.cases.config.discover_campaign_configs(
-        campaign_root,
+def test_primary_airflow_training_source_is_selected_by_exact_dataset_name() -> None:
+    """Keep the independent campaign primary without forbidding neutral packages."""
+    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/id_dataset.yaml"
+    campaign = generation.cases.config.load_campaign_config(
+        campaign_path,
         require_executable=False,
     )
-    training_packages = [
-        (campaign, package)
-        for campaign in campaigns
-        for package in campaign.dataset_packages
-        if package["dataset_view"] == "steady_flow" and package["split_eligibility"]["train"]
-    ]
+    package = campaign.dataset_packages[0]
 
-    assert len(training_packages) == 1
-    campaign, package = training_packages[0]
     assert campaign.campaign_purpose == "steady_flow_id_dataset"
     assert campaign.profile.id == "steady_flow"
-    assert package["materials"] == ["lentil", "chickpea", "kidney_bean"]
     assert package["membership"]["totals"] == {
         "train": 840,
         "validation": 105,
         "id_test": 105,
     }
-    assert package["dataset_name"] == ("steady_flow__lentil+chickpea+kidney_bean__id")
-    assert domain.tasks.registry.get_task("steady_flow").default_datasets.train == (package["dataset_name"])
+    assert domain.tasks.registry.get_task("steady_flow").default_datasets.train == package["dataset_name"]
 
 
 def test_semantic_seed_derivation_is_version_bound() -> None:

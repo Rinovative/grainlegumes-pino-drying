@@ -1,10 +1,12 @@
-# ruff: noqa: PLR2004, S101
+# ruff: noqa: PLR2004, S101, SLF001
 """Per-case campaign reconciliation and human monitoring contracts."""
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 from src import generation
 from src.generation import generation_campaign_status as status_service
@@ -61,7 +63,9 @@ def _active_case(case_id: str, job_id: str, node: str, simulated_time: float) ->
             "phase": "transient_drying",
             "terminal": False,
             "parser_state": "available",
+            "comsol_progress_percent": 4.0,
             "simulated_time_seconds": simulated_time,
+            "step_index": 220,
             "step_size_seconds": 0.075,
             "order": 2,
             "time_failures": 1,
@@ -92,7 +96,12 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "slurm_job_ids": [record["job_id"] for record in submissions],
         "scheduler_job_name": "campaign",
         "scheduler_log_directory": str(run_directory / "scheduler"),
-        "submission_config": {"maximum_failed_cases": 10},
+        "submission_config": {
+            "cores_per_case": 16,
+            "pending_buffer": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 10,
+        },
         "submission_intent": None,
         "submissions": submissions,
         "state": "active",
@@ -174,12 +183,20 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     assert [case["case_id"] for case in status["cases"]] == [task.case_id for task in tasks]
     assert [case["state"] for case in status["cases"]] == [
         "successful",
-        "active",
+        "running",
         "failed",
         "license_blocked",
-        "pending",
+        "scheduler_pending",
         "never_started",
     ]
+    assert (
+        sum(
+            status["work_unit_counts"][state]
+            for state in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+        )
+        == status["work_unit_counts"]["total"]
+        == 6
+    )
     active = status["cases"][1]
     assert active["latest_job_id"] == "102"
     assert active["latest_job_name"] == "campaign-0002"
@@ -230,7 +247,12 @@ def test_conversion_failure_cannot_terminalize_an_active_campaign(
         "slurm_job_ids": ["101", "102"],
         "scheduler_job_name": "campaign",
         "scheduler_log_directory": str(run_directory / "scheduler"),
-        "submission_config": {"maximum_failed_cases": 0},
+        "submission_config": {
+            "cores_per_case": 16,
+            "pending_buffer": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 0,
+        },
         "submission_intent": None,
         "submissions": [],
         "remote_storage_root": str(tmp_path),
@@ -309,6 +331,85 @@ def test_conversion_failure_cannot_terminalize_an_active_campaign(
     assert unresolved["campaign_state"] == "completed_with_failures"
 
 
+def test_replay_blocked_failures_leave_free_normal_admission_unblocked(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report replay failures without overlapping categories or a false admission block."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=12,
+        pending_buffer=2,
+        maximum_failed_cases=5,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    run_id = "replay-blocked-status__0123456789abcdef"
+    run_directory = tmp_path / "replay-blocked-status"
+    run_directory.mkdir()
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": "a" * 40,
+        "slurm_job_ids": [],
+        "scheduler_job_name": "campaign",
+        "scheduler_log_directory": str(run_directory / "scheduler"),
+        "submission_config": {
+            "cores_per_case": 16,
+            "pending_buffer": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+        },
+        "submission_intent": None,
+        "submissions": [],
+        "state": "completed_with_failures",
+        "remote_storage_root": str(tmp_path),
+        "campaign_meta_directory": str(run_directory),
+    }
+    views = [
+        {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": "conversion_failed" if index < 2 else "never_started",
+            "failure_stage": "conversion" if index < 2 else None,
+            "quality_flag_count": 0,
+            "temporary_license_retry": None,
+            "license_retry_eligible": False,
+            "postprocessing_replay_available": index < 2,
+            "replay_eligible": False,
+            "replay_blocked": index < 2,
+        }
+        for index, task in enumerate(tasks)
+    ]
+    monkeypatch.setattr(generation.campaign.campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
+    monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
+    monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_run_directory", lambda *_args, **_kwargs: run_directory)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: {
+            "squeue": {"command": [], "output": "", "error": None},
+            "sacct": {"command": [], "output": "", "error": None},
+            "active": {},
+            "accounted": {},
+        },
+    )
+    monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: (views, 0, 0))
+
+    status = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
+
+    assert status["campaign_state"] == "feeding"
+    assert status["admission_blocked"] is False
+    assert status["admission_block_reason"] is None
+    assert status["failure_counts"]["conversion_failed"] == 2
+    assert status["failure_counts"]["replay_blocked"] == 2
+    assert status["work_unit_counts"]["failed"] == 2
+    assert status["work_unit_counts"]["never_started"] == 10
+    assert status["work_unit_counts"]["total"] == 12
+
+
 def test_human_summary_shows_two_cases_and_bounds_only_automatic_inventory() -> None:
     """Render every explicit active case while bounding workflow snapshots."""
     status = {
@@ -327,7 +428,7 @@ def test_human_summary_shows_two_cases_and_bounds_only_automatic_inventory() -> 
         assert value in explicit
     assert "case_0001" in bounded
     assert "case_0002" not in bounded
-    assert "1 additional active case(s) omitted" in bounded
+    assert "displayed=1  additional=1" in bounded
 
 
 def test_human_summary_exposes_pinned_execution_resources() -> None:
@@ -375,9 +476,139 @@ def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
     rendered = status_service.format_campaign_status_summary(status)
 
     assert "License-blocked cases:" in rendered
-    assert "state=license_blocked" in rendered
+    assert "reason=temporary_license_capacity" in rendered
     assert "Failed cases:" not in rendered
-    assert "0 failed" in rendered
+    assert "failed=0" in rendered
+
+
+def test_human_summary_compacts_failed_replay_evidence() -> None:
+    """Keep actionable replay state while omitting internal replay metadata."""
+    status = {
+        "campaign_run_id": "replay-blocked__0123456789abcdef",
+        "campaign_state": "feeding",
+        "cases": [
+            {
+                "batch_name": "transient_drying__chickpea__natural",
+                "case_id": "case_0001",
+                "state": "failed",
+                "classified_state": "conversion_failed",
+                "reason": "postprocessing replay failed " + "with internal detail " * 30,
+                "failure_stage": "conversion",
+                "solver_state": "succeeded",
+                "postprocessing_state": "replay_blocked",
+                "replay_eligible": False,
+                "replay_running": False,
+                "replay_blocked": True,
+                "replay_block_reason": "unchanged_replay_identity",
+                "replay_attempt_count": 1,
+                "replay_evidence_path": "/storage/01_generation/attempts/replay_failure.json",
+                "automatic_continuation_allowed": False,
+            },
+            {
+                "batch_name": "transient_drying__chickpea__natural",
+                "case_id": "case_0002",
+                "state": "never_started",
+            },
+        ],
+    }
+
+    rendered = status_service.format_campaign_status_summary(status)
+
+    for value in (
+        "state=conversion_failed",
+        "stage=conversion",
+        "solver=succeeded",
+        "replay=blocked",
+        "evidence=.../01_generation/attempts/replay_failure.json",
+    ):
+        assert value in rendered
+    for internal in (
+        "postprocessing_state",
+        "replay_eligible",
+        "replay_running",
+        "replay_blocked",
+        "replay_block_reason",
+        "replay_attempt_count",
+        "replay_evidence_path",
+        "automatic_continuation_allowed",
+    ):
+        assert internal not in rendered
+    reason_line = next(line for line in rendered.splitlines() if "reason=" in line)
+    assert len(reason_line) <= 171
+    assert max(map(len, rendered.splitlines())) <= 180
+
+
+def test_human_summary_bounds_license_rows_and_omits_machine_evidence() -> None:
+    """Show retry actions while retaining raw license evidence only in JSON."""
+    cases = [
+        {
+            "batch_name": "transient_drying__kidney_bean__natural",
+            "case_id": f"case_{index:04d}",
+            "state": "license_blocked",
+            "reason": "temporary_license_capacity",
+            "latest_job_id": str(629_820 + index),
+            "temporary_license_retry": {
+                "feature": "Equilibrium Moisture Transport in Porous Media",
+                "error_code": "-4,132",
+                "retry_count": index + 1,
+                "next_retry_at": "2026-08-20T00:07:09Z",
+                "cumulative_wait_seconds": 60,
+                "matched_signatures": ["licensed number of users already reached"],
+                "raw_excerpt": "FlexNet error " * 500,
+                "license_path": "/complete/internal/license/path",
+            },
+        }
+        for index in range(22)
+    ]
+
+    rendered = status_service.format_campaign_status_summary({"campaign_run_id": "license-run", "campaign_state": "running", "cases": cases})
+
+    for value in (
+        'feature="Equilibrium Moisture Transport in Porous Media"',
+        "code=-4,132",
+        "retry=1",
+        "next_retry=2026-08-20T00:07:09Z",
+        "cumulative_wait=60 s",
+        "displayed=20  additional=2",
+    ):
+        assert value in rendered
+    for internal in ("raw_excerpt", "matched_signatures", "FlexNet error", "license_path", "[", "{"):
+        assert internal not in rendered
+    assert max(map(len, rendered.splitlines())) <= 180
+
+
+def test_running_summary_keeps_progress_without_replay_metadata() -> None:
+    """Keep useful solver progress and omit unrelated replay evidence."""
+    case = _active_case("case_0002", "629565", "hpc119", 125.496)
+    case.update(
+        {
+            "replay_eligible": False,
+            "replay_running": False,
+            "replay_blocked": False,
+            "replay_attempt_count": 0,
+            "postprocessing_state": "not_applicable",
+        }
+    )
+    case["runtime_progress"]["last_solver_log_update_at"] = "2026-08-19T19:11:41Z"
+
+    rendered = status_service.format_campaign_status_summary({"campaign_run_id": "running", "campaign_state": "running", "cases": [case]})
+
+    for value in (
+        "job=629565",
+        "node=hpc119",
+        "phase=transient_drying",
+        "progress=4%",
+        "simulated_time=0.03486 h",
+        "step=220",
+        "step_size=0.075 s",
+        "Tfail=1",
+        "NLfail=25",
+        "last_solver_update=2026-08-19T19:11:41Z",
+        "age=4 s ago",
+    ):
+        assert value in rendered
+    for internal in ("replay_eligible", "replay_running", "replay_blocked", "replay_attempt_count", "postprocessing_state"):
+        assert internal not in rendered
 
 
 def test_monitor_signatures_separate_phase_changes_from_rate_limited_advancement() -> None:
@@ -460,5 +691,191 @@ def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_boun
     exporting["runtime_progress"]["phase"] = "collecting_exports"
     exporting_text = status_service.format_campaign_status_summary({**status, "cases": [exporting]})
     assert "phase=collecting_exports" in exporting_text
-    assert "progress=unavailable" in exporting_text
-    assert "simulated_time=unavailable" in exporting_text
+    assert "progress=" not in exporting_text
+    assert "simulated_time=" not in exporting_text
+    assert "step=" not in exporting_text
+    assert "Tfail=" not in exporting_text
+
+
+def test_human_summary_groups_never_started_campaigns_at_material_scale() -> None:
+    """Scale never-started output with ordered materials rather than case count."""
+    campaign_shapes = (
+        (18, (("field_pea", 3), ("rapeseed", 3), ("sunflower_seed", 3))),
+        (600, (("lentil", 120), ("chickpea", 120), ("field_pea", 120), ("rapeseed", 120), ("sunflower_seed", 120))),
+        (1_050, (("lentil", 210), ("chickpea", 210), ("field_pea", 210), ("rapeseed", 210), ("sunflower_seed", 210))),
+    )
+    for total, groups in campaign_shapes:
+        never_started_count = sum(count for _material, count in groups)
+        successful_count = total - never_started_count
+        cases = [{"case_id": f"successful_{index:04d}", "batch_name": "completed", "state": "successful"} for index in range(successful_count)]
+        for material, count in groups:
+            cases.extend(
+                {
+                    "case_id": f"{material}_{index:04d}",
+                    "batch_name": f"transient_drying__{material}__natural",
+                    "material": material,
+                    "state": "never_started",
+                }
+                for index in range(count)
+            )
+
+        rendered = status_service.format_campaign_status_summary(
+            {"campaign_run_id": f"campaign-{total}", "campaign_state": "running", "cases": cases}
+        )
+        never_started = rendered.split("Never started:\n", maxsplit=1)[1]
+
+        assert f"never_started={never_started_count}" in rendered
+        assert f"total={total}" in rendered
+        assert [never_started.index(f"{material}: {count}") for material, count in groups] == sorted(
+            never_started.index(f"{material}: {count}") for material, count in groups
+        )
+        assert f"total: {never_started_count}" in never_started
+        assert not any(f"{material}_0000" in never_started for material, _count in groups)
+        assert len(never_started.splitlines()) == len(groups) + 1
+
+
+def test_benchmark_summary_uses_bounded_common_work_unit_vocabulary() -> None:
+    """Render benchmark work units in supplied resolved order without inventory expansion."""
+    status = {
+        "suite_name": "core scaling",
+        "benchmark_run_id": "benchmark",
+        "state": "running",
+        "wave_count": 2,
+        "current_wave": {"wave_position": 1, "variant_id": "cores_4", "cores_per_case": 4},
+        "work_units": [
+            {"variant_id": "cores_4", "case_role": "canary", "work_unit_id": "four-canary", "state": "running"},
+            {"variant_id": "cores_4", "case_role": "measurement", "work_unit_id": "four-measurement", "state": "never_started"},
+            {"variant_id": "cores_8", "case_role": "canary", "work_unit_id": "eight-canary", "state": "never_started"},
+        ],
+        "partial_evaluation": {"variants": [], "recommended_cores_per_case": 4},
+    }
+
+    rendered = status_service.format_benchmark_status_summary(status, max_active_cases=1)
+
+    assert "successful=0" in rendered
+    assert "running=1" in rendered
+    assert "never_started=2" in rendered
+    assert "four-canary" in rendered
+    assert "Partial wave evaluation (provisional):" in rendered
+
+
+def test_pilot_license_observability_uses_existing_solver_and_wait_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report successful overlap and license delays without submitting work."""
+    batch = SimpleNamespace(
+        batch_id="batch-id",
+        batch_storage_name="batch-storage",
+        case_indices=(1, 2),
+        case_id=lambda index: f"case_{index:04d}",
+    )
+    campaign = SimpleNamespace(batches=(batch,))
+    views = [{"batch_id": "batch-id", "case_index": index, "state": "successful"} for index in (1, 2)]
+    processed_roots: dict[int, Path] = {}
+    intervals = {
+        1: ("2026-01-01T00:00:00+00:00", "2026-01-01T00:10:00+00:00"),
+        2: ("2026-01-01T00:05:00+00:00", "2026-01-01T00:15:00+00:00"),
+    }
+    for case_index, (started_at, ended_at) in intervals.items():
+        directory = tmp_path / f"processed-{case_index}"
+        directory.mkdir()
+        (directory / "execution_provenance.json").write_text(
+            json.dumps({"result": {"started_at": started_at, "ended_at": ended_at}}),
+            encoding="utf-8",
+        )
+        processed_roots[case_index] = directory
+    attempt_root = tmp_path / "attempts"
+    retry_count = 17
+    for attempt_index in range(1, retry_count + 1):
+        receipt = attempt_root / f"attempt_{attempt_index:04d}" / "attempt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(
+            json.dumps(
+                {
+                    "campaign_run_id": "pilot-run",
+                    "batch_id": "batch-id",
+                    "case_id": "case_0001",
+                    "case_state": "license_blocked",
+                    "attempt_index": attempt_index,
+                    "job_id": str(500 + attempt_index),
+                    "elapsed_seconds": 3.5,
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "processed_case_directory",
+        lambda _batch, case_index, **_kwargs: processed_roots[case_index],
+    )
+    monkeypatch.setattr(
+        generation.campaign.license_service,
+        "load_temporary_license_wait",
+        lambda _batch, case_index, **_kwargs: (
+            {
+                "retry_count": retry_count,
+                "cumulative_wait_seconds": 1_020.0,
+                "feature": "COMSOL Multiphysics",
+                "error_code": "-4,132",
+                "recent_job_ids": [str(job_id) for job_id in range(502, 518)],
+            }
+            if case_index == 1
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        generation.campaign.common.paths,
+        "resolve_generation_attempt_case_directory",
+        lambda *_args, **_kwargs: attempt_root,
+    )
+
+    observed = generation.campaign._pilot_license_observability(
+        cast("generation.cases.config.CampaignConfig", campaign),
+        views,
+        run_id="pilot-run",
+        storage_root=tmp_path,
+    )
+
+    assert observed == {
+        "observed_peak_solver_concurrency": 2,
+        "successful_solver_start_count": 2,
+        "license_blocked_submission_count": 17,
+        "accumulated_license_wait_seconds": 1_020.0,
+        "accumulated_license_probe_seconds": 59.5,
+        "detected_license_features": ["COMSOL Multiphysics"],
+        "detected_license_error_codes": ["-4,132"],
+        "observed_license_concurrency_lower_bound": 2,
+    }
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "pilot-run",
+            "campaign_state": "successful",
+            "cases": [],
+            "license_observability": observed,
+        }
+    )
+    assert "Material-pilot license observability" not in rendered
+    assert "observed_license_concurrency_lower_bound" not in rendered
+    assert "detected_license_features" not in rendered
+
+
+def test_completed_benchmark_status_prints_validated_final_markdown() -> None:
+    """Expose the persisted final benchmark result without recomputing it."""
+    rendered = status_service.format_benchmark_status_summary(
+        {
+            "suite_name": "core scaling",
+            "benchmark_run_id": "benchmark",
+            "state": "complete",
+            "wave_count": 4,
+            "work_units": [],
+            "final_summary": {
+                "path": "/evidence/summary.md",
+                "markdown": "# Validated benchmark result\n\nRecommended: 4 cores.\n",
+            },
+        }
+    )
+
+    assert "Final validated benchmark summary" in rendered
+    assert "/evidence/summary.md" in rendered
+    assert "# Validated benchmark result" in rendered

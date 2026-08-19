@@ -567,8 +567,24 @@ try:
         if mapping_export_mode == "missing":
             airflow_path.unlink()
         if transient_profile:
-            state_times = (0.0, 1.0, 1.5)
+            transient_time_mode = os.environ.get("FAKE_COMSOL_TRANSIENT_TIME_MODE", "exact_stop")
+            if transient_time_mode == "exact_stop":
+                state_times = (0.0, 1.0, 1.5)
+            elif transient_time_mode == "post_horizon":
+                state_times = (*map(float, range(169)), 172.2885558527809)
+            else:
+                raise RuntimeError(f"unsupported fake transient time mode: {transient_time_mode}")
             water_by_time = {state_time: [] for state_time in state_times}
+            f_wet_by_time = {
+                state_time: (
+                    1.0
+                    if state_time == 0.0
+                    else 0.04
+                    if transient_time_mode == "exact_stop" or state_time > 168.0
+                    else 0.08
+                )
+                for state_time in state_times
+            }
             with (exports / "transient.csv").open("w", encoding="utf-8", newline="") as stream:
                 logical_units = (
                     ("t", "h"),
@@ -647,7 +663,7 @@ try:
                             state_time,
                             state_time,
                             bulk,
-                            1.0 if state_time == 0.0 else 0.04,
+                            f_wet_by_time[state_time],
                             0.8 * 9e-6 * weighted_water,
                             1.0 + 0.1 * state_time,
                             0.1 - 0.01 * state_time,
@@ -683,7 +699,7 @@ try:
                         scalars["T_amb"],
                         0.0,
                         final_time,
-                        0.04,
+                        f_wet_by_time[final_time],
                         bulk,
                         maximum,
                         296.0 - 0.1 * final_time,

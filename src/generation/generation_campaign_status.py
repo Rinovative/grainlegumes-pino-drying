@@ -18,6 +18,7 @@ This module does NOT:
 from __future__ import annotations
 
 import math
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
 
 from src import common
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
 _MONITOR_RECORD_KIND = "campaign-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
+_MAX_ACTIONABLE_DETAILS = 20
+_MAX_REASON_CHARACTERS = 160
+_MAX_EVIDENCE_PATH_CHARACTERS = 80
 _FAILED_CASE_STATES = frozenset(
     {
         "failed",
@@ -44,6 +48,39 @@ def _text(value: object) -> str:
     if value is None or value == "":
         return "unavailable"
     return str(value)
+
+
+def _available_text(value: object) -> str | None:
+    """Return displayable scalar text while suppressing routine empty values."""
+    if value is None or value is False or isinstance(value, (dict, list, tuple, set)):
+        return None
+    if value in {"", "unavailable", "not_applicable"}:
+        return None
+    return str(value)
+
+
+def _bounded_text(value: object, *, maximum: int) -> str | None:
+    """Return one whitespace-normalized scalar bounded for terminal display."""
+    text = _available_text(value)
+    if text is None:
+        return None
+    compact = " ".join(text.split())
+    if len(compact) <= maximum:
+        return compact
+    return f"{compact[: maximum - 3].rstrip()}..."
+
+
+def _compact_evidence_path(value: object) -> str | None:
+    """Return a short relative-looking suffix for retained evidence."""
+    text = _available_text(value)
+    if text is None:
+        return None
+    path = PurePath(text)
+    relative_parts = [part for part in path.parts if part not in {path.anchor, "/"}]
+    compact = PurePath(*relative_parts[-3:]).as_posix()
+    if path.is_absolute():
+        compact = f".../{compact}"
+    return _bounded_text(compact, maximum=_MAX_EVIDENCE_PATH_CHARACTERS)
 
 
 def _float_value(value: object) -> float | None:
@@ -119,66 +156,159 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
     return "failed"
 
 
-def _case_heading(case: Mapping[str, Any], *, show_batch: bool) -> str:
-    """Return one compact exact case, job, node, and elapsed line."""
+def _case_heading(case: Mapping[str, Any], *, include_runtime: bool = True) -> str:
+    """Return one compact work-unit identity and scheduler heading."""
     parts = [str(case["case_id"])]
-    if show_batch:
-        parts.append(f"batch={case['batch_name']}")
-    parts.extend(
-        (
-            f"job={_text(case.get('latest_job_id'))}",
-            f"node={_text(case.get('node'))}",
-            f"elapsed={_text(case.get('elapsed'))}",
-        )
-    )
+    label = _group_label(case)
+    if label != "unavailable":
+        parts.append(f"batch={label}")
+    variant = _available_text(case.get("variant_id"))
+    role = _available_text(case.get("case_role"))
+    if variant is not None and variant != label:
+        parts.append(f"variant={variant}")
+    if role is not None:
+        parts.append(f"role={role}")
+    for name, value in (("job", case.get("latest_job_id")), ("node", case.get("node"))):
+        rendered = _available_text(value)
+        if rendered is not None:
+            parts.append(f"{name}={rendered}")
+    if include_runtime:
+        elapsed = _available_text(case.get("elapsed"))
+        if elapsed is not None:
+            parts.append(f"elapsed={elapsed}")
     return "  ".join(parts)
 
 
-def _active_case_lines(case: Mapping[str, Any], *, show_batch: bool) -> list[str]:
-    """Return compact multiline raw evidence for one running work unit."""
-    lines = [_case_heading(case, show_batch=show_batch)]
+def _active_case_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return compact multiline progress for one running work unit."""
+    lines = [_case_heading(case)]
     runtime = _runtime_view(case)
     if runtime.get("availability") != "available":
-        reason = _text(runtime.get("reason"))
-        lines.append(f"  phase=unavailable  parser_state={reason}  last_progress_update=unavailable")
+        reason = _bounded_text(runtime.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+        if reason is not None:
+            lines.append(f"  runtime_progress={reason}")
         return lines
-    phase = _text(runtime.get("phase"))
-    parser_state = _text(runtime.get("parser_state"))
-    progress = _format_comsol_stage(runtime.get("comsol_progress_percent")) if phase in {"stationary_airflow", "transient_drying"} else "unavailable"
-    lines.append(f"  state=running  phase={phase}  parser_state={parser_state}  progress={progress}")
+    phase = _available_text(runtime.get("phase"))
+    if phase is not None:
+        phase_parts = [f"phase={phase}"]
+        if phase in {"stationary_airflow", "transient_drying"}:
+            progress = _available_text(_format_comsol_stage(runtime.get("comsol_progress_percent")))
+            if progress is not None:
+                phase_parts.append(f"progress={progress}")
+        lines.append(f"  {'  '.join(phase_parts)}")
     if phase in {"stationary_airflow", "transient_drying"} and runtime.get("parser_state") == "available":
-        lines.append(
-            "  "
-            f"simulated_time={_format_simulated_time(runtime.get('simulated_time_seconds'))}  "
-            f"step={_text(runtime.get('step_index'))}  "
-            f"step_size={_format_step_size(runtime.get('step_size_seconds'))}"
+        solver_values = (
+            ("simulated_time", _format_simulated_time(runtime.get("simulated_time_seconds"))),
+            ("step", runtime.get("step_index")),
+            ("step_size", _format_step_size(runtime.get("step_size_seconds"))),
         )
-    else:
-        lines.append("  simulated_time=unavailable  step=unavailable  step_size=unavailable")
-    lines.append(
-        "  "
-        f"Tfail={_text(runtime.get('time_failures'))}  NLfail={_text(runtime.get('nonlinear_failures'))}  "
-        f"last_solver_update={_text(runtime.get('last_solver_log_update_at'))}  "
-        f"last_progress_update={_text(runtime.get('updated_at'))}  age={_format_age(runtime)}"
-    )
+        solver_parts = [f"{name}={rendered}" for name, value in solver_values if (rendered := _available_text(value)) is not None]
+        if solver_parts:
+            lines.append(f"  {'  '.join(solver_parts)}")
+        failure_parts = []
+        for name, value in (("Tfail", runtime.get("time_failures")), ("NLfail", runtime.get("nonlinear_failures"))):
+            rendered = _available_text(value)
+            if rendered is not None:
+                failure_parts.append(f"{name}={rendered}")
+        if failure_parts:
+            lines.append(f"  {'  '.join(failure_parts)}")
+        update_parts = []
+        updated = _available_text(runtime.get("last_solver_log_update_at"))
+        if updated is not None:
+            update_parts.append(f"last_solver_update={updated}")
+        age = _available_text(_format_age(runtime))
+        if age is not None:
+            update_parts.append(f"age={age}")
+        if update_parts:
+            lines.append(f"  {'  '.join(update_parts)}")
     return lines
 
 
-def _nonactive_case_line(case: Mapping[str, Any], *, show_batch: bool) -> str:
-    """Return one concise state line for a non-active case."""
-    heading = _case_heading(case, show_batch=show_batch)
-    details = [
-        f"state={_text(case.get('state'))}",
-        f"reason={_text(case.get('reason'))}",
-    ]
-    if case.get("failure_stage") is not None:
-        details.extend(
-            (
-                f"solver={_text(case.get('solver_state'))}",
-                f"failure_stage={_text(case.get('failure_stage'))}",
-            )
-        )
-    return f"{heading}  {'  '.join(details)}"
+def _scheduler_pending_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return one compact scheduler-pending work-unit block."""
+    lines = [_case_heading(case, include_runtime=False)]
+    details = []
+    for name, value in (
+        ("queue_age", case.get("queue_age")),
+        ("reason", case.get("scheduler_state") or case.get("reason")),
+        ("cores", case.get("requested_cores")),
+    ):
+        rendered = _bounded_text(value, maximum=_MAX_REASON_CHARACTERS)
+        if rendered is not None:
+            details.append(f"{name}={rendered}")
+    if details:
+        lines.append(f"  {'  '.join(details)}")
+    return lines
+
+
+def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return concise operational license retry detail without raw evidence."""
+    lines = [_case_heading(case, include_runtime=False)]
+    retry = case.get("temporary_license_retry")
+    if isinstance(retry, dict):
+        feature = _bounded_text(retry.get("feature"), maximum=_MAX_REASON_CHARACTERS)
+        if feature is not None:
+            lines.append(f'  feature="{feature}"')
+        retry_parts = []
+        for name, value in (
+            ("code", retry.get("error_code")),
+            ("retry", retry.get("retry_count")),
+            ("next_retry", retry.get("next_retry_at")),
+        ):
+            rendered = _available_text(value)
+            if rendered is not None:
+                retry_parts.append(f"{name}={rendered}")
+        if retry_parts:
+            lines.append(f"  {'  '.join(retry_parts)}")
+        wait = _available_text(retry.get("cumulative_wait_seconds"))
+        if wait is not None:
+            lines.append(f"  cumulative_wait={wait} s")
+    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    if reason is not None:
+        lines.append(f"  reason={reason}")
+    return lines
+
+
+def _replay_state(case: Mapping[str, Any]) -> str:
+    """Return the compact operational replay state for a failed case."""
+    if case.get("replay_running") is True:
+        return "running"
+    if case.get("replay_blocked") is True:
+        return "blocked"
+    if case.get("replay_eligible") is True:
+        return "eligible"
+    return "unavailable"
+
+
+def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return compact actionable failure detail with bounded evidence references."""
+    lines = [_case_heading(case)]
+    state = _available_text(case.get("classified_state")) or _text(case.get("state"))
+    details = [f"state={state}"]
+    for name, value in (("stage", case.get("failure_stage")), ("solver", case.get("solver_state"))):
+        rendered = _available_text(value)
+        if rendered is not None:
+            details.append(f"{name}={rendered}")
+    lines.append(f"  {'  '.join(details)}")
+    lines.append(f"  replay={_replay_state(case)}")
+    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    if reason is not None:
+        lines.append(f'  reason="{reason}"')
+    evidence = _compact_evidence_path(case.get("evidence_path") or case.get("replay_evidence_path"))
+    if evidence is not None:
+        lines.append(f"  evidence={evidence}")
+    return lines
+
+
+def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return the established compact successful-case detail."""
+    lines = [_case_heading(case)]
+    details = ["state=successful"]
+    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    if reason is not None:
+        details.append(f"reason={reason}")
+    lines.append(f"  {'  '.join(details)}")
+    return lines
 
 
 def _case_inventory(status: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -195,6 +325,44 @@ def _append_section(lines: list[str], title: str, records: Sequence[str]) -> Non
         return
     lines.extend(("", f"{title}:"))
     lines.extend(records)
+
+
+def _group_label(case: Mapping[str, Any]) -> str:
+    """Return the authoritative material label, falling back to batch identity."""
+    material = case.get("material")
+    return str(material) if isinstance(material, str) and material else _text(case.get("batch_name"))
+
+
+def _grouped_population_rows(cases: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return deterministic batch or material counts for a non-actionable population."""
+    counts: dict[str, int] = {}
+    for case in cases:
+        label = _group_label(case)
+        counts[label] = counts.get(label, 0) + 1
+    return [*(f"  {label}: {count}" for label, count in counts.items()), f"  total: {len(cases)}"]
+
+
+def _actionable_section(
+    lines: list[str],
+    title: str,
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    maximum: int | None,
+    renderer: Any,
+) -> None:
+    """Append bounded deterministic detail for one actionable presentation state."""
+    if not cases:
+        return
+    records: list[str] = []
+    visible = cases if maximum is None else cases[:maximum]
+    for index, case in enumerate(visible):
+        if index:
+            records.append("")
+        records.extend(renderer(case))
+    displayed = len(visible)
+    if maximum is not None and displayed < len(cases):
+        records.insert(0, f"displayed={displayed}  additional={len(cases) - displayed}")
+    _append_section(lines, title, records)
 
 
 def format_campaign_status_summary(
@@ -249,38 +417,17 @@ def format_campaign_status_summary(
             "Cases: "
             f"successful={len(buckets['successful'])}  running={len(buckets['running'])}  "
             f"scheduler_pending={len(buckets['scheduler_pending'])}  license_blocked={len(buckets['license_blocked'])}  "
-            f"never_started={len(buckets['never_started'])}  failed={len(buckets['failed'])}  total={len(cases)} "
-            f"({len(buckets['failed'])} failed)"
+            f"never_started={len(buckets['never_started'])}  failed={len(buckets['failed'])}  total={len(cases)}"
         ),
     ]
-    show_batch = len({str(case.get("batch_name")) for case in cases}) > 1
-    active = buckets["running"]
-    visible_active = active if max_active_cases is None else active[:max_active_cases]
-    active_lines: list[str] = []
-    for index, case in enumerate(visible_active):
-        if index:
-            active_lines.append("")
-        active_lines.extend(_active_case_lines(case, show_batch=show_batch))
-    omitted = len(active) - len(visible_active)
-    if omitted:
-        active_lines.append(f"... {omitted} additional active case(s) omitted")
-    _append_section(lines, "Running cases", active_lines)
-    license_blocked_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["license_blocked"]]
-    pending_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["scheduler_pending"]]
-    never_started_records = [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["never_started"]]
-    _append_section(lines, "License-blocked cases", license_blocked_records)
-    _append_section(lines, "Scheduler-pending cases", pending_records)
-    _append_section(lines, "Never-started cases", never_started_records)
-    _append_section(
-        lines,
-        "Failed cases",
-        [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["failed"]],
-    )
-    _append_section(
-        lines,
-        "Completed cases",
-        [_nonactive_case_line(case, show_batch=show_batch) for case in buckets["successful"]],
-    )
+    detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
+    _actionable_section(lines, "Running cases", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
+    _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
+    _actionable_section(lines, "License-blocked cases", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
+    _actionable_section(lines, "Failed cases", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
+    _actionable_section(lines, "Completed cases", buckets["successful"], maximum=None, renderer=_completed_case_lines)
+    if buckets["never_started"]:
+        _append_section(lines, "Never started", _grouped_population_rows(buckets["never_started"]))
     return "\n".join(lines)
 
 
@@ -310,6 +457,13 @@ def campaign_monitor_signatures(status: Mapping[str, Any]) -> tuple[str, str]:
             "latest_job_id": case.get("latest_job_id"),
             "scheduler_state": case.get("scheduler_state"),
             "node": case.get("node"),
+            "attempt_index": case.get("attempt_index"),
+            "attempt_campaign_run_id": case.get("attempt_campaign_run_id"),
+            "postprocessing_state": case.get("postprocessing_state"),
+            "replay_eligible": case.get("replay_eligible"),
+            "replay_blocked": case.get("replay_blocked"),
+            "replay_block_reason": case.get("replay_block_reason"),
+            "replay_attempt_count": case.get("replay_attempt_count"),
             "phase": runtime.get("phase"),
             "terminal": runtime.get("terminal"),
         }
@@ -328,7 +482,12 @@ def campaign_monitor_signatures(status: Mapping[str, Any]) -> tuple[str, str]:
                 "nonlinear_iteration": runtime.get("nonlinear_iteration"),
             }
         )
-    urgent_payload = {"campaign_state": status.get("campaign_state"), "cases": urgent_cases}
+    urgent_payload = {
+        "campaign_state": status.get("campaign_state"),
+        "admission_blocked": status.get("admission_blocked"),
+        "admission_block_reason": status.get("admission_block_reason"),
+        "cases": urgent_cases,
+    }
     progress_payload = {"campaign_state": status.get("campaign_state"), "cases": progress_cases}
     return (
         common.serialization.canonical_json_sha256(urgent_payload),
@@ -375,32 +534,32 @@ def format_benchmark_status_summary(
     *,
     max_active_cases: int | None = None,
 ) -> str:
-    """Format benchmark status through the common work-unit presentation model."""
+    """Format benchmark status through the common bounded work-unit model."""
     raw_units = status.get("work_units")
     units = raw_units if isinstance(raw_units, list) and all(isinstance(item, dict) for item in raw_units) else []
     normalized = [
         {
             **unit,
-            "case_id": f"{unit.get('variant_id', 'unavailable')} {unit.get('case_role', 'unavailable')}",
+            "case_id": str(unit.get("work_unit_id", f"{unit.get('variant_id', 'unavailable')} {unit.get('case_role', 'unavailable')}")),
             "batch_name": str(unit.get("variant_id", "unavailable")),
         }
         for unit in units
     ]
     categories = ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
-    counts = {name: sum(unit.get("state") == name for unit in normalized) for name in categories}
+    buckets = {name: [unit for unit in normalized if _case_bucket(unit) == name] for name in categories}
     wave = status.get("current_wave")
     wave_values = wave if isinstance(wave, dict) else {}
     current_variant = wave_values.get("variant_id")
     current_units = [unit for unit in normalized if unit.get("variant_id") == current_variant]
-    current_counts = {name: sum(unit.get("state") == name for unit in current_units) for name in categories}
+    current_counts = {name: sum(_case_bucket(unit) == name for unit in current_units) for name in categories}
     lines = [
         f"Benchmark: {_text(status.get('suite_name'))}",
         f"Run: {_text(status.get('benchmark_run_id'))}",
         f"State: {_text(status.get('state'))}",
         f"Wave: {_text(wave_values.get('wave_position'))}/{_text(status.get('wave_count'))}",
         f"Current cores_per_case: {_text(wave_values.get('cores_per_case'))}",
-        f"Measurements: {counts['successful']}/{len(normalized)} successful",
-        "Work units: " + "  ".join(f"{name}={counts[name]}" for name in categories) + f"  total={len(normalized)}",
+        f"Measurements: {len(buckets['successful'])}/{len(normalized)} successful",
+        "Work units: " + "  ".join(f"{name}={len(buckets[name])}" for name in categories) + f"  total={len(normalized)}",
     ]
     if current_units:
         lines.extend(
@@ -416,25 +575,14 @@ def format_benchmark_status_summary(
                 f"  eta={_text(status.get('eta'))}",
             )
         )
-    running = [unit for unit in normalized if unit.get("state") == "running"]
-    visible_running = running if max_active_cases is None else running[:max_active_cases]
-    detail: list[str] = []
-    for index, unit in enumerate(visible_running):
-        if index:
-            detail.append("")
-        detail.extend(_active_case_lines(unit, show_batch=False))
-    omitted = len(running) - len(visible_running)
-    if omitted:
-        detail.append(f"... {omitted} additional running work unit(s) omitted")
-    _append_section(lines, "Running work units", detail)
-    wave_order = status.get("waves")
-    if isinstance(wave_order, list):
-        completed = [f"  {item.get('variant_id')}: complete" for item in wave_order if isinstance(item, dict) and item.get("state") == "complete"]
-        future = [
-            f"  {item.get('variant_id')}: never_started" for item in wave_order if isinstance(item, dict) and item.get("state") == "never_started"
-        ]
-        _append_section(lines, "Completed waves", completed)
-        _append_section(lines, "Future waves", future)
+    detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
+    _actionable_section(lines, "Running work units", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
+    _actionable_section(lines, "Scheduler-pending work units", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
+    _actionable_section(lines, "License-blocked work units", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
+    _actionable_section(lines, "Failed work units", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
+    _actionable_section(lines, "Completed work units", buckets["successful"], maximum=None, renderer=_completed_case_lines)
+    if buckets["never_started"]:
+        _append_section(lines, "Never started", _grouped_population_rows(buckets["never_started"]))
     partial = status.get("partial_evaluation")
     if isinstance(partial, dict):
         lines.extend(("", "Partial wave evaluation (provisional):"))
@@ -463,6 +611,24 @@ def format_benchmark_status_summary(
                     )
                 )
         lines.append(f"  provisional_recommendation={_text(partial.get('recommended_cores_per_case'))}")
+    final_summary = status.get("final_summary")
+    if isinstance(final_summary, dict):
+        markdown = final_summary.get("markdown")
+        if isinstance(markdown, str) and markdown:
+            lines.extend(("", f"Final validated benchmark summary ({_text(final_summary.get('path'))}):", markdown.rstrip()))
+        else:
+            lines.extend(
+                (
+                    "",
+                    f"Final benchmark summary: {_text(final_summary.get('path'))}",
+                    f"  fastest_single_case_cores={_text(final_summary.get('fastest_single_case_cores'))}",
+                    f"  lowest_core_hours_cores={_text(final_summary.get('lowest_core_hours_cores'))}",
+                    f"  recommended_cores_per_case={_text(final_summary.get('recommended_cores_per_case'))}",
+                    f"  estimated_cases_per_node={_text(final_summary.get('estimated_cases_per_node'))}",
+                    (f"  estimated_compute_only_cases_per_node_hour={_text(final_summary.get('estimated_compute_only_cases_per_node_hour'))}"),
+                    f"  license_qualification={_text(final_summary.get('license_qualification'))}",
+                )
+            )
     return "\n".join(lines)
 
 

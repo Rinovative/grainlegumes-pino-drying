@@ -44,6 +44,8 @@ ATTEMPT_SCHEMA_KIND: Final = "generation_case_attempt"
 ATTEMPT_SCHEMA_VERSION: Final = 1
 REPLAY_SCHEMA_KIND: Final = "generation_case_attempt_replay"
 REPLAY_SCHEMA_VERSION: Final = 1
+REPLAY_FAILURE_SCHEMA_KIND: Final = "generation_case_attempt_replay_failure"
+REPLAY_FAILURE_SCHEMA_VERSION: Final = 1
 CLEANUP_SCHEMA_KIND: Final = "generation_case_attempt_cleanup"
 CLEANUP_SCHEMA_VERSION: Final = 1
 LICENSE_COMPACTION_SCHEMA_KIND: Final = "generation_license_attempt_compaction"
@@ -72,6 +74,9 @@ _SMALL_RUNTIME_PATHS: Final = (
     Path("runtime/stop.json"),
 )
 _MAX_RETAINED_RUNTIME_LOG_BYTES: Final = 1024 * 1024
+_MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS: Final = 160
+_MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS: Final = 1024
+_RETAINED_SOLVED_MODEL_PAYLOAD: Final = "payload/solved.mph"
 _BOUNDED_RUNTIME_LOG_PATHS: Final = frozenset(
     {
         Path("runtime/solver.log"),
@@ -155,6 +160,25 @@ _REPLAY_RECEIPT_KEYS: Final = frozenset(
         "processed_case_hdf5_sha256",
         "removed_temporary_payload",
         "cleanup_state",
+        "recorded_at",
+    }
+)
+_REPLAY_FAILURE_RECEIPT_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "case_id",
+        "failed_attempt",
+        "source_attempt",
+        "replay_payload",
+        "replay_payload_sha256",
+        "converter_dependency_sha256",
+        "output_contract_sha256",
+        "time_contract_sha256",
+        "result",
+        "error_type",
+        "error_message",
         "recorded_at",
     }
 )
@@ -1005,6 +1029,183 @@ def _replay_audit(
     return str(state), frozenset(removed)
 
 
+def _replay_failure_audit(
+    directory: Path,
+    *,
+    attempt_payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Admit immutable replay-failure identity evidence when recorded."""
+    path = directory / "replay_failure.json"
+    if not path.exists():
+        return None
+    payload = _load_json(path, label="attempt replay failure audit")
+    failed = payload.get("failed_attempt")
+    source = payload.get("source_attempt")
+    replay_payload = payload.get("replay_payload")
+    if (
+        set(payload) != _REPLAY_FAILURE_RECEIPT_KEYS
+        or payload.get("schema_kind") != REPLAY_FAILURE_SCHEMA_KIND
+        or payload.get("schema_version") != REPLAY_FAILURE_SCHEMA_VERSION
+        or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
+        or payload.get("case_id") != attempt_payload["case_id"]
+        or not isinstance(failed, dict)
+        or set(failed) != {"attempt_index", "receipt_sha256"}
+        or failed.get("attempt_index") != attempt_payload["attempt_index"]
+        or failed.get("receipt_sha256") != common.serialization.file_sha256(directory / "attempt.json")
+        or not isinstance(source, dict)
+        or set(source) != {"attempt_index", "receipt_sha256"}
+        or source != attempt_payload["previous_attempt"]
+        or not isinstance(replay_payload, list)
+        or not replay_payload
+        or not all(
+            isinstance(identity, dict)
+            and set(identity) == {"relative_path", "sha256", "size_bytes"}
+            and _safe_relative_text(identity.get("relative_path"), prefix="payload/")
+            and isinstance(identity.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is not None
+            and isinstance(identity.get("size_bytes"), int)
+            and not isinstance(identity.get("size_bytes"), bool)
+            and identity["size_bytes"] >= 0
+            for identity in replay_payload
+        )
+        or len({identity["relative_path"] for identity in replay_payload}) != len(replay_payload)
+        or payload.get("replay_payload_sha256") != common.serialization.canonical_json_sha256({"replay_payload": replay_payload})
+        or any(
+            not isinstance(payload.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None
+            for key in (
+                "converter_dependency_sha256",
+                "output_contract_sha256",
+                "time_contract_sha256",
+            )
+        )
+        or payload.get("result") != "failed"
+        or not isinstance(payload.get("error_type"), str)
+        or not payload["error_type"]
+        or len(payload["error_type"]) > _MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS
+        or not isinstance(payload.get("error_message"), str)
+        or len(payload["error_message"]) > _MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS
+        or not _nonempty_text(payload.get("recorded_at"))
+    ):
+        message = f"Attempt replay failure audit is invalid: {path}"
+        raise ValueError(message)
+    source_path = directory.parent / f"attempt_{int(source['attempt_index']):04d}" / "attempt.json"
+    if not source_path.is_file() or source_path.is_symlink() or common.serialization.file_sha256(source_path) != source["receipt_sha256"]:
+        message = f"Attempt replay failure source receipt is invalid: {source_path}"
+        raise ValueError(message)
+    source_payload = _load_json(source_path, label="replay failure source attempt receipt")
+    _validate_attempt_receipt(source_payload, path=source_path)
+    failed_inventory = attempt_payload.get("retained_inventory")
+    required = attempt_payload.get("replay_required_payload")
+    if not isinstance(failed_inventory, dict) or not isinstance(required, list):
+        message = f"Attempt replay failure payload is invalid: {path}"
+        raise TypeError(message)
+    failed_required = list(required)
+    if attempt_payload["retention_policy"] == "full" and _RETAINED_SOLVED_MODEL_PAYLOAD in failed_inventory:
+        failed_required.append(_RETAINED_SOLVED_MODEL_PAYLOAD)
+    expected_payload = [
+        {
+            "relative_path": relative,
+            "sha256": failed_inventory[relative]["sha256"],
+            "size_bytes": failed_inventory[relative]["size_bytes"],
+        }
+        for relative in dict.fromkeys(failed_required)
+        if isinstance(relative, str) and relative in failed_inventory
+    ]
+    if expected_payload != replay_payload or len(expected_payload) != len(dict.fromkeys(failed_required)):
+        message = f"Attempt replay failure payload identity disagrees with its source: {path}"
+        raise ValueError(message)
+    return payload
+
+
+def replay_failure_evidence(attempt: AttemptEvidence) -> dict[str, Any] | None:
+    """Return admitted immutable replay-failure evidence for one attempt."""
+    return _replay_failure_audit(
+        attempt.directory,
+        attempt_payload=attempt.payload,
+    )
+
+
+def record_replay_failure(
+    failed_attempt: AttemptEvidence,
+    source_attempt: AttemptEvidence,
+    *,
+    converter_dependency_sha256: str,
+    output_contract_sha256: str,
+    time_contract_sha256: str,
+    error: BaseException,
+) -> Path:
+    """Append immutable replay-failure evidence bound to exact retry inputs."""
+    if failed_attempt.payload["previous_attempt"] != {
+        "attempt_index": source_attempt.payload["attempt_index"],
+        "receipt_sha256": common.serialization.file_sha256(source_attempt.receipt_path),
+    }:
+        message = "Replay failure must immediately follow its source attempt."
+        raise ValueError(message)
+    for label, digest in (
+        ("converter dependency", converter_dependency_sha256),
+        ("output contract", output_contract_sha256),
+        ("time contract", time_contract_sha256),
+    ):
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            message = f"Replay {label} identity must be one SHA-256 digest."
+            raise ValueError(message)
+    inventory = failed_attempt.payload["retained_inventory"]
+    required = failed_attempt.payload["replay_required_payload"]
+    if not isinstance(inventory, dict) or not isinstance(required, list) or not required:
+        message = "Replay failure source lacks required retained payload evidence."
+        raise ValueError(message)
+    replay_payload = []
+    source_required = list(required)
+    if failed_attempt.payload["retention_policy"] == "full" and _RETAINED_SOLVED_MODEL_PAYLOAD in inventory:
+        source_required.append(_RETAINED_SOLVED_MODEL_PAYLOAD)
+    for relative in dict.fromkeys(source_required):
+        identity = inventory.get(relative) if isinstance(relative, str) else None
+        if (
+            not isinstance(identity, dict)
+            or not isinstance(identity.get("sha256"), str)
+            or not isinstance(identity.get("size_bytes"), int)
+            or isinstance(identity.get("size_bytes"), bool)
+        ):
+            message = f"Replay failure source payload identity is invalid: {relative!r}"
+            raise TypeError(message)
+        replay_payload.append({"relative_path": relative, "sha256": identity["sha256"], "size_bytes": identity["size_bytes"]})
+    target = failed_attempt.directory / "replay_failure.json"
+    receipt = {
+        "schema_kind": REPLAY_FAILURE_SCHEMA_KIND,
+        "schema_version": REPLAY_FAILURE_SCHEMA_VERSION,
+        "campaign_run_id": failed_attempt.payload["campaign_run_id"],
+        "case_id": failed_attempt.payload["case_id"],
+        "failed_attempt": {
+            "attempt_index": failed_attempt.payload["attempt_index"],
+            "receipt_sha256": common.serialization.file_sha256(failed_attempt.receipt_path),
+        },
+        "source_attempt": {
+            "attempt_index": source_attempt.payload["attempt_index"],
+            "receipt_sha256": common.serialization.file_sha256(source_attempt.receipt_path),
+        },
+        "replay_payload": replay_payload,
+        "replay_payload_sha256": common.serialization.canonical_json_sha256({"replay_payload": replay_payload}),
+        "converter_dependency_sha256": converter_dependency_sha256,
+        "output_contract_sha256": output_contract_sha256,
+        "time_contract_sha256": time_contract_sha256,
+        "result": "failed",
+        "error_type": type(error).__name__[:_MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS],
+        "error_message": (str(error) or type(error).__name__)[:_MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS],
+        "recorded_at": _utc_now(),
+    }
+    if target.exists():
+        existing = _load_json(target, label="attempt replay failure audit")
+        comparable = dict(receipt)
+        comparable["recorded_at"] = existing.get("recorded_at")
+        if existing != comparable:
+            message = f"Existing replay failure audit conflicts: {target}"
+            raise FileExistsError(message)
+        return target
+    common.serialization.atomic_write_json(target, receipt)
+    _replay_failure_audit(failed_attempt.directory, attempt_payload=failed_attempt.payload)
+    return target
+
+
 def _validate_cleanup_audit(
     directory: Path,
     *,
@@ -1129,6 +1330,7 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
         attempt_payload=payload,
     )
     _validate_cleanup_audit(root, attempt_payload=payload)
+    _replay_failure_audit(root, attempt_payload=payload)
     compaction, compacted = _license_compaction_audit(
         root,
         attempt_payload=payload,
@@ -1388,6 +1590,56 @@ def latest_case_attempt(
         key=lambda entry: int(entry.name[8:]),
     )
     return None if not candidates else load_attempt(candidates[-1])
+
+
+def latest_case_attempt_across_campaign_runs(
+    config: GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str,
+) -> AttemptEvidence | None:
+    """Return the newest admitted attempt across campaign runs for one case."""
+    case_root = (
+        common.paths.get_generation_attempts_root(storage_root=storage_root)
+        / common.paths.validate_logical_name(config.batch_storage_name, label="batch_storage_name")
+        / common.paths.validate_logical_name(config.case_id(case_index), label="case_id")
+    )
+    if not case_root.exists():
+        return None
+    if not case_root.is_dir() or case_root.is_symlink():
+        message = f"Attempt case history path is unsafe: {case_root}"
+        raise ValueError(message)
+    candidates: list[tuple[datetime, str, int, AttemptEvidence]] = []
+    for run_directory in case_root.iterdir():
+        if not run_directory.is_dir() or run_directory.is_symlink():
+            message = f"Attempt campaign history contains an unsafe entry: {run_directory}"
+            raise ValueError(message)
+        run_id = common.paths.validate_logical_name(run_directory.name, label="campaign_run_id")
+        attempt = latest_case_attempt(
+            config,
+            case_index,
+            run_id,
+            storage_root=storage_root,
+        )
+        if attempt is None:
+            continue
+        try:
+            recorded_at = datetime.fromisoformat(str(attempt.payload["recorded_at"]))
+        except ValueError as error:
+            message = f"Attempt recorded_at is malformed: {attempt.receipt_path}"
+            raise ValueError(message) from error
+        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
+            message = f"Attempt recorded_at is not timezone-aware: {attempt.receipt_path}"
+            raise ValueError(message)
+        candidates.append(
+            (
+                recorded_at.astimezone(timezone.utc),
+                run_id,
+                int(attempt.payload["attempt_index"]),
+                attempt,
+            )
+        )
+    return None if not candidates else max(candidates, key=lambda item: item[:3])[3]
 
 
 def _replay_receipt(

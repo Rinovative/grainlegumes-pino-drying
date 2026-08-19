@@ -569,6 +569,7 @@ def _task_scheduler_view(
             "submit_time": None,
             "start_time": None,
             "elapsed": None,
+            "queue_age": None,
         }
     raw_job_id = latest_submission.get("job_id")
     job_id = raw_job_id if isinstance(raw_job_id, str) else None
@@ -588,6 +589,7 @@ def _task_scheduler_view(
             "submit_time": _scheduler_field(active, 4),
             "start_time": None if is_pending else _scheduler_field(active, 5),
             "elapsed": None if is_pending else _scheduler_field(active, 6),
+            "queue_age": _scheduler_field(active, 6) if is_pending else None,
         }
     return {
         "latest_job_id": job_id,
@@ -597,6 +599,7 @@ def _task_scheduler_view(
         "submit_time": _scheduler_field(accounted, 3),
         "start_time": _scheduler_field(accounted, 4),
         "elapsed": _scheduler_field(accounted, 6),
+        "queue_age": None,
     }
 
 
@@ -633,14 +636,26 @@ def _admitted_case_attempt(
 ) -> attempt_service.AttemptEvidence | None:
     """Return the newest attempt after exact campaign and case identity checks."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    current_run_id = str(manifest["campaign_run_id"])
     attempt = attempt_service.latest_case_attempt(
         batch,
         task.case_index,
-        str(manifest["campaign_run_id"]),
+        current_run_id,
         storage_root=storage,
     )
+    historical = False
     if attempt is None:
-        return None
+        candidate = attempt_service.latest_case_attempt_across_campaign_runs(
+            batch,
+            task.case_index,
+            storage_root=storage,
+        )
+        if candidate is None or candidate.payload["campaign_run_id"] == current_run_id:
+            return None
+        if candidate.payload["failure_stage"] not in {"conversion", "publication"}:
+            return None
+        attempt = candidate
+        historical = True
     input_reference = input_service.admit_persisted_input_case(
         batch,
         task.case_index,
@@ -649,7 +664,6 @@ def _admitted_case_attempt(
     )
     canonical_raw_case = input_reference.case_directory.resolve().relative_to(storage).as_posix()
     expected = {
-        "campaign_run_id": manifest["campaign_run_id"],
         "campaign_purpose": batch.scientific_values["campaign_purpose"],
         "batch_storage_name": batch.batch_storage_name,
         "batch_id": batch.batch_id,
@@ -660,14 +674,25 @@ def _admitted_case_attempt(
         "case_input_id": input_reference.case_input_id,
         "simulation_case_id": input_reference.simulation_case_id,
         "canonical_raw_case": canonical_raw_case,
-        "solver_git_commit": manifest["git_commit"],
         "scientific_config_digest": batch.scientific_config_digest,
         "export_contract_sha256": common.serialization.canonical_json_sha256(batch.scientific_values["output_contract"]),
     }
-    if any(attempt.payload.get(key) != value for key, value in expected.items()) or attempt.payload.get("template") != {
-        "relative_path": batch.template_relative_path,
-        "sha256": batch.template_sha256,
-    }:
+    attempt_run_id = common.paths.validate_logical_name(
+        attempt.directory.parent.name,
+        label="attempt campaign_run_id",
+    )
+    current_run_identity_valid = attempt.payload.get("campaign_run_id") == attempt_run_id and (
+        historical or (attempt_run_id == current_run_id and attempt.payload.get("solver_git_commit") == manifest["git_commit"])
+    )
+    if (
+        not current_run_identity_valid
+        or any(attempt.payload.get(key) != value for key, value in expected.items())
+        or attempt.payload.get("template")
+        != {
+            "relative_path": batch.template_relative_path,
+            "sha256": batch.template_sha256,
+        }
+    ):
         message = f"Attempt evidence disagrees with its persisted campaign case: {attempt.receipt_path}"
         raise RuntimeError(message)
     return attempt
@@ -715,6 +740,40 @@ def _scheduler_terminal_case_state(scheduler_state: str) -> tuple[str, str]:
     )
 
 
+def _postprocessing_replay_view(
+    batch: config_service.GenerationConfig,
+    failure_stage: str | None,
+    attempt: attempt_service.AttemptEvidence | None,
+) -> dict[str, Any]:
+    """Project replay eligibility without changing attempt or workspace state."""
+    default = {
+        "postprocessing_replay_available": False,
+        "postprocessing_state": "not_applicable",
+        "replay_eligible": False,
+        "replay_running": False,
+        "replay_blocked": False,
+        "replay_block_reason": None,
+        "replay_attempt_count": 0,
+        "replay_evidence_path": None,
+    }
+    if attempt is None or failure_stage not in {"conversion", "publication"}:
+        return default
+    status = batch_runtime.replay_case_postprocessing_status(batch, attempt)
+    eligible = status["eligible"] is True
+    blocked = status["blocked"] is True
+    evidence = status["evidence_path"]
+    return {
+        "postprocessing_replay_available": attempt.replay_available,
+        "postprocessing_state": ("replay_blocked" if blocked else "replay_eligible" if eligible else "replay_unavailable"),
+        "replay_eligible": eligible,
+        "replay_running": False,
+        "replay_blocked": blocked,
+        "replay_block_reason": str(status["reason"]) if blocked else None,
+        "replay_attempt_count": int(status["attempt_count"]),
+        "replay_evidence_path": evidence if isinstance(evidence, str) else None,
+    }
+
+
 def _task_state(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -738,7 +797,7 @@ def _task_state(
         "publication_state": "not_started",
     }
     failure_stage: str | None = None
-    replay_available = False
+    replay = _postprocessing_replay_view(batch, failure_stage, attempt)
     attempt_index: int | None = None
     quality_flag_count = 0
     canonical_raw_case: str | None = None
@@ -818,7 +877,7 @@ def _task_state(
                         "publication_state",
                     )
                 }
-                replay_available = attempt.replay_available
+                replay = _postprocessing_replay_view(batch, failure_stage, attempt)
                 attempt_index = int(attempt.payload["attempt_index"])
                 flags = attempt.payload.get("quality_flags")
                 quality_flag_count = len(flags) if isinstance(flags, list) else 0
@@ -880,14 +939,17 @@ def _task_state(
     )
     return {
         **_task_payload(task),
+        "material": batch.material_family,
+        "requested_cores": int(campaign.execution_values["cluster"]["cores_per_case"]),
         "state": state,
         "reason": reason,
         "submission_count": len(submissions),
         "attempt_index": attempt_index,
+        "attempt_campaign_run_id": None if attempt is None else str(attempt.payload["campaign_run_id"]),
         "failure_stage": failure_stage,
         **pipeline,
         "quality_flag_count": quality_flag_count,
-        "postprocessing_replay_available": replay_available,
+        **replay,
         "canonical_raw_case": canonical_raw_case,
         **scheduler_view,
         "runtime_progress": runtime_progress,
@@ -895,6 +957,10 @@ def _task_state(
         "license_retry_eligible": license_retry_eligible,
         "license_wait_exhausted": license_wait_exhausted,
         "license_first_blocked_at": license_first_blocked_at,
+        "evidence_path": None if attempt is None else str(attempt.receipt_path),
+        "automatic_continuation_allowed": bool(
+            replay["replay_eligible"] or license_retry_eligible or state in {"never_started", "cancelled", "interrupted"}
+        ),
     }
 
 
@@ -1119,6 +1185,123 @@ def feed_campaign(
         )
 
 
+_LICENSE_ACQUIRED_RUNTIME_PHASES = frozenset(
+    {
+        "stationary_airflow",
+        "transient_drying",
+        "collecting_exports",
+        "canonicalizing",
+        "validating",
+        "publishing",
+    }
+)
+_LICENSE_RESOLVED_RUNTIME_PHASES = frozenset({"completed", "failed"})
+
+
+def _runtime_proves_license_acquired(view: Mapping[str, Any]) -> bool:
+    """Return whether existing progress proves license checkout and solver work."""
+    runtime = view.get("runtime_progress")
+    if not isinstance(runtime, dict) or runtime.get("availability") != "available":
+        return False
+    phase = runtime.get("phase")
+    if phase in {"stationary_airflow", "transient_drying"}:
+        return runtime.get("parser_state") == "available"
+    return phase in _LICENSE_ACQUIRED_RUNTIME_PHASES
+
+
+def _active_unresolved_license_probe(
+    manifest: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+    scheduler: Mapping[str, Any],
+) -> bool:
+    """Return whether one active retry still lacks a known license outcome."""
+    by_identity = {(str(view["batch_id"]), int(view["case_index"])): view for view in task_views}
+    unresolved = 0
+    for record in manifest.get("submissions", ()):
+        if record.get("mode") != "license_retry" or record.get("status") != "submitted" or record.get("job_id") not in scheduler["active"]:
+            continue
+        case = record.get("case")
+        if not isinstance(case, dict):
+            message = "Active license-retry submission lacks one case identity."
+            raise TypeError(message)
+        case_index = case.get("case_index")
+        if isinstance(case_index, bool) or not isinstance(case_index, int):
+            message = "Active license-retry submission has an invalid case index."
+            raise TypeError(message)
+        key = (str(case.get("batch_id")), case_index)
+        view = by_identity.get(key)
+        if view is None:
+            message = f"Active license-retry submission has no campaign task: {key}."
+            raise RuntimeError(message)
+        runtime = view.get("runtime_progress")
+        phase = runtime.get("phase") if isinstance(runtime, dict) and runtime.get("availability") == "available" else None
+        if _runtime_proves_license_acquired(view) or phase in _LICENSE_RESOLVED_RUNTIME_PHASES:
+            continue
+        unresolved += 1
+    if unresolved > 1:
+        message = "Campaign has more than one unresolved active license probe."
+        raise RuntimeError(message)
+    return unresolved == 1
+
+
+def _failure_population_counts(
+    task_views: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Return precise disjoint failure and operational populations."""
+    return {
+        "solver_failed": sum(
+            view["state"] == "failed" and view.get("failure_stage") == "solver" and view.get("temporary_license_retry") is None for view in task_views
+        ),
+        "technical_runtime_timed_out": sum(view["state"] == "timed_out" and view.get("temporary_license_retry") is None for view in task_views),
+        "conversion_failed": sum(view["state"] == "conversion_failed" for view in task_views),
+        "publication_failed": sum(view["state"] == "publication_failed" for view in task_views),
+        "license_blocked": sum(view["state"] == "license_blocked" for view in task_views),
+        "replay_blocked": sum(view.get("replay_blocked") is True for view in task_views),
+    }
+
+
+def _solver_failure_threshold_exceeded(
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    maximum_failed_cases: int,
+) -> bool:
+    """Return whether solver failures and timeouts exceed the configured budget."""
+    counts = _failure_population_counts(task_views)
+    return counts["solver_failed"] + counts["technical_runtime_timed_out"] > maximum_failed_cases
+
+
+def _normal_admission_status(
+    manifest: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    pending_jobs: int,
+    running_jobs: int,
+) -> tuple[bool, str | None]:
+    """Return whether eligible normal work is prevented from admission."""
+    restart_available = any(view["state"] in {"cancelled", "interrupted"} for view in task_views)
+    fresh_available = any(view["state"] == "never_started" for view in task_views)
+    if not restart_available and not fresh_available:
+        return False, None
+    submission_config = manifest["submission_config"]
+    if manifest.get("submission_intent") is not None:
+        return True, "submission_intent_unresolved"
+    if pending_jobs >= int(submission_config["pending_buffer"]):
+        return True, "pending_buffer_full"
+    max_running = submission_config["max_running_cases"]
+    if max_running is not None and running_jobs >= int(max_running):
+        return True, "max_running_cases_reached"
+    if (
+        fresh_available
+        and not restart_available
+        and _solver_failure_threshold_exceeded(
+            task_views,
+            maximum_failed_cases=int(submission_config["maximum_failed_cases"]),
+        )
+    ):
+        return True, "solver_failure_threshold_exceeded"
+    return False, None
+
+
 def _fill_submission_capacity(
     manifest: dict[str, Any],
     campaign: config_service.CampaignConfig,
@@ -1129,15 +1312,17 @@ def _fill_submission_capacity(
     scheduler: Mapping[str, Any],
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
-    """Submit eligible work until one configured admission limit is reached."""
+    """Submit retry, interrupted, and fresh work until admission is full."""
     run_id = str(manifest["campaign_run_id"])
     pending_buffer = int(manifest["submission_config"]["pending_buffer"])
     max_running = manifest["submission_config"]["max_running_cases"]
+    maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
     admitted_pending_jobs = pending_jobs
     selected_tasks: set[tuple[str, int]] = set()
-    active_license_probe = any(
-        record["mode"] == "license_retry" and record["status"] == "submitted" and record["job_id"] in scheduler["active"]
-        for record in manifest.get("submissions", ())
+    unresolved_license_probe = _active_unresolved_license_probe(
+        manifest,
+        task_views,
+        scheduler,
     )
 
     while True:
@@ -1153,10 +1338,24 @@ def _fill_submission_capacity(
             return manifest
 
         eligible_blocked = sorted(
-            (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
+            (
+                view
+                for view in task_views
+                if view["state"] == "license_blocked"
+                and view["license_retry_eligible"] is True
+                and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
+            ),
             key=lambda view: str(view["license_first_blocked_at"]),
         )
-        next_retry = None if active_license_probe or not eligible_blocked else eligible_blocked[0]
+        next_retry = None if unresolved_license_probe or not eligible_blocked else eligible_blocked[0]
+        next_restart = next(
+            (
+                view
+                for view in task_views
+                if view["state"] in {"cancelled", "interrupted"} and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
+            ),
+            None,
+        )
         next_unsent = next(
             (
                 view
@@ -1165,12 +1364,12 @@ def _fill_submission_capacity(
             ),
             None,
         )
-        unresolved_solver_failures = sum(view["state"] in {"failed", "timed_out"} for view in task_views)
-        maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
-        circuit_breaker_tripped = unresolved_solver_failures > maximum_failed_cases
-        blocked_cases_exist = any(view["state"] == "license_blocked" for view in task_views)
-        next_view = next_retry
-        if next_view is None and not active_license_probe and not blocked_cases_exist and not circuit_breaker_tripped:
+        circuit_breaker_tripped = _solver_failure_threshold_exceeded(
+            task_views,
+            maximum_failed_cases=maximum_failed_cases,
+        )
+        next_view = next_retry or next_restart
+        if next_view is None and not circuit_breaker_tripped:
             next_view = next_unsent
         if next_view is None:
             if admitted_pending_jobs or running_jobs:
@@ -1189,9 +1388,19 @@ def _fill_submission_capacity(
                 manifest,
             )
             return manifest
+
+        current_commit = _repository_commit()
+        if current_commit != manifest["git_commit"]:
+            message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
+            raise RuntimeError(message)
         task = _task_from_payload(campaign, next_view)
         selected_tasks.add((task.batch_id, task.case_index))
-        mode = "license_retry" if next_view["state"] == "license_blocked" else "initial"
+        if next_view["state"] == "license_blocked":
+            mode = "license_retry"
+        elif next_view["state"] in {"cancelled", "interrupted"}:
+            mode = "resume"
+        else:
+            mode = "initial"
         manifest = _submit_one(
             manifest,
             campaign,
@@ -1200,7 +1409,7 @@ def _fill_submission_capacity(
             storage_root=storage_root,
         )
         admitted_pending_jobs += 1
-        active_license_probe = active_license_probe or mode == "license_retry"
+        unresolved_license_probe = unresolved_license_probe or mode == "license_retry"
 
 
 def submit_campaign(
@@ -1280,7 +1489,7 @@ def resume_campaign(
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Fill normal admission capacity, then apply the explicit repair matrix."""
+    """Fill scheduler capacity first, then process independent local replays."""
     run_directory = campaign_evidence.campaign_run_directory(
         run_id,
         storage_root=storage_root,
@@ -1307,20 +1516,6 @@ def resume_campaign(
             storage_root=storage_root,
             compact_license_attempt_payloads=True,
         )
-        if pending_jobs or running_jobs:
-            current_commit = _repository_commit()
-            if current_commit != manifest["git_commit"]:
-                message = f"CPU checkout commit {current_commit} does not match run commit {manifest['git_commit']}."
-                raise RuntimeError(message)
-            return _fill_submission_capacity(
-                manifest,
-                campaign,
-                task_views,
-                pending_jobs=pending_jobs,
-                running_jobs=running_jobs,
-                scheduler=scheduler,
-                storage_root=storage_root,
-            )
         if all(view["state"] == "successful" for view in task_views):
             _finalize_completed_batches(
                 campaign,
@@ -1332,96 +1527,68 @@ def resume_campaign(
                 storage_root=storage_root,
             )
 
-        eligible_blocked = sorted(
-            (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
-            key=lambda view: str(view["license_first_blocked_at"]),
+        submission_count_before = len(manifest.get("submissions", ()))
+        manifest = _fill_submission_capacity(
+            manifest,
+            campaign,
+            task_views,
+            pending_jobs=pending_jobs,
+            running_jobs=running_jobs,
+            scheduler=scheduler,
+            storage_root=storage_root,
         )
-        if eligible_blocked:
-            task = _task_from_payload(campaign, eligible_blocked[0])
-            manifest["state"] = "active"
-            return _submit_one(
-                manifest,
-                campaign,
-                task,
-                mode="license_retry",
-                storage_root=storage_root,
-            )
+        admission_active = pending_jobs > 0 or running_jobs > 0 or len(manifest.get("submissions", ())) > submission_count_before
 
-        replay_view = next(
-            (
-                view
-                for view in task_views
-                if view["state"] in {"conversion_failed", "publication_failed"} and view["postprocessing_replay_available"] is True
-            ),
-            None,
-        )
-        if replay_view is not None:
+        replayed = False
+        replay_failed = False
+        replay_views = [
+            view
+            for view in task_views
+            if view["state"] in {"conversion_failed", "publication_failed"}
+            and view.get("replay_eligible", view.get("postprocessing_replay_available")) is True
+        ]
+        for replay_view in replay_views:
             batch = campaign.batch(str(replay_view["batch_name"]))
-            outcome = batch_runtime.replay_case_postprocessing(
-                batch,
-                int(replay_view["case_index"]),
-                storage_root=storage_root,
-            )
-            if outcome.status not in {"replayed", "skipped"}:
-                manifest["state"] = "completed_with_failures"
-                return _write_campaign_manifest(
-                    manifest,
+            try:
+                outcome = batch_runtime.replay_case_postprocessing(
+                    batch,
+                    int(replay_view["case_index"]),
+                    source_campaign_run_id=str(replay_view["attempt_campaign_run_id"]),
                     storage_root=storage_root,
                 )
+            except Exception:  # noqa: BLE001 -- durable replay evidence owns diagnostics
+                replay_failed = True
+                continue
+            if outcome.status in {"replayed", "skipped"}:
+                replayed = True
+            else:
+                replay_failed = True
+
+        if replayed:
             _finalize_completed_batches(
                 campaign,
                 storage_root=storage_root,
             )
-            all_successful = all(
-                batch_runtime.completed_case_is_valid(
-                    batch_config,
-                    case_index,
-                    storage_root=storage_root,
-                )
-                for batch_config in campaign.batches
-                for case_index in batch_config.case_indices
-            )
-            manifest["state"] = "complete" if all_successful else "active"
-            return _write_campaign_manifest(
-                manifest,
+        all_successful = all(
+            batch_runtime.completed_case_is_valid(
+                batch_config,
+                case_index,
                 storage_root=storage_root,
             )
-
-        restart_view = next(
-            (view for view in task_views if view["state"] in {"cancelled", "interrupted"}),
-            None,
+            for batch_config in campaign.batches
+            for case_index in batch_config.case_indices
         )
-        unresolved_solver_failures = sum(view["state"] in {"failed", "timed_out"} for view in task_views)
-        maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
-        if restart_view is None and unresolved_solver_failures <= maximum_failed_cases:
-            restart_view = next(
-                (view for view in task_views if view["state"] == "never_started"),
-                None,
-            )
-        if restart_view is None and any(view["state"] == "license_blocked" for view in task_views):
-            manifest["state"] = "license_blocked"
-            return _write_campaign_manifest(
-                manifest,
-                storage_root=storage_root,
-            )
-        if restart_view is None:
+        if all_successful:
+            manifest["state"] = "complete"
+        elif admission_active:
+            manifest["state"] = "active"
+        elif replay_failed and manifest["state"] not in {
+            "license_blocked",
+            "failure_threshold_reached",
+        }:
             manifest["state"] = "completed_with_failures"
-            return _write_campaign_manifest(
-                manifest,
-                storage_root=storage_root,
-            )
-
-        current_commit = _repository_commit()
-        if current_commit != manifest["git_commit"]:
-            message = f"Solver resume requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
-            raise RuntimeError(message)
-        manifest["state"] = "active"
-        task = _task_from_payload(campaign, restart_view)
-        return _submit_one(
+        return _write_campaign_manifest(
             manifest,
-            campaign,
-            task,
-            mode=("resume" if restart_view["state"] in {"cancelled", "interrupted"} else "initial"),
             storage_root=storage_root,
         )
 
@@ -1586,6 +1753,7 @@ def _batch_status(
         )
         / "batch_manifest.json"
     )
+    failure_counts = _failure_population_counts(selected)
     return {
         "batch_name": batch.batch_name,
         "batch_id": batch.batch_id,
@@ -1594,11 +1762,12 @@ def _batch_status(
         "active": sum(view["state"] == "active" for view in selected),
         "pending": sum(view["state"] == "pending" for view in selected),
         "never_started": sum(view["state"] == "never_started" for view in selected),
-        "solver_failed": sum(view["state"] == "failed" for view in selected),
-        "timed_out": sum(view["state"] == "timed_out" for view in selected),
+        "solver_failed": failure_counts["solver_failed"],
+        "timed_out": failure_counts["technical_runtime_timed_out"],
         "exports_failed": sum(view["state"] == "exports_failed" for view in selected),
-        "conversion_failed": sum(view["state"] == "conversion_failed" for view in selected),
-        "publication_failed": sum(view["state"] == "publication_failed" for view in selected),
+        "conversion_failed": failure_counts["conversion_failed"],
+        "publication_failed": failure_counts["publication_failed"],
+        "replay_blocked": failure_counts["replay_blocked"],
         "cancelled": sum(view["state"] == "cancelled" for view in selected),
         "interrupted": sum(view["state"] == "interrupted" for view in selected),
         "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in selected),
@@ -1608,6 +1777,124 @@ def _batch_status(
         "quarantined": (len(tuple(quarantine.iterdir())) if quarantine.is_dir() else 0),
         "terminal_manifest": str(terminal_path),
         "terminal_manifest_available": terminal_path.is_file(),
+    }
+
+
+def _public_task_view(view: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one work unit in the shared public state vocabulary."""
+    classified_state = str(view["state"])
+    if classified_state == "active":
+        state = "running"
+    elif classified_state == "pending":
+        state = "scheduler_pending"
+    elif classified_state in {"successful", "license_blocked", "never_started"}:
+        state = classified_state
+    else:
+        state = "failed"
+    return {**view, "state": state, "classified_state": classified_state}
+
+
+def _pilot_license_observability(
+    campaign: config_service.CampaignConfig,
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Project pilot solver concurrency and license waits from existing evidence."""
+    intervals: list[tuple[datetime, datetime]] = []
+    successful_starts = 0
+    blocked_submissions = 0
+    accumulated_wait = 0.0
+    accumulated_probe = 0.0
+    features: set[str] = set()
+    error_codes: set[str] = set()
+    by_identity = {(str(view["batch_id"]), int(view["case_index"])): view for view in task_views}
+    for batch in campaign.batches:
+        for case_index in batch.case_indices:
+            view = by_identity[(batch.batch_id, case_index)]
+            if view["state"] == "successful":
+                execution_path = (
+                    batch_runtime.processed_case_directory(
+                        batch,
+                        case_index,
+                        storage_root=storage_root,
+                    )
+                    / "execution_provenance.json"
+                )
+                execution = json.loads(execution_path.read_text(encoding="utf-8"))
+                result = execution.get("result") if isinstance(execution, dict) else None
+                if not isinstance(result, dict):
+                    message = f"Pilot execution provenance is malformed: {execution_path}"
+                    raise ValueError(message)
+                started = result.get("started_at")
+                ended = result.get("ended_at")
+                if isinstance(started, str) and isinstance(ended, str):
+                    start = datetime.fromisoformat(started).astimezone(timezone.utc)
+                    end = datetime.fromisoformat(ended).astimezone(timezone.utc)
+                    if end < start:
+                        message = f"Pilot solver interval is negative: {execution_path}"
+                        raise ValueError(message)
+                    intervals.append((start, end))
+                    successful_starts += 1
+            wait = license_service.load_temporary_license_wait(
+                batch,
+                case_index,
+                campaign_run_id=run_id,
+                storage_root=storage_root,
+            )
+            if wait is None:
+                continue
+            retry_count = int(wait["retry_count"])
+            blocked_submissions += retry_count
+            accumulated_wait += float(wait["cumulative_wait_seconds"])
+            features.add(str(wait["feature"]))
+            if wait["error_code"] is not None:
+                error_codes.add(str(wait["error_code"]))
+            attempt_root = common.paths.resolve_generation_attempt_case_directory(
+                batch.batch_storage_name,
+                batch.case_id(case_index),
+                run_id,
+                storage_root=storage_root,
+            )
+            for attempt_index in range(1, retry_count + 1):
+                receipt_path = attempt_root / f"attempt_{attempt_index:04d}" / "attempt.json"
+                if not receipt_path.is_file() or receipt_path.is_symlink():
+                    continue
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                elapsed = receipt.get("elapsed_seconds") if isinstance(receipt, dict) else None
+                if (
+                    isinstance(receipt, dict)
+                    and receipt.get("campaign_run_id") == run_id
+                    and receipt.get("batch_id") == batch.batch_id
+                    and receipt.get("case_id") == batch.case_id(case_index)
+                    and receipt.get("case_state") == "license_blocked"
+                    and receipt.get("attempt_index") == attempt_index
+                    and isinstance(receipt.get("job_id"), str)
+                    and _JOB_ID_PATTERN.fullmatch(str(receipt["job_id"])) is not None
+                    and not isinstance(elapsed, bool)
+                    and isinstance(elapsed, (int, float))
+                    and float(elapsed) >= 0.0
+                ):
+                    accumulated_probe += float(elapsed)
+    events = sorted(
+        [(start, 1) for start, _end in intervals] + [(end, -1) for _start, end in intervals],
+        key=lambda item: (item[0], item[1]),
+    )
+    concurrent = 0
+    peak = 0
+    for _timestamp, delta in events:
+        concurrent += delta
+        peak = max(peak, concurrent)
+    return {
+        "observed_peak_solver_concurrency": peak,
+        "successful_solver_start_count": successful_starts,
+        "license_blocked_submission_count": blocked_submissions,
+        "accumulated_license_wait_seconds": accumulated_wait,
+        "accumulated_license_probe_seconds": accumulated_probe,
+        "detected_license_features": sorted(features),
+        "detected_license_error_codes": sorted(error_codes),
+        "observed_license_concurrency_lower_bound": peak,
     }
 
 
@@ -1649,25 +1936,27 @@ def campaign_status(
         )
         for batch in campaign.batches
     ]
+    failure_counts = _failure_population_counts(task_views)
     count_states = {
         "planned": len(task_views),
         "successful": sum(view["state"] == "successful" for view in task_views),
         "active": sum(view["state"] == "active" for view in task_views),
         "pending": sum(view["state"] == "pending" for view in task_views),
         "never_started": sum(view["state"] == "never_started" for view in task_views),
-        "solver_failed": sum(view["state"] == "failed" for view in task_views),
-        "timed_out": sum(view["state"] == "timed_out" for view in task_views),
+        "solver_failed": failure_counts["solver_failed"],
+        "timed_out": failure_counts["technical_runtime_timed_out"],
         "exports_failed": sum(view["state"] == "exports_failed" for view in task_views),
-        "conversion_failed": sum(view["state"] == "conversion_failed" for view in task_views),
-        "publication_failed": sum(view["state"] == "publication_failed" for view in task_views),
+        "conversion_failed": failure_counts["conversion_failed"],
+        "publication_failed": failure_counts["publication_failed"],
         "cancelled": sum(view["state"] == "cancelled" for view in task_views),
         "interrupted": sum(view["state"] == "interrupted" for view in task_views),
         "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in task_views),
-        "license_blocked": sum(view["state"] == "license_blocked" for view in task_views),
+        "license_blocked": failure_counts["license_blocked"],
+        "replay_blocked": failure_counts["replay_blocked"],
     }
     unknown_cases = sum(view["state"] == "scheduler_unknown" for view in task_views)
     license_retry_eligible_cases = sum(view["state"] == "license_blocked" and view["license_retry_eligible"] is True for view in task_views)
-    replayable_cases = sum(view["postprocessing_replay_available"] is True for view in task_views)
+    replayable_cases = sum(view.get("replay_eligible", view.get("postprocessing_replay_available")) is True for view in task_views)
     unresolved_failure_states = {
         "failed",
         "timed_out",
@@ -1676,9 +1965,18 @@ def campaign_status(
         "publication_failed",
     }
     unresolved_cases = sum(view["state"] in unresolved_failure_states for view in task_views)
-    unresolved_solver_failures = count_states["solver_failed"] + count_states["timed_out"]
+    unresolved_solver_failures = failure_counts["solver_failed"] + failure_counts["technical_runtime_timed_out"]
     maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
-    circuit_breaker_tripped = unresolved_solver_failures > maximum_failed_cases
+    circuit_breaker_tripped = _solver_failure_threshold_exceeded(
+        task_views,
+        maximum_failed_cases=maximum_failed_cases,
+    )
+    admission_blocked, admission_block_reason = _normal_admission_status(
+        manifest,
+        task_views,
+        pending_jobs=pending_jobs,
+        running_jobs=running_jobs,
+    )
     run_directory = campaign_evidence.campaign_run_directory(
         run_id,
         storage_root=storage_root,
@@ -1721,6 +2019,19 @@ def campaign_status(
 
     failed_cases = unresolved_cases
     cases_per_material = len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None
+    public_task_views = [_public_task_view(view) for view in task_views]
+    work_unit_counts = {
+        state: sum(view["state"] == state for view in public_task_views)
+        for state in (
+            "successful",
+            "running",
+            "scheduler_pending",
+            "license_blocked",
+            "never_started",
+            "failed",
+        )
+    }
+    work_unit_counts["total"] = len(public_task_views)
     return {
         "campaign_run_id": run_id,
         "campaign_state": state,
@@ -1743,14 +2054,29 @@ def campaign_status(
         "license_blocked_cases": count_states["license_blocked"],
         "license_retry_eligible_cases": license_retry_eligible_cases,
         "postprocessing_replay_available_cases": replayable_cases,
+        "replay_blocked_cases": failure_counts["replay_blocked"],
+        "failure_counts": failure_counts,
         "unresolved_solver_failed_cases": unresolved_solver_failures,
+        "admission_blocked": admission_blocked,
+        "admission_block_reason": admission_block_reason,
         "maximum_failed_cases": maximum_failed_cases,
         "failure_circuit_breaker_tripped": circuit_breaker_tripped,
         "cancellation_requested": cancellation_requested,
         "squeue": manifest_scheduler_view(scheduler["squeue"]),
         "sacct": manifest_scheduler_view(scheduler["sacct"]),
         "batches": batches,
-        "cases": task_views,
+        "cases": public_task_views,
+        "work_unit_counts": work_unit_counts,
+        "license_observability": (
+            _pilot_license_observability(
+                campaign,
+                task_views,
+                run_id=run_id,
+                storage_root=storage_root,
+            )
+            if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE
+            else None
+        ),
         "remote_storage_root": manifest["remote_storage_root"],
         "campaign_meta_directory": manifest["campaign_meta_directory"],
         "suggested_next_command": next_command,

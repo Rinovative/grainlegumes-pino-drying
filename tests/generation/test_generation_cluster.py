@@ -245,14 +245,15 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         pending_buffer=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
-    task = cluster.campaign_tasks(campaign)[0]
+    tasks = cluster.campaign_tasks(campaign)
+    task = tasks[0]
     commit = "9" * 40
     storage = tmp_path / "storage"
     submitted_ids = iter(("4101", "4102", "4103"))
     submit_commands: list[list[str]] = []
     retry_eligible = {"value": False}
     retry_active = {"value": False}
-    completed = {"value": False}
+    completed_cases: set[int] = set()
     wait_record = {
         "classification": "temporary_license_capacity",
         "retry_budget_remaining": True,
@@ -264,7 +265,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         assert arguments[0] == "sbatch"
         submit_commands.append(arguments)
         job_id = next(submitted_ids)
-        if job_id == "4102":
+        if job_id == "4103":
             retry_active["value"] = True
         return subprocess.CompletedProcess(
             arguments,
@@ -274,7 +275,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         )
 
     def scheduler_evidence(job_ids: list[str]) -> dict[str, Any]:
-        active = {"4102": ["4102", "RUNNING"]} if retry_active["value"] and "4102" in job_ids else {}
+        active = {"4103": ["4103", "RUNNING"]} if retry_active["value"] and "4103" in job_ids else {}
         return _scheduler(
             active=active,
             accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids if job_id not in active},
@@ -293,7 +294,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
-        lambda *_args, **_kwargs: completed["value"],
+        lambda _batch, case_index, **_kwargs: case_index in completed_cases,
     )
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
@@ -339,35 +340,35 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     assert waiting["campaign_state"] == "license_blocked"
     assert waiting["cases"][0]["state"] == "license_blocked"
     assert waiting["cases"][0]["license_retry_eligible"] is False
-    held = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert held["state"] == "license_blocked"
-    assert len(submit_commands) == 1
+    advanced = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert advanced["state"] == "active"
+    assert advanced["slurm_job_ids"] == ["4101", "4102"]
+    assert advanced["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
+    assert advanced["submissions"][-1]["mode"] == "initial"
+    assert len(submit_commands) == 2
 
+    completed_cases.add(tasks[1].case_index)
     retry_eligible["value"] = True
     eligible = generation.campaign.campaign_status(run_id, storage_root=storage)
     assert eligible["campaign_state"] == "license_blocked"
     assert eligible["cases"][0]["state"] == "license_blocked"
     assert eligible["cases"][0]["license_retry_eligible"] is True
     retried = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert retried["slurm_job_ids"] == ["4101", "4102"]
+    assert retried["slurm_job_ids"] == ["4101", "4102", "4103"]
     assert [record["mode"] for record in retried["submissions"]] == [
+        "initial",
         "initial",
         "license_retry",
     ]
-    expected_case = {
-        "batch_name": task.batch_name,
-        "batch_id": task.batch_id,
-        "case_index": task.case_index,
-        "case_id": task.case_id,
-    }
-    assert all(record["case"] == expected_case for record in retried["submissions"])
-    assert len(submit_commands) == 2
+    assert retried["submissions"][0]["case"]["case_id"] == task.case_id
+    assert retried["submissions"][2]["case"] == retried["submissions"][0]["case"]
+    assert len(submit_commands) == 3
     active_probe = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert active_probe["state"] == "active"
-    assert len(submit_commands) == 2
+    assert len(submit_commands) == 3
 
     retry_active["value"] = False
-    completed["value"] = True
+    completed_cases.add(task.case_index)
     terminal = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert terminal["state"] == "complete"
     terminal_batch = (
@@ -558,7 +559,11 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         "git_commit": commit,
         "slurm_job_ids": [],
         "submission_intent": None,
-        "submission_config": {"maximum_failed_cases": 0},
+        "submission_config": {
+            "pending_buffer": 1,
+            "max_running_cases": None,
+            "maximum_failed_cases": 0,
+        },
         "state": "active",
     }
     views = [
@@ -569,6 +574,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
             "case_id": task.case_id,
             "state": (case_state if task == target else "successful"),
             "postprocessing_replay_available": (replay_available if task == target else False),
+            "attempt_campaign_run_id": (run_id if task == target and replay_available else None),
         }
         for task in tasks
     ]
@@ -594,7 +600,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     monkeypatch.setattr(
         generation.campaign,
         "_reconciled",
-        lambda *_args, **_kwargs: (views, [], []),
+        lambda *_args, **_kwargs: (views, 0, 0),
     )
     monkeypatch.setattr(
         generation.campaign,
@@ -631,10 +637,16 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         "replay_case_postprocessing",
         replay,
     )
+
+    def case_is_valid(_batch: Any, case_index: int, **_kwargs: Any) -> bool:
+        if case_index != target.case_index:
+            return True
+        return case_state == "successful" or (expected_action == "replay" and bool(replays))
+
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
-        lambda *_args, **_kwargs: True,
+        case_is_valid,
     )
     monkeypatch.setattr(
         generation.campaign,
@@ -962,6 +974,8 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
             "case_index": task.case_index,
             "case_id": task.case_id,
             "state": state,
+            "failure_stage": "solver" if state in {"failed", "timed_out"} else None,
+            "temporary_license_retry": None,
             "postprocessing_replay_available": False,
         }
 
@@ -1027,6 +1041,360 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
     monitored = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
     assert monitored["state"] == "active"
     assert submitted == []
+
+
+@pytest.mark.parametrize(
+    ("failure_count", "maximum_failed_cases", "expected_tripped"),
+    [
+        (0, 5, False),
+        (1, 5, False),
+        (3, 5, False),
+        (5, 5, False),
+        (6, 5, True),
+    ],
+)
+def test_solver_failure_threshold_has_an_exact_exceeds_boundary(
+    failure_count: int,
+    maximum_failed_cases: int,
+    expected_tripped: bool,
+) -> None:
+    """Count only solver failures and trip strictly above the configured limit."""
+    views = [
+        {
+            "state": "failed",
+            "failure_stage": "solver",
+            "temporary_license_retry": None,
+        }
+        for _index in range(failure_count)
+    ]
+    views.extend(
+        (
+            {"state": "conversion_failed"},
+            {"state": "publication_failed"},
+            {
+                "state": "failed",
+                "failure_stage": "solver",
+                "temporary_license_retry": {"classification": "temporary_license_capacity"},
+            },
+        )
+    )
+
+    assert (
+        generation.campaign._solver_failure_threshold_exceeded(
+            views,
+            maximum_failed_cases=maximum_failed_cases,
+        )
+        is expected_tripped
+    )
+
+
+def test_replay_failures_do_not_precede_or_starve_normal_admission(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fill pending capacity before independently attempting every eligible replay."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=12,
+        pending_buffer=2,
+        maximum_failed_cases=5,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    run_id = "replay-admission__0123456789abcdef"
+    commit = "e" * 40
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
+    run_directory.mkdir(parents=True)
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": commit,
+        "slurm_job_ids": [],
+        "submission_intent": None,
+        "submission_config": {
+            "pending_buffer": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+        },
+        "submissions": [],
+        "state": "active",
+    }
+    views = [
+        {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": "conversion_failed" if index < 2 else "never_started",
+            "failure_stage": "conversion" if index < 2 else None,
+            "temporary_license_retry": None,
+            "postprocessing_replay_available": index < 2,
+            "replay_eligible": index < 2,
+            "replay_blocked": False,
+            "attempt_campaign_run_id": run_id if index < 2 else None,
+        }
+        for index, task in enumerate(tasks)
+    ]
+    events: list[str] = []
+    submitted: list[str] = []
+    replayed: list[str] = []
+    monkeypatch.setattr(campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
+    monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
+    monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: (views, 0, 0))
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign, "_write_campaign_manifest", lambda payload, **_kwargs: dict(payload))
+    monkeypatch.setattr(generation.campaign.batch_runtime, "completed_case_is_valid", lambda *_args, **_kwargs: False)
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        assert mode == "initial"
+        events.append("submit")
+        submitted.append(task.case_id)
+        payload["submissions"].append(
+            {
+                "case": {
+                    "batch_name": task.batch_name,
+                    "batch_id": task.batch_id,
+                    "case_index": task.case_index,
+                    "case_id": task.case_id,
+                }
+            }
+        )
+        return payload
+
+    def fail_replay(batch: Any, case_index: int, **_kwargs: Any) -> None:
+        events.append("replay")
+        replayed.append(batch.case_id(case_index))
+        message = "deterministic replay failure"
+        raise ValueError(message)
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
+    monkeypatch.setattr(generation.campaign.batch_runtime, "replay_case_postprocessing", fail_replay)
+
+    resumed = generation.campaign.resume_campaign(run_id, storage_root=tmp_path)
+
+    assert resumed["state"] == "active"
+    assert submitted == [tasks[2].case_id, tasks[3].case_id]
+    assert replayed == [tasks[0].case_id, tasks[1].case_id]
+    assert events == ["submit", "submit", "replay", "replay"]
+
+
+def test_eligible_license_retry_is_oldest_first_and_fresh_work_fills_spare_capacity(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit one retry probe first and then use the remaining pending slot."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=3,
+        pending_buffer=2,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    commit = "f" * 40
+    manifest = {
+        "campaign_run_id": "mixed-license__0123456789abcdef",
+        "git_commit": commit,
+        "submission_config": {
+            "pending_buffer": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+        },
+        "submission_intent": None,
+        "submissions": [],
+        "state": "active",
+    }
+    views = [
+        {
+            "batch_name": task.batch_name,
+            "batch_id": task.batch_id,
+            "case_index": task.case_index,
+            "case_id": task.case_id,
+            "state": "license_blocked" if index == 0 else "never_started",
+            "license_retry_eligible": index == 0,
+            "license_first_blocked_at": "2026-01-01T00:00:00+00:00" if index == 0 else None,
+            "temporary_license_retry": {"classification": "temporary_license_capacity"} if index == 0 else None,
+            "failure_stage": "solver" if index == 0 else None,
+        }
+        for index, task in enumerate(tasks)
+    ]
+    submitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.common.serialization, "atomic_write_json", lambda *_args, **_kwargs: None)
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        submitted.append((task.case_id, mode))
+        return payload
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
+
+    generation.campaign._fill_submission_capacity(
+        manifest,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=0,
+        scheduler={"active": {}},
+        storage_root=tmp_path,
+    )
+
+    assert submitted == [
+        (tasks[0].case_id, "license_retry"),
+        (tasks[1].case_id, "initial"),
+    ]
+
+
+def test_progressed_license_retry_no_longer_holds_fresh_admission(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a retry with parsed solver progress as ordinary running work."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=2,
+        pending_buffer=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    commit = "a" * 40
+    manifest = {
+        "campaign_run_id": "progressed-license__0123456789abcdef",
+        "git_commit": commit,
+        "submission_config": {
+            "pending_buffer": 1,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+        },
+        "submission_intent": None,
+        "submissions": [
+            {
+                "mode": "license_retry",
+                "status": "submitted",
+                "job_id": "601",
+                "case": {
+                    "batch_name": tasks[0].batch_name,
+                    "batch_id": tasks[0].batch_id,
+                    "case_index": tasks[0].case_index,
+                    "case_id": tasks[0].case_id,
+                },
+            }
+        ],
+        "state": "active",
+    }
+    views = [
+        {
+            "batch_name": tasks[0].batch_name,
+            "batch_id": tasks[0].batch_id,
+            "case_index": tasks[0].case_index,
+            "case_id": tasks[0].case_id,
+            "state": "active",
+            "runtime_progress": {
+                "availability": "available",
+                "phase": "transient_drying",
+                "parser_state": "available",
+            },
+            "temporary_license_retry": None,
+            "failure_stage": None,
+        },
+        {
+            "batch_name": tasks[1].batch_name,
+            "batch_id": tasks[1].batch_id,
+            "case_index": tasks[1].case_index,
+            "case_id": tasks[1].case_id,
+            "state": "never_started",
+            "temporary_license_retry": None,
+            "failure_stage": None,
+        },
+    ]
+    submitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(generation.campaign.common.serialization, "atomic_write_json", lambda *_args, **_kwargs: None)
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        submitted.append((task.case_id, mode))
+        return payload
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
+
+    generation.campaign._fill_submission_capacity(
+        manifest,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=1,
+        scheduler={"active": {"601": ["601", "RUNNING"]}},
+        storage_root=tmp_path,
+    )
+
+    assert submitted == [(tasks[1].case_id, "initial")]
+
+
+def test_license_probe_resolution_uses_strong_progress_and_enforces_one_unresolved() -> None:
+    """Release progressed retries from the one-unresolved-probe gate."""
+    manifest = {
+        "submissions": [
+            {
+                "mode": "license_retry",
+                "status": "submitted",
+                "job_id": "501",
+                "case": {"batch_id": "batch", "case_index": 1},
+            },
+            {
+                "mode": "license_retry",
+                "status": "submitted",
+                "job_id": "502",
+                "case": {"batch_id": "batch", "case_index": 2},
+            },
+        ]
+    }
+    scheduler = {"active": {"501": ["501", "RUNNING"], "502": ["502", "RUNNING"]}}
+    views = [
+        {
+            "batch_id": "batch",
+            "case_index": 1,
+            "runtime_progress": {
+                "availability": "available",
+                "phase": "transient_drying",
+                "parser_state": "available",
+            },
+        },
+        {
+            "batch_id": "batch",
+            "case_index": 2,
+            "runtime_progress": {"availability": "unavailable", "reason": "not_reported"},
+        },
+    ]
+
+    assert generation.campaign._active_unresolved_license_probe(manifest, views, scheduler) is True
+    views[0]["runtime_progress"] = {"availability": "unavailable", "reason": "not_reported"}
+    with pytest.raises(RuntimeError, match="more than one unresolved"):
+        generation.campaign._active_unresolved_license_probe(manifest, views, scheduler)
 
 
 def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(

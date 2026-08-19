@@ -19,6 +19,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import stat
@@ -39,6 +40,7 @@ STOP_EVIDENCE_SCHEMA_KIND = "generation_runtime_stop"
 STOP_EVIDENCE_SCHEMA_VERSION = 1
 DEFAULT_POLL_INTERVAL_SECONDS = 0.25
 DEFAULT_ESCALATION_WAIT_SECONDS = 5.0
+_MAX_STATUS_EXCERPT_BYTES = 160
 
 StopReason = Literal["timeout", "cancelled"]
 
@@ -192,15 +194,104 @@ def _derive_stop_evidence_path(active_work_directory: Path | str) -> Path:
     return _derive_owned_path(active_work_directory, "runtime", STOP_EVIDENCE_FILENAME, create_parent=True)
 
 
+class UnexpectedStopStatusContentError(RuntimeError):
+    """Report bounded evidence for an owned status file that is unsafe to replace."""
+
+    def __init__(
+        self,
+        diagnostics: dict[str, object],
+        *,
+        exit_code: int | None = None,
+        required_exports_present: bool | None = None,
+        replay_available: bool | None = None,
+    ) -> None:
+        """Initialize exact status-file and optional post-termination evidence."""
+        self.diagnostics = {
+            **diagnostics,
+            "solver_exit_code": exit_code,
+            "required_exports_present": required_exports_present,
+            "replay_available": replay_available,
+        }
+        self.exit_code = exit_code
+        self.timed_out = False
+        message = "Refusing to replace unexpected COMSOL stop status content: " + json.dumps(
+            self.diagnostics,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        super().__init__(message)
+
+    def with_runtime_evidence(
+        self,
+        *,
+        exit_code: int,
+        required_exports_present: bool,
+        replay_available: bool,
+    ) -> UnexpectedStopStatusContentError:
+        """Return the same rejection enriched after the owned solver has exited."""
+        base = {
+            key: value for key, value in self.diagnostics.items() if key not in {"solver_exit_code", "required_exports_present", "replay_available"}
+        }
+        return UnexpectedStopStatusContentError(
+            base,
+            exit_code=exit_code,
+            required_exports_present=required_exports_present,
+            replay_available=replay_available,
+        )
+
+
+def _unexpected_status_diagnostics(
+    path: Path,
+    command: str,
+    accepted_existing: frozenset[str],
+) -> dict[str, object]:
+    """Return bounded content and ownership evidence for one rejected status file."""
+    size = path.stat().st_size
+    with path.open("rb") as stream:
+        raw = stream.read(_MAX_STATUS_EXCERPT_BYTES + 1)
+    bounded = raw[:_MAX_STATUS_EXCERPT_BYTES]
+    try:
+        excerpt = bounded.decode("utf-8")
+    except UnicodeDecodeError:
+        actual_class = "invalid_utf8_bytes"
+        excerpt = bounded.hex()
+    else:
+        if not raw:
+            actual_class = "empty"
+        elif excerpt == STOP_COMMAND:
+            actual_class = "stop_command"
+        elif excerpt == CANCEL_COMMAND:
+            actual_class = "cancel_command"
+        else:
+            actual_class = "unexpected_utf8_text"
+    expected = sorted({command, *accepted_existing})
+    return {
+        "status_path": str(path),
+        "expected_content_class": "exact_command_or_admitted_predecessor",
+        "expected_contents": [value.rstrip("\n") for value in expected],
+        "actual_content_class": actual_class,
+        "actual_content_excerpt": excerpt,
+        "actual_content_excerpt_truncated": size > _MAX_STATUS_EXCERPT_BYTES,
+        "file_size": size,
+        "ownership_evidence": "derived_regular_file_below_owned_active_workspace",
+    }
+
+
 def _write_verified_command(path: Path, command: str, *, accepted_existing: frozenset[str]) -> None:
     """Atomically publish one exact COMSOL command without replacing unknown content."""
     if path.exists():
-        existing = path.read_text(encoding="utf-8")
+        admitted = {command, *accepted_existing}
+        if path.stat().st_size > max(len(value.encode("utf-8")) for value in admitted):
+            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing))
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing)) from error
         if existing == command:
             return
         if existing not in accepted_existing:
-            msg = f"Refusing to replace unexpected COMSOL stop status content at {path}."
-            raise RuntimeError(msg)
+            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing))
     common.serialization.atomic_write_text(path, command)
     if path.read_text(encoding="utf-8") != command:
         msg = f"COMSOL stop status command was not durably verified at {path}."

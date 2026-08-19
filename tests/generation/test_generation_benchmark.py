@@ -663,6 +663,7 @@ def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> No
     ]
     assert [case["case_index"] for case in inspection["representative_cases"]] == [1, 2]
     wave_cores = [wave["cores_per_case"] for wave in inspection["variant_waves"]]
+    assert suite.production_cores_per_case == 16
     assert wave_cores[0] == suite.production_cores_per_case
     assert wave_cores[1:] == sorted(variant.cores_per_case for variant in suite.variants if variant.cores_per_case != suite.production_cores_per_case)
     assert inspection["parallel_cases_per_variant"] == 2
@@ -1187,6 +1188,152 @@ def test_license_overlap_qualification_does_not_change_compute_metrics(
     assert summary["recommended_cores_per_case"] == 4
     assert summary["license_qualification"] == ("compute recommendation valid; concurrent-license observation incomplete")
     assert all(record["observed_peak_solver_concurrency"] == 1 for record in summary["variants"])
+
+
+def test_markdown_summary_loader_reads_only_persisted_canonical_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Print the validated Markdown artifact and fail closed on drift or absence."""
+    directory = generation.benchmark.core_benchmark_directory(
+        _RUN_ID,
+        storage_root=tmp_path,
+    )
+    directory.mkdir(parents=True)
+    summary = {"benchmark_run_id": _RUN_ID}
+    expected = "# Persisted benchmark summary\n"
+    monkeypatch.setattr(
+        generation.benchmark,
+        "load_core_benchmark_summary",
+        lambda *_args, **_kwargs: summary,
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "core_benchmark_markdown",
+        lambda _summary: expected,
+    )
+    summary_path = directory / "summary.md"
+    summary_path.write_text(expected, encoding="utf-8")
+
+    assert (
+        generation.benchmark.load_core_benchmark_markdown(
+            _RUN_ID,
+            storage_root=tmp_path,
+        )
+        == expected
+    )
+
+    summary_path.write_text("# Drifted summary\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="inconsistent"):
+        generation.benchmark.load_core_benchmark_markdown(
+            _RUN_ID,
+            storage_root=tmp_path,
+        )
+    summary_path.unlink()
+    with pytest.raises(ValueError, match="missing or unsafe"):
+        generation.benchmark.load_core_benchmark_markdown(
+            _RUN_ID,
+            storage_root=tmp_path,
+        )
+
+
+def test_completed_status_exposes_the_persisted_validated_summary(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Project final persisted benchmark evidence through read-only status."""
+    suite = _synthetic_suite(generation_config_factory)
+    storage = tmp_path / "storage"
+    directory = generation.benchmark.core_benchmark_directory(
+        _RUN_ID,
+        storage_root=storage,
+    )
+    for representative in suite.representative_cases:
+        proof = generation.benchmark._canonical_case_proof_path(
+            directory,
+            representative,
+        )
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text("{}\n", encoding="utf-8")
+    markdown = "# Validated benchmark\n\nRecommended: 4 cores.\n"
+    (directory / "summary.md").write_text(markdown, encoding="utf-8")
+    records = _success_records(
+        suite,
+        {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)},
+    )
+    manifest = {
+        **_minimal_manifest(),
+        "state": "complete",
+        "suite_config": str(suite.source_path),
+    }
+    summary = {
+        "fastest_single_case_cores": 32,
+        "lowest_core_hours_cores": 4,
+        "recommended_cores_per_case": 4,
+        "recommended_production": {
+            "estimated_cases_per_node": 8,
+            "estimated_cases_per_node_hour": 288.0,
+        },
+        "license_qualification": "concurrent-license execution observed",
+    }
+    monkeypatch.setattr(
+        generation.benchmark,
+        "load_core_benchmark_manifest",
+        lambda *_args, **_kwargs: (manifest, suite),
+    )
+    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args, **_kwargs: records)
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_benchmark_work_unit_views",
+        lambda *_args, **_kwargs: [{**record, "state": "successful", "runtime_progress": None} for record in records],
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_controller_scheduler_queue_accounting",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "_completed_wave_evaluation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "load_core_benchmark_summary",
+        lambda *_args, **_kwargs: summary,
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "core_benchmark_markdown",
+        lambda _summary: markdown,
+    )
+
+    status = generation.benchmark.core_benchmark_status(
+        _RUN_ID,
+        storage_root=storage,
+        query_scheduler=False,
+    )
+
+    assert status["state"] == "complete"
+    assert status["final_summary"] == {
+        "path": str(directory / "summary.md"),
+        "markdown": markdown,
+        "fastest_single_case_cores": 32,
+        "lowest_core_hours_cores": 4,
+        "recommended_cores_per_case": 4,
+        "estimated_cases_per_node": 8,
+        "estimated_compute_only_cases_per_node_hour": 288.0,
+        "license_qualification": "concurrent-license execution observed",
+    }
+
+    (directory / "summary.md").unlink()
+    with pytest.raises(ValueError, match="missing or unsafe"):
+        generation.benchmark.core_benchmark_status(
+            _RUN_ID,
+            storage_root=storage,
+            query_scheduler=False,
+        )
 
 
 def test_valid_success_evidence_overrides_prior_license_warning() -> None:
