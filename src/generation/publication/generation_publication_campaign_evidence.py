@@ -61,6 +61,7 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "submission_config",
         "submissions",
         "submission_intent",
+        "admission_reservations",
         "remote_storage_root",
         "campaign_meta_directory",
         "batches",
@@ -341,6 +342,33 @@ def _validate_submission_record(
     return None, False
 
 
+def _validate_admission_reservations(manifest: Mapping[str, Any], *, run_id: str) -> None:
+    """Validate durable admitted cases waiting outside scheduler allocation."""
+    reservations = manifest.get("admission_reservations")
+    if not isinstance(reservations, list):
+        message = f"Campaign-run admission reservations are malformed: {run_id}."
+        raise TypeError(message)
+    identities: set[tuple[str, int]] = set()
+    for reservation in reservations:
+        if not isinstance(reservation, dict) or set(reservation) != {"batch_name", "batch_id", "case_index", "case_id"}:
+            message = f"Campaign-run admission reservation is malformed: {run_id}."
+            raise ValueError(message)
+        case_index = reservation.get("case_index")
+        if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 1:
+            message = f"Campaign-run admission reservation case index is malformed: {run_id}."
+            raise ValueError(message)
+        for key in ("batch_name", "batch_id", "case_id"):
+            common.paths.validate_logical_name(
+                reservation.get(key),
+                label=f"admission reservation {key}",
+            )
+        identity = str(reservation["batch_id"]), case_index
+        if identity in identities:
+            message = f"Campaign-run admission reservation is duplicated: {run_id}."
+            raise ValueError(message)
+        identities.add(identity)
+
+
 def _validate_submission_records(
     manifest: Mapping[str, Any],
     *,
@@ -376,8 +404,10 @@ def load_campaign_run(
         campaign_run_manifest_path(run_id, storage_root=storage_root),
         label="campaign-run manifest",
     )
+    manifest.setdefault("admission_reservations", [])
     job_ids = _validate_campaign_run_header(manifest, run_id=run_id)
     _validate_submission_configuration(manifest, run_id=run_id)
+    _validate_admission_reservations(manifest, run_id=run_id)
     persisted_ids, unresolved = _validate_submission_records(
         manifest,
         run_id=run_id,
@@ -391,6 +421,28 @@ def load_campaign_run(
         raise ValueError(message)
     resolve_campaign_config_path(manifest.get("campaign_config"))
     return manifest
+
+
+def _validate_admission_reservations_for_campaign(
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+) -> None:
+    """Bind operational admission reservations to exact unsent plan members."""
+    planned = {
+        (batch.batch_id, case_index): (batch.batch_name, batch.case_id(case_index)) for batch in campaign.batches for case_index in batch.case_indices
+    }
+    submissions = manifest.get("submissions", [])
+    reservations = manifest.get("admission_reservations", [])
+    submitted = {(str(record["case"]["batch_id"]), int(record["case"]["case_index"])) for record in submissions}
+    for reservation in reservations:
+        key = str(reservation["batch_id"]), int(reservation["case_index"])
+        expected = planned.get(key)
+        if expected != (reservation["batch_name"], reservation["case_id"]):
+            message = "Campaign admission reservation is not an exact resolved plan member."
+            raise ValueError(message)
+        if key in submitted:
+            message = "Campaign admission reservation conflicts with durable submission history."
+            raise ValueError(message)
 
 
 def current_campaign_from_manifest(
@@ -408,6 +460,7 @@ def current_campaign_from_manifest(
     ):
         message = "Campaign simulation configuration or execution-view identity changed after launch."
         raise RuntimeError(message)
+    _validate_admission_reservations_for_campaign(manifest, campaign)
     return campaign
 
 

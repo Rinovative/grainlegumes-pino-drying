@@ -18,6 +18,7 @@ This module does NOT:
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
 
@@ -151,6 +152,8 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
         return "license_blocked"
     if state in {"scheduler_pending", "pending"}:
         return "scheduler_pending"
+    if state == "admission_waiting":
+        return "admission_waiting"
     if state == "never_started":
         return "never_started"
     return "failed"
@@ -294,14 +297,54 @@ def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
 
 
 def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
-    """Return the established compact successful-case detail."""
-    lines = [_case_heading(case)]
+    """Return compact successful-case terminal evidence."""
+    lines = [_case_heading(case, include_runtime=False)]
     details = ["state=successful"]
     reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
     if reason is not None:
         details.append(f"reason={reason}")
     lines.append(f"  {'  '.join(details)}")
+    terminal = []
+    simulated_end = _float_value(case.get("simulated_end_time"))
+    simulated_end_unit = _available_text(case.get("simulated_end_time_unit"))
+    if simulated_end is not None and simulated_end_unit is not None:
+        terminal.append(f"simulated_end={simulated_end:g} {simulated_end_unit}")
+    moisture_name = _available_text(case.get("final_moisture_name"))
+    moisture = _float_value(case.get("final_moisture_value"))
+    moisture_unit = _available_text(case.get("final_moisture_unit"))
+    if moisture_name is not None and moisture is not None and moisture_unit is not None:
+        terminal.append(f"{moisture_name}={moisture:g} {moisture_unit}")
+    if terminal:
+        lines.append(f"  {'  '.join(terminal)}")
     return lines
+
+
+def _completion_timestamp(case: Mapping[str, Any]) -> datetime:
+    """Return one comparable completion time or the oldest possible value."""
+    value = case.get("completed_at")
+    if not isinstance(value, str):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recent_completed_cases(cases: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    """Return at most three newest completions with stable plan-order ties."""
+    plan_ordered = sorted(
+        enumerate(cases),
+        key=lambda item: (item[0], str(item[1].get("case_id"))),
+    )
+    newest_first = sorted(
+        plan_ordered,
+        key=lambda item: _completion_timestamp(item[1]),
+        reverse=True,
+    )
+    return tuple(case for _index, case in newest_first[:3])
 
 
 def _case_inventory(status: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -390,7 +433,15 @@ def format_campaign_status_summary(
     cases = _case_inventory(status)
     buckets = {
         name: [case for case in cases if _case_bucket(case) == name]
-        for name in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+        for name in (
+            "successful",
+            "running",
+            "scheduler_pending",
+            "license_blocked",
+            "admission_waiting",
+            "never_started",
+            "failed",
+        )
     }
     submission = status.get("submission_config")
     submission_values = submission if isinstance(submission, dict) else {}
@@ -414,7 +465,8 @@ def format_campaign_status_summary(
             "Cases: "
             f"successful={len(buckets['successful'])}  running={len(buckets['running'])}  "
             f"scheduler_pending={len(buckets['scheduler_pending'])}  license_blocked={len(buckets['license_blocked'])}  "
-            f"never_started={len(buckets['never_started'])}  failed={len(buckets['failed'])}  total={len(cases)}"
+            f"admission_waiting={len(buckets['admission_waiting'])}  never_started={len(buckets['never_started'])}  "
+            f"failed={len(buckets['failed'])}  total={len(cases)}"
         ),
         (f"Admission: {_text(admission_values.get('count'))}/{_text(admission_values.get('maximum'))}"),
         (
@@ -425,12 +477,30 @@ def format_campaign_status_summary(
             f"retrying={_text(component_values.get('retrying'))}"
         ),
     ]
+    pacing = status.get("license_retry_launch_pacing")
+    if isinstance(pacing, dict) and pacing.get("active") is True:
+        pacing_parts = []
+        next_launch = _available_text(pacing.get("next_launch_at"))
+        spacing = _float_value(pacing.get("spacing_seconds"))
+        if next_launch is not None:
+            pacing_parts.append(f"next_launch={next_launch}")
+        if spacing is not None:
+            pacing_parts.append(f"stagger={spacing:g} s")
+        if pacing_parts:
+            lines.extend(("License retry:", f"  {'  '.join(pacing_parts)}"))
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
     _actionable_section(lines, "Running cases", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
     _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
     _actionable_section(lines, "License-blocked cases", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
     _actionable_section(lines, "Failed cases", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
-    _actionable_section(lines, "Completed cases", buckets["successful"], maximum=None, renderer=_completed_case_lines)
+    recent_completed = _recent_completed_cases(buckets["successful"])
+    _actionable_section(
+        lines,
+        f"Recently completed cases (latest {len(recent_completed)} of {len(buckets['successful'])})",
+        recent_completed,
+        maximum=None,
+        renderer=_completed_case_lines,
+    )
     if buckets["never_started"]:
         _append_section(lines, "Never started", _grouped_population_rows(buckets["never_started"]))
     return "\n".join(lines)

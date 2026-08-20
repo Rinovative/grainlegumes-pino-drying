@@ -21,7 +21,7 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -277,6 +277,7 @@ def _new_campaign_manifest(
         "submission_config": _submission_config(campaign),
         "submissions": [],
         "submission_intent": None,
+        "admission_reservations": [],
         "remote_storage_root": str(storage),
         "campaign_meta_directory": str(run_directory),
         "batches": [
@@ -569,6 +570,7 @@ def _task_scheduler_view(
             "submit_time": None,
             "start_time": None,
             "elapsed": None,
+            "end_time": None,
             "queue_age": None,
         }
     raw_job_id = latest_submission.get("job_id")
@@ -589,6 +591,7 @@ def _task_scheduler_view(
             "submit_time": _scheduler_field(active, 4),
             "start_time": None if is_pending else _scheduler_field(active, 5),
             "elapsed": None if is_pending else _scheduler_field(active, 6),
+            "end_time": None,
             "queue_age": _scheduler_field(active, 6) if is_pending else None,
         }
     return {
@@ -599,6 +602,7 @@ def _task_scheduler_view(
         "submit_time": _scheduler_field(accounted, 3),
         "start_time": _scheduler_field(accounted, 4),
         "elapsed": _scheduler_field(accounted, 6),
+        "end_time": _scheduler_field(accounted, 5),
         "queue_age": None,
     }
 
@@ -698,13 +702,13 @@ def _admitted_case_attempt(
     return attempt
 
 
-def _successful_quality_flag_count(
+def _successful_status_summary(
     batch: config_service.GenerationConfig,
     task: cluster_service.CampaignTask,
     *,
     storage_root: Path | str | None,
-) -> int:
-    """Return the admitted processed quality-flag count for one successful case."""
+) -> dict[str, Any]:
+    """Return compact terminal fields from the already-consumed case status."""
     status_path = (
         batch_runtime.processed_case_directory(
             batch,
@@ -714,7 +718,14 @@ def _successful_quality_flag_count(
         / "status.json"
     )
     if not status_path.is_file():
-        return 0
+        return {
+            "quality_flag_count": 0,
+            "simulated_end_time": None,
+            "simulated_end_time_unit": None,
+            "final_moisture_name": None,
+            "final_moisture_value": None,
+            "final_moisture_unit": None,
+        }
     status = campaign_evidence.load_json_object(
         status_path,
         label="processed case status",
@@ -723,7 +734,24 @@ def _successful_quality_flag_count(
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         message = f"Processed case quality-flag count is malformed: {status_path}"
         raise ValueError(message)
-    return count
+    units = status.get("units")
+    unit_values = units if isinstance(units, dict) else {}
+    simulated_end = status.get("t_stop_exact")
+    simulated_end_unit = unit_values.get("t_stop_exact")
+    final_moisture = status.get("f_wet_dm_final")
+    final_moisture_unit = unit_values.get("f_wet_dm_final")
+    simulated_end_value = float(simulated_end) if not isinstance(simulated_end, bool) and isinstance(simulated_end, (int, float)) else None
+    final_moisture_value = float(final_moisture) if not isinstance(final_moisture, bool) and isinstance(final_moisture, (int, float)) else None
+    simulated_end_available = simulated_end_value is not None and isinstance(simulated_end_unit, str) and bool(simulated_end_unit)
+    final_moisture_available = final_moisture_value is not None and isinstance(final_moisture_unit, str) and bool(final_moisture_unit)
+    return {
+        "quality_flag_count": count,
+        "simulated_end_time": simulated_end_value if simulated_end_available else None,
+        "simulated_end_time_unit": simulated_end_unit if simulated_end_available else None,
+        "final_moisture_name": "f_wet_dm_final" if final_moisture_available else None,
+        "final_moisture_value": final_moisture_value if final_moisture_available else None,
+        "final_moisture_unit": final_moisture_unit if final_moisture_available else None,
+    }
 
 
 def _scheduler_terminal_case_state(scheduler_state: str) -> tuple[str, str]:
@@ -788,6 +816,35 @@ def _license_retry_is_active(
     )
 
 
+def _successful_completion_at(
+    state: str,
+    scheduler_view: Mapping[str, Any],
+    *,
+    case_id: str,
+) -> str | None:
+    """Return the authoritative Slurm terminal time for one validated success."""
+    end_time = scheduler_view.get("end_time")
+    if state != "successful" or not isinstance(end_time, str):
+        return None
+    return _parse_utc_timestamp(
+        end_time,
+        label=f"Successful case terminal timestamp for {case_id}",
+    ).isoformat()
+
+
+def _unsubmitted_task_state(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    submissions: Sequence[Mapping[str, Any]],
+) -> tuple[str, str]:
+    """Return controller lifecycle for a case without active terminal evidence."""
+    if submissions:
+        return "never_started", str(submissions[-1]["error"] or "submission_failed")
+    if (task.batch_id, task.case_index) in _admission_reservation_keys(manifest):
+        return "admission_waiting", "license_launch_pacing"
+    return "never_started", "not_submitted"
+
+
 def _task_state(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -814,10 +871,18 @@ def _task_state(
     replay = _postprocessing_replay_view(batch, failure_stage, attempt)
     attempt_index: int | None = None
     quality_flag_count = 0
+    successful_status: Mapping[str, Any] = {
+        "simulated_end_time": None,
+        "simulated_end_time_unit": None,
+        "final_moisture_name": None,
+        "final_moisture_value": None,
+        "final_moisture_unit": None,
+    }
     canonical_raw_case: str | None = None
     license_retry_eligible = False
     license_wait_exhausted = False
     license_first_blocked_at: str | None = None
+    license_next_retry_at: str | None = None
 
     if batch_runtime.completed_case_is_valid(
         batch,
@@ -833,11 +898,12 @@ def _task_state(
             "diagnostics_state": "complete",
             "publication_state": "succeeded",
         }
-        quality_flag_count = _successful_quality_flag_count(
+        successful_status = _successful_status_summary(
             batch,
             task,
             storage_root=storage_root,
         )
+        quality_flag_count = int(successful_status["quality_flag_count"])
     else:
         active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
         unknown_records = [
@@ -871,6 +937,11 @@ def _task_state(
                     message = f"Temporary-license first blocked timestamp is malformed for {task.case_id}."
                     raise TypeError(message)
                 license_first_blocked_at = first_blocked_at
+                next_retry_at = retry_attempt["next_retry_at"]
+                if next_retry_at is not None and not isinstance(next_retry_at, str):
+                    message = f"Temporary-license retry timestamp is malformed for {task.case_id}."
+                    raise TypeError(message)
+                license_next_retry_at = next_retry_at
             attempt = _admitted_case_attempt(
                 manifest,
                 batch,
@@ -937,12 +1008,12 @@ def _task_state(
                 state, reason = _scheduler_terminal_case_state(_scheduler_state(latest_accounted[1]))
                 failure_stage = "solver"
                 pipeline["solver_state"] = state
-            elif submissions:
-                state = "never_started"
-                reason = str(submissions[-1]["error"] or "submission_failed")
             else:
-                state = "never_started"
-                reason = "not_submitted"
+                state, reason = _unsubmitted_task_state(
+                    manifest,
+                    task,
+                    submissions,
+                )
 
     scheduler_view = _task_scheduler_view(latest_submission, scheduler)
     runtime_progress = _task_runtime_progress_view(
@@ -956,6 +1027,11 @@ def _task_state(
         latest_submission,
         runtime_progress,
     )
+    completed_at = _successful_completion_at(
+        state,
+        scheduler_view,
+        case_id=task.case_id,
+    )
     return {
         **_task_payload(task),
         "material": batch.material_family,
@@ -968,6 +1044,8 @@ def _task_state(
         "failure_stage": failure_stage,
         **pipeline,
         "quality_flag_count": quality_flag_count,
+        "completed_at": completed_at,
+        **successful_status,
         **replay,
         "canonical_raw_case": canonical_raw_case,
         **scheduler_view,
@@ -977,9 +1055,10 @@ def _task_state(
         "license_retry_eligible": license_retry_eligible,
         "license_wait_exhausted": license_wait_exhausted,
         "license_first_blocked_at": license_first_blocked_at,
+        "license_next_retry_at": license_next_retry_at,
         "evidence_path": None if attempt is None else str(attempt.receipt_path),
         "automatic_continuation_allowed": bool(
-            replay["replay_eligible"] or license_retry_eligible or state in {"never_started", "cancelled", "interrupted"}
+            replay["replay_eligible"] or license_retry_eligible or state in {"admission_waiting", "never_started", "cancelled", "interrupted"}
         ),
     }
 
@@ -1015,6 +1094,11 @@ def _reconciled(
         )
         for task in cluster_service.campaign_tasks(campaign)
     ]
+    reservation_keys = _admission_reservation_keys(manifest)
+    waiting_keys = {_task_identity_key(view) for view in task_views if view["state"] == "admission_waiting"}
+    if waiting_keys != reservation_keys:
+        message = "Campaign admission reservations conflict with reconciled case evidence."
+        raise RuntimeError(message)
     persisted_job_ids = set(manifest["slurm_job_ids"])
     states = [_scheduler_state(fields[1]) for job_id, fields in scheduler["active"].items() if job_id in persisted_job_ids]
     pending_jobs = sum(state == _ACTIVE_PENDING_STATE for state in states)
@@ -1240,6 +1324,7 @@ def _view_consumes_admission(view: Mapping[str, Any]) -> bool:
     if state == "active":
         return not _runtime_proves_license_acquired(view)
     return state in {
+        "admission_waiting",
         "pending",
         "scheduler_unknown",
         "license_blocked",
@@ -1281,12 +1366,22 @@ def _submission_intent(
     return (str(case.get("batch_id")), case_index), str(mode)
 
 
+def _admission_reservation_keys(manifest: Mapping[str, Any]) -> frozenset[tuple[str, int]]:
+    """Return logical cases admitted while waiting for launch pacing."""
+    reservations = manifest.get("admission_reservations", [])
+    if not isinstance(reservations, list):
+        message = "Campaign admission reservations are malformed."
+        raise TypeError(message)
+    return frozenset((str(record["batch_id"]), int(record["case_index"])) for record in reservations)
+
+
 def _logical_admission_case_keys(
     manifest: Mapping[str, Any],
     task_views: Sequence[Mapping[str, Any]],
 ) -> frozenset[tuple[str, int]]:
     """Reconstruct logical admission membership from durable case state."""
     keys = {_task_identity_key(view) for view in task_views if _view_consumes_admission(view)}
+    keys.update(_admission_reservation_keys(manifest))
     intent = _submission_intent(manifest)
     if intent is not None:
         keys.add(intent[0])
@@ -1317,6 +1412,10 @@ def _admission_summary(
         else:
             category = "starting"
         categories[category].add(key)
+    for key in _admission_reservation_keys(manifest):
+        for values in categories.values():
+            values.discard(key)
+        categories["starting"].add(key)
     intent = _submission_intent(manifest)
     if intent is not None:
         key, mode = intent
@@ -1397,6 +1496,138 @@ def _normal_admission_status(
     return False, None
 
 
+def _parse_utc_timestamp(value: str, *, label: str) -> datetime:
+    """Return one timezone-aware UTC timestamp from durable evidence."""
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError as error:
+        message = f"{label} is not an ISO timestamp: {value!r}."
+        raise ValueError(message) from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        message = f"{label} must be timezone-aware: {value!r}."
+        raise ValueError(message)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _campaign_retry_launch_spacing_seconds(manifest: Mapping[str, Any]) -> float | None:
+    """Return derived retry-launch spacing or no gate for one admission case."""
+    submission = manifest["submission_config"]
+    maximum = submission["max_admission_cases"]
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        message = "Campaign max_admission_cases must be a positive integer."
+        raise ValueError(message)
+    retry = submission["temporary_license_retry"]
+    if retry["enabled"] is not True or maximum == 1:
+        return None
+    initial_delay = float(retry["initial_delay_seconds"])
+    if initial_delay <= 0.0:
+        message = "Temporary-license initial retry delay must be positive."
+        raise ValueError(message)
+    return initial_delay / maximum
+
+
+def _license_pressure_active(task_views: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether this campaign currently has pre-solver license pressure."""
+    return any(view["state"] == "license_blocked" or view.get("license_retry_active") is True for view in task_views)
+
+
+def _last_pre_solver_launch_at(manifest: Mapping[str, Any]) -> datetime | None:
+    """Return the latest durable submitted or submitting pre-solver launch."""
+    timestamps: list[datetime] = []
+    for record in manifest["submissions"]:
+        if record["status"] not in {"submitted", "submitting"}:
+            continue
+        timestamps.append(
+            _parse_utc_timestamp(
+                str(record["recorded_at"]),
+                label="Campaign pre-solver launch timestamp",
+            )
+        )
+    return max(timestamps, default=None)
+
+
+def _campaign_retry_launch_pacing(
+    manifest: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the durable campaign-level gate for pre-solver license launches."""
+    spacing = _campaign_retry_launch_spacing_seconds(manifest)
+    active = spacing is not None and _license_pressure_active(task_views)
+    last_launch = _last_pre_solver_launch_at(manifest) if active else None
+    current = _parse_utc_timestamp(_utc_now(), label="Campaign controller clock") if at is None else at
+    if current.tzinfo is None or current.utcoffset() is None:
+        message = "Campaign controller clock must be timezone-aware."
+        raise ValueError(message)
+    current = current.astimezone(timezone.utc)
+    next_launch = None if last_launch is None else last_launch + timedelta(seconds=spacing or 0.0)
+    return {
+        "active": active,
+        "spacing_seconds": spacing,
+        "last_launch_at": None if last_launch is None else last_launch.isoformat(),
+        "next_launch_at": None if next_launch is None else next_launch.isoformat(),
+        "launch_allowed": not active or next_launch is None or current >= next_launch,
+    }
+
+
+def _retry_candidate_sort_key(
+    view: Mapping[str, Any],
+    *,
+    plan_order: Mapping[tuple[str, int], int],
+) -> tuple[datetime, datetime, int, str, int]:
+    """Return the stable due-first campaign order for eligible license retries."""
+    next_retry_at = view.get("license_next_retry_at")
+    first_blocked_at = view.get("license_first_blocked_at")
+    if not isinstance(next_retry_at, str) or not isinstance(first_blocked_at, str):
+        message = "Eligible temporary-license retry lacks durable due and first-blocked timestamps."
+        raise TypeError(message)
+    return (
+        _parse_utc_timestamp(next_retry_at, label="Temporary-license next retry timestamp"),
+        _parse_utc_timestamp(first_blocked_at, label="Temporary-license first blocked timestamp"),
+        plan_order[_task_identity_key(view)],
+        str(view["batch_id"]),
+        int(view["case_index"]),
+    )
+
+
+def _reserve_initial_launch(
+    manifest: dict[str, Any],
+    task: cluster_service.CampaignTask,
+    admission_keys: set[tuple[str, int]],
+    reservation_keys: frozenset[tuple[str, int]],
+    *,
+    maximum: int,
+) -> None:
+    """Durably admit one fresh case before its paced Slurm launch."""
+    key = task.batch_id, task.case_index
+    if key in admission_keys:
+        if key not in reservation_keys:
+            message = "Fresh case is admitted without a controller-side launch reservation."
+            raise RuntimeError(message)
+        return
+    if len(admission_keys) >= maximum:
+        message = "Fresh case admission would exceed the logical admission limit."
+        raise RuntimeError(message)
+    reservations = manifest.setdefault("admission_reservations", [])
+    if not isinstance(reservations, list):
+        message = "Campaign admission reservations are malformed."
+        raise TypeError(message)
+    reservations.append(_task_payload(task))
+    admission_keys.add(key)
+
+
+def _release_initial_launch_reservation(
+    manifest: dict[str, Any],
+    *,
+    key: tuple[str, int],
+) -> None:
+    """Release one reservation as its durable submission intent takes over."""
+    manifest["admission_reservations"] = [
+        record for record in manifest.get("admission_reservations", []) if (str(record["batch_id"]), int(record["case_index"])) != key
+    ]
+
+
 def _fill_submission_capacity(
     manifest: dict[str, Any],
     campaign: config_service.CampaignConfig,
@@ -1415,6 +1646,7 @@ def _fill_submission_capacity(
     maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
     admission_keys = set(_logical_admission_case_keys(manifest, task_views))
     selected_tasks: set[tuple[str, int]] = set()
+    plan_order = {(task.batch_id, task.case_index): index for index, task in enumerate(cluster_service.campaign_tasks(campaign))}
 
     while True:
         if max_running is not None and running_jobs >= int(max_running):
@@ -1434,10 +1666,9 @@ def _fill_submission_capacity(
                 for view in task_views
                 if view["state"] == "license_blocked" and view["license_retry_eligible"] is True and _task_identity_key(view) not in selected_tasks
             ),
-            key=lambda view: (
-                str(view["license_first_blocked_at"]),
-                str(view["batch_id"]),
-                int(view["case_index"]),
+            key=lambda view: _retry_candidate_sort_key(
+                view,
+                plan_order=plan_order,
             ),
         )
         next_retry = eligible_blocked[0] if eligible_blocked else None
@@ -1445,15 +1676,32 @@ def _fill_submission_capacity(
             (view for view in task_views if view["state"] in {"cancelled", "interrupted"} and _task_identity_key(view) not in selected_tasks),
             None,
         )
+        reservation_keys = _admission_reservation_keys(manifest)
+        next_reserved = next(
+            (
+                view
+                for view in task_views
+                if view["state"] in {"admission_waiting", "never_started"}
+                and _task_identity_key(view) in reservation_keys
+                and _task_identity_key(view) not in selected_tasks
+            ),
+            None,
+        )
         next_unsent = next(
-            (view for view in task_views if view["state"] == "never_started" and _task_identity_key(view) not in selected_tasks),
+            (
+                view
+                for view in task_views
+                if view["state"] == "never_started"
+                and _task_identity_key(view) not in reservation_keys
+                and _task_identity_key(view) not in selected_tasks
+            ),
             None,
         )
         circuit_breaker_tripped = _solver_failure_threshold_exceeded(
             task_views,
             maximum_failed_cases=maximum_failed_cases,
         )
-        next_view = next_retry or next_restart
+        next_view = next_retry or next_restart or next_reserved
         if next_view is None and not circuit_breaker_tripped and len(admission_keys) < max_admission_cases:
             next_view = next_unsent
         if next_view is None:
@@ -1476,10 +1724,6 @@ def _fill_submission_capacity(
             )
             return manifest
 
-        current_commit = _repository_commit()
-        if current_commit != manifest["git_commit"]:
-            message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
-            raise RuntimeError(message)
         task = _task_from_payload(campaign, next_view)
         key = (task.batch_id, task.case_index)
         selected_tasks.add(key)
@@ -1490,13 +1734,35 @@ def _fill_submission_capacity(
         else:
             mode = "initial"
         if mode == "initial":
-            if key in admission_keys or len(admission_keys) >= max_admission_cases:
-                message = "Fresh case admission would exceed the logical admission limit."
-                raise RuntimeError(message)
-            admission_keys.add(key)
+            _reserve_initial_launch(
+                manifest,
+                task,
+                admission_keys,
+                reservation_keys,
+                maximum=max_admission_cases,
+            )
         elif key not in admission_keys:
             message = "Retry or resume case no longer owns logical admission."
             raise RuntimeError(message)
+
+        pacing = _campaign_retry_launch_pacing(manifest, task_views)
+        if pacing["launch_allowed"] is not True:
+            manifest["state"] = "active" if pending_jobs or running_jobs else "license_blocked"
+            common.serialization.atomic_write_json(
+                campaign_evidence.campaign_run_manifest_path(
+                    run_id,
+                    storage_root=storage_root,
+                ),
+                manifest,
+            )
+            return manifest
+
+        current_commit = _repository_commit()
+        if current_commit != manifest["git_commit"]:
+            message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
+            raise RuntimeError(message)
+        if mode == "initial":
+            _release_initial_launch_reservation(manifest, key=key)
         manifest = _submit_one(
             manifest,
             campaign,
@@ -1547,6 +1813,7 @@ def submit_campaign(
                     "slurm_job_ids",
                     "submissions",
                     "submission_intent",
+                    "admission_reservations",
                     "state",
                 }
             )
@@ -1855,6 +2122,7 @@ def _batch_status(
         "successful": sum(view["state"] == "successful" for view in selected),
         "active": sum(view["state"] == "active" for view in selected),
         "pending": sum(view["state"] == "pending" for view in selected),
+        "admission_waiting": sum(view["state"] == "admission_waiting" for view in selected),
         "never_started": sum(view["state"] == "never_started" for view in selected),
         "solver_failed": failure_counts["solver_failed"],
         "timed_out": failure_counts["technical_runtime_timed_out"],
@@ -1881,7 +2149,7 @@ def _public_task_view(view: Mapping[str, Any]) -> dict[str, Any]:
         state = "running"
     elif classified_state == "pending":
         state = "scheduler_pending"
-    elif classified_state in {"successful", "license_blocked", "never_started"}:
+    elif classified_state in {"successful", "license_blocked", "admission_waiting", "never_started"}:
         state = classified_state
     else:
         state = "failed"
@@ -2036,6 +2304,7 @@ def campaign_status(
         "successful": sum(view["state"] == "successful" for view in task_views),
         "active": sum(view["state"] == "active" for view in task_views),
         "pending": sum(view["state"] == "pending" for view in task_views),
+        "admission_waiting": sum(view["state"] == "admission_waiting" for view in task_views),
         "never_started": sum(view["state"] == "never_started" for view in task_views),
         "solver_failed": failure_counts["solver_failed"],
         "timed_out": failure_counts["technical_runtime_timed_out"],
@@ -2114,6 +2383,7 @@ def campaign_status(
     cases_per_material = len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None
     public_task_views = [_public_task_view(view) for view in task_views]
     admission = _admission_summary(manifest, task_views)
+    license_retry_launch_pacing = _campaign_retry_launch_pacing(manifest, task_views)
     license_observability = (
         _pilot_license_observability(
             campaign,
@@ -2131,6 +2401,7 @@ def campaign_status(
             "running",
             "scheduler_pending",
             "license_blocked",
+            "admission_waiting",
             "never_started",
             "failed",
         )
@@ -2158,6 +2429,7 @@ def campaign_status(
         "license_blocked_cases": count_states["license_blocked"],
         "admission": admission,
         "license_retry_eligible_cases": license_retry_eligible_cases,
+        "license_retry_launch_pacing": license_retry_launch_pacing,
         "postprocessing_replay_available_cases": replayable_cases,
         "replay_blocked_cases": failure_counts["replay_blocked"],
         "failure_counts": failure_counts,

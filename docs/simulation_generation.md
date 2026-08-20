@@ -327,25 +327,57 @@ not a limit of two simultaneous solvers.
 
 For example, if A and B are both `license_blocked`, admission is 2/2 and C remains
 never-started even though no Slurm allocation is active. A and B retain those
-logical slots throughout backoff and may both retry when eligible; there is no
-separate probe limit. When job-bound evidence from the common progress parser
-proves A obtained a license and actual solver execution began, A immediately
-becomes ordinary running, admission becomes 1/2, and the same controller
-advancement may admit C. If C then starts, D may be admitted. If B and D later
-become blocked, admission returns to 2/2 and E remains never-started. This
-progressively discovers available concurrency while preventing a campaign from
-accumulating many cases that all fail on temporary capacity. Increasing admission
-merely to create a large queue is not a substitute for license integration.
+logical slots throughout backoff and may both retry independently; there is no
+separate probe limit. The controller orders due retries by `next_retry_at`, first
+blocked time, resolved campaign-plan order, and stable case identity, then paces
+their Slurm submissions through one campaign-level launch gate. The spacing is
+derived from the existing initial retry delay divided by the admission limit.
+With the maintained 15-second initial delay and two admission cases, the initial
+target is approximately 7.5 seconds. This is deterministic de-synchronization,
+not a real-time guarantee: controller polling and Slurm startup determine the
+observed cadence.
+
+Each case still obeys its own 15-to-30-second retry backoff and is never launched
+before its durable `next_retry_at`. When both cases reach 30-second per-case
+backoff, two cases cannot sustain one attempt every 7.5 seconds indefinitely;
+the achievable average may be about one attempt every 15 seconds. The controller
+does not admit extra cases to increase retry frequency. It also applies the same
+gate to a fresh pre-solver launch while current strong temporary-capacity
+evidence remains active, without throttling unrelated campaigns, already-running
+solvers, or postprocessing replay.
+
+A fresh case admitted while that gate is closed is recorded only as a durable
+controller-side admission reservation in the schema-version-1 campaign
+operational manifest. Status classifies this lifecycle as `admission_waiting`,
+never as `never_started`. It immediately consumes its one logical slot but remains
+outside Slurm until the gate opens, so restart cannot lose the admission decision
+and no node or CPU is retained merely for stagger waiting. This mutable field is
+excluded from scientific, Dataset, Generation, workflow, schedule, benchmark,
+case, and publication identities and their compatibility digests.
+
+When job-bound evidence from the common progress parser proves A obtained a
+license and actual solver execution began, A immediately becomes ordinary
+running, admission becomes 1/2, and the controller may next admit C under the
+same pacing policy. If C then starts, D may be admitted. If B and D later become
+blocked, admission returns to 2/2 and E remains never-started. This progressively
+discovers available concurrency while preventing a campaign from accumulating
+many cases that all fail on temporary capacity. Increasing admission merely to
+create a large queue is not a substitute for license integration.
 
 The controller waits outside compute allocations. Maintained retry backoff starts
 at 15 seconds, is capped at 30 seconds, and continues indefinitely because
 `maximum_wait_seconds: null`; the regular controller poll submits on the first
-advancement after `next_retry_at`. A blocked case retains only its logical
-admission slot: no CPU, memory, node, Slurm allocation, or COMSOL process is held
-during the wait. This improves responsiveness but neither reserves a FlexNet
-license nor creates fairness. License-only attempts never consume the scientific
-failure budget or benchmark runtime, core-hour, throughput, or ranking
-measurements.
+advancement after both `next_retry_at` and the campaign launch gate permit it.
+The maintained poll interval is 15 seconds, so the first normal advancement may
+occur materially after the 7.5-second target; no sub-poll or real-time cadence is
+claimed. The restart-safe gate derives its latest relevant launch from the
+schema-version-1 campaign submission history rather than process memory. A
+blocked case retains only its logical admission slot: no CPU, memory, node, Slurm
+allocation, or COMSOL process is held during the wait. This improves
+responsiveness and improves the chance of observing a briefly available license,
+but it neither reserves a FlexNet license nor guarantees fairness against other
+users. License-only attempts never consume the scientific failure budget or
+benchmark runtime, core-hour, throughput, or ranking measurements.
 
 Each blocked work unit owns one mutable schema-version-1 `license_wait.json`. The
 compact payload records work-unit and scientific identities, the observed
@@ -442,10 +474,16 @@ The public administrative commands are:
 ```
 
 Status reports successful, running, scheduler-pending, license-blocked,
-never-started, and failed units. Active and problematic cases receive compact,
-actionable detail, while never-started work is grouped in resolved campaign-plan
-order so output scales with materials or benchmark variants rather than case
-count. For example:
+never-started, and failed units. The summary retains the authoritative total
+successful count, while recurring campaign output shows only the three most
+recent successful cases by terminal completion time. Older successes remain in
+canonical evidence but disappear from recurring terminal detail as newer cases
+complete. Physical simulated end time and the maintained final-moisture metric
+are shown only when canonical terminal status already supplies both value and
+unit without another result-file read. Active and problematic cases receive
+compact, actionable detail, while never-started work is grouped in resolved
+campaign-plan order so output scales with materials or benchmark variants rather
+than case count. For example:
 
 ```text
 Campaign: material_pilot__0123456789abcdef

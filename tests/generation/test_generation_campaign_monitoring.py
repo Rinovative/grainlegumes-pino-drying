@@ -5,18 +5,30 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
+
+import pytest
 
 from src import generation
 from src.generation import generation_campaign_status as status_service
 from src.generation.cli import cli_generation
 from src.generation.runtime import generation_runtime_cluster as cluster
 
-if TYPE_CHECKING:
-    from pathlib import Path
 
-    import pytest
+def _synthetic_retry_policy(
+    *,
+    initial_delay_seconds: float = 20.0,
+    maximum_delay_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Return one test-owned unlimited temporary-license retry policy."""
+    return {
+        "enabled": True,
+        "initial_delay_seconds": initial_delay_seconds,
+        "maximum_delay_seconds": maximum_delay_seconds,
+        "maximum_wait_seconds": None,
+    }
 
 
 def _submission(task: cluster.CampaignTask, job_id: str, index: int) -> dict[str, Any]:
@@ -101,6 +113,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
             "max_admission_cases": 3,
             "max_running_cases": None,
             "maximum_failed_cases": 10,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": submissions,
@@ -132,7 +145,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
             ],
         },
         "accounted": {
-            "101": ["101", "COMPLETED", "0:0", "submit-a", "start-a", "end-a", "00:01:00", "node-a", "16", "standard"],
+            "101": ["101", "COMPLETED", "0:0", "submit-a", "start-a", "2026-01-01T00:01:00+00:00", "00:01:00", "node-a", "16", "standard"],
             "103": ["103", "FAILED", "1:0", "submit-c", "start-c", "end-c", "00:02:00", "node-c", "16", "standard"],
             "104": ["104", "FAILED", "1:0", "submit-d", "start-d", "end-d", "00:01:00", "node-d", "16", "standard"],
         },
@@ -146,6 +159,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     wait = {
         "retry_budget_remaining": True,
         "first_blocked_at": "2026-01-01T00:00:00+00:00",
+        "next_retry_at": "2026-01-01T00:00:20+00:00",
     }
     monkeypatch.setattr(generation.campaign.campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
@@ -195,6 +209,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "scheduler_pending",
         "never_started",
     ]
+    assert status["cases"][0]["completed_at"] == "2026-01-01T00:01:00+00:00"
     assert (
         sum(
             status["work_unit_counts"][state]
@@ -270,6 +285,7 @@ def test_conversion_failure_cannot_terminalize_an_active_campaign(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 0,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": [],
@@ -377,6 +393,7 @@ def test_replay_blocked_failures_leave_free_normal_admission_unblocked(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": [],
@@ -471,6 +488,13 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
                 "retrying": 0,
             },
         },
+        "license_retry_launch_pacing": {
+            "active": True,
+            "spacing_seconds": 7.5,
+            "last_launch_at": "2026-08-20T00:00:00+00:00",
+            "next_launch_at": "2026-08-20T00:00:07.500000+00:00",
+            "launch_allowed": False,
+        },
         "cases": [],
     }
 
@@ -483,6 +507,9 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
     assert "max_running_cases=3" in rendered
     assert "Admission: 2/2" in rendered
     assert "pending=0  starting=0  license_waiting=2  retrying=0" in rendered
+    assert "License retry:" in rendered
+    assert "next_launch=" in rendered
+    assert "stagger=7.5 s" in rendered
 
     status["submission_config"]["max_running_cases"] = None
     assert "max_running_cases=unlimited" in status_service.format_campaign_status_summary(status)
@@ -724,6 +751,149 @@ def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_boun
     assert "simulated_time=" not in exporting_text
     assert "step=" not in exporting_text
     assert "Tfail=" not in exporting_text
+
+
+def test_admission_waiting_is_distinct_from_never_started_in_status() -> None:
+    """Present a durable logical admission without implying scheduler work."""
+    waiting = {
+        "case_id": "case_0001",
+        "batch_name": "transient_drying__lentil__natural",
+        "state": "admission_waiting",
+    }
+    unsent = {
+        "case_id": "case_0002",
+        "batch_name": "transient_drying__lentil__natural",
+        "state": "never_started",
+    }
+
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "paced-admission",
+            "campaign_state": "license_blocked",
+            "cases": [waiting, unsent],
+        }
+    )
+
+    assert "admission_waiting=1" in rendered
+    assert "never_started=1" in rendered
+    never_started_section = rendered.split("Never started:", maxsplit=1)[1]
+    assert "total: 1" in never_started_section
+
+
+def _successful_case(
+    index: int,
+    *,
+    completed_at: str,
+    simulated_end_time: float | None = None,
+    final_moisture_value: float | None = None,
+) -> dict[str, Any]:
+    """Return one synthetic successful campaign-status row."""
+    return {
+        "case_id": f"case_{index:04d}",
+        "batch_name": "transient_drying__lentil__natural",
+        "material": "lentil",
+        "state": "successful",
+        "reason": "validated_case_evidence",
+        "completed_at": completed_at,
+        "elapsed": "99:59:59",
+        "simulated_end_time": simulated_end_time,
+        "simulated_end_time_unit": "h" if simulated_end_time is not None else None,
+        "final_moisture_name": "f_wet_dm_final" if final_moisture_value is not None else None,
+        "final_moisture_value": final_moisture_value,
+        "final_moisture_unit": "1" if final_moisture_value is not None else None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("completed_count", "displayed_count"),
+    [(0, 0), (1, 1), (3, 3), (4, 3), (600, 3), (1_050, 3)],
+)
+def test_recent_completions_are_bounded_at_campaign_scale(
+    completed_count: int,
+    displayed_count: int,
+) -> None:
+    """Keep the full success count while rendering at most three details."""
+    cases = [
+        _successful_case(index, completed_at=f"2026-01-{1 + index // 86:02d}T{index % 24:02d}:00:00+00:00") for index in range(1, completed_count + 1)
+    ]
+
+    rendered = status_service.format_campaign_status_summary({"campaign_run_id": "bounded-completions", "campaign_state": "running", "cases": cases})
+
+    assert f"successful={completed_count}" in rendered
+    assert rendered.count("  state=successful") == displayed_count
+    if completed_count == 0:
+        assert "Recently completed cases" not in rendered
+    else:
+        assert f"Recently completed cases (latest {displayed_count} of {completed_count}):" in rendered
+    assert "additional completed cases omitted" not in rendered
+
+
+def test_recent_completions_use_timestamp_then_stable_plan_order() -> None:
+    """Select newest terminal timestamps and preserve plan order for exact ties."""
+    cases = [
+        _successful_case(4, completed_at="2026-01-01T00:04:00+00:00"),
+        _successful_case(2, completed_at="2026-01-01T00:05:00+00:00"),
+        _successful_case(1, completed_at="2026-01-01T00:05:00+00:00"),
+        _successful_case(3, completed_at="2026-01-01T00:03:00+00:00"),
+    ]
+
+    rendered = status_service.format_campaign_status_summary({"campaign_run_id": "ordered-completions", "campaign_state": "running", "cases": cases})
+    section = rendered.split("Recently completed cases", maxsplit=1)[1]
+
+    assert [section.index(case_id) for case_id in ("case_0002", "case_0001", "case_0004")] == sorted(
+        section.index(case_id) for case_id in ("case_0002", "case_0001", "case_0004")
+    )
+    assert "case_0003" not in section
+
+
+def test_new_completion_replaces_the_oldest_displayed_case() -> None:
+    """Drop the previous oldest row when a newer terminal completion arrives."""
+    cases = [_successful_case(index, completed_at=f"2026-01-01T00:0{index}:00+00:00") for index in range(1, 4)]
+    initial = status_service.format_campaign_status_summary({"campaign_run_id": "rolling-completions", "campaign_state": "running", "cases": cases})
+    updated = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "rolling-completions",
+            "campaign_state": "running",
+            "cases": [*cases, _successful_case(4, completed_at="2026-01-01T00:04:00+00:00")],
+        }
+    )
+
+    assert "case_0001" in initial
+    assert "case_0001" not in updated
+    assert "case_0004" in updated
+    assert updated.count("  state=successful") == 3
+
+
+def test_completed_formatting_is_pure_and_optional_terminal_fields_are_conditional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use only supplied status fields and omit unavailable terminal science."""
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        message = "Formatting attempted external or filesystem work"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    monkeypatch.setattr(Path, "rglob", forbidden)
+    monkeypatch.setattr(status_service.common.serialization, "file_sha256", forbidden)
+    available = _successful_case(
+        1,
+        completed_at="2026-01-01T00:01:00+00:00",
+        simulated_end_time=168.0,
+        final_moisture_value=0.125,
+    )
+    unavailable = _successful_case(2, completed_at="2026-01-01T00:02:00+00:00")
+
+    rendered = status_service.format_campaign_status_summary(
+        {"campaign_run_id": "terminal-fields", "campaign_state": "running", "cases": [available, unavailable]}
+    )
+
+    assert "simulated_end=168 h" in rendered
+    assert "f_wet_dm_final=0.125 1" in rendered
+    assert "elapsed=99:59:59" not in rendered
+    assert "simulated_end=unavailable" not in rendered
+    assert "final_moisture=unavailable" not in rendered
+    assert max(map(len, rendered.splitlines())) < 220
 
 
 def test_human_summary_groups_never_started_campaigns_at_material_scale() -> None:

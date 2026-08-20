@@ -7,6 +7,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,20 @@ from src.generation.cli import cli_generation
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
 from src.generation.runtime import generation_runtime_workspace as workspace
+
+
+def _synthetic_retry_policy(
+    *,
+    initial_delay_seconds: float = 20.0,
+    maximum_delay_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Return one test-owned unlimited temporary-license retry policy."""
+    return {
+        "enabled": True,
+        "initial_delay_seconds": initial_delay_seconds,
+        "maximum_delay_seconds": maximum_delay_seconds,
+        "maximum_wait_seconds": None,
+    }
 
 
 def _scheduler(
@@ -259,6 +274,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         "classification": "temporary_license_capacity",
         "retry_budget_remaining": True,
         "first_blocked_at": "2026-01-01T00:00:00+00:00",
+        "next_retry_at": "2026-01-01T00:00:20+00:00",
     }
 
     def fake_submit(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -546,6 +562,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
             "max_admission_cases": 1,
             "max_running_cases": None,
             "maximum_failed_cases": 0,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "state": "active",
     }
@@ -958,6 +975,7 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
             "max_admission_cases": 1,
             "max_running_cases": None,
             "maximum_failed_cases": maximum_failed_cases,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "state": "active",
@@ -1111,6 +1129,7 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submissions": [],
         "state": "active",
@@ -1209,7 +1228,16 @@ def _admission_view(
         "license_retry_active": False,
         "license_retry_eligible": retry_eligible,
         "license_first_blocked_at": (f"2026-01-01T00:00:{task.case_index:02d}+00:00" if state == "license_blocked" else None),
-        "temporary_license_retry": ({"classification": "temporary_license_capacity"} if state == "license_blocked" else None),
+        "license_next_retry_at": (f"2026-01-01T00:01:{task.case_index:02d}+00:00" if state == "license_blocked" else None),
+        "temporary_license_retry": (
+            {
+                "classification": "temporary_license_capacity",
+                "next_retry_at": f"2026-01-01T00:01:{task.case_index:02d}+00:00",
+                "retry_count": 1,
+            }
+            if state == "license_blocked"
+            else None
+        ),
         "failure_stage": "solver" if state == "license_blocked" else None,
     }
 
@@ -1272,12 +1300,55 @@ def test_durable_submission_intent_counts_one_logical_case() -> None:
     assert generation.campaign._logical_admission_case_keys(manifest, [view]) == frozenset({("batch", 1)})
 
 
-def test_two_blocked_cases_retry_without_admitting_a_third(
+def test_retry_launch_spacing_is_derived_from_existing_policy() -> None:
+    """Derive generic and maintained spacing without another tuning parameter."""
+    views = [{"state": "license_blocked", "license_retry_active": False}]
+    generic = {
+        "submission_config": {
+            "max_admission_cases": 4,
+            "temporary_license_retry": _synthetic_retry_policy(
+                initial_delay_seconds=20.0,
+                maximum_delay_seconds=30.0,
+            ),
+        },
+        "submissions": [],
+    }
+    maintained = {
+        "submission_config": {
+            "max_admission_cases": 2,
+            "temporary_license_retry": _synthetic_retry_policy(
+                initial_delay_seconds=15.0,
+                maximum_delay_seconds=30.0,
+            ),
+        },
+        "submissions": [],
+    }
+    serial = {
+        "submission_config": {
+            "max_admission_cases": 1,
+            "temporary_license_retry": _synthetic_retry_policy(),
+        },
+        "submissions": [],
+    }
+    at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    assert generation.campaign._campaign_retry_launch_pacing(generic, views, at=at)["spacing_seconds"] == pytest.approx(5.0)
+    assert generation.campaign._campaign_retry_launch_pacing(maintained, views, at=at)["spacing_seconds"] == pytest.approx(7.5)
+    assert generation.campaign._campaign_retry_launch_pacing(serial, views, at=at) == {
+        "active": False,
+        "spacing_seconds": None,
+        "last_launch_at": None,
+        "next_launch_at": None,
+        "launch_allowed": True,
+    }
+
+
+def test_two_synchronized_license_failures_launch_one_at_a_time(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Allow both slot owners to retry without a hidden one-probe gate."""
+    """Pace equal-due slot owners without altering admission or per-case backoff."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=3,
@@ -1290,6 +1361,11 @@ def test_two_blocked_cases_retry_without_admitting_a_third(
         _admission_view(tasks[1], "license_blocked", retry_eligible=True),
         _admission_view(tasks[2], "never_started"),
     ]
+    due = "2026-01-01T00:00:00+00:00"
+    for view in views[:2]:
+        view["license_next_retry_at"] = due
+        view["license_first_blocked_at"] = due
+        view["temporary_license_retry"]["next_retry_at"] = due
     manifest = {
         "campaign_run_id": "two-retries__0123456789abcdef",
         "git_commit": "f" * 40,
@@ -1297,13 +1373,23 @@ def test_two_blocked_cases_retry_without_admitting_a_third(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(
+                initial_delay_seconds=15.0,
+                maximum_delay_seconds=30.0,
+            ),
         },
         "submission_intent": None,
         "submissions": [],
         "state": "license_blocked",
     }
-    submitted: list[tuple[str, str]] = []
+    clock = {"value": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    submitted: list[tuple[str, str, datetime]] = []
+
+    def clock_text() -> str:
+        return clock["value"].isoformat()
+
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "f" * 40)
+    monkeypatch.setattr(generation.campaign, "_utc_now", clock_text)
     monkeypatch.setattr(
         generation.campaign.common.serialization,
         "atomic_write_json",
@@ -1319,7 +1405,19 @@ def test_two_blocked_cases_retry_without_admitting_a_third(
         storage_root: Path | str | None,
     ) -> dict[str, Any]:
         del storage_root
-        submitted.append((task.case_id, mode))
+        submitted.append((task.case_id, mode, clock["value"]))
+        payload["submissions"].append(
+            {
+                "status": "submitted",
+                "recorded_at": clock["value"].isoformat(),
+                "mode": mode,
+                "case": {
+                    "batch_id": task.batch_id,
+                    "case_index": task.case_index,
+                    "case_id": task.case_id,
+                },
+            }
+        )
         return payload
 
     monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
@@ -1333,20 +1431,42 @@ def test_two_blocked_cases_retry_without_admitting_a_third(
         storage_root=tmp_path,
     )
 
-    assert submitted == [
+    assert [(case_id, mode) for case_id, mode, _at in submitted] == [(tasks[0].case_id, "license_retry")]
+    retry_count_before = views[1]["temporary_license_retry"]["retry_count"]
+    views[0]["license_next_retry_at"] = "2026-01-01T00:00:15+00:00"
+    views[0]["temporary_license_retry"]["next_retry_at"] = views[0]["license_next_retry_at"]
+    restored = json.loads(json.dumps(manifest))
+    clock["value"] += timedelta(seconds=7.49)
+    generation.campaign._fill_submission_capacity(
+        restored,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=0,
+        scheduler={"active": {}},
+        storage_root=tmp_path,
+    )
+    assert len(submitted) == 1
+    assert views[1]["temporary_license_retry"]["retry_count"] == retry_count_before
+    assert generation.campaign._admission_summary(restored, views)["count"] == 2
+    assert all(record["case"]["case_id"] != tasks[1].case_id for record in restored["submissions"])
+
+    clock["value"] += timedelta(seconds=0.01)
+    generation.campaign._fill_submission_capacity(
+        restored,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=0,
+        scheduler={"active": {}},
+        storage_root=tmp_path,
+    )
+    assert [(case_id, mode) for case_id, mode, _at in submitted] == [
         (tasks[0].case_id, "license_retry"),
         (tasks[1].case_id, "license_retry"),
     ]
-    assert generation.campaign._admission_summary(manifest, views) == {
-        "count": 2,
-        "maximum": 2,
-        "components": {
-            "pending": 0,
-            "starting": 0,
-            "license_waiting": 2,
-            "retrying": 0,
-        },
-    }
+    assert submitted[1][2] - submitted[0][2] == timedelta(seconds=7.5)
+    assert views[2]["state"] == "never_started"
 
 
 @pytest.mark.parametrize(
@@ -1379,6 +1499,7 @@ def test_shared_admission_limit_blocks_a_third_case(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": [],
@@ -1411,12 +1532,12 @@ def test_shared_admission_limit_blocks_a_third_case(
     assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
 
 
-def test_repeated_license_failures_do_not_accumulate_blocked_cases(
+def test_fair_staggered_retries_do_not_accumulate_blocked_cases(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep retry history on the same two logical slot owners indefinitely."""
+    """Alternate oldest-due retries while retaining exactly two logical owners."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=8,
@@ -1428,6 +1549,11 @@ def test_repeated_license_failures_do_not_accumulate_blocked_cases(
         _admission_view(task, "license_blocked", retry_eligible=index < 2) if index < 2 else _admission_view(task, "never_started")
         for index, task in enumerate(tasks)
     ]
+    common_due = "2026-01-01T00:00:00+00:00"
+    for view in views[:2]:
+        view["license_next_retry_at"] = common_due
+        view["license_first_blocked_at"] = common_due
+        view["temporary_license_retry"]["next_retry_at"] = common_due
     manifest = {
         "campaign_run_id": "no-accumulation__0123456789abcdef",
         "git_commit": "d" * 40,
@@ -1435,12 +1561,20 @@ def test_repeated_license_failures_do_not_accumulate_blocked_cases(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": [],
         "state": "license_blocked",
     }
+    clock = {"value": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    launch_times: list[datetime] = []
+
+    def clock_text() -> str:
+        return clock["value"].isoformat()
+
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "d" * 40)
+    monkeypatch.setattr(generation.campaign, "_utc_now", clock_text)
     monkeypatch.setattr(
         generation.campaign.common.serialization,
         "atomic_write_json",
@@ -1456,10 +1590,13 @@ def test_repeated_license_failures_do_not_accumulate_blocked_cases(
         storage_root: Path | str | None,
     ) -> dict[str, Any]:
         del storage_root
+        launch_times.append(clock["value"])
         payload["submissions"].append(
             {
                 "submission_index": len(payload["submissions"]) + 1,
                 "mode": mode,
+                "status": "submitted",
+                "recorded_at": clock["value"].isoformat(),
                 "case": {
                     "batch_id": task.batch_id,
                     "case_index": task.case_index,
@@ -1467,15 +1604,15 @@ def test_repeated_license_failures_do_not_accumulate_blocked_cases(
                 },
             }
         )
+        view = views[tasks.index(task)]
+        next_due = clock["value"] + timedelta(seconds=20)
+        view["license_next_retry_at"] = next_due.isoformat()
+        view["temporary_license_retry"]["next_retry_at"] = next_due.isoformat()
+        view["temporary_license_retry"]["retry_count"] += 1
         return payload
 
     monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    next_retry_at = {tasks[0].case_id: now, tasks[1].case_id: now}
-    for _cycle in range(10):
-        now += timedelta(seconds=30)
-        for view in views[:2]:
-            view["license_retry_eligible"] = now >= next_retry_at[view["case_id"]]
+    for _launch in range(10):
         generation.campaign._fill_submission_capacity(
             manifest,
             campaign,
@@ -1485,16 +1622,14 @@ def test_repeated_license_failures_do_not_accumulate_blocked_cases(
             scheduler={"active": {}},
             storage_root=tmp_path,
         )
-        for task in tasks[:2]:
-            next_retry_at[task.case_id] = now + timedelta(seconds=30)
         assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
+        clock["value"] += timedelta(seconds=10)
 
-    assert len(manifest["submissions"]) == 20
-    assert {record["case"]["case_id"] for record in manifest["submissions"]} == {
-        tasks[0].case_id,
-        tasks[1].case_id,
-    }
+    case_ids = [record["case"]["case_id"] for record in manifest["submissions"]]
+    assert case_ids == [tasks[index % 2].case_id for index in range(10)]
+    assert all(launch_times[index] - launch_times[index - 1] >= timedelta(seconds=10) for index in range(1, len(launch_times)))
     assert all(view["state"] == "never_started" for view in views[2:])
+    assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
 
 
 def test_restart_reconstructs_blocked_admission_without_admitting_more(
@@ -1524,6 +1659,7 @@ def test_restart_reconstructs_blocked_admission_without_admitting_more(
                     "max_admission_cases": 2,
                     "max_running_cases": None,
                     "maximum_failed_cases": 5,
+                    "temporary_license_retry": _synthetic_retry_policy(),
                 },
                 "submission_intent": None,
                 "submissions": [
@@ -1585,7 +1721,7 @@ def test_solver_start_releases_slots_for_progressive_discovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Admit C then D as A and C prove solver start, while B waits."""
+    """Release solvers immediately while paced fresh cases retain admission."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=5,
@@ -1600,6 +1736,7 @@ def test_solver_start_releases_slots_for_progressive_discovery(
         _admission_view(tasks[3], "never_started"),
         _admission_view(tasks[4], "never_started"),
     ]
+    clock = {"value": datetime(2026, 1, 1, tzinfo=timezone.utc)}
     manifest = {
         "campaign_run_id": "progressive__0123456789abcdef",
         "git_commit": "c" * 40,
@@ -1607,34 +1744,109 @@ def test_solver_start_releases_slots_for_progressive_discovery(
             "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
-        "submissions": [],
+        "submissions": [
+            {
+                "submission_index": 1,
+                "mode": "license_retry",
+                "status": "submitted",
+                "recorded_at": clock["value"].isoformat(),
+                "case": {
+                    "batch_id": tasks[0].batch_id,
+                    "case_index": tasks[0].case_index,
+                    "case_id": tasks[0].case_id,
+                },
+            }
+        ],
+        "admission_reservations": [],
         "state": "active",
     }
     submitted: list[str] = []
+
+    def clock_text() -> str:
+        return clock["value"].isoformat()
+
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "c" * 40)
+    monkeypatch.setattr(generation.campaign, "_utc_now", clock_text)
     monkeypatch.setattr(
         generation.campaign.common.serialization,
         "atomic_write_json",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_one",
-        lambda payload, _campaign, task, **_kwargs: (submitted.append(task.case_id), payload)[1],
-    )
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: Any,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        submitted.append(task.case_id)
+        payload["submissions"].append(
+            {
+                "submission_index": len(payload["submissions"]) + 1,
+                "mode": mode,
+                "status": "submitted",
+                "recorded_at": clock["value"].isoformat(),
+                "case": {
+                    "batch_id": task.batch_id,
+                    "case_index": task.case_index,
+                    "case_id": task.case_id,
+                },
+            }
+        )
+        return payload
+
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
 
     generation.campaign._fill_submission_capacity(
         manifest, campaign, views, pending_jobs=0, running_jobs=1, scheduler={"active": {}}, storage_root=tmp_path
     )
+    assert submitted == []
+    assert [record["case_id"] for record in manifest["admission_reservations"]] == [tasks[2].case_id]
+    assert generation.campaign._unsubmitted_task_state(manifest, tasks[2], []) == (
+        "admission_waiting",
+        "license_launch_pacing",
+    )
+    views[2]["state"] = "admission_waiting"
+    assert generation.campaign._view_consumes_admission(views[2])
+    assert generation.campaign._admission_summary(manifest, views) == {
+        "count": 2,
+        "maximum": 2,
+        "components": {
+            "pending": 0,
+            "starting": 1,
+            "license_waiting": 1,
+            "retrying": 0,
+        },
+    }
+
+    clock["value"] += timedelta(seconds=10)
+    generation.campaign._fill_submission_capacity(
+        manifest, campaign, views, pending_jobs=0, running_jobs=1, scheduler={"active": {}}, storage_root=tmp_path
+    )
     assert submitted == [tasks[2].case_id]
+    assert manifest["admission_reservations"] == []
 
     views[2] = _admission_view(tasks[2], "active", solver_started=True)
     generation.campaign._fill_submission_capacity(
         manifest, campaign, views, pending_jobs=0, running_jobs=2, scheduler={"active": {}}, storage_root=tmp_path
     )
+    assert submitted == [tasks[2].case_id]
+    assert [record["case_id"] for record in manifest["admission_reservations"]] == [tasks[3].case_id]
+    views[3]["state"] = "admission_waiting"
+    assert generation.campaign._admission_summary(manifest, views)["count"] == 2
+
+    clock["value"] += timedelta(seconds=10)
+    generation.campaign._fill_submission_capacity(
+        manifest, campaign, views, pending_jobs=0, running_jobs=2, scheduler={"active": {}}, storage_root=tmp_path
+    )
     assert submitted == [tasks[2].case_id, tasks[3].case_id]
+    assert manifest["admission_reservations"] == []
 
     views[3] = _admission_view(tasks[3], "license_blocked")
     generation.campaign._fill_submission_capacity(
@@ -1648,6 +1860,37 @@ def test_solver_start_releases_slots_for_progressive_discovery(
         "license_waiting": 2,
         "retrying": 0,
     }
+
+
+def test_admission_reservations_are_exact_unsent_plan_members(
+    generation_config_factory: Any,
+) -> None:
+    """Reject foreign or already-submitted operational reservations."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=2,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    reservation = {
+        "batch_name": task.batch_name,
+        "batch_id": task.batch_id,
+        "case_index": task.case_index,
+        "case_id": task.case_id,
+    }
+    manifest = {"admission_reservations": [reservation], "submissions": []}
+
+    campaign_evidence._validate_admission_reservations_for_campaign(manifest, campaign)
+
+    foreign = deepcopy(manifest)
+    foreign["admission_reservations"][0]["case_id"] = "foreign_case"
+    with pytest.raises(ValueError, match="resolved plan member"):
+        campaign_evidence._validate_admission_reservations_for_campaign(foreign, campaign)
+
+    submitted = deepcopy(manifest)
+    submitted["submissions"] = [{"case": reservation}]
+    with pytest.raises(ValueError, match="submission history"):
+        campaign_evidence._validate_admission_reservations_for_campaign(submitted, campaign)
 
 
 def test_license_retry_activity_ends_at_common_solver_progress() -> None:
