@@ -1049,3 +1049,361 @@ def record_in_allocation_license_window(
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+_STATUS_RECOVERY_SCHEMA_KIND: Final = "generation_in_allocation_status_artifact_recovery"
+_STATUS_RECOVERY_SCHEMA_VERSION: Final = 1
+_STATUS_RECOVERY_DIRECTORY_NAME: Final = "license_status_recoveries"
+_STATUS_RECOVERY_FILENAME_PATTERN: Final = re.compile(r"checkout_(?P<index>[0-9]{4,})[.]json")
+_STATUS_RECOVERY_STATES: Final = frozenset({"pending", "complete"})
+_MAX_STATUS_RECOVERY_EXCERPT_BYTES: Final = 160
+_STATUS_RECOVERY_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "batch_id",
+        "case_id",
+        "work_unit_id",
+        "scientific_config_digest",
+        "slurm_job_id",
+        "checkout_index",
+        "hostname",
+        "process_id",
+        "process_exit_code",
+        "checkout_started_at",
+        "checkout_ended_at",
+        "prelaunch_checked_at",
+        "prelaunch_path_existed",
+        "status_relative_path",
+        "status_content_class",
+        "status_state",
+        "status_timestamp_milliseconds",
+        "status_size_bytes",
+        "status_sha256",
+        "status_excerpt",
+        "status_file_device",
+        "status_file_inode",
+        "status_file_user_id",
+        "status_file_modified_nanoseconds",
+        "temporary_capacity_classification",
+        "feature",
+        "error_code",
+        "license_evidence_sha256",
+        "solver_progress_started",
+        "required_exports_exist",
+        "scientific_result_exists",
+        "cleanup_state",
+        "recorded_at",
+        "cleanup_completed_at",
+    }
+)
+
+
+def in_allocation_status_recovery_directory(
+    campaign_run_id: str,
+    batch_id: str,
+    case_id: str,
+    job_id: str,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return one exact per-job status-artifact recovery directory."""
+    if _JOB_ID_PATTERN.fullmatch(job_id) is None:
+        message = "Status-artifact recovery requires one numeric Slurm job ID."
+        raise ValueError(message)
+    run_directory = campaign_evidence.campaign_run_directory(
+        campaign_run_id,
+        storage_root=storage_root,
+    )
+    safe_batch = common.paths.validate_logical_name(batch_id, label="batch_id")
+    safe_case = common.paths.validate_logical_name(case_id, label="case_id")
+    return run_directory / _STATUS_RECOVERY_DIRECTORY_NAME / safe_batch / safe_case / job_id
+
+
+def _status_recovery_payload(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    job_id: str,
+    checkout_started_at: datetime,
+    checkout_ended_at: datetime,
+    hostname: str,
+    artifact: Any,
+    classification: TemporaryLicenseCapacityClassification,
+    cleanup_state: str,
+    recorded_at: str,
+    cleanup_completed_at: str | None,
+) -> dict[str, Any]:
+    """Return one exact bounded capacity status-artifact recovery receipt."""
+    case_id = config.case_id(case_index)
+    classification_identity = {
+        "classification": classification.classification,
+        "feature": classification.feature,
+        "error_code": classification.license_code,
+        "matched_signatures": list(classification.matched_signatures),
+    }
+    return {
+        "schema_kind": _STATUS_RECOVERY_SCHEMA_KIND,
+        "schema_version": _STATUS_RECOVERY_SCHEMA_VERSION,
+        "campaign_run_id": common.paths.validate_logical_name(campaign_run_id, label="campaign_run_id"),
+        "batch_id": config.batch_id,
+        "case_id": case_id,
+        "work_unit_id": f"{config.batch_id}/{case_id}",
+        "scientific_config_digest": config.scientific_config_digest,
+        "slurm_job_id": job_id,
+        "checkout_index": artifact.prelaunch.checkout_index,
+        "hostname": hostname,
+        "process_id": artifact.process_id,
+        "process_exit_code": artifact.process_exit_code,
+        "checkout_started_at": checkout_started_at.astimezone(timezone.utc).isoformat(),
+        "checkout_ended_at": checkout_ended_at.astimezone(timezone.utc).isoformat(),
+        "prelaunch_checked_at": artifact.prelaunch.checked_at,
+        "prelaunch_path_existed": False,
+        "status_relative_path": "solved.mph.status",
+        "status_content_class": "comsol_batch_status_timestamp_and_state",
+        "status_state": artifact.status_state,
+        "status_timestamp_milliseconds": artifact.status_timestamp_milliseconds,
+        "status_size_bytes": artifact.file_size_bytes,
+        "status_sha256": artifact.content_sha256,
+        "status_excerpt": artifact.content_excerpt,
+        "status_file_device": artifact.file_device,
+        "status_file_inode": artifact.file_inode,
+        "status_file_user_id": artifact.file_user_id,
+        "status_file_modified_nanoseconds": artifact.file_modified_nanoseconds,
+        "temporary_capacity_classification": classification.classification,
+        "feature": classification.feature,
+        "error_code": classification.license_code,
+        "license_evidence_sha256": common.serialization.canonical_json_sha256(classification_identity),
+        "solver_progress_started": False,
+        "required_exports_exist": False,
+        "scientific_result_exists": False,
+        "cleanup_state": cleanup_state,
+        "recorded_at": recorded_at,
+        "cleanup_completed_at": cleanup_completed_at,
+    }
+
+
+def _validate_status_recovery_payload(
+    payload: object,
+    *,
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    campaign_run_id: str,
+    job_id: str,
+    path: Path,
+) -> dict[str, Any]:
+    """Validate one exact schema-version-1 status-artifact recovery receipt."""
+    case_id = config.case_id(case_index)
+    if not isinstance(payload, dict) or set(payload) != _STATUS_RECOVERY_KEYS:
+        message = f"Status-artifact recovery receipt is malformed: {path}"
+        raise ValueError(message)
+    index = payload.get("checkout_index")
+    integer_fields = (
+        "process_id",
+        "status_timestamp_milliseconds",
+        "status_size_bytes",
+        "status_file_device",
+        "status_file_inode",
+        "status_file_user_id",
+        "status_file_modified_nanoseconds",
+    )
+    if (
+        payload.get("schema_kind") != _STATUS_RECOVERY_SCHEMA_KIND
+        or payload.get("schema_version") != _STATUS_RECOVERY_SCHEMA_VERSION
+        or payload.get("campaign_run_id") != campaign_run_id
+        or payload.get("batch_id") != config.batch_id
+        or payload.get("case_id") != case_id
+        or payload.get("work_unit_id") != f"{config.batch_id}/{case_id}"
+        or payload.get("scientific_config_digest") != config.scientific_config_digest
+        or payload.get("slurm_job_id") != job_id
+        or isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 1
+        or not isinstance(payload.get("hostname"), str)
+        or not payload["hostname"]
+        or any(isinstance(payload.get(key), bool) or not isinstance(payload.get(key), int) or int(payload[key]) < 0 for key in integer_fields)
+        or isinstance(payload.get("process_exit_code"), bool)
+        or not isinstance(payload.get("process_exit_code"), int)
+        or payload.get("prelaunch_path_existed") is not False
+        or payload.get("status_relative_path") != "solved.mph.status"
+        or payload.get("status_content_class") != "comsol_batch_status_timestamp_and_state"
+        or payload.get("status_state") not in {"Running", "Done", "Failed"}
+        or not isinstance(payload.get("status_excerpt"), str)
+        or len(payload["status_excerpt"].encode("utf-8")) > _MAX_STATUS_RECOVERY_EXCERPT_BYTES
+        or not isinstance(payload.get("status_sha256"), str)
+        or _SCIENTIFIC_DIGEST_PATTERN.fullmatch(payload["status_sha256"]) is None
+        or payload.get("temporary_capacity_classification") != TEMPORARY_LICENSE_CAPACITY
+        or not isinstance(payload.get("feature"), str)
+        or not payload["feature"]
+        or (payload.get("error_code") is not None and not isinstance(payload["error_code"], str))
+        or not isinstance(payload.get("license_evidence_sha256"), str)
+        or _SCIENTIFIC_DIGEST_PATTERN.fullmatch(payload["license_evidence_sha256"]) is None
+        or payload.get("solver_progress_started") is not False
+        or payload.get("required_exports_exist") is not False
+        or payload.get("scientific_result_exists") is not False
+        or payload.get("cleanup_state") not in _STATUS_RECOVERY_STATES
+    ):
+        message = f"Status-artifact recovery identity is malformed: {path}"
+        raise ValueError(message)
+    started = _parse_timestamp(payload.get("checkout_started_at"), label="status-recovery checkout start")
+    ended = _parse_timestamp(payload.get("checkout_ended_at"), label="status-recovery checkout end")
+    _parse_timestamp(payload.get("prelaunch_checked_at"), label="status-recovery prelaunch check")
+    _parse_timestamp(payload.get("recorded_at"), label="status-recovery record")
+    completed = payload.get("cleanup_completed_at")
+    if (
+        ended < started
+        or (payload["cleanup_state"] == "pending" and completed is not None)
+        or (payload["cleanup_state"] == "complete" and completed is None)
+    ):
+        message = f"Status-artifact recovery lifecycle is malformed: {path}"
+        raise ValueError(message)
+    if completed is not None:
+        _parse_timestamp(completed, label="status-recovery completion")
+    expected_name = f"checkout_{index:04d}.json"
+    if path.name != expected_name:
+        message = f"Status-artifact recovery filename is malformed: {path}"
+        raise ValueError(message)
+    return payload
+
+
+def record_in_allocation_status_artifact_recovery(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    job_id: str,
+    checkout_started_at: datetime,
+    checkout_ended_at: datetime,
+    hostname: str,
+    artifact: Any,
+    classification: TemporaryLicenseCapacityClassification,
+    cleanup_state: str,
+    storage_root: Path | str | None,
+) -> Path:
+    """Persist pending evidence before cleanup, then complete the same exact receipt."""
+    for label, value in (
+        ("checkout_started_at", checkout_started_at),
+        ("checkout_ended_at", checkout_ended_at),
+    ):
+        if value.tzinfo is None or value.utcoffset() is None:
+            message = f"Status-artifact recovery {label} must be timezone-aware."
+            raise ValueError(message)
+    if cleanup_state not in _STATUS_RECOVERY_STATES:
+        message = "Status-artifact recovery cleanup state must be pending or complete."
+        raise ValueError(message)
+    directory = in_allocation_status_recovery_directory(
+        campaign_run_id,
+        config.batch_id,
+        config.case_id(case_index),
+        job_id,
+        storage_root=storage_root,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        message = f"Status-artifact recovery directory is unsafe: {directory}"
+        raise ValueError(message)
+    path = directory / f"checkout_{artifact.prelaunch.checkout_index:04d}.json"
+    existing: dict[str, Any] | None = None
+    if path.exists():
+        if path.is_symlink() or not path.is_file():
+            message = f"Status-artifact recovery receipt is unsafe: {path}"
+            raise ValueError(message)
+        try:
+            raw_existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            message = f"Could not load status-artifact recovery receipt: {path}"
+            raise ValueError(message) from error
+        existing = _validate_status_recovery_payload(
+            raw_existing,
+            config=config,
+            case_index=case_index,
+            campaign_run_id=campaign_run_id,
+            job_id=job_id,
+            path=path,
+        )
+    if existing is None and cleanup_state == "complete":
+        message = "Status-artifact cleanup completion requires its prior pending receipt."
+        raise RuntimeError(message)
+    recorded_at = datetime.now(timezone.utc).isoformat() if existing is None else str(existing["recorded_at"])
+    payload = _status_recovery_payload(
+        config,
+        case_index,
+        campaign_run_id=campaign_run_id,
+        job_id=job_id,
+        checkout_started_at=checkout_started_at,
+        checkout_ended_at=checkout_ended_at,
+        hostname=hostname,
+        artifact=artifact,
+        classification=classification,
+        cleanup_state=cleanup_state,
+        recorded_at=recorded_at,
+        cleanup_completed_at=(datetime.now(timezone.utc).isoformat() if cleanup_state == "complete" else None),
+    )
+    if existing is not None:
+        comparable = dict(payload)
+        comparable["cleanup_state"] = existing["cleanup_state"]
+        comparable["cleanup_completed_at"] = existing["cleanup_completed_at"]
+        if comparable != existing:
+            message = f"Status-artifact recovery receipt conflicts with its exact checkout: {path}"
+            raise FileExistsError(message)
+        if existing["cleanup_state"] == "complete" or cleanup_state == "pending":
+            return path
+    common.serialization.atomic_write_json(path, payload)
+    _validate_status_recovery_payload(
+        payload,
+        config=config,
+        case_index=case_index,
+        campaign_run_id=campaign_run_id,
+        job_id=job_id,
+        path=path,
+    )
+    return path
+
+
+def load_in_allocation_status_artifact_recoveries(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    job_id: str,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Load every exact status-artifact recovery receipt for one Slurm job."""
+    directory = in_allocation_status_recovery_directory(
+        campaign_run_id,
+        config.batch_id,
+        config.case_id(case_index),
+        job_id,
+        storage_root=storage_root,
+    )
+    if not directory.exists():
+        return ()
+    if directory.is_symlink() or not directory.is_dir():
+        message = f"Status-artifact recovery directory is unsafe: {directory}"
+        raise ValueError(message)
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.iterdir(), key=lambda candidate: candidate.name):
+        match = _STATUS_RECOVERY_FILENAME_PATTERN.fullmatch(path.name)
+        if path.is_symlink() or not path.is_file() or match is None:
+            message = f"Status-artifact recovery directory contains an unsafe entry: {path}"
+            raise ValueError(message)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            message = f"Could not load status-artifact recovery receipt: {path}"
+            raise ValueError(message) from error
+        record = _validate_status_recovery_payload(
+            payload,
+            config=config,
+            case_index=case_index,
+            campaign_run_id=campaign_run_id,
+            job_id=job_id,
+            path=path,
+        )
+        if int(match.group("index")) != int(record["checkout_index"]):
+            message = f"Status-artifact recovery checkout identity is malformed: {path}"
+            raise ValueError(message)
+        records.append(record)
+    return tuple(records)

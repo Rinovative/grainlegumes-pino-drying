@@ -31,6 +31,8 @@ _MONITOR_RECORD_KIND = "campaign-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
 _MAX_ACTIONABLE_DETAILS = 20
+_MAX_RECENT_FAILURES = 3
+_MAX_OLDER_FAILURE_GROUPS = 8
 _MAX_REASON_CHARACTERS = 160
 _MAX_EVIDENCE_PATH_CHARACTERS = 80
 _FAILED_CASE_STATES = frozenset(
@@ -40,6 +42,7 @@ _FAILED_CASE_STATES = frozenset(
         "exports_failed",
         "conversion_failed",
         "publication_failed",
+        "case_reconciliation_failed",
     }
 )
 
@@ -276,6 +279,9 @@ def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
             window_parts.append(f"checkouts={checkouts}")
         if window_parts:
             lines.append(f"  {'  '.join(window_parts)}")
+    recovered = case.get("status_artifact_recovery_count")
+    if isinstance(recovered, int) and not isinstance(recovered, bool) and recovered > 0:
+        lines.append(f"  status_artifacts_recovered={recovered}")
     retry = case.get("temporary_license_retry")
     if isinstance(retry, dict):
         retry_parts = []
@@ -319,7 +325,21 @@ def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
     reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
     if reason is not None:
         lines.append(f'  reason="{reason}"')
-    evidence = _compact_evidence_path(case.get("evidence_path") or case.get("replay_evidence_path"))
+    reconciliation = case.get("case_reconciliation")
+    if isinstance(reconciliation, dict):
+        category = _bounded_text(
+            reconciliation.get("failure_category"),
+            maximum=_MAX_REASON_CHARACTERS,
+        )
+        parts = [] if category is None else [f"category={category}"]
+        parts.extend(
+            (
+                f"scientific_success_valid={str(reconciliation.get('scientific_success_valid') is True).lower()}",
+                f"admission_continues={str(reconciliation.get('admission_continues') is True).lower()}",
+            )
+        )
+        lines.append(f"  {'  '.join(parts)}")
+    evidence = _compact_evidence_path(case.get("case_reconciliation_evidence_path") or case.get("evidence_path") or case.get("replay_evidence_path"))
     if evidence is not None:
         lines.append(f"  evidence={evidence}")
     return lines
@@ -345,35 +365,102 @@ def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
         terminal.append(f"{moisture_name}={moisture:g} {moisture_unit}")
     if terminal:
         lines.append(f"  {'  '.join(terminal)}")
+    reconciliation = case.get("case_reconciliation")
+    if isinstance(reconciliation, dict):
+        category = _bounded_text(
+            reconciliation.get("failure_category"),
+            maximum=_MAX_REASON_CHARACTERS,
+        )
+        evidence = _compact_evidence_path(case.get("case_reconciliation_evidence_path"))
+        parts = []
+        if category is not None:
+            parts.append(f"presentation={category}")
+        parts.append(f"scientific_success_valid={str(reconciliation.get('scientific_success_valid') is True).lower()}")
+        parts.append(f"admission_continues={str(reconciliation.get('admission_continues') is True).lower()}")
+        if evidence is not None:
+            parts.append(f"evidence={evidence}")
+        lines.append(f"  {'  '.join(parts)}")
     return lines
 
 
-def _completion_timestamp(case: Mapping[str, Any]) -> datetime:
-    """Return one comparable completion time or the oldest possible value."""
-    value = case.get("completed_at")
+def _terminal_timestamp(
+    case: Mapping[str, Any],
+    *,
+    field: str,
+) -> datetime | None:
+    """Return one comparable aware terminal timestamp when safely usable."""
+    value = case.get(field)
     if not isinstance(value, str):
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
-def _recent_completed_cases(cases: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
-    """Return at most three newest completions with stable plan-order ties."""
+def _ordered_terminal_cases(
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    field: str,
+) -> tuple[Mapping[str, Any], ...]:
+    """Order usable timestamps newest-first, then stable campaign-plan order."""
     plan_ordered = sorted(
         enumerate(cases),
         key=lambda item: (item[0], str(item[1].get("case_id"))),
     )
-    newest_first = sorted(
-        plan_ordered,
-        key=lambda item: _completion_timestamp(item[1]),
-        reverse=True,
-    )
-    return tuple(case for _index, case in newest_first[:3])
+    projected = [(index, case, _terminal_timestamp(case, field=field)) for index, case in plan_ordered]
+    timestamped = [(index, case, timestamp) for index, case, timestamp in projected if timestamp is not None]
+    timestamped.sort(key=lambda item: item[2], reverse=True)
+    unavailable = [(index, case) for index, case, timestamp in projected if timestamp is None]
+    return tuple([case for _index, case, _timestamp in timestamped] + [case for _index, case in unavailable])
+
+
+def _recent_completed_cases(
+    cases: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    """Return at most three newest completions with deterministic fallback."""
+    return _ordered_terminal_cases(cases, field="completed_at")[:3]
+
+
+def _recent_and_older_failed_cases(
+    cases: Sequence[Mapping[str, Any]],
+) -> tuple[
+    tuple[Mapping[str, Any], ...],
+    tuple[Mapping[str, Any], ...],
+]:
+    """Return latest-three terminal failures and the remaining population."""
+    ordered = _ordered_terminal_cases(cases, field="failed_at")
+    return ordered[:_MAX_RECENT_FAILURES], ordered[_MAX_RECENT_FAILURES:]
+
+
+def _normalized_failure_class(case: Mapping[str, Any]) -> str:
+    """Return one bounded stable failure category without raw diagnostics."""
+    state = _available_text(case.get("classified_state")) or _text(case.get("state"))
+    stage = _available_text(case.get("failure_stage"))
+    if state == "case_reconciliation_failed":
+        return state
+    if stage is None:
+        return state
+    return f"{stage}:{state}"
+
+
+def _older_failure_rows(cases: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Group all older failures by normalized classification with a hard bound."""
+    counts: dict[str, int] = {}
+    for case in cases:
+        classification = _normalized_failure_class(case)
+        counts[classification] = counts.get(classification, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: item[0])
+    visible = ordered[:_MAX_OLDER_FAILURE_GROUPS]
+    hidden_count = sum(count for _name, count in ordered[_MAX_OLDER_FAILURE_GROUPS:])
+    rows = [f"  {name}: {count}" for name, count in visible]
+    if hidden_count:
+        rows.append(f"  other_classifications: {hidden_count}")
+    rows.append(f"  total: {len(cases)}")
+    return rows
 
 
 def _case_inventory(status: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -506,11 +593,40 @@ def format_campaign_status_summary(
             f"license_waiting={_text(component_values.get('license_waiting'))}"
         ),
     ]
+    runnable_work_remains = any(
+        buckets[name]
+        for name in (
+            "running",
+            "scheduler_pending",
+            "license_blocked",
+            "admission_waiting",
+            "never_started",
+        )
+    ) or any(case.get("replay_eligible") is True for case in buckets["failed"])
+    if buckets["failed"] and runnable_work_remains:
+        lines.append(
+            f"Failures: {len(buckets['failed'])} terminal, continuing remaining "
+            "work  admission_blocked="
+            f"{str(status.get('admission_blocked') is True).lower()}"
+        )
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
     _actionable_section(lines, "Running cases", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
     _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
     _actionable_section(lines, "License-blocked cases", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
-    _actionable_section(lines, "Failed cases", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
+    recent_failed, older_failed = _recent_and_older_failed_cases(buckets["failed"])
+    _actionable_section(
+        lines,
+        (f"Recently failed cases (latest {len(recent_failed)} of {len(buckets['failed'])})"),
+        recent_failed,
+        maximum=None,
+        renderer=_failed_case_lines,
+    )
+    if older_failed:
+        _append_section(
+            lines,
+            f"Older failures ({len(older_failed)})",
+            _older_failure_rows(older_failed),
+        )
     recent_completed = _recent_completed_cases(buckets["successful"])
     _actionable_section(
         lines,

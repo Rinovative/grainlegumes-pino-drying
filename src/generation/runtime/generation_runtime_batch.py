@@ -74,6 +74,7 @@ _CASE_SUCCESS_SCHEMA_KIND: Final = "simulation_case_success"
 _CASE_ID_PATTERN: Final = re.compile(r"case_[0-9]{4,}")
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 _MAX_RETAINED_SOLVER_LOG_BYTES: Final = 1024 * 1024
+_CHECKOUT_TERMINATION_WAIT_SECONDS: Final = 5.0
 ValidationDepth = Literal["routine", "full", "deep"]
 _BATCH_MANIFEST_KEYS: Final = frozenset(
     {
@@ -240,6 +241,14 @@ class CaseCleanupError(RuntimeError):
     """Report cleanup failure after persistent outcome evidence exists."""
 
 
+class CaseLocalReplayError(RuntimeError):
+    """Report a replay defect after durable case-local evidence is complete."""
+
+
+class ReplayIntegrityError(RuntimeError):
+    """Report a replay path or identity violation that remains campaign-global."""
+
+
 class CaseInterruptedError(InterruptedError):
     """Report cooperative campaign cancellation with solver evidence."""
 
@@ -322,14 +331,18 @@ def _unregister_solver(process: subprocess.Popen[str]) -> None:
 
 
 def _terminate_solver_and_wait(process: subprocess.Popen[str]) -> int:
-    """TERM then KILL one solver group and return its final status."""
+    """TERM then KILL one solver group within two bounded waits."""
     _signal_solver_termination(process)
     try:
-        return process.wait(timeout=5.0)
+        return process.wait(timeout=_CHECKOUT_TERMINATION_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        return process.wait()
+    try:
+        return process.wait(timeout=_CHECKOUT_TERMINATION_WAIT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        message = f"Owned COMSOL process did not exit after bounded TERM and KILL waits: pid={process.pid}"
+        raise RuntimeError(message) from error
 
 
 def _create_runtime_progress_reporter(
@@ -1303,13 +1316,9 @@ def _assert_capacity_retry_workspace_is_clean(
     prepared: PreparedCase,
     solved_models_before: Mapping[str, _SolvedModelInventoryEntry],
 ) -> None:
-    """Fail closed unless only owned startup logs need resetting for another checkout."""
+    """Fail closed unless a capacity-only checkout changed no scientific artifacts."""
     if _solved_model_inventory(prepared.work_directory) != solved_models_before:
         message = "Temporary-capacity checkout changed solved-model artifacts before retry."
-        raise CaseExecutionError(message, work_directory=prepared.work_directory)
-    status_path = stop_service.derive_stop_status_path(prepared.work_directory)
-    if status_path.exists():
-        message = "Temporary-capacity checkout left a COMSOL status file before retry."
         raise CaseExecutionError(message, work_directory=prepared.work_directory)
     export_root = prepared.work_directory / str(config.scientific_values["output_contract"]["exports_root"])
     if export_root.exists() and (export_root.is_symlink() or not export_root.is_dir() or any(export_root.iterdir())):
@@ -1421,6 +1430,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     checkout_summaries: list[license_service.InAllocationLicenseCheckoutSummary] = []
     in_allocation_license_window_seconds = 0.0
     in_allocation_pause_seconds = 0.0
+    status_artifact_recovery_count = 0
     process: subprocess.Popen[str] | None = None
     stop_result: stop_service.StopResult | None = None
     timed_out = False
@@ -1457,6 +1467,14 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         attempt_started_monotonic = time.monotonic()
         started_at = attempt_started_at.isoformat()
         monotonic_start = attempt_started_monotonic
+        status_prelaunch = (
+            stop_service.prepare_capacity_checkout_status(
+                prepared.work_directory,
+                checkout_index=len(checkout_summaries) + 1,
+            )
+            if in_allocation_enabled
+            else None
+        )
         with (
             stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
             stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
@@ -1608,18 +1626,9 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         solver_started = license_service.solver_progress_started(captured_solver_text)
         expected_exports_exist = _expected_exports_exist(config, prepared.work_directory)
         if license_evidence is not None and not solver_started and not expected_exports_exist:
-            checkout_summaries.append(
-                license_service.InAllocationLicenseCheckoutSummary(
-                    checkout_index=len(checkout_summaries) + 1,
-                    started_at=attempt_started_at,
-                    ended_at=datetime.now(timezone.utc),
-                    started_monotonic_seconds=attempt_started_monotonic,
-                    ended_monotonic_seconds=time.monotonic(),
-                    process_exit_code=exit_code,
-                    classification=license_evidence,
-                    solver_progress_started=False,
-                )
-            )
+            attempt_ended_at = datetime.now(timezone.utc)
+            attempt_ended_monotonic = time.monotonic()
+            checkout_index = len(checkout_summaries) + 1
             if not in_allocation_enabled:
                 message = f"COMSOL could not obtain temporary floating-license capacity for {license_evidence.feature!r}."
                 raise license_service.TemporaryLicenseCapacityError(
@@ -1630,6 +1639,65 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                     evidence=license_evidence,
                 )
             _assert_capacity_retry_workspace_is_clean(config, prepared, solved_models_before)
+            if process is None or status_prelaunch is None:
+                message = "Capacity-checkout status ownership lacks its exact process or prelaunch evidence."
+                raise RuntimeError(message)
+            completed_exit_code = process.poll()
+            artifact = stop_service.inspect_capacity_checkout_status(
+                status_prelaunch,
+                process_id=process.pid,
+                process_exit_code=completed_exit_code,
+                temporary_capacity_classified=True,
+                solver_progress_started=False,
+                required_exports_exist=False,
+                scientific_result_exists=False,
+            )
+            if artifact is not None:
+                campaign_run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID")
+                job_id = os.environ.get("SLURM_JOB_ID")
+                if campaign_run_id is None or job_id is None:
+                    message = "Capacity status-artifact recovery requires campaign and Slurm identity."
+                    raise RuntimeError(message)
+                license_service.record_in_allocation_status_artifact_recovery(
+                    config,
+                    int(prepared.bundle.case_payload["case_index"]),
+                    campaign_run_id=campaign_run_id,
+                    job_id=job_id,
+                    checkout_started_at=attempt_started_at,
+                    checkout_ended_at=attempt_ended_at,
+                    hostname=hostname,
+                    artifact=artifact,
+                    classification=license_evidence,
+                    cleanup_state="pending",
+                    storage_root=prepared.storage_root,
+                )
+                stop_service.remove_capacity_checkout_status(artifact)
+                license_service.record_in_allocation_status_artifact_recovery(
+                    config,
+                    int(prepared.bundle.case_payload["case_index"]),
+                    campaign_run_id=campaign_run_id,
+                    job_id=job_id,
+                    checkout_started_at=attempt_started_at,
+                    checkout_ended_at=attempt_ended_at,
+                    hostname=hostname,
+                    artifact=artifact,
+                    classification=license_evidence,
+                    cleanup_state="complete",
+                    storage_root=prepared.storage_root,
+                )
+                status_artifact_recovery_count += 1
+            checkout_summaries.append(
+                license_service.InAllocationLicenseCheckoutSummary(
+                    checkout_index=checkout_index,
+                    started_at=attempt_started_at,
+                    ended_at=attempt_ended_at,
+                    started_monotonic_seconds=attempt_started_monotonic,
+                    ended_monotonic_seconds=attempt_ended_monotonic,
+                    process_exit_code=exit_code,
+                    classification=license_evidence,
+                    solver_progress_started=False,
+                )
+            )
             if window_deadline is None:
                 message = "Enabled in-allocation retry requires a monotonic deadline."
                 raise RuntimeError(message)
@@ -1818,6 +1886,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             "in_allocation_license_window_seconds": in_allocation_license_window_seconds,
             "in_allocation_capacity_pause_seconds": in_allocation_pause_seconds,
             "in_allocation_checkout_attempt_count": len(checkout_summaries),
+            "status_artifact_recovery_count": status_artifact_recovery_count,
             "export_conversion_s": export_conversion_seconds,
             "export_conversion_seconds": export_conversion_seconds,
             "complete_execution_s": time.monotonic() - monotonic_start,
@@ -3424,11 +3493,17 @@ def _copy_replay_payload(
             message = f"Replay artifact path is unsafe: {retained_relative}"
             raise ValueError(message)
         source = attempt.directory / relative
+        if source.is_symlink():
+            message = f"Replay artifact source is a symbolic link: {source}"
+            raise ReplayIntegrityError(message)
+        if not source.is_file():
+            message = f"Replay-required artifact is missing: {source}"
+            raise FileNotFoundError(message)
         destination_relative = Path(*relative.parts[1:])
         destination = prepared.work_directory / destination_relative
         if not destination.absolute().is_relative_to(prepared.work_directory.absolute()):
             message = f"Replay artifact escaped the prepared workspace: {destination}"
-            raise ValueError(message)
+            raise ReplayIntegrityError(message)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         identity = inventory[retained_relative]
@@ -3439,7 +3514,7 @@ def _copy_replay_payload(
             or common.serialization.file_sha256(destination) != identity["sha256"]
         ):
             message = f"Replay artifact changed during restoration: {destination}"
-            raise RuntimeError(message)
+            raise ReplayIntegrityError(message)
 
 
 def _replayed_canonical_case(
@@ -3668,6 +3743,8 @@ def replay_case_postprocessing(
             )
             publication_complete = True
         except BaseException as error:
+            if isinstance(error, (ReplayIntegrityError, FileExistsError)):
+                raise
             recorded_failure = _record_replay_failure(
                 config,
                 case_index,
@@ -3684,7 +3761,10 @@ def replay_case_postprocessing(
                 time_contract_sha256=replay_status["identities"]["time_contract_sha256"],
                 error=error,
             )
-            raise
+            if not isinstance(error, Exception):
+                raise
+            message = f"Case-local postprocessing replay failed: {error}"
+            raise CaseLocalReplayError(message) from error
         else:
             try:
                 attempt_service.record_replay_success(

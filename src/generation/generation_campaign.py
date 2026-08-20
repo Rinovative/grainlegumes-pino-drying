@@ -17,11 +17,13 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -76,6 +78,63 @@ _REGIME_JOB_CODES: Final = {
     "extreme_family_ood": "stress",
     "none": "none",
 }
+_TERMINAL_TIMESTAMP_OWNER: Final = "generation_campaign.terminal_timestamp_normalization.v1"
+_CASE_RECONCILIATION_OWNER: Final = "generation_campaign.case_reconciliation.v1"
+_MAX_RECONCILIATION_REASON_CHARACTERS: Final = 512
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalTimestampProjection:
+    """Preserve one raw terminal timestamp and an optional safe UTC projection."""
+
+    original_value: str | None
+    source_timezone: str | None
+    normalized_utc_value: str | None
+    normalization_owner: str
+    normalization_reason: str
+
+    @property
+    def completed_at(self) -> str | None:
+        """Return the usable presentation timestamp, if one is proven."""
+        return self.normalized_utc_value
+
+    def evidence(self) -> dict[str, str | None]:
+        """Return compact operational normalization evidence."""
+        return {
+            "original_value": self.original_value,
+            "source_timezone": self.source_timezone,
+            "normalized_utc_value": self.normalized_utc_value,
+            "normalization_owner": self.normalization_owner,
+            "normalization_reason": self.normalization_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedCaseAttempt:
+    """Bind one attempt to its current or historical replay role."""
+
+    attempt: attempt_service.AttemptEvidence
+    historical: bool
+
+
+class CaseLocalReconciliationError(RuntimeError):
+    """Describe one deterministic case-local defect safe to isolate."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        scientific_success_valid: bool,
+        source_path: Path | None,
+        source_sha256: str | None,
+    ) -> None:
+        """Initialize one bounded case-local reconciliation failure."""
+        super().__init__(message)
+        self.category = category
+        self.scientific_success_valid = scientific_success_valid
+        self.source_path = source_path
+        self.source_sha256 = source_sha256
 
 
 def _utc_now() -> str:
@@ -541,6 +600,18 @@ def _task_submissions(
     return tuple(record for record in manifest["submissions"] if record["case"] == expected)
 
 
+def _require_unambiguous_active_task_ownership(
+    task: cluster_service.CampaignTask,
+    active_records: Sequence[Mapping[str, Any]],
+) -> None:
+    """Reject more than one active Slurm submission for one exact case."""
+    if len(active_records) <= 1:
+        return
+    job_ids = sorted(str(record["job_id"]) for record in active_records)
+    message = f"Conflicting active Slurm submission ownership for {task.batch_id}/{task.case_id}: {job_ids}"
+    raise RuntimeError(message)
+
+
 def _scheduler_state(value: str) -> str:
     """Normalize one Slurm state token without its optional suffix."""
     return value.split("+", maxsplit=1)[0].split(maxsplit=1)[0]
@@ -637,7 +708,7 @@ def _admitted_case_attempt(
     task: cluster_service.CampaignTask,
     *,
     storage_root: Path | str | None,
-) -> attempt_service.AttemptEvidence | None:
+) -> AdmittedCaseAttempt | None:
     """Return the newest attempt after exact campaign and case identity checks."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     current_run_id = str(manifest["campaign_run_id"])
@@ -654,9 +725,11 @@ def _admitted_case_attempt(
             task.case_index,
             storage_root=storage,
         )
-        if candidate is None or candidate.payload["campaign_run_id"] == current_run_id:
-            return None
-        if candidate.payload["failure_stage"] not in {"conversion", "publication"}:
+        if (
+            candidate is None
+            or candidate.payload["campaign_run_id"] == current_run_id
+            or candidate.payload["failure_stage"] not in {"conversion", "publication"}
+        ):
             return None
         attempt = candidate
         historical = True
@@ -699,7 +772,69 @@ def _admitted_case_attempt(
     ):
         message = f"Attempt evidence disagrees with its persisted campaign case: {attempt.receipt_path}"
         raise RuntimeError(message)
-    return attempt
+    return AdmittedCaseAttempt(
+        attempt=attempt,
+        historical=historical,
+    )
+
+
+def _successful_status_path(
+    batch: config_service.GenerationConfig,
+    task: cluster_service.CampaignTask,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return the already-validated processed status used for presentation."""
+    return (
+        batch_runtime.processed_case_directory(
+            batch,
+            task.case_index,
+            storage_root=storage_root,
+        )
+        / "status.json"
+    )
+
+
+def _empty_successful_status_summary() -> dict[str, Any]:
+    """Return presentation defaults that do not own scientific success."""
+    return {
+        "quality_flag_count": 0,
+        "simulated_end_time": None,
+        "simulated_end_time_unit": None,
+        "final_moisture_name": None,
+        "final_moisture_value": None,
+        "final_moisture_unit": None,
+    }
+
+
+def _optional_presentation_float(value: object) -> float | None:
+    """Return one display-only numeric value without raising on huge integers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        return None
+
+
+def _successful_status_reconciliation_error(
+    task: cluster_service.CampaignTask,
+    status_path: Path,
+    message: str,
+) -> CaseLocalReconciliationError:
+    """Bind one presentation-only defect to the exact source bytes."""
+    try:
+        source_sha256 = hashlib.sha256(status_path.read_bytes()).hexdigest()
+    except OSError as error:
+        detail = f"Could not bind processed status bytes: {status_path}"
+        raise RuntimeError(detail) from error
+    return CaseLocalReconciliationError(
+        f"Successful-case presentation metadata is unusable for {task.case_id}: {message}",
+        category="successful_case_presentation_metadata",
+        scientific_success_valid=True,
+        source_path=status_path,
+        source_sha256=source_sha256,
+    )
 
 
 def _successful_status_summary(
@@ -708,49 +843,50 @@ def _successful_status_summary(
     *,
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
-    """Return compact terminal fields from the already-consumed case status."""
-    status_path = (
-        batch_runtime.processed_case_directory(
-            batch,
-            task.case_index,
-            storage_root=storage_root,
+    """Return compact fields without letting presentation metadata own success."""
+    status_path = _successful_status_path(
+        batch,
+        task,
+        storage_root=storage_root,
+    )
+    if not status_path.exists():
+        return _empty_successful_status_summary()
+    if status_path.is_symlink() or not status_path.is_file():
+        message = f"Processed case status path is unsafe: {status_path}"
+        raise RuntimeError(message)
+    try:
+        status = campaign_evidence.load_json_object(
+            status_path,
+            label="processed case status",
         )
-        / "status.json"
-    )
-    if not status_path.is_file():
-        return {
-            "quality_flag_count": 0,
-            "simulated_end_time": None,
-            "simulated_end_time_unit": None,
-            "final_moisture_name": None,
-            "final_moisture_value": None,
-            "final_moisture_unit": None,
-        }
-    status = campaign_evidence.load_json_object(
-        status_path,
-        label="processed case status",
-    )
+    except (TypeError, ValueError) as error:
+        raise _successful_status_reconciliation_error(
+            task,
+            status_path,
+            str(error),
+        ) from error
     count = status.get("quality_flag_count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        message = f"Processed case quality-flag count is malformed: {status_path}"
-        raise ValueError(message)
+        raise _successful_status_reconciliation_error(
+            task,
+            status_path,
+            "malformed quality-flag count",
+        )
     units = status.get("units")
     unit_values = units if isinstance(units, dict) else {}
-    simulated_end = status.get("t_stop_exact")
+    simulated_end_value = _optional_presentation_float(status.get("t_stop_exact"))
     simulated_end_unit = unit_values.get("t_stop_exact")
-    final_moisture = status.get("f_wet_dm_final")
+    final_moisture_value = _optional_presentation_float(status.get("f_wet_dm_final"))
     final_moisture_unit = unit_values.get("f_wet_dm_final")
-    simulated_end_value = float(simulated_end) if not isinstance(simulated_end, bool) and isinstance(simulated_end, (int, float)) else None
-    final_moisture_value = float(final_moisture) if not isinstance(final_moisture, bool) and isinstance(final_moisture, (int, float)) else None
     simulated_end_available = simulated_end_value is not None and isinstance(simulated_end_unit, str) and bool(simulated_end_unit)
     final_moisture_available = final_moisture_value is not None and isinstance(final_moisture_unit, str) and bool(final_moisture_unit)
     return {
         "quality_flag_count": count,
-        "simulated_end_time": simulated_end_value if simulated_end_available else None,
-        "simulated_end_time_unit": simulated_end_unit if simulated_end_available else None,
-        "final_moisture_name": "f_wet_dm_final" if final_moisture_available else None,
-        "final_moisture_value": final_moisture_value if final_moisture_available else None,
-        "final_moisture_unit": final_moisture_unit if final_moisture_available else None,
+        "simulated_end_time": (simulated_end_value if simulated_end_available else None),
+        "simulated_end_time_unit": (simulated_end_unit if simulated_end_available else None),
+        "final_moisture_name": ("f_wet_dm_final" if final_moisture_available else None),
+        "final_moisture_value": (final_moisture_value if final_moisture_available else None),
+        "final_moisture_unit": (final_moisture_unit if final_moisture_available else None),
     }
 
 
@@ -816,20 +952,609 @@ def _license_retry_is_active(
     )
 
 
+def _terminal_timestamp_projection(
+    value: object,
+    *,
+    source_timezone: tzinfo | None,
+) -> TerminalTimestampProjection:
+    """Normalize one timestamp only when its timezone provenance is authoritative."""
+    original = value if isinstance(value, str) and value else None
+    if original is None:
+        return TerminalTimestampProjection(
+            original_value=None,
+            source_timezone=None,
+            normalized_utc_value=None,
+            normalization_owner=_TERMINAL_TIMESTAMP_OWNER,
+            normalization_reason="terminal_timestamp_unavailable",
+        )
+    try:
+        parsed = datetime.fromisoformat(original.replace("Z", "+00:00"))
+    except ValueError:
+        return TerminalTimestampProjection(
+            original_value=original,
+            source_timezone=None,
+            normalized_utc_value=None,
+            normalization_owner=_TERMINAL_TIMESTAMP_OWNER,
+            normalization_reason="terminal_timestamp_ambiguous_for_presentation",
+        )
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        return TerminalTimestampProjection(
+            original_value=original,
+            source_timezone="embedded_offset",
+            normalized_utc_value=parsed.astimezone(timezone.utc).isoformat(),
+            normalization_owner=_TERMINAL_TIMESTAMP_OWNER,
+            normalization_reason="terminal_timestamp_timezone_aware",
+        )
+    if source_timezone is None:
+        return TerminalTimestampProjection(
+            original_value=original,
+            source_timezone=None,
+            normalized_utc_value=None,
+            normalization_owner=_TERMINAL_TIMESTAMP_OWNER,
+            normalization_reason="terminal_timestamp_ambiguous_for_presentation",
+        )
+    localized = parsed.replace(tzinfo=source_timezone)
+    if localized.utcoffset() is None:
+        message = "Authoritative terminal source timezone has no UTC offset."
+        raise ValueError(message)
+    return TerminalTimestampProjection(
+        original_value=original,
+        source_timezone=str(source_timezone),
+        normalized_utc_value=localized.astimezone(timezone.utc).isoformat(),
+        normalization_owner=_TERMINAL_TIMESTAMP_OWNER,
+        normalization_reason="terminal_timestamp_normalized",
+    )
+
+
 def _successful_completion_at(
     state: str,
     scheduler_view: Mapping[str, Any],
+) -> TerminalTimestampProjection:
+    """Project the external Slurm End field without owning scientific success."""
+    if state != "successful":
+        return _terminal_timestamp_projection(None, source_timezone=None)
+    return _terminal_timestamp_projection(
+        scheduler_view.get("end_time"),
+        source_timezone=None,
+    )
+
+
+_TERMINAL_TIMESTAMP_SCHEMA_KIND: Final = "generation_terminal_timestamp_projection"
+_TERMINAL_TIMESTAMP_SCHEMA_VERSION: Final = 1
+_TERMINAL_TIMESTAMP_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "batch_id",
+        "case_id",
+        "slurm_job_id",
+        "source_field",
+        "source_sha256",
+        "original_value",
+        "source_timezone",
+        "normalized_utc_value",
+        "normalization_owner",
+        "normalization_reason",
+        "recorded_at",
+    }
+)
+
+
+def _terminal_timestamp_evidence_path(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    job_id: str,
     *,
-    case_id: str,
-) -> str | None:
-    """Return the authoritative Slurm terminal time for one validated success."""
-    end_time = scheduler_view.get("end_time")
-    if state != "successful" or not isinstance(end_time, str):
+    storage_root: Path | str | None,
+) -> Path:
+    """Return one exact operational Slurm-End projection receipt path."""
+    if _JOB_ID_PATTERN.fullmatch(job_id) is None:
+        message = "Terminal timestamp evidence requires one numeric Slurm job ID."
+        raise ValueError(message)
+    run_directory = campaign_evidence.campaign_run_directory(
+        str(manifest["campaign_run_id"]),
+        storage_root=storage_root,
+    )
+    safe_batch = common.paths.validate_logical_name(task.batch_id, label="batch_id")
+    safe_case = common.paths.validate_logical_name(task.case_id, label="case_id")
+    return run_directory / "case_reconciliation" / safe_batch / safe_case / f"{job_id}.terminal_timestamp.json"
+
+
+def _validate_terminal_timestamp_evidence(
+    payload: object,
+    *,
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    job_id: str,
+    path: Path,
+) -> dict[str, Any]:
+    """Validate one exact schema-version-1 external timestamp projection."""
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _TERMINAL_TIMESTAMP_KEYS
+        or payload.get("schema_kind") != _TERMINAL_TIMESTAMP_SCHEMA_KIND
+        or payload.get("schema_version") != _TERMINAL_TIMESTAMP_SCHEMA_VERSION
+        or payload.get("campaign_run_id") != manifest["campaign_run_id"]
+        or payload.get("batch_id") != task.batch_id
+        or payload.get("case_id") != task.case_id
+        or payload.get("slurm_job_id") != job_id
+        or payload.get("source_field") != "sacct.End"
+        or not isinstance(payload.get("source_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["source_sha256"]) is None
+        or not isinstance(payload.get("original_value"), str)
+        or not payload["original_value"]
+        or payload.get("normalization_owner") != _TERMINAL_TIMESTAMP_OWNER
+        or payload.get("normalization_reason")
+        not in {
+            "terminal_timestamp_timezone_aware",
+            "terminal_timestamp_normalized",
+            "terminal_timestamp_ambiguous_for_presentation",
+        }
+        or (payload.get("source_timezone") is not None and not isinstance(payload["source_timezone"], str))
+        or (payload.get("normalized_utc_value") is not None and not isinstance(payload["normalized_utc_value"], str))
+    ):
+        message = f"Terminal timestamp projection evidence is malformed: {path}"
+        raise ValueError(message)
+    expected_digest = common.serialization.canonical_json_sha256(
+        {
+            "slurm_job_id": job_id,
+            "source_field": "sacct.End",
+            "original_value": payload["original_value"],
+        }
+    )
+    if payload["source_sha256"] != expected_digest:
+        message = f"Terminal timestamp source digest is malformed: {path}"
+        raise ValueError(message)
+    normalized = payload["normalized_utc_value"]
+    if normalized is not None:
+        _parse_utc_timestamp(
+            normalized,
+            label="Normalized terminal timestamp",
+        )
+    reason = payload["normalization_reason"]
+    if reason == "terminal_timestamp_ambiguous_for_presentation" and (
+        payload["source_timezone"] is not None or payload["normalized_utc_value"] is not None
+    ):
+        message = f"Ambiguous terminal timestamp evidence fabricated a timezone: {path}"
+        raise ValueError(message)
+    if reason == "terminal_timestamp_timezone_aware" and (payload["source_timezone"] != "embedded_offset" or payload["normalized_utc_value"] is None):
+        message = f"Timezone-aware terminal timestamp evidence is incomplete: {path}"
+        raise ValueError(message)
+    if reason == "terminal_timestamp_normalized" and (
+        payload["source_timezone"] is None or payload["source_timezone"] == "embedded_offset" or payload["normalized_utc_value"] is None
+    ):
+        message = f"Normalized terminal timestamp evidence lacks provenance: {path}"
+        raise ValueError(message)
+    _parse_utc_timestamp(
+        str(payload["recorded_at"]),
+        label="Terminal timestamp evidence record",
+    )
+    return payload
+
+
+def _load_terminal_timestamp_evidence(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    job_id: str,
+    *,
+    storage_root: Path | str | None,
+) -> dict[str, Any] | None:
+    """Load one existing external timestamp projection without scheduler I/O."""
+    path = _terminal_timestamp_evidence_path(
+        manifest,
+        task,
+        job_id,
+        storage_root=storage_root,
+    )
+    if not path.exists():
         return None
-    return _parse_utc_timestamp(
-        end_time,
-        label=f"Successful case terminal timestamp for {case_id}",
-    ).isoformat()
+    if path.is_symlink() or not path.is_file():
+        message = f"Terminal timestamp projection evidence is unsafe: {path}"
+        raise ValueError(message)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Could not load terminal timestamp projection evidence: {path}"
+        raise ValueError(message) from error
+    return _validate_terminal_timestamp_evidence(
+        payload,
+        manifest=manifest,
+        task=task,
+        job_id=job_id,
+        path=path,
+    )
+
+
+def _record_terminal_timestamp_evidence(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    job_id: str,
+    projection: TerminalTimestampProjection,
+    *,
+    storage_root: Path | str | None,
+) -> Path | None:
+    """Persist raw Slurm End and its non-scientific UTC projection."""
+    if projection.original_value is None:
+        return None
+    path = _terminal_timestamp_evidence_path(
+        manifest,
+        task,
+        job_id,
+        storage_root=storage_root,
+    )
+    payload = {
+        "schema_kind": _TERMINAL_TIMESTAMP_SCHEMA_KIND,
+        "schema_version": _TERMINAL_TIMESTAMP_SCHEMA_VERSION,
+        "campaign_run_id": manifest["campaign_run_id"],
+        "batch_id": task.batch_id,
+        "case_id": task.case_id,
+        "slurm_job_id": job_id,
+        "source_field": "sacct.End",
+        "source_sha256": common.serialization.canonical_json_sha256(
+            {
+                "slurm_job_id": job_id,
+                "source_field": "sacct.End",
+                "original_value": projection.original_value,
+            }
+        ),
+        **projection.evidence(),
+        "recorded_at": _utc_now(),
+    }
+    _validate_terminal_timestamp_evidence(
+        payload,
+        manifest=manifest,
+        task=task,
+        job_id=job_id,
+        path=path,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        message = f"Terminal timestamp projection directory is unsafe: {path.parent}"
+        raise ValueError(message)
+    if path.exists():
+        existing = _load_terminal_timestamp_evidence(
+            manifest,
+            task,
+            job_id,
+            storage_root=storage_root,
+        )
+        comparable = dict(payload)
+        comparable["recorded_at"] = None if existing is None else existing["recorded_at"]
+        if existing != comparable:
+            message = f"Terminal timestamp projection evidence conflicts: {path}"
+            raise FileExistsError(message)
+        return path
+    common.serialization.atomic_write_json(path, payload)
+    _validate_terminal_timestamp_evidence(
+        payload,
+        manifest=manifest,
+        task=task,
+        job_id=job_id,
+        path=path,
+    )
+    return path
+
+
+_CASE_RECONCILIATION_SCHEMA_KIND: Final = "generation_case_reconciliation"
+_CASE_RECONCILIATION_SCHEMA_VERSION: Final = 1
+_CASE_RECONCILIATION_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "batch_id",
+        "case_id",
+        "case_index",
+        "failure_category",
+        "scientific_success_valid",
+        "admission_continues",
+        "source_path",
+        "source_sha256",
+        "reconciliation_owner",
+        "reconciliation_dependency_sha256",
+        "resulting_state",
+        "reason",
+        "recorded_at",
+    }
+)
+
+
+def _case_reconciliation_dependency_sha256() -> str:
+    """Return the dependency-scoped identity for case-local classification."""
+    return common.serialization.canonical_json_sha256(
+        {
+            "owner": _CASE_RECONCILIATION_OWNER,
+            "schema_version": _CASE_RECONCILIATION_SCHEMA_VERSION,
+            "categories": ["successful_case_presentation_metadata"],
+            "states": ["successful", "case_reconciliation_failed"],
+        }
+    )
+
+
+def _case_reconciliation_source(
+    source_path: Path,
+    *,
+    storage_root: Path | str | None,
+) -> tuple[str, str]:
+    """Return one safe storage-relative source path and its exact byte digest."""
+    if source_path.is_symlink() or not source_path.is_file():
+        message = f"Case-local reconciliation source is unsafe: {source_path}"
+        raise RuntimeError(message)
+    storage = workspace_service.resolve_storage_root(
+        storage_root,
+        create=False,
+    ).resolve()
+    resolved = source_path.resolve()
+    try:
+        relative = resolved.relative_to(storage).as_posix()
+    except ValueError as error:
+        message = f"Case-local reconciliation source escaped storage: {source_path}"
+        raise RuntimeError(message) from error
+    try:
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    except OSError as error:
+        message = f"Could not bind case-local reconciliation source: {source_path}"
+        raise RuntimeError(message) from error
+    return relative, source_sha256
+
+
+def _case_reconciliation_evidence_path(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    source_sha256: str,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return a direct digest-keyed case-local reconciliation receipt path."""
+    if re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
+        message = "Case-local reconciliation requires one SHA-256 source identity."
+        raise ValueError(message)
+    run_directory = campaign_evidence.campaign_run_directory(
+        str(manifest["campaign_run_id"]),
+        storage_root=storage_root,
+    )
+    safe_batch = common.paths.validate_logical_name(task.batch_id, label="batch_id")
+    safe_case = common.paths.validate_logical_name(task.case_id, label="case_id")
+    dependency = _case_reconciliation_dependency_sha256()
+    return run_directory / "case_reconciliation_failures" / safe_batch / safe_case / f"{source_sha256}.{dependency}.json"
+
+
+def _case_reconciliation_payload(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    error: CaseLocalReconciliationError,
+    *,
+    source_path: str,
+    source_sha256: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """Build one bounded schema-version-1 case-local classification receipt."""
+    reason = " ".join(str(error).split())
+    if len(reason) > _MAX_RECONCILIATION_REASON_CHARACTERS:
+        reason = f"{reason[: _MAX_RECONCILIATION_REASON_CHARACTERS - 3].rstrip()}..."
+    resulting_state = "successful" if error.scientific_success_valid else "case_reconciliation_failed"
+    return {
+        "schema_kind": _CASE_RECONCILIATION_SCHEMA_KIND,
+        "schema_version": _CASE_RECONCILIATION_SCHEMA_VERSION,
+        "campaign_run_id": manifest["campaign_run_id"],
+        "batch_id": task.batch_id,
+        "case_id": task.case_id,
+        "case_index": task.case_index,
+        "failure_category": error.category,
+        "scientific_success_valid": error.scientific_success_valid,
+        "admission_continues": True,
+        "source_path": source_path,
+        "source_sha256": source_sha256,
+        "reconciliation_owner": _CASE_RECONCILIATION_OWNER,
+        "reconciliation_dependency_sha256": (_case_reconciliation_dependency_sha256()),
+        "resulting_state": resulting_state,
+        "reason": reason,
+        "recorded_at": recorded_at,
+    }
+
+
+def _validate_case_reconciliation_evidence(
+    payload: object,
+    *,
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    source_path: str,
+    source_sha256: str,
+    path: Path,
+) -> dict[str, Any]:
+    """Validate one exact case-local classification without hiding corruption."""
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _CASE_RECONCILIATION_KEYS
+        or payload.get("schema_kind") != _CASE_RECONCILIATION_SCHEMA_KIND
+        or payload.get("schema_version") != _CASE_RECONCILIATION_SCHEMA_VERSION
+        or payload.get("campaign_run_id") != manifest["campaign_run_id"]
+        or payload.get("batch_id") != task.batch_id
+        or payload.get("case_id") != task.case_id
+        or payload.get("case_index") != task.case_index
+        or payload.get("failure_category") != "successful_case_presentation_metadata"
+        or not isinstance(payload.get("scientific_success_valid"), bool)
+        or payload.get("admission_continues") is not True
+        or payload.get("source_path") != source_path
+        or payload.get("source_sha256") != source_sha256
+        or payload.get("reconciliation_owner") != _CASE_RECONCILIATION_OWNER
+        or payload.get("reconciliation_dependency_sha256") != _case_reconciliation_dependency_sha256()
+        or payload.get("resulting_state") not in {"successful", "case_reconciliation_failed"}
+        or not isinstance(payload.get("reason"), str)
+        or not payload["reason"]
+        or len(payload["reason"]) > _MAX_RECONCILIATION_REASON_CHARACTERS
+        or not isinstance(payload.get("recorded_at"), str)
+    ):
+        message = f"Case-local reconciliation evidence is malformed: {path}"
+        raise ValueError(message)
+    expected_state = "successful" if payload["scientific_success_valid"] else "case_reconciliation_failed"
+    if payload["resulting_state"] != expected_state:
+        message = f"Case-local reconciliation state is contradictory: {path}"
+        raise ValueError(message)
+    relative = Path(source_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        message = f"Case-local reconciliation source reference is unsafe: {path}"
+        raise ValueError(message)
+    _parse_utc_timestamp(
+        payload["recorded_at"],
+        label="Case-local reconciliation record",
+    )
+    return payload
+
+
+def _load_case_reconciliation_evidence(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    *,
+    source_path: str,
+    source_sha256: str,
+    storage_root: Path | str | None,
+) -> dict[str, Any] | None:
+    """Load one direct digest-keyed case-local receipt, if already recorded."""
+    path = _case_reconciliation_evidence_path(
+        manifest,
+        task,
+        source_sha256,
+        storage_root=storage_root,
+    )
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        message = f"Case-local reconciliation evidence is unsafe: {path}"
+        raise ValueError(message)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Could not load case-local reconciliation evidence: {path}"
+        raise ValueError(message) from error
+    return _validate_case_reconciliation_evidence(
+        payload,
+        manifest=manifest,
+        task=task,
+        source_path=source_path,
+        source_sha256=source_sha256,
+        path=path,
+    )
+
+
+def _record_case_reconciliation_evidence(
+    manifest: Mapping[str, Any],
+    task: cluster_service.CampaignTask,
+    error: CaseLocalReconciliationError,
+    *,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, Any], Path]:
+    """Persist one deterministic case-local receipt bound to unchanged bytes."""
+    if error.source_path is None or error.source_sha256 is None:
+        message = "Case-local reconciliation error lacks exact source evidence."
+        raise RuntimeError(message)
+    source_path, source_sha256 = _case_reconciliation_source(
+        error.source_path,
+        storage_root=storage_root,
+    )
+    if source_sha256 != error.source_sha256:
+        message = f"Case-local reconciliation source changed while it was classified: {error.source_path}"
+        raise RuntimeError(message)
+    path = _case_reconciliation_evidence_path(
+        manifest,
+        task,
+        source_sha256,
+        storage_root=storage_root,
+    )
+    payload = _case_reconciliation_payload(
+        manifest,
+        task,
+        error,
+        source_path=source_path,
+        source_sha256=source_sha256,
+        recorded_at=_utc_now(),
+    )
+    _validate_case_reconciliation_evidence(
+        payload,
+        manifest=manifest,
+        task=task,
+        source_path=source_path,
+        source_sha256=source_sha256,
+        path=path,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        message = f"Case-local reconciliation directory is unsafe: {path.parent}"
+        raise ValueError(message)
+    if path.exists():
+        existing = _load_case_reconciliation_evidence(
+            manifest,
+            task,
+            source_path=source_path,
+            source_sha256=source_sha256,
+            storage_root=storage_root,
+        )
+        if existing is None:
+            message = f"Case-local reconciliation evidence disappeared while loading: {path}"
+            raise RuntimeError(message)
+        comparable = dict(payload)
+        comparable["recorded_at"] = existing["recorded_at"]
+        if existing != comparable:
+            message = f"Case-local reconciliation evidence conflicts: {path}"
+            raise FileExistsError(message)
+        return existing, path
+    common.serialization.atomic_write_json(path, payload)
+    return payload, path
+
+
+def _matching_case_reconciliation_evidence(
+    manifest: Mapping[str, Any],
+    batch: config_service.GenerationConfig,
+    task: cluster_service.CampaignTask,
+    *,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, Any], Path] | None:
+    """Load the exact unchanged presentation defect without scanning storage."""
+    run_directory = campaign_evidence.campaign_run_directory(
+        str(manifest["campaign_run_id"]),
+        storage_root=storage_root,
+    )
+    receipt_directory = (
+        run_directory
+        / "case_reconciliation_failures"
+        / common.paths.validate_logical_name(task.batch_id, label="batch_id")
+        / common.paths.validate_logical_name(task.case_id, label="case_id")
+    )
+    if not receipt_directory.exists():
+        return None
+    if receipt_directory.is_symlink() or not receipt_directory.is_dir():
+        message = f"Case-local reconciliation directory is unsafe: {receipt_directory}"
+        raise ValueError(message)
+    source = _successful_status_path(
+        batch,
+        task,
+        storage_root=storage_root,
+    )
+    if not source.exists():
+        return None
+    source_path, source_sha256 = _case_reconciliation_source(
+        source,
+        storage_root=storage_root,
+    )
+    payload = _load_case_reconciliation_evidence(
+        manifest,
+        task,
+        source_path=source_path,
+        source_sha256=source_sha256,
+        storage_root=storage_root,
+    )
+    if payload is None:
+        return None
+    return (
+        payload,
+        _case_reconciliation_evidence_path(
+            manifest,
+            task,
+            source_sha256,
+            storage_root=storage_root,
+        ),
+    )
 
 
 def _unsubmitted_task_state(
@@ -845,7 +1570,7 @@ def _unsubmitted_task_state(
     return "never_started", "not_submitted"
 
 
-def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconciliation
+def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence reconciliation
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
     task: cluster_service.CampaignTask,
@@ -853,14 +1578,27 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
     *,
     storage_root: Path | str | None,
     compact_license_attempt_payloads: bool = False,
+    cached_case_reconciliation: tuple[Mapping[str, Any], Path | None] | None = None,
 ) -> dict[str, Any]:
     """Reconcile one case from processed, attempt, and exact scheduler evidence."""
     batch = campaign.batch(task.batch_name)
     submissions = _task_submissions(manifest, task)
     latest_submission = submissions[-1] if submissions else None
+    active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
+    _require_unambiguous_active_task_ownership(task, active_records)
+    unknown_records = [
+        record
+        for record in submissions
+        if record["status"] == "submitted" and record["job_id"] not in scheduler["active"] and record["job_id"] not in scheduler["accounted"]
+    ]
     retry_attempt: Mapping[str, Any] | None = None
     allocation_window: Mapping[str, Any] | None = None
     attempt: attempt_service.AttemptEvidence | None = None
+    admitted_attempt: AdmittedCaseAttempt | None = None
+    case_reconciliation = None if cached_case_reconciliation is None else cached_case_reconciliation[0]
+    case_reconciliation_evidence_path = (
+        None if cached_case_reconciliation is None or cached_case_reconciliation[1] is None else str(cached_case_reconciliation[1])
+    )
     pipeline = {
         "solver_state": "not_started",
         "exports_state": "not_started",
@@ -899,19 +1637,20 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
             "diagnostics_state": "complete",
             "publication_state": "succeeded",
         }
-        successful_status = _successful_status_summary(
-            batch,
-            task,
-            storage_root=storage_root,
-        )
+        if (
+            case_reconciliation is not None
+            and case_reconciliation.get("scientific_success_valid") is True
+            and case_reconciliation.get("resulting_state") == "successful"
+        ):
+            successful_status = _empty_successful_status_summary()
+        else:
+            successful_status = _successful_status_summary(
+                batch,
+                task,
+                storage_root=storage_root,
+            )
         quality_flag_count = int(successful_status["quality_flag_count"])
     else:
-        active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
-        unknown_records = [
-            record
-            for record in submissions
-            if record["status"] == "submitted" and record["job_id"] not in scheduler["active"] and record["job_id"] not in scheduler["accounted"]
-        ]
         latest_accounted = next(
             (scheduler["accounted"][record["job_id"]] for record in reversed(submissions) if record["job_id"] in scheduler["accounted"]),
             None,
@@ -951,12 +1690,15 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
                     message = f"Temporary-license retry timestamp is malformed for {task.case_id}."
                     raise TypeError(message)
                 license_next_retry_at = next_retry_at
-            attempt = _admitted_case_attempt(
+            admitted_attempt = _admitted_case_attempt(
                 manifest,
                 batch,
                 task,
                 storage_root=storage_root,
             )
+            if admitted_attempt is not None and admitted_attempt.historical and submissions:
+                admitted_attempt = None
+            attempt = None if admitted_attempt is None else admitted_attempt.attempt
             if attempt is not None:
                 state = str(attempt.payload["case_state"])
                 reason = str(attempt.payload["reason"])
@@ -1043,10 +1785,85 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
         latest_submission,
         runtime_progress,
     )
-    completed_at = _successful_completion_at(
+    completion_timestamp = _successful_completion_at(
         state,
         scheduler_view,
-        case_id=task.case_id,
+    )
+    terminal_timestamp_evidence_path: str | None = None
+    terminal_job_id = scheduler_view["latest_job_id"]
+    if state == "successful" and isinstance(terminal_job_id, str) and _JOB_ID_PATTERN.fullmatch(terminal_job_id) is not None:
+        if compact_license_attempt_payloads and completion_timestamp.original_value is not None:
+            recorded_path = _record_terminal_timestamp_evidence(
+                manifest,
+                task,
+                terminal_job_id,
+                completion_timestamp,
+                storage_root=storage_root,
+            )
+            terminal_timestamp_evidence_path = None if recorded_path is None else str(recorded_path)
+        existing_timestamp = _load_terminal_timestamp_evidence(
+            manifest,
+            task,
+            terminal_job_id,
+            storage_root=storage_root,
+        )
+        if existing_timestamp is not None:
+            if completion_timestamp.original_value is not None and existing_timestamp["original_value"] != completion_timestamp.original_value:
+                message = f"Terminal timestamp source changed for one completed Slurm job: {terminal_job_id}"
+                raise RuntimeError(message)
+            completion_timestamp = TerminalTimestampProjection(
+                original_value=str(existing_timestamp["original_value"]),
+                source_timezone=existing_timestamp["source_timezone"],
+                normalized_utc_value=existing_timestamp["normalized_utc_value"],
+                normalization_owner=str(existing_timestamp["normalization_owner"]),
+                normalization_reason=str(existing_timestamp["normalization_reason"]),
+            )
+            terminal_timestamp_evidence_path = str(
+                _terminal_timestamp_evidence_path(
+                    manifest,
+                    task,
+                    terminal_job_id,
+                    storage_root=storage_root,
+                )
+            )
+    status_artifact_recoveries = (
+        ()
+        if scheduler_view["latest_job_id"] is None
+        else license_service.load_in_allocation_status_artifact_recoveries(
+            batch,
+            task.case_index,
+            campaign_run_id=str(manifest["campaign_run_id"]),
+            job_id=str(scheduler_view["latest_job_id"]),
+            storage_root=storage_root,
+        )
+    )
+    failed_timestamp = _terminal_timestamp_projection(
+        (
+            attempt.payload.get("recorded_at")
+            if attempt is not None
+            and state
+            in {
+                "failed",
+                "timed_out",
+                "exports_failed",
+                "conversion_failed",
+                "publication_failed",
+            }
+            else scheduler_view.get("end_time")
+        ),
+        source_timezone=None,
+    )
+    failed_at = (
+        failed_timestamp.completed_at
+        if state
+        in {
+            "failed",
+            "timed_out",
+            "exports_failed",
+            "conversion_failed",
+            "publication_failed",
+        }
+        else None
     )
     return {
         **_task_payload(task),
@@ -1060,7 +1877,10 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
         "failure_stage": failure_stage,
         **pipeline,
         "quality_flag_count": quality_flag_count,
-        "completed_at": completed_at,
+        "completed_at": completion_timestamp.completed_at,
+        "terminal_timestamp": completion_timestamp.evidence(),
+        "terminal_timestamp_evidence_path": (terminal_timestamp_evidence_path),
+        "failed_at": failed_at,
         **successful_status,
         **replay,
         "canonical_raw_case": canonical_raw_case,
@@ -1068,14 +1888,26 @@ def _task_state(  # noqa: PLR0912, PLR0915 -- centralized case evidence reconcil
         "runtime_progress": runtime_progress,
         "temporary_license_retry": retry_attempt,
         "in_allocation_license_window": allocation_window,
+        "status_artifact_recoveries": list(status_artifact_recoveries),
+        "status_artifact_recovery_count": sum(record["cleanup_state"] == "complete" for record in status_artifact_recoveries),
         "license_retry_active": license_retry_active,
         "license_retry_eligible": license_retry_eligible,
         "license_wait_exhausted": license_wait_exhausted,
         "license_first_blocked_at": license_first_blocked_at,
         "license_next_retry_at": license_next_retry_at,
         "evidence_path": None if attempt is None else str(attempt.receipt_path),
+        "case_reconciliation": case_reconciliation,
+        "case_reconciliation_evidence_path": (case_reconciliation_evidence_path),
         "automatic_continuation_allowed": bool(
-            replay["replay_eligible"] or license_retry_eligible or state in {"admission_waiting", "never_started", "cancelled", "interrupted"}
+            replay["replay_eligible"]
+            or license_retry_eligible
+            or state
+            in {
+                "admission_waiting",
+                "never_started",
+                "cancelled",
+                "interrupted",
+            }
         ),
     }
 
@@ -1091,6 +1923,87 @@ def _finalize_completed_batches(
             batch_runtime.finalize_batch(batch, storage_root=storage_root)
 
 
+def _case_reconciliation_failed_view(
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+    task: cluster_service.CampaignTask,
+    scheduler: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    evidence_path: Path | None,
+    *,
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Return one isolated lifecycle view while unrelated cases continue."""
+    batch = campaign.batch(task.batch_name)
+    submissions = _task_submissions(manifest, task)
+    latest_submission = submissions[-1] if submissions else None
+    active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
+    unknown_records = [
+        record
+        for record in submissions
+        if record["status"] == "submitted" and record["job_id"] not in scheduler["active"] and record["job_id"] not in scheduler["accounted"]
+    ]
+    _require_unambiguous_active_task_ownership(task, active_records)
+    if active_records:
+        active_state = _scheduler_state(scheduler["active"][active_records[-1]["job_id"]][1])
+        state = "pending" if active_state == _ACTIVE_PENDING_STATE else "active"
+    elif unknown_records:
+        state = "scheduler_unknown"
+    else:
+        state = str(evidence["resulting_state"])
+    scheduler_view = _task_scheduler_view(latest_submission, scheduler)
+    runtime_progress = _task_runtime_progress_view(
+        manifest,
+        task,
+        latest_job_id=scheduler_view["latest_job_id"],
+        storage_root=storage_root,
+    )
+    failure_stage = "reconciliation" if state == "case_reconciliation_failed" else None
+    pipeline = {
+        "solver_state": "unknown" if failure_stage is not None else "not_started",
+        "exports_state": "unknown" if failure_stage is not None else "not_started",
+        "conversion_state": "unknown" if failure_stage is not None else "not_started",
+        "diagnostics_state": "unknown" if failure_stage is not None else "not_started",
+        "publication_state": "unknown" if failure_stage is not None else "not_started",
+    }
+    timestamp = _terminal_timestamp_projection(None, source_timezone=None)
+    return {
+        **_task_payload(task),
+        "material": batch.material_family,
+        "requested_cores": int(campaign.execution_values["cluster"]["cores_per_case"]),
+        "state": state,
+        "reason": str(evidence["failure_category"]),
+        "submission_count": len(submissions),
+        "attempt_index": None,
+        "attempt_campaign_run_id": None,
+        "failure_stage": failure_stage,
+        **pipeline,
+        "quality_flag_count": 0,
+        "completed_at": None,
+        "terminal_timestamp": timestamp.evidence(),
+        "terminal_timestamp_evidence_path": None,
+        "failed_at": (str(evidence["recorded_at"]) if state == "case_reconciliation_failed" else None),
+        **_empty_successful_status_summary(),
+        **_postprocessing_replay_view(batch, failure_stage, None),
+        "canonical_raw_case": None,
+        **scheduler_view,
+        "runtime_progress": runtime_progress,
+        "temporary_license_retry": None,
+        "in_allocation_license_window": None,
+        "status_artifact_recoveries": [],
+        "status_artifact_recovery_count": 0,
+        "license_retry_active": False,
+        "license_retry_eligible": False,
+        "license_wait_exhausted": False,
+        "license_first_blocked_at": None,
+        "license_next_retry_at": None,
+        "evidence_path": None if evidence_path is None else str(evidence_path),
+        "case_reconciliation": dict(evidence),
+        "case_reconciliation_evidence_path": (None if evidence_path is None else str(evidence_path)),
+        "automatic_continuation_allowed": state in {"active", "pending", "scheduler_unknown"},
+    }
+
+
 def _reconciled(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -1099,18 +2012,87 @@ def _reconciled(
     storage_root: Path | str | None,
     compact_license_attempt_payloads: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Return task views plus exact pending/running counts for this campaign."""
-    task_views = [
-        _task_state(
+    """Reconcile every case while isolating only typed case-local defects."""
+    task_views: list[dict[str, Any]] = []
+    for task in cluster_service.campaign_tasks(campaign):
+        batch = campaign.batch(task.batch_name)
+        cached = _matching_case_reconciliation_evidence(
             manifest,
-            campaign,
+            batch,
             task,
-            scheduler,
             storage_root=storage_root,
-            compact_license_attempt_payloads=compact_license_attempt_payloads,
         )
-        for task in cluster_service.campaign_tasks(campaign)
-    ]
+        if cached is not None and cached[0]["resulting_state"] == "case_reconciliation_failed":
+            view = _case_reconciliation_failed_view(
+                manifest,
+                campaign,
+                task,
+                scheduler,
+                cached[0],
+                cached[1],
+                storage_root=storage_root,
+            )
+            task_views.append(view)
+            continue
+        try:
+            view = _task_state(
+                manifest,
+                campaign,
+                task,
+                scheduler,
+                storage_root=storage_root,
+                compact_license_attempt_payloads=(compact_license_attempt_payloads),
+                cached_case_reconciliation=cached,
+            )
+        except CaseLocalReconciliationError as error:
+            if error.source_path is None or error.source_sha256 is None:
+                message = f"Typed case-local reconciliation error lacks exact source evidence for {task.case_id}."
+                raise RuntimeError(message) from error
+            source_path, source_sha256 = _case_reconciliation_source(
+                error.source_path,
+                storage_root=storage_root,
+            )
+            if source_sha256 != error.source_sha256:
+                message = f"Case-local evidence changed during reconciliation for {task.case_id}."
+                raise RuntimeError(message) from error
+            if compact_license_attempt_payloads:
+                evidence, evidence_path = _record_case_reconciliation_evidence(
+                    manifest,
+                    task,
+                    error,
+                    storage_root=storage_root,
+                )
+            else:
+                evidence = _case_reconciliation_payload(
+                    manifest,
+                    task,
+                    error,
+                    source_path=source_path,
+                    source_sha256=source_sha256,
+                    recorded_at=_utc_now(),
+                )
+                evidence_path = None
+            if error.scientific_success_valid:
+                view = _task_state(
+                    manifest,
+                    campaign,
+                    task,
+                    scheduler,
+                    storage_root=storage_root,
+                    compact_license_attempt_payloads=(compact_license_attempt_payloads),
+                    cached_case_reconciliation=(evidence, evidence_path),
+                )
+            else:
+                view = _case_reconciliation_failed_view(
+                    manifest,
+                    campaign,
+                    task,
+                    scheduler,
+                    evidence,
+                    evidence_path,
+                    storage_root=storage_root,
+                )
+        task_views.append(view)
     reservation_keys = _admission_reservation_keys(manifest)
     waiting_keys = {_task_identity_key(view) for view in task_views if view["state"] == "admission_waiting"}
     if waiting_keys != reservation_keys:
@@ -1471,6 +2453,7 @@ def _failure_population_counts(
         "technical_runtime_timed_out": sum(view["state"] == "timed_out" and view.get("temporary_license_retry") is None for view in task_views),
         "conversion_failed": sum(view["state"] == "conversion_failed" for view in task_views),
         "publication_failed": sum(view["state"] == "publication_failed" for view in task_views),
+        "case_reconciliation_failed": sum(view["state"] == "case_reconciliation_failed" for view in task_views),
         "license_blocked": sum(view["state"] == "license_blocked" for view in task_views),
         "replay_blocked": sum(view.get("replay_blocked") is True for view in task_views),
     }
@@ -1864,7 +2847,10 @@ def resume_campaign(
                     source_campaign_run_id=str(replay_view["attempt_campaign_run_id"]),
                     storage_root=storage_root,
                 )
-            except Exception:  # noqa: BLE001 -- durable replay evidence owns diagnostics
+            except (
+                batch_runtime.CaseCleanupError,
+                batch_runtime.CaseLocalReplayError,
+            ):
                 replay_failed = True
                 continue
             if outcome.status in {"replayed", "skipped"}:
@@ -2076,6 +3062,7 @@ def _batch_status(
         "exports_failed": sum(view["state"] == "exports_failed" for view in selected),
         "conversion_failed": failure_counts["conversion_failed"],
         "publication_failed": failure_counts["publication_failed"],
+        "case_reconciliation_failed": failure_counts["case_reconciliation_failed"],
         "replay_blocked": failure_counts["replay_blocked"],
         "cancelled": sum(view["state"] == "cancelled" for view in selected),
         "interrupted": sum(view["state"] == "interrupted" for view in selected),
@@ -2096,7 +3083,12 @@ def _public_task_view(view: Mapping[str, Any]) -> dict[str, Any]:
         state = "running"
     elif classified_state == "pending":
         state = "scheduler_pending"
-    elif classified_state in {"successful", "license_blocked", "admission_waiting", "never_started"}:
+    elif classified_state in {
+        "successful",
+        "license_blocked",
+        "admission_waiting",
+        "never_started",
+    }:
         state = classified_state
     else:
         state = "failed"
@@ -2258,6 +3250,7 @@ def campaign_status(
         "exports_failed": sum(view["state"] == "exports_failed" for view in task_views),
         "conversion_failed": failure_counts["conversion_failed"],
         "publication_failed": failure_counts["publication_failed"],
+        "case_reconciliation_failed": failure_counts["case_reconciliation_failed"],
         "cancelled": sum(view["state"] == "cancelled" for view in task_views),
         "interrupted": sum(view["state"] == "interrupted" for view in task_views),
         "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in task_views),
@@ -2273,6 +3266,7 @@ def campaign_status(
         "exports_failed",
         "conversion_failed",
         "publication_failed",
+        "case_reconciliation_failed",
     }
     unresolved_cases = sum(view["state"] in unresolved_failure_states for view in task_views)
     unresolved_solver_failures = failure_counts["solver_failed"] + failure_counts["technical_runtime_timed_out"]
@@ -2373,6 +3367,7 @@ def campaign_status(
         "unsent_cases": count_states["never_started"],
         "unknown_cases": unknown_cases,
         "license_blocked_cases": count_states["license_blocked"],
+        "status_artifact_recovery_count": sum(int(view.get("status_artifact_recovery_count", 0)) for view in task_views),
         "admission": admission,
         "license_retry_eligible_cases": license_retry_eligible_cases,
         "postprocessing_replay_available_cases": replayable_cases,

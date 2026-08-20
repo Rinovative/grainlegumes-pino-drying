@@ -619,14 +619,14 @@ def test_attempt_from_another_campaign_is_not_current(
         only_batch=_natural_batch_name("steady_flow"),
     )
     storage = tmp_path / "campaign-scoped attempt storage"
-    old_run_id = "old-campaign__0123456789abcdef"
+    source_run_id = "source-campaign__0123456789abcdef"
     current_run_id = "current-campaign__0123456789abcdef"
     _record_synthetic_failure(
         config,
         storage,
         monkeypatch,
         git_commit="a" * 40,
-        execution_run_id=old_run_id,
+        execution_run_id=source_run_id,
     )
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
 
@@ -637,13 +637,13 @@ def test_attempt_from_another_campaign_is_not_current(
         execution_run_id=current_run_id,
         git_commit="a" * 40,
     )
-    old_attempt = generation.publication.attempt.latest_case_attempt(
+    source_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
-        old_run_id,
+        source_run_id,
         storage_root=storage,
     )
-    assert old_attempt is not None
+    assert source_attempt is not None
 
 
 @pytest.mark.integration
@@ -662,19 +662,19 @@ def test_attempt_history_is_append_only_across_failure_and_success(
         config_path,
         only_batch=_natural_batch_name("steady_flow"),
     )
-    old_run_id = "old-campaign__0123456789abcdef"
+    source_run_id = "source-campaign__0123456789abcdef"
     current_run_id = "current-campaign__0123456789abcdef"
     commit = "a" * 40
 
     failed_storage = tmp_path / "append-only failure storage"
-    old_path = _record_synthetic_failure(
+    source_path = _record_synthetic_failure(
         config,
         failed_storage,
         monkeypatch,
         git_commit=commit,
-        execution_run_id=old_run_id,
+        execution_run_id=source_run_id,
     )
-    old_bytes = old_path.read_bytes()
+    source_bytes = source_path.read_bytes()
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
     with monkeypatch.context() as scoped:
 
@@ -695,7 +695,7 @@ def test_attempt_history_is_append_only_across_failure_and_success(
                 storage_root=failed_storage,
                 work_root=tmp_path / "new failure work",
             )
-    assert old_path.read_bytes() == old_bytes
+    assert source_path.read_bytes() == source_bytes
     current_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
@@ -711,7 +711,7 @@ def test_attempt_history_is_append_only_across_failure_and_success(
         success_storage,
         monkeypatch,
         git_commit=commit,
-        execution_run_id=old_run_id,
+        execution_run_id=source_run_id,
     )
     success_bytes = success_path.read_bytes()
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)

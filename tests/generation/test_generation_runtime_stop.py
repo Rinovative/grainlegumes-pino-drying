@@ -1,3 +1,4 @@
+# ruff: noqa: PLR2004, S101, SLF001
 """Focused controlled-stop lifecycle and workspace-containment contracts."""
 
 from __future__ import annotations
@@ -6,10 +7,11 @@ import json
 import signal
 import subprocess
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from src.generation.runtime import generation_runtime_batch as batch_runtime
 from src.generation.runtime import generation_runtime_stop as stop_service
 
 if TYPE_CHECKING:
@@ -66,6 +68,41 @@ def _workspace(tmp_path: Path) -> Path:
     directory = tmp_path / "active-case"
     directory.mkdir()
     return directory
+
+
+def test_checkout_termination_uses_only_bounded_term_and_kill_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed if an owned checkout survives both bounded signal waits."""
+    wait_timeouts: list[float | None] = []
+    signals: list[signal.Signals] = []
+
+    class NeverExits:
+        pid = 8842
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> int:
+            if timeout is None:
+                pytest.fail("Checkout termination must never use an unbounded wait.")
+            wait_timeouts.append(timeout)
+            command = "comsol"
+            raise subprocess.TimeoutExpired(command, timeout)
+
+    def signal_group(process_group_id: int, value: signal.Signals) -> None:
+        assert process_group_id == NeverExits.pid
+        signals.append(value)
+
+    monkeypatch.setattr(batch_runtime.os, "killpg", signal_group)
+
+    with pytest.raises(RuntimeError, match="bounded TERM and KILL waits"):
+        batch_runtime._terminate_solver_and_wait(cast("subprocess.Popen[str]", NeverExits()))  # pyright: ignore[reportPrivateUsage]
+
+    assert wait_timeouts == [5.0, 5.0]
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_timeout_requests_stop_at_reserve_then_classifies_clean_controlled_exit(tmp_path: Path) -> None:
@@ -229,3 +266,164 @@ def test_non_utf8_status_content_is_preserved_and_classified(tmp_path: Path) -> 
     diagnostics = json.loads(str(caught.value).split(": ", maxsplit=1)[1])
     _require(diagnostics["actual_content_class"] == "invalid_utf8_bytes", "Binary status content was misclassified.")
     _require(diagnostics["actual_content_excerpt"] == original.hex(), "Binary status excerpt was not safely encoded.")
+
+
+def test_capacity_status_created_by_one_exited_checkout_is_removed_exactly(tmp_path: Path) -> None:
+    """Admit only the known small COMSOL status class and revalidate before unlink."""
+    work_directory = _workspace(tmp_path)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=2,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text("1787215759123\nFailed\n", encoding="utf-8")
+
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=9812,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+
+    assert artifact is not None
+    assert artifact.prelaunch.checkout_index == 2
+    assert artifact.status_state == "Failed"
+    assert artifact.status_timestamp_milliseconds == 1787215759123
+    assert artifact.file_size_bytes == status_path.stat().st_size
+    assert len(artifact.content_sha256) == 64
+    stop_service.remove_capacity_checkout_status(artifact)
+    assert not status_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"process_exit_code": None}, "checkout_process_may_still_be_alive"),
+        ({"temporary_capacity_classified": False}, "checkout_not_strongly_classified"),
+        ({"solver_progress_started": True}, "solver_progress_started"),
+        ({"required_exports_exist": True}, "required_exports_exist"),
+        ({"scientific_result_exists": True}, "scientific_result_exists"),
+    ],
+)
+def test_capacity_status_recovery_rejects_ambiguous_lifecycle(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    reason: str,
+) -> None:
+    """Do not clean a status artifact unless every capacity-only predicate holds."""
+    work_directory = _workspace(tmp_path)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=1,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text("1787215759123\nRunning\n", encoding="utf-8")
+    arguments: dict[str, Any] = {
+        "process_id": 9812,
+        "process_exit_code": 0,
+        "temporary_capacity_classified": True,
+        "solver_progress_started": False,
+        "required_exports_exist": False,
+        "scientific_result_exists": False,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(stop_service.UnsafeCapacityStatusArtifactError, match=reason):
+        stop_service.inspect_capacity_checkout_status(prelaunch, **arguments)
+
+    assert status_path.exists()
+
+
+def test_capacity_status_recovery_rejects_preexisting_unknown_and_changed_content(
+    tmp_path: Path,
+) -> None:
+    """Preserve status files that are pre-existing, unknown, or changed after admission."""
+    work_directory = _workspace(tmp_path)
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text("1787215759123\nFailed\n", encoding="utf-8")
+    with pytest.raises(
+        stop_service.UnsafeCapacityStatusArtifactError,
+        match="status_path_existed_before_checkout",
+    ):
+        stop_service.prepare_capacity_checkout_status(
+            work_directory,
+            checkout_index=1,
+        )
+
+    status_path.unlink()
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=1,
+    )
+    status_path.write_text("foreign marker\n", encoding="utf-8")
+    with pytest.raises(
+        stop_service.UnsafeCapacityStatusArtifactError,
+        match="unknown_capacity_status_content",
+    ):
+        stop_service.inspect_capacity_checkout_status(
+            prelaunch,
+            process_id=9812,
+            process_exit_code=0,
+            temporary_capacity_classified=True,
+            solver_progress_started=False,
+            required_exports_exist=False,
+            scientific_result_exists=False,
+        )
+    assert status_path.read_text(encoding="utf-8") == "foreign marker\n"
+
+    status_path.write_text("1787215759123\nDone\n", encoding="utf-8")
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=9812,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+    assert artifact is not None
+    status_path.write_text("1787215759124\nDone\n", encoding="utf-8")
+    with pytest.raises(
+        stop_service.UnsafeCapacityStatusArtifactError,
+        match=r"status_identity_changed_before_cleanup|status_content_changed_before_cleanup",
+    ):
+        stop_service.remove_capacity_checkout_status(artifact)
+    assert status_path.exists()
+
+
+def test_capacity_status_cleanup_failure_preserves_the_artifact(tmp_path: Path) -> None:
+    """Fail closed when the exact admitted unlink cannot be completed."""
+    work_directory = _workspace(tmp_path)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=1,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text("1787215759123\nFailed\n", encoding="utf-8")
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=9812,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+    assert artifact is not None
+
+    def fail_unlink(_path: Path) -> None:
+        message = "synthetic unlink denial"
+        raise PermissionError(message)
+
+    with pytest.raises(
+        stop_service.UnsafeCapacityStatusArtifactError,
+        match="status_cleanup_failed",
+    ):
+        stop_service.remove_capacity_checkout_status(
+            artifact,
+            unlink_status=fail_unlink,
+        )
+    assert status_path.exists()

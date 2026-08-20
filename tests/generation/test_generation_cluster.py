@@ -412,11 +412,11 @@ def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     task = cluster.campaign_tasks(campaign)[0]
     batch = campaign.batch(task.batch_name)
     storage = tmp_path / "stale campaign storage"
-    old_commit = "7" * 40
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", old_commit)
+    source_commit = "7" * 40
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", source_commit)
     monkeypatch.setenv(
         "GENERATION_CAMPAIGN_RUN_ID",
-        "old-campaign__0123456789abcdef",
+        "source-campaign__0123456789abcdef",
     )
     generation.cases.input_generation.generate_input_cases(
         batch,
@@ -426,10 +426,10 @@ def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     generation.runtime.record_case_failure(
         batch,
         task.case_index,
-        RuntimeError("old synthetic failure"),
+        RuntimeError("prior synthetic failure"),
         worker_slot=0,
         scheduler_kind="slurm",
-        allocated_node="node-old",
+        allocated_node="node-source",
         work_directory=None,
         storage_root=storage,
         scratch_cleanup_status="not_created",
@@ -565,7 +565,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         run_id,
         storage_root=storage,
     ).mkdir(parents=True)
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": run_id,
         "git_commit": commit,
         "slurm_job_ids": [],
@@ -979,7 +979,7 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
     run_id = f"failure-threshold-{maximum_failed_cases}__0123456789abcdef"
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
     run_directory.mkdir(parents=True)
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": run_id,
         "git_commit": commit,
         "slurm_job_ids": [],
@@ -1085,7 +1085,7 @@ def test_solver_failure_threshold_has_an_exact_exceeds_boundary(
     expected_tripped: bool,
 ) -> None:
     """Count only solver failures and trip strictly above the configured limit."""
-    views = [
+    views: list[dict[str, Any]] = [
         {
             "state": "failed",
             "failure_stage": "solver",
@@ -1102,6 +1102,7 @@ def test_solver_failure_threshold_has_an_exact_exceeds_boundary(
                 "failure_stage": "solver",
                 "temporary_license_retry": {"classification": "temporary_license_capacity"},
             },
+            {"state": "case_reconciliation_failed", "failure_stage": "reconciliation"},
         )
     )
 
@@ -1132,7 +1133,7 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
     commit = "e" * 40
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
     run_directory.mkdir(parents=True)
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": run_id,
         "git_commit": commit,
         "slurm_job_ids": [],
@@ -1201,7 +1202,7 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
         events.append("replay")
         replayed.append(batch.case_id(case_index))
         message = "deterministic replay failure"
-        raise ValueError(message)
+        raise generation.runtime.batch.CaseLocalReplayError(message)
 
     monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
     monkeypatch.setattr(generation.campaign.batch_runtime, "replay_case_postprocessing", fail_replay)
@@ -1212,6 +1213,27 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
     assert submitted == [tasks[2].case_id, tasks[3].case_id]
     assert replayed == [tasks[0].case_id, tasks[1].case_id]
     assert events == ["submit", "submit", "replay", "replay"]
+
+    def fail_integrity(*_args: Any, **_kwargs: Any) -> None:
+        message = "conflicting immutable publication hash"
+        raise generation.runtime.batch.ReplayIntegrityError(message)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            generation.campaign,
+            "_fill_submission_capacity",
+            lambda payload, *_args, **_kwargs: payload,
+        )
+        scoped.setattr(
+            generation.campaign.batch_runtime,
+            "replay_case_postprocessing",
+            fail_integrity,
+        )
+        with pytest.raises(
+            generation.runtime.batch.ReplayIntegrityError,
+            match="immutable publication hash",
+        ):
+            generation.campaign.resume_campaign(run_id, storage_root=tmp_path)
 
 
 def _admission_view(
@@ -1292,6 +1314,98 @@ def test_logical_admission_membership_is_lifecycle_owned(
     assert generation.campaign._view_consumes_admission(view) is expected
 
 
+@pytest.mark.parametrize("failure_count", [1, 3])
+def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_count: int,
+) -> None:
+    """Keep monitoring one active case and admit fresh cases below the budget."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=failure_count + 3,
+        max_admission_cases=2,
+        maximum_failed_cases=5,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    failed = [
+        {
+            **_admission_view(task, "failed"),
+            "failure_stage": "solver",
+            "temporary_license_retry": None,
+        }
+        for task in tasks[:failure_count]
+    ]
+    active = _admission_view(
+        tasks[failure_count],
+        "active",
+        solver_started=True,
+    )
+    fresh = [_admission_view(task, "never_started") for task in tasks[failure_count + 1 :]]
+    views = [*failed, active, *fresh]
+    manifest = {
+        "campaign_run_id": f"failure-continuation-{failure_count}__0123456789abcdef",
+        "git_commit": "e" * 40,
+        "slurm_job_ids": ["811"],
+        "submission_config": {
+            "max_admission_cases": 2,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
+        },
+        "submission_intent": None,
+        "admission_reservations": [],
+        "submissions": [],
+        "state": "active",
+    }
+    scheduler = _scheduler(active={"811": ["811", "RUNNING"]})
+    submitted: list[str] = []
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: cluster.CampaignTask,
+        *,
+        mode: str,
+        storage_root: Path | str | None,
+    ) -> dict[str, Any]:
+        del storage_root
+        assert mode == "initial"
+        submitted.append(task.case_id)
+        return payload
+
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "e" * 40)
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
+    monkeypatch.setattr(
+        generation.campaign.common.serialization,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: None,
+    )
+
+    advanced = generation.campaign._fill_submission_capacity(
+        manifest,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=1,
+        scheduler=scheduler,
+        storage_root=tmp_path,
+    )
+
+    assert advanced["state"] == "active"
+    assert submitted == [view["case_id"] for view in fresh]
+    assert scheduler["active"] == {"811": ["811", "RUNNING"]}
+    assert (
+        generation.campaign._solver_failure_threshold_exceeded(
+            views,
+            maximum_failed_cases=5,
+        )
+        is False
+    )
+
+
 def test_durable_submission_intent_counts_one_logical_case() -> None:
     """Count one unresolved intent without counting its job history."""
     view = {
@@ -1335,7 +1449,7 @@ def test_two_due_license_retries_submit_independently(
         view["license_next_retry_at"] = due
         view["license_first_blocked_at"] = due
         view["temporary_license_retry"]["next_retry_at"] = due
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": "two-retries__0123456789abcdef",
         "git_commit": "f" * 40,
         "submission_config": {
@@ -1422,7 +1536,7 @@ def test_shared_admission_limit_blocks_a_third_case(
         _admission_view(tasks[1], states[1]),
         _admission_view(tasks[2], "never_started"),
     ]
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": "full-admission__0123456789abcdef",
         "git_commit": "e" * 40,
         "submission_config": {
@@ -1436,12 +1550,18 @@ def test_shared_admission_limit_blocks_a_third_case(
         "state": "active",
     }
     submitted: list[str] = []
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: cluster.CampaignTask,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        submitted.append(task.case_id)
+        return payload
+
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "e" * 40)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_one",
-        lambda payload, _campaign, task, **_kwargs: (submitted.append(task.case_id), payload)[1],
-    )
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
     monkeypatch.setattr(
         generation.campaign.common.serialization,
         "atomic_write_json",
@@ -1484,7 +1604,7 @@ def test_repeated_independent_retries_do_not_accumulate_blocked_cases(
         view["license_next_retry_at"] = common_due
         view["license_first_blocked_at"] = common_due
         view["temporary_license_retry"]["next_retry_at"] = common_due
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": "no-accumulation__0123456789abcdef",
         "git_commit": "d" * 40,
         "submission_config": {
@@ -1602,12 +1722,18 @@ def test_restart_reconstructs_blocked_admission_without_admitting_more(
         )
     )
     submitted: list[str] = []
+
+    def submit_one(
+        payload: dict[str, Any],
+        _campaign: Any,
+        task: cluster.CampaignTask,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        submitted.append(task.case_id)
+        return payload
+
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "b" * 40)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_one",
-        lambda payload, _campaign, task, **_kwargs: (submitted.append(task.case_id), payload)[1],
-    )
+    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
     monkeypatch.setattr(
         generation.campaign.common.serialization,
         "atomic_write_json",
@@ -1658,7 +1784,7 @@ def test_solver_start_releases_slots_for_progressive_discovery(
         _admission_view(tasks[3], "never_started"),
         _admission_view(tasks[4], "never_started"),
     ]
-    manifest = {
+    manifest: dict[str, Any] = {
         "campaign_run_id": "progressive__0123456789abcdef",
         "git_commit": "c" * 40,
         "submission_config": {

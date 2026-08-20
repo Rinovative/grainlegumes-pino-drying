@@ -14,6 +14,7 @@ import yaml
 from src import generation
 from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_license as license_service
+from src.generation.runtime import generation_runtime_stop as stop_service
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -149,6 +150,104 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
         )
 
 
+def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Persist exact pending evidence before unlink and complete it afterward."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    work_directory = tmp_path / "owned-work"
+    work_directory.mkdir()
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=3,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text("1787215759123\nFailed\n", encoding="utf-8")
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=7731,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+    classification = license_service.classify_temporary_license_capacity(
+        _OBSERVED_CAPACITY_TEXT,
+    )
+    assert artifact is not None
+    assert classification is not None
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    ended_at = started_at + timedelta(seconds=1)
+
+    with pytest.raises(ValueError, match="must be timezone-aware"):
+        license_service.record_in_allocation_status_artifact_recovery(
+            config,
+            1,
+            campaign_run_id="status-recovery__0123456789abcdef",
+            job_id="633014",
+            checkout_started_at=started_at.replace(tzinfo=None),
+            checkout_ended_at=ended_at,
+            hostname="synthetic-node",
+            artifact=artifact,
+            classification=classification,
+            cleanup_state="pending",
+            storage_root=tmp_path / "storage",
+        )
+
+    receipt_path = license_service.record_in_allocation_status_artifact_recovery(
+        config,
+        1,
+        campaign_run_id="status-recovery__0123456789abcdef",
+        job_id="633014",
+        checkout_started_at=started_at,
+        checkout_ended_at=ended_at,
+        hostname="synthetic-node",
+        artifact=artifact,
+        classification=classification,
+        cleanup_state="pending",
+        storage_root=tmp_path / "storage",
+    )
+    pending = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert pending["cleanup_state"] == "pending"
+    assert pending["status_state"] == "Failed"
+    assert pending["status_sha256"] == artifact.content_sha256
+    assert status_path.exists()
+
+    stop_service.remove_capacity_checkout_status(artifact)
+    license_service.record_in_allocation_status_artifact_recovery(
+        config,
+        1,
+        campaign_run_id="status-recovery__0123456789abcdef",
+        job_id="633014",
+        checkout_started_at=started_at,
+        checkout_ended_at=ended_at,
+        hostname="synthetic-node",
+        artifact=artifact,
+        classification=classification,
+        cleanup_state="complete",
+        storage_root=tmp_path / "storage",
+    )
+    records = license_service.load_in_allocation_status_artifact_recoveries(
+        config,
+        1,
+        campaign_run_id="status-recovery__0123456789abcdef",
+        job_id="633014",
+        storage_root=tmp_path / "storage",
+    )
+    assert not status_path.exists()
+    assert len(records) == 1
+    assert records[0]["cleanup_state"] == "complete"
+    assert records[0]["checkout_index"] == 3
+    assert records[0]["solver_progress_started"] is False
+    assert records[0]["required_exports_exist"] is False
+
+
 def test_license_retry_backoff_is_exponential_and_bounded() -> None:
     """Increase a test-owned retry delay without exceeding its cap."""
     policy = {
@@ -226,6 +325,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "701")
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
+    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Failed")
 
     blocked = generation.runtime.run_case(
         config,
@@ -275,6 +375,15 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     assert window["checkout_attempt_count"] >= 1
     assert window["checkout_capacity_failure_count"] == window["checkout_attempt_count"]
     assert all(summary["process_exit_code"] == 0 for summary in window["recent_checkout_summaries"])
+    status_recoveries = license_service.load_in_allocation_status_artifact_recoveries(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id="701",
+        storage_root=storage,
+    )
+    assert len(status_recoveries) == window["checkout_capacity_failure_count"]
+    assert all(record["cleanup_state"] == "complete" for record in status_recoveries)
     assert not (blocked.processed_directory / "_SUCCESS").exists()
     assert not (blocked.processed_directory / "case.h5").exists()
     assert (
@@ -288,6 +397,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     )
 
     monkeypatch.delenv("FAKE_COMSOL_MODE")
+    monkeypatch.delenv("FAKE_COMSOL_CAPACITY_STATUS_STATE")
     monkeypatch.setenv("SLURM_JOB_ID", "702")
     outcome = generation.runtime.run_case(
         config,
@@ -349,6 +459,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "711")
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity_twice_then_success")
+    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Failed")
     monkeypatch.setenv("FAKE_COMSOL_DELAY", "0.5")
 
     outcome = generation.runtime.run_case(
@@ -374,6 +485,15 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     assert receipt["checkout_capacity_failure_count"] == 2
     assert [summary["process_exit_code"] for summary in receipt["recent_checkout_summaries"]] == [0, 0, None]
     assert receipt["recent_checkout_summaries"][-1]["solver_progress_started"] is True
+    status_recoveries = license_service.load_in_allocation_status_artifact_recoveries(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id="711",
+        storage_root=storage,
+    )
+    assert [record["checkout_index"] for record in status_recoveries] == [1, 2]
+    assert all(record["cleanup_state"] == "complete" for record in status_recoveries)
     assert (
         license_service.load_temporary_license_wait(
             config,
@@ -385,6 +505,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     )
     timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
     assert timing["in_allocation_checkout_attempt_count"] == 3
+    assert timing["status_artifact_recovery_count"] == 2
     assert timing["in_allocation_capacity_pause_seconds"] == pytest.approx(0.02)
     assert timing["comsol_process_seconds"] < timing["complete_execution_s"]
     assert generation.runtime.completed_case_is_valid(config, 1, storage_root=storage)

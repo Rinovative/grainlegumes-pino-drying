@@ -221,9 +221,9 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reuse exact old replay evidence while preserving solver and processing commits."""
-    old_run_id = "old-campaign__0123456789abcdef"
-    new_run_id = "new-campaign__fedcba9876543210"
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", old_run_id)
+    source_run_id = "source-campaign__0123456789abcdef"
+    target_run_id = "target-campaign__fedcba9876543210"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", source_run_id)
     config, storage = _production_case(generation_config_factory, fake_comsol, tmp_path)
     original_convert = storage_service.convert_exports_to_hdf5
 
@@ -241,14 +241,14 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
                 storage_root=storage,
                 work_root=tmp_path / "historical solver work",
             )
-    old_attempt = generation.publication.attempt.latest_case_attempt(
+    source_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
-        old_run_id,
+        source_run_id,
         storage_root=storage,
     )
-    assert old_attempt is not None
-    old_receipt = old_attempt.receipt_path.read_bytes()
+    assert source_attempt is not None
+    source_receipt = source_attempt.receipt_path.read_bytes()
     task = cluster_service.CampaignTask(
         batch_name=config.batch_name,
         batch_id=config.batch_id,
@@ -256,15 +256,15 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
         case_id=config.case_id(1),
     )
     historical = generation.campaign._admitted_case_attempt(  # noqa: SLF001 -- tests cross-run admission
-        {"campaign_run_id": new_run_id, "git_commit": "b" * 40},
+        {"campaign_run_id": target_run_id, "git_commit": "b" * 40},
         config,
         task,
         storage_root=storage,
     )
     assert historical is not None
-    assert historical.receipt_path == old_attempt.receipt_path
+    assert historical.attempt.receipt_path == source_attempt.receipt_path
 
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", new_run_id)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", target_run_id)
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "b" * 40)
     monkeypatch.setattr(comsol_service, "build_comsol_command", _forbid_comsol)
     with monkeypatch.context() as scoped:
@@ -273,14 +273,14 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
             generation.runtime.replay_case_postprocessing(
                 config,
                 1,
-                source_campaign_run_id=old_run_id,
+                source_campaign_run_id=source_run_id,
                 storage_root=storage,
                 work_root=tmp_path / "failed cross-commit replay work",
             )
     retry_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
-        old_run_id,
+        source_run_id,
         storage_root=storage,
     )
     assert retry_attempt is not None
@@ -290,7 +290,7 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
         generation.publication.attempt.latest_case_attempt(
             config,
             1,
-            new_run_id,
+            target_run_id,
             storage_root=storage,
         )
         is None
@@ -308,13 +308,13 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
     outcome = generation.runtime.replay_case_postprocessing(
         config,
         1,
-        source_campaign_run_id=old_run_id,
+        source_campaign_run_id=source_run_id,
         storage_root=storage,
         work_root=tmp_path / "changed cross-commit replay work",
     )
 
     assert outcome.status == "replayed"
-    assert old_attempt.receipt_path.read_bytes() == old_receipt
+    assert source_attempt.receipt_path.read_bytes() == source_receipt
     processing = json.loads((outcome.processed_directory / "processing_provenance.json").read_text(encoding="utf-8"))
     assert processing["solver_git_commit"] == "a" * 40
     assert processing["processing_git_commit"] == "b" * 40
@@ -327,7 +327,7 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep an old conversion failure out of new-run Slurm submissions."""
+    """Keep a source conversion failure out of target-run Slurm submissions."""
     config_path, _template = generation_config_factory(
         executable=fake_comsol,
         campaign_purpose="family_generalization",
@@ -338,8 +338,8 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
     campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.batches[0]
     storage = tmp_path / "cross-commit campaign storage"
-    old_run_id = "old-submit-campaign__0123456789abcdef"
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", old_run_id)
+    source_run_id = "source-submit-campaign__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", source_run_id)
     generation.cases.input_generation.generate_input_cases(
         batch,
         len(batch.case_indices),
@@ -361,15 +361,15 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
                 work_root=tmp_path / "old campaign solver work",
             )
 
-    new_commit = "b" * 40
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", new_commit)
+    target_commit = "b" * 40
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", target_commit)
     submitted: list[list[str]] = []
 
     def submit_case(command: list[str], **_kwargs: Any) -> str:
         submitted.append(command)
         return str(7_000 + len(submitted))
 
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: new_commit)
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: target_commit)
     monkeypatch.setattr(generation.campaign, "_submit_case", submit_case)
     monkeypatch.setattr(
         generation.campaign,
@@ -384,7 +384,7 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
 
     manifest = generation.campaign.submit_campaign(
         campaign,
-        git_commit=new_commit,
+        git_commit=target_commit,
         storage_root=storage,
     )
 
@@ -393,7 +393,7 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
     historical = generation.publication.attempt.latest_case_attempt(
         batch,
         1,
-        old_run_id,
+        source_run_id,
         storage_root=storage,
     )
     assert historical is not None
@@ -408,9 +408,9 @@ def test_historical_solver_failure_is_not_misclassified_as_replayable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Leave genuine old solver work eligible for a new campaign submission."""
-    old_run_id = "old-solver-campaign__0123456789abcdef"
-    new_run_id = "new-solver-campaign__fedcba9876543210"
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", old_run_id)
+    source_run_id = "source-solver-campaign__0123456789abcdef"
+    target_run_id = "target-solver-campaign__fedcba9876543210"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", source_run_id)
     config, storage = _production_case(generation_config_factory, fake_comsol, tmp_path)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "failure")
     with pytest.raises(generation.runtime.CaseExecutionError):
@@ -421,14 +421,14 @@ def test_historical_solver_failure_is_not_misclassified_as_replayable(
             storage_root=storage,
             work_root=tmp_path / "historical failed solver work",
         )
-    old_attempt = generation.publication.attempt.latest_case_attempt(
+    source_attempt = generation.publication.attempt.latest_case_attempt(
         config,
         1,
-        old_run_id,
+        source_run_id,
         storage_root=storage,
     )
-    assert old_attempt is not None
-    assert old_attempt.payload["failure_stage"] == "solver"
+    assert source_attempt is not None
+    assert source_attempt.payload["failure_stage"] == "solver"
     task = cluster_service.CampaignTask(
         batch_name=config.batch_name,
         batch_id=config.batch_id,
@@ -438,7 +438,7 @@ def test_historical_solver_failure_is_not_misclassified_as_replayable(
 
     assert (
         generation.campaign._admitted_case_attempt(  # noqa: SLF001 -- tests cross-run admission
-            {"campaign_run_id": new_run_id, "git_commit": "b" * 40},
+            {"campaign_run_id": target_run_id, "git_commit": "b" * 40},
             config,
             task,
             storage_root=storage,

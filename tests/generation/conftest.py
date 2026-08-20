@@ -420,6 +420,14 @@ def write_spreadsheet_header(stream, names, metadata):
     writer.writerow([f"% {names[0]}", *names[1:]])
 
 
+def write_capacity_status():
+    state = os.environ.get("FAKE_COMSOL_CAPACITY_STATUS_STATE")
+    if state is None:
+        return
+    content = f"1787215759123\n{state}\n"
+    pathlib.Path("solved.mph.status").write_text(content, encoding="utf-8")
+
+
 def runtime_scalar_values(arguments, case):
     handoff = case.get("scalar_handoff")
     entries = None if not isinstance(handoff, dict) else handoff.get("entries")
@@ -491,6 +499,7 @@ if mode in {"license_capacity", "success_with_license_warning"}:
     print("Feature: COMSOL", file=sys.stderr)
     print("FlexNet Licensing error:-4,132", file=sys.stderr)
     if mode == "license_capacity":
+        write_capacity_status()
         raise SystemExit(0)
 if mode == "success_after_capacity":
     print("Time-Dependent Solver 1 in Transient Drying", flush=True)
