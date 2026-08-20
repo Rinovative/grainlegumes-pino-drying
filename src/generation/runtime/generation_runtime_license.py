@@ -101,7 +101,7 @@ _WAIT_KEYS: Final = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class TemporaryLicenseCapacityClassification:
-    """Conservative classification extracted from captured COMSOL text."""
+    """Conservative evidence for one retryable pre-solver capacity event."""
 
     classification: str
     feature: str
@@ -184,6 +184,18 @@ def classify_temporary_license_capacity(
         license_code=license_code,
         matched_signatures=tuple(exact_signatures),
         raw_excerpt=_bounded_raw_excerpt(captured_text),
+    )
+
+
+def controller_owned_window_deadline_evidence() -> TemporaryLicenseCapacityClassification:
+    """Return structured retry evidence for the owned acquisition deadline."""
+    reason = "controller_owned_in_allocation_license_window_deadline"
+    return TemporaryLicenseCapacityClassification(
+        classification=TEMPORARY_LICENSE_CAPACITY,
+        feature="COMSOL license acquisition",
+        license_code=None,
+        matched_signatures=(reason,),
+        raw_excerpt=reason,
     )
 
 

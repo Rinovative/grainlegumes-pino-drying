@@ -1438,6 +1438,14 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     started_at = _utc_now()
     monotonic_start = window_started_monotonic
     while True:
+        if in_allocation_enabled and runtime_cancellation_requested():
+            message = "Campaign cancellation was requested between COMSOL license checkouts."
+            raise CaseInterruptedError(
+                message,
+                work_directory=prepared.work_directory,
+                command=tuple(command),
+                exit_code=None,
+            )
         if window_deadline is not None and time.monotonic() >= window_deadline:
             if not checkout_summaries or checkout_summaries[-1].classification is None:
                 message = "In-allocation COMSOL startup deadline elapsed without strong temporary-capacity evidence."
@@ -1553,6 +1561,67 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                         work_directory=prepared.work_directory,
                         command=tuple(command),
                         exit_code=startup_exit_code,
+                    )
+                if startup_outcome == "window_deadline":
+                    if runtime_cancellation_requested():
+                        message = "Campaign cancellation coincided with the COMSOL license-acquisition deadline."
+                        raise CaseInterruptedError(  # noqa: TRY301 -- cancellation retains lifecycle priority
+                            message,
+                            work_directory=prepared.work_directory,
+                            command=tuple(command),
+                            exit_code=startup_exit_code,
+                        )
+                    captured = _captured_startup_text(prepared)
+                    if license_service.solver_progress_started(captured):
+                        message = "COMSOL solver progress appeared while resolving the license-acquisition deadline."
+                        raise CaseExecutionError(  # noqa: TRY301 -- ambiguous scientific progress fails closed
+                            message,
+                            work_directory=prepared.work_directory,
+                            command=tuple(command),
+                            exit_code=startup_exit_code,
+                        )
+                    _assert_capacity_retry_workspace_is_clean(config, prepared, solved_models_before)
+                    case_index = int(prepared.bundle.case_payload["case_index"])
+                    if completed_case_is_valid(
+                        config,
+                        case_index,
+                        storage_root=prepared.storage_root,
+                    ):
+                        message = "Canonical scientific completion exists at the license-acquisition deadline."
+                        raise CaseExecutionError(  # noqa: TRY301 -- canonical success cannot become operational retry
+                            message,
+                            work_directory=prepared.work_directory,
+                            command=tuple(command),
+                            exit_code=startup_exit_code,
+                        )
+                    deadline_evidence = license_service.controller_owned_window_deadline_evidence()
+                    checkout_summaries.append(
+                        license_service.InAllocationLicenseCheckoutSummary(
+                            checkout_index=len(checkout_summaries) + 1,
+                            started_at=attempt_started_at,
+                            ended_at=datetime.now(timezone.utc),
+                            started_monotonic_seconds=attempt_started_monotonic,
+                            ended_monotonic_seconds=time.monotonic(),
+                            process_exit_code=startup_exit_code,
+                            classification=deadline_evidence,
+                            solver_progress_started=False,
+                        )
+                    )
+                    _persist_in_allocation_window(
+                        config,
+                        prepared,
+                        tuple(checkout_summaries),
+                        window_started_at=window_started_at,
+                        window_started_monotonic=window_started_monotonic,
+                        outcome="window_exhausted",
+                    )
+                    message = "In-allocation COMSOL license-acquisition window exhausted."
+                    raise license_service.TemporaryLicenseCapacityError(  # noqa: TRY301 -- existing operational retry owner
+                        message,
+                        work_directory=prepared.work_directory,
+                        command=tuple(command),
+                        exit_code=startup_exit_code,
+                        evidence=deadline_evidence,
                     )
                 if startup_outcome == "solver_progress_started":
                     checkout_summaries.append(

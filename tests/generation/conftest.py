@@ -480,6 +480,13 @@ if mode == "license_capacity_twice_then_success":
 if mode == "failure":
     print("synthetic failure", file=sys.stderr)
     raise SystemExit(7)
+if mode == "external_sigterm":
+    os.kill(os.getpid(), 15)
+    time.sleep(1.0)
+    raise RuntimeError("fake COMSOL survived SIGTERM")
+if mode == "silent_startup":
+    time.sleep(30.0)
+    raise RuntimeError("fake COMSOL exceeded its controller-owned startup window")
 if mode == "license_capacity_delayed":
     update_tracker(1)
     try:

@@ -1,18 +1,21 @@
-# ruff: noqa: S101, PLR2004
+# ruff: noqa: S101, PLR2004, SLF001
 """Temporary COMSOL floating-license capacity retry contracts."""
 
 from __future__ import annotations
 
 import json
+import signal
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import yaml
 
 from src import generation
 from src.generation.publication import generation_publication_attempt as attempt_service
+from src.generation.runtime import generation_runtime_batch as batch_runtime
 from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_stop as stop_service
 
@@ -27,6 +30,39 @@ Licensed number of users already reached.
 Feature: COMSOL
 FlexNet Licensing error:-4,132
 """
+
+
+class _Clock:
+    """Small monotonic clock advanced by bounded fake-process waits."""
+
+    def __init__(self, value: float = 10.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class _WaitingProcess:
+    """Fake process that remains alive until the controller terminates it."""
+
+    pid = 4172
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+
+    @staticmethod
+    def poll() -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None:
+            pytest.fail("Startup wait must remain bounded.")
+        self.clock.advance(timeout)
+        command = "comsol"
+        raise subprocess.TimeoutExpired(command, timeout)
 
 
 def _capacity_error(work_directory: Path) -> license_service.TemporaryLicenseCapacityError:
@@ -67,6 +103,58 @@ def test_license_capacity_classifier_is_strong_and_conservative() -> None:
         "HDF5 conversion validation failed.",
     )
     assert all(license_service.classify_temporary_license_capacity(message) is None for message in terminal_messages)
+
+
+def test_startup_waiter_preserves_owned_deadline_and_cancellation_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminate a silent checkout at its deadline without masking cancellation."""
+    clock = _Clock()
+    process = _WaitingProcess(clock)
+    terminated: list[_WaitingProcess] = []
+
+    monkeypatch.setattr(batch_runtime.time, "monotonic", clock)
+    monkeypatch.setattr(batch_runtime, "_captured_startup_text", lambda _prepared: "")
+    monkeypatch.setattr(batch_runtime, "runtime_cancellation_requested", lambda: False)
+
+    def terminate(owned: _WaitingProcess) -> int:
+        terminated.append(owned)
+        return -signal.SIGTERM
+
+    monkeypatch.setattr(batch_runtime, "_terminate_solver_and_wait", terminate)
+    prepared: Any = object()
+    outcome, exit_code = batch_runtime._wait_for_solver_start_or_exit(
+        cast("subprocess.Popen[str]", process),
+        prepared,
+        deadline=10.5,
+        window_started_monotonic=10.0,
+        window_limit_seconds=0.5,
+        checkout_attempt_count=1,
+        last_result=None,
+        progress_reporter=None,
+    )
+
+    assert outcome == "window_deadline"
+    assert exit_code == -signal.SIGTERM
+    assert terminated == [process]
+    assert clock() == 10.5
+
+    cancelled_process = _WaitingProcess(clock)
+    monkeypatch.setattr(batch_runtime, "runtime_cancellation_requested", lambda: True)
+    cancelled, cancelled_exit_code = batch_runtime._wait_for_solver_start_or_exit(
+        cast("subprocess.Popen[str]", cancelled_process),
+        prepared,
+        deadline=clock(),
+        window_started_monotonic=10.0,
+        window_limit_seconds=0.5,
+        checkout_attempt_count=1,
+        last_result=None,
+        progress_reporter=None,
+    )
+
+    assert cancelled == "cancelled"
+    assert cancelled_exit_code == -signal.SIGTERM
+    assert terminated == [process, cancelled_process]
 
 
 def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
@@ -432,6 +520,194 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
             storage_root=storage,
         )
         is not None
+    )
+
+
+@pytest.mark.integration
+def test_silent_controller_deadline_becomes_license_blocked_without_failure(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route the controller-owned TERM status through existing operational retry."""
+    config_path, _template = generation_config_factory(
+        executable=fake_comsol,
+        scheduler_kind="slurm",
+        maximum_failed_cases=0,
+        in_allocation_maximum_window_seconds=0.05,
+        in_allocation_pause_after_capacity_failure_seconds=0.01,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
+    run_id = "silent-deadline__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    monkeypatch.setenv("SLURM_JOB_ID", "703")
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "silent_startup")
+
+    blocked = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=1,
+        scheduler_kind="slurm",
+        storage_root=storage,
+        work_root=tmp_path / "work",
+    )
+
+    assert blocked.status == "license_blocked"
+    assert blocked.message == "in_allocation_license_window_exhausted"
+    assert not generation.runtime.case_failure_is_recorded(config, 1, storage_root=storage)
+    assert attempt_service.latest_case_attempt(config, 1, run_id, storage_root=storage) is None
+    assert not generation.runtime.completed_case_is_valid(config, 1, storage_root=storage)
+    wait = license_service.load_temporary_license_wait(
+        config,
+        1,
+        campaign_run_id=run_id,
+        storage_root=storage,
+    )
+    assert wait is not None
+    assert wait["comsol_exit_code"] == -signal.SIGTERM
+    assert wait["feature"] == "COMSOL license acquisition"
+    assert wait["matched_signatures"] == ["controller_owned_in_allocation_license_window_deadline"]
+    assert wait["retry_budget_remaining"] is True
+    window = license_service.load_in_allocation_license_window(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id="703",
+        storage_root=storage,
+    )
+    assert window is not None
+    assert window["outcome"] == "window_exhausted"
+    assert window["reason"] == "in_allocation_license_window_exhausted"
+    assert window["recent_checkout_summaries"][-1]["process_exit_code"] == -signal.SIGTERM
+    assert (
+        generation.campaign._solver_failure_threshold_exceeded(
+            [
+                {
+                    "state": "license_blocked",
+                    "failure_stage": "solver",
+                    "temporary_license_retry": wait,
+                }
+            ],
+            maximum_failed_cases=0,
+        )
+        is False
+    )
+
+
+@pytest.mark.integration
+def test_cancellation_between_capacity_checkouts_remains_cancelled(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Give cancellation priority after a capacity checkout and before retry."""
+    config_path, _template = generation_config_factory(
+        executable=fake_comsol,
+        scheduler_kind="slurm",
+        in_allocation_maximum_window_seconds=1.0,
+        in_allocation_pause_after_capacity_failure_seconds=0.1,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
+    run_id = "cancelled-checkout__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    monkeypatch.setenv("SLURM_JOB_ID", "705")
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
+    pauses: list[float] = []
+    real_sleep = batch_runtime.time.sleep
+
+    def cancel_during_pause(seconds: float) -> None:
+        if seconds == 0.1:
+            pauses.append(seconds)
+            generation.runtime.request_runtime_cancellation()
+            return
+        real_sleep(seconds)
+
+    monkeypatch.setattr(batch_runtime.time, "sleep", cancel_during_pause)
+    generation.runtime.reset_runtime_cancellation()
+    try:
+        with pytest.raises(generation.runtime.CaseInterruptedError):
+            generation.runtime.run_case(
+                config,
+                1,
+                cores_per_case=1,
+                scheduler_kind="slurm",
+                storage_root=storage,
+                work_root=tmp_path / "work",
+            )
+    finally:
+        generation.runtime.reset_runtime_cancellation()
+
+    assert pauses == [0.1]
+    assert (
+        license_service.load_temporary_license_wait(
+            config,
+            1,
+            campaign_run_id=run_id,
+            storage_root=storage,
+        )
+        is None
+    )
+    attempt = attempt_service.latest_case_attempt(config, 1, run_id, storage_root=storage)
+    assert attempt is not None
+    assert attempt.payload["case_state"] == "cancelled"
+
+
+@pytest.mark.integration
+def test_unowned_sigterm_remains_a_genuine_solver_failure(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never reinterpret an arbitrary process status minus fifteen as capacity."""
+    config_path, _template = generation_config_factory(
+        executable=fake_comsol,
+        scheduler_kind="slurm",
+        in_allocation_maximum_window_seconds=1.0,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
+    run_id = "external-term__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    monkeypatch.setenv("SLURM_JOB_ID", "704")
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "external_sigterm")
+
+    with pytest.raises(generation.runtime.CaseExecutionError) as caught:
+        generation.runtime.run_case(
+            config,
+            1,
+            cores_per_case=1,
+            scheduler_kind="slurm",
+            storage_root=storage,
+            work_root=tmp_path / "work",
+        )
+
+    assert caught.value.exit_code == -signal.SIGTERM
+    assert generation.runtime.case_failure_is_recorded(config, 1, storage_root=storage)
+    assert (
+        license_service.load_temporary_license_wait(
+            config,
+            1,
+            campaign_run_id=run_id,
+            storage_root=storage,
+        )
+        is None
     )
 
 

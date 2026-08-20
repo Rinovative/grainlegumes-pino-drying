@@ -35,6 +35,7 @@ _MAX_RECENT_FAILURES = 3
 _MAX_OLDER_FAILURE_GROUPS = 8
 _MAX_REASON_CHARACTERS = 160
 _MAX_EVIDENCE_PATH_CHARACTERS = 80
+_STORAGE_DOMAIN_NAMES = frozenset({"01_generation", "02_datasets", "03_experiments"})
 _UNSAFE_CAPACITY_STATUS_PREFIX = "Unsafe COMSOL capacity-checkout status artifact:"
 _FAILED_CASE_STATES = frozenset(
     {
@@ -76,15 +77,22 @@ def _bounded_text(value: object, *, maximum: int) -> str | None:
 
 
 def _compact_evidence_path(value: object) -> str | None:
-    """Return a short relative-looking suffix for retained evidence."""
+    """Return one compact evidence path relative to its storage domain."""
     text = _available_text(value)
     if text is None:
         return None
     path = PurePath(text)
     relative_parts = [part for part in path.parts if part not in {path.anchor, "/"}]
-    compact = PurePath(*relative_parts[-3:]).as_posix()
-    if path.is_absolute():
-        compact = f".../{compact}"
+    domain_index = next(
+        (index for index, part in enumerate(relative_parts) if part in _STORAGE_DOMAIN_NAMES),
+        None,
+    )
+    if domain_index is not None:
+        compact = PurePath(*relative_parts[domain_index:]).as_posix()
+    else:
+        compact = PurePath(*relative_parts[-3:]).as_posix()
+        if path.is_absolute():
+            compact = f".../{compact}"
     return _bounded_text(compact, maximum=_MAX_EVIDENCE_PATH_CHARACTERS)
 
 

@@ -643,7 +643,7 @@ def test_human_summary_replaces_unsafe_status_json_with_bounded_reason() -> None
     )
 
     assert 'reason="Unowned or unsupported COMSOL status artifact."' in rendered
-    assert "evidence=.../attempts/case_0001/attempt.json" in rendered
+    assert "evidence=01_generation/attempts/case_0001/attempt.json" in rendered
     assert "content_excerpt" not in rendered
     assert "content_sha256" not in rendered
     assert "1787228251108" not in rendered
@@ -689,7 +689,7 @@ def test_human_summary_compacts_failed_replay_evidence() -> None:
         "stage=conversion",
         "solver=succeeded",
         "replay=blocked",
-        "evidence=.../01_generation/attempts/replay_failure.json",
+        "evidence=01_generation/attempts/replay_failure.json",
     ):
         assert value in rendered
     for internal in (
