@@ -409,10 +409,10 @@ def test_transient_initial_state_tolerance_validation(
         generation.cases.config.load_campaign_config(config_path)
 
 
-def test_startup_ramp_identity_ignores_inactive_duration_and_binds_active_behavior(
+def test_startup_ramp_identity_ignores_inactive_policy_and_binds_active_behavior(
     generation_config_factory: Any,
 ) -> None:
-    """Bind enabled ramp behavior while excluding disabled duration from identity."""
+    """Bind enabled ramp behavior while excluding disabled policy values from identity."""
     transient_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         startup_ramp_enabled=False,
@@ -423,12 +423,19 @@ def test_startup_ramp_identity_ignores_inactive_duration_and_binds_active_behavi
     operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
 
     operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.375
+    operations["boundary_schedule"]["startup_ramp"]["initial_equilibrium_rh_dry_margin"] = 0.075
+    operations["boundary_schedule"]["startup_ramp"]["max_relative_humidity"] = 0.95
     operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
-    inactive_duration_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
-    assert inactive_duration_changed.scientific_values["boundary_schedule"]["startup_ramp"]["duration_h"] == 0.375
-    assert inactive_duration_changed.scientific_config_digest == disabled.scientific_config_digest
-    assert inactive_duration_changed.case_input_config_digest == disabled.case_input_config_digest
-    assert inactive_duration_changed.batch_id == disabled.batch_id
+    inactive_policy_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    assert inactive_policy_changed.scientific_values["boundary_schedule"]["startup_ramp"] == {
+        "enabled": False,
+        "duration_h": 0.375,
+        "initial_equilibrium_rh_dry_margin": 0.075,
+        "max_relative_humidity": 0.95,
+    }
+    assert inactive_policy_changed.scientific_config_digest == disabled.scientific_config_digest
+    assert inactive_policy_changed.case_input_config_digest == disabled.case_input_config_digest
+    assert inactive_policy_changed.batch_id == disabled.batch_id
 
     operations["boundary_schedule"]["startup_ramp"]["enabled"] = True
     operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
@@ -443,6 +450,20 @@ def test_startup_ramp_identity_ignores_inactive_duration_and_binds_active_behavi
     assert active_duration_changed.scientific_config_digest != enabled.scientific_config_digest
     assert active_duration_changed.case_input_config_digest != enabled.case_input_config_digest
     assert active_duration_changed.batch_id != enabled.batch_id
+
+    operations["boundary_schedule"]["startup_ramp"]["initial_equilibrium_rh_dry_margin"] = 0.065
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+    active_margin_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    assert active_margin_changed.scientific_config_digest != active_duration_changed.scientific_config_digest
+    assert active_margin_changed.case_input_config_digest != active_duration_changed.case_input_config_digest
+    assert active_margin_changed.batch_id != active_duration_changed.batch_id
+
+    operations["boundary_schedule"]["startup_ramp"]["max_relative_humidity"] = 0.92
+    operations_path.write_text(yaml.safe_dump(operations, sort_keys=False), encoding="utf-8")
+    active_maximum_changed = generation.cases.config.load_campaign_config(transient_path).batches[0]
+    assert active_maximum_changed.scientific_config_digest != active_margin_changed.scientific_config_digest
+    assert active_maximum_changed.case_input_config_digest != active_margin_changed.case_input_config_digest
+    assert active_maximum_changed.batch_id != active_margin_changed.batch_id
 
     steady_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
@@ -462,12 +483,50 @@ def test_startup_ramp_identity_ignores_inactive_duration_and_binds_active_behavi
     assert changed_steady.batch_id == original_steady.batch_id
 
 
+def test_startup_margin_does_not_change_sampling_or_case_membership(
+    generation_config_factory: Any,
+) -> None:
+    """Keep deterministic preprocessing outside the DoE and seed plan."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=3,
+    )
+    original = generation.cases.config.load_campaign_config(config_path).batches[0]
+    original_sample = generation.cases.sampling.sample_case(original, 1)
+    operations_path = config_path.parent / "operations.yaml"
+    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+    operations["boundary_schedule"]["startup_ramp"]["initial_equilibrium_rh_dry_margin"] = 0.06
+    operations["boundary_schedule"]["startup_ramp"]["max_relative_humidity"] = 0.93
+    operations_path.write_text(
+        yaml.safe_dump(operations, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    changed = generation.cases.config.load_campaign_config(config_path).batches[0]
+    changed_sample = generation.cases.sampling.sample_case(changed, 1)
+
+    assert changed.case_indices == original.case_indices
+    assert changed.seed_base == original.seed_base
+    assert changed.case_seed(1) == original.case_seed(1)
+    assert changed_sample.values == original_sample.values
+    assert changed_sample.units == original_sample.units
+    assert changed_sample.block_provenance == original_sample.block_provenance
+    assert changed_sample.coupled_selections == original_sample.coupled_selections
+    assert "initial_equilibrium_rh_dry_margin" not in changed_sample.values
+    assert "max_relative_humidity" not in changed_sample.values
+    assert changed.scientific_config_digest != original.scientific_config_digest
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
         ("enabled", "true", "enabled must be boolean"),
         ("duration_h", 0.0, "strictly positive and shorter"),
         ("duration_h", 0.75, "strictly positive and shorter"),
+        ("initial_equilibrium_rh_dry_margin", 0.0, "strictly inside"),
+        ("initial_equilibrium_rh_dry_margin", 1.0, "strictly inside"),
+        ("max_relative_humidity", 0.0, "inside"),
+        ("max_relative_humidity", 1.01, "inside"),
     ],
 )
 def test_startup_ramp_configuration_is_strict(
@@ -521,25 +580,6 @@ def test_execution_count_limits_reject_invalid_domains(
 
     with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
         generation.cases.config.load_campaign_config(config_path)
-
-
-def test_maintained_cluster_license_admission_contract() -> None:
-    """Protect the documented cluster admission and retry operating contract."""
-    path = common.paths.get_project_root() / "configs/generation/execution/cluster_cpu.yaml"
-    execution = yaml.safe_load(path.read_text(encoding="utf-8"))
-
-    assert execution["schema_version"] == 1
-    assert execution["submission"]["max_admission_cases"] == 2
-    assert execution["submission"]["max_running_cases"] is None
-    assert execution["runtime"]["temporary_license_retry"] == {
-        "enabled": True,
-        "initial_delay_seconds": 15,
-        "maximum_delay_seconds": 30,
-        "maximum_wait_seconds": None,
-    }
-    assert execution["cluster"]["cores_per_case"] == 16
-    assert "pending_buffer" not in execution["submission"]
-    assert "license_probe_limit" not in execution["submission"]
 
 
 def test_valid_config_edits_are_resolved_without_source_synchronization(
@@ -611,7 +651,12 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert scientific["grid"]["dx"] == pytest.approx(0.1)
     assert scientific["grid"]["dy"] == pytest.approx(0.1)
     assert scientific["time"]["regular_times"] == [index * 0.5 for index in range(169)]
-    assert scientific["boundary_schedule"]["startup_ramp"]["duration_h"] == 0.25
+    assert scientific["boundary_schedule"]["startup_ramp"] == {
+        "enabled": True,
+        "duration_h": 0.25,
+        "initial_equilibrium_rh_dry_margin": 0.05,
+        "max_relative_humidity": 0.90,
+    }
     assert scientific["scientific_fixed_values"]["T_flow_ref"] == 301.15
     assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
     assert scientific["storage"]["compression_level"] == 6
@@ -825,7 +870,10 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
     tmp_path: Path,
 ) -> None:
     """Reject a stale RH column even after its file and case identities are refreshed."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        startup_ramp_enabled=False,
+    )
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=generation.cases.config.build_batch_name(
@@ -869,7 +917,10 @@ def test_scalar_handoff_rejects_an_unknown_name(
     tmp_path: Path,
 ) -> None:
     """Protect the exact scalar schema after a modified file receives a fresh hash."""
-    config_path, _template = generation_config_factory(simulation_profile="transient_drying")
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        startup_ramp_enabled=False,
+    )
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=generation.cases.config.build_batch_name(

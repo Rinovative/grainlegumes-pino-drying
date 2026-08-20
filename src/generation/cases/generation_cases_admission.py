@@ -385,8 +385,14 @@ def _validate_schedule(payload: Mapping[str, Any], schedule: np.ndarray) -> None
     schedule_service.validate_comsol_boundary_schedule(
         schedule,
         regular_times=regular_times,
-        startup_ramp={"enabled": ramp["enabled"], "duration_h": ramp["duration_h"]},
+        startup_ramp={
+            "enabled": ramp["enabled"],
+            "duration_h": ramp["duration_h"],
+            "initial_equilibrium_rh_dry_margin": ramp["initial_equilibrium_rh_dry_margin"],
+            "max_relative_humidity": ramp["startup_relative_humidity_max"],
+        },
         initial_temperature=float(payload["sampled_values"]["T_init"]),
+        source_air_temperature=float(payload["sampled_values"]["T_amb"]),
         pressure=_stationary_value(payload, "p_ref"),
         metadata=metadata,
     )

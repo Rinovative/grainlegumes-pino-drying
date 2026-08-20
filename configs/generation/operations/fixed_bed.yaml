@@ -12,6 +12,8 @@ boundary_schedule:
   startup_ramp:
     enabled: true
     duration_h: 0.5
+    initial_equilibrium_rh_dry_margin: 0.05
+    max_relative_humidity: 0.90
 parameter_values:
   pressure_bc.mean:
     lower: 250.0

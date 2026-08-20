@@ -1,9 +1,9 @@
 schema_kind: generation_execution
 schema_version: 1
 runtime:
-  timeout_seconds: 3600
+  timeout_seconds: 2400
   graceful_stop_reserve_seconds: 300
-  maximum_failed_cases: 5
+  maximum_failed_cases: 10
   extra_arguments: []
   temporary_license_retry:
     enabled: true

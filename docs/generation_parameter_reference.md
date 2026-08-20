@@ -178,29 +178,93 @@ candidate is rejected and deterministically resampled as a whole rather than
 repaired by pointwise clipping. Schedule supports and composition are synthetic
 design assumptions, not literature measurements or active control.
 
+The canonical humidity-ratio interval
+`[0.0025, 0.0145] kg/kg` is an engineering-estimate source-air design envelope
+for the sampled stochastic schedule. It continues to govern canonical candidate
+acceptance, deterministic resampling, the rejoin state, and every retained
+canonical row. Its ownership and provenance are unchanged. The deterministic
+startup row is instead derived from the bed-referenced RH target and is not
+independently limited by the canonical `omega_max`. Its humidity ratio must
+remain finite and positive, reproduce the target RH at `T_init` and `p_ref`,
+and remain nonsupersaturated at the maintained source-air temperature. No
+startup humidity-ratio clipping or replacement ceiling is applied.
+
 The accepted stochastic schedule remains canonical on
-`common.time.regular_times`. The maintained fixed-bed operation currently sets
-`boundary_schedule.startup_ramp.enabled: false`; consequently, the final COMSOL
-table is the unchanged canonical hourly support from 0 through 168 h. There is
-no hidden 0.5 h row, sub-hour output state, or boundary rejoin. `T_init` remains
-the domain initial state and is not substituted for the time-zero inlet forcing.
-The authored inactive `duration_h` is retained as resolved provenance but does
-not affect scientific or case-input identity while the ramp is disabled.
+`common.time.regular_times` and retains its continuous inlet-RH operating
+envelope `[0.05, 0.85]`. The startup policy is applied only after canonical
+candidate acceptance, so its settings cannot admit a stochastic realization
+that canonical generation would reject or alter deterministic resampling. The
+maintained fixed-bed operation enables one `0.5 h` startup handoff. This is a
+short deterministic startup-conditioning, or gradual fresh-air takeover, phase;
+it is not an additional output time, sampled case parameter, or claim that this
+is the only physically possible startup procedure.
 
-The ramp capability remains explicit for campaigns that deliberately enable it.
-In that mode, `duration_h` must lie strictly between zero and the first regular
-interval. The boundary begins at `T_init` while preserving the canonical initial
-humidity ratio, then adds one primitive interpolation row at `duration_h` whose
-temperature and humidity ratio are the exact canonical linear interpolation.
-Derived relative humidity is recomputed from those primitives; it is never added
-to `schedule.csv`. The extra row is interpolation support, not a regular output
-state.
+The packed bed begins with a heterogeneous equilibrium-RH field obtained by
+applying the exact inverse Oswin relation to every generated
+`X_0_db_field` cell at `T_init`. A temperature-only handoff can impose a large
+initial inlet-RH discontinuity. The coupled policy therefore uses the global
+minimum of that exact field and the fixed absolute margin
+`initial_equilibrium_rh_dry_margin: 0.05`:
 
-In either mode, the handoff uses no bed-state or solver feedback. COMSOL output,
-HDF5 state time, and Dataset transitions use only `common.time.regular_times`.
-Final schedule bytes and active handoff provenance participate in exact input
-identity. Absolute temperatures are persisted in kelvin; Celsius conversion is
-a presentation concern, while amplitudes, changes, differences, and rates remain
+```text
+phi_in_start = min(phi_eq_init) - 0.05
+```
+
+Here `0.05` means five RH percentage points, not a five-percent multiplicative
+reduction. Referencing the global minimum guarantees that the incoming air starts
+at least five RH percentage points drier than every generated packed-bed cell.
+The rule is deterministic preprocessing, is identical for every material and
+campaign, does not change the DoE, and is not an independent neural-operator
+input. A very wet bed can require `phi_in_start > 0.85` while remaining
+unambiguously drying because the inlet is still five RH points below the driest
+initial cell. The dedicated `max_relative_humidity: 0.90` permits that state only
+inside the short startup handoff. It is a synthetic startup-design bound, not a
+literature-derived threshold or a widened canonical operating range.
+
+The four maintained RH ceilings have distinct ownership:
+
+| Value | Meaning |
+| ---: | --- |
+| `0.85` | Maximum continuous RH accepted by canonical stochastic schedule generation and retained canonical operation |
+| `0.90` | Maximum continuous RH allowed only during the deterministic startup handoff |
+| `0.999` | Numerical clipping ceiling used by the COMSOL Oswin evaluation |
+| `1.0` | Physical RH upper limit used by feasibility validation |
+
+Under the maintained deterministic Technical Smoke inputs, the exact startup
+targets are `0.8650037786093981` and `0.857554136418594`. Both exceed the
+canonical `0.85` ceiling, remain below the startup-only `0.90` ceiling, and stay
+exactly five RH points below their own initial equilibrium-field minima. These
+values are acceptance evidence, not production constants.
+
+At `t=0`, `T_in_bc=T_init` and the maintained `p_ref` psychrometric conversion
+maps `phi_in_start` to `omega_in_bc`. Both primitive columns then follow the
+same linear startup profile to the exact canonical state at the configured
+`0.5 h` rejoin. Every later canonical row and all canonical stochastic
+temperature/humidity values remain unchanged. COMSOL and Dataset consumers
+receive the same final `t,T_in_bc,omega_in_bc` table. `phi_in_bc` is always
+derived thermodynamically after primitive interpolation and never becomes a
+fourth `schedule.csv` column or learned channel. Exact candidate extrema validate
+the nonlinear derived RH over the complete startup interval against both the
+bed-relative target and the startup-only `0.90` ceiling. The exact canonical
+rejoin and every later row remain governed by the unchanged `0.85` ceiling.
+
+Two compact test-owned diagnostic fields illustrate the calculation at
+`p_ref=101325 Pa`:
+
+| Case | `T_init` | Initial equilibrium RH (min / mean / max) | `phi_in_start` | `omega_in_start` |
+| --- | ---: | ---: | ---: | ---: |
+| A | 293.15 K | 0.825 / 0.8519999999999999 / 0.872 | 0.7749999999999999 | 0.011301991584801987 kg/kg |
+| B | 288.37 K | 0.7760000000000001 / 0.8170000000000002 / 0.8480000000000001 | 0.7260000000000001 | 0.007788855627705122 kg/kg |
+
+These are computational acceptance examples, not experimental validation. The
+current one-sided evaporation law still excludes rewetting.
+
+When the ramp is disabled in a test-owned or future campaign, the final schedule
+values remain exactly canonical. In either mode, COMSOL output, HDF5 state time,
+and Dataset transitions use only `common.time.regular_times`. Final schedule
+bytes and active handoff provenance participate in exact input identity.
+Absolute temperatures are persisted in kelvin; Celsius conversion is a
+presentation concern, while amplitudes, changes, differences, and rates remain
 in K or K/h.
 
 ### Moisture, heat, and equilibrium coupling

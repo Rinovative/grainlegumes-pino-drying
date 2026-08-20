@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from src import common, datasets, generation, learning
+from src import common, datasets, domain, generation, learning
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 
@@ -121,6 +121,8 @@ def _synthetic_scientific_contract() -> dict[str, Any]:
             "startup_ramp": {
                 "enabled": True,
                 "duration_h": 1.0 / 6.0,
+                "initial_equilibrium_rh_dry_margin": 0.05,
+                "max_relative_humidity": 0.90,
             }
         },
         "input_contract": {"schema_kind": "synthetic_inputs", "schema_version": 1},
@@ -193,21 +195,6 @@ def _write_transient_case(
     x_axis = np.linspace(0.0, float(grid["Lx"]), int(grid["nx"]), dtype=np.float64)
     y_axis = np.linspace(0.0, float(grid["Ly"]), int(grid["ny"]), dtype=np.float64)
     shape = (y_axis.size, x_axis.size)
-    static_constants = (1.0e-10, 0.0, 2.0e-10, 0.4, 100.0, 0.2, 0.1, 0.05, 101325.0, 550.0)
-    assert len(static_constants) == len(profiles.TRANSIENT_STATIC_FIELD_NAMES)
-    static = np.stack([np.full(shape, value, dtype=np.float32) for value in static_constants])
-    regular_time = np.asarray(scientific["time"]["regular_times"][:regular_state_count], dtype=np.float64)
-    initial_water = static_constants[-1] * static_constants[5]
-    base = np.asarray([295.0, 0.4, initial_water, initial_water], dtype=np.float32)
-    increments = np.asarray([1.0, 0.01, -0.5, -0.25], dtype=np.float32)
-
-    def state_at(time_value: float) -> np.ndarray:
-        return np.stack([np.full(shape, base[channel] + time_value * increments[channel], dtype=np.float32) for channel in range(4)])
-
-    transient = np.stack([state_at(float(time_value)) for time_value in regular_time])
-    exact_fields = None if exact_stop_time is None else state_at(exact_stop_time)
-    complete_time = regular_time if exact_stop_time is None else np.concatenate((regular_time, [exact_stop_time]))
-    complete_fields = transient if exact_fields is None else np.concatenate((transient, exact_fields[np.newaxis, ...]))
     scalar_values = {
         "T_amb": 295.0,
         "eps_bed_cal_ref": 0.5,
@@ -222,6 +209,41 @@ def _write_transient_case(
         "B_osw": 0.002,
         "C_osw": 0.3,
     }
+    initial_moisture = float(
+        domain.moisture.oswin_equilibrium_dry_basis_moisture(
+            np.asarray([0.8], dtype=np.float64),
+            scalar_values["T_amb"],
+            a_osw=scalar_values["A_osw"],
+            b_osw=scalar_values["B_osw"],
+            c_osw=scalar_values["C_osw"],
+        )[0]
+    )
+    static_constants = (
+        1.0e-10,
+        0.0,
+        2.0e-10,
+        0.4,
+        100.0,
+        initial_moisture,
+        0.1,
+        0.05,
+        101325.0,
+        550.0,
+    )
+    assert len(static_constants) == len(profiles.TRANSIENT_STATIC_FIELD_NAMES)
+    static = np.stack([np.full(shape, value, dtype=np.float32) for value in static_constants])
+    regular_time = np.asarray(scientific["time"]["regular_times"][:regular_state_count], dtype=np.float64)
+    initial_water = static_constants[-1] * static_constants[5]
+    base = np.asarray([295.0, 0.4, initial_water, initial_water], dtype=np.float32)
+    increments = np.asarray([1.0, 0.01, -0.5, -0.25], dtype=np.float32)
+
+    def state_at(time_value: float) -> np.ndarray:
+        return np.stack([np.full(shape, base[channel] + time_value * increments[channel], dtype=np.float32) for channel in range(4)])
+
+    transient = np.stack([state_at(float(time_value)) for time_value in regular_time])
+    exact_fields = None if exact_stop_time is None else state_at(exact_stop_time)
+    complete_time = regular_time if exact_stop_time is None else np.concatenate((regular_time, [exact_stop_time]))
+    complete_fields = transient if exact_fields is None else np.concatenate((transient, exact_fields[np.newaxis, ...]))
     scalar_names = profiles.TRANSIENT_SCALAR_INPUT_FIELDS
     scalars = np.asarray([scalar_values[name] for name in scalar_names], dtype=np.float64)
     ownership = ["case_dependent"] * len(scalar_names)
@@ -252,6 +274,9 @@ def _write_transient_case(
         ),
         scientific["boundary_schedule"]["startup_ramp"],
         initial_temperature=scalar_values["T_amb"],
+        source_air_temperature=scalar_values["T_amb"],
+        initial_dry_basis_moisture=static[5],
+        oswin_parameters={name: scalar_values[name] for name in ("A_osw", "B_osw", "C_osw")},
         pressure=float(scientific["scientific_fixed_values"]["p_ref"]),
     )
     schedule = boundary_schedule.values
@@ -670,7 +695,23 @@ def test_transient_index_excludes_irregular_stop_and_derives_increments(tmp_path
     assert first["static"].shape == (7, 251, 401)
     assert first["boundary"].shape == (9,)
     with h5py.File(source, "r") as handle:
-        support = np.asarray(_hdf5_dataset(handle, "schedule/values")[1], dtype=np.float32)
+        schedule_dataset = _hdf5_dataset(handle, "schedule/values")
+        persisted_schedule = np.asarray(schedule_dataset, dtype=np.float64)
+        support = np.asarray(persisted_schedule[1], dtype=np.float32)
+        handoff = json.loads(str(schedule_dataset.attrs["boundary_handoff"]))
+    startup = handoff["startup_ramp"]
+    assert persisted_schedule[0, 1] == 295.0
+    assert persisted_schedule[0, 2] == startup["startup_humidity_ratio_kg_per_kg"]
+    assert persisted_schedule[1].tolist() == handoff["rejoin_row"]
+    derived_start = schedule_service.humidity_ratio_to_relative_humidity(
+        persisted_schedule[:1, 2],
+        persisted_schedule[:1, 1],
+        pressure=101325.0,
+    )[0]
+    assert derived_start == pytest.approx(
+        startup["startup_target_relative_humidity"],
+        abs=schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+    )
     assert first["boundary"][5].item() == pytest.approx(1.0 / 6.0)
     torch.testing.assert_close(first["boundary"][6:8], torch.from_numpy(support[1:3]))
     assert first["boundary"][8].item() == 1.0
@@ -853,7 +894,20 @@ def test_transient_rollout_windows_share_runtime_and_exclude_exact_stop(tmp_path
     assert first["scalars"].shape == (8,)
     assert first["target"].shape == (2, 4, 4, 5)
     first_time = cast("dict[str, torch.Tensor]", first["time"])
-    torch.testing.assert_close(first["state"][:, 0, 0], torch.tensor([296.0, 0.41, 109.5, 109.75]))
+    initial_moisture = float(
+        domain.moisture.oswin_equilibrium_dry_basis_moisture(
+            np.asarray([0.8], dtype=np.float64),
+            295.0,
+            a_osw=0.1,
+            b_osw=0.002,
+            c_osw=0.3,
+        )[0]
+    )
+    initial_water = 550.0 * initial_moisture
+    torch.testing.assert_close(
+        first["state"][:, 0, 0],
+        torch.tensor([296.0, 0.41, initial_water - 0.5, initial_water - 0.25]),
+    )
     torch.testing.assert_close(first["boundary"][:, :2], torch.tensor([[295.01, 295.02], [295.02, 295.03]]))
     torch.testing.assert_close(first["boundary"][0, 1], first["boundary"][1, 0])
     torch.testing.assert_close(first["boundary"][0, 3], first["boundary"][1, 2])

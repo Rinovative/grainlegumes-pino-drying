@@ -396,6 +396,9 @@ def generate_case_input_bundle(
             schedule,
             config.scientific_values["boundary_schedule"]["startup_ramp"],
             initial_temperature=float(values["T_init"]),
+            source_air_temperature=float(values["T_amb"]),
+            initial_dry_basis_moisture=fields.columns["X_0_db_field"],
+            oswin_parameters={name: values[name] for name in ("A_osw", "B_osw", "C_osw")},
             pressure=float(fixed["p_ref"]),
         )
 

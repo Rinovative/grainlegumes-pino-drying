@@ -23,7 +23,7 @@ The maintained entry configurations are:
 | --- | --- | ---: |
 | Paired Technical Smoke | `configs/generation/workflows/technical_smoke.yaml` | two ordinary two-case child campaigns |
 | Transient core benchmark | `configs/generation/benchmarks/transient_core_scaling/suite.yaml` | 8 successful measurements |
-| All-material pilot | `configs/generation/campaigns/transient_drying/material_pilot.yaml` | 18 cases |
+| All-material pilot | `configs/generation/campaigns/transient_drying/material_pilot.yaml` | mutable campaign-defined case count |
 | Transient production | `configs/generation/campaigns/transient_drying/family_generalization.yaml` | 600 cases |
 | Airflow ID Dataset | `configs/generation/campaigns/steady_flow/id_dataset.yaml` | 1,050 cases |
 
@@ -61,6 +61,51 @@ Run any maintained workflow in the foreground:
 
 Technical Smoke is optional and is not a prerequisite for another run. The core
 benchmark is standalone and does not read Smoke evidence.
+
+## Coupled transient startup handoff
+
+The maintained transient operation uses its existing `0.5 h` startup duration.
+Generation derives the exact equilibrium-RH field from the generated
+`X_0_db_field`, `T_init`, and material Oswin record, then sets the initial inlet
+RH five absolute percentage points below the driest cell. The active
+`schedule.csv` begins with `T_in_bc=T_init` and the humidity ratio obtained from
+that RH at package-fixed `p_ref`. Both primitive columns ramp to the unchanged
+canonical state at `0.5 h`; every canonical row after the rejoin remains
+unchanged.
+
+The final three-column schedule is the single handoff used by COMSOL,
+`case.json` evidence, canonical HDF5, and Dataset startup-support channels.
+Relative humidity remains derived after primitive interpolation. The fixed
+`0.05` policy is not sampled, does not alter case membership or seeds, and is
+not a neural-operator channel. The coupled handoff is the authoritative
+boundary-handoff version-`1` contract for regenerated data; all Generation
+schemas and the unchanged canonical schedule generator also remain at version
+`1`.
+
+Canonical generation and every canonical rejoin/later row retain the continuous
+RH envelope `[0.05, 0.85]`. A separate synthetic startup-design ceiling of
+`0.90` applies only to the post-generation deterministic handoff, so a very wet
+bed may start above `0.85` while the inlet remains five RH points below every
+initial cell. The COMSOL Oswin numerical clip remains `0.999`, and physical
+feasibility remains bounded by `1.0`. The startup ceiling does not broaden
+canonical candidate acceptance or deterministic resampling.
+
+The canonical humidity-ratio interval `[0.0025, 0.0145] kg/kg` remains the
+engineering-estimate source-air design envelope for stochastic generation, the
+canonical rejoin, and all later rows. It is not a universal thermodynamic limit.
+The deterministic startup humidity ratio is derived from its bed-referenced RH
+target and may exceed `0.0145 kg/kg`; it must still be finite, positive,
+consistent with `T_init` and `p_ref`, below the startup RH ceiling, and
+nonsupersaturated at the source-air temperature. No independent startup
+humidity-ratio ceiling or clipping is used.
+
+Generation fails before solver submission if the exact initial field, fixed
+margin, startup-only RH ceiling, thermodynamic conversion, source-air
+feasibility, canonical rejoin, or continuous startup RH violates its active
+bound. The canonical humidity-ratio engineering envelope remains authoritative
+for the rejoin and retained canonical rows. Generation never clips the startup
+target or humidity ratio, reduces the margin, lengthens the ramp, or repairs the
+canonical schedule.
 
 ## Common plan and lifecycle
 
@@ -242,11 +287,14 @@ missing, invoking the workflow config performs no new COMSOL solves.
 
 ## Core benchmark
 
-The benchmark is one fast production-oriented core-selection phase. It uses the
-same two deterministic scientific cases for every variant: one nominal/reference
-case and one nontrivial natural-support case. The variants are 4, 8, 16, and 32
-cores per case. Each wave runs its two cases concurrently, waits for both valid
-successful measurements, and only then enables the next wave. The resolved
+The benchmark is one fast production-oriented core-selection phase. Its dedicated
+`configs/generation/benchmarks/transient_core_scaling/benchmark_cases.yaml`
+configuration owns the same two deterministic scientific cases for every variant:
+one nominal/reference case and one nontrivial natural-support case. They resolve
+through the normal Generation machinery and do not depend on the material-pilot
+case count. The variants are 4, 8, 16, and 32 cores per case. Each wave runs
+its two cases concurrently, waits for both valid successful measurements, and
+only then enables the next wave. The resolved
 production-core variant runs first; the maintained production configuration
 currently uses 16 cores per case, so its variant is the canary wave. Remaining
 variant order comes from the resolved run plan rather than a hardcoded list. The

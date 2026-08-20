@@ -27,6 +27,7 @@ from typing import Any, Final
 
 import numpy as np
 
+from src import domain
 from src.generation.contracts import generation_contracts_profiles as profiles
 
 from . import generation_cases_seeding as seeding
@@ -45,6 +46,9 @@ _MAGNUS_TEMPERATURE_OFFSET_C = 243.04
 _RELATIVE_HUMIDITY_ROOT_TOLERANCE = 256.0 * np.finfo(np.float64).eps
 SCHEDULE_GENERATOR_VERSION: Final = 1
 COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
+STARTUP_RELATIVE_HUMIDITY_TOLERANCE: Final = 1.0e-12
+STARTUP_POLICY_ID: Final = "coupled_temperature_humidity_equilibrium_minimum_margin_v1"
+STARTUP_RELATIVE_HUMIDITY_MAX_BASIS: Final = "synthetic_startup_design_bound"
 CORRELATION_TOLERANCE: Final = 2.0e-12
 MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
 MINIMUM_EVENT_WIDTH_INTERVALS: Final = 2.0
@@ -129,21 +133,66 @@ class ComsolBoundarySchedule:
     metadata: dict[str, Any]
 
 
-def _startup_ramp_policy(value: Mapping[str, Any], *, regular_interval: float) -> tuple[bool, float]:
+@dataclass(frozen=True, slots=True)
+class InitialEquilibriumStartup:
+    """
+    Validated initial equilibrium-RH state and derived inlet target.
+
+    Attributes
+    ----------
+    minimum, mean, maximum : float
+        Exact equilibrium-RH field statistics over all packed-bed cells.
+    dry_margin : float
+        Configured absolute RH reduction from the global minimum.
+    target_relative_humidity : float
+        Initial inlet RH target.
+    startup_humidity_ratio : float
+        Initial primitive humidity ratio at the active reference pressure.
+    realized_minimum_margin : float
+        Smallest cell-to-inlet initial RH difference.
+    source_relative_humidity : float
+        Derived startup RH at the source-air temperature.
+
+    """
+
+    minimum: float
+    mean: float
+    maximum: float
+    dry_margin: float
+    target_relative_humidity: float
+    startup_humidity_ratio: float
+    realized_minimum_margin: float
+    source_relative_humidity: float
+
+
+def _startup_ramp_policy(value: Mapping[str, Any], *, regular_interval: float) -> tuple[bool, float, float, float]:
     """Return one validated startup-ramp policy."""
     if (
         not isinstance(value, Mapping)
-        or set(value) != {"enabled", "duration_h"}
+        or set(value) != {"enabled", "duration_h", "initial_equilibrium_rh_dry_margin", "max_relative_humidity"}
         or not isinstance(value["enabled"], bool)
         or isinstance(value["duration_h"], bool)
+        or isinstance(value["initial_equilibrium_rh_dry_margin"], bool)
+        or isinstance(value["max_relative_humidity"], bool)
     ):
-        msg = "Startup-ramp policy must contain exact boolean enabled and numeric duration_h values."
+        msg = (
+            "Startup-ramp policy must contain exact boolean enabled and numeric "
+            "duration_h, initial_equilibrium_rh_dry_margin, and max_relative_humidity values."
+        )
         raise ValueError(msg)
     duration_h = float(value["duration_h"])
     if not math.isfinite(duration_h) or not 0.0 < duration_h < regular_interval:
         msg = "Startup-ramp duration_h must be finite, positive, and shorter than the regular interval."
         raise ValueError(msg)
-    return value["enabled"], duration_h
+    dry_margin = float(value["initial_equilibrium_rh_dry_margin"])
+    if not math.isfinite(dry_margin) or not 0.0 < dry_margin < 1.0:
+        msg = "Startup initial-equilibrium RH dry margin must be finite and lie strictly inside (0, 1)."
+        raise ValueError(msg)
+    startup_relative_humidity_maximum = float(value["max_relative_humidity"])
+    if not math.isfinite(startup_relative_humidity_maximum) or not 0.0 < startup_relative_humidity_maximum <= 1.0:
+        msg = "Startup max_relative_humidity must be finite and lie inside (0, 1]."
+        raise ValueError(msg)
+    return value["enabled"], duration_h, dry_margin, startup_relative_humidity_maximum
 
 
 def _operational_bounds(metadata: Mapping[str, Any], name: str) -> tuple[float, float]:
@@ -159,44 +208,257 @@ def _operational_bounds(metadata: Mapping[str, Any], name: str) -> tuple[float, 
     return lower, upper
 
 
+def derive_initial_equilibrium_startup(
+    dry_basis_moisture: np.ndarray,
+    *,
+    initial_temperature: float,
+    source_air_temperature: float,
+    oswin_parameters: Mapping[str, Any],
+    dry_margin: float,
+    pressure: float,
+    startup_relative_humidity_maximum: float,
+) -> InitialEquilibriumStartup:
+    """
+    Derive the inlet startup state from the exact initial moisture field.
+
+    Parameters
+    ----------
+    dry_basis_moisture : numpy.ndarray
+        Exact generated dry-basis moisture field over valid packed-bed cells.
+    initial_temperature : float
+        Initial packed-bed and inlet temperature in kelvin.
+    source_air_temperature : float
+        Source-air temperature used for heater-only feasibility in kelvin.
+    oswin_parameters : Mapping[str, Any]
+        Exact A_osw, B_osw, and C_osw material coefficients.
+    dry_margin : float
+        Absolute RH reduction from the global equilibrium-field minimum.
+    pressure : float
+        Active absolute reference pressure in pascals.
+    startup_relative_humidity_maximum : float
+        Dedicated deterministic startup-handoff RH ceiling.
+
+    Returns
+    -------
+    InitialEquilibriumStartup
+        Validated field statistics and thermodynamic startup state.
+
+    Raises
+    ------
+    ValueError
+        If the field, sorption state, margin, psychrometric conversion, or
+        thermodynamic feasibility contract is invalid.
+
+    Notes
+    -----
+    The global minimum of the maintained inverse-Oswin field owns the target.
+    No clipping or sampled approximation is applied.
+
+    """
+    moisture = np.asarray(dry_basis_moisture, dtype=np.float64)
+    if moisture.size == 0 or not np.isfinite(moisture).all() or np.any(moisture < 0.0):
+        msg = "Initial dry-basis moisture field must contain finite non-negative packed-bed cells."
+        raise ValueError(msg)
+    if set(oswin_parameters) != {"A_osw", "B_osw", "C_osw"} or any(
+        isinstance(oswin_parameters[name], bool) or not isinstance(oswin_parameters[name], (int, float)) for name in oswin_parameters
+    ):
+        msg = "Initial equilibrium RH requires exact numeric A_osw, B_osw, and C_osw parameters."
+        raise ValueError(msg)
+    if (
+        not math.isfinite(initial_temperature)
+        or initial_temperature <= 0.0
+        or not math.isfinite(source_air_temperature)
+        or source_air_temperature <= 0.0
+        or not math.isfinite(dry_margin)
+        or not 0.0 < dry_margin < 1.0
+    ):
+        msg = "Startup temperatures must be positive and the absolute dry margin must lie strictly inside (0, 1)."
+        raise ValueError(msg)
+    if initial_temperature < source_air_temperature:
+        msg = "Startup inlet temperature cannot be below the source-air temperature under heater-only operation."
+        raise ValueError(msg)
+
+    equilibrium = domain.moisture.oswin_equilibrium_relative_humidity(
+        moisture,
+        initial_temperature,
+        a_osw=float(oswin_parameters["A_osw"]),
+        b_osw=float(oswin_parameters["B_osw"]),
+        c_osw=float(oswin_parameters["C_osw"]),
+    )
+    reconstructed = domain.moisture.oswin_equilibrium_dry_basis_moisture(
+        equilibrium,
+        initial_temperature,
+        a_osw=float(oswin_parameters["A_osw"]),
+        b_osw=float(oswin_parameters["B_osw"]),
+        c_osw=float(oswin_parameters["C_osw"]),
+    )
+    if not np.allclose(
+        reconstructed,
+        moisture,
+        rtol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+        atol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+    ):
+        msg = "Initial equilibrium RH field is inconsistent with the maintained modified-Oswin relation."
+        raise ValueError(msg)
+    minimum = float(np.min(equilibrium))
+    mean = float(np.mean(equilibrium))
+    maximum = float(np.max(equilibrium))
+    if (
+        not 0.0 <= minimum < 1.0
+        or not 0.0 <= maximum < 1.0
+        or mean < minimum - STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+        or mean > maximum + STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+    ):
+        msg = "Initial equilibrium RH statistics are non-finite or outside physical bounds."
+        raise ValueError(msg)
+
+    target = minimum - dry_margin
+    if not math.isfinite(startup_relative_humidity_maximum) or not 0.0 < startup_relative_humidity_maximum <= 1.0:
+        msg = "Startup-handoff relative-humidity maximum must be finite and lie inside (0, 1]."
+        raise ValueError(msg)
+    if not 0.0 < target < 1.0:
+        msg = (
+            "Initial equilibrium RH dry margin is infeasible: "
+            f"minimum={minimum!r}, requested_margin={dry_margin!r}, target={target!r}, violated_bound=(0, 1)."
+        )
+        raise ValueError(msg)
+    if target > startup_relative_humidity_maximum:
+        msg = (
+            "Initial equilibrium RH dry margin violates the startup-handoff RH maximum: "
+            f"minimum={minimum!r}, requested_margin={dry_margin!r}, target={target!r}, "
+            f"violated_bound=(0, {startup_relative_humidity_maximum!r}]."
+        )
+        raise ValueError(msg)
+
+    startup_humidity_ratio = float(
+        relative_humidity_to_humidity_ratio(
+            np.asarray([target], dtype=np.float64),
+            np.asarray([initial_temperature], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    if not math.isfinite(startup_humidity_ratio) or startup_humidity_ratio <= 0.0:
+        msg = "Initial equilibrium RH target produced a non-finite or non-positive startup humidity ratio."
+        raise ValueError(msg)
+    round_trip = float(
+        humidity_ratio_to_relative_humidity(
+            np.asarray([startup_humidity_ratio], dtype=np.float64),
+            np.asarray([initial_temperature], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    if not math.isclose(
+        round_trip,
+        target,
+        rel_tol=0.0,
+        abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+    ):
+        msg = (
+            "Startup relative-humidity psychrometric round trip failed: "
+            f"target={target!r}, humidity_ratio={startup_humidity_ratio!r}, derived={round_trip!r}."
+        )
+        raise ValueError(msg)
+    source_relative_humidity = float(
+        humidity_ratio_to_relative_humidity(
+            np.asarray([startup_humidity_ratio], dtype=np.float64),
+            np.asarray([source_air_temperature], dtype=np.float64),
+            pressure=pressure,
+        )[0]
+    )
+    if not 0.0 < source_relative_humidity <= 1.0:
+        msg = "Startup humidity ratio is infeasible for the maintained source-air temperature."
+        raise ValueError(msg)
+    realized_minimum_margin = float(np.min(equilibrium - target))
+    if realized_minimum_margin < dry_margin - STARTUP_RELATIVE_HUMIDITY_TOLERANCE:
+        msg = (
+            "Startup inlet RH does not preserve the requested dry margin for every initial packed-bed cell: "
+            f"realized={realized_minimum_margin!r}, requested={dry_margin!r}, "
+            f"tolerance={STARTUP_RELATIVE_HUMIDITY_TOLERANCE!r}."
+        )
+        raise ValueError(msg)
+    return InitialEquilibriumStartup(
+        minimum=minimum,
+        mean=mean,
+        maximum=maximum,
+        dry_margin=dry_margin,
+        target_relative_humidity=target,
+        startup_humidity_ratio=startup_humidity_ratio,
+        realized_minimum_margin=realized_minimum_margin,
+        source_relative_humidity=source_relative_humidity,
+    )
+
+
 def _startup_ramp_metadata(
     canonical_start: np.ndarray,
     *,
     enabled: bool,
     duration_h: float,
+    dry_margin: float,
+    startup_relative_humidity_maximum: float,
     initial_temperature: float,
     pressure: float,
+    startup: InitialEquilibriumStartup | None,
+    rejoin_row: np.ndarray | None,
+    startup_extrema: tuple[float, float] | None,
 ) -> dict[str, Any]:
     """Return truthful startup-ramp policy evidence."""
-    canonical_humidity_ratio = float(canonical_start[2])
-    boundary_start_temperature = initial_temperature if enabled else float(canonical_start[1])
-    startup_phi = float(
-        humidity_ratio_to_relative_humidity(
-            np.asarray([canonical_humidity_ratio], dtype=np.float64),
-            np.asarray([boundary_start_temperature], dtype=np.float64),
-            pressure=pressure,
-        )[0]
-    )
+    pressure_convention = {
+        "name": "p_ref",
+        "value": pressure,
+        "unit": "Pa",
+        "owner": "package_fixed",
+    }
     if not enabled:
+        canonical_phi = float(
+            humidity_ratio_to_relative_humidity(
+                np.asarray([float(canonical_start[2])], dtype=np.float64),
+                np.asarray([float(canonical_start[1])], dtype=np.float64),
+                pressure=pressure,
+            )[0]
+        )
         return {
+            "policy_id": STARTUP_POLICY_ID,
             "enabled": False,
             "duration_h": duration_h,
+            "initial_equilibrium_rh_dry_margin": dry_margin,
+            "startup_relative_humidity_max": startup_relative_humidity_maximum,
+            "startup_relative_humidity_max_basis": STARTUP_RELATIVE_HUMIDITY_MAX_BASIS,
             "temperature_start_policy": "disabled_retain_canonical_schedule",
-            "initial_temperature_K": initial_temperature,
-            "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
-            "startup_relative_humidity": startup_phi,
-            "humidity_start_policy": "disabled_derive_from_retained_canonical_primitives",
+            "humidity_start_policy": "disabled_retain_canonical_schedule",
+            "relative_humidity_policy": "derive_from_T_in_bc_and_omega_in_bc",
+            "canonical_start_relative_humidity": canonical_phi,
+            "pressure_convention": pressure_convention,
             "rejoin_policy": "not_applicable",
         }
+    if startup is None or rejoin_row is None or startup_extrema is None:
+        msg = "Enabled coupled startup metadata requires equilibrium state, rejoin state, and continuous RH extrema."
+        raise ValueError(msg)
     return {
+        "policy_id": STARTUP_POLICY_ID,
         "enabled": True,
         "duration_h": duration_h,
         "temperature_start_policy": "use_initial_temperature_exactly",
+        "humidity_start_policy": "derive_from_global_minimum_initial_equilibrium_rh_minus_absolute_margin",
+        "relative_humidity_policy": "derive_from_T_in_bc_and_omega_in_bc",
         "initial_temperature_K": initial_temperature,
-        "canonical_start_humidity_ratio_kg_per_kg": canonical_humidity_ratio,
-        "startup_relative_humidity": startup_phi,
-        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_derive_phi_in_bc",
-        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_derive_phi_in_bc",
+        "initial_equilibrium_rh_minimum": startup.minimum,
+        "initial_equilibrium_rh_mean": startup.mean,
+        "initial_equilibrium_rh_maximum": startup.maximum,
+        "initial_equilibrium_rh_dry_margin": startup.dry_margin,
+        "startup_relative_humidity_max": startup_relative_humidity_maximum,
+        "startup_relative_humidity_max_basis": STARTUP_RELATIVE_HUMIDITY_MAX_BASIS,
+        "startup_target_relative_humidity": startup.target_relative_humidity,
+        "startup_humidity_ratio_kg_per_kg": startup.startup_humidity_ratio,
+        "startup_source_relative_humidity": startup.source_relative_humidity,
+        "realized_minimum_initial_cell_to_inlet_rh_margin": startup.realized_minimum_margin,
+        "continuous_startup_relative_humidity_minimum": startup_extrema[0],
+        "continuous_startup_relative_humidity_maximum": startup_extrema[1],
+        "relative_humidity_tolerance": STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+        "canonical_rejoin_time_h": float(rejoin_row[0]),
+        "canonical_rejoin_temperature_K": float(rejoin_row[1]),
+        "canonical_rejoin_humidity_ratio_kg_per_kg": float(rejoin_row[2]),
+        "pressure_convention": pressure_convention,
+        "rejoin_policy": "linearly_interpolate_both_primitives_to_unchanged_canonical_state",
     }
 
 
@@ -225,12 +487,13 @@ def _boundary_handoff_metadata(
     }
 
 
-def validate_comsol_boundary_schedule(
+def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centralized primitive and derived-RH validation
     schedule_values: np.ndarray,
     *,
     regular_times: np.ndarray,
     startup_ramp: Mapping[str, Any],
     initial_temperature: float,
+    source_air_temperature: float,
     pressure: float,
     metadata: Mapping[str, Any],
 ) -> None:
@@ -254,7 +517,10 @@ def validate_comsol_boundary_schedule(
     ):
         msg = "COMSOL boundary handoff requires a regular canonical grid beginning at t=0."
         raise ValueError(msg)
-    enabled, duration_h = _startup_ramp_policy(startup_ramp, regular_interval=regular_interval)
+    enabled, duration_h, dry_margin, startup_relative_humidity_maximum = _startup_ramp_policy(
+        startup_ramp,
+        regular_interval=regular_interval,
+    )
     expected_times = np.concatenate((regular[:1], [duration_h], regular[1:])) if enabled else regular
     if (
         values.ndim != _TABLE_RANK
@@ -265,12 +531,18 @@ def validate_comsol_boundary_schedule(
     ):
         msg = "COMSOL boundary schedule has invalid shape, times, ordering, or finite values."
         raise ValueError(msg)
-    if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
-        msg = "COMSOL startup temperature source must be finite and physically positive."
+    if (
+        not math.isfinite(initial_temperature)
+        or initial_temperature <= 0.0
+        or not math.isfinite(source_air_temperature)
+        or source_air_temperature <= 0.0
+    ):
+        msg = "COMSOL startup and source-air temperatures must be finite and physically positive."
         raise ValueError(msg)
     if np.any(values[:, 1] <= 0.0) or np.any(values[:, 2] <= 0.0):
         msg = "COMSOL boundary temperature or humidity ratio is physically invalid."
         raise ValueError(msg)
+
     temperature_minimum, temperature_maximum = _operational_bounds(
         metadata,
         "temperature_operational_bounds",
@@ -320,7 +592,7 @@ def validate_comsol_boundary_schedule(
 
     source_phi = humidity_ratio_to_relative_humidity(
         values[:, 2],
-        np.full(values.shape[0], initial_temperature, dtype=np.float64),
+        np.full(values.shape[0], source_air_temperature, dtype=np.float64),
         pressure=pressure,
     )
     physical_phi_minimum, physical_phi_maximum = derived_relative_humidity_extrema(
@@ -330,35 +602,203 @@ def validate_comsol_boundary_schedule(
     )
     if (
         np.any((source_phi <= 0.0) | (source_phi > 1.0))
-        or np.any(values[:, 1] < initial_temperature)
+        or np.any(values[:, 1] < source_air_temperature)
         or physical_phi_minimum <= 0.0
         or physical_phi_maximum > 1.0
     ):
         msg = "COMSOL boundary schedule violates heater-only or physical humidity constraints."
         raise ValueError(msg)
 
+    startup_metadata = handoff["startup_ramp"]
+    if not isinstance(startup_metadata, Mapping):
+        msg = "COMSOL startup-ramp provenance must be a mapping."
+        raise TypeError(msg)
     if enabled:
+        expected_startup_keys = {
+            "policy_id",
+            "enabled",
+            "duration_h",
+            "temperature_start_policy",
+            "humidity_start_policy",
+            "relative_humidity_policy",
+            "initial_temperature_K",
+            "initial_equilibrium_rh_minimum",
+            "initial_equilibrium_rh_mean",
+            "initial_equilibrium_rh_maximum",
+            "initial_equilibrium_rh_dry_margin",
+            "startup_relative_humidity_max",
+            "startup_relative_humidity_max_basis",
+            "startup_target_relative_humidity",
+            "startup_humidity_ratio_kg_per_kg",
+            "startup_source_relative_humidity",
+            "realized_minimum_initial_cell_to_inlet_rh_margin",
+            "continuous_startup_relative_humidity_minimum",
+            "continuous_startup_relative_humidity_maximum",
+            "relative_humidity_tolerance",
+            "canonical_rejoin_time_h",
+            "canonical_rejoin_temperature_K",
+            "canonical_rejoin_humidity_ratio_kg_per_kg",
+            "pressure_convention",
+            "rejoin_policy",
+        }
+        if set(startup_metadata) != expected_startup_keys:
+            msg = "Enabled coupled startup-ramp provenance has invalid fields."
+            raise ValueError(msg)
         fraction = duration_h / regular_interval
         expected_rejoin = canonical_start + fraction * (values[2] - canonical_start)
         expected_rejoin[0] = duration_h
         rejoin_row = np.asarray(handoff["rejoin_row"], dtype=np.float64)
-        expected_startup_metadata = _startup_ramp_metadata(
-            canonical_start,
-            enabled=True,
-            duration_h=duration_h,
-            initial_temperature=initial_temperature,
-            pressure=pressure,
-        )
         if (
-            handoff["startup_ramp"] != expected_startup_metadata
-            or values[0, 1] != initial_temperature
-            or values[0, 2] != canonical_start[2]
+            values[0, 1] != initial_temperature
             or rejoin_row.shape != (len(profiles.SCHEDULE_FIELDS),)
             or not np.array_equal(values[1], expected_rejoin)
             or not np.array_equal(rejoin_row, expected_rejoin)
             or not np.array_equal(values[2:, 0], regular[1:])
         ):
-            msg = "COMSOL startup node, rejoin node, or retained regular nodes are invalid."
+            msg = "COMSOL startup node, canonical rejoin node, or retained regular nodes are invalid."
+            raise ValueError(msg)
+
+        numeric_names = (
+            "initial_equilibrium_rh_minimum",
+            "initial_equilibrium_rh_mean",
+            "initial_equilibrium_rh_maximum",
+            "initial_equilibrium_rh_dry_margin",
+            "startup_relative_humidity_max",
+            "startup_target_relative_humidity",
+            "startup_humidity_ratio_kg_per_kg",
+            "startup_source_relative_humidity",
+            "realized_minimum_initial_cell_to_inlet_rh_margin",
+            "continuous_startup_relative_humidity_minimum",
+            "continuous_startup_relative_humidity_maximum",
+            "relative_humidity_tolerance",
+            "canonical_rejoin_time_h",
+            "canonical_rejoin_temperature_K",
+            "canonical_rejoin_humidity_ratio_kg_per_kg",
+        )
+        if any(
+            isinstance(startup_metadata[name], bool)
+            or not isinstance(startup_metadata[name], (int, float))
+            or not math.isfinite(float(startup_metadata[name]))
+            for name in numeric_names
+        ):
+            msg = "Enabled coupled startup-ramp provenance contains invalid numeric evidence."
+            raise ValueError(msg)
+        initial_minimum = float(startup_metadata["initial_equilibrium_rh_minimum"])
+        initial_mean = float(startup_metadata["initial_equilibrium_rh_mean"])
+        initial_maximum = float(startup_metadata["initial_equilibrium_rh_maximum"])
+        target = float(startup_metadata["startup_target_relative_humidity"])
+        startup_humidity_ratio = float(startup_metadata["startup_humidity_ratio_kg_per_kg"])
+        realized_margin = float(startup_metadata["realized_minimum_initial_cell_to_inlet_rh_margin"])
+        startup_extrema = derived_relative_humidity_extrema(
+            values[:2, 1],
+            values[:2, 2],
+            pressure=pressure,
+        )
+        round_trip = float(
+            humidity_ratio_to_relative_humidity(
+                values[:1, 2],
+                values[:1, 1],
+                pressure=pressure,
+            )[0]
+        )
+        expected_pressure = {
+            "name": "p_ref",
+            "value": pressure,
+            "unit": "Pa",
+            "owner": "package_fixed",
+        }
+        evidence_matches = (
+            startup_metadata["policy_id"] == STARTUP_POLICY_ID
+            and startup_metadata["enabled"] is True
+            and float(startup_metadata["duration_h"]) == duration_h
+            and startup_metadata["temperature_start_policy"] == "use_initial_temperature_exactly"
+            and startup_metadata["humidity_start_policy"] == "derive_from_global_minimum_initial_equilibrium_rh_minus_absolute_margin"
+            and startup_metadata["relative_humidity_policy"] == "derive_from_T_in_bc_and_omega_in_bc"
+            and float(startup_metadata["initial_temperature_K"]) == initial_temperature
+            and float(startup_metadata["initial_equilibrium_rh_dry_margin"]) == dry_margin
+            and float(startup_metadata["startup_relative_humidity_max"]) == startup_relative_humidity_maximum
+            and startup_metadata["startup_relative_humidity_max_basis"] == STARTUP_RELATIVE_HUMIDITY_MAX_BASIS
+            and float(startup_metadata["relative_humidity_tolerance"]) == STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+            and startup_metadata["pressure_convention"] == expected_pressure
+            and startup_metadata["rejoin_policy"] == "linearly_interpolate_both_primitives_to_unchanged_canonical_state"
+            and float(startup_metadata["canonical_rejoin_time_h"]) == rejoin_row[0]
+            and float(startup_metadata["canonical_rejoin_temperature_K"]) == rejoin_row[1]
+            and float(startup_metadata["canonical_rejoin_humidity_ratio_kg_per_kg"]) == rejoin_row[2]
+            and values[0, 2] == startup_humidity_ratio
+            and math.isclose(
+                float(startup_metadata["startup_source_relative_humidity"]),
+                float(source_phi[0]),
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+            and math.isclose(
+                float(startup_metadata["continuous_startup_relative_humidity_minimum"]),
+                startup_extrema[0],
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+            and math.isclose(
+                float(startup_metadata["continuous_startup_relative_humidity_maximum"]),
+                startup_extrema[1],
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+        )
+        if not evidence_matches:
+            msg = "Coupled startup-ramp provenance disagrees with the primitive boundary schedule."
+            raise ValueError(msg)
+        if (
+            not 0.0 <= initial_minimum < 1.0
+            or not 0.0 <= initial_maximum < 1.0
+            or initial_mean < initial_minimum - STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+            or initial_mean > initial_maximum + STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+            or not math.isclose(
+                target,
+                initial_minimum - dry_margin,
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+            or not math.isclose(
+                realized_margin,
+                initial_minimum - target,
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+            or realized_margin < dry_margin - STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+            or not math.isclose(
+                round_trip,
+                target,
+                rel_tol=0.0,
+                abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+            )
+            or not 0.0 < target <= startup_relative_humidity_maximum
+            or startup_humidity_ratio <= 0.0
+        ):
+            msg = "Coupled startup target violates its equilibrium-margin, round-trip, or startup RH contract."
+            raise ValueError(msg)
+        if startup_extrema[0] <= 0.0 or startup_extrema[1] > startup_relative_humidity_maximum + STARTUP_RELATIVE_HUMIDITY_TOLERANCE:
+            msg = (
+                "Continuous startup relative humidity violates the dedicated startup-handoff envelope: "
+                f"minimum={startup_extrema[0]!r}, maximum={startup_extrema[1]!r}, "
+                f"allowed_interval=(0, {startup_relative_humidity_maximum!r}], "
+                f"tolerance={STARTUP_RELATIVE_HUMIDITY_TOLERANCE!r}."
+            )
+            raise ValueError(msg)
+        if startup_extrema[1] > target + STARTUP_RELATIVE_HUMIDITY_TOLERANCE:
+            rejoin_phi = float(
+                humidity_ratio_to_relative_humidity(
+                    values[1:2, 2],
+                    values[1:2, 1],
+                    pressure=pressure,
+                )[0]
+            )
+            msg = (
+                "Canonical startup rejoin violates the fixed dry-margin contract: "
+                f"rejoin_time_h={rejoin_row[0]!r}, rejoin_temperature_K={rejoin_row[1]!r}, "
+                f"rejoin_humidity_ratio={rejoin_row[2]!r}, rejoin_relative_humidity={rejoin_phi!r}, "
+                f"continuous_maximum={startup_extrema[1]!r}, allowed_maximum={target!r}, "
+                f"tolerance={STARTUP_RELATIVE_HUMIDITY_TOLERANCE!r}."
+            )
             raise ValueError(msg)
         canonical_rows = np.concatenate(
             (canonical_start[np.newaxis, :], values[2:]),
@@ -369,14 +809,15 @@ def validate_comsol_boundary_schedule(
             canonical_start,
             enabled=False,
             duration_h=duration_h,
+            dry_margin=dry_margin,
+            startup_relative_humidity_maximum=startup_relative_humidity_maximum,
             initial_temperature=initial_temperature,
             pressure=pressure,
+            startup=None,
+            rejoin_row=None,
+            startup_extrema=None,
         )
-        if (
-            handoff["startup_ramp"] != expected_startup_metadata
-            or handoff["rejoin_row"] is not None
-            or not np.array_equal(values[0], canonical_start)
-        ):
+        if dict(startup_metadata) != expected_startup_metadata or handoff["rejoin_row"] is not None or not np.array_equal(values[0], canonical_start):
             msg = "Disabled COMSOL startup ramp must retain the canonical schedule exactly."
             raise ValueError(msg)
         canonical_rows = values
@@ -401,9 +842,12 @@ def build_comsol_boundary_schedule(
     startup_ramp: Mapping[str, Any],
     *,
     initial_temperature: float,
+    source_air_temperature: float,
+    initial_dry_basis_moisture: np.ndarray | None,
+    oswin_parameters: Mapping[str, Any] | None,
     pressure: float,
 ) -> ComsolBoundarySchedule:
-    """Apply the configured startup handoff to primitive schedule values."""
+    """Apply the configured startup handoff to both primitive schedule values."""
     canonical_values = np.asarray(canonical.values, dtype=np.float64)
     if (
         canonical_values.ndim != _TABLE_RANK
@@ -415,30 +859,62 @@ def build_comsol_boundary_schedule(
         raise ValueError(msg)
     regular_times = canonical_values[:, 0]
     regular_interval = float(regular_times[1] - regular_times[0])
-    enabled, duration_h = _startup_ramp_policy(startup_ramp, regular_interval=regular_interval)
-    if not math.isfinite(initial_temperature) or initial_temperature <= 0.0:
-        msg = "COMSOL startup temperature source must be finite and physically positive."
+    enabled, duration_h, dry_margin, startup_relative_humidity_maximum = _startup_ramp_policy(
+        startup_ramp,
+        regular_interval=regular_interval,
+    )
+    if (
+        not math.isfinite(initial_temperature)
+        or initial_temperature <= 0.0
+        or not math.isfinite(source_air_temperature)
+        or source_air_temperature <= 0.0
+    ):
+        msg = "COMSOL startup and source-air temperatures must be finite and physically positive."
         raise ValueError(msg)
+
     rejoin_row: np.ndarray | None = None
     startup_metadata: dict[str, Any]
     if enabled:
+        if initial_dry_basis_moisture is None or oswin_parameters is None:
+            msg = "Enabled coupled startup requires the exact initial moisture field and modified-Oswin parameters."
+            raise ValueError(msg)
+        startup = derive_initial_equilibrium_startup(
+            initial_dry_basis_moisture,
+            initial_temperature=initial_temperature,
+            source_air_temperature=source_air_temperature,
+            oswin_parameters=oswin_parameters,
+            dry_margin=dry_margin,
+            pressure=pressure,
+            startup_relative_humidity_maximum=startup_relative_humidity_maximum,
+        )
         fraction = duration_h / regular_interval
         constructed_rejoin = canonical_values[0] + fraction * (canonical_values[1] - canonical_values[0])
         constructed_rejoin[0] = duration_h
-        startup_metadata = _startup_ramp_metadata(
-            canonical_values[0],
-            enabled=True,
-            duration_h=duration_h,
-            initial_temperature=initial_temperature,
-            pressure=pressure,
-        )
         start_row = canonical_values[0].copy()
         start_row[1] = initial_temperature
+        start_row[2] = startup.startup_humidity_ratio
         handoff_values = np.concatenate(
             (start_row[np.newaxis, :], constructed_rejoin[np.newaxis, :], canonical_values[1:]),
             axis=0,
         )
         rejoin_row = constructed_rejoin
+        startup_extrema = derived_relative_humidity_extrema(
+            handoff_values[:2, 1],
+            handoff_values[:2, 2],
+            pressure=pressure,
+        )
+        startup_metadata = _startup_ramp_metadata(
+            canonical_values[0],
+            enabled=True,
+            duration_h=duration_h,
+            dry_margin=dry_margin,
+            startup_relative_humidity_maximum=startup_relative_humidity_maximum,
+            initial_temperature=initial_temperature,
+            pressure=pressure,
+            startup=startup,
+            rejoin_row=rejoin_row,
+            startup_extrema=startup_extrema,
+        )
         if not np.array_equal(handoff_values[2:], canonical_values[1:]):
             msg = "COMSOL startup transformation changed retained canonical regular nodes."
             raise RuntimeError(msg)
@@ -448,8 +924,13 @@ def build_comsol_boundary_schedule(
             canonical_values[0],
             enabled=False,
             duration_h=duration_h,
+            dry_margin=dry_margin,
+            startup_relative_humidity_maximum=startup_relative_humidity_maximum,
             initial_temperature=initial_temperature,
             pressure=pressure,
+            startup=None,
+            rejoin_row=None,
+            startup_extrema=None,
         )
     metadata = copy.deepcopy(canonical.metadata)
     metadata["boundary_handoff"] = _boundary_handoff_metadata(
@@ -463,6 +944,7 @@ def build_comsol_boundary_schedule(
         regular_times=regular_times,
         startup_ramp=startup_ramp,
         initial_temperature=initial_temperature,
+        source_air_temperature=source_air_temperature,
         pressure=pressure,
         metadata=metadata,
     )

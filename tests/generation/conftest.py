@@ -128,6 +128,18 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     for material_family in (_TEST_MATERIAL_FAMILY,):
         source = repository_root / "configs/generation/materials" / f"{material_family}.yaml"
         material = yaml.safe_load(source.read_text(encoding="utf-8"))
+        material["oswin"]["record_id"] = "test_owned_lentil_oswin_v1"
+        material["oswin"]["components"]["C_osw"] = 0.8
+        material["oswin"]["provenance"].update(
+            {
+                "evidence": "synthetic_design",
+                "source_refs": [],
+                "method": (
+                    "Test-owned non-default sorption record chosen to keep compact "
+                    "synthetic startup cases inside their authored operational envelope."
+                ),
+            }
+        )
         (materials_root / f"{material_family}.yaml").write_text(
             yaml.safe_dump(material, sort_keys=False),
             encoding="utf-8",
@@ -196,6 +208,8 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         operations["boundary_schedule"]["startup_ramp"] = {
             "enabled": startup_ramp_enabled,
             "duration_h": startup_ramp_duration_h,
+            "initial_equilibrium_rh_dry_margin": 0.05,
+            "max_relative_humidity": 0.90,
         }
         template_relative_path = f"templates/{simulation_profile}_{campaign_number}.mph"
         template_path = project_root / template_relative_path

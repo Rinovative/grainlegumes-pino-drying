@@ -1376,7 +1376,7 @@ def _validate_operations(
     )
     _exact_keys(
         startup_ramp,
-        required={"enabled", "duration_h"},
+        required={"enabled", "duration_h", "initial_equilibrium_rh_dry_margin", "max_relative_humidity"},
         optional=set(),
         label="operations.boundary_schedule.startup_ramp",
     )
@@ -1391,9 +1391,25 @@ def _validate_operations(
     if not 0.0 < duration_h < regular_interval:
         message = "operations.boundary_schedule.startup_ramp.duration_h must be strictly positive and shorter than common.time.interval."
         raise GenerationConfigError(message)
+    dry_margin = _finite(
+        startup_ramp["initial_equilibrium_rh_dry_margin"],
+        label="operations.boundary_schedule.startup_ramp.initial_equilibrium_rh_dry_margin",
+    )
+    if not 0.0 < dry_margin < 1.0:
+        message = "operations.boundary_schedule.startup_ramp.initial_equilibrium_rh_dry_margin must lie strictly inside (0, 1)."
+        raise GenerationConfigError(message)
+    startup_relative_humidity_maximum = _finite(
+        startup_ramp["max_relative_humidity"],
+        label="operations.boundary_schedule.startup_ramp.max_relative_humidity",
+    )
+    if not 0.0 < startup_relative_humidity_maximum <= 1.0:
+        message = "operations.boundary_schedule.startup_ramp.max_relative_humidity must lie inside (0, 1]."
+        raise GenerationConfigError(message)
     boundary_schedule["startup_ramp"] = {
         "enabled": startup_ramp["enabled"],
         "duration_h": duration_h,
+        "initial_equilibrium_rh_dry_margin": dry_margin,
+        "max_relative_humidity": startup_relative_humidity_maximum,
     }
     operations["boundary_schedule"] = boundary_schedule
 

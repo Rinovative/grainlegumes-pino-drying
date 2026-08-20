@@ -4,12 +4,12 @@ suite_name: transient_core_scaling
 benchmark_mode: core_selection
 representative_cases:
 - case_role: nominal
-  campaign_config: configs/generation/campaigns/transient_drying/material_pilot.yaml
+  campaign_config: configs/generation/benchmarks/transient_core_scaling/benchmark_cases.yaml
   material_family: lentil
   sampling_regime: natural
   case_index: 1
 - case_role: natural
-  campaign_config: configs/generation/campaigns/transient_drying/material_pilot.yaml
+  campaign_config: configs/generation/benchmarks/transient_core_scaling/benchmark_cases.yaml
   material_family: lentil
   sampling_regime: natural
   case_index: 2

@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from src import domain
 from src.generation.cases import generation_cases_schedule as schedule_service
 
 _TIME = {
@@ -25,6 +26,7 @@ _FIXED = {
     "phi_clip_min": 1.0e-6,
     "phi_clip_max": 0.999,
 }
+_OSWIN = {"A_osw": 12.06202053, "B_osw": -0.0573838, "C_osw": 0.34338283}
 _SEEDS = {"schedule_shared": 918273, "schedule_independent": 564738}
 
 
@@ -55,6 +57,76 @@ def _schedule(**overrides: Any) -> schedule_service.Schedule:
     )
 
 
+def _policy(
+    *,
+    enabled: bool = True,
+    duration_h: float = 0.5,
+    max_relative_humidity: float = 0.90,
+) -> dict[str, float | bool]:
+    return {
+        "enabled": enabled,
+        "duration_h": duration_h,
+        "initial_equilibrium_rh_dry_margin": 0.05,
+        "max_relative_humidity": max_relative_humidity,
+    }
+
+
+def _initial_moisture(
+    relative_humidity: np.ndarray,
+    *,
+    initial_temperature: float,
+) -> np.ndarray:
+    return domain.moisture.oswin_equilibrium_dry_basis_moisture(
+        relative_humidity,
+        initial_temperature,
+        a_osw=_OSWIN["A_osw"],
+        b_osw=_OSWIN["B_osw"],
+        c_osw=_OSWIN["C_osw"],
+    )
+
+
+def _build_handoff(
+    canonical: schedule_service.Schedule,
+    *,
+    initial_temperature: float = 293.15,
+    source_air_temperature: float | None = None,
+    equilibrium_relative_humidity: np.ndarray | None = None,
+    enabled: bool = True,
+    max_relative_humidity: float = 0.90,
+) -> schedule_service.ComsolBoundarySchedule:
+    if equilibrium_relative_humidity is None:
+        equilibrium_relative_humidity = np.asarray(
+            ((0.825, 0.852), (0.841, 0.872)),
+            dtype=np.float64,
+        )
+    return schedule_service.build_comsol_boundary_schedule(
+        canonical,
+        _policy(enabled=enabled, max_relative_humidity=max_relative_humidity),
+        initial_temperature=initial_temperature,
+        source_air_temperature=(initial_temperature if source_air_temperature is None else source_air_temperature),
+        initial_dry_basis_moisture=_initial_moisture(
+            equilibrium_relative_humidity,
+            initial_temperature=initial_temperature,
+        ),
+        oswin_parameters=_OSWIN,
+        pressure=float(_FIXED["p_ref"]),
+    )
+
+
+def _simple_canonical(values: np.ndarray) -> schedule_service.Schedule:
+    return schedule_service.Schedule(
+        values=values,
+        metadata={
+            "temperature_operational_bounds": [_FIXED["T_in_min"], _FIXED["T_in_max"]],
+            "humidity_ratio_operational_bounds": [_FIXED["omega_min"], _FIXED["omega_max"]],
+            "relative_humidity_operational_bounds": [
+                _FIXED["phi_operational_min"],
+                _FIXED["phi_operational_max"],
+            ],
+        },
+    )
+
+
 def test_schedule_replays_deterministically() -> None:
     """Reproduce the same scientific schedule from the same explicit seeds."""
     first = _schedule()
@@ -63,25 +135,272 @@ def test_schedule_replays_deterministically() -> None:
     np.testing.assert_array_equal(first.values, second.values)
 
 
+def test_canonical_schedule_rejects_relative_humidity_above_maintained_maximum() -> None:
+    """Keep the startup-only ceiling out of canonical candidate acceptance."""
+    temperature = 290.15
+    humidity_ratio = float(
+        schedule_service.relative_humidity_to_humidity_ratio(
+            np.asarray([0.86], dtype=np.float64),
+            np.asarray([temperature], dtype=np.float64),
+            pressure=float(_FIXED["p_ref"]),
+        )[0]
+    )
+
+    with pytest.raises(ValueError, match=r"continuous operating envelope \[0\.05, 0\.85\]"):
+        _schedule(
+            T_in_base=temperature,
+            T_in_amp=0.0,
+            omega_in_base=humidity_ratio,
+            omega_in_amp=0.0,
+            T_amb=temperature,
+        )
+
+
+def test_canonical_schedule_rejects_humidity_ratio_above_maintained_maximum() -> None:
+    """Keep the canonical stochastic humidity-ratio engineering envelope."""
+    accepted = _schedule(omega_in_base=0.0145, omega_in_amp=0.0)
+    assert float(np.max(accepted.values[:, 2])) == 0.0145
+
+    with pytest.raises(ValueError, match="source-air engineering envelope"):
+        _schedule(omega_in_base=0.0146, omega_in_amp=0.0)
+
+
+def test_startup_ceiling_does_not_change_canonical_realization() -> None:
+    """Keep startup policy out of canonical acceptance and deterministic resampling."""
+    canonical = _schedule()
+    canonical_values = canonical.values.copy()
+    canonical_diagnostics = canonical.diagnostics.copy()
+
+    first = _build_handoff(canonical, max_relative_humidity=0.90)
+    second = _build_handoff(canonical, max_relative_humidity=0.95)
+
+    np.testing.assert_array_equal(canonical.values, canonical_values)
+    assert canonical.diagnostics == canonical_diagnostics
+    np.testing.assert_array_equal(first.values, second.values)
+    assert canonical.metadata["relative_humidity_operational_bounds"] == [0.05, 0.85]
+    assert first.metadata["boundary_handoff"]["startup_ramp"]["startup_relative_humidity_max"] == 0.90
+    assert second.metadata["boundary_handoff"]["startup_ramp"]["startup_relative_humidity_max"] == 0.95
+
+
+@pytest.mark.parametrize(
+    ("initial_temperature", "equilibrium_minimum", "expected_target"),
+    [
+        (294.02023891487676, 0.9150037786093982, 0.8650037786093981),
+        (288.72816040244123, 0.9075541364185941, 0.857554136418594),
+    ],
+)
+def test_enabled_startup_allows_target_between_canonical_and_startup_maximum(
+    initial_temperature: float,
+    equilibrium_minimum: float,
+    expected_target: float,
+) -> None:
+    """Admit smoke-equivalent startup RH above 0.85 without widening canonical RH."""
+    equilibrium = np.asarray((equilibrium_minimum, 0.96, 0.97), dtype=np.float64)
+    handoff = _build_handoff(
+        _schedule(T_amb=initial_temperature),
+        initial_temperature=initial_temperature,
+        equilibrium_relative_humidity=equilibrium,
+    )
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+
+    assert startup["startup_target_relative_humidity"] == expected_target
+    assert 0.85 < startup["startup_target_relative_humidity"] < startup["startup_relative_humidity_max"]
+    assert startup["realized_minimum_initial_cell_to_inlet_rh_margin"] >= (0.05 - schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
+    assert startup["continuous_startup_relative_humidity_maximum"] <= (
+        startup["startup_target_relative_humidity"] + schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+    )
+    assert startup["startup_relative_humidity_max_basis"] == "synthetic_startup_design_bound"
+    assert handoff.metadata["relative_humidity_operational_bounds"] == [0.05, 0.85]
+
+
+def test_deterministic_startup_may_exceed_canonical_humidity_ratio_without_clipping() -> None:
+    """Apply canonical omega bounds only after the deterministic startup row."""
+    initial_temperature = 303.15
+    equilibrium = np.asarray((0.85, 0.87, 0.89), dtype=np.float64)
+    canonical = _schedule(T_amb=initial_temperature)
+    canonical_values = canonical.values.copy()
+    handoff = _build_handoff(
+        canonical,
+        initial_temperature=initial_temperature,
+        equilibrium_relative_humidity=equilibrium,
+    )
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+    expected_target = float(np.min(equilibrium)) - 0.05
+    expected_omega = float(
+        schedule_service.relative_humidity_to_humidity_ratio(
+            np.asarray([expected_target], dtype=np.float64),
+            np.asarray([initial_temperature], dtype=np.float64),
+            pressure=float(_FIXED["p_ref"]),
+        )[0]
+    )
+
+    assert expected_omega > _FIXED["omega_max"]
+    assert handoff.values[0, 2] == expected_omega
+    assert startup["startup_humidity_ratio_kg_per_kg"] == expected_omega
+    assert startup["startup_target_relative_humidity"] == pytest.approx(expected_target)
+    assert startup["realized_minimum_initial_cell_to_inlet_rh_margin"] >= (0.05 - schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
+    assert startup["continuous_startup_relative_humidity_maximum"] <= 0.90
+    np.testing.assert_array_equal(canonical.values, canonical_values)
+    np.testing.assert_array_equal(handoff.values[2:], canonical.values[1:])
+    assert np.all(handoff.values[1:, 2] <= _FIXED["omega_max"])
+
+
+def test_enabled_startup_above_dedicated_maximum_fails_without_clipping() -> None:
+    """Reject the exact target above 0.90 instead of clipping or reducing margin."""
+    equilibrium = np.asarray((0.96, 0.97, 0.98), dtype=np.float64)
+
+    with pytest.raises(ValueError, match=r"target=0\.9099999999999999.*violated_bound=\(0, 0\.9\]"):
+        _build_handoff(
+            _schedule(),
+            equilibrium_relative_humidity=equilibrium,
+        )
+
+
+def test_initial_equilibrium_startup_uses_inverse_oswin_and_global_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use every exact packed-bed cell and let the global minimum own the target."""
+    equilibrium = np.asarray(((0.70, 0.90), (0.82, 0.78)), dtype=np.float64)
+    moisture = _initial_moisture(equilibrium, initial_temperature=293.15)
+    original = domain.moisture.oswin_equilibrium_relative_humidity
+    calls = 0
+
+    def tracked_inverse(*args: Any, **kwargs: Any) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        domain.moisture,
+        "oswin_equilibrium_relative_humidity",
+        tracked_inverse,
+    )
+    state = schedule_service.derive_initial_equilibrium_startup(
+        moisture,
+        initial_temperature=293.15,
+        source_air_temperature=293.15,
+        oswin_parameters=_OSWIN,
+        dry_margin=0.05,
+        pressure=float(_FIXED["p_ref"]),
+        startup_relative_humidity_maximum=0.90,
+    )
+
+    assert calls == 1
+    assert state.minimum == pytest.approx(float(np.min(equilibrium)))
+    assert state.mean == pytest.approx(float(np.mean(equilibrium)))
+    assert state.maximum == pytest.approx(float(np.max(equilibrium)))
+    assert state.target_relative_humidity == pytest.approx(0.65)
+    assert state.realized_minimum_margin >= (0.05 - schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
+    mean_based_target = float(np.mean(equilibrium)) - 0.05
+    assert float(np.min(equilibrium)) - mean_based_target < 0.05
+
+
+def test_homogeneous_initial_equilibrium_field_preserves_absolute_margin() -> None:
+    """Preserve five absolute RH percentage points for every homogeneous cell."""
+    equilibrium = np.full((2, 3), 0.81, dtype=np.float64)
+    state = schedule_service.derive_initial_equilibrium_startup(
+        _initial_moisture(equilibrium, initial_temperature=293.15),
+        initial_temperature=293.15,
+        source_air_temperature=293.15,
+        oswin_parameters=_OSWIN,
+        dry_margin=0.05,
+        pressure=float(_FIXED["p_ref"]),
+        startup_relative_humidity_maximum=0.90,
+    )
+
+    assert state.target_relative_humidity == pytest.approx(0.76)
+    assert state.realized_minimum_margin == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize(
+    "moisture",
+    [
+        np.asarray([], dtype=np.float64),
+        np.asarray([np.nan], dtype=np.float64),
+        np.asarray([-0.1], dtype=np.float64),
+    ],
+)
+def test_initial_equilibrium_startup_rejects_invalid_fields(
+    moisture: np.ndarray,
+) -> None:
+    """Fail closed for empty, non-finite, and physically invalid moisture fields."""
+    with pytest.raises(ValueError, match=r"moisture|Modified-Oswin"):
+        schedule_service.derive_initial_equilibrium_startup(
+            moisture,
+            initial_temperature=293.15,
+            source_air_temperature=293.15,
+            oswin_parameters=_OSWIN,
+            dry_margin=0.05,
+            pressure=float(_FIXED["p_ref"]),
+            startup_relative_humidity_maximum=0.90,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "initial_temperature",
+        "equilibrium_values",
+        "expected_target",
+        "expected_omega",
+    ),
+    [
+        (293.15, (0.825, 0.859, 0.872), 0.775, 0.011301991584801987),
+        (288.37, (0.776, 0.827, 0.848), 0.726, 0.007788855627705122),
+    ],
+)
+def test_diagnostic_startup_cases_match_scientific_references(
+    initial_temperature: float,
+    equilibrium_values: tuple[float, float, float],
+    expected_target: float,
+    expected_omega: float,
+) -> None:
+    """Match the two test-owned full-precision diagnostic startup references."""
+    equilibrium = np.asarray(equilibrium_values, dtype=np.float64)
+    state = schedule_service.derive_initial_equilibrium_startup(
+        _initial_moisture(
+            equilibrium,
+            initial_temperature=initial_temperature,
+        ),
+        initial_temperature=initial_temperature,
+        source_air_temperature=initial_temperature,
+        oswin_parameters=_OSWIN,
+        dry_margin=0.05,
+        pressure=float(_FIXED["p_ref"]),
+        startup_relative_humidity_maximum=0.90,
+    )
+
+    assert state.minimum == pytest.approx(float(np.min(equilibrium)))
+    assert state.mean == pytest.approx(float(np.mean(equilibrium)))
+    assert state.maximum == pytest.approx(float(np.max(equilibrium)))
+    assert state.target_relative_humidity == pytest.approx(expected_target)
+    assert state.startup_humidity_ratio == pytest.approx(expected_omega)
+    derived = schedule_service.humidity_ratio_to_relative_humidity(
+        np.asarray([state.startup_humidity_ratio]),
+        np.asarray([initial_temperature]),
+        pressure=float(_FIXED["p_ref"]),
+    )
+    assert derived[0] == pytest.approx(
+        expected_target,
+        abs=schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
+    )
+
+
 def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly() -> None:
-    """Add one physical startup node without changing the canonical realization."""
+    """Ramp both primitives to an unchanged canonical rejoin and regular schedule."""
     canonical = _schedule()
     canonical_values = canonical.values.copy()
     duration_h = 0.5
 
-    handoff = schedule_service.build_comsol_boundary_schedule(
-        canonical,
-        {"enabled": True, "duration_h": duration_h},
-        initial_temperature=293.15,
-        pressure=float(_FIXED["p_ref"]),
-    )
+    handoff = _build_handoff(canonical)
 
     np.testing.assert_array_equal(canonical.values, canonical_values)
     np.testing.assert_array_equal(handoff.values[:5, 0], [0.0, duration_h, 1.0, 2.0, 3.0])
     assert handoff.values[-1, 0] == 168.0
     assert handoff.values[0, 1] == 293.15
-    assert handoff.values[0, 2] == canonical.values[0, 2]
-    fraction = duration_h / float(_TIME["interval"])
+    assert handoff.values[0, 2] != canonical.values[0, 2]
+    regular_interval = _TIME["interval"]
+    assert isinstance(regular_interval, float)
+    fraction = duration_h / regular_interval
     expected_rejoin = canonical.values[0] + fraction * (canonical.values[1] - canonical.values[0])
     expected_rejoin[0] = duration_h
     np.testing.assert_array_equal(handoff.values[1], expected_rejoin)
@@ -95,7 +414,7 @@ def test_comsol_startup_handoff_preserves_canonical_schedule_and_rejoins_exactly
 
 
 def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearly() -> None:
-    """Derive the thermodynamic midpoint of one analytically simple ramp."""
+    """Derive nonlinear RH only after linearly interpolating both primitives."""
     canonical_values = np.asarray(
         (
             (0.0, 302.0, 0.008),
@@ -104,22 +423,11 @@ def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearl
         ),
         dtype=np.float64,
     )
-    canonical = schedule_service.Schedule(
-        values=canonical_values,
-        metadata={
-            "temperature_operational_bounds": [_FIXED["T_in_min"], _FIXED["T_in_max"]],
-            "humidity_ratio_operational_bounds": [_FIXED["omega_min"], _FIXED["omega_max"]],
-            "relative_humidity_operational_bounds": [
-                _FIXED["phi_operational_min"],
-                _FIXED["phi_operational_max"],
-            ],
-        },
-    )
-    handoff = schedule_service.build_comsol_boundary_schedule(
+    canonical = _simple_canonical(canonical_values)
+    handoff = _build_handoff(
         canonical,
-        {"enabled": True, "duration_h": 0.5},
         initial_temperature=298.0,
-        pressure=float(_FIXED["p_ref"]),
+        equilibrium_relative_humidity=np.asarray(((0.70, 0.73), (0.75, 0.72))),
     )
 
     np.testing.assert_array_equal(handoff.values[:, 0], (0.0, 0.5, 1.0, 2.0))
@@ -129,8 +437,6 @@ def test_comsol_startup_ramp_interpolates_temperature_and_humidity_ratio_linearl
     midpoint_humidity_ratio = np.interp(0.25, handoff.values[:, 0], handoff.values[:, 2])
     assert midpoint_temperature == ramp_start[1] + 0.5 * (ramp_end[1] - ramp_start[1])
     assert midpoint_humidity_ratio == ramp_start[2] + 0.5 * (ramp_end[2] - ramp_start[2])
-    assert midpoint_temperature == 302.0
-    assert midpoint_humidity_ratio == 0.0085
     assert ramp_end[1] == 306.0
     assert ramp_end[2] == canonical_values[0, 2] + 0.5 * (canonical_values[1, 2] - canonical_values[0, 2])
 
@@ -173,30 +479,28 @@ def test_continuous_derived_relative_humidity_detects_interval_interior_extremum
 def test_disabled_comsol_startup_handoff_is_semantically_canonical() -> None:
     """Leave canonical schedule values unchanged when startup is disabled."""
     canonical = _schedule()
-    handoff = schedule_service.build_comsol_boundary_schedule(
-        canonical,
-        {"enabled": False, "duration_h": 0.5},
-        initial_temperature=293.15,
-        pressure=float(_FIXED["p_ref"]),
-    )
+    handoff = _build_handoff(canonical, enabled=False)
 
     np.testing.assert_array_equal(handoff.values, canonical.values)
 
 
 def test_comsol_startup_handoff_rejects_invalid_physical_state() -> None:
-    """Keep startup validity separate from the canonical operating envelope."""
+    """Reject invalid primitive startup temperature before field derivation."""
     canonical = _schedule()
     with pytest.raises(ValueError, match="physically positive"):
         schedule_service.build_comsol_boundary_schedule(
             canonical,
-            {"enabled": True, "duration_h": 0.5},
+            _policy(),
             initial_temperature=-1.0,
+            source_air_temperature=293.15,
+            initial_dry_basis_moisture=np.asarray([0.2]),
+            oswin_parameters=_OSWIN,
             pressure=float(_FIXED["p_ref"]),
         )
 
 
-def test_comsol_startup_handoff_uses_cold_initial_state_without_preheating() -> None:
-    """Begin exactly at the physical initial state outside regular T and RH bounds."""
+def test_comsol_startup_handoff_uses_cold_initial_equilibrium_state() -> None:
+    """Begin at exact bed temperature and five RH points below the driest cell."""
     initial_temperature = 288.7
     canonical = _schedule(
         T_in_base=308.15,
@@ -205,52 +509,87 @@ def test_comsol_startup_handoff_uses_cold_initial_state_without_preheating() -> 
         omega_in_amp=0.0,
         T_amb=initial_temperature,
     )
-    handoff = schedule_service.build_comsol_boundary_schedule(
+    equilibrium = np.asarray(((0.825, 0.852), (0.841, 0.872)))
+    handoff = _build_handoff(
         canonical,
-        {"enabled": True, "duration_h": 0.5},
         initial_temperature=initial_temperature,
-        pressure=float(_FIXED["p_ref"]),
+        equilibrium_relative_humidity=equilibrium,
     )
 
-    expected_phi = schedule_service.humidity_ratio_to_relative_humidity(
-        canonical.values[:1, 2],
-        np.asarray([initial_temperature], dtype=np.float64),
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+    expected_target = float(np.min(equilibrium)) - 0.05
+    expected_omega = schedule_service.relative_humidity_to_humidity_ratio(
+        np.asarray([expected_target]),
+        np.asarray([initial_temperature]),
         pressure=float(_FIXED["p_ref"]),
     )[0]
-    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
     assert initial_temperature < _FIXED["T_in_min"]
-    assert _FIXED["phi_operational_max"] < expected_phi < 1.0
     assert handoff.values[0, 1] == initial_temperature
-    assert handoff.values[0, 2] == canonical.values[0, 2]
-    assert startup == {
-        "enabled": True,
-        "duration_h": 0.5,
-        "temperature_start_policy": "use_initial_temperature_exactly",
-        "initial_temperature_K": initial_temperature,
-        "canonical_start_humidity_ratio_kg_per_kg": canonical.values[0, 2],
-        "startup_relative_humidity": expected_phi,
-        "humidity_start_policy": "preserve_canonical_omega_in_bc_and_derive_phi_in_bc",
-        "rejoin_policy": "interpolate_canonical_temperature_and_humidity_ratio_then_derive_phi_in_bc",
-    }
+    assert handoff.values[0, 2] == expected_omega
+    assert startup["policy_id"] == schedule_service.STARTUP_POLICY_ID
+    assert startup["initial_equilibrium_rh_minimum"] == pytest.approx(float(np.min(equilibrium)))
+    assert startup["initial_equilibrium_rh_mean"] == pytest.approx(float(np.mean(equilibrium)))
+    assert startup["initial_equilibrium_rh_maximum"] == pytest.approx(float(np.max(equilibrium)))
+    assert startup["initial_equilibrium_rh_dry_margin"] == 0.05
+    assert startup["startup_relative_humidity_max"] == 0.90
+    assert startup["startup_target_relative_humidity"] == pytest.approx(expected_target)
+    assert startup["startup_humidity_ratio_kg_per_kg"] == expected_omega
+    assert startup["realized_minimum_initial_cell_to_inlet_rh_margin"] >= (0.05 - schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
+    assert startup["continuous_startup_relative_humidity_maximum"] <= (expected_target + schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
     assert handoff.metadata["boundary_handoff"]["handoff_version"] == 1
 
 
-def test_comsol_startup_handoff_rejects_supersaturated_initial_state() -> None:
-    """Fail closed instead of repairing a supersaturated physical startup state."""
-    canonical = _schedule(
-        T_in_base=308.15,
-        T_in_amp=0.0,
-        omega_in_base=0.010625,
-        omega_in_amp=0.0,
-        T_amb=288.7,
+def test_comsol_startup_handoff_rejects_supersaturated_source_air() -> None:
+    """Retain source-air thermodynamic feasibility above the canonical omega ceiling."""
+    canonical = _simple_canonical(
+        np.asarray(
+            (
+                (0.0, 305.0, 0.008),
+                (1.0, 306.0, 0.008),
+                (2.0, 307.0, 0.008),
+            ),
+            dtype=np.float64,
+        )
     )
 
-    with pytest.raises(ValueError, match="physical humidity constraints"):
-        schedule_service.build_comsol_boundary_schedule(
+    with pytest.raises(ValueError, match="source-air temperature"):
+        _build_handoff(
             canonical,
-            {"enabled": True, "duration_h": 0.5},
-            initial_temperature=280.0,
-            pressure=float(_FIXED["p_ref"]),
+            initial_temperature=303.15,
+            source_air_temperature=293.15,
+            equilibrium_relative_humidity=np.asarray((0.85, 0.87, 0.89), dtype=np.float64),
+        )
+
+
+def test_comsol_startup_handoff_rejects_source_air_hotter_than_inlet() -> None:
+    """Fail closed instead of violating the heater-only source-air contract."""
+    with pytest.raises(ValueError, match="heater-only"):
+        _build_handoff(
+            _schedule(),
+            initial_temperature=293.15,
+            source_air_temperature=294.15,
+        )
+
+
+def test_comsol_startup_handoff_rejects_invalid_canonical_rejoin_rh() -> None:
+    """Reject an unchanged canonical rejoin that exceeds the fixed startup target."""
+    canonical = _simple_canonical(
+        np.asarray(
+            (
+                (0.0, 295.0, 0.008),
+                (1.0, 295.0, 0.008),
+                (2.0, 296.0, 0.007),
+            ),
+            dtype=np.float64,
+        )
+    )
+    equilibrium = np.asarray(((0.45, 0.55), (0.60, 0.52)), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="Canonical startup rejoin"):
+        _build_handoff(
+            canonical,
+            initial_temperature=293.15,
+            equilibrium_relative_humidity=equilibrium,
         )
 
 
@@ -267,11 +606,10 @@ def test_comsol_handoff_rejects_operational_rejoin_violation(
 ) -> None:
     """Keep authored operational envelopes on the rejoin and regular nodes."""
     canonical = _schedule()
-    handoff = schedule_service.build_comsol_boundary_schedule(
+    handoff = _build_handoff(
         canonical,
-        {"enabled": True, "duration_h": 0.5},
         initial_temperature=288.15,
-        pressure=float(_FIXED["p_ref"]),
+        equilibrium_relative_humidity=np.asarray(((0.825, 0.84), (0.85, 0.83))),
     )
     invalid = handoff.values.copy()
     invalid[1, column] = invalid_value
@@ -280,8 +618,9 @@ def test_comsol_handoff_rejects_operational_rejoin_violation(
         schedule_service.validate_comsol_boundary_schedule(
             invalid,
             regular_times=np.asarray(_TIME["regular_times"], dtype=np.float64),
-            startup_ramp={"enabled": True, "duration_h": 0.5},
+            startup_ramp=_policy(),
             initial_temperature=288.15,
+            source_air_temperature=288.15,
             pressure=float(_FIXED["p_ref"]),
             metadata=handoff.metadata,
         )
@@ -351,7 +690,7 @@ def test_grid_resolution_guards_smooth_and_event_scales() -> None:
 
 def test_authored_temporal_supports_must_resolve_on_the_grid() -> None:
     """Reject an authored fast tail below the canonical interval requirements."""
-    supports = {
+    supports: dict[str, dict[str, Any]] = {
         "schedule.timescale_rel": {
             "lower": 0.05,
             "upper": 0.18,

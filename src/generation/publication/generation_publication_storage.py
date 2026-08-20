@@ -2133,6 +2133,8 @@ def _validate_hdf5_schedule(
     scientific_ramp = {"enabled": enabled}
     if enabled is True:
         scientific_ramp["duration_h"] = duration_h
+        scientific_ramp["initial_equilibrium_rh_dry_margin"] = handoff_ramp.get("initial_equilibrium_rh_dry_margin")
+        scientific_ramp["max_relative_humidity"] = handoff_ramp.get("startup_relative_humidity_max")
     if scientific.get("boundary_schedule") != {"startup_ramp": scientific_ramp}:
         msg = "COMSOL boundary handoff disagrees with active scientific startup identity."
         raise ValueError(msg)

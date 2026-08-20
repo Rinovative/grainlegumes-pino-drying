@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import yaml
 
 from src import common, generation
 
@@ -74,6 +75,39 @@ def _synthetic_suite(
         production_cores_key="cluster.cores_per_case",
         production_cores_per_case=16,
     )
+
+
+def _test_owned_pilot_campaign(
+    generation_config_factory: Any,
+    *,
+    cases_per_material: int,
+) -> Path:
+    """Return a valid mutable pilot configuration owned entirely by one test."""
+    path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        natural_count=cases_per_material,
+        campaign_purpose="technical_runtime_smoke",
+    )
+    campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
+    campaign["campaign_purpose"] = "pilot_check"
+    campaign.pop("paired_equivalence_seed")
+    campaign["sampling"] = {
+        "method": "lhs",
+        "seed_base": 123456,
+        "cases_per_material": cases_per_material,
+        "case_semantics": {
+            "first": "nominal_reference",
+            "remaining": "natural_pilot",
+        },
+    }
+    campaign["dataset_packages"] = []
+    path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
+
+    execution_path = path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["retention"]["pilot_check"] = "full"
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+    return path
 
 
 def _production() -> dict[str, Any]:
@@ -646,7 +680,7 @@ def test_resource_change_preserves_both_case_identities(
 
 
 def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> None:
-    """Resolve the sole fast benchmark with production cores first."""
+    """Resolve the benchmark-owned cases with production cores first."""
     repository = common.paths.get_project_root()
     suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
     suite = generation.benchmark.load_core_benchmark_suite(
@@ -657,11 +691,13 @@ def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> No
         suite_path,
         require_executable=False,
     )
+    assert suite.case_campaign_path == (repository / "configs/generation/benchmarks/transient_core_scaling/benchmark_cases.yaml")
     assert [case["case_role"] for case in inspection["representative_cases"]] == [
         "nominal",
         "natural",
     ]
     assert [case["case_index"] for case in inspection["representative_cases"]] == [1, 2]
+    assert len(suite.variants) == 4
     wave_cores = [wave["cores_per_case"] for wave in inspection["variant_waves"]]
     assert suite.production_cores_per_case == 16
     assert wave_cores[0] == suite.production_cores_per_case
@@ -669,6 +705,43 @@ def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> No
     assert inspection["parallel_cases_per_variant"] == 2
     assert inspection["required_successful_measurements"] == 8
     assert inspection["canary_wave"]["included_in_final_measurements"] is True
+
+
+@pytest.mark.parametrize("cases_per_material", [1, 3, 5])
+def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    cases_per_material: int,
+) -> None:
+    """Resolve the same benchmark owner around valid test-owned pilot counts."""
+    test_project_root = common.paths.get_project_root()
+    repository = Path(__file__).resolve().parents[2]
+    suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
+    monkeypatch.setenv("PROJECT_ROOT", str(repository))
+    before = generation.benchmark.load_core_benchmark_suite(
+        suite_path,
+        require_executable=False,
+    )
+    pilot_path = _test_owned_pilot_campaign(
+        generation_config_factory,
+        cases_per_material=cases_per_material,
+    )
+    monkeypatch.setenv("PROJECT_ROOT", str(test_project_root))
+    pilot = generation.cases.config.load_campaign_config(
+        pilot_path,
+        require_executable=False,
+    )
+    monkeypatch.setenv("PROJECT_ROOT", str(repository))
+    after = generation.benchmark.load_core_benchmark_suite(
+        suite_path,
+        require_executable=False,
+    )
+
+    assert pilot.total_case_count == cases_per_material
+    assert before.suite_digest == after.suite_digest
+    assert before.case_campaign_path == after.case_campaign_path
+    assert before.case_campaign_path != pilot.source_path
+    assert [case.case_index for case in after.representative_cases] == [1, 2]
 
 
 def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
