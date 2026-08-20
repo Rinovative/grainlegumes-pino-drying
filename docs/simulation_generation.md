@@ -306,25 +306,55 @@ validated exports and HDF5, and successful publication remain successful.
 A genuine pre-solve capacity event becomes `license_blocked`, does not count as a
 scientific failure, and does not consume `maximum_failed_cases`.
 
-The controller waits outside compute allocations with bounded exponential
-backoff. `maximum_wait_seconds: null` means it waits until capacity becomes
-available or the operator cancels. A blocked case whose `next_retry_at` is in the
-future never suppresses fresh admission. The oldest eligible block receives the
-next suitable slot, but fresh cases fill any remaining pending capacity. At most
-one retry remains an unresolved license probe. Once job-bound parser evidence
-shows stationary or transient solver progress after checkout, that job is an
-ordinary running case and releases the probe gate. License-only attempts never
-consume the solver failure budget or benchmark measurements. Campaigns and
-benchmarks use the same policy. Current OST Slurm exposes no verified license
-resources, so submissions use neither `sbatch --licenses` nor COMSOL
-`-usebatchlic`.
+The target cluster currently reports `No licenses configured in Slurm` from
+`scontrol show lic`. Slurm therefore cannot reserve COMSOL FlexNet capacity,
+preserve a license queue position, or guarantee fairness against other users.
+Submissions use neither `sbatch --licenses` nor COMSOL `-usebatchlic`.
+Administrator-managed Slurm license integration remains the preferred long-term
+solution.
 
-Each blocked work unit owns one mutable `license_wait.json` with schema version
-1. It records work-unit and scientific identities, feature, error code, exact
-matched signatures, COMSOL exit code, solver-progress and export flags, first
-and latest blocked timestamps, retry count, latest and bounded recent job IDs,
-next retry time, cumulative wait, and a bounded raw excerpt. A new license-only
-event creates no scientific attempt directory and copies no canonical input.
+`submission.max_admission_cases` is the single controller admission limit. It is
+the maximum number of logical cases admitted for execution that have not yet
+reached confirmed COMSOL solver execution. The maintained value is 2. The count
+includes durable submission intents, submissions being reconciled, Slurm-PENDING
+cases, workers and COMSOL processes starting without solver proof,
+`license_blocked` cases waiting for or eligible for retry, and active retry
+attempts. It excludes never-started cases, confirmed running solvers, completed
+or genuinely terminal cases, and conversion/publication-only replay. Historical
+Slurm attempts never add entries: one logical case with many retries consumes one
+slot. `max_running_cases: null` remains independent, so the admission limit is
+not a limit of two simultaneous solvers.
+
+For example, if A and B are both `license_blocked`, admission is 2/2 and C remains
+never-started even though no Slurm allocation is active. A and B retain those
+logical slots throughout backoff and may both retry when eligible; there is no
+separate probe limit. When job-bound evidence from the common progress parser
+proves A obtained a license and actual solver execution began, A immediately
+becomes ordinary running, admission becomes 1/2, and the same controller
+advancement may admit C. If C then starts, D may be admitted. If B and D later
+become blocked, admission returns to 2/2 and E remains never-started. This
+progressively discovers available concurrency while preventing a campaign from
+accumulating many cases that all fail on temporary capacity. Increasing admission
+merely to create a large queue is not a substitute for license integration.
+
+The controller waits outside compute allocations. Maintained retry backoff starts
+at 15 seconds, is capped at 30 seconds, and continues indefinitely because
+`maximum_wait_seconds: null`; the regular controller poll submits on the first
+advancement after `next_retry_at`. A blocked case retains only its logical
+admission slot: no CPU, memory, node, Slurm allocation, or COMSOL process is held
+during the wait. This improves responsiveness but neither reserves a FlexNet
+license nor creates fairness. License-only attempts never consume the scientific
+failure budget or benchmark runtime, core-hour, throughput, or ranking
+measurements.
+
+Each blocked work unit owns one mutable schema-version-1 `license_wait.json`. The
+compact payload records work-unit and scientific identities, the observed
+feature, error code, exact matched signatures, COMSOL exit code, solver-progress
+and export flags, first and latest blocked timestamps, retry count, latest and
+bounded recent job IDs, next retry time, cumulative wait, and a bounded raw
+excerpt. A new license-only event creates no scientific attempt directory and
+copies no canonical input.
+
 
 ## Attempt retention
 
@@ -346,7 +376,8 @@ and independent admission of its canonical input. It retains an immutable
 compaction audit and reports reclaimed bytes.
 
 Postprocessing replay is independent from Slurm admission and runs only after
-normal pending capacity is filled. A failed replay appends schema-version-1
+the controller evaluates normal logical-case admission. A failed replay appends
+schema-version-1
 `replay_failure.json` evidence bound to its source/predecessor receipts, the exact
 future replay payload membership and hashes, the converter dependency, and the
 output and time contracts. The same identities become `replay_blocked` instead
@@ -420,8 +451,10 @@ count. For example:
 Campaign: material_pilot__0123456789abcdef
 State: running
 Execution: commit=a1b2c3d4  config_digest=9f8e7d6c
-Resources: cores_per_case=16  pending_buffer=2  max_running_cases=3
+Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=unlimited
 Cases: successful=5  running=1  scheduler_pending=1  license_blocked=1  never_started=9  failed=1  total=18
+Admission: 2/2
+  pending=1  starting=0  license_waiting=1  retrying=0
 
 Running cases:
 case_0002  batch=kidney_bean  job=629565  node=hpc119  elapsed=40:41
@@ -436,10 +469,9 @@ case_0003  batch=kidney_bean  job=629844
 
 License-blocked cases:
 case_0001  batch=kidney_bean  job=629820
-  feature="Equilibrium Moisture Transport in Porous Media"
-  code=-4,132  retry=1  next_retry=2026-08-20T00:07:09Z
-  cumulative_wait=60 s
-  reason=temporary_license_capacity
+  state=license_blocked
+  retry=5  next_retry=2026-08-20T00:06:24Z
+  cumulative_wait=135 s
 
 Failed cases:
 case_0004  batch=chickpea  job=629553  elapsed=18:41

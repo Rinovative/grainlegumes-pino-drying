@@ -214,7 +214,7 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
         "cases_per_job": 1,
         "cores_per_case": campaign.execution_values["cluster"]["cores_per_case"],
         "cores_per_node": campaign.execution_values["site"]["cores_per_node"],
-        "pending_buffer": campaign.execution_values["submission"]["pending_buffer"],
+        "max_admission_cases": campaign.execution_values["submission"]["max_admission_cases"],
         "poll_interval_seconds": campaign.execution_values["submission"]["poll_interval_seconds"],
         "max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
     }

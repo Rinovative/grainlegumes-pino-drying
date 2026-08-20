@@ -172,7 +172,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         startup_ramp_enabled: bool = True,
         startup_ramp_duration_h: float = 0.25,
         maximum_failed_cases: int = 2,
-        pending_buffer: int = 1,
+        max_admission_cases: int = 1,
         poll_interval_seconds: int = 1,
         max_running_cases: int | None = None,
         license_retry_enabled: bool = True,
@@ -233,7 +233,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         execution["retention"][campaign_purpose] = retention_policy
         execution["submission"].update(
             {
-                "pending_buffer": pending_buffer,
+                "max_admission_cases": max_admission_cases,
                 "poll_interval_seconds": poll_interval_seconds,
                 "max_running_cases": max_running_cases,
             }

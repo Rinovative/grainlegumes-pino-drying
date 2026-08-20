@@ -904,7 +904,7 @@ print("\t".join(("workflow", *(str(item) for item in fields))))')" ||
 resolve_configured_resources() {
   resolve_local_python
   local record kind configured_cores_per_case configured_wall_time
-  local configured_cores_per_node configured_pending_buffer configured_poll_interval
+  local configured_cores_per_node configured_max_admission_cases configured_poll_interval
   local configured_max_running configured_cpu_host configured_scheduler
   local configured_partition configured_python_module configured_comsol_module
   local configured_python_executable configured_comsol_executable extra
@@ -920,7 +920,7 @@ max_running = submission.get("max_running_cases")
 fields = (
     value["campaign_purpose"], cluster["cores_per_case"],
     "-" if wall is None else wall, cluster["cores_per_node"],
-    submission["pending_buffer"], submission["poll_interval_seconds"],
+    submission["max_admission_cases"], submission["poll_interval_seconds"],
     "-" if max_running is None else max_running,
     site["cpu_host"], site["scheduler"], site["partition"],
     site["python_module"], site["comsol_module"],
@@ -931,7 +931,7 @@ if any("\t" in str(item) or "\n" in str(item) or "\r" in str(item) for item in f
 print("\t".join(("execution", *(str(item) for item in fields))))')" ||
     fail 1 "Could not resolve configured campaign execution."
   IFS=$'\t' read -r kind CAMPAIGN_PURPOSE configured_cores_per_case \
-    configured_wall_time configured_cores_per_node configured_pending_buffer \
+    configured_wall_time configured_cores_per_node configured_max_admission_cases \
     configured_poll_interval configured_max_running configured_cpu_host \
     configured_scheduler configured_partition configured_python_module \
     configured_comsol_module configured_python_executable \
@@ -940,7 +940,7 @@ print("\t".join(("execution", *(str(item) for item in fields))))')" ||
     fail 1 "Malformed configured execution record."
   validate_positive "configured cores_per_case" "${configured_cores_per_case}"
   validate_positive "configured cores_per_node" "${configured_cores_per_node}"
-  validate_positive "configured pending_buffer" "${configured_pending_buffer}"
+  validate_positive "configured max_admission_cases" "${configured_max_admission_cases}"
   validate_positive "configured poll_interval_seconds" "${configured_poll_interval}"
   [[ "${configured_max_running}" == - ]] ||
     validate_positive "configured max_running_cases" "${configured_max_running}"
@@ -950,7 +950,7 @@ print("\t".join(("execution", *(str(item) for item in fields))))')" ||
   PARTITION="${configured_partition}"
   CORES_PER_NODE="${configured_cores_per_node}"
   CORES_PER_CASE="${configured_cores_per_case}"
-  PENDING_BUFFER="${configured_pending_buffer}"
+  MAX_ADMISSION_CASES="${configured_max_admission_cases}"
   MAX_RUNNING_CASES="${configured_max_running}"
   STATUS_POLL_SECONDS="${configured_poll_interval}"
   WALL_TIME="${configured_wall_time}"
@@ -1002,7 +1002,7 @@ print("\t".join(("pilot", str(value["campaign_purpose"]), str(counts[0]), str(su
 validate_resources() {
   validate_positive "configured cores_per_case" "${CORES_PER_CASE}"
   validate_positive "configured cores_per_node" "${CORES_PER_NODE}"
-  validate_positive "configured pending_buffer" "${PENDING_BUFFER}"
+  validate_positive "configured max_admission_cases" "${MAX_ADMISSION_CASES}"
   validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
   [[ "${MAX_RUNNING_CASES}" == - ]] ||
     validate_positive "configured max_running_cases" "${MAX_RUNNING_CASES}"

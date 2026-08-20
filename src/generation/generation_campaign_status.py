@@ -243,15 +243,11 @@ def _scheduler_pending_lines(case: Mapping[str, Any]) -> list[str]:
 
 def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
     """Return concise operational license retry detail without raw evidence."""
-    lines = [_case_heading(case, include_runtime=False)]
+    lines = [_case_heading(case, include_runtime=False), "  state=license_blocked"]
     retry = case.get("temporary_license_retry")
     if isinstance(retry, dict):
-        feature = _bounded_text(retry.get("feature"), maximum=_MAX_REASON_CHARACTERS)
-        if feature is not None:
-            lines.append(f'  feature="{feature}"')
         retry_parts = []
         for name, value in (
-            ("code", retry.get("error_code")),
             ("retry", retry.get("retry_count")),
             ("next_retry", retry.get("next_retry_at")),
         ):
@@ -263,9 +259,6 @@ def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
         wait = _available_text(retry.get("cumulative_wait_seconds"))
         if wait is not None:
             lines.append(f"  cumulative_wait={wait} s")
-    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
-    if reason is not None:
-        lines.append(f"  reason={reason}")
     return lines
 
 
@@ -401,6 +394,10 @@ def format_campaign_status_summary(
     }
     submission = status.get("submission_config")
     submission_values = submission if isinstance(submission, dict) else {}
+    admission = status.get("admission")
+    admission_values = admission if isinstance(admission, dict) else {}
+    components = admission_values.get("components")
+    component_values = components if isinstance(components, dict) else {}
     max_running = submission_values.get("max_running_cases")
     max_running_text = "unlimited" if max_running is None else _text(max_running)
     lines = [
@@ -410,7 +407,7 @@ def format_campaign_status_summary(
         (
             "Resources: "
             f"cores_per_case={_text(submission_values.get('cores_per_case'))}  "
-            f"pending_buffer={_text(submission_values.get('pending_buffer'))}  "
+            f"max_admission_cases={_text(submission_values.get('max_admission_cases'))}  "
             f"max_running_cases={max_running_text}"
         ),
         (
@@ -418,6 +415,14 @@ def format_campaign_status_summary(
             f"successful={len(buckets['successful'])}  running={len(buckets['running'])}  "
             f"scheduler_pending={len(buckets['scheduler_pending'])}  license_blocked={len(buckets['license_blocked'])}  "
             f"never_started={len(buckets['never_started'])}  failed={len(buckets['failed'])}  total={len(cases)}"
+        ),
+        (f"Admission: {_text(admission_values.get('count'))}/{_text(admission_values.get('maximum'))}"),
+        (
+            "  "
+            f"pending={_text(component_values.get('pending'))}  "
+            f"starting={_text(component_values.get('starting'))}  "
+            f"license_waiting={_text(component_values.get('license_waiting'))}  "
+            f"retrying={_text(component_values.get('retrying'))}"
         ),
     ]
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases

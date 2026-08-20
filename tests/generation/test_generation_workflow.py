@@ -404,7 +404,7 @@ elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; 
   fi
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
   printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
-  printf 'Resources: cores_per_case=16  pending_buffer=2  max_running_cases=null\n'
+  printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
   printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
   printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
   printf '  phase=transient_drying  sim_time=%s h  step=0.075 s\n' "${progress_value}"
@@ -412,7 +412,7 @@ elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; 
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format summary '* ]]; then
   printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' \
     "${FAKE_RUN_ID}" "${FAKE_CAMPAIGN_STATE}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
-  printf 'Resources: cores_per_case=16  pending_buffer=2  max_running_cases=null\n'
+  printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
   printf 'Cases: 0/1 completed, 0 active, 1 pending, 0 failed\n\n'
   printf 'Pending cases:\ncase_0001  job=591776  node=unavailable  elapsed=unavailable  state=active  reason=PENDING\n'
 elif [[ " $* " == *' campaign-status '* && " $* " == *' --format state '* ]]; then
@@ -1750,7 +1750,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     dirty_execution = execution_config.read_text(encoding="utf-8")
     assert f"cores_per_case: {dirty_cores}" in dirty_execution
     assert untracked.read_text(encoding="utf-8") == "continue local development\n"
-    assert f"Resources: cores_per_case={committed_cores}  pending_buffer=2  max_running_cases=null" in result.stdout
+    assert f"Resources: cores_per_case={committed_cores}  max_admission_cases=2  max_running_cases=null" in result.stdout
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("submit-campaign") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text

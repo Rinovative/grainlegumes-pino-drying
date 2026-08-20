@@ -7,8 +7,8 @@ runtime:
   extra_arguments: []
   temporary_license_retry:
     enabled: true
-    initial_delay_seconds: 60
-    maximum_delay_seconds: 300
+    initial_delay_seconds: 15
+    maximum_delay_seconds: 30
     maximum_wait_seconds: null
 retention:
   family_generalization: compact
@@ -16,7 +16,7 @@ retention:
   technical_runtime_smoke: full
   pilot_check: full
 submission:
-  pending_buffer: 2
+  max_admission_cases: 3
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:

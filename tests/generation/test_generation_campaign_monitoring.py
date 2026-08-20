@@ -98,7 +98,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         "scheduler_log_directory": str(run_directory / "scheduler"),
         "submission_config": {
             "cores_per_case": 16,
-            "pending_buffer": 2,
+            "max_admission_cases": 3,
             "max_running_cases": None,
             "maximum_failed_cases": 10,
         },
@@ -171,7 +171,13 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         generation.campaign.progress_service,
         "load_runtime_progress",
         lambda _run_id, job_id, _identity, **_kwargs: (
-            {"availability": "available", "phase": "transient_drying", "age_seconds": 5.0, "stale": False}
+            {
+                "availability": "available",
+                "phase": "transient_drying",
+                "parser_state": "available",
+                "age_seconds": 5.0,
+                "stale": False,
+            }
             if job_id == "102"
             else {"availability": "unavailable", "reason": "not_reported", "age_seconds": None, "stale": None}
         ),
@@ -214,6 +220,16 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     assert pending["elapsed"] is None
     assert status["cases"][5]["latest_job_id"] is None
     assert status["cases"][5]["runtime_progress"]["reason"] == "no_job"
+    assert status["admission"] == {
+        "count": 2,
+        "maximum": 3,
+        "components": {
+            "pending": 1,
+            "starting": 0,
+            "license_waiting": 1,
+            "retrying": 0,
+        },
+    }
     state_with_progress = status["campaign_state"]
 
     monkeypatch.setattr(
@@ -224,6 +240,8 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     without_progress = generation.campaign.campaign_status(run_id, storage_root=tmp_path)
     assert query_count["value"] == 2
     assert without_progress["campaign_state"] == state_with_progress
+    assert without_progress["admission"]["count"] == 3
+    assert without_progress["admission"]["components"]["starting"] == 1
 
 
 def test_conversion_failure_cannot_terminalize_an_active_campaign(
@@ -249,7 +267,7 @@ def test_conversion_failure_cannot_terminalize_an_active_campaign(
         "scheduler_log_directory": str(run_directory / "scheduler"),
         "submission_config": {
             "cores_per_case": 16,
-            "pending_buffer": 2,
+            "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 0,
         },
@@ -340,7 +358,7 @@ def test_replay_blocked_failures_leave_free_normal_admission_unblocked(
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=12,
-        pending_buffer=2,
+        max_admission_cases=2,
         maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -356,7 +374,7 @@ def test_replay_blocked_failures_leave_free_normal_admission_unblocked(
         "scheduler_log_directory": str(run_directory / "scheduler"),
         "submission_config": {
             "cores_per_case": 16,
-            "pending_buffer": 2,
+            "max_admission_cases": 2,
             "max_running_cases": None,
             "maximum_failed_cases": 5,
         },
@@ -440,8 +458,18 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
         "execution_config_digest": "b" * 64,
         "submission_config": {
             "cores_per_case": 8,
-            "pending_buffer": 2,
+            "max_admission_cases": 2,
             "max_running_cases": 3,
+        },
+        "admission": {
+            "count": 2,
+            "maximum": 2,
+            "components": {
+                "pending": 0,
+                "starting": 0,
+                "license_waiting": 2,
+                "retrying": 0,
+            },
         },
         "cases": [],
     }
@@ -451,8 +479,10 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
     assert f"commit={'a' * 40}" in rendered
     assert f"config_digest={'b' * 64}" in rendered
     assert "cores_per_case=8" in rendered
-    assert "pending_buffer=2" in rendered
+    assert "max_admission_cases=2" in rendered
     assert "max_running_cases=3" in rendered
+    assert "Admission: 2/2" in rendered
+    assert "pending=0  starting=0  license_waiting=2  retrying=0" in rendered
 
     status["submission_config"]["max_running_cases"] = None
     assert "max_running_cases=unlimited" in status_service.format_campaign_status_summary(status)
@@ -476,7 +506,7 @@ def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
     rendered = status_service.format_campaign_status_summary(status)
 
     assert "License-blocked cases:" in rendered
-    assert "reason=temporary_license_capacity" in rendered
+    assert "state=license_blocked" in rendered
     assert "Failed cases:" not in rendered
     assert "failed=0" in rendered
 
@@ -564,8 +594,7 @@ def test_human_summary_bounds_license_rows_and_omits_machine_evidence() -> None:
     rendered = status_service.format_campaign_status_summary({"campaign_run_id": "license-run", "campaign_state": "running", "cases": cases})
 
     for value in (
-        'feature="Equilibrium Moisture Transport in Porous Media"',
-        "code=-4,132",
+        "state=license_blocked",
         "retry=1",
         "next_retry=2026-08-20T00:07:09Z",
         "cumulative_wait=60 s",

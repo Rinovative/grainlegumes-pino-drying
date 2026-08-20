@@ -1957,13 +1957,13 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     submission = _mapping(execution["submission"], label="execution.submission")
     _exact_keys(
         submission,
-        required={"pending_buffer", "poll_interval_seconds", "max_running_cases"},
+        required={"max_admission_cases", "poll_interval_seconds", "max_running_cases"},
         optional=set(),
         label="execution.submission",
     )
-    submission["pending_buffer"] = _integer(
-        submission["pending_buffer"],
-        label="execution.submission.pending_buffer",
+    submission["max_admission_cases"] = _integer(
+        submission["max_admission_cases"],
+        label="execution.submission.max_admission_cases",
         minimum=1,
     )
     submission["poll_interval_seconds"] = _integer(

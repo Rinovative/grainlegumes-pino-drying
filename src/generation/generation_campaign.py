@@ -4,7 +4,7 @@ generation_campaign.py
 Persist, feed, inspect, and terminally validate one campaign run.
 Responsibilities:
   - Bind campaign execution to one clean exact Git commit and execution config
-  - Reconcile exact per-case Slurm jobs and restore a small pending buffer
+  - Reconcile exact per-case Slurm jobs within one logical admission pool
   - Persist scheduler identity before and after each ordinary job submission
 Design principles:
   - One Slurm job owns one exact campaign case with no arrays or node packing
@@ -146,7 +146,7 @@ def _submission_config(campaign: config_service.CampaignConfig) -> dict[str, Any
     submission = campaign.execution_values["submission"]
     cluster = campaign.execution_values["cluster"]
     return {
-        "pending_buffer": int(submission["pending_buffer"]),
+        "max_admission_cases": int(submission["max_admission_cases"]),
         "poll_interval_seconds": int(submission["poll_interval_seconds"]),
         "max_running_cases": submission["max_running_cases"],
         "cores_per_case": int(cluster["cores_per_case"]),
@@ -377,7 +377,7 @@ def plan_campaign(
         "submission_config": _submission_config(campaign),
         "planned_case_jobs": len(tasks),
         "first_submission_command": first_command,
-        "submission_model": "one ordinary non-exclusive Slurm job per case, restored one job at a time to the pending buffer",
+        "submission_model": "one ordinary non-exclusive Slurm job per case within one shared logical admission pool",
     }
 
 
@@ -774,6 +774,20 @@ def _postprocessing_replay_view(
     }
 
 
+def _license_retry_is_active(
+    state: str,
+    latest_submission: Mapping[str, Any] | None,
+    runtime_progress: Mapping[str, Any],
+) -> bool:
+    """Return whether the current pre-solver job is a license retry."""
+    return bool(
+        latest_submission is not None
+        and latest_submission.get("mode") == "license_retry"
+        and state in {"pending", "active", "scheduler_unknown"}
+        and not _runtime_proves_license_acquired({"runtime_progress": runtime_progress})
+    )
+
+
 def _task_state(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -937,6 +951,11 @@ def _task_state(
         latest_job_id=scheduler_view["latest_job_id"],
         storage_root=storage_root,
     )
+    license_retry_active = _license_retry_is_active(
+        state,
+        latest_submission,
+        runtime_progress,
+    )
     return {
         **_task_payload(task),
         "material": batch.material_family,
@@ -954,6 +973,7 @@ def _task_state(
         **scheduler_view,
         "runtime_progress": runtime_progress,
         "temporary_license_retry": retry_attempt,
+        "license_retry_active": license_retry_active,
         "license_retry_eligible": license_retry_eligible,
         "license_wait_exhausted": license_wait_exhausted,
         "license_first_blocked_at": license_first_blocked_at,
@@ -1209,39 +1229,115 @@ def _runtime_proves_license_acquired(view: Mapping[str, Any]) -> bool:
     return phase in _LICENSE_ACQUIRED_RUNTIME_PHASES
 
 
-def _active_unresolved_license_probe(
+def _task_identity_key(view: Mapping[str, Any]) -> tuple[str, int]:
+    """Return one logical campaign-case identity from a reconciled view."""
+    return str(view["batch_id"]), int(view["case_index"])
+
+
+def _view_consumes_admission(view: Mapping[str, Any]) -> bool:
+    """Return whether one logical case currently occupies admission."""
+    state = view.get("state")
+    if state == "active":
+        return not _runtime_proves_license_acquired(view)
+    return state in {
+        "pending",
+        "scheduler_unknown",
+        "license_blocked",
+        "cancelled",
+        "interrupted",
+    }
+
+
+def _submission_intent(
+    manifest: Mapping[str, Any],
+) -> tuple[tuple[str, int], str] | None:
+    """Return the logical case and mode bound to one durable intent."""
+    intent = manifest.get("submission_intent")
+    if intent is None:
+        return None
+    if isinstance(intent, bool) or not isinstance(intent, int) or intent < 1:
+        message = "Campaign submission intent is malformed."
+        raise ValueError(message)
+    submissions = manifest.get("submissions")
+    if not isinstance(submissions, list) or intent > len(submissions):
+        message = "Campaign submission intent has no durable submission record."
+        raise ValueError(message)
+    record = submissions[intent - 1]
+    if not isinstance(record, dict) or record.get("submission_index") != intent:
+        message = "Campaign submission intent does not match its durable record."
+        raise ValueError(message)
+    case = record.get("case")
+    if not isinstance(case, dict):
+        message = "Campaign submission intent lacks one logical case."
+        raise TypeError(message)
+    case_index = case.get("case_index")
+    if isinstance(case_index, bool) or not isinstance(case_index, int):
+        message = "Campaign submission intent has an invalid case index."
+        raise TypeError(message)
+    mode = record.get("mode")
+    if mode not in {"initial", "resume", "license_retry"}:
+        message = "Campaign submission intent has an invalid mode."
+        raise ValueError(message)
+    return (str(case.get("batch_id")), case_index), str(mode)
+
+
+def _logical_admission_case_keys(
     manifest: Mapping[str, Any],
     task_views: Sequence[Mapping[str, Any]],
-    scheduler: Mapping[str, Any],
-) -> bool:
-    """Return whether one active retry still lacks a known license outcome."""
-    by_identity = {(str(view["batch_id"]), int(view["case_index"])): view for view in task_views}
-    unresolved = 0
-    for record in manifest.get("submissions", ()):
-        if record.get("mode") != "license_retry" or record.get("status") != "submitted" or record.get("job_id") not in scheduler["active"]:
+) -> frozenset[tuple[str, int]]:
+    """Reconstruct logical admission membership from durable case state."""
+    keys = {_task_identity_key(view) for view in task_views if _view_consumes_admission(view)}
+    intent = _submission_intent(manifest)
+    if intent is not None:
+        keys.add(intent[0])
+    return frozenset(keys)
+
+
+def _admission_summary(
+    manifest: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return disjoint logical admission occupancy components."""
+    categories: dict[str, set[tuple[str, int]]] = {
+        "pending": set(),
+        "starting": set(),
+        "license_waiting": set(),
+        "retrying": set(),
+    }
+    for view in task_views:
+        if not _view_consumes_admission(view):
             continue
-        case = record.get("case")
-        if not isinstance(case, dict):
-            message = "Active license-retry submission lacks one case identity."
-            raise TypeError(message)
-        case_index = case.get("case_index")
-        if isinstance(case_index, bool) or not isinstance(case_index, int):
-            message = "Active license-retry submission has an invalid case index."
-            raise TypeError(message)
-        key = (str(case.get("batch_id")), case_index)
-        view = by_identity.get(key)
-        if view is None:
-            message = f"Active license-retry submission has no campaign task: {key}."
-            raise RuntimeError(message)
-        runtime = view.get("runtime_progress")
-        phase = runtime.get("phase") if isinstance(runtime, dict) and runtime.get("availability") == "available" else None
-        if _runtime_proves_license_acquired(view) or phase in _LICENSE_RESOLVED_RUNTIME_PHASES:
-            continue
-        unresolved += 1
-    if unresolved > 1:
-        message = "Campaign has more than one unresolved active license probe."
+        key = _task_identity_key(view)
+        if view.get("license_retry_active") is True:
+            category = "retrying"
+        elif view["state"] == "license_blocked":
+            category = "license_waiting"
+        elif view["state"] == "pending":
+            category = "pending"
+        else:
+            category = "starting"
+        categories[category].add(key)
+    intent = _submission_intent(manifest)
+    if intent is not None:
+        key, mode = intent
+        for values in categories.values():
+            values.discard(key)
+        categories["retrying" if mode == "license_retry" else "starting"].add(key)
+    components = {name: len(values) for name, values in categories.items()}
+    admission_count = sum(components.values())
+    expected = len(_logical_admission_case_keys(manifest, task_views))
+    if admission_count != expected:
+        message = "Campaign admission components do not match logical membership."
         raise RuntimeError(message)
-    return unresolved == 1
+    maximum = int(manifest["submission_config"]["max_admission_cases"])
+    if admission_count > maximum:
+        message = f"Campaign logical admission exceeds max_admission_cases: {admission_count} > {maximum}."
+        raise RuntimeError(message)
+    return {
+        "count": admission_count,
+        "maximum": maximum,
+        "components": components,
+    }
 
 
 def _failure_population_counts(
@@ -1274,10 +1370,9 @@ def _normal_admission_status(
     manifest: Mapping[str, Any],
     task_views: Sequence[Mapping[str, Any]],
     *,
-    pending_jobs: int,
     running_jobs: int,
 ) -> tuple[bool, str | None]:
-    """Return whether eligible normal work is prevented from admission."""
+    """Return whether eligible fresh work is prevented from admission."""
     restart_available = any(view["state"] in {"cancelled", "interrupted"} for view in task_views)
     fresh_available = any(view["state"] == "never_started" for view in task_views)
     if not restart_available and not fresh_available:
@@ -1285,11 +1380,11 @@ def _normal_admission_status(
     submission_config = manifest["submission_config"]
     if manifest.get("submission_intent") is not None:
         return True, "submission_intent_unresolved"
-    if pending_jobs >= int(submission_config["pending_buffer"]):
-        return True, "pending_buffer_full"
     max_running = submission_config["max_running_cases"]
     if max_running is not None and running_jobs >= int(max_running):
         return True, "max_running_cases_reached"
+    if fresh_available and len(_logical_admission_case_keys(manifest, task_views)) >= int(submission_config["max_admission_cases"]):
+        return True, "max_admission_cases_reached"
     if (
         fresh_available
         and not restart_available
@@ -1312,21 +1407,17 @@ def _fill_submission_capacity(
     scheduler: Mapping[str, Any],
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
-    """Submit retry, interrupted, and fresh work until admission is full."""
+    """Submit owned retries and admit fresh cases within one logical pool."""
+    del scheduler
     run_id = str(manifest["campaign_run_id"])
-    pending_buffer = int(manifest["submission_config"]["pending_buffer"])
+    max_admission_cases = int(manifest["submission_config"]["max_admission_cases"])
     max_running = manifest["submission_config"]["max_running_cases"]
     maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
-    admitted_pending_jobs = pending_jobs
+    admission_keys = set(_logical_admission_case_keys(manifest, task_views))
     selected_tasks: set[tuple[str, int]] = set()
-    unresolved_license_probe = _active_unresolved_license_probe(
-        manifest,
-        task_views,
-        scheduler,
-    )
 
     while True:
-        if admitted_pending_jobs >= pending_buffer or (max_running is not None and running_jobs >= int(max_running)):
+        if max_running is not None and running_jobs >= int(max_running):
             manifest["state"] = "active"
             common.serialization.atomic_write_json(
                 campaign_evidence.campaign_run_manifest_path(
@@ -1341,27 +1432,21 @@ def _fill_submission_capacity(
             (
                 view
                 for view in task_views
-                if view["state"] == "license_blocked"
-                and view["license_retry_eligible"] is True
-                and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
+                if view["state"] == "license_blocked" and view["license_retry_eligible"] is True and _task_identity_key(view) not in selected_tasks
             ),
-            key=lambda view: str(view["license_first_blocked_at"]),
+            key=lambda view: (
+                str(view["license_first_blocked_at"]),
+                str(view["batch_id"]),
+                int(view["case_index"]),
+            ),
         )
-        next_retry = None if unresolved_license_probe or not eligible_blocked else eligible_blocked[0]
+        next_retry = eligible_blocked[0] if eligible_blocked else None
         next_restart = next(
-            (
-                view
-                for view in task_views
-                if view["state"] in {"cancelled", "interrupted"} and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
-            ),
+            (view for view in task_views if view["state"] in {"cancelled", "interrupted"} and _task_identity_key(view) not in selected_tasks),
             None,
         )
         next_unsent = next(
-            (
-                view
-                for view in task_views
-                if view["state"] == "never_started" and (str(view["batch_id"]), int(view["case_index"])) not in selected_tasks
-            ),
+            (view for view in task_views if view["state"] == "never_started" and _task_identity_key(view) not in selected_tasks),
             None,
         )
         circuit_breaker_tripped = _solver_failure_threshold_exceeded(
@@ -1369,13 +1454,15 @@ def _fill_submission_capacity(
             maximum_failed_cases=maximum_failed_cases,
         )
         next_view = next_retry or next_restart
-        if next_view is None and not circuit_breaker_tripped:
+        if next_view is None and not circuit_breaker_tripped and len(admission_keys) < max_admission_cases:
             next_view = next_unsent
         if next_view is None:
-            if admitted_pending_jobs or running_jobs:
+            if pending_jobs or running_jobs:
                 manifest["state"] = "active"
             elif any(view["state"] == "license_blocked" for view in task_views):
                 manifest["state"] = "license_blocked"
+            elif admission_keys:
+                manifest["state"] = "active"
             elif circuit_breaker_tripped and next_unsent is not None:
                 manifest["state"] = "failure_threshold_reached"
             else:
@@ -1394,13 +1481,22 @@ def _fill_submission_capacity(
             message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
             raise RuntimeError(message)
         task = _task_from_payload(campaign, next_view)
-        selected_tasks.add((task.batch_id, task.case_index))
+        key = (task.batch_id, task.case_index)
+        selected_tasks.add(key)
         if next_view["state"] == "license_blocked":
             mode = "license_retry"
         elif next_view["state"] in {"cancelled", "interrupted"}:
             mode = "resume"
         else:
             mode = "initial"
+        if mode == "initial":
+            if key in admission_keys or len(admission_keys) >= max_admission_cases:
+                message = "Fresh case admission would exceed the logical admission limit."
+                raise RuntimeError(message)
+            admission_keys.add(key)
+        elif key not in admission_keys:
+            message = "Retry or resume case no longer owns logical admission."
+            raise RuntimeError(message)
         manifest = _submit_one(
             manifest,
             campaign,
@@ -1408,8 +1504,6 @@ def _fill_submission_capacity(
             mode=mode,
             storage_root=storage_root,
         )
-        admitted_pending_jobs += 1
-        unresolved_license_probe = unresolved_license_probe or mode == "license_retry"
 
 
 def submit_campaign(
@@ -1974,7 +2068,6 @@ def campaign_status(
     admission_blocked, admission_block_reason = _normal_admission_status(
         manifest,
         task_views,
-        pending_jobs=pending_jobs,
         running_jobs=running_jobs,
     )
     run_directory = campaign_evidence.campaign_run_directory(
@@ -2020,6 +2113,17 @@ def campaign_status(
     failed_cases = unresolved_cases
     cases_per_material = len(campaign.batches[0].case_indices) if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE else None
     public_task_views = [_public_task_view(view) for view in task_views]
+    admission = _admission_summary(manifest, task_views)
+    license_observability = (
+        _pilot_license_observability(
+            campaign,
+            task_views,
+            run_id=run_id,
+            storage_root=storage_root,
+        )
+        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE
+        else None
+    )
     work_unit_counts = {
         state: sum(view["state"] == state for view in public_task_views)
         for state in (
@@ -2052,6 +2156,7 @@ def campaign_status(
         "unsent_cases": count_states["never_started"],
         "unknown_cases": unknown_cases,
         "license_blocked_cases": count_states["license_blocked"],
+        "admission": admission,
         "license_retry_eligible_cases": license_retry_eligible_cases,
         "postprocessing_replay_available_cases": replayable_cases,
         "replay_blocked_cases": failure_counts["replay_blocked"],
@@ -2067,16 +2172,7 @@ def campaign_status(
         "batches": batches,
         "cases": public_task_views,
         "work_unit_counts": work_unit_counts,
-        "license_observability": (
-            _pilot_license_observability(
-                campaign,
-                task_views,
-                run_id=run_id,
-                storage_root=storage_root,
-            )
-            if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE
-            else None
-        ),
+        "license_observability": license_observability,
         "remote_storage_root": manifest["remote_storage_root"],
         "campaign_meta_directory": manifest["campaign_meta_directory"],
         "suggested_next_command": next_command,

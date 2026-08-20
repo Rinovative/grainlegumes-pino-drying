@@ -558,7 +558,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     execution["cluster"]["wall_time"] = "01:15:00"
     execution["submission"].update(
         {
-            "pending_buffer": 2,
+            "max_admission_cases": 2,
             "poll_interval_seconds": 7,
             "max_running_cases": 3,
         }
@@ -602,7 +602,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert resolved.execution_values["cluster"]["wall_time"] == "01:15:00"
     assert resolved.execution_values["cluster"]["cores_per_case"] == 8
     assert resolved.execution_values["submission"] == {
-        "pending_buffer": 2,
+        "max_admission_cases": 2,
         "poll_interval_seconds": 7,
         "max_running_cases": 3,
     }

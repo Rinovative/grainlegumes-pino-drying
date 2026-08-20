@@ -211,7 +211,7 @@ def _validate_submission_configuration(
         message = f"Campaign-run submission configuration is malformed: {run_id}."
         raise TypeError(message)
     if set(submission) != {
-        "pending_buffer",
+        "max_admission_cases",
         "poll_interval_seconds",
         "max_running_cases",
         "cores_per_case",
@@ -223,7 +223,7 @@ def _validate_submission_configuration(
     }:
         message = f"Campaign-run submission configuration is malformed: {run_id}."
         raise ValueError(message)
-    for key in ("pending_buffer", "poll_interval_seconds", "cores_per_case"):
+    for key in ("max_admission_cases", "poll_interval_seconds", "cores_per_case"):
         value = submission[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."

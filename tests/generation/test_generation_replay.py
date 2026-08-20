@@ -333,7 +333,7 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
         campaign_purpose="family_generalization",
         scheduler_kind="slurm",
         natural_count=3,
-        pending_buffer=2,
+        max_admission_cases=2,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     batch = campaign.batches[0]
