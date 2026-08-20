@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import subprocess
@@ -299,6 +300,88 @@ def test_capacity_status_created_by_one_exited_checkout_is_removed_exactly(tmp_p
 
 
 @pytest.mark.parametrize(
+    ("payload", "expected_state"),
+    [
+        (b"1787228251108\nRunning", "Running"),
+        (b"1787228251108\r\nDone\r\n", "Done"),
+        (b"1787228251108\nFailed\n", "Failed"),
+        (b"1787228251108\nError", "Error"),
+    ],
+)
+def test_capacity_status_byte_grammar_accepts_only_maintained_states(
+    tmp_path: Path,
+    payload: bytes,
+    expected_state: str,
+) -> None:
+    """Accept exact bounded ASCII COMSOL status records after capacity proof."""
+    work_directory = _workspace(tmp_path)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=1,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_bytes(payload)
+
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=9812,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+
+    assert artifact is not None
+    assert artifact.status_state == expected_state
+    assert artifact.content_sha256 == hashlib.sha256(payload).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"Error",
+        b"1787228251108\nError\nforeign",
+        b"1787228251108\nError suffix",
+        b'{"state":"Error"}',
+        b"1787228251108\nError\nstack trace",
+        b"1787228251108\nError\xff",
+        b"1" * 161,
+        b"178722825108\nError",
+        b"1787228251108\rError",
+    ],
+)
+def test_capacity_status_byte_grammar_rejects_unknown_payloads(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    """Reject malformed, non-ASCII, oversized, and extended status payloads."""
+    work_directory = _workspace(tmp_path)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=1,
+    )
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_bytes(payload)
+
+    with pytest.raises(
+        stop_service.UnsafeCapacityStatusArtifactError,
+        match=r"unknown_capacity_status_content|status_content_exceeds_bound",
+    ):
+        stop_service.inspect_capacity_checkout_status(
+            prelaunch,
+            process_id=9812,
+            process_exit_code=0,
+            temporary_capacity_classified=True,
+            solver_progress_started=False,
+            required_exports_exist=False,
+            scientific_result_exists=False,
+        )
+
+    assert status_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
     ("overrides", "reason"),
     [
         ({"process_exit_code": None}, "checkout_process_may_still_be_alive"),
@@ -320,7 +403,7 @@ def test_capacity_status_recovery_rejects_ambiguous_lifecycle(
         checkout_index=1,
     )
     status_path = work_directory / stop_service.STOP_STATUS_FILENAME
-    status_path.write_text("1787215759123\nRunning\n", encoding="utf-8")
+    status_path.write_text("1787228251108\nError", encoding="utf-8")
     arguments: dict[str, Any] = {
         "process_id": 9812,
         "process_exit_code": 0,

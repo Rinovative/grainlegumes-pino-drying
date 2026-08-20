@@ -589,6 +589,68 @@ def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
     assert "failed=0" in rendered
 
 
+def test_human_summary_recovers_capacity_status_without_machine_json() -> None:
+    """Show compact capacity recovery while keeping detailed diagnostics in evidence."""
+    status = {
+        "campaign_run_id": "capacity-recovery__0123456789abcdef",
+        "campaign_state": "running",
+        "cases": [
+            {
+                "batch_name": "transient_drying__kidney_bean__natural",
+                "material": "kidney_bean",
+                "case_id": "case_0001",
+                "state": "running",
+                "latest_job_id": "633912",
+                "status_artifact_recovery_count": 1,
+                "runtime_progress": {
+                    "availability": "available",
+                    "phase": "acquiring_comsol_license",
+                    "license_window_seconds": 17.0,
+                    "license_window_limit_seconds": 120.0,
+                    "license_checkout_attempt_count": 2,
+                    "last_license_result": "temporary_license_capacity",
+                },
+            }
+        ],
+    }
+
+    rendered = status_service.format_campaign_status_summary(status)
+
+    assert "phase=acquiring_comsol_license" in rendered
+    assert "checkout_result=temporary_license_capacity" in rendered
+    assert "status_artifact=recovered" in rendered
+    assert "window=17 s / 120 s" in rendered
+    assert "checkouts=2" in rendered
+    assert "content_excerpt" not in rendered
+    assert "content_sha256" not in rendered
+
+
+def test_human_summary_replaces_unsafe_status_json_with_bounded_reason() -> None:
+    """Keep machine diagnostics in canonical evidence rather than recurring output."""
+    case = _failed_case(1, failed_at="2026-08-20T09:49:19+00:00")
+    case["reason"] = (
+        "Unsafe COMSOL capacity-checkout status artifact: "
+        '{"content_excerpt":"1787228251108\\nError","content_sha256":"' + "a" * 64 + '","status_path":"/private/worker/solved.mph.status"}'
+    )
+    case["evidence_path"] = "/storage/01_generation/attempts/case_0001/attempt.json"
+
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "unsafe-status__0123456789abcdef",
+            "campaign_state": "completed_with_failures",
+            "cases": [case],
+        }
+    )
+
+    assert 'reason="Unowned or unsupported COMSOL status artifact."' in rendered
+    assert "evidence=.../attempts/case_0001/attempt.json" in rendered
+    assert "content_excerpt" not in rendered
+    assert "content_sha256" not in rendered
+    assert "1787228251108" not in rendered
+    assert "/private/worker" not in rendered
+    assert "{" not in rendered
+
+
 def test_human_summary_compacts_failed_replay_evidence() -> None:
     """Keep actionable replay state while omitting internal replay metadata."""
     status = {

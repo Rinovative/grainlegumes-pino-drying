@@ -113,16 +113,25 @@ the same allocation every five seconds until the 120-second launch deadline.
 The process that proves solver startup continues unchanged through solve and
 publication. Queue time and workspace preparation are outside the window.
 
-A capacity-only `solved.mph.status` file is removed only when strict evidence
-proves it was absent before launch, is owned and unchanged, matches the bounded
-known status class, and no solver progress, solved model, export, or scientific
-result exists. Pending and complete schema-version-1 receipts bracket the exact
-unlink. Ambiguous or unsafe artifacts remain preserved and fail closed.
+COMSOL may write an exact 13-digit epoch-millisecond timestamp followed by
+`Error` after a failed startup checkout. `Error` alone never proves temporary
+capacity. A capacity-only `solved.mph.status` file is removed only when the
+independent strong capacity classifier succeeds, the checkout process has
+terminated, the path was absent before launch inside the isolated owned worker
+workspace, the file is a non-symlink owned regular file, and no solver progress,
+solved model, export, canonical success, or scientific result exists. The status
+bytes must match one exact bounded timestamp-and-state grammar. Device, inode,
+owner, size, modification time, and digest are revalidated immediately before
+cleanup. Pending and complete schema-version-1 receipts bracket the exact
+unlink. Pre-existing, changed, unknown, or otherwise unsafe artifacts remain
+preserved and fail closed.
 
-Window exhaustion produces operational evidence and `license_blocked`; it is not
-a scientific attempt or failure. The controller later retries the same logical
-case through normal admission. Termination may add at most five seconds after
-TERM and five after KILL beyond the launch deadline.
+A safely recovered capacity artifact permits the next checkout in the same
+allocation. Window exhaustion produces operational evidence and
+`license_blocked`; it is not a scientific attempt or failure. The controller
+later retries the same logical case through normal admission. Termination may
+add at most five seconds after TERM and five after KILL beyond the launch
+deadline.
 
 ## Failure isolation and completion
 
@@ -157,8 +166,12 @@ they are omitted from timestamp ordering without demoting the case.
 
 Status shows at most three recent successful cases and three recent failures.
 Older failures are grouped by bounded classification, and never-started cases are
-grouped by material or work-unit family. Formatting does not read HDF5/CSV,
-query Slurm again, hash payloads, or expose raw license logs.
+grouped by material or work-unit family. Temporary-capacity cases stay outside
+the scientific failed section. Recurring terminal output reports only compact
+checkout, recovered-artifact, window, and retry state; content excerpts, digests,
+raw dictionaries, and machine-oriented JSON remain in canonical evidence.
+Formatting does not read HDF5/CSV, query Slurm again, hash payloads, or expose
+raw license logs.
 
 ```bash
 ./scripts/generation_workflow.sh status CONFIG_OR_RUN_ID --cpu-host "$CPU_HOST"

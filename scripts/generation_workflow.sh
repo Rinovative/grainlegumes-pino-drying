@@ -57,6 +57,7 @@ DEFER_COLLECTION=false
 CONSOLE_CHANGED_PROGRESS_SECONDS="${GENERATION_CONSOLE_CHANGED_PROGRESS_SECONDS:-60}"
 CONSOLE_HEARTBEAT_SECONDS="${GENERATION_CONSOLE_HEARTBEAT_SECONDS:-120}"
 COMPOSITE_CHILD_MODE=false
+CAMPAIGN_PARTIAL=false
 PAIRED_SMOKE_RECEIPT=""
 
 usage() {
@@ -1352,8 +1353,9 @@ remote_cli_retryable() {
 }
 
 remote_transfer_plan() {
-  remote_cli_retryable "campaign transfer-plan read" campaign-transfer-plan \
-    "${RUN_ID}" --format tsv --storage-root "${REMOTE_STORAGE_ROOT}"
+  local -a arguments=(campaign-transfer-plan "${RUN_ID}" --format tsv --storage-root "${REMOTE_STORAGE_ROOT}")
+  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || arguments+=(--partial)
+  remote_cli_retryable "campaign transfer-plan read" "${arguments[@]}"
 }
 
 resolve_local_storage() {
@@ -1418,11 +1420,16 @@ validate_transfer_path() {
 }
 
 gpu_publication_is_valid() {
+  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || return 1
+  local -a arguments=(
+    validate-published-campaign "${RUN_ID}"
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+  )
+  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || arguments+=(--partial)
   generation_run_with_heartbeat \
     "host-publication-existing-${RUN_ID}" 6 9 "Host publication" \
     "validating existing host inventory" "" \
-    local_cli_quiet validate-published-campaign "${RUN_ID}" \
-      --storage-root "${LOCAL_STORAGE_ROOT}"
+    local_cli_quiet "${arguments[@]}"
 }
 
 repair_existing_campaign_publication() {
@@ -1448,7 +1455,7 @@ collect_campaign() {
     printf 'GPU generation publication validated and reused for %s.\n' "${RUN_ID}"
     return
   fi
-  if repair_existing_campaign_publication; then
+  if [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] && repair_existing_campaign_publication; then
     printf 'GPU generation publication receipt reconstructed from canonical CPU identity for %s.\n' "${RUN_ID}"
     return
   fi
@@ -1502,10 +1509,16 @@ collect_campaign() {
     printf -v transfer_progress \
       "directories_completed=%s/%s\ncurrent_artifact=%s" \
       "$((directory_index - 1))" "${directory_total}" "${directory}"
+    local -a rsync_arguments=(
+      -a --protect-args --relative --exclude='.state/' --exclude='work/'
+    )
+    if [[ -d "${LOCAL_STORAGE_ROOT}/${directory}" ]]; then
+      rsync_arguments+=(--link-dest="${LOCAL_STORAGE_ROOT}")
+    fi
     generation_run_with_heartbeat \
       "host-transfer-${RUN_ID}-${directory_index}" 6 9 "Host publication" \
       "transferring ${directory}" "${transfer_progress}" \
-      rsync -a --protect-args --relative --exclude='.state/' --exclude='work/' \
+      rsync "${rsync_arguments[@]}" \
         "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${directory}" "${staging}/" ||
       fail 1 "Transfer failed; staging retained at ${staging}."
   done
@@ -1515,12 +1528,16 @@ collect_campaign() {
   fi
   printf -v transfer_progress \
     "directories_completed=%s/%s" "${directory_total}" "${directory_total}"
+  local -a publication_arguments=(
+    publish-transferred-campaign "${RUN_ID}"
+    --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}"
+    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}"
+  )
+  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || publication_arguments+=(--partial)
   receipt="$(generation_run_with_heartbeat \
     "host-publication-validate-${RUN_ID}" 6 9 "Host publication" \
     "validating destination inventory and hashes" "${transfer_progress}" \
-    local_cli publish-transferred-campaign "${RUN_ID}" \
-      --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
-      --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}")" ||
+    local_cli "${publication_arguments[@]}")" ||
     fail 1 "GPU publication validation failed; staging retained at ${staging}."
   if [[ "${PILOT_MODE}" != true ]]; then
     local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
@@ -1534,11 +1551,12 @@ collect_campaign() {
 build_datasets() {
   resolve_local_python
   resolve_local_storage
+  local -a arguments=(build-campaign-datasets "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
+  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || arguments+=(--partial)
   generation_run_with_heartbeat \
     "dataset-packages-${RUN_ID}" 7 9 "Packages/finalizer" \
     "building Dataset packages and loader smoke evidence" "" \
-    local_cli build-campaign-datasets "${RUN_ID}" \
-      --storage-root "${LOCAL_STORAGE_ROOT}"
+    local_cli "${arguments[@]}"
 }
 
 remote_campaign_monitor() {
@@ -1603,7 +1621,11 @@ deferred_campaign_report() {
 
 prepare_all_receipt() {
   local -a arguments=(prepare-all-workflow "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")
-  [[ "${KEEP_CPU_SOURCE}" != true ]] || arguments+=(--keep-cpu-source)
+  if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
+    arguments+=(--partial --keep-cpu-source)
+  elif [[ "${KEEP_CPU_SOURCE}" == true ]]; then
+    arguments+=(--keep-cpu-source)
+  fi
   generation_run_with_heartbeat \
     "workflow-gates-${RUN_ID}" 8 9 "Retention policy" \
     "validating immutable host and Dataset workflow gates" "" \
@@ -2137,8 +2159,9 @@ monitor_generation_units() {
             sleep "$STATUS_POLL_SECONDS" || true
             ;;
           completed_with_failures)
+            CAMPAIGN_PARTIAL=true
             disarm_campaign_interrupt
-            fail 1 "Campaign has a permanent scientific or postprocessing failure; inspect retained case evidence before rerunning the same config."
+            return
             ;;
           cancelled)
             disarm_campaign_interrupt
@@ -2199,6 +2222,7 @@ monitor_generation_units() {
 resolve_leaf_plan() {
   LEAF_STATE=running
   LEAF_RESULT=OK
+  CAMPAIGN_PARTIAL=false
   LEAF_EXISTING_DETAIL=""
   case "$RUN_KIND" in
     campaign)
@@ -2407,9 +2431,15 @@ print("\t".join((str(value["status"]), reason)))')" ||
         fail 1 "Could not decode Dataset package stage."
       IFS=$'\t' read -r dataset_status dataset_reason extra <<< "$dataset_record"
       [[ -z "${extra:-}" ]] || fail 1 "Malformed Dataset package stage."
-      [[ "$dataset_status" == complete ]] ||
-        fail 1 "Dataset package stage returned unsupported status: $dataset_status"
-      LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID declared packages and finalizers validated"
+      if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
+        [[ "$dataset_status" == incomplete ]] ||
+          fail 1 "Partial Dataset package stage returned unsupported status: $dataset_status"
+        LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID Dataset packages incomplete; successful cases retained for resume"
+      else
+        [[ "$dataset_status" == complete ]] ||
+          fail 1 "Dataset package stage returned unsupported status: $dataset_status"
+        LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID declared packages and finalizers validated"
+      fi
       ;;
     benchmark)
       LEAF_PACKAGE_DETAIL="benchmark_run_id=$RUN_ID summary validated; Dataset packages=none"
@@ -2423,12 +2453,13 @@ apply_leaf_retention() {
   case "$RUN_KIND" in
     campaign)
       prepare_all_receipt >/dev/null
-      if [[ "$KEEP_CPU_SOURCE" == true ]]; then
+      if [[ "${CAMPAIGN_PARTIAL:-false}" == true || "$KEEP_CPU_SOURCE" == true ]]; then
         read_remote_source_status
       else
         confirm_cpu_cleanup >/dev/null
       fi
-      if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
+      if [[ "$CAMPAIGN_PURPOSE" == pilot_check \
+        && "${CAMPAIGN_PARTIAL:-false}" != true ]]; then
         cleanup_pilot_staging >/dev/null
         record_pilot_cleanup_result
       fi
@@ -2464,17 +2495,26 @@ prepare_leaf_for_parent() {
 validate_leaf_result() {
   case "$RUN_KIND" in
     campaign)
-      generation_run_with_heartbeat \
-        "final-workflow-$RUN_ID" 9 9 "Final validation" \
-        "validating terminal workflow and cleanup evidence" "" \
-        local_cli validate-all-workflow "$RUN_ID" \
-          --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
-      generation_run_with_heartbeat \
-        "final-packages-$RUN_ID" 9 9 "Final validation" \
-        "validating current Dataset package state" "" \
-        local_cli validate-campaign-package-state "$RUN_ID" \
-          --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
-      if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
+      if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
+        generation_run_with_heartbeat \
+          "partial-workflow-$RUN_ID" 9 9 "Final validation" \
+          "validating partial publication, retained CPU source, and resume metadata" "" \
+          local_cli validate-all-workflow "$RUN_ID" --partial \
+            --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+      else
+        generation_run_with_heartbeat \
+          "final-workflow-$RUN_ID" 9 9 "Final validation" \
+          "validating terminal workflow and cleanup evidence" "" \
+          local_cli validate-all-workflow "$RUN_ID" \
+            --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+        generation_run_with_heartbeat \
+          "final-packages-$RUN_ID" 9 9 "Final validation" \
+          "validating current Dataset package state" "" \
+          local_cli validate-campaign-package-state "$RUN_ID" \
+            --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null
+      fi
+      if [[ "$CAMPAIGN_PURPOSE" == pilot_check \
+        && "${CAMPAIGN_PARTIAL:-false}" != true ]]; then
         generation_run_with_heartbeat \
           "final-pilot-$RUN_ID" 9 9 "Final validation" \
           "validating pilot cleanup evidence" "" \
@@ -2596,9 +2636,15 @@ run_leaf_plan() {
 
   ALL_STAGE="common work-unit monitoring and CPU finalization"
   monitor_generation_units "$RUN_KIND"
-  finalize_leaf_cpu_evidence
-  generation_console_stage 5 9 "Work units" OK \
-    "run_id=$RUN_ID kind=$RUN_KIND state=cpu_complete"
+  if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
+    LEAF_RESULT=PARTIAL
+    generation_console_stage 5 9 "Work units" OK \
+      "run_id=$RUN_ID kind=$RUN_KIND state=completed_with_failures partial=true"
+  else
+    finalize_leaf_cpu_evidence
+    generation_console_stage 5 9 "Work units" OK \
+      "run_id=$RUN_ID kind=$RUN_KIND state=cpu_complete"
+  fi
 
   if [[ "$DEFER_COLLECTION" == true ]]; then
     LEAF_STATE=awaiting_collection
@@ -2616,7 +2662,8 @@ run_leaf_plan() {
   generation_console_stage 7 9 "Packages/finalizer" RUNNING
   build_leaf_packages_and_finalizers
   generation_console_stage 7 9 "Packages/finalizer" OK "$LEAF_PACKAGE_DETAIL"
-  if [[ "$COMPOSITE_CHILD_MODE" == true ]]; then
+  if [[ "$COMPOSITE_CHILD_MODE" == true \
+    && "${CAMPAIGN_PARTIAL:-false}" != true ]]; then
     prepare_leaf_for_parent
     return
   fi
@@ -2639,14 +2686,16 @@ run_workflow_plan() {
   local index
   WORKFLOW_CHILD_RUN_IDS=()
   PAIRED_SMOKE_RECEIPT=""
-  local workflow_result=REUSED workflow_children
+  local workflow_result=REUSED workflow_children workflow_partial=false
   COMPOSITE_CHILD_MODE=true
   for ((index=0; index<RUN_CHILD_COUNT; index++)); do
     run_leaf_plan campaign \
       "${RUN_CHILD_CONFIGS[index]}" "${RUN_CHILD_IDENTITIES[index]}" \
       "${RUN_CHILD_PURPOSES[index]}" "${RUN_CHILD_PROFILES[index]}"
     WORKFLOW_CHILD_RUN_IDS+=("$RUN_ID")
-    if [[ "$LEAF_RESULT" != REUSED ]]; then
+    if [[ "$LEAF_RESULT" == PARTIAL ]]; then
+      workflow_partial=true
+    elif [[ "$LEAF_RESULT" != REUSED ]]; then
       workflow_result=OK
     fi
     case "$LEAF_STATE" in
@@ -2660,6 +2709,12 @@ run_workflow_plan() {
   COMPOSITE_CHILD_MODE=false
   if [[ "${WORKFLOW_STATE:-}" == awaiting_collection ]]; then
     printf 'AWAITING: workflow=%s state=awaiting_collection\n' "$RUN_PLAN_ID"
+    return
+  fi
+  if [[ "$workflow_partial" == true ]]; then
+    LEAF_RESULT=PARTIAL
+    LEAF_STATE=complete
+    WORKFLOW_STATE=complete
     return
   fi
   (( ${#WORKFLOW_CHILD_RUN_IDS[@]} == 2 )) ||
@@ -2763,7 +2818,7 @@ execute_generation_run() {
         "$RUN_PLAN_PURPOSE" "$RUN_PLAN_PROFILE"
       case "$LEAF_STATE" in
         complete)
-          generation_console_final             "run_identity=$RUN_PLAN_ID campaign_run_id=$RUN_ID state=complete result=$LEAF_RESULT"
+          generation_console_final             "run_identity=$RUN_PLAN_ID campaign_run_id=$RUN_ID state=${REMOTE_CAMPAIGN_STATE:-complete} result=$LEAF_RESULT"
           ;;
         awaiting_collection)
           printf 'AWAITING: run_identity=%s state=%s\n'             "$RUN_PLAN_ID" "$LEAF_STATE"
@@ -2785,7 +2840,7 @@ execute_generation_run() {
       WORKFLOW_STATE=""
       run_workflow_plan
       if [[ "$WORKFLOW_STATE" == complete ]]; then
-        generation_console_final           "run_identity=$RUN_PLAN_ID state=complete children=${WORKFLOW_CHILD_RUN_IDS[*]}"
+        generation_console_final           "run_identity=$RUN_PLAN_ID state=complete result=$LEAF_RESULT children=${WORKFLOW_CHILD_RUN_IDS[*]}"
       fi
       ;;
     *) fail 2 "Unsupported Generation run kind: $RUN_KIND" ;;

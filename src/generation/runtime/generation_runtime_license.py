@@ -1229,7 +1229,7 @@ def _validate_status_recovery_payload(
         or payload.get("prelaunch_path_existed") is not False
         or payload.get("status_relative_path") != "solved.mph.status"
         or payload.get("status_content_class") != "comsol_batch_status_timestamp_and_state"
-        or payload.get("status_state") not in {"Running", "Done", "Failed"}
+        or payload.get("status_state") not in {"Running", "Done", "Failed", "Error"}
         or not isinstance(payload.get("status_excerpt"), str)
         or len(payload["status_excerpt"].encode("utf-8")) > _MAX_STATUS_RECOVERY_EXCERPT_BYTES
         or not isinstance(payload.get("status_sha256"), str)

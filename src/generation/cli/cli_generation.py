@@ -605,6 +605,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     publish_transfer.add_argument("--destination-root", type=Path, required=True)
     publish_transfer.add_argument("--source-host", required=True)
     publish_transfer.add_argument("--source-storage-root", required=True)
+    publish_transfer.add_argument("--partial", action="store_true")
 
     campaign_terminal = subparsers.add_parser("validate-campaign-terminal", help="validate and publish terminal campaign evidence")
     campaign_terminal.add_argument("campaign_run_id")
@@ -613,6 +614,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     transfer_plan = subparsers.add_parser("campaign-transfer-plan", help="print terminally validated collection directories")
     transfer_plan.add_argument("campaign_run_id")
     transfer_plan.add_argument("--format", choices=("json", "tsv"), default="json")
+    transfer_plan.add_argument("--partial", action="store_true")
     _add_storage_arguments(transfer_plan)
 
     transfer_authority = subparsers.add_parser(
@@ -638,6 +640,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="validate an exact GPU generation publication and transfer receipt",
     )
     validate_publication.add_argument("campaign_run_id")
+    validate_publication.add_argument("--partial", action="store_true")
     _add_storage_arguments(validate_publication)
 
     pilot_source_inventory = subparsers.add_parser(
@@ -720,6 +723,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="build the launch packages or only missing additive extensions",
     )
     build_datasets.add_argument("campaign_run_id")
+    build_datasets.add_argument("--partial", action="store_true")
     _add_storage_arguments(build_datasets)
 
     validate_package_state = subparsers.add_parser(
@@ -735,6 +739,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     prepare_all.add_argument("campaign_run_id")
     prepare_all.add_argument("--keep-cpu-source", action="store_true")
+    prepare_all.add_argument("--partial", action="store_true")
     _add_storage_arguments(prepare_all)
 
     validate_all = subparsers.add_parser(
@@ -742,6 +747,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="require one terminally successful all-workflow receipt",
     )
     validate_all.add_argument("campaign_run_id")
+    validate_all.add_argument("--partial", action="store_true")
     _add_storage_arguments(validate_all)
 
     cleanup_authorization = subparsers.add_parser(
@@ -1617,6 +1623,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             destination_root=args.destination_root,
             source_host=args.source_host,
             source_storage_root=args.source_storage_root,
+            partial=args.partial,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
@@ -1628,9 +1635,17 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(terminal, sort_keys=True))
         return 0
     if args.command == "campaign-transfer-plan":
-        transfer_plan = campaign_runtime.campaign_transfer_plan(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
+        transfer_plan = (
+            campaign_runtime.partial_campaign_transfer_plan(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+                refresh=True,
+            )
+            if args.partial
+            else campaign_runtime.campaign_transfer_plan(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
         )
         if args.format == "json":
             print(json.dumps(transfer_plan, sort_keys=True))
@@ -1708,9 +1723,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "validate-published-campaign":
-        receipt = campaign_runtime.validate_transferred_campaign(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
+        receipt = (
+            campaign_runtime.validate_partially_transferred_campaign(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            if args.partial
+            else campaign_runtime.validate_transferred_campaign(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
@@ -1832,9 +1854,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(report, sort_keys=True))
         return 0
     if args.command == "build-campaign-datasets":
-        receipt = workflow_service.build_campaign_datasets(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
+        receipt = (
+            workflow_service.record_incomplete_campaign_datasets(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            if args.partial
+            else workflow_service.build_campaign_datasets(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
@@ -1846,17 +1875,31 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(state, sort_keys=True))
         return 0
     if args.command == "prepare-all-workflow":
-        receipt = workflow_service.prepare_all_workflow_receipt(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            cleanup_requested=not args.keep_cpu_source,
+        receipt = (
+            workflow_service.prepare_partial_completion_receipt(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            if args.partial
+            else workflow_service.prepare_all_workflow_receipt(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+                cleanup_requested=not args.keep_cpu_source,
+            )
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "validate-all-workflow":
-        receipt = workflow_service.validate_completed_workflow(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
+        receipt = (
+            workflow_service.validate_partial_completion_receipt(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            if args.partial
+            else workflow_service.validate_completed_workflow(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0

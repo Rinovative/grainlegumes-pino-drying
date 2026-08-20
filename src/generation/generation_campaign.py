@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from src import common
 
@@ -62,6 +62,9 @@ _ACTIVE_PENDING_STATE: Final = "PENDING"
 _JOB_NAME_PATTERN: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _MAX_SLURM_JOB_NAME_LENGTH: Final = 48
 _TRANSFER_PUBLICATION_JOURNAL: Final = ".generation-transfer-publication.json"
+_PARTIAL_TRANSFER_PUBLICATION_JOURNAL: Final = ".generation-partial-transfer-publication.json"
+_PARTIAL_CAMPAIGN_FILENAME: Final = "campaign_partial.json"
+_PARTIAL_TRANSFER_FILENAME: Final = "transfer_partial.json"
 _MATERIAL_JOB_CODES: Final = {
     "lentil": "lentil",
     "chickpea": "chickpea",
@@ -3598,6 +3601,265 @@ def campaign_transfer_plan(
     }
 
 
+def _validate_partial_campaign_evidence(
+    run_id: str,
+    evidence: Mapping[str, Any],
+    *,
+    storage_root: Path,
+) -> dict[str, Any]:
+    """Bind partial status evidence to the exact launch and configured cases."""
+    required = {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "campaign_id",
+        "git_commit",
+        "campaign_state",
+        "successful_cases",
+        "failed_cases",
+        "resume_command",
+        "recorded_at",
+        "transfer_plan",
+    }
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
+    campaign = campaign_evidence.campaign_from_manifest(manifest)
+    plan = evidence.get("transfer_plan")
+    successful = evidence.get("successful_cases")
+    failed = evidence.get("failed_cases")
+    case_keys = {
+        "batch_name",
+        "batch_id",
+        "case_id",
+        "case_index",
+        "state",
+        "classified_state",
+    }
+    expected_cases = {
+        (batch.batch_name, batch.batch_id, batch.case_id(case_index), case_index) for batch in campaign.batches for case_index in batch.case_indices
+    }
+    records = [*successful, *failed] if isinstance(successful, list) and isinstance(failed, list) else []
+    observed_cases = {
+        (
+            record.get("batch_name"),
+            record.get("batch_id"),
+            record.get("case_id"),
+            record.get("case_index"),
+        )
+        for record in records
+        if isinstance(record, dict)
+    }
+    expected_batches = [
+        {
+            "batch_name": batch.batch_name,
+            "batch_id": batch.batch_id,
+            "case_count": len(batch.case_indices),
+        }
+        for batch in campaign.batches
+    ]
+    plan_batches = plan.get("batches") if isinstance(plan, dict) else None
+    if (
+        set(evidence) != required
+        or evidence.get("schema_kind") != "generation_campaign_partial"
+        or evidence.get("schema_version") != 1
+        or evidence.get("campaign_run_id") != run_id
+        or evidence.get("campaign_id") != campaign.campaign_id
+        or evidence.get("git_commit") != manifest["git_commit"]
+        or evidence.get("campaign_state") != "completed_with_failures"
+        or evidence.get("resume_command") != f"resume {run_id}"
+        or not isinstance(evidence.get("recorded_at"), str)
+        or not evidence["recorded_at"]
+        or not isinstance(plan, dict)
+        or set(plan)
+        != {
+            "campaign_run_id",
+            "campaign_name",
+            "git_commit",
+            "campaign_config",
+            "campaign_directory",
+            "batches",
+        }
+        or plan.get("campaign_run_id") != run_id
+        or plan.get("campaign_name") != campaign.campaign_name
+        or plan.get("git_commit") != manifest["git_commit"]
+        or plan.get("campaign_config") != manifest["campaign_config"]
+        or not isinstance(plan.get("campaign_directory"), str)
+        or not isinstance(plan_batches, list)
+        or len(plan_batches) != len(expected_batches)
+        or any(
+            not isinstance(batch, dict)
+            or set(batch)
+            != {
+                "batch_name",
+                "batch_id",
+                "case_count",
+                "meta_directory",
+                "raw_directory",
+                "processed_directory",
+                "attempt_directories",
+            }
+            for batch in plan_batches
+        )
+        or [
+            {
+                "batch_name": batch.get("batch_name"),
+                "batch_id": batch.get("batch_id"),
+                "case_count": batch.get("case_count"),
+            }
+            for batch in plan_batches
+            if isinstance(batch, dict)
+        ]
+        != expected_batches
+        or not isinstance(successful, list)
+        or not successful
+        or not isinstance(failed, list)
+        or not failed
+        or any(not isinstance(record, dict) or set(record) != case_keys for record in records)
+        or observed_cases != expected_cases
+        or len(observed_cases) != len(records)
+        or any(record["state"] != "successful" or record["classified_state"] != "successful" for record in successful)
+        or any(record["state"] != "failed" or record["classified_state"] == "successful" for record in failed)
+    ):
+        message = "Partial campaign evidence conflicts with the launch campaign."
+        raise ValueError(message)
+    batches_by_name = {batch.batch_name: batch for batch in campaign.batches}
+    for record in successful:
+        batch = batches_by_name[str(record["batch_name"])]
+        if not batch_runtime.completed_case_is_valid(
+            batch,
+            int(record["case_index"]),
+            storage_root=storage_root,
+        ):
+            message = f"Successful case publication is invalid: {record['case_id']!r}."
+            raise RuntimeError(message)
+    return dict(evidence)
+
+
+def partial_campaign_transfer_plan(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Return a validated transfer plan for one resumable partial campaign."""
+    storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
+    evidence_path = (
+        campaign_evidence.campaign_run_directory(
+            run_id,
+            storage_root=storage,
+        )
+        / _PARTIAL_CAMPAIGN_FILENAME
+    )
+    if evidence_path.is_file() and not refresh:
+        evidence = campaign_evidence.load_json_object(
+            evidence_path,
+            label="partial campaign evidence",
+        )
+        validated = _validate_partial_campaign_evidence(
+            run_id,
+            evidence,
+            storage_root=storage,
+        )
+        return cast("dict[str, Any]", validated["transfer_plan"])
+
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
+    campaign = campaign_evidence.campaign_from_manifest(manifest)
+    status = campaign_status(run_id, storage_root=storage, query_scheduler=True)
+    successful = [case for case in status["cases"] if case["state"] == "successful"]
+    failed = [case for case in status["cases"] if case["state"] == "failed"]
+    if status["campaign_state"] != "completed_with_failures" or not successful or not failed:
+        message = "Partial publication requires successful cases and genuine terminal case failures."
+        raise RuntimeError(message)
+    batches_by_name = {batch.batch_name: batch for batch in campaign.batches}
+    for case in successful:
+        batch = batches_by_name[str(case["batch_name"])]
+        if not batch_runtime.completed_case_is_valid(
+            batch,
+            int(case["case_index"]),
+            storage_root=storage,
+        ):
+            message = f"Successful case publication is invalid: {case['case_id']!r}."
+            raise RuntimeError(message)
+
+    def relative_directory(directory: Path) -> str:
+        resolved = directory.resolve()
+        if not resolved.is_dir() or resolved.is_symlink():
+            message = f"Partial transfer source is missing or unsafe: {resolved}."
+            raise FileNotFoundError(message)
+        try:
+            return resolved.relative_to(storage).as_posix()
+        except ValueError as error:
+            message = f"Partial transfer source escapes the storage root: {resolved}."
+            raise ValueError(message) from error
+
+    def attempt_directories(batch: config_service.GenerationConfig) -> list[str]:
+        directories: list[str] = []
+        for case_index in batch.case_indices:
+            candidate = common.paths.resolve_generation_attempt_case_directory(
+                batch.batch_storage_name,
+                batch.case_id(case_index),
+                run_id,
+                storage_root=storage,
+            )
+            if candidate.is_symlink():
+                message = f"Attempt transfer source is unsafe: {candidate}."
+                raise ValueError(message)
+            if candidate.exists():
+                directories.append(relative_directory(candidate))
+        return directories
+
+    plan = {
+        "campaign_run_id": run_id,
+        "campaign_name": campaign.campaign_name,
+        "git_commit": manifest["git_commit"],
+        "campaign_config": manifest["campaign_config"],
+        "campaign_directory": relative_directory(evidence_path.parent),
+        "batches": [
+            {
+                "batch_name": batch.batch_name,
+                "batch_id": batch.batch_id,
+                "case_count": len(batch.case_indices),
+                "meta_directory": relative_directory(batch_runtime.batch_meta_directory(batch, storage_root=storage)),
+                "raw_directory": relative_directory(
+                    common.paths.resolve_generated_batch_dir(batch.batch_storage_name, stage="raw", storage_root=storage)
+                ),
+                "processed_directory": relative_directory(
+                    common.paths.resolve_generated_batch_dir(batch.batch_storage_name, stage="processed", storage_root=storage)
+                ),
+                "attempt_directories": attempt_directories(batch),
+            }
+            for batch in campaign.batches
+        ],
+    }
+    case_fields = (
+        "batch_name",
+        "batch_id",
+        "case_id",
+        "case_index",
+        "state",
+        "classified_state",
+    )
+    evidence = {
+        "schema_kind": "generation_campaign_partial",
+        "schema_version": 1,
+        "campaign_run_id": run_id,
+        "campaign_id": campaign.campaign_id,
+        "git_commit": manifest["git_commit"],
+        "campaign_state": "completed_with_failures",
+        "successful_cases": [{field: case[field] for field in case_fields} for case in successful],
+        "failed_cases": [{field: case[field] for field in case_fields} for case in failed],
+        "resume_command": f"resume {run_id}",
+        "recorded_at": _utc_now(),
+        "transfer_plan": plan,
+    }
+    common.serialization.atomic_write_json(evidence_path, evidence)
+    validated = _validate_partial_campaign_evidence(
+        run_id,
+        evidence,
+        storage_root=storage,
+    )
+    return cast("dict[str, Any]", validated["transfer_plan"])
+
+
 def campaign_transfer_inventory(
     run_id: str,
     *,
@@ -3679,9 +3941,10 @@ def _load_or_create_campaign_transfer_journal(
     destination: Path,
     source_host: str,
     source_storage_root: str,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Load or immutably establish interruption-recovery transfer evidence."""
-    journal_path = staging / _TRANSFER_PUBLICATION_JOURNAL
+    journal_path = staging / (_PARTIAL_TRANSFER_PUBLICATION_JOURNAL if partial else _TRANSFER_PUBLICATION_JOURNAL)
     expected_identity = {
         "schema_kind": "generation_transfer_publication",
         "schema_version": 1,
@@ -3711,18 +3974,40 @@ def _load_or_create_campaign_transfer_journal(
             message = f"Transfer publication journal conflicts: {journal_path}"
             raise RuntimeError(message)
         return journal
-    terminal = validate_terminal_campaign(run_id, storage_root=staging)
-    plan = campaign_transfer_plan(run_id, storage_root=staging)
+    if partial:
+        evidence_path = (
+            campaign_evidence.campaign_run_directory(
+                run_id,
+                storage_root=staging,
+            )
+            / _PARTIAL_CAMPAIGN_FILENAME
+        )
+        terminal = _validate_partial_campaign_evidence(
+            run_id,
+            campaign_evidence.load_json_object(
+                evidence_path,
+                label="partial campaign evidence",
+            ),
+            storage_root=staging,
+        )
+        plan = partial_campaign_transfer_plan(run_id, storage_root=staging)
+    else:
+        terminal = validate_terminal_campaign(run_id, storage_root=staging)
+        plan = campaign_transfer_plan(run_id, storage_root=staging)
     source_inventory = campaign_evidence.transfer_inventory_from_plan(
         plan,
         storage_root=staging,
     )
     journal = {
         **expected_identity,
-        "terminal": {
-            "campaign_id": terminal["campaign_id"],
-            "git_commit": terminal["git_commit"],
-        },
+        "terminal": (
+            terminal
+            if partial
+            else {
+                "campaign_id": terminal["campaign_id"],
+                "git_commit": terminal["git_commit"],
+            }
+        ),
         "plan": plan,
         "source_inventory": source_inventory,
         "directories": _campaign_transfer_directory_records(plan, staging=staging),
@@ -3872,6 +4157,7 @@ def publish_transferred_campaign(
     destination_root: Path | str,
     source_host: str,
     source_storage_root: str,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Validate incoming bytes and atomically rename them into final locations."""
     if not source_host or any(character in source_host for character in "\r\n\t"):
@@ -3898,11 +4184,7 @@ def publish_transferred_campaign(
         destination=destination,
         source_host=source_host,
         source_storage_root=source_storage_root,
-    )
-    outcomes = _publish_incoming_campaign_directories(
-        journal,
-        staging=staging,
-        destination=destination,
+        partial=partial,
     )
     plan = journal["plan"]
     source_inventory = journal["source_inventory"]
@@ -3910,6 +4192,89 @@ def publish_transferred_campaign(
     if not isinstance(plan, dict) or not isinstance(source_inventory, dict) or not isinstance(terminal, dict):
         message = "Transfer publication journal terminal evidence is malformed."
         raise TypeError(message)
+    if partial:
+        if terminal.get("schema_kind") != "generation_campaign_partial":
+            message = "Transfer publication journal partial evidence is malformed."
+            raise ValueError(message)
+        existing_receipt_path = (
+            campaign_evidence.campaign_run_directory(
+                run_id,
+                storage_root=destination,
+            )
+            / _PARTIAL_TRANSFER_FILENAME
+        )
+        if existing_receipt_path.exists():
+            existing_partial = campaign_evidence.load_json_object(
+                existing_receipt_path,
+                label="partial transfer receipt",
+            )
+            expected_identity = {
+                "campaign_run_id": run_id,
+                "campaign_id": terminal["campaign_id"],
+                "git_commit": terminal["git_commit"],
+                "source_host": source_host,
+                "source_storage_root": source_storage_root,
+                "destination_storage_root": str(destination),
+            }
+            if any(existing_partial.get(key) != value for key, value in expected_identity.items()):
+                message = f"Existing partial transfer identity conflicts: {existing_receipt_path}"
+                raise FileExistsError(message)
+    outcomes = _publish_incoming_campaign_directories(
+        journal,
+        staging=staging,
+        destination=destination,
+    )
+    if partial:
+        evidence_path = (
+            campaign_evidence.campaign_run_directory(
+                run_id,
+                storage_root=destination,
+            )
+            / _PARTIAL_CAMPAIGN_FILENAME
+        )
+        if terminal.get("schema_kind") != "generation_campaign_partial":
+            message = "Transfer publication journal partial evidence is malformed."
+            raise ValueError(message)
+        common.serialization.atomic_write_json(evidence_path, terminal)
+        evidence = campaign_evidence.load_json_object(
+            evidence_path,
+            label="partial campaign evidence",
+        )
+        destination_inventory = campaign_evidence.transfer_inventory_from_plan(
+            plan,
+            storage_root=destination,
+        )
+        if destination_inventory != source_inventory:
+            message = "Published partial campaign inventory differs from the incoming transfer source."
+            raise RuntimeError(message)
+        receipt_path = evidence_path.parent / _PARTIAL_TRANSFER_FILENAME
+        receipt = {
+            "schema_kind": "generation_campaign_partial_transfer",
+            "schema_version": 1,
+            "status": "partial",
+            "recorded_at": _utc_now(),
+            "campaign_run_id": run_id,
+            "campaign_id": evidence["campaign_id"],
+            "git_commit": evidence["git_commit"],
+            "source_host": source_host,
+            "source_storage_root": source_storage_root,
+            "destination_storage_root": str(destination),
+            "campaign_partial_sha256": common.serialization.file_sha256(evidence_path),
+            "transferred_file_count": source_inventory["file_count"],
+            "transferred_bytes": source_inventory["size_bytes"],
+            "transfer_inventory_sha256": source_inventory["inventory_sha256"],
+            "files": source_inventory["files"],
+            "directories": outcomes,
+            "successful_cases": evidence["successful_cases"],
+            "failed_cases": evidence["failed_cases"],
+            "source_removed": False,
+        }
+        common.serialization.atomic_write_json(receipt_path, receipt)
+        return validate_partially_transferred_campaign(
+            run_id,
+            storage_root=destination,
+        )
+
     validated = validate_terminal_campaign(run_id, storage_root=destination)
     destination_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
     if destination_inventory != source_inventory:
@@ -4078,3 +4443,96 @@ def validate_transferred_campaign(
         plan=plan,
         storage_root=destination,
     )
+
+
+def validate_partially_transferred_campaign(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate a resumable partial GPU publication without promoting it to complete."""
+    destination = workspace_service.resolve_storage_root(storage_root, create=False)
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=destination,
+    )
+    evidence_path = run_directory / _PARTIAL_CAMPAIGN_FILENAME
+    evidence = campaign_evidence.load_json_object(
+        evidence_path,
+        label="partial campaign evidence",
+    )
+    plan = partial_campaign_transfer_plan(run_id, storage_root=destination)
+    inventory = campaign_evidence.transfer_inventory_from_plan(
+        plan,
+        storage_root=destination,
+    )
+    receipt_path = run_directory / _PARTIAL_TRANSFER_FILENAME
+    receipt = campaign_evidence.load_json_object(
+        receipt_path,
+        label="partial transfer receipt",
+    )
+    required = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "recorded_at",
+        "campaign_run_id",
+        "campaign_id",
+        "git_commit",
+        "source_host",
+        "source_storage_root",
+        "destination_storage_root",
+        "campaign_partial_sha256",
+        "transferred_file_count",
+        "transferred_bytes",
+        "transfer_inventory_sha256",
+        "files",
+        "directories",
+        "successful_cases",
+        "failed_cases",
+        "source_removed",
+    }
+    successful = evidence.get("successful_cases")
+    failed = evidence.get("failed_cases")
+    if (
+        set(receipt) != required
+        or receipt.get("schema_kind") != "generation_campaign_partial_transfer"
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "partial"
+        or receipt.get("campaign_run_id") != run_id
+        or receipt.get("campaign_id") != evidence.get("campaign_id")
+        or receipt.get("git_commit") != evidence.get("git_commit")
+        or receipt.get("destination_storage_root") != str(destination)
+        or receipt.get("campaign_partial_sha256") != common.serialization.file_sha256(evidence_path)
+        or receipt.get("transferred_file_count") != inventory["file_count"]
+        or receipt.get("transferred_bytes") != inventory["size_bytes"]
+        or receipt.get("transfer_inventory_sha256") != inventory["inventory_sha256"]
+        or receipt.get("files") != inventory["files"]
+        or receipt.get("successful_cases") != successful
+        or receipt.get("failed_cases") != failed
+        or not isinstance(successful, list)
+        or not successful
+        or not isinstance(failed, list)
+        or not failed
+        or receipt.get("source_removed") is not False
+    ):
+        message = f"Partial transfer receipt or GPU publication is invalid: {receipt_path}"
+        raise ValueError(message)
+    campaign = campaign_evidence.campaign_from_manifest(campaign_evidence.load_campaign_run(run_id, storage_root=destination))
+    batches = {batch.batch_name: batch for batch in campaign.batches}
+    for case in successful:
+        if not isinstance(case, dict) or case.get("classified_state") != "successful":
+            message = f"Partial successful-case evidence is invalid: {receipt_path}"
+            raise ValueError(message)
+        batch = batches[str(case["batch_name"])]
+        if not batch_runtime.completed_case_is_valid(
+            batch,
+            int(case["case_index"]),
+            storage_root=destination,
+        ):
+            message = f"Partial successful case is not publishable: {case['case_id']!r}."
+            raise RuntimeError(message)
+    if any(not isinstance(case, dict) or case.get("classified_state") == "successful" for case in failed):
+        message = f"Partial failed-case evidence is invalid: {receipt_path}"
+        raise ValueError(message)
+    return receipt

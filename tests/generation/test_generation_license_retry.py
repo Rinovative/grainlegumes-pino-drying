@@ -167,7 +167,7 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
         checkout_index=3,
     )
     status_path = work_directory / stop_service.STOP_STATUS_FILENAME
-    status_path.write_text("1787215759123\nFailed\n", encoding="utf-8")
+    status_path.write_text("1787228251108\nError", encoding="utf-8")
     artifact = stop_service.inspect_capacity_checkout_status(
         prelaunch,
         process_id=7731,
@@ -215,7 +215,7 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     )
     pending = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert pending["cleanup_state"] == "pending"
-    assert pending["status_state"] == "Failed"
+    assert pending["status_state"] == "Error"
     assert pending["status_sha256"] == artifact.content_sha256
     assert status_path.exists()
 
@@ -325,7 +325,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "701")
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
-    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Failed")
+    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Error")
 
     blocked = generation.runtime.run_case(
         config,
@@ -459,7 +459,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     monkeypatch.setenv("SLURM_JOB_ID", "711")
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity_twice_then_success")
-    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Failed")
+    monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Error")
     monkeypatch.setenv("FAKE_COMSOL_DELAY", "0.5")
 
     outcome = generation.runtime.run_case(

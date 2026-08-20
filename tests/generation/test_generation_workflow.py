@@ -757,7 +757,11 @@ if [[ " $* " == *' -c '* ]]; then
         "${FAKE_RUN_ID}" "${compatible_state}" "${FAKE_INVENTORY_SHA}"
     fi
   elif [[ " $* " == *'reason = str(value.get'* ]]; then
-    printf 'complete\t-\n'
+    if [[ "${FAKE_CAMPAIGN_STATE}" == completed_with_failures ]]; then
+      printf 'incomplete\tpartial campaign completion\n'
+    else
+      printf 'complete\t-\n'
+    fi
   elif [[ " $* " == *'keys = ("status"'* ]]; then
     printf 'created\tgw-20260818T154501Z-run-01234567\tgw-run-154501-01234567\t%s\t' \
       "${FAKE_GIT_COMMIT}"
@@ -844,7 +848,11 @@ if [[ " $* " == *' validate-real-smoke '* ]]; then
 elif [[ " $* " == *' validate-core-benchmark '* ]]; then
   [[ -f "${FAKE_BENCHMARK_PUBLISHED_FILE}" ]]
 elif [[ " $* " == *' validate-published-campaign '* ]]; then
-  [[ "${FAKE_GPU_ALWAYS_VALID:-false}" == true || -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
+  if [[ " $* " == *' --partial '* ]]; then
+    [[ -f "${FAKE_GPU_PARTIAL_FILE}" ]]
+  else
+    [[ "${FAKE_GPU_ALWAYS_VALID:-false}" == true || -f "${FAKE_GPU_PUBLISHED_FILE}" ]]
+  fi
 elif [[ " $* " == *' repair-transferred-campaign '* ]]; then
   [[ "${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}" == compatible_repairable ]] || exit 4
   : > "${FAKE_GPU_PUBLISHED_FILE}"
@@ -866,8 +874,13 @@ elif [[ " $* " == *' publish-transferred-campaign '* ]]; then
     printf '%s\n' 'synthetic destination hash validation failed' >&2
     exit 4
   fi
-  : > "${FAKE_GPU_PUBLISHED_FILE}"
-  printf '%s\n' '{"source_removed":false,"status":"transfer_complete"}'
+  if [[ " $* " == *' --partial '* ]]; then
+    : > "${FAKE_GPU_PARTIAL_FILE}"
+    printf '%s\n' '{"source_removed":false,"status":"partial"}'
+  else
+    : > "${FAKE_GPU_PUBLISHED_FILE}"
+    printf '%s\n' '{"source_removed":false,"status":"transfer_complete"}'
+  fi
 elif [[ " $* " == *' cleanup-transfer-staging '* ]]; then
   [[ -z "${directory}" || ! -d "${directory}" ]] || rm -r -- "${directory}"
   printf '%s\n' '{"mode":"delete"}'
@@ -878,11 +891,15 @@ elif [[ " $* " == *' build-campaign-datasets '* ]]; then
     printf '%s\n' 'synthetic dataset build failed' >&2
     exit 5
   fi
-  if [[ "${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}" != extension_required ]]; then
-    : > "${FAKE_DATASETS_COMPLETE_FILE}"
+  if [[ " $* " == *' --partial '* || "${FAKE_CAMPAIGN_STATE}" == completed_with_failures ]]; then
+    printf '%s\n' '{"status":"incomplete","packages":[]}'
+  else
+    if [[ "${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}" != extension_required ]]; then
+      : > "${FAKE_DATASETS_COMPLETE_FILE}"
+    fi
+    : > "${FAKE_PACKAGE_STATE_READY_FILE}"
+    printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
   fi
-  : > "${FAKE_PACKAGE_STATE_READY_FILE}"
-  printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
 elif [[ " $* " == *' prepare-all-workflow '* ]]; then
   : > "${FAKE_WORKFLOW_READY_FILE}"
   if [[ " $* " == *' --keep-cpu-source '* \
@@ -1003,6 +1020,7 @@ fi
             "FAKE_TRACK_SINGLE_SUBMISSION": "false",
             "FAKE_SUBMISSION_FILE": str(state_root / "submission"),
             "FAKE_GPU_PUBLISHED_FILE": str(state_root / "gpu-published"),
+            "FAKE_GPU_PARTIAL_FILE": str(state_root / "gpu-partial"),
             "FAKE_BENCHMARK_PUBLISHED_FILE": str(state_root / "benchmark-published"),
             "FAKE_DATASETS_COMPLETE_FILE": str(state_root / "datasets-complete"),
             "FAKE_PACKAGE_STATE_READY_FILE": str(state_root / "package-state-ready"),
@@ -3062,9 +3080,9 @@ def test_package_only_resume_builds_no_generation_work_units(tmp_path: Path) -> 
         assert forbidden not in log_text
 
 
-def test_partial_remote_failure_never_cleans_cpu_source(tmp_path: Path) -> None:
-    """Preserve the CPU source when a campaign has a permanent unit failure."""
-    workflow, _log, environment, _storage, mirror = _harness(tmp_path)
+def test_partial_remote_failure_publishes_and_remains_resumable(tmp_path: Path) -> None:
+    """Publish valid successes, retain failures, and reuse them on partial resume."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
     source_directories = _seed_transfer(mirror, environment)
     environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
     environment["FAKE_SOURCE_STATE"] = "completed_with_failures"
@@ -3074,9 +3092,101 @@ def test_partial_remote_failure_never_cleans_cpu_source(tmp_path: Path) -> None:
         environment,
     )
 
-    assert partial.returncode != 0
-    assert "permanent scientific or postprocessing failure" in partial.stderr
+    assert partial.returncode == 0, partial.stderr
+    assert "DONE:" in partial.stdout
+    assert "state=completed_with_failures result=PARTIAL" in partial.stdout
     assert all((mirror / relative).is_dir() for relative in source_directories)
+    assert not Path(environment["FAKE_DATASETS_COMPLETE_FILE"]).exists()
+    assert not Path(environment["FAKE_PACKAGE_STATE_READY_FILE"]).exists()
+    first_log = log.read_text(encoding="utf-8")
+    assert "<publish-transferred-campaign" in first_log
+    assert "--partial" in first_log
+    assert "<build-campaign-datasets" in first_log
+    assert "cleanup-campaign-source" not in first_log
+    assert "<validate-all-workflow" in first_log
+    assert " resume-campaign " in first_log
+    first_rsync_count = first_log.count("rsync-start")
+    first_resume_count = first_log.count(" resume-campaign ")
+    first_publish_count = first_log.count("<publish-transferred-campaign")
+
+    for relative in source_directories:
+        (storage / relative).mkdir(parents=True, exist_ok=True)
+
+    repeated = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert "result=PARTIAL" in repeated.stdout
+    repeated_log = log.read_text(encoding="utf-8")
+    assert repeated_log.count("rsync-start") == first_rsync_count * 2
+    assert repeated_log.count(" resume-campaign ") == first_resume_count + 1
+    assert repeated_log.count("<publish-transferred-campaign") == first_publish_count * 2
+    assert repeated_log.count(f"<--link-dest={storage}>") == len(source_directories)
+    assert "cleanup-campaign-source" not in repeated_log
+
+
+def test_partial_publication_integrity_failure_remains_failed(tmp_path: Path) -> None:
+    """Keep destination validation corruption on the global FAILED path."""
+    workflow, _log, environment, _storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
+    environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
+    environment["FAKE_SOURCE_STATE"] = "completed_with_failures"
+    environment["FAKE_PUBLISH_FAIL"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED: atomic host publication" in result.stderr
+    assert "result=PARTIAL" not in result.stdout
+    assert all((mirror / relative).is_dir() for relative in source_directories)
+
+
+def test_partial_rerun_completes_missing_publication_and_packages(
+    tmp_path: Path,
+) -> None:
+    """Promote only after remaining cases succeed on the existing resume path."""
+    workflow, log, environment, _storage, mirror = _harness(tmp_path)
+    source_directories = _seed_transfer(mirror, environment)
+    environment["FAKE_CAMPAIGN_STATE"] = "completed_with_failures"
+    environment["FAKE_SOURCE_STATE"] = "completed_with_failures"
+    first = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+    assert first.returncode == 0, first.stderr
+    assert "result=PARTIAL" in first.stdout
+    assert Path(environment["FAKE_GPU_PARTIAL_FILE"]).is_file()
+    assert not Path(environment["FAKE_GPU_PUBLISHED_FILE"]).exists()
+    first_resume_count = log.read_text(encoding="utf-8").count(" resume-campaign ")
+
+    environment["FAKE_CAMPAIGN_STATE"] = "successful"
+    environment["FAKE_SOURCE_STATE"] = "successful"
+    completed = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "state=successful result=OK" in completed.stdout
+    assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()
+    assert Path(environment["FAKE_DATASETS_COMPLETE_FILE"]).is_file()
+    assert Path(environment["FAKE_PACKAGE_STATE_READY_FILE"]).is_file()
+    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
+    assert (mirror / source_directories[3]).is_dir()
+    final_log = log.read_text(encoding="utf-8")
+    assert final_log.count(" resume-campaign ") == first_resume_count + 1
+    assert " validate-campaign-terminal " in final_log
+    assert "<build-campaign-datasets>" in final_log
+    assert "cleanup-campaign-source" in final_log
 
 
 @pytest.mark.parametrize("collection_mode", ["--defer-collection", "--keep-cpu-source"])

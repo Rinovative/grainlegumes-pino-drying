@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 DATASET_RECEIPT_FILENAME: Final = "dataset_packages_complete.json"
+INCOMPLETE_DATASET_RECEIPT_FILENAME: Final = "dataset_packages_incomplete.json"
+PARTIAL_COMPLETION_RECEIPT_FILENAME: Final = "partial_completion.json"
 ALL_WORKFLOW_RECEIPT_FILENAME: Final = "all_workflow.json"
 CPU_CLEANUP_RECEIPT_FILENAME: Final = "cpu_source_cleanup.json"
 DATASET_RECEIPT_SCHEMA_KIND: Final = "generation_dataset_packages_complete"
@@ -2747,3 +2749,214 @@ def storage_status(
             str(datasets_root),
         ],
     }
+
+
+def record_incomplete_campaign_datasets(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Record that Dataset membership is incomplete without minting Dataset IDs."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    transfer = campaign_runtime.validate_partially_transferred_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    receipt_path = run_directory / INCOMPLETE_DATASET_RECEIPT_FILENAME
+    receipt = {
+        "schema_kind": "generation_dataset_packages_incomplete",
+        "schema_version": 1,
+        "status": "incomplete",
+        "campaign_run_id": run_id,
+        "campaign_id": transfer["campaign_id"],
+        "git_commit": transfer["git_commit"],
+        "partial_transfer_receipt_sha256": common.serialization.file_sha256(run_directory / "transfer_partial.json"),
+        "successful_cases": transfer["successful_cases"],
+        "failed_cases": transfer["failed_cases"],
+        "declared_package_count": len(
+            campaign_evidence.campaign_from_manifest(campaign_evidence.load_campaign_run(run_id, storage_root=storage)).dataset_packages
+        ),
+        "packages": [],
+        "dataset_ids": [],
+        "reason": "required campaign membership is incomplete",
+        "recorded_at": _utc_now(),
+    }
+    common.serialization.atomic_write_json(receipt_path, receipt)
+    return validate_incomplete_campaign_datasets(run_id, storage_root=storage)
+
+
+def validate_incomplete_campaign_datasets(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate that incomplete membership has not been published as complete."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    transfer = campaign_runtime.validate_partially_transferred_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    receipt_path = run_directory / INCOMPLETE_DATASET_RECEIPT_FILENAME
+    receipt = _load_json(receipt_path, label="incomplete Dataset receipt")
+    required = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "campaign_run_id",
+        "campaign_id",
+        "git_commit",
+        "partial_transfer_receipt_sha256",
+        "successful_cases",
+        "failed_cases",
+        "declared_package_count",
+        "packages",
+        "dataset_ids",
+        "reason",
+        "recorded_at",
+    }
+    campaign = campaign_evidence.campaign_from_manifest(campaign_evidence.load_campaign_run(run_id, storage_root=storage))
+    if (
+        set(receipt) != required
+        or receipt.get("schema_kind") != "generation_dataset_packages_incomplete"
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "incomplete"
+        or receipt.get("campaign_run_id") != run_id
+        or receipt.get("campaign_id") != transfer["campaign_id"]
+        or receipt.get("git_commit") != transfer["git_commit"]
+        or receipt.get("partial_transfer_receipt_sha256") != common.serialization.file_sha256(run_directory / "transfer_partial.json")
+        or receipt.get("successful_cases") != transfer["successful_cases"]
+        or receipt.get("failed_cases") != transfer["failed_cases"]
+        or receipt.get("declared_package_count") != len(campaign.dataset_packages)
+        or receipt.get("packages") != []
+        or receipt.get("dataset_ids") != []
+        or not isinstance(receipt.get("recorded_at"), str)
+        or not receipt["recorded_at"]
+    ):
+        message = f"Incomplete Dataset receipt is invalid: {receipt_path}"
+        raise ValueError(message)
+    return receipt
+
+
+def prepare_partial_completion_receipt(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Persist validated partial completion with retained-source resume metadata."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    transfer = campaign_runtime.validate_partially_transferred_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    datasets = validate_incomplete_campaign_datasets(
+        run_id,
+        storage_root=storage,
+    )
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    receipt = {
+        "schema_kind": "generation_partial_completion",
+        "schema_version": 1,
+        "workflow_result": "partial",
+        "campaign_run_id": run_id,
+        "campaign_id": transfer["campaign_id"],
+        "git_commit": transfer["git_commit"],
+        "campaign_state": "completed_with_failures",
+        "partial_transfer_receipt_sha256": common.serialization.file_sha256(run_directory / "transfer_partial.json"),
+        "incomplete_dataset_receipt_sha256": common.serialization.file_sha256(run_directory / INCOMPLETE_DATASET_RECEIPT_FILENAME),
+        "successful_cases": transfer["successful_cases"],
+        "failed_cases": transfer["failed_cases"],
+        "dataset_status": datasets["status"],
+        "dataset_ids": [],
+        "cpu_source_host": transfer["source_host"],
+        "cpu_source_root": transfer["source_storage_root"],
+        "cpu_source_retained": True,
+        "cleanup_requested": False,
+        "resume_command": f"resume {run_id}",
+        "completed_at": _utc_now(),
+    }
+    common.serialization.atomic_write_json(
+        run_directory / PARTIAL_COMPLETION_RECEIPT_FILENAME,
+        receipt,
+    )
+    return validate_partial_completion_receipt(run_id, storage_root=storage)
+
+
+def validate_partial_completion_receipt(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate partial publication, incomplete packages, and retained-source intent."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    transfer = campaign_runtime.validate_partially_transferred_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    datasets = validate_incomplete_campaign_datasets(
+        run_id,
+        storage_root=storage,
+    )
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    receipt_path = run_directory / PARTIAL_COMPLETION_RECEIPT_FILENAME
+    receipt = _load_json(receipt_path, label="partial completion receipt")
+    required = {
+        "schema_kind",
+        "schema_version",
+        "workflow_result",
+        "campaign_run_id",
+        "campaign_id",
+        "git_commit",
+        "campaign_state",
+        "partial_transfer_receipt_sha256",
+        "incomplete_dataset_receipt_sha256",
+        "successful_cases",
+        "failed_cases",
+        "dataset_status",
+        "dataset_ids",
+        "cpu_source_host",
+        "cpu_source_root",
+        "cpu_source_retained",
+        "cleanup_requested",
+        "resume_command",
+        "completed_at",
+    }
+    if (
+        set(receipt) != required
+        or receipt.get("schema_kind") != "generation_partial_completion"
+        or receipt.get("schema_version") != 1
+        or receipt.get("workflow_result") != "partial"
+        or receipt.get("campaign_run_id") != run_id
+        or receipt.get("campaign_id") != transfer["campaign_id"]
+        or receipt.get("git_commit") != transfer["git_commit"]
+        or receipt.get("campaign_state") != "completed_with_failures"
+        or receipt.get("partial_transfer_receipt_sha256") != common.serialization.file_sha256(run_directory / "transfer_partial.json")
+        or receipt.get("incomplete_dataset_receipt_sha256") != common.serialization.file_sha256(run_directory / INCOMPLETE_DATASET_RECEIPT_FILENAME)
+        or receipt.get("successful_cases") != transfer["successful_cases"]
+        or receipt.get("failed_cases") != transfer["failed_cases"]
+        or receipt.get("dataset_status") != datasets["status"]
+        or receipt.get("dataset_ids") != []
+        or receipt.get("cpu_source_host") != transfer["source_host"]
+        or receipt.get("cpu_source_root") != transfer["source_storage_root"]
+        or receipt.get("cpu_source_retained") is not True
+        or receipt.get("cleanup_requested") is not False
+        or receipt.get("resume_command") != f"resume {run_id}"
+        or not isinstance(receipt.get("completed_at"), str)
+        or not receipt["completed_at"]
+    ):
+        message = f"Partial completion receipt is invalid: {receipt_path}"
+        raise ValueError(message)
+    return receipt

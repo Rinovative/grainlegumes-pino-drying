@@ -35,6 +35,7 @@ _MAX_RECENT_FAILURES = 3
 _MAX_OLDER_FAILURE_GROUPS = 8
 _MAX_REASON_CHARACTERS = 160
 _MAX_EVIDENCE_PATH_CHARACTERS = 80
+_UNSAFE_CAPACITY_STATUS_PREFIX = "Unsafe COMSOL capacity-checkout status artifact:"
 _FAILED_CASE_STATES = frozenset(
     {
         "failed",
@@ -216,7 +217,10 @@ def _active_case_lines(case: Mapping[str, Any]) -> list[str]:
             lines.append(f"  {'  '.join(acquisition_parts)}")
         last_result = _bounded_text(runtime.get("last_license_result"), maximum=_MAX_REASON_CHARACTERS)
         if last_result is not None:
-            lines.append(f"  last_result={last_result}")
+            lines.append(f"  checkout_result={last_result}")
+        recovered = case.get("status_artifact_recovery_count")
+        if isinstance(recovered, int) and not isinstance(recovered, bool) and recovered > 0:
+            lines.append("  status_artifact=recovered")
     if phase in {"stationary_airflow", "transient_drying"} and runtime.get("parser_state") == "available":
         solver_values = (
             ("simulated_time", _format_simulated_time(runtime.get("simulated_time_seconds"))),
@@ -322,7 +326,12 @@ def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
             details.append(f"{name}={rendered}")
     lines.append(f"  {'  '.join(details)}")
     lines.append(f"  replay={_replay_state(case)}")
-    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    raw_reason = case.get("reason")
+    reason: str | None
+    if isinstance(raw_reason, str) and raw_reason.startswith(_UNSAFE_CAPACITY_STATUS_PREFIX):
+        reason = "Unowned or unsupported COMSOL status artifact."
+    else:
+        reason = _bounded_text(raw_reason, maximum=_MAX_REASON_CHARACTERS)
     if reason is not None:
         lines.append(f'  reason="{reason}"')
     reconciliation = case.get("case_reconciliation")

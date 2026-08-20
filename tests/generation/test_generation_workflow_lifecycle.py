@@ -740,3 +740,96 @@ def test_storage_status_reports_separate_protected_layers_and_staging(
     assert status["packages_by_view_regime"] == []
     assert status["transfer_staging_bytes"] >= len(b"partial")
     assert status["protected_cleanup_targets"] == [str(generation_root), str(datasets_root)]
+
+
+def test_partial_completion_receipt_keeps_packages_incomplete_and_source_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validate partial completion without Dataset IDs or cleanup authorization."""
+    storage = (tmp_path / "storage").resolve()
+    run_directory = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns" / _RUN_ID
+    run_directory.mkdir(parents=True)
+    (run_directory / "transfer_partial.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    successful = [
+        {
+            "batch_name": "batch",
+            "batch_id": "batch-id",
+            "case_id": "case_0001",
+            "case_index": 1,
+            "state": "successful",
+            "classified_state": "successful",
+        }
+    ]
+    failed = [
+        {
+            "batch_name": "batch",
+            "batch_id": "batch-id",
+            "case_id": "case_0002",
+            "case_index": 2,
+            "state": "failed",
+            "classified_state": "failed",
+        }
+    ]
+    transfer = {
+        "campaign_id": "campaign-id",
+        "git_commit": _COMMIT,
+        "source_host": "cpu.example",
+        "source_storage_root": "/remote/storage",
+        "successful_cases": successful,
+        "failed_cases": failed,
+    }
+    monkeypatch.setattr(
+        generation.campaign,
+        "validate_partially_transferred_campaign",
+        lambda *_args, **_kwargs: transfer,
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {"campaign_run_id": _RUN_ID},
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: SimpleNamespace(dataset_packages=({"dataset_view": "all"},)),
+    )
+
+    datasets = generation.workflow.record_incomplete_campaign_datasets(
+        _RUN_ID,
+        storage_root=storage,
+    )
+    partial = generation.workflow.prepare_partial_completion_receipt(
+        _RUN_ID,
+        storage_root=storage,
+    )
+
+    assert datasets["schema_version"] == 1
+    assert datasets["status"] == "incomplete"
+    assert datasets["packages"] == []
+    assert datasets["dataset_ids"] == []
+    assert partial["schema_version"] == 1
+    assert partial["workflow_result"] == "partial"
+    assert partial["campaign_state"] == "completed_with_failures"
+    assert partial["successful_cases"] == successful
+    assert partial["failed_cases"] == failed
+    assert partial["dataset_ids"] == []
+    assert partial["cpu_source_retained"] is True
+    assert partial["cleanup_requested"] is False
+    assert partial["resume_command"] == f"resume {_RUN_ID}"
+
+    receipt_path = run_directory / generation.workflow.PARTIAL_COMPLETION_RECEIPT_FILENAME
+    corrupted = json.loads(receipt_path.read_text(encoding="utf-8"))
+    corrupted["cleanup_requested"] = True
+    receipt_path.write_text(
+        json.dumps(corrupted) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Partial completion receipt is invalid"):
+        generation.workflow.validate_partial_completion_receipt(
+            _RUN_ID,
+            storage_root=storage,
+        )

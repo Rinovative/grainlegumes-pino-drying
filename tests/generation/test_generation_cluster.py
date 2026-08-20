@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import yaml
 
-from src import generation
+from src import common, generation
 from src.generation.cli import cli_generation
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
@@ -2506,3 +2506,203 @@ def test_case_attempt_index_counts_only_real_slurm_submissions(
         )
     )
     assert generation.campaign._next_case_attempt_index(manifest, task) == 2
+
+
+def test_partial_transfer_publication_is_distinct_and_hash_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publish partial evidence without creating complete campaign authority."""
+    run_id = "synthetic_partial__0123456789abcdef"
+    destination = tmp_path / "destination"
+    staging = workspace.create_transfer_staging(
+        storage_root=destination,
+        run_id=run_id,
+    )
+    campaign_directory = f"01_generation/meta/campaigns/{run_id}"
+    directories = (
+        "01_generation/meta/batches/partial_batch",
+        "01_generation/raw/partial_batch",
+        "01_generation/processed/partial_batch",
+        f"01_generation/attempts/partial_batch/case_00002/{run_id}",
+    )
+    for index, relative in enumerate((*directories, campaign_directory)):
+        directory = staging / relative
+        directory.mkdir(parents=True)
+        (directory / f"payload-{index}.txt").write_text(
+            f"payload-{index}\n",
+            encoding="utf-8",
+        )
+    staged_case = staging / directories[2] / "case_0001" / "case.h5"
+    staged_case.parent.mkdir()
+    staged_case.write_bytes(b"canonical-case")
+    successful = [
+        {
+            "batch_name": "partial_batch",
+            "batch_id": "partial-batch-id",
+            "case_id": "case_0001",
+            "case_index": 1,
+            "state": "successful",
+            "classified_state": "successful",
+        }
+    ]
+    failed = [
+        {
+            "batch_name": "partial_batch",
+            "batch_id": "partial-batch-id",
+            "case_id": "case_0002",
+            "case_index": 2,
+            "state": "failed",
+            "classified_state": "failed",
+        }
+    ]
+    plan = {
+        "campaign_run_id": run_id,
+        "campaign_name": "partial",
+        "git_commit": "d" * 40,
+        "campaign_config": "partial.yaml",
+        "campaign_directory": campaign_directory,
+        "batches": [
+            {
+                "batch_name": "partial_batch",
+                "batch_id": "partial-batch-id",
+                "case_count": 2,
+                "meta_directory": directories[0],
+                "raw_directory": directories[1],
+                "processed_directory": directories[2],
+                "attempt_directories": [directories[3]],
+            }
+        ],
+    }
+    partial_path = staging / campaign_directory / "campaign_partial.json"
+    partial_path.write_text(
+        json.dumps(
+            {
+                "schema_kind": "generation_campaign_partial",
+                "schema_version": 1,
+                "campaign_run_id": run_id,
+                "campaign_id": "campaign-id",
+                "git_commit": "d" * 40,
+                "campaign_state": "completed_with_failures",
+                "successful_cases": successful,
+                "failed_cases": failed,
+                "resume_command": f"resume {run_id}",
+                "recorded_at": "2026-08-20T00:00:00+00:00",
+                "transfer_plan": plan,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "partial_campaign_transfer_plan",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {
+            "campaign_run_id": run_id,
+            "campaign_config": "partial.yaml",
+            "git_commit": "d" * 40,
+        },
+    )
+    partial_batch = SimpleNamespace(
+        batch_name="partial_batch",
+        batch_id="partial-batch-id",
+        case_indices=(1, 2),
+        case_id=lambda index: f"case_{index:04d}",
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: SimpleNamespace(
+            campaign_id="campaign-id",
+            campaign_name="partial",
+            batches=(partial_batch,),
+        ),
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda *_args, **_kwargs: True,
+    )
+
+    receipt = generation.campaign.publish_transferred_campaign(
+        run_id,
+        staging_root=staging,
+        destination_root=destination,
+        source_host="cpu.example",
+        source_storage_root="/remote/storage",
+        partial=True,
+    )
+
+    assert receipt["schema_version"] == 1
+    assert receipt["status"] == "partial"
+    assert receipt["successful_cases"] == successful
+    assert receipt["failed_cases"] == failed
+    assert receipt["source_removed"] is False
+    assert not (destination / campaign_directory / "transfer_complete.json").exists()
+    assert (destination / campaign_directory / "transfer_partial.json").is_file()
+
+    published_case = destination / directories[2] / "case_0001" / "case.h5"
+    case_identity = (
+        published_case.stat().st_ino,
+        common.serialization.file_sha256(published_case),
+    )
+    repeated_staging = workspace.create_transfer_staging(
+        storage_root=destination,
+        run_id=run_id,
+    )
+    for relative in (*directories, campaign_directory):
+        shutil.copytree(
+            destination / relative,
+            repeated_staging / relative,
+        )
+    repeated = generation.campaign.publish_transferred_campaign(
+        run_id,
+        staging_root=repeated_staging,
+        destination_root=destination,
+        source_host="cpu.example",
+        source_storage_root="/remote/storage",
+        partial=True,
+    )
+    assert all(record["status"] == "reused" for record in repeated["directories"])
+    assert (
+        published_case.stat().st_ino,
+        common.serialization.file_sha256(published_case),
+    ) == case_identity
+
+    conflicting_staging = workspace.create_transfer_staging(
+        storage_root=destination,
+        run_id=run_id,
+    )
+    for relative in (*directories, campaign_directory):
+        shutil.copytree(
+            destination / relative,
+            conflicting_staging / relative,
+        )
+    with pytest.raises(FileExistsError, match="partial transfer identity conflicts"):
+        generation.campaign.publish_transferred_campaign(
+            run_id,
+            staging_root=conflicting_staging,
+            destination_root=destination,
+            source_host="other-cpu.example",
+            source_storage_root="/remote/storage",
+            partial=True,
+        )
+
+    published_partial = destination / campaign_directory / "campaign_partial.json"
+    payload = json.loads(published_partial.read_text(encoding="utf-8"))
+    payload["resume_command"] = "resume conflicting-run"
+    published_partial.write_text(
+        json.dumps(payload) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Partial transfer receipt"):
+        generation.campaign.validate_partially_transferred_campaign(
+            run_id,
+            storage_root=destination,
+        )

@@ -196,7 +196,7 @@ def _derive_stop_evidence_path(active_work_directory: Path | str) -> Path:
     return _derive_owned_path(active_work_directory, "runtime", STOP_EVIDENCE_FILENAME, create_parent=True)
 
 
-_CAPACITY_STATUS_PATTERN = re.compile(rb"(?P<timestamp>[0-9]{13})\r?\n(?P<state>Running|Done|Failed)(?:\r?\n)?")
+_CAPACITY_STATUS_PATTERN = re.compile(rb"(?P<timestamp>[0-9]{13})\r?\n(?P<state>Running|Done|Failed|Error)(?:\r?\n)?")
 _MAX_CAPACITY_STATUS_BYTES = 160
 _WORKSPACE_NOT_OWNED = "workspace_not_owned_by_current_user"
 _STATUS_PREEXISTED = "status_path_existed_before_checkout"
