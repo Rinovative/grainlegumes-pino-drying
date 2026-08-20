@@ -34,6 +34,7 @@ from .cases import generation_cases_input as input_service
 from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_attempt as attempt_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
+from .publication import generation_publication_storage as storage_service
 from .runtime import generation_runtime_batch as batch_runtime
 from .runtime import generation_runtime_cluster as cluster_service
 from .runtime import generation_runtime_license as license_service
@@ -804,9 +805,8 @@ def _empty_successful_status_summary() -> dict[str, Any]:
         "quality_flag_count": 0,
         "simulated_end_time": None,
         "simulated_end_time_unit": None,
-        "final_moisture_name": None,
-        "final_moisture_value": None,
-        "final_moisture_unit": None,
+        "final_bulk_moisture_wb": None,
+        "target_moisture_wb": None,
     }
 
 
@@ -822,20 +822,20 @@ def _optional_presentation_float(value: object) -> float | None:
 
 def _successful_status_reconciliation_error(
     task: cluster_service.CampaignTask,
-    status_path: Path,
+    source_path: Path,
     message: str,
 ) -> CaseLocalReconciliationError:
     """Bind one presentation-only defect to the exact source bytes."""
     try:
-        source_sha256 = hashlib.sha256(status_path.read_bytes()).hexdigest()
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
     except OSError as error:
-        detail = f"Could not bind processed status bytes: {status_path}"
+        detail = f"Could not bind successful-case presentation source bytes: {source_path}"
         raise RuntimeError(detail) from error
     return CaseLocalReconciliationError(
         f"Successful-case presentation metadata is unusable for {task.case_id}: {message}",
         category="successful_case_presentation_metadata",
         scientific_success_valid=True,
-        source_path=status_path,
+        source_path=source_path,
         source_sha256=source_sha256,
     )
 
@@ -852,6 +852,9 @@ def _successful_status_summary(
         task,
         storage_root=storage_root,
     )
+    if not status_path.exists() and batch.profile.id == "transient_drying":
+        message = f"Successful transient case lacks required processed status evidence: {status_path}"
+        raise RuntimeError(message)
     if not status_path.exists():
         return _empty_successful_status_summary()
     if status_path.is_symlink() or not status_path.is_file():
@@ -879,17 +882,31 @@ def _successful_status_summary(
     unit_values = units if isinstance(units, dict) else {}
     simulated_end_value = _optional_presentation_float(status.get("t_stop_exact"))
     simulated_end_unit = unit_values.get("t_stop_exact")
-    final_moisture_value = _optional_presentation_float(status.get("f_wet_dm_final"))
-    final_moisture_unit = unit_values.get("f_wet_dm_final")
+    target_entry = batch.scientific_values["material"]["parameter_registry"].get("X_target_wb") if batch.profile.id == "transient_drying" else None
+    target_moisture_wb = _optional_presentation_float(target_entry.get("nominal")) if isinstance(target_entry, dict) else None
     simulated_end_available = simulated_end_value is not None and isinstance(simulated_end_unit, str) and bool(simulated_end_unit)
-    final_moisture_available = final_moisture_value is not None and isinstance(final_moisture_unit, str) and bool(final_moisture_unit)
+    final_bulk_moisture_wb = None
+    if batch.profile.id == "transient_drying":
+        canonical_case_path = status_path.parent / "case.h5"
+        try:
+            final_bulk_moisture_wb = storage_service.read_transient_final_bulk_moisture(
+                canonical_case_path,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            if canonical_case_path.exists():
+                raise _successful_status_reconciliation_error(
+                    task,
+                    canonical_case_path,
+                    str(error),
+                ) from error
+            message = f"Successful transient case lacks required canonical final bulk-moisture evidence: {canonical_case_path}"
+            raise RuntimeError(message) from error
     return {
         "quality_flag_count": count,
         "simulated_end_time": (simulated_end_value if simulated_end_available else None),
         "simulated_end_time_unit": (simulated_end_unit if simulated_end_available else None),
-        "final_moisture_name": ("f_wet_dm_final" if final_moisture_available else None),
-        "final_moisture_value": (final_moisture_value if final_moisture_available else None),
-        "final_moisture_unit": (final_moisture_unit if final_moisture_available else None),
+        "final_bulk_moisture_wb": final_bulk_moisture_wb,
+        "target_moisture_wb": target_moisture_wb,
     }
 
 
@@ -1011,13 +1028,33 @@ def _terminal_timestamp_projection(
 
 def _successful_completion_at(
     state: str,
-    scheduler_view: Mapping[str, Any],
+    batch: config_service.GenerationConfig,
+    task: cluster_service.CampaignTask,
+    *,
+    storage_root: Path | str | None,
 ) -> TerminalTimestampProjection:
-    """Project the external Slurm End field without owning scientific success."""
+    """Project the admitted successful-processing timestamp for presentation."""
     if state != "successful":
         return _terminal_timestamp_projection(None, source_timezone=None)
+    processing_path = (
+        batch_runtime.processed_case_directory(
+            batch,
+            task.case_index,
+            storage_root=storage_root,
+        )
+        / "processing_provenance.json"
+    )
+    if not processing_path.exists():
+        return _terminal_timestamp_projection(None, source_timezone=None)
+    if processing_path.is_symlink() or not processing_path.is_file():
+        message = f"Successful-case processing provenance path is unsafe: {processing_path}"
+        raise RuntimeError(message)
+    processing = campaign_evidence.load_json_object(
+        processing_path,
+        label="successful-case processing provenance",
+    )
     return _terminal_timestamp_projection(
-        scheduler_view.get("end_time"),
+        processing.get("recorded_at"),
         source_timezone=None,
     )
 
@@ -1616,9 +1653,8 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
     successful_status: Mapping[str, Any] = {
         "simulated_end_time": None,
         "simulated_end_time_unit": None,
-        "final_moisture_name": None,
-        "final_moisture_value": None,
-        "final_moisture_unit": None,
+        "final_bulk_moisture_wb": None,
+        "target_moisture_wb": None,
     }
     canonical_raw_case: str | None = None
     license_retry_eligible = False
@@ -1790,17 +1826,23 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
     )
     completion_timestamp = _successful_completion_at(
         state,
-        scheduler_view,
+        batch,
+        task,
+        storage_root=storage_root,
+    )
+    scheduler_terminal_timestamp = _terminal_timestamp_projection(
+        scheduler_view.get("end_time") if state == "successful" else None,
+        source_timezone=None,
     )
     terminal_timestamp_evidence_path: str | None = None
     terminal_job_id = scheduler_view["latest_job_id"]
     if state == "successful" and isinstance(terminal_job_id, str) and _JOB_ID_PATTERN.fullmatch(terminal_job_id) is not None:
-        if compact_license_attempt_payloads and completion_timestamp.original_value is not None:
+        if compact_license_attempt_payloads and scheduler_terminal_timestamp.original_value is not None:
             recorded_path = _record_terminal_timestamp_evidence(
                 manifest,
                 task,
                 terminal_job_id,
-                completion_timestamp,
+                scheduler_terminal_timestamp,
                 storage_root=storage_root,
             )
             terminal_timestamp_evidence_path = None if recorded_path is None else str(recorded_path)
@@ -1811,10 +1853,13 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
             storage_root=storage_root,
         )
         if existing_timestamp is not None:
-            if completion_timestamp.original_value is not None and existing_timestamp["original_value"] != completion_timestamp.original_value:
+            if (
+                scheduler_terminal_timestamp.original_value is not None
+                and existing_timestamp["original_value"] != scheduler_terminal_timestamp.original_value
+            ):
                 message = f"Terminal timestamp source changed for one completed Slurm job: {terminal_job_id}"
                 raise RuntimeError(message)
-            completion_timestamp = TerminalTimestampProjection(
+            scheduler_terminal_timestamp = TerminalTimestampProjection(
                 original_value=str(existing_timestamp["original_value"]),
                 source_timezone=existing_timestamp["source_timezone"],
                 normalized_utc_value=existing_timestamp["normalized_utc_value"],
@@ -1881,7 +1926,7 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
         **pipeline,
         "quality_flag_count": quality_flag_count,
         "completed_at": completion_timestamp.completed_at,
-        "terminal_timestamp": completion_timestamp.evidence(),
+        "terminal_timestamp": scheduler_terminal_timestamp.evidence(),
         "terminal_timestamp_evidence_path": (terminal_timestamp_evidence_path),
         "failed_at": failed_at,
         **successful_status,

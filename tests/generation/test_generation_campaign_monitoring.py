@@ -172,6 +172,19 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
         lambda _batch, case_index, **_kwargs: case_index == tasks[0].case_index,
     )
     monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_completion_at",
+        lambda *_args, **_kwargs: generation.campaign._terminal_timestamp_projection(
+            "2026-01-01T00:01:00+00:00",
+            source_timezone=None,
+        ),
+    )
+    monkeypatch.setattr(
         generation.campaign.batch_runtime,
         "case_failure_is_recorded",
         lambda _batch, case_index, **_kwargs: case_index == tasks[2].case_index,
@@ -841,20 +854,38 @@ def test_campaign_status_cli_reuses_summary_and_monitor_formatter(
 
 
 def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_bound() -> None:
-    """Count every work unit once and hide stale solver values after solving."""
+    """Keep fixed zero-inclusive labels while hiding stale solver progress."""
     cases = [
         {"case_id": "success", "batch_name": "batch", "state": "successful"},
         _active_case("case_0001", "101", "node-a", 120.0),
         {"case_id": "queued", "batch_name": "batch", "state": "pending", "latest_job_id": "102", "scheduler_state": "PENDING"},
-        {"case_id": "blocked", "batch_name": "batch", "state": "license_blocked"},
         {"case_id": "unsent", "batch_name": "batch", "state": "never_started", "latest_job_id": None},
         {"case_id": "failed", "batch_name": "batch", "state": "failed"},
     ]
-    status = {"campaign_run_id": "run", "campaign_state": "running", "cases": cases}
+    status = {
+        "campaign_run_id": "run",
+        "campaign_state": "running",
+        "cases": cases,
+        "admission": {
+            "count": 1,
+            "maximum": 2,
+            "components": {
+                "pending": 1,
+                "starting": 0,
+                "acquiring_license": 0,
+                "license_waiting": 0,
+            },
+        },
+    }
     rendered = status_service.format_campaign_status_summary(status)
-    for category in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed"):
-        assert f"{category}=1" in rendered
-    assert "total=6" in rendered
+    lines = rendered.splitlines()
+    cases_line = next(line for line in lines if line.startswith("Cases:"))
+    admission_index = lines.index("Admission: 1/2")
+
+    assert cases_line == ("Cases: successful=1  running=1  scheduler_pending=1  license_blocked=0  not_admitted=1  failed=1  total=5")
+    assert lines[admission_index + 1] == ("  pending=1  starting=0  acquiring_license=0  license_waiting=0")
+    case_counts = [int(field.split("=", maxsplit=1)[1]) for field in cases_line.removeprefix("Cases: ").split("  ")[:-1]]
+    assert sum(case_counts) == len(cases)
 
     exporting = deepcopy(cases[1])
     exporting["runtime_progress"]["phase"] = "collecting_exports"
@@ -866,8 +897,8 @@ def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_boun
     assert "Tfail=" not in exporting_text
 
 
-def test_admission_waiting_is_distinct_from_never_started_in_status() -> None:
-    """Present a durable logical admission without implying scheduler work."""
+def test_not_admitted_is_distinct_from_every_admission_component() -> None:
+    """Project a reserved case as active while leaving an unsent case unadmitted."""
     waiting = {
         "case_id": "case_0001",
         "batch_name": "transient_drying__lentil__natural",
@@ -884,13 +915,23 @@ def test_admission_waiting_is_distinct_from_never_started_in_status() -> None:
             "campaign_run_id": "reserved-admission",
             "campaign_state": "license_blocked",
             "cases": [waiting, unsent],
+            "admission": {
+                "count": 1,
+                "maximum": 2,
+                "components": {
+                    "pending": 0,
+                    "starting": 1,
+                    "acquiring_license": 0,
+                    "license_waiting": 0,
+                },
+            },
         }
     )
 
-    assert "admission_waiting=1" in rendered
-    assert "never_started=1" in rendered
-    never_started_section = rendered.split("Never started:", maxsplit=1)[1]
-    assert "total: 1" in never_started_section
+    assert ("Cases: successful=0  running=1  scheduler_pending=0  license_blocked=0  not_admitted=1  failed=0  total=2") in rendered
+    assert ("  pending=0  starting=1  acquiring_license=0  license_waiting=0") in rendered
+    not_admitted_section = rendered.split("Not admitted:", maxsplit=1)[1]
+    assert "total: 1" in not_admitted_section
 
 
 def test_terminal_timestamp_projection_preserves_ambiguous_slurm_end() -> None:
@@ -1079,6 +1120,11 @@ def test_resume_preserves_success_with_naive_slurm_end_and_admits_other_case(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
         lambda _batch, case_index, **_kwargs: case_index == first.case_index,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
@@ -1394,27 +1440,175 @@ def test_duplicate_active_case_ownership_remains_campaign_global(
         )
 
 
+@pytest.mark.parametrize(
+    ("target_reached", "hit_t_max", "final_bulk_moisture"),
+    [(True, False, 0.118), (False, True, 0.134)],
+)
+def test_successful_transient_status_uses_validated_final_bulk_moisture(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_reached: bool,
+    hit_t_max: bool,
+    final_bulk_moisture: float,
+) -> None:
+    """Project canonical moisture for target-stop and maximum-horizon success."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    processed = tmp_path / "processed" / task.case_id
+    processed.mkdir(parents=True)
+    status_path = processed / "status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "quality_flag_count": 0,
+                "t_stop_exact": 60.3223,
+                "target_reached": target_reached,
+                "hit_t_max": hit_t_max,
+                "f_wet_dm_final": 0.0129802,
+                "units": {
+                    "t_stop_exact": "h",
+                    "f_wet_dm_final": "1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "processed_case_directory",
+        lambda *_args, **_kwargs: processed,
+    )
+    canonical_reads: list[Path] = []
+
+    def read_final_bulk(path: Path) -> float:
+        canonical_reads.append(path)
+        return final_bulk_moisture
+
+    monkeypatch.setattr(
+        generation.campaign.storage_service,
+        "read_transient_final_bulk_moisture",
+        read_final_bulk,
+    )
+
+    summary = generation.campaign._successful_status_summary(
+        batch,
+        task,
+        storage_root=tmp_path,
+    )
+
+    target = batch.scientific_values["material"]["parameter_registry"]["X_target_wb"]["nominal"]
+    assert summary["simulated_end_time"] == pytest.approx(60.3223)
+    assert summary["final_bulk_moisture_wb"] == pytest.approx(final_bulk_moisture)
+    assert summary["target_moisture_wb"] == pytest.approx(target)
+    assert canonical_reads == [processed / "case.h5"]
+    assert "final_moisture_value" not in summary
+    persisted = json.loads(status_path.read_text(encoding="utf-8"))
+    assert persisted["f_wet_dm_final"] == pytest.approx(0.0129802)
+    assert persisted["target_reached"] is target_reached
+    assert persisted["hit_t_max"] is hit_t_max
+
+
+def test_successful_transient_status_fails_without_final_bulk_moisture(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail projection when validated success lacks required canonical evidence."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    processed = tmp_path / "processed" / task.case_id
+    processed.mkdir(parents=True)
+    (processed / "status.json").write_text(
+        json.dumps(
+            {
+                "quality_flag_count": 0,
+                "t_stop_exact": 60.3223,
+                "units": {"t_stop_exact": "h"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "processed_case_directory",
+        lambda *_args, **_kwargs: processed,
+    )
+
+    with pytest.raises(RuntimeError, match="lacks required canonical final bulk-moisture evidence"):
+        generation.campaign._successful_status_summary(
+            batch,
+            task,
+            storage_root=tmp_path,
+        )
+
+
+def test_successful_completion_uses_admitted_processing_provenance(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Project the existing timezone-aware successful-processing timestamp."""
+    config_path, _template = generation_config_factory()
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    processed = tmp_path / "processed" / task.case_id
+    processed.mkdir(parents=True)
+    processing_path = processed / "processing_provenance.json"
+    processing_path.write_text(
+        json.dumps({"recorded_at": "2026-08-20T10:15:30+02:00"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "processed_case_directory",
+        lambda *_args, **_kwargs: processed,
+    )
+
+    projected = generation.campaign._successful_completion_at(
+        "successful",
+        batch,
+        task,
+        storage_root=tmp_path,
+    )
+
+    assert projected.completed_at == "2026-08-20T08:15:30+00:00"
+    assert projected.original_value == "2026-08-20T10:15:30+02:00"
+
+
 def _successful_case(
     index: int,
     *,
-    completed_at: str,
+    completed_at: str | None,
+    material: str = "lentil",
+    latest_job_id: str | None = None,
     simulated_end_time: float | None = None,
-    final_moisture_value: float | None = None,
+    final_bulk_moisture_wb: float | None = None,
+    target_moisture_wb: float | None = None,
 ) -> dict[str, Any]:
     """Return one synthetic successful campaign-status row."""
     return {
         "case_id": f"case_{index:04d}",
-        "batch_name": "transient_drying__lentil__natural",
-        "material": "lentil",
+        "batch_name": f"transient_drying__{material}__natural",
+        "material": material,
         "state": "successful",
         "reason": "validated_case_evidence",
         "completed_at": completed_at,
+        "latest_job_id": latest_job_id,
         "elapsed": "99:59:59",
         "simulated_end_time": simulated_end_time,
         "simulated_end_time_unit": "h" if simulated_end_time is not None else None,
-        "final_moisture_name": "f_wet_dm_final" if final_moisture_value is not None else None,
-        "final_moisture_value": final_moisture_value,
-        "final_moisture_unit": "1" if final_moisture_value is not None else None,
+        "final_bulk_moisture_wb": final_bulk_moisture_wb,
+        "target_moisture_wb": target_moisture_wb,
     }
 
 
@@ -1442,22 +1636,27 @@ def test_recent_completions_are_bounded_at_campaign_scale(
     assert "additional completed cases omitted" not in rendered
 
 
-def test_recent_completions_use_timestamp_then_stable_plan_order() -> None:
-    """Select newest terminal timestamps and preserve plan order for exact ties."""
+def test_recent_completions_select_actual_latest_three_newest_first() -> None:
+    """Ignore plan, duration, and job ordering when selecting recent success."""
     cases = [
-        _successful_case(4, completed_at="2026-01-01T00:04:00+00:00"),
-        _successful_case(2, completed_at="2026-01-01T00:05:00+00:00"),
-        _successful_case(1, completed_at="2026-01-01T00:05:00+00:00"),
-        _successful_case(3, completed_at="2026-01-01T00:03:00+00:00"),
+        _successful_case(1, completed_at="2026-01-01T00:02:00+00:00", material="lentil", latest_job_id="900", simulated_end_time=70.0),
+        _successful_case(2, completed_at="2026-01-01T00:05:00+00:00", material="chickpea", latest_job_id="100", simulated_end_time=20.0),
+        _successful_case(3, completed_at="2026-01-01T00:03:00+00:00", material="kidney_bean", latest_job_id="800", simulated_end_time=90.0),
+        _successful_case(4, completed_at="2026-01-01T00:04:00+00:00", material="rapeseed", latest_job_id="700", simulated_end_time=10.0),
+        _successful_case(5, completed_at="2026-01-01T00:06:00+00:00", material="sunflower_seed", latest_job_id="001", simulated_end_time=100.0),
     ]
 
-    rendered = status_service.format_campaign_status_summary({"campaign_run_id": "ordered-completions", "campaign_state": "running", "cases": cases})
-    section = rendered.split("Recently completed cases", maxsplit=1)[1]
-
-    assert [section.index(case_id) for case_id in ("case_0002", "case_0001", "case_0004")] == sorted(
-        section.index(case_id) for case_id in ("case_0002", "case_0001", "case_0004")
+    rendered = status_service.format_campaign_status_summary(
+        {"campaign_run_id": "ordered-completions", "campaign_state": "successful", "cases": cases}
     )
+    section = rendered.split("Recently completed cases (latest 3 of 5):", maxsplit=1)[1]
+    expected = ("case_0005", "case_0002", "case_0004")
+
+    assert [section.index(case_id) for case_id in expected] == sorted(section.index(case_id) for case_id in expected)
+    assert "batch=sunflower_seed" in section
+    assert "case_0001" not in section
     assert "case_0003" not in section
+    assert section.count("  state=successful") == 3
 
 
 def test_new_completion_replaces_the_oldest_displayed_case() -> None:
@@ -1493,8 +1692,9 @@ def test_completed_formatting_is_pure_and_optional_terminal_fields_are_condition
     available = _successful_case(
         1,
         completed_at="2026-01-01T00:01:00+00:00",
-        simulated_end_time=168.0,
-        final_moisture_value=0.125,
+        simulated_end_time=60.3223,
+        final_bulk_moisture_wb=0.116,
+        target_moisture_wb=0.12,
     )
     unavailable = _successful_case(2, completed_at="2026-01-01T00:02:00+00:00")
 
@@ -1502,11 +1702,14 @@ def test_completed_formatting_is_pure_and_optional_terminal_fields_are_condition
         {"campaign_run_id": "terminal-fields", "campaign_state": "running", "cases": [available, unavailable]}
     )
 
-    assert "simulated_end=168 h" in rendered
-    assert "f_wet_dm_final=0.125 1" in rendered
+    assert "simulated_end=60.32 h" in rendered
+    assert "bulk_moisture=11.6% wb" in rendered
+    assert "target=12.0% wb" in rendered
+    assert "simulated_end=60.32 h  bulk_moisture=11.6% wb  target=12.0% wb" in rendered
+    assert "f_wet_dm_final" not in rendered
     assert "elapsed=99:59:59" not in rendered
     assert "simulated_end=unavailable" not in rendered
-    assert "final_moisture=unavailable" not in rendered
+    assert "bulk_moisture=unavailable" not in rendered
     assert max(map(len, rendered.splitlines())) < 220
 
 
@@ -1584,7 +1787,7 @@ def test_recent_failures_are_bounded_and_older_failures_are_grouped(
 
 
 def test_failed_and_completed_timestamp_fallback_is_deterministic() -> None:
-    """Place aware timestamps first and ambiguous rows in campaign-plan order."""
+    """Place aware timestamps first and break ties by stable case identity."""
     failures = [
         _failed_case(4, failed_at="2026-08-20T09:49:19"),
         _failed_case(2, failed_at="2026-08-20T08:00:00+00:00"),
@@ -1602,15 +1805,15 @@ def test_failed_and_completed_timestamp_fallback_is_deterministic() -> None:
         "Older failures",
         maxsplit=1,
     )[0]
-    expected = ("case_0002", "case_0001", "case_0004")
+    expected = ("case_0001", "case_0002", "case_0003")
     assert [recent.index(case_id) for case_id in expected] == sorted(recent.index(case_id) for case_id in expected)
-    assert "case_0003" not in recent
+    assert "case_0004" not in recent
 
     completions = [
         _successful_case(4, completed_at="2026-08-20T09:49:19"),
         _successful_case(2, completed_at="2026-08-20T08:00:00+00:00"),
         _successful_case(1, completed_at="2026-08-20T08:00:00+00:00"),
-        _successful_case(3, completed_at="malformed"),
+        _successful_case(3, completed_at=None),
     ]
     completed = status_service.format_campaign_status_summary(
         {
@@ -1620,12 +1823,12 @@ def test_failed_and_completed_timestamp_fallback_is_deterministic() -> None:
         }
     ).split("Recently completed cases", maxsplit=1)[1]
     assert [completed.index(case_id) for case_id in expected] == sorted(completed.index(case_id) for case_id in expected)
-    assert "case_0003" not in completed
+    assert "case_0004" not in completed
     assert "completed_at=unavailable" not in completed
 
 
-def test_human_summary_groups_never_started_campaigns_at_material_scale() -> None:
-    """Scale never-started output with ordered materials rather than case count."""
+def test_human_summary_groups_not_admitted_campaigns_at_material_scale() -> None:
+    """Scale unadmitted output with ordered materials rather than case count."""
     campaign_shapes = (
         (18, (("field_pea", 3), ("rapeseed", 3), ("sunflower_seed", 3))),
         (600, (("lentil", 120), ("chickpea", 120), ("field_pea", 120), ("rapeseed", 120), ("sunflower_seed", 120))),
@@ -1649,16 +1852,16 @@ def test_human_summary_groups_never_started_campaigns_at_material_scale() -> Non
         rendered = status_service.format_campaign_status_summary(
             {"campaign_run_id": f"campaign-{total}", "campaign_state": "running", "cases": cases}
         )
-        never_started = rendered.split("Never started:\n", maxsplit=1)[1]
+        not_admitted = rendered.split("Not admitted:\n", maxsplit=1)[1]
 
-        assert f"never_started={never_started_count}" in rendered
+        assert f"not_admitted={never_started_count}" in rendered
         assert f"total={total}" in rendered
-        assert [never_started.index(f"{material}: {count}") for material, count in groups] == sorted(
-            never_started.index(f"{material}: {count}") for material, count in groups
+        assert [not_admitted.index(f"{material}: {count}") for material, count in groups] == sorted(
+            not_admitted.index(f"{material}: {count}") for material, count in groups
         )
-        assert f"total: {never_started_count}" in never_started
-        assert not any(f"{material}_0000" in never_started for material, _count in groups)
-        assert len(never_started.splitlines()) == len(groups) + 1
+        assert f"total: {never_started_count}" in not_admitted
+        assert not any(f"{material}_0000" in not_admitted for material, _count in groups)
+        assert len(not_admitted.splitlines()) == len(groups) + 1
 
 
 def test_benchmark_summary_uses_bounded_common_work_unit_vocabulary() -> None:
@@ -1681,7 +1884,7 @@ def test_benchmark_summary_uses_bounded_common_work_unit_vocabulary() -> None:
 
     assert "successful=0" in rendered
     assert "running=1" in rendered
-    assert "never_started=2" in rendered
+    assert "not_admitted=2" in rendered
     assert "four-canary" in rendered
     assert "Partial wave evaluation (provisional):" in rendered
 

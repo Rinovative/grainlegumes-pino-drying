@@ -2330,6 +2330,34 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         }
 
 
+def read_transient_final_bulk_moisture(path: Path) -> float:
+    """Read authoritative final bulk moisture from one canonical transient case."""
+    if not path.is_file() or path.is_symlink():
+        message = f"Canonical transient case HDF5 is missing or unsafe: {path}"
+        raise FileNotFoundError(message)
+    with h5py.File(path, "r") as handle:
+        profile = _hdf5_text_attribute(
+            handle.attrs.get("simulation_profile", ""),
+            label="simulation_profile",
+        )
+        if profile != profiles.TRANSIENT_DRYING_PROFILE:
+            message = f"Canonical final bulk moisture requires a transient-drying case, got {profile!r}."
+            raise ValueError(message)
+        _require_group_members(handle, "final_status", {"values"})
+        final_status = _hdf5_dataset(handle, "final_status/values")
+        values = np.asarray(final_status, dtype=np.float64)
+        if final_status.dtype != np.float64 or values.shape != (len(profiles.FINAL_STATUS_FIELDS),) or not np.isfinite(values).all():
+            message = "Canonical final-status values are invalid."
+            raise ValueError(message)
+        _dataset_contract(
+            final_status,
+            names=profiles.FINAL_STATUS_FIELDS,
+            units=profiles.FINAL_STATUS_UNITS,
+            label="final_status",
+        )
+        return float(values[profiles.FINAL_STATUS_FIELDS.index("X_wb_bulk_final")])
+
+
 @dataclass(frozen=True, slots=True)
 class _DiagnosticExport:
     """Minimal raw-export descriptor accepted by production parsers."""

@@ -912,6 +912,77 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
         )
 
 
+def test_practical_safe_storage_rounding_uses_whole_percent_wb() -> None:
+    """Round exact safe-storage evidence deterministically for operation."""
+    rounding = generation.contracts.materials.practical_target_moisture_wb
+
+    assert rounding(0.11894) == pytest.approx(0.12)
+    assert rounding(0.14315) == pytest.approx(0.14)
+
+
+def test_target_reaches_scalar_handoff_and_scientific_identity(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Bind one test-owned target to case inputs and scientific identity."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+    )
+    batch_name = generation.cases.config.build_batch_name(
+        "transient_drying",
+        "lentil",
+        "natural",
+    )
+    original = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=batch_name,
+    )
+    material_path = config_path.parents[3] / "materials/lentil.yaml"
+    assert tmp_path in material_path.parents
+    authored = yaml.safe_load(material_path.read_text(encoding="utf-8"))
+    assert set(authored["target_moisture"]) == {
+        "target_moisture_wb",
+        "provenance",
+    }
+    authored["target_moisture"]["target_moisture_wb"] = 0.13
+    material_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    changed = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=batch_name,
+    )
+    bundle = generation.cases.case.generate_case_input_bundle(
+        changed,
+        1,
+        tmp_path / "target-case",
+    )
+    assert changed.scientific_config_digest != original.scientific_config_digest
+    assert changed.case_input_config_digest != original.case_input_config_digest
+    assert bundle.scalar_handoff is not None
+    scalar_values = dict(
+        zip(
+            bundle.scalar_handoff.field_names,
+            bundle.scalar_handoff.values,
+            strict=True,
+        )
+    )
+    assert scalar_values["X_target_wb"] == pytest.approx(0.13)
+
+    authored["target_moisture"]["market_acceptance_moisture_wb"] = 0.17
+    material_path.write_text(
+        yaml.safe_dump(authored, sort_keys=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"target_moisture.*unknown"):
+        generation.cases.config.load_generation_config(
+            config_path,
+            only_batch=batch_name,
+        )
+
+
 def test_scalar_handoff_rejects_an_unknown_name(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -1146,32 +1217,6 @@ def test_transient_bulk_moisture_tolerance_validation(
         match=message,
     ):
         generation.cases.config.load_campaign_config(config_path)
-
-
-def test_maintained_cluster_license_acquisition_contract() -> None:
-    """Protect the documented two-slot, 16-core bounded acquisition policy."""
-    execution_path = common.paths.get_project_root() / "configs/generation/execution/cluster_cpu.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    retry = execution["runtime"]["temporary_license_retry"]
-
-    assert execution["schema_version"] == 1
-    assert execution["submission"] == {
-        "max_admission_cases": 2,
-        "poll_interval_seconds": 15,
-        "max_running_cases": None,
-    }
-    assert execution["cluster"]["cores_per_case"] == 16
-    assert retry == {
-        "enabled": True,
-        "initial_delay_seconds": 15,
-        "maximum_delay_seconds": 30,
-        "maximum_wait_seconds": None,
-        "in_allocation_retry": {
-            "enabled": True,
-            "maximum_window_seconds": 120,
-            "pause_after_capacity_failure_seconds": 5,
-        },
-    }
 
 
 @pytest.mark.parametrize(

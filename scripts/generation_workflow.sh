@@ -1066,6 +1066,8 @@ setup_cpu() {
   printf 'Mode: %s\n' "$([[ "${EXECUTE_SETUP}" == true ]] && printf execute || printf dry-run)"
   print_command mkdir -p "${REMOTE_ROOT}" "${REMOTE_STORAGE_ROOT}"
   print_command git clone --no-checkout "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${REMOTE_REPOSITORY}"
+  print_command "${REMOTE_VENV}/bin/python" -m src.generation.cli.cli_generation \
+    assert-shared-setup-idle --storage-root "${REMOTE_STORAGE_ROOT}"
   print_command git -C "${REMOTE_REPOSITORY}" fetch origin "${REQUESTED_COMMIT}"
   print_command git -C "${REMOTE_REPOSITORY}" checkout --detach "${REQUESTED_COMMIT}"
   print_command module load "${PYTHON_MODULE}"
@@ -1090,31 +1092,97 @@ setup_require_command() {
     exit 1
   }
 }
+setup_fail() {
+  printf 'CPU setup refused: %s\n' "$1" >&2
+  exit 1
+}
 for name in git stat module; do setup_require_command "${name}"; done
-[[ "${root}" != / && "${root}" != "${HOME}" ]]
+[[ "${root}" != / && "${root}" != "${HOME}" ]] || setup_fail "remote root is unsafe"
 parent="${root}"
 while [[ ! -e "${parent}" ]]; do parent="$(dirname "${parent}")"; done
-[[ -d "${parent}" && ! -L "${parent}" && "$(stat -c %u "${parent}")" -eq "${UID}" && -w "${parent}" ]]
-mkdir -p "${root}" "${storage}"
-[[ ! -L "${root}" && ! -L "${storage}" ]]
-if [[ ! -e "${repository}" ]]; then
-  git clone --no-checkout "${repository_url}" "${repository}"
+[[ -d "${parent}" && ! -L "${parent}" && "$(stat -c %u "${parent}")" -eq "${UID}" && -w "${parent}" ]] ||
+  setup_fail "remote root parent is not a writable owned directory"
+if [[ ! -e "${root}" ]]; then
+  mkdir -p -- "${root}" "${storage}"
+elif [[ -d "${root}" && ! -L "${root}" ]]; then
+  mkdir -p -- "${storage}"
 else
-  [[ -d "${repository}/.git" && ! -L "${repository}" ]]
-  [[ -z "$(git -C "${repository}" status --porcelain)" ]]
-  [[ "$(git -C "${repository}" remote get-url origin)" == "${repository_url}" ]]
+  setup_fail "remote root is not a directory"
 fi
-git -C "${repository}" fetch origin "${commit}"
-git -C "${repository}" cat-file -e "${commit}^{commit}"
-git -C "${repository}" checkout --detach "${commit}"
-if ! module load "${python_module}"; then
-  printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
-    "${python_module}" >&2
-  exit 1
+[[ -d "${root}" && ! -L "${root}" && -d "${storage}" && ! -L "${storage}" ]] ||
+  setup_fail "remote layout contains an unsafe root or storage path"
+shopt -s nullglob dotglob
+root_entries=("${root}"/*)
+shopt -u nullglob dotglob
+for entry in "${root_entries[@]}"; do
+  case "${entry}" in
+    "${repository}"|"${storage}"|"${venv}") ;;
+    *) setup_fail "remote root contains an unsupported top-level entry: ${entry}" ;;
+  esac
+done
+repository_ready=false
+if [[ -e "${repository}" ]]; then
+  [[ -d "${repository}/.git" && ! -L "${repository}" ]] ||
+    setup_fail "existing repository is unsafe or incomplete"
+  [[ -z "$(git -C "${repository}" status --porcelain)" ]] ||
+    setup_fail "existing repository has uncommitted changes"
+  [[ "$(git -C "${repository}" remote get-url origin)" == "${repository_url}" ]] ||
+    setup_fail "existing repository origin differs from the configured source"
+  repository_ready=true
+fi
+venv_ready=false
+if [[ -e "${venv}" ]]; then
+  [[ -d "${venv}" && ! -L "${venv}" && -x "${venv}/bin/python" ]] ||
+    setup_fail "existing virtual environment is unsafe or incomplete"
+  venv_ready=true
+fi
+if [[ "${venv_ready}" == true && "${repository_ready}" != true ]]; then
+  setup_fail "existing virtual environment has no matching repository"
+fi
+if [[ "${repository_ready}" == true && "${venv_ready}" == true ]]; then
+  fresh_installation=false
+  if ! module load "${python_module}"; then
+    printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
+      "${python_module}" >&2
+    exit 1
+  fi
+  "${venv}/bin/python" -m src.generation.cli.cli_generation \
+    assert-shared-setup-idle --storage-root "${storage}" ||
+    setup_fail "active dependent scheduler jobs block shared setup"
+else
+  fresh_installation=true
+  shopt -s nullglob dotglob
+  storage_entries=("${storage}"/*)
+  shopt -u nullglob dotglob
+  (( ${#storage_entries[@]} == 0 )) ||
+    setup_fail "incomplete installation cannot be repaired while persistent storage is non-empty"
+fi
+if [[ "${repository_ready}" != true ]]; then
+  git clone --no-checkout "${repository_url}" "${repository}"
+fi
+if [[ "${fresh_installation}" == false \
+  && "$(git -C "${repository}" rev-parse HEAD)" == "${commit}" ]]; then
+  setup_changed=false
+else
+  git -C "${repository}" fetch origin "${commit}"
+  git -C "${repository}" cat-file -e "${commit}^{commit}"
+  git -C "${repository}" checkout --detach "${commit}"
+  setup_changed=true
+fi
+if [[ "${fresh_installation}" == true ]]; then
+  if ! module load "${python_module}"; then
+    printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
+      "${python_module}" >&2
+    exit 1
+  fi
 fi
 setup_require_command "${python_executable}"
-[[ -x "${venv}/bin/python" ]] || "${python_executable}" -m venv "${venv}"
-"${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
+if [[ "${fresh_installation}" == true ]]; then
+  "${python_executable}" -m venv "${venv}"
+fi
+if [[ "${fresh_installation}" == true || "${setup_changed}" == true ]]; then
+  "${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
+fi
 if ! module load "${comsol_module}"; then
   printf 'CPU login prerequisite failed: COMSOL module %s (blocks setup capability check).\n' \
     "${comsol_module}" >&2
@@ -1892,12 +1960,50 @@ remote_benchmark_plan_submit() {
   remote_bash "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${remote_suite}" "${operation}" \
-    "${REMOTE_ROOT}/benchmark-preflight-scratch" "${PYTHON_MODULE}" \
-    "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
+    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; suite="$5"
-operation="$6"; scratch="$7"; python_module="$8"
-comsol_module="$9"; comsol_executable="${10}"
+operation="$6"; python_module="$7"; comsol_module="$8"; comsol_executable="$9"
+for name in realpath stat mktemp rm; do
+  command -v "${name}" >/dev/null 2>&1 || {
+    printf 'CPU benchmark preflight failed: required command %s is unavailable.\n' "${name}" >&2
+    exit 1
+  }
+done
+benchmark_scratch_parent="$(realpath -e -- "${TMPDIR:-/tmp}")" || {
+  printf 'CPU benchmark preflight failed: temporary parent cannot be resolved.\n' >&2
+  exit 1
+}
+[[ -d "${benchmark_scratch_parent}" && ! -L "${benchmark_scratch_parent}" \
+  && -w "${benchmark_scratch_parent}" && -x "${benchmark_scratch_parent}" ]] || {
+  printf 'CPU benchmark preflight failed: temporary parent is unsafe.\n' >&2
+  exit 1
+}
+scratch="$(mktemp -d "${benchmark_scratch_parent%/}/generation-benchmark-preflight.XXXXXXXX")" || {
+  printf 'CPU benchmark preflight failed: temporary scratch creation failed.\n' >&2
+  exit 1
+}
+[[ -d "${scratch}" && ! -L "${scratch}" \
+  && "$(stat -c %u "${scratch}")" -eq "${UID}" ]] || {
+  printf 'CPU benchmark preflight failed: temporary scratch ownership is unsafe.\n' >&2
+  exit 1
+}
+scratch_marker="${scratch}/.generation-benchmark-preflight"
+printf 'generation-benchmark-preflight\n' > "${scratch_marker}"
+cleanup_benchmark_scratch() {
+  local status="$1"
+  if [[ -d "${scratch}" && ! -L "${scratch}" && -f "${scratch_marker}" \
+    && ! -L "${scratch_marker}" \
+    && "${scratch}" == "${benchmark_scratch_parent}/generation-benchmark-preflight."* ]]; then
+    rm -rf -- "${scratch}"
+  else
+    printf 'CPU benchmark preflight refused to remove an unverified scratch directory.\n' >&2
+    status=1
+  fi
+  trap - EXIT
+  exit "${status}"
+}
+trap 'cleanup_benchmark_scratch "$?"' EXIT
 module load "${python_module}"
 if ! module load "${comsol_module}"; then
   printf 'CPU benchmark preflight failed: COMSOL module %s is unavailable.\n' \
@@ -1919,7 +2025,6 @@ comsol_version="$("${resolved_comsol}" -version 2>&1)" || {
   printf 'CPU benchmark preflight failed: COMSOL version query failed.\n' >&2
   exit 1
 }
-mkdir -p -- "${scratch}"
 export GENERATION_CPU_VENV="${venv}"
 export STORAGE_ROOT="${storage}"
 export GENERATION_GIT_COMMIT="${commit}"

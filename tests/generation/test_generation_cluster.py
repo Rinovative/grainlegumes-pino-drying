@@ -191,6 +191,11 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         "completed_case_is_valid",
         lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) == (first_case.batch_name, first_case.case_index),
     )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
+    )
     advanced = generation.campaign.submit_campaign(
         campaign,
         git_commit=commit,
@@ -358,6 +363,11 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         generation.campaign,
         "_finalize_completed_batches",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
 
     initial = generation.campaign.submit_campaign(
@@ -911,6 +921,11 @@ def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
         "completed_case_is_valid",
         lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) in completed,
     )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
+    )
     storage = tmp_path / "storage"
     manifest = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
     completed.add((tasks[0].batch_name, tasks[0].case_index))
@@ -953,6 +968,11 @@ def test_optional_running_cap_blocks_only_while_capacity_is_occupied(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
         lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) == (tasks[0].batch_name, tasks[0].case_index),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
     advanced = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
     assert advanced["slurm_job_ids"] == ["201", "202"]

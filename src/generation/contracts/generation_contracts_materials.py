@@ -21,6 +21,7 @@ import copy
 import math
 import re
 from collections.abc import Mapping
+from decimal import ROUND_HALF_UP, Decimal
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -319,6 +320,19 @@ def resolve_value_record(
         raise ValueError(message)
     record["provenance"] = provenance_service.resolve_provenance(provenance, sources=sources, label=f"{label}.provenance")
     return record
+
+
+def practical_target_moisture_wb(exact_reference_wb: float) -> float:
+    """Round one safe-storage reference to a whole wet-basis percentage point."""
+    reference = _finite(
+        exact_reference_wb,
+        label="exact safe-storage moisture reference",
+    )
+    if not 0 < reference < 1:
+        message = "Exact safe-storage moisture reference must lie inside (0, 1)."
+        raise ValueError(message)
+    percentage = Decimal(str(reference)) * Decimal(100)
+    return float(percentage.quantize(Decimal(1), rounding=ROUND_HALF_UP) / Decimal(100))
 
 
 def _resolve_synthetic_ood_provenance(
@@ -1055,27 +1069,22 @@ def resolve_material_definition(
     target = resolve_value_record(material["target_moisture"], sources=sources, label=f"material {family}.target_moisture")
     _exact_keys(
         target,
-        {
-            "selected_simulation_target_wb",
-            "market_acceptance_moisture_wb",
-            "safe_storage_moisture_wb",
-            "provenance",
-        },
+        {"target_moisture_wb", "provenance"},
         label=f"material {family}.target_moisture",
     )
     target_wb = _finite(
-        target["selected_simulation_target_wb"],
-        label=f"material {family}.target_moisture.selected_simulation_target_wb",
+        target["target_moisture_wb"],
+        label=f"material {family}.target_moisture.target_moisture_wb",
     )
     if not 0 < target_wb < 1:
-        message = f"Material {family!r} simulation target moisture must lie inside (0, 1)."
+        message = f"Material {family!r} target moisture must lie inside (0, 1)."
+        raise ValueError(message)
+    if practical_target_moisture_wb(target_wb) != target_wb:
+        message = f"Material {family!r} target moisture must use a whole wet-basis percentage point."
         raise ValueError(message)
     target_db = target_wb / (1.0 - target_wb)
     target = {
-        "selected_simulation_target_wb": target_wb,
-        "selected_target_db": target_db,
-        "market_acceptance_moisture_wb": target["market_acceptance_moisture_wb"],
-        "safe_storage_moisture_wb": target["safe_storage_moisture_wb"],
+        "target_moisture_wb": target_wb,
         "provenance": copy.deepcopy(target["provenance"]),
     }
     margin_above_target_db = _finite(

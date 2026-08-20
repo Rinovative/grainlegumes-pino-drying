@@ -742,6 +742,59 @@ def test_storage_status_reports_separate_protected_layers_and_staging(
     assert status["protected_cleanup_targets"] == [str(generation_root), str(datasets_root)]
 
 
+def test_shared_setup_idle_checks_campaigns_and_benchmarks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse shared-installation mutation for any owned active Slurm job."""
+    storage = (tmp_path / "storage").resolve()
+    campaign_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
+    campaign_root.joinpath(_RUN_ID).mkdir(parents=True)
+    benchmark_id = "core_scaling_transient__0123456789abcdef"
+    benchmark_root = common.paths.get_generation_performance_benchmark_root(storage_root=storage) / "core_scaling"
+    benchmark_root.joinpath(benchmark_id).mkdir(parents=True)
+    monkeypatch.setattr(
+        generation.workflow,
+        "_safe_campaign_source_status",
+        lambda *_args, **_kwargs: {
+            "active_slurm": False,
+            "scheduler_error": None,
+        },
+    )
+    monkeypatch.setattr(
+        generation.benchmark,
+        "core_benchmark_source_status",
+        lambda *_args, **_kwargs: {"active_slurm": True},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"active dependent Generation jobs.*benchmark",
+    ):
+        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+
+def test_shared_setup_idle_fails_closed_on_scheduler_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject mutation when persisted campaign scheduler state is unprovable."""
+    storage = (tmp_path / "storage").resolve()
+    campaign_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
+    campaign_root.joinpath(_RUN_ID).mkdir(parents=True)
+    monkeypatch.setattr(
+        generation.workflow,
+        "_safe_campaign_source_status",
+        lambda *_args, **_kwargs: {
+            "active_slurm": None,
+            "scheduler_error": "squeue unavailable",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"cannot prove.*squeue unavailable"):
+        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+
 def test_partial_completion_receipt_keeps_packages_incomplete_and_source_retained(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

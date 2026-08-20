@@ -804,6 +804,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     storage_status.add_argument("--query-scheduler", action="store_true")
     _add_storage_arguments(storage_status)
 
+    shared_setup_idle = subparsers.add_parser(
+        "assert-shared-setup-idle",
+        help="refuse shared CPU setup while persisted Generation jobs are active",
+    )
+    shared_setup_idle.add_argument("--storage-root", type=Path, required=True)
+
     workflow_failure = subparsers.add_parser(
         "record-workflow-failure",
         help="persist one compact workflow failure record with continuation guidance",
@@ -2000,6 +2006,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             run_id=args.campaign_run_id,
             query_scheduler=args.query_scheduler,
         )
+        print(json.dumps(status, sort_keys=True))
+        return 0
+    if args.command == "assert-shared-setup-idle":
+        try:
+            status = workflow_service.assert_shared_setup_idle(
+                storage_root=args.storage_root,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
         print(json.dumps(status, sort_keys=True))
         return 0
     if args.command == "record-workflow-failure":

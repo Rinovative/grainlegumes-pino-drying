@@ -97,6 +97,28 @@ _REQUIRED_CASE_RESULT_FIELDS: Final = frozenset(
 )
 _MAX_FIXED_POINT_ITERATIONS: Final = 20
 _SHA256_LENGTH: Final = 64
+_GPU_PUBLICATION_BYTE_FIELDS: Final = (
+    "gpu_generation_bytes",
+    "gpu_generation_hdf5_bytes",
+    "gpu_generation_meta_bytes",
+    "gpu_pilot_logs_bytes",
+    "gpu_dataset_incremental_bytes_if_any",
+    "retained_failure_evidence_bytes",
+)
+_GPU_ACCOUNTING_BYTE_FIELDS: Final = (
+    *_GPU_PUBLICATION_BYTE_FIELDS,
+    "pilot_receipt_and_summary_bytes",
+    "current_pilot_gpu_permanent_bytes",
+)
+_PILOT_CHECK_METADATA_FILENAMES: Final = frozenset(
+    {
+        PILOT_RECEIPT_FILENAME,
+        PILOT_PRE_CLEANUP_FILENAME,
+        PILOT_STAGING_CLEANUP_FILENAME,
+        PILOT_SUMMARY_CSV,
+        PILOT_SUMMARY_MARKDOWN,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1570,28 +1592,88 @@ def _summary_markdown(receipt: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _pilot_check_metadata_files(
+    run_id: str,
+    *,
+    storage: Path,
+    excluded_filenames: frozenset[str] = frozenset(),
+) -> list[Path]:
+    """Return only the durable files owned by one pilot-check directory."""
+    directory = pilot_check_directory(run_id, storage_root=storage)
+    if not directory.exists():
+        return []
+    if not directory.is_dir() or directory.is_symlink():
+        message = f"Pilot-check metadata directory is unsafe: {directory}"
+        raise ValueError(message)
+    entries = sorted(directory.iterdir())
+    if any(entry.is_symlink() or not entry.is_file() or entry.name not in _PILOT_CHECK_METADATA_FILENAMES for entry in entries):
+        message = f"Pilot-check metadata contains an unsupported or unsafe entry: {directory}"
+        raise ValueError(message)
+    return [entry for entry in entries if entry.name not in excluded_filenames]
+
+
 def _gpu_inventory(
     run_id: str,
     *,
     storage: Path,
+    validated_publication: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Measure permanent GPU generation and pilot metadata separately."""
-    plan = pilot_transfer_plan(run_id, storage_root=storage)
-    generation_files = _regular_files(_plan_roots(plan, storage=storage))
-    pilot_directory = pilot_check_directory(run_id, storage_root=storage)
-    pilot_files = _regular_files([pilot_directory]) if pilot_directory.is_dir() else []
-    generation_bytes = sum(path.stat().st_size for path in generation_files)
-    hdf5_bytes = sum(path.stat().st_size for path in generation_files if path.name == "case.h5")
-    meta_roots = {
-        (storage / plan["campaign_directory"]).resolve(),
-        *{(storage / batch["meta_directory"]).resolve() for batch in plan["batches"]},
-    }
-    meta_files = _regular_files(meta_roots)
-    meta_bytes = sum(path.stat().st_size for path in meta_files)
-    log_bytes = sum(path.stat().st_size for path in generation_files if path.suffix in {".log", ".out", ".err"})
-    failure_bytes = sum(path.stat().st_size for path in generation_files if "attempts" in path.parts or "pilot_failure_evidence" in path.parts)
+    """Measure permanent pilot bytes from one validated destination inventory."""
+    files = validated_publication.get("files")
+    generation_bytes = validated_publication.get("transferred_bytes")
+    generation_file_count = validated_publication.get("transferred_file_count")
+    inventory_sha256 = validated_publication.get("transfer_inventory_sha256")
+    if (
+        validated_publication.get("campaign_run_id") != run_id
+        or validated_publication.get("destination_storage_root") != str(storage)
+        or not isinstance(files, list)
+        or isinstance(generation_bytes, bool)
+        or not isinstance(generation_bytes, int)
+        or generation_bytes < 0
+        or isinstance(generation_file_count, bool)
+        or not isinstance(generation_file_count, int)
+        or generation_file_count < 1
+        or not isinstance(inventory_sha256, str)
+        or len(inventory_sha256) != _SHA256_LENGTH
+        or any(character not in "0123456789abcdef" for character in inventory_sha256)
+        or len(files) != generation_file_count
+        or any(
+            not isinstance(record, dict)
+            or not isinstance(record.get("relative_path"), str)
+            or isinstance(record.get("size_bytes"), bool)
+            or not isinstance(record.get("size_bytes"), int)
+            or record["size_bytes"] < 0
+            for record in files
+        )
+        or sum(record["size_bytes"] for record in files) != generation_bytes
+    ):
+        message = "Validated destination publication accounting is malformed or identity-conflicting."
+        raise ValueError(message)
+    pilot_files = _pilot_check_metadata_files(
+        run_id,
+        storage=storage,
+    )
+    hdf5_bytes = 0
+    meta_bytes = 0
+    log_bytes = 0
+    failure_bytes = 0
+    for record in files:
+        relative = Path(record["relative_path"])
+        size_bytes = record["size_bytes"]
+        if relative.name == "case.h5":
+            hdf5_bytes += size_bytes
+        if relative.parts[:2] == ("01_generation", "meta"):
+            meta_bytes += size_bytes
+        if relative.suffix in {".log", ".out", ".err"}:
+            log_bytes += size_bytes
+        if "attempts" in relative.parts or "pilot_failure_evidence" in relative.parts:
+            failure_bytes += size_bytes
     pilot_meta_bytes = sum(path.stat().st_size for path in pilot_files)
     return {
+        "campaign_run_id": run_id,
+        "destination_storage_root": str(storage),
+        "destination_inventory_sha256": inventory_sha256,
+        "destination_file_count": generation_file_count,
         "gpu_generation_bytes": generation_bytes,
         "gpu_generation_hdf5_bytes": hdf5_bytes,
         "gpu_generation_meta_bytes": meta_bytes,
@@ -1603,39 +1685,162 @@ def _gpu_inventory(
     }
 
 
+def _validate_pilot_gpu_accounting(
+    value: Any,
+    *,
+    run_id: str,
+    storage: Path,
+    validated_publication: Mapping[str, Any],
+) -> None:
+    """Validate one complete permanent-GPU accounting projection."""
+    required = {
+        "campaign_run_id",
+        "destination_storage_root",
+        "destination_inventory_sha256",
+        "destination_file_count",
+        *_GPU_ACCOUNTING_BYTE_FIELDS,
+    }
+    missing = required if not isinstance(value, dict) else required.difference(value)
+    if missing:
+        labels = ", ".join(sorted(missing))
+        message = f"Pilot storage accounting is missing required validated destination metric: {labels}"
+        raise ValueError(message)
+    if set(value) != required:
+        message = "Pilot storage accounting contains unsupported validated destination metrics."
+        raise ValueError(message)
+    if any(
+        isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0
+        for field in (*_GPU_ACCOUNTING_BYTE_FIELDS, "destination_file_count")
+    ):
+        message = "Pilot storage accounting contains invalid validated destination byte metrics."
+        raise ValueError(message)
+    if (
+        value["campaign_run_id"] != run_id
+        or value["destination_storage_root"] != str(storage)
+        or value["destination_inventory_sha256"] != validated_publication.get("transfer_inventory_sha256")
+        or value["destination_file_count"] != validated_publication.get("transferred_file_count")
+        or value["gpu_generation_bytes"] != validated_publication.get("transferred_bytes")
+    ):
+        message = "Pilot storage accounting conflicts with validated destination publication identity."
+        raise ValueError(message)
+    generation_bytes = value["gpu_generation_bytes"]
+    if (
+        any(value[field] > generation_bytes for field in _GPU_PUBLICATION_BYTE_FIELDS[1:])
+        or value["gpu_dataset_incremental_bytes_if_any"] != 0
+        or value["current_pilot_gpu_permanent_bytes"] != generation_bytes + value["pilot_receipt_and_summary_bytes"]
+    ):
+        message = "Pilot storage accounting has inconsistent permanent-publication scopes."
+        raise ValueError(message)
+
+
+def _validate_current_pilot_check_metadata(
+    value: Any,
+    *,
+    run_id: str,
+    storage: Path,
+    excluded_filenames: frozenset[str] = frozenset(),
+) -> None:
+    """Reconcile persisted totals with the current owned pilot-check files."""
+    if not isinstance(value, dict):
+        message = "Validated pilot storage accounting did not remain a mapping."
+        raise TypeError(message)
+    pilot_meta_bytes = sum(
+        path.stat().st_size
+        for path in _pilot_check_metadata_files(
+            run_id,
+            storage=storage,
+            excluded_filenames=excluded_filenames,
+        )
+    )
+    if (
+        value["pilot_receipt_and_summary_bytes"] != pilot_meta_bytes
+        or value["current_pilot_gpu_permanent_bytes"] != value["gpu_generation_bytes"] + pilot_meta_bytes
+    ):
+        message = "Pilot storage accounting does not match current durable pilot-check metadata."
+        raise ValueError(message)
+
+
+def _validated_destination_publication(
+    run_id: str,
+    *,
+    storage: Path,
+) -> dict[str, Any]:
+    """Return one hash-validated destination publication receipt."""
+    terminal = validate_pilot_terminal(run_id, storage_root=storage)
+    return campaign_evidence.validate_transfer_receipt(
+        run_id,
+        terminal=terminal,
+        plan=pilot_transfer_plan(run_id, storage_root=storage),
+        storage_root=storage,
+    )
+
+
 def _write_receipt_and_views(
     run_id: str,
     receipt: dict[str, Any],
     *,
     storage: Path,
     write_pre_cleanup_snapshot: bool,
+    validated_publication: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write canonical JSON then converge exact GPU inventory and derived views."""
+    """Write views only after validated accounting reaches one fixed point."""
+    publication = _validated_destination_publication(run_id, storage=storage) if validated_publication is None else validated_publication
     directory = pilot_check_directory(run_id, storage_root=storage)
     directory.mkdir(parents=True, exist_ok=True)
     receipt_path = directory / PILOT_RECEIPT_FILENAME
     csv_path = directory / PILOT_SUMMARY_CSV
     markdown_path = directory / PILOT_SUMMARY_MARKDOWN
     snapshot_path = directory / PILOT_PRE_CLEANUP_FILENAME
+    _validate_pilot_gpu_accounting(
+        receipt.get("post_transfer_gpu_inventory"),
+        run_id=run_id,
+        storage=storage,
+        validated_publication=publication,
+    )
+    receipt["post_transfer_gpu_inventory"] = _gpu_inventory(
+        run_id,
+        storage=storage,
+        validated_publication=publication,
+    )
     for _ in range(_MAX_FIXED_POINT_ITERATIONS):
+        _validate_pilot_gpu_accounting(
+            receipt.get("post_transfer_gpu_inventory"),
+            run_id=run_id,
+            storage=storage,
+            validated_publication=publication,
+        )
         common.serialization.atomic_write_json(receipt_path, receipt)
         common.serialization.atomic_write_text(csv_path, _summary_csv(receipt))
         common.serialization.atomic_write_text(markdown_path, _summary_markdown(receipt))
         if write_pre_cleanup_snapshot:
             common.serialization.atomic_write_json(snapshot_path, receipt)
-        measured = _gpu_inventory(run_id, storage=storage)
-        if measured == receipt.get("post_transfer_gpu_inventory"):
+        measured = _gpu_inventory(
+            run_id,
+            storage=storage,
+            validated_publication=publication,
+        )
+        if measured == receipt["post_transfer_gpu_inventory"]:
             break
         receipt["post_transfer_gpu_inventory"] = measured
     else:
         message = f"Pilot GPU inventory did not reach a fixed point: {directory}"
         raise RuntimeError(message)
+    _validate_pilot_gpu_accounting(
+        receipt.get("post_transfer_gpu_inventory"),
+        run_id=run_id,
+        storage=storage,
+        validated_publication=publication,
+    )
     common.serialization.atomic_write_json(receipt_path, receipt)
     common.serialization.atomic_write_text(csv_path, _summary_csv(receipt))
     common.serialization.atomic_write_text(markdown_path, _summary_markdown(receipt))
     if write_pre_cleanup_snapshot:
         common.serialization.atomic_write_json(snapshot_path, receipt)
-        measured = _gpu_inventory(run_id, storage=storage)
+        measured = _gpu_inventory(
+            run_id,
+            storage=storage,
+            validated_publication=publication,
+        )
         if measured != receipt["post_transfer_gpu_inventory"]:
             receipt["post_transfer_gpu_inventory"] = measured
             return _write_receipt_and_views(
@@ -1643,6 +1848,7 @@ def _write_receipt_and_views(
                 receipt,
                 storage=storage,
                 write_pre_cleanup_snapshot=True,
+                validated_publication=publication,
             )
     return receipt
 
@@ -1702,17 +1908,15 @@ def prepare_pilot_receipt(
     projection_contract = _production_projection_contract(production_campaign)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     terminal = validate_pilot_terminal(run_id, storage_root=storage)
-    campaign_evidence.validate_transfer_receipt(
-        run_id,
-        terminal=terminal,
-        plan=pilot_transfer_plan(run_id, storage_root=storage),
-        storage_root=storage,
-    )
     campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     snapshot_path = pilot_check_directory(run_id, storage_root=storage) / PILOT_PRE_CLEANUP_FILENAME
     if snapshot_path.exists():
-        snapshot = validate_pilot_pre_cleanup(run_id, storage_root=storage)
+        snapshot = validate_pilot_pre_cleanup(
+            run_id,
+            storage_root=storage,
+            require_current_receipt=True,
+        )
         if snapshot.get("cleanup", {}).get("cleanup_requested") is not cleanup_requested:
             message = "Existing pilot cleanup choice conflicts with the current --keep-cpu-source selection."
             raise ValueError(message)
@@ -1721,6 +1925,12 @@ def prepare_pilot_receipt(
             message = "Existing pilot projection conflicts with the resolved production campaign."
             raise ValueError(message)
         return snapshot
+    validated_publication = campaign_evidence.validate_transfer_receipt(
+        run_id,
+        terminal=terminal,
+        plan=pilot_transfer_plan(run_id, storage_root=storage),
+        storage_root=storage,
+    )
     source_inventory = validate_cpu_source_inventory(run_id, storage_root=storage)
     staging_inventory = validate_transfer_staging_inventory(
         run_id,
@@ -1776,7 +1986,11 @@ def prepare_pilot_receipt(
         "problems": _problems(cases),
         "pre_cleanup_cpu_inventory": source_inventory,
         "transfer_staging_inventory": staging_inventory,
-        "post_transfer_gpu_inventory": {},
+        "post_transfer_gpu_inventory": _gpu_inventory(
+            run_id,
+            storage=storage,
+            validated_publication=validated_publication,
+        ),
         "production_storage_projection": {
             **analysis_service.production_storage_projection(
                 successful,
@@ -1827,6 +2041,7 @@ def prepare_pilot_receipt(
         receipt,
         storage=storage,
         write_pre_cleanup_snapshot=True,
+        validated_publication=validated_publication,
     )
     return validate_pilot_pre_cleanup(
         run_id,
@@ -1840,6 +2055,7 @@ def validate_pilot_pre_cleanup(
     *,
     storage_root: Path | str | None = None,
     require_live_evidence: bool = False,
+    require_current_receipt: bool = False,
 ) -> dict[str, Any]:
     """Validate the immutable pilot evidence snapshot required for cleanup."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
@@ -1875,29 +2091,129 @@ def validate_pilot_pre_cleanup(
     ):
         message = f"Pilot pre-cleanup campaign evidence is invalid: {directory}"
         raise ValueError(message)
+    validated_publication = _validated_destination_publication(
+        run_id,
+        storage=storage,
+    )
+    _validate_pilot_gpu_accounting(
+        snapshot.get("post_transfer_gpu_inventory"),
+        run_id=run_id,
+        storage=storage,
+        validated_publication=validated_publication,
+    )
     validate_cpu_source_inventory(run_id, storage_root=storage)
-    validate_transfer_staging_inventory(
+    staging_inventory = validate_transfer_staging_inventory(
         run_id,
         storage_root=storage,
         require_staging_present=require_live_evidence,
     )
-    if require_live_evidence:
-        terminal = validate_pilot_terminal(run_id, storage_root=storage)
-        campaign_evidence.validate_transfer_receipt(
-            run_id,
-            terminal=terminal,
-            plan=pilot_transfer_plan(run_id, storage_root=storage),
-            storage_root=storage,
+    canonical_status: str | None = None
+    if require_live_evidence or require_current_receipt:
+        canonical = _load_json(
+            directory / PILOT_RECEIPT_FILENAME,
+            label="canonical pilot receipt",
         )
-        canonical = _load_json(directory / PILOT_RECEIPT_FILENAME, label="canonical pilot receipt")
-        if (
-            canonical != snapshot
-            or (directory / PILOT_SUMMARY_CSV).read_text(encoding="utf-8") != _summary_csv(snapshot)
-            or (directory / PILOT_SUMMARY_MARKDOWN).read_text(encoding="utf-8") != _summary_markdown(snapshot)
-        ):
-            message = f"Pilot receipt and derived views were not durable before cleanup: {directory}"
+        _validate_pilot_gpu_accounting(
+            canonical.get("post_transfer_gpu_inventory"),
+            run_id=run_id,
+            storage=storage,
+            validated_publication=validated_publication,
+        )
+        cleanup = canonical.get("cleanup")
+        transfer_cleanup = cleanup.get("transfer_staging") if isinstance(cleanup, dict) else None
+        status = transfer_cleanup.get("status") if isinstance(transfer_cleanup, dict) else None
+        canonical_status = status if isinstance(status, str) else None
+        if canonical_status not in {"pending", "complete"}:
+            message = f"Canonical pilot receipt has invalid staging cleanup state: {directory}"
             raise ValueError(message)
+        pending_cleanup_receipt: frozenset[str] = frozenset()
+        cleanup_receipt_path = directory / PILOT_STAGING_CLEANUP_FILENAME
+        if canonical_status == "pending" and cleanup_receipt_path.exists():
+            _validate_staging_cleanup_receipt(
+                _load_json(cleanup_receipt_path, label="pilot staging cleanup receipt"),
+                run_id=run_id,
+                staging=Path(staging_inventory["transfer_staging_path"]),
+                pre_cleanup_snapshot_sha256=common.serialization.file_sha256(directory / PILOT_PRE_CLEANUP_FILENAME),
+                receipt_path=cleanup_receipt_path,
+            )
+            pending_cleanup_receipt = frozenset({PILOT_STAGING_CLEANUP_FILENAME})
+        _validate_current_pilot_check_metadata(
+            canonical.get("post_transfer_gpu_inventory"),
+            run_id=run_id,
+            storage=storage,
+            excluded_filenames=pending_cleanup_receipt,
+        )
+    if (require_live_evidence or (require_current_receipt and canonical_status == "pending")) and (
+        canonical != snapshot
+        or (directory / PILOT_SUMMARY_CSV).read_text(encoding="utf-8") != _summary_csv(snapshot)
+        or (directory / PILOT_SUMMARY_MARKDOWN).read_text(encoding="utf-8") != _summary_markdown(snapshot)
+    ):
+        message = f"Pilot receipt and derived views were not durable before cleanup: {directory}"
+        raise ValueError(message)
+    if require_current_receipt and canonical_status == "complete":
+        validate_pilot_receipt(run_id, storage_root=storage)
     return snapshot
+
+
+def _validate_staging_cleanup_receipt(
+    value: Any,
+    *,
+    run_id: str,
+    staging: Path,
+    pre_cleanup_snapshot_sha256: str,
+    receipt_path: Path,
+) -> dict[str, Any]:
+    """Validate one durable pending or completed staging-cleanup receipt."""
+    base_identity = {
+        "schema_kind": "generation_pilot_staging_cleanup",
+        "schema_version": PILOT_SCHEMA_VERSION,
+        "campaign_run_id": run_id,
+        "staging_path": str(staging),
+        "pre_cleanup_snapshot_sha256": pre_cleanup_snapshot_sha256,
+    }
+    required = {
+        *base_identity,
+        "expected_bytes",
+        "expected_file_count",
+        "status",
+        "removed",
+        "reclaimed_bytes",
+        "started_at",
+        "completed_at",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or any(value.get(key) != expected for key, expected in base_identity.items())
+        or not isinstance(value.get("expected_bytes"), int)
+        or isinstance(value.get("expected_bytes"), bool)
+        or value["expected_bytes"] < 0
+        or not isinstance(value.get("expected_file_count"), int)
+        or isinstance(value.get("expected_file_count"), bool)
+        or value["expected_file_count"] < 1
+        or not isinstance(value.get("started_at"), str)
+    ):
+        message = f"Pilot staging cleanup receipt is malformed or conflicts: {receipt_path}"
+        raise ValueError(message)
+    expected_bytes = value["expected_bytes"]
+    if value.get("status") == "complete":
+        if (
+            staging.exists()
+            or value.get("removed") is not True
+            or value.get("reclaimed_bytes") != expected_bytes
+            or not isinstance(value.get("completed_at"), str)
+        ):
+            message = f"Pilot staging cleanup completion is invalid: {receipt_path}"
+            raise ValueError(message)
+    elif (
+        value.get("status") != "pending"
+        or value.get("removed") is not False
+        or value.get("reclaimed_bytes") != 0
+        or value.get("completed_at") is not None
+    ):
+        message = f"Pilot staging cleanup receipt has an unsupported state: {receipt_path}"
+        raise ValueError(message)
+    return value
 
 
 def cleanup_recorded_transfer_staging(
@@ -1913,58 +2229,27 @@ def cleanup_recorded_transfer_staging(
     staging = Path(inventory["transfer_staging_path"])
     directory = pilot_check_directory(run_id, storage_root=storage)
     receipt_path = directory / PILOT_STAGING_CLEANUP_FILENAME
+    pre_cleanup_snapshot_sha256 = common.serialization.file_sha256(directory / PILOT_PRE_CLEANUP_FILENAME)
     base_identity = {
         "schema_kind": "generation_pilot_staging_cleanup",
         "schema_version": PILOT_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         "staging_path": str(staging),
-        "pre_cleanup_snapshot_sha256": common.serialization.file_sha256(directory / PILOT_PRE_CLEANUP_FILENAME),
-    }
-    receipt_keys = {
-        *base_identity,
-        "expected_bytes",
-        "expected_file_count",
-        "status",
-        "removed",
-        "reclaimed_bytes",
-        "started_at",
-        "completed_at",
+        "pre_cleanup_snapshot_sha256": pre_cleanup_snapshot_sha256,
     }
     existing = _load_json(receipt_path, label="pilot staging cleanup receipt") if receipt_path.exists() else None
     if existing is not None:
-        if (
-            set(existing) != receipt_keys
-            or any(existing.get(key) != value for key, value in base_identity.items())
-            or not isinstance(existing.get("expected_bytes"), int)
-            or isinstance(existing.get("expected_bytes"), bool)
-            or existing["expected_bytes"] < 0
-            or not isinstance(existing.get("expected_file_count"), int)
-            or isinstance(existing.get("expected_file_count"), bool)
-            or existing["expected_file_count"] < 1
-            or not isinstance(existing.get("started_at"), str)
-        ):
-            message = f"Pilot staging cleanup receipt is malformed or conflicts: {receipt_path}"
-            raise ValueError(message)
+        existing = _validate_staging_cleanup_receipt(
+            existing,
+            run_id=run_id,
+            staging=staging,
+            pre_cleanup_snapshot_sha256=pre_cleanup_snapshot_sha256,
+            receipt_path=receipt_path,
+        )
         expected_bytes = int(existing["expected_bytes"])
         expected_files = int(existing["expected_file_count"])
-        if existing.get("status") == "complete":
-            if (
-                staging.exists()
-                or existing.get("removed") is not True
-                or existing.get("reclaimed_bytes") != expected_bytes
-                or not isinstance(existing.get("completed_at"), str)
-            ):
-                message = f"Pilot staging cleanup completion is invalid: {receipt_path}"
-                raise ValueError(message)
+        if existing["status"] == "complete":
             return existing
-        if (
-            existing.get("status") != "pending"
-            or existing.get("removed") is not False
-            or existing.get("reclaimed_bytes") != 0
-            or existing.get("completed_at") is not None
-        ):
-            message = f"Pilot staging cleanup receipt has an unsupported state: {receipt_path}"
-            raise ValueError(message)
     else:
         if not confirm:
             if staging.exists():
@@ -2128,9 +2413,33 @@ def validate_pilot_receipt(
 ) -> dict[str, Any]:
     """Validate canonical pilot identity, views, and optional cleanup completion."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    validate_pilot_pre_cleanup(run_id, storage_root=storage)
+    pre_cleanup = validate_pilot_pre_cleanup(run_id, storage_root=storage)
     path = pilot_receipt_path(run_id, storage_root=storage)
     receipt = _load_json(path, label="canonical pilot receipt")
+    baseline_accounting = pre_cleanup["post_transfer_gpu_inventory"]
+    current_accounting = receipt.get("post_transfer_gpu_inventory")
+    publication_identity = {
+        "transfer_inventory_sha256": baseline_accounting["destination_inventory_sha256"],
+        "transferred_file_count": baseline_accounting["destination_file_count"],
+        "transferred_bytes": baseline_accounting["gpu_generation_bytes"],
+    }
+    _validate_pilot_gpu_accounting(
+        current_accounting,
+        run_id=run_id,
+        storage=storage,
+        validated_publication=publication_identity,
+    )
+    _validate_current_pilot_check_metadata(
+        current_accounting,
+        run_id=run_id,
+        storage=storage,
+    )
+    if not isinstance(current_accounting, dict):
+        message = "Validated pilot storage accounting did not remain a mapping."
+        raise TypeError(message)
+    if any(current_accounting[field] != baseline_accounting[field] for field in _GPU_PUBLICATION_BYTE_FIELDS):
+        message = "Pilot storage accounting conflicts with immutable pre-cleanup publication metrics."
+        raise ValueError(message)
     campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     _validate_case_results(
         receipt.get("cases"),

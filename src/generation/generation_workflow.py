@@ -6,6 +6,7 @@ Responsibilities:
   - Validate exact GPU transfer inventories and every declared dataset package
   - Persist the staged all-workflow receipt used for idempotent continuation
   - Authorize and execute run-scoped CPU source cleanup after every local gate
+  - Protect shared CPU setup through persisted run and scheduler evidence
   - Report generation, package, staging, run, and cleanup storage state
 Design principles:
   - GPU generation sources and immutable learning views remain separate layers
@@ -2748,6 +2749,92 @@ def storage_status(
             str(generation_root),
             str(datasets_root),
         ],
+    }
+
+
+def _owned_run_directories(root: Path, *, label: str) -> tuple[Path, ...]:
+    """Return every safe persisted run directory below one optional owner root."""
+    if not root.exists():
+        return ()
+    if not root.is_dir() or root.is_symlink():
+        message = f"{label} root is unsafe: {root}"
+        raise ValueError(message)
+    directories: list[Path] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            message = f"{label} contains an unsafe run entry: {entry}"
+            raise ValueError(message)
+        directories.append(entry)
+    return tuple(directories)
+
+
+def assert_shared_setup_idle(
+    *,
+    storage_root: Path | str,
+) -> dict[str, Any]:
+    """Fail closed unless persisted Generation jobs no longer use repo or venv."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    campaign_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
+    benchmark_root = common.paths.get_generation_performance_benchmark_root(storage_root=storage) / "core_scaling"
+    campaign_runs = _owned_run_directories(
+        campaign_root,
+        label="Generation campaign",
+    )
+    benchmark_runs = _owned_run_directories(
+        benchmark_root,
+        label="Generation benchmark",
+    )
+    active: list[dict[str, str]] = []
+    errors: list[str] = []
+    for directory in campaign_runs:
+        run_id = common.paths.validate_logical_name(
+            directory.name,
+            label="campaign_run_id",
+        )
+        status = _safe_campaign_source_status(
+            run_id,
+            storage=storage,
+            query_scheduler=True,
+        )
+        error = status.get("error") or status.get("scheduler_error")
+        if error is not None:
+            errors.append(f"campaign {run_id}: {error}")
+        elif status.get("active_slurm") is True:
+            active.append({"run_kind": "campaign", "run_id": run_id})
+    if benchmark_runs:
+        from . import generation_benchmark as benchmark_service  # noqa: PLC0415
+
+        for directory in benchmark_runs:
+            run_id = common.paths.validate_logical_name(
+                directory.name,
+                label="benchmark_run_id",
+            )
+            try:
+                status = benchmark_service.core_benchmark_source_status(
+                    run_id,
+                    storage_root=storage,
+                    query_scheduler=True,
+                )
+            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+                errors.append(f"benchmark {run_id}: {error}")
+                continue
+            if status.get("active_slurm") is True:
+                active.append({"run_kind": "benchmark", "run_id": run_id})
+    if errors:
+        detail = "; ".join(errors)
+        message = f"Shared CPU setup cannot prove dependent Generation jobs are idle: {detail}"
+        raise RuntimeError(message)
+    if active:
+        detail = ", ".join(f"{record['run_kind']} {record['run_id']}" for record in active)
+        message = f"Shared CPU setup is blocked by active dependent Generation jobs: {detail}"
+        raise RuntimeError(message)
+    return {
+        "schema_kind": "generation_shared_setup_idle",
+        "schema_version": 1,
+        "status": "idle",
+        "campaign_run_count": len(campaign_runs),
+        "benchmark_run_count": len(benchmark_runs),
+        "active_dependent_jobs": [],
     }
 
 

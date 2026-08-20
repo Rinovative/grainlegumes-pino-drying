@@ -12,7 +12,7 @@ runtime:
     maximum_wait_seconds: null
     in_allocation_retry:
       enabled: true
-      maximum_window_seconds: 120
+      maximum_window_seconds: 300
       pause_after_capacity_failure_seconds: 5
 retention:
   family_generalization: compact
@@ -20,11 +20,11 @@ retention:
   technical_runtime_smoke: full
   pilot_check: full
 submission:
-  max_admission_cases: 2
+  max_admission_cases: 4
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:
-  cores_per_case: 16
+  cores_per_case: 8
   wall_time: "01:05:00"
   scheduler_options: []
 site:

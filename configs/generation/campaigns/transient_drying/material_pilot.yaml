@@ -21,7 +21,7 @@ material_roles:
 sampling:
   method: lhs
   seed_base: 9940
-  cases_per_material: 1
+  cases_per_material: 3
   case_semantics:
     first: nominal_reference
     remaining: natural_pilot

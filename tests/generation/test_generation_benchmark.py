@@ -679,34 +679,6 @@ def test_resource_change_preserves_both_case_identities(
     assert suite.execution_id(changed_variant) != suite.execution_id(baseline_variant)
 
 
-def test_maintained_suite_is_two_cases_four_waves_and_eight_measurements() -> None:
-    """Resolve the benchmark-owned cases with production cores first."""
-    repository = common.paths.get_project_root()
-    suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
-    suite = generation.benchmark.load_core_benchmark_suite(
-        suite_path,
-        require_executable=False,
-    )
-    inspection = generation.benchmark.inspect_core_benchmark(
-        suite_path,
-        require_executable=False,
-    )
-    assert suite.case_campaign_path == (repository / "configs/generation/benchmarks/transient_core_scaling/benchmark_cases.yaml")
-    assert [case["case_role"] for case in inspection["representative_cases"]] == [
-        "nominal",
-        "natural",
-    ]
-    assert [case["case_index"] for case in inspection["representative_cases"]] == [1, 2]
-    assert len(suite.variants) == 4
-    wave_cores = [wave["cores_per_case"] for wave in inspection["variant_waves"]]
-    assert suite.production_cores_per_case == 16
-    assert wave_cores[0] == suite.production_cores_per_case
-    assert wave_cores[1:] == sorted(variant.cores_per_case for variant in suite.variants if variant.cores_per_case != suite.production_cores_per_case)
-    assert inspection["parallel_cases_per_variant"] == 2
-    assert inspection["required_successful_measurements"] == 8
-    assert inspection["canary_wave"]["included_in_final_measurements"] is True
-
-
 @pytest.mark.parametrize("cases_per_material", [1, 3, 5])
 def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
     generation_config_factory: Any,

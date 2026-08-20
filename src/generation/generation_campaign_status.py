@@ -37,6 +37,20 @@ _MAX_REASON_CHARACTERS = 160
 _MAX_EVIDENCE_PATH_CHARACTERS = 80
 _STORAGE_DOMAIN_NAMES = frozenset({"01_generation", "02_datasets", "03_experiments"})
 _UNSAFE_CAPACITY_STATUS_PREFIX = "Unsafe COMSOL capacity-checkout status artifact:"
+_CASE_SUMMARY_LABELS = (
+    "successful",
+    "running",
+    "scheduler_pending",
+    "license_blocked",
+    "not_admitted",
+    "failed",
+)
+_ADMISSION_SUMMARY_LABELS = (
+    "pending",
+    "starting",
+    "acquiring_license",
+    "license_waiting",
+)
 _FAILED_CASE_STATES = frozenset(
     {
         "failed",
@@ -165,9 +179,11 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
     if state in {"scheduler_pending", "pending"}:
         return "scheduler_pending"
     if state == "admission_waiting":
-        return "admission_waiting"
+        # A reservation has entered admission; the Admission line retains its
+        # precise starting/acquiring/waiting occupancy projection.
+        return "running"
     if state == "never_started":
-        return "never_started"
+        return "not_admitted"
     return "failed"
 
 
@@ -374,12 +390,13 @@ def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
     simulated_end = _float_value(case.get("simulated_end_time"))
     simulated_end_unit = _available_text(case.get("simulated_end_time_unit"))
     if simulated_end is not None and simulated_end_unit is not None:
-        terminal.append(f"simulated_end={simulated_end:g} {simulated_end_unit}")
-    moisture_name = _available_text(case.get("final_moisture_name"))
-    moisture = _float_value(case.get("final_moisture_value"))
-    moisture_unit = _available_text(case.get("final_moisture_unit"))
-    if moisture_name is not None and moisture is not None and moisture_unit is not None:
-        terminal.append(f"{moisture_name}={moisture:g} {moisture_unit}")
+        terminal.append(f"simulated_end={simulated_end:.2f} {simulated_end_unit}")
+    bulk_moisture = _float_value(case.get("final_bulk_moisture_wb"))
+    if bulk_moisture is not None:
+        terminal.append(f"bulk_moisture={100.0 * bulk_moisture:.1f}% wb")
+    target = _float_value(case.get("target_moisture_wb"))
+    if target is not None:
+        terminal.append(f"target={100.0 * target:.1f}% wb")
     if terminal:
         lines.append(f"  {'  '.join(terminal)}")
     reconciliation = case.get("case_reconciliation")
@@ -418,21 +435,29 @@ def _terminal_timestamp(
     return parsed.astimezone(timezone.utc)
 
 
+def _terminal_case_identity(case: Mapping[str, Any]) -> tuple[str, str]:
+    """Return deterministic existing batch/case identity for ordering ties."""
+    return (
+        str(case.get("batch_id") or case.get("batch_name") or ""),
+        str(case.get("case_id") or ""),
+    )
+
+
 def _ordered_terminal_cases(
     cases: Sequence[Mapping[str, Any]],
     *,
     field: str,
 ) -> tuple[Mapping[str, Any], ...]:
-    """Order usable timestamps newest-first, then stable campaign-plan order."""
-    plan_ordered = sorted(
-        enumerate(cases),
-        key=lambda item: (item[0], str(item[1].get("case_id"))),
+    """Order usable timestamps newest-first and unavailable times by identity."""
+    projected = [(case, _terminal_timestamp(case, field=field)) for case in cases]
+    timestamped = [(case, timestamp) for case, timestamp in projected if timestamp is not None]
+    timestamped.sort(key=lambda item: _terminal_case_identity(item[0]))
+    timestamped.sort(key=lambda item: item[1], reverse=True)
+    unavailable = sorted(
+        (case for case, timestamp in projected if timestamp is None),
+        key=_terminal_case_identity,
     )
-    projected = [(index, case, _terminal_timestamp(case, field=field)) for index, case in plan_ordered]
-    timestamped = [(index, case, timestamp) for index, case, timestamp in projected if timestamp is not None]
-    timestamped.sort(key=lambda item: item[2], reverse=True)
-    unavailable = [(index, case) for index, case, timestamp in projected if timestamp is None]
-    return tuple([case for _index, case, _timestamp in timestamped] + [case for _index, case in unavailable])
+    return tuple([case for case, _timestamp in timestamped] + unavailable)
 
 
 def _recent_completed_cases(
@@ -564,24 +589,23 @@ def format_campaign_status_summary(
         message = "max_active_cases must be a positive integer or None."
         raise ValueError(message)
     cases = _case_inventory(status)
-    buckets = {
-        name: [case for case in cases if _case_bucket(case) == name]
-        for name in (
-            "successful",
-            "running",
-            "scheduler_pending",
-            "license_blocked",
-            "admission_waiting",
-            "never_started",
-            "failed",
-        )
-    }
+    buckets = {name: [case for case in cases if _case_bucket(case) == name] for name in _CASE_SUMMARY_LABELS}
     submission = status.get("submission_config")
     submission_values = submission if isinstance(submission, dict) else {}
     admission = status.get("admission")
     admission_values = admission if isinstance(admission, dict) else {}
     components = admission_values.get("components")
     component_values = components if isinstance(components, dict) else {}
+    admission_counts = {name: component_values.get(name, 0) for name in _ADMISSION_SUMMARY_LABELS}
+    admission_count = admission_values.get(
+        "count",
+        sum(value for value in admission_counts.values() if isinstance(value, int) and not isinstance(value, bool)),
+    )
+    admission_maximum = admission_values.get(
+        "maximum",
+        submission_values.get("max_admission_cases", 0),
+    )
+    case_counts = {name: len(buckets[name]) for name in _CASE_SUMMARY_LABELS}
     max_running = submission_values.get("max_running_cases")
     max_running_text = "unlimited" if max_running is None else _text(max_running)
     lines = [
@@ -594,21 +618,9 @@ def format_campaign_status_summary(
             f"max_admission_cases={_text(submission_values.get('max_admission_cases'))}  "
             f"max_running_cases={max_running_text}"
         ),
-        (
-            "Cases: "
-            f"successful={len(buckets['successful'])}  running={len(buckets['running'])}  "
-            f"scheduler_pending={len(buckets['scheduler_pending'])}  license_blocked={len(buckets['license_blocked'])}  "
-            f"admission_waiting={len(buckets['admission_waiting'])}  never_started={len(buckets['never_started'])}  "
-            f"failed={len(buckets['failed'])}  total={len(cases)}"
-        ),
-        (f"Admission: {_text(admission_values.get('count'))}/{_text(admission_values.get('maximum'))}"),
-        (
-            "  "
-            f"pending={_text(component_values.get('pending'))}  "
-            f"starting={_text(component_values.get('starting'))}  "
-            f"acquiring_license={_text(component_values.get('acquiring_license'))}  "
-            f"license_waiting={_text(component_values.get('license_waiting'))}"
-        ),
+        ("Cases: " + "  ".join(f"{name}={case_counts[name]}" for name in _CASE_SUMMARY_LABELS) + f"  total={len(cases)}"),
+        f"Admission: {_text(admission_count)}/{_text(admission_maximum)}",
+        ("  " + "  ".join(f"{name}={_text(admission_counts[name])}" for name in _ADMISSION_SUMMARY_LABELS)),
     ]
     runnable_work_remains = any(
         buckets[name]
@@ -616,8 +628,7 @@ def format_campaign_status_summary(
             "running",
             "scheduler_pending",
             "license_blocked",
-            "admission_waiting",
-            "never_started",
+            "not_admitted",
         )
     ) or any(case.get("replay_eligible") is True for case in buckets["failed"])
     if buckets["failed"] and runnable_work_remains:
@@ -652,8 +663,12 @@ def format_campaign_status_summary(
         maximum=None,
         renderer=_completed_case_lines,
     )
-    if buckets["never_started"]:
-        _append_section(lines, "Never started", _grouped_population_rows(buckets["never_started"]))
+    if buckets["not_admitted"]:
+        _append_section(
+            lines,
+            "Not admitted",
+            _grouped_population_rows(buckets["not_admitted"]),
+        )
     return "\n".join(lines)
 
 
@@ -771,7 +786,7 @@ def format_benchmark_status_summary(
         }
         for unit in units
     ]
-    categories = ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
+    categories = _CASE_SUMMARY_LABELS
     buckets = {name: [unit for unit in normalized if _case_bucket(unit) == name] for name in categories}
     wave = status.get("current_wave")
     wave_values = wave if isinstance(wave, dict) else {}
@@ -807,8 +822,8 @@ def format_benchmark_status_summary(
     _actionable_section(lines, "License-blocked work units", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
     _actionable_section(lines, "Failed work units", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
     _actionable_section(lines, "Completed work units", buckets["successful"], maximum=None, renderer=_completed_case_lines)
-    if buckets["never_started"]:
-        _append_section(lines, "Never started", _grouped_population_rows(buckets["never_started"]))
+    if buckets["not_admitted"]:
+        _append_section(lines, "Not admitted", _grouped_population_rows(buckets["not_admitted"]))
     partial = status.get("partial_evaluation")
     if isinstance(partial, dict):
         lines.extend(("", "Partial wave evaluation (provisional):"))

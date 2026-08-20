@@ -557,6 +557,9 @@ def test_hdf5_validation_uses_embedded_noncurrent_contract(tmp_path: Path) -> No
     )
     assert admitted["scientific_config_digest"] == common.serialization.canonical_json_sha256(scientific)
     with h5py.File(source, "r") as handle:
+        expected_bulk_moisture = float(_hdf5_dataset(handle, "final_status/values")[profiles.FINAL_STATUS_FIELDS.index("X_wb_bulk_final")])
+    assert generation.publication.storage.read_transient_final_bulk_moisture(source) == pytest.approx(expected_bulk_moisture)
+    with h5py.File(source, "r") as handle:
         assert _hdf5_dataset(handle, "coords/x").shape == (9,)
         assert _hdf5_dataset(handle, "coords/y").shape == (7,)
         assert _hdf5_dataset(handle, "static/fields").chunks == (1, 3, 4)

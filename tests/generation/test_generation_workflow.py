@@ -317,6 +317,16 @@ next_campaign_state() {
   fi
   printf '%s\n' "${state}"
 }
+if [[ "${FAKE_SETUP_IDLE_REJECT:-false}" == true \
+  && -f "${FAKE_SETUP_INSTALLED_FILE}" \
+  && "${payload}" == *'assert-shared-setup-idle'* ]]; then
+  printf 'setup-idle-check <established>\n' >> "${FAKE_COMMAND_LOG}"
+  printf '%s\n' '{"status":"active_dependent_jobs"}' >&2
+  exit 65
+fi
+if [[ "${payload}" == *'CPU setup complete: %s'* ]]; then
+  : > "${FAKE_SETUP_INSTALLED_FILE}"
+fi
 if [[ "${FAKE_CPU_LOGIN_RSYNC_MISSING:-false}" == true \
   && "${payload}" == *'generation_cpu_login_preflight.sh'* ]]; then
   printf 'CPU login prerequisite missing: rsync (blocks transfer).\n' >&2
@@ -353,7 +363,7 @@ elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format monitor '
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${FAKE_BENCHMARK_STATE}" "${signature}" "${signature}"
   printf 'Benchmark: transient_core_scaling\nRun: %s\nState: %s\n' \
     "${FAKE_BENCHMARK_RUN_ID}" "${FAKE_BENCHMARK_STATE}"
-  printf 'Work units: successful=%s  running=0  scheduler_pending=0  license_blocked=0  never_started=0  failed=%s  total=8\n' \
+  printf 'Work units: successful=%s  running=0  scheduler_pending=0  license_blocked=0  not_admitted=0  failed=%s  total=8\n' \
     "$((8 - failed))" "${failed}"
 elif [[ " $* " == *' core-benchmark-status '* && " $* " == *' --format summary '* ]]; then
   printf 'Benchmark: transient_core_scaling\nRun: %s\nState: %s\n' \
@@ -1009,6 +1019,8 @@ fi
             "FAKE_INVENTORY_SHA": _INVENTORY_SHA,
             "FAKE_CLEANUP_RECEIPT_SHA": _CLEANUP_RECEIPT_SHA,
             "FAKE_LOGIN_PREFLIGHT_STDOUT": "false",
+            "FAKE_SETUP_IDLE_REJECT": "false",
+            "FAKE_SETUP_INSTALLED_FILE": str(state_root / "setup-installed"),
             "FAKE_SSH_FAILURE_MATCH": "",
             "FAKE_SSH_FAILURE_PHASE": "before",
             "FAKE_SSH_FAILURE_LIMIT": "0",
@@ -2521,10 +2533,48 @@ def test_setup_is_read_only_by_default_and_execute_is_explicit(tmp_path: Path) -
     assert execute.returncode == 0, execute.stderr
     log_text = log.read_text(encoding="utf-8")
     assert "<BatchMode=yes>" in log_text
-    assert "checkout --detach" in log_text
+    assert "fresh_installation=true" in log_text
+    assert 'repository="${root}/${commit}"' not in log_text
+
+    repeat = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
+    assert repeat.returncode == 0, repeat.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "fresh_installation=false" in log_text
+    assert log_text.index("assert-shared-setup-idle") < log_text.index('git -C "${repository}" fetch origin "${commit}"')
 
     unsafe = _run(workflow, ["setup-cpu", "--cpu-host", "bad;host"], environment)
     assert unsafe.returncode == 2
+
+
+def test_setup_refuses_active_shared_jobs_before_remote_mutation(tmp_path: Path) -> None:
+    """Reject an established setup before Git or virtual-environment mutation."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    established = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
+    assert established.returncode == 0, established.stderr
+    assert Path(environment["FAKE_SETUP_INSTALLED_FILE"]).is_file()
+    log.write_text("", encoding="utf-8")
+    environment["FAKE_SETUP_IDLE_REJECT"] = "true"
+
+    result = _run(workflow, ["setup-cpu", *_remote_options(), "--execute"], environment)
+
+    assert result.returncode != 0
+    assert "active_dependent_jobs" in result.stderr
+    payload = log.read_text(encoding="utf-8")
+    assert "setup-idle-check <established>" in payload
+    assert "assert-shared-setup-idle" in payload
+    assert payload.index("assert-shared-setup-idle") < payload.index('git -C "${repository}" fetch origin "${commit}"')
+
+
+def test_benchmark_preflight_scratch_is_ephemeral_and_verified(tmp_path: Path) -> None:
+    """Keep benchmark preflight scratch outside the persistent CPU layout."""
+    workflow, _log, _environment, _storage, _mirror = _harness(tmp_path)
+
+    source = workflow.read_text(encoding="utf-8")
+
+    assert "benchmark-preflight-scratch" not in source
+    assert 'mktemp -d "${benchmark_scratch_parent%/}/generation-benchmark-preflight.XXXXXXXX"' in source
+    assert ".generation-benchmark-preflight" in source
+    assert "cleanup_benchmark_scratch" in source
 
 
 def test_local_docker_failure_stops_before_remote_mutation(tmp_path: Path) -> None:

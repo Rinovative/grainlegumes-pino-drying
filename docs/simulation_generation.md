@@ -33,6 +33,32 @@ Maintained entry configurations are:
 
 All maintained Generation schemas and durable records remain version `1`.
 
+## CPU installation layout
+
+The maintained CPU Generation root is
+`/zfspool/storage/home/rino.albertin/grainlegumes-generation`. A fresh
+`setup-cpu --execute` creates one detached execution checkout, one matching
+environment, and the persistent scientific storage root:
+
+```text
+grainlegumes-generation/
+├── repo/
+├── venv/
+└── storage/
+```
+
+Generation creates scientific domains below `storage/` only when a workflow
+needs them. Setup does not create empty Dataset or experiment domains for visual
+symmetry. Benchmark preflight and case scratch use marker-owned directories
+below the approved system temporary root and are removed deterministically;
+they are not persistent children of the CPU root.
+
+Before an existing `repo/` or `venv/` can change, setup queries the exact
+persisted campaign and benchmark Slurm identities. Active dependent jobs or
+unprovable scheduler evidence block mutation. Repeating setup for the same
+installed commit leaves the shared checkout and environment unchanged.
+Commit-keyed checkouts and per-commit environments are not supported.
+
 ## Common plan and lifecycle
 
 Every config resolves to one deterministic `GenerationRunPlan` containing its
@@ -54,6 +80,20 @@ The controller:
 Re-running the same config reuses valid work, reconciles active ownership, and
 submits only eligible missing work. It never treats Slurm `COMPLETED` alone as
 scientific success.
+
+For the all-material pilot, `current_pilot_gpu_permanent_bytes` is the
+validated destination transfer inventory plus all regular durable files owned
+by the pilot-check directory: the receipt, pre-cleanup snapshot, finalized
+cleanup receipt, and summaries. A recognized in-progress cleanup receipt remains
+outside the pre-cleanup total until finalization records it. The metric excludes
+incoming transfer staging, retained CPU source, unexpected pilot-check entries,
+and unrelated storage. The finalizer
+produces and validates the complete
+campaign-, destination-, and inventory-bound accounting mapping before
+rendering operator views. Missing or conflicting accounting fails the
+finalizer, not any already successful scientific case. Re-running the normal
+workflow reuses a valid pre-cleanup pilot receipt and resumes only missing
+finalizer or retention evidence.
 
 ## Controller and collection modes
 
@@ -165,11 +205,30 @@ source timezone is authoritative; otherwise their raw value is retained and
 they are omitted from timestamp ordering without demoting the case.
 
 Status shows at most three recent successful cases and three recent failures.
-Older failures are grouped by bounded classification, and never-started cases are
-grouped by material or work-unit family. Temporary-capacity cases stay outside
-the scientific failed section. Recurring terminal output reports only compact
-checkout, recovered-artifact, window, and retry state; content excerpts, digests,
-raw dictionaries, and machine-oriented JSON remain in canonical evidence.
+Older failures are grouped by bounded classification, and cases whose persisted
+state is `never_started` are presented as `not_admitted` and grouped by
+material or work-unit family. The recurring Cases line always renders, in order,
+`successful`, `running`, `scheduler_pending`, `license_blocked`,
+`not_admitted`, `failed`, and `total`, including zero counts. The separate
+Admission line always renders `pending`, `starting`, `acquiring_license`,
+and `license_waiting`; these counts describe admission-slot occupancy rather
+than a second case-state inventory.
+
+For a successful transient case, compact terminal science uses the validated
+bulk wet-basis moisture and configured material target:
+
+```text
+case_0001  batch=lentil
+  state=successful  reason=validated_case_evidence
+  simulated_end=60.32 h  bulk_moisture=11.6% wb  target=12.0% wb
+```
+
+The spatial `f_wet_dm` result remains part of stopping, validation, canonical
+results, and detailed diagnostics, but is not repeated on the normal successful
+status line. Temporary-capacity cases stay outside the scientific failed
+section. Recurring terminal output reports only compact checkout,
+recovered-artifact, window, and retry state; content excerpts, digests, raw
+dictionaries, and machine-oriented JSON remain in canonical evidence.
 Formatting does not read HDF5/CSV, query Slurm again, hash payloads, or expose
 raw license logs.
 

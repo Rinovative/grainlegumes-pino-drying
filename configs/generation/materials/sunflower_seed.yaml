@@ -200,13 +200,15 @@ initial_moisture:
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 target_moisture:
-  selected_simulation_target_wb: 0.06
-  market_acceptance_moisture_wb: 0.06
-  safe_storage_moisture_wb: 0.06
+  target_moisture_wb: 0.06
   provenance:
     evidence: official_industry_target
     source_refs:
     - swiss_oil_2026
+    method: The source-backed safe-storage target is already the practical whole
+      wet-basis percentage value 0.06 wb.
+    note: Single practical safe-storage drying target; market acceptance is not
+      a separate operational target.
 oswin:
   record_id: sunflower_seed_production_oswin_v1
   components:

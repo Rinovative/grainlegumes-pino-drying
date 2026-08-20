@@ -189,15 +189,16 @@ initial_moisture:
       verification: mathematically_reproduced
   margin_above_target_db: 0.01
 target_moisture:
-  selected_simulation_target_wb: 0.135
-  market_acceptance_moisture_wb: 0.17
-  safe_storage_moisture_wb: 0.14315
+  target_moisture_wb: 0.14
   provenance:
     evidence: derived
     source_refs:
     - manitoba_field_beans
-    note: Selected simulation stop target; market, safe-storage and selected values
-      remain separate.
+    method: Exact safe-storage reference 0.14315 wb, rounded to the nearest whole
+      wet-basis percentage point.
+    verification: mathematically_reproduced
+    note: Single practical safe-storage drying target; market acceptance is not
+      an operational target.
 oswin:
   record_id: kidney_bean_production_oswin_v1
   components:

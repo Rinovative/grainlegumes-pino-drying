@@ -6,13 +6,14 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import yaml
 
-from src import common
+from src import common, generation
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_input as input_service
 from src.generation.cases import generation_cases_sampling as sampling_service
@@ -427,6 +428,566 @@ def test_storage_projection_uses_only_successful_measured_hdf5() -> None:
         )
 
 
+def _validated_publication(
+    run_id: str,
+    storage: Path,
+    files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return one compact validated-destination receipt projection."""
+    return {
+        "campaign_run_id": run_id,
+        "destination_storage_root": str(storage),
+        "transferred_file_count": len(files),
+        "transferred_bytes": sum(record["size_bytes"] for record in files),
+        "transfer_inventory_sha256": "b" * 64,
+        "files": files,
+    }
+
+
+def test_gpu_accounting_uses_only_validated_destination_and_pilot_metadata(
+    tmp_path: Path,
+) -> None:
+    """Exclude CPU source and transfer staging from permanent GPU bytes."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_gpu_accounting"
+    files = [
+        {
+            "relative_path": "01_generation/processed/batch/case_00001/case.h5",
+            "size_bytes": 11,
+        },
+        {
+            "relative_path": f"01_generation/meta/campaigns/{run_id}/campaign_terminal.json",
+            "size_bytes": 7,
+        },
+        {
+            "relative_path": "01_generation/raw/batch/case_00001/solver.log",
+            "size_bytes": 3,
+        },
+        {
+            "relative_path": f"01_generation/attempts/batch/case_00002/{run_id}/attempt.json",
+            "size_bytes": 5,
+        },
+    ]
+    publication = _validated_publication(run_id, storage, files)
+    pilot_directory = pilot_service.pilot_check_directory(
+        run_id,
+        storage_root=storage,
+    )
+    pilot_directory.mkdir(parents=True)
+    (pilot_directory / pilot_service.PILOT_SUMMARY_MARKDOWN).write_bytes(b"pilot-meta")
+    cpu_retained = storage / "cpu-retained-source.bin"
+    cpu_retained.write_bytes(b"x" * 101)
+    staging = storage / ".incoming/transfer-staging.bin"
+    staging.parent.mkdir()
+    staging.write_bytes(b"y" * 103)
+
+    accounting = pilot_service._gpu_inventory(  # noqa: SLF001 -- focused accounting owner
+        run_id,
+        storage=storage,
+        validated_publication=publication,
+    )
+
+    assert accounting["gpu_generation_bytes"] == 26
+    assert accounting["gpu_generation_hdf5_bytes"] == 11
+    assert accounting["gpu_generation_meta_bytes"] == 7
+    assert accounting["gpu_pilot_logs_bytes"] == 3
+    assert accounting["retained_failure_evidence_bytes"] == 5
+    assert accounting["pilot_receipt_and_summary_bytes"] == len(b"pilot-meta")
+    assert accounting["current_pilot_gpu_permanent_bytes"] == 26 + len(b"pilot-meta")
+    assert accounting["current_pilot_gpu_permanent_bytes"] != (
+        publication["transferred_bytes"] + cpu_retained.stat().st_size + staging.stat().st_size
+    )
+    pilot_service._validate_current_pilot_check_metadata(  # noqa: SLF001 -- exact live reconciliation
+        accounting,
+        run_id=run_id,
+        storage=storage,
+    )
+    unexpected = pilot_directory / "unexpected.bin"
+    unexpected.write_bytes(b"unowned")
+    with pytest.raises(ValueError, match="unsupported or unsafe entry"):
+        pilot_service._validate_current_pilot_check_metadata(  # noqa: SLF001 -- unexpected-file rejection
+            accounting,
+            run_id=run_id,
+            storage=storage,
+        )
+    unexpected.unlink()
+    summary = pilot_directory / pilot_service.PILOT_SUMMARY_MARKDOWN
+    summary.write_bytes(b"changed-pilot-meta")
+    with pytest.raises(ValueError, match="does not match current durable"):
+        pilot_service._validate_current_pilot_check_metadata(  # noqa: SLF001 -- stale total rejection
+            accounting,
+            run_id=run_id,
+            storage=storage,
+        )
+    summary.write_bytes(b"pilot-meta")
+
+
+def test_staging_cleanup_accounting_exclusion_requires_bound_receipt(
+    tmp_path: Path,
+) -> None:
+    """Exclude only a schema-valid run-bound cleanup transaction."""
+    run_id = "bound_cleanup_transaction"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    receipt_path = tmp_path / pilot_service.PILOT_STAGING_CLEANUP_FILENAME
+    receipt = {
+        "schema_kind": "generation_pilot_staging_cleanup",
+        "schema_version": pilot_service.PILOT_SCHEMA_VERSION,
+        "campaign_run_id": run_id,
+        "staging_path": str(staging),
+        "pre_cleanup_snapshot_sha256": "a" * 64,
+        "expected_bytes": 7,
+        "expected_file_count": 1,
+        "status": "pending",
+        "removed": False,
+        "reclaimed_bytes": 0,
+        "started_at": "2026-08-20T00:00:00+00:00",
+        "completed_at": None,
+    }
+
+    assert (
+        pilot_service._validate_staging_cleanup_receipt(  # noqa: SLF001 -- durable cleanup boundary
+            receipt,
+            run_id=run_id,
+            staging=staging,
+            pre_cleanup_snapshot_sha256="a" * 64,
+            receipt_path=receipt_path,
+        )
+        == receipt
+    )
+    conflicting = dict(receipt)
+    conflicting["campaign_run_id"] = "another_campaign"
+    with pytest.raises(ValueError, match="malformed or conflicts"):
+        pilot_service._validate_staging_cleanup_receipt(  # noqa: SLF001 -- identity conflict
+            conflicting,
+            run_id=run_id,
+            staging=staging,
+            pre_cleanup_snapshot_sha256="a" * 64,
+            receipt_path=receipt_path,
+        )
+    malformed = dict(receipt)
+    malformed["status"] = "unknown"
+    with pytest.raises(ValueError, match="unsupported state"):
+        pilot_service._validate_staging_cleanup_receipt(  # noqa: SLF001 -- malformed state
+            malformed,
+            run_id=run_id,
+            staging=staging,
+            pre_cleanup_snapshot_sha256="a" * 64,
+            receipt_path=receipt_path,
+        )
+
+
+def test_pre_cleanup_reuse_rejects_same_size_view_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile reusable receipt views with the immutable snapshot contents."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_same_size_tamper"
+    directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    directory.mkdir(parents=True)
+    retained = storage / "retained"
+    retained.mkdir()
+    snapshot = {
+        "schema_kind": pilot_service.PILOT_RECEIPT_SCHEMA_KIND,
+        "schema_version": pilot_service.PILOT_SCHEMA_VERSION,
+        "pilot_check_id": run_id,
+        "campaign_id": "pilot_campaign",
+        "campaign_digest": "c" * 64,
+        "materials": [],
+        "cases": [],
+        "production_storage_projection": {},
+        "retained_evidence_paths": [str(retained)],
+        "post_transfer_gpu_inventory": {},
+        "cleanup": {
+            "authorized": True,
+            "cleanup_requested": False,
+            "transfer_staging": {"status": "pending"},
+        },
+    }
+    common.serialization.atomic_write_json(
+        directory / pilot_service.PILOT_PRE_CLEANUP_FILENAME,
+        snapshot,
+    )
+    common.serialization.atomic_write_json(
+        directory / pilot_service.PILOT_RECEIPT_FILENAME,
+        snapshot,
+    )
+    csv_path = directory / pilot_service.PILOT_SUMMARY_CSV
+    markdown_path = directory / pilot_service.PILOT_SUMMARY_MARKDOWN
+    csv_path.write_text("expected\n", encoding="utf-8")
+    markdown_path.write_text("expected\n", encoding="utf-8")
+    monkeypatch.setattr(pilot_service, "_validate_case_results", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pilot_service, "_validate_storage_projection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_for_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            campaign_id="pilot_campaign",
+            campaign_digest="c" * 64,
+            material_inventory=(),
+        ),
+    )
+    monkeypatch.setattr(pilot_service, "_validated_destination_publication", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(pilot_service, "_validate_pilot_gpu_accounting", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pilot_service, "validate_cpu_source_inventory", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        pilot_service,
+        "validate_transfer_staging_inventory",
+        lambda *_args, **_kwargs: {"transfer_staging_path": str(tmp_path / "staging")},
+    )
+    monkeypatch.setattr(pilot_service, "_validate_current_pilot_check_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pilot_service, "_summary_csv", lambda _receipt: "expected\n")
+    monkeypatch.setattr(pilot_service, "_summary_markdown", lambda _receipt: "expected\n")
+
+    pilot_service.validate_pilot_pre_cleanup(
+        run_id,
+        storage_root=storage,
+        require_current_receipt=True,
+    )
+    csv_path.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not durable before cleanup"):
+        pilot_service.validate_pilot_pre_cleanup(
+            run_id,
+            storage_root=storage,
+            require_current_receipt=True,
+        )
+
+
+def test_pilot_gpu_accounting_reports_complete_validation_errors(
+    tmp_path: Path,
+) -> None:
+    """Reject missing, invalid, and identity-conflicting accounting values."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_gpu_validation"
+    publication = _validated_publication(
+        run_id,
+        storage,
+        [{"relative_path": "01_generation/processed/batch/case.h5", "size_bytes": 17}],
+    )
+    accounting = pilot_service._gpu_inventory(  # noqa: SLF001 -- focused accounting owner
+        run_id,
+        storage=storage,
+        validated_publication=publication,
+    )
+
+    missing = dict(accounting)
+    missing.pop("current_pilot_gpu_permanent_bytes")
+    with pytest.raises(
+        ValueError,
+        match=("Pilot storage accounting is missing required validated destination metric: current_pilot_gpu_permanent_bytes"),
+    ):
+        pilot_service._validate_pilot_gpu_accounting(  # noqa: SLF001 -- explicit validation boundary
+            missing,
+            run_id=run_id,
+            storage=storage,
+            validated_publication=publication,
+        )
+    with pytest.raises(
+        ValueError,
+        match=("Pilot storage accounting is missing required validated destination metric: current_pilot_gpu_permanent_bytes"),
+    ):
+        pilot_service._write_receipt_and_views(  # noqa: SLF001 -- finalizer validation boundary
+            run_id,
+            {"post_transfer_gpu_inventory": missing},
+            storage=storage,
+            write_pre_cleanup_snapshot=False,
+            validated_publication=publication,
+        )
+
+    for invalid in (True, -1, 1.5, "17"):
+        malformed = dict(accounting)
+        malformed["current_pilot_gpu_permanent_bytes"] = invalid
+        with pytest.raises(ValueError, match="invalid validated destination byte metrics"):
+            pilot_service._validate_pilot_gpu_accounting(  # noqa: SLF001 -- explicit validation boundary
+                malformed,
+                run_id=run_id,
+                storage=storage,
+                validated_publication=publication,
+            )
+
+    conflicting = dict(accounting)
+    conflicting["destination_inventory_sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="conflicts with validated destination publication identity"):
+        pilot_service._validate_pilot_gpu_accounting(  # noqa: SLF001 -- explicit validation boundary
+            conflicting,
+            run_id=run_id,
+            storage=storage,
+            validated_publication=publication,
+        )
+
+
+def test_prepare_pilot_receipt_completes_six_successes_after_validated_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complete finalizer views after six successful published cases."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "six_successful_pilot"
+    materials = (
+        "chickpea",
+        "field_pea",
+        "kidney_bean",
+        "lentil",
+        "rapeseed",
+        "sunflower_seed",
+    )
+    retained: dict[str, Path] = {}
+    terminal_cases: list[dict[str, Any]] = []
+    analyzed: dict[str, dict[str, Any]] = {}
+    for index, material in enumerate(materials, start=1):
+        processed = storage / f"01_generation/processed/{material}/case_{index:05d}"
+        processed.mkdir(parents=True)
+        retained[material] = processed
+        terminal_cases.append(
+            {
+                "terminal_state": "success",
+                "processed_directory": processed.relative_to(storage).as_posix(),
+                "case_kind": "nominal_reference",
+                "case_index": index,
+                "case_id": f"case_{index:05d}",
+                "material": material,
+                "material_role": "seen",
+            }
+        )
+        result = _canonical_case_result()
+        result.update(
+            {
+                "material": material,
+                "case_index": index,
+                "case_id": f"case_{index:05d}",
+                "duration": {
+                    "result": "PASS",
+                    "stop_consistent": True,
+                },
+                "conservation_diagnostic": {
+                    "comsol_mt_mass_balance": {"max_abs": 0.0},
+                },
+                "storage": {
+                    "canonical_hdf5_bytes": 10 + index,
+                    "regular_state_count": 2,
+                    "transient_dataset_storage_bytes": 4,
+                    "global_dataset_storage_bytes": 2,
+                },
+                "retained_evidence_path": str(processed),
+            }
+        )
+        analyzed[str(processed)] = result
+    terminal = {
+        "git_commit": "a" * 40,
+        "cases_per_material": 1,
+        "terminal_counts": {
+            "successful": 6,
+            "failed": 0,
+            "running": 0,
+            "scheduler_pending": 0,
+            "never_started": 0,
+            "total": 6,
+        },
+        "cases": terminal_cases,
+    }
+    campaign = SimpleNamespace(
+        campaign_id="material_pilot_test",
+        campaign_digest="d" * 64,
+        campaign_purpose="pilot_check",
+        template_sha256="e" * 64,
+        execution_values={},
+        material_inventory=materials,
+        batches=tuple(
+            SimpleNamespace(
+                batch_name=f"transient_drying::{material}::natural",
+                scientific_config_digest=f"{index:x}".zfill(64),
+            )
+            for index, material in enumerate(materials, start=1)
+        ),
+    )
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    run_directory.mkdir(parents=True)
+    (run_directory / "transfer_complete.json").write_bytes(b"{}\n")
+    publication_files = [
+        {
+            "relative_path": f"01_generation/processed/{material}/case_{index:05d}/case.h5",
+            "size_bytes": 10 + index,
+        }
+        for index, material in enumerate(materials, start=1)
+    ]
+    publication = _validated_publication(run_id, storage, publication_files)
+    projection_contract = {
+        "target_campaign_id": "production_campaign",
+        "target_campaign_digest": "f" * 64,
+        "simulation_profile": "transient_drying",
+        "target_case_count": 600,
+        "regular_state_count": 21,
+        "regular_time_start_h": 0.0,
+        "time_horizon_h": 240.0,
+    }
+    rows = [
+        {
+            "material": material,
+            "material_role": "seen",
+            "nominal_result_class": "PASS",
+            "nominal_duration_result": "PASS",
+            "nominal_stop_consistent": True,
+            "nominal_drying_duration_h": 72.0,
+            "successful_duration_median_h": 72.0,
+            "successful_duration_min_h": 72.0,
+            "successful_duration_max_h": 72.0,
+            "target_reached_count": 1,
+            "runtime_failure_count": 0,
+            "physical_contract_violation_count": 0,
+            "worst_mt_mass_balance_max_abs": 0.0,
+            "worst_independent_total_water_residual_kg": 0.0,
+            "median_hdf5_size_bytes": 10 + index,
+        }
+        for index, material in enumerate(materials, start=1)
+    ]
+    monkeypatch.setattr(pilot_service, "_production_projection_contract", lambda *_args, **_kwargs: projection_contract)
+    monkeypatch.setattr(pilot_service, "validate_pilot_terminal", lambda *_args, **_kwargs: terminal)
+    monkeypatch.setattr(campaign_evidence, "campaign_for_run", lambda *_args, **_kwargs: campaign)
+    monkeypatch.setattr(campaign_evidence, "validate_transfer_receipt", lambda *_args, **_kwargs: publication)
+    monkeypatch.setattr(pilot_service, "pilot_transfer_plan", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        pilot_service,
+        "validate_cpu_source_inventory",
+        lambda *_args, **_kwargs: {
+            "cpu_source_bytes_before_cleanup": 30_821_820_373,
+            "cpu_exports_bytes": 17,
+            "cpu_logs_bytes": 19,
+        },
+    )
+    monkeypatch.setattr(
+        pilot_service,
+        "validate_transfer_staging_inventory",
+        lambda *_args, **_kwargs: {
+            "transfer_staging_bytes_before_cleanup": 211,
+        },
+    )
+    monkeypatch.setattr(
+        analysis_service,
+        "analyze_successful_case",
+        lambda path, **_kwargs: analyzed[str(path)],
+    )
+    monkeypatch.setattr(pilot_service, "_per_material", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(pilot_service, "_problems", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        analysis_service,
+        "production_storage_projection",
+        lambda *_args, **_kwargs: {
+            "status": "available",
+            "basis": "synthetic_validated_publication",
+            "mean_based_bytes": 8100,
+            "median_based_bytes": 8100,
+            "full_horizon_projection": {"status": "available", "projected_bytes": 9000},
+        },
+    )
+    monkeypatch.setattr(
+        pilot_service,
+        "validate_pilot_pre_cleanup",
+        lambda *_args, **_kwargs: json.loads(
+            (pilot_service.pilot_check_directory(run_id, storage_root=storage) / pilot_service.PILOT_PRE_CLEANUP_FILENAME).read_text(encoding="utf-8")
+        ),
+    )
+
+    receipt = pilot_service.prepare_pilot_receipt(
+        run_id,
+        production_campaign=tmp_path / "production.yaml",
+        storage_root=storage,
+        cleanup_requested=False,
+    )
+
+    assert receipt["case_counts"]["successful"] == 6
+    assert receipt["case_counts"]["failed"] == 0
+    assert receipt["post_transfer_gpu_inventory"]["gpu_generation_bytes"] == sum(record["size_bytes"] for record in publication_files)
+    assert (
+        receipt["post_transfer_gpu_inventory"]["current_pilot_gpu_permanent_bytes"] > receipt["post_transfer_gpu_inventory"]["gpu_generation_bytes"]
+    )
+    assert receipt["post_transfer_gpu_inventory"]["current_pilot_gpu_permanent_bytes"] < 30_821_820_373
+    receipt_path = pilot_service.pilot_receipt_path(run_id, storage_root=storage)
+    original_receipt = receipt_path.read_bytes()
+    repeated = pilot_service.prepare_pilot_receipt(
+        run_id,
+        production_campaign=tmp_path / "production.yaml",
+        storage_root=storage,
+        cleanup_requested=False,
+    )
+    assert repeated == receipt
+    assert receipt_path.read_bytes() == original_receipt
+    summary = (pilot_service.pilot_check_directory(run_id, storage_root=storage) / pilot_service.PILOT_SUMMARY_MARKDOWN).read_text(encoding="utf-8")
+    assert "Current permanent GPU pilot:" in summary
+
+
+def test_new_commit_pilot_reuses_all_valid_cases_without_scientific_submission(
+    pilot_campaign_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complete a commit-bound pilot run with no Slurm or COMSOL work."""
+    campaign = _pilot(pilot_campaign_path)
+    storage = tmp_path / "storage"
+    commit = "c" * 40
+    prepared: list[bool] = []
+    finalized: list[bool] = []
+    submissions: list[str] = []
+
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
+    monkeypatch.setattr(
+        input_service,
+        "prepare_campaign_inputs",
+        lambda *_args, **_kwargs: prepared.append(True),
+    )
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: {
+            "squeue": {"command": [], "output": "", "error": None},
+            "sacct": {"command": [], "output": "", "error": None},
+            "active": {},
+            "accounted": {},
+        },
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),  # noqa: SLF001 -- focused reuse seam
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_finalize_completed_batches",
+        lambda *_args, **_kwargs: finalized.append(True),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_submit_one",
+        lambda *_args, **_kwargs: submissions.append("unexpected"),
+    )
+
+    manifest = generation.campaign.submit_campaign(
+        campaign,
+        git_commit=commit,
+        storage_root=storage,
+    )
+
+    assert prepared == [True]
+    assert finalized == [True]
+    assert submissions == []
+    assert manifest["state"] == "complete"
+    assert manifest["slurm_job_ids"] == []
+    assert manifest["submissions"] == []
+
+
 def test_pre_cleanup_storage_inventories_record_exact_files_and_case_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -758,6 +1319,14 @@ def test_staging_cleanup_writes_pending_transaction_before_deletion(
     assert receipt["removed"] is True
     assert receipt["reclaimed_bytes"] == expected_bytes
     assert not staging.exists()
+    assert (
+        pilot_service.cleanup_recorded_transfer_staging(
+            run_id,
+            storage_root=storage,
+            confirm=True,
+        )
+        == receipt
+    )
 
 
 def test_staging_cleanup_accounts_for_residual_after_atomic_publication(

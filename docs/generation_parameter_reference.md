@@ -67,6 +67,27 @@ X_db = X_wb / (1 - X_wb)
 Spatial-field statistics and bounds are configuration-owned synthetic generator
 contracts unless their resolved provenance states otherwise.
 
+Each material owns exactly one operational drying target:
+
+```yaml
+target_moisture:
+  target_moisture_wb: 0.12
+```
+
+`target_moisture_wb` is the material-specific practical safe-storage drying
+target expressed as a wet-basis mass fraction; `0.12` means `12.0 % wb`.
+Exact literature or isotherm-derived safe-storage values remain in provenance
+and are normally rounded deterministically to a practical whole wet-basis
+percentage point. A stricter conventional source-backed value may be retained
+when upward rounding would contradict safe storage. Market-acceptance limits
+may be cited for context, but they are not a competing runtime target.
+
+The resolved target supplies the existing `X_target_wb` COMSOL scalar and
+therefore participates in the existing scientific and case-input identities.
+The stopping criterion remains spatial: `f_wet_dm` measures the dry-mass
+fraction above `X_target_wb` and is compared with the configured tolerance.
+This target cleanup does not replace that criterion with bulk-only termination.
+
 ### Packing and permeability
 
 Mean permeability is coupled to packing porosity through a material-calibrated
