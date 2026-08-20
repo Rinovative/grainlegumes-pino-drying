@@ -234,6 +234,7 @@ def _validate_submission_configuration(
         message = f"Campaign-run submission configuration 'maximum_failed_cases' is malformed: {run_id}."
         raise ValueError(message)
     retry = submission["temporary_license_retry"]
+    in_allocation = retry.get("in_allocation_retry") if isinstance(retry, dict) else None
     if (
         not isinstance(retry, dict)
         or set(retry)
@@ -242,6 +243,7 @@ def _validate_submission_configuration(
             "initial_delay_seconds",
             "maximum_delay_seconds",
             "maximum_wait_seconds",
+            "in_allocation_retry",
         }
         or not isinstance(retry.get("enabled"), bool)
         or any(
@@ -261,6 +263,15 @@ def _validate_submission_configuration(
         )
         or retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]
         or (retry["maximum_wait_seconds"] is not None and retry["maximum_wait_seconds"] < retry["initial_delay_seconds"])
+        or not isinstance(in_allocation, dict)
+        or set(in_allocation) != {"enabled", "maximum_window_seconds", "pause_after_capacity_failure_seconds"}
+        or not isinstance(in_allocation.get("enabled"), bool)
+        or any(
+            isinstance(in_allocation.get(key), bool)
+            or not isinstance(in_allocation.get(key), (int, float))
+            or not 0.0 < float(in_allocation[key]) < float("inf")
+            for key in ("maximum_window_seconds", "pause_after_capacity_failure_seconds")
+        )
     ):
         message = f"Campaign-run temporary-license retry configuration is malformed: {run_id}."
         raise ValueError(message)

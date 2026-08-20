@@ -193,12 +193,27 @@ def _active_case_lines(case: Mapping[str, Any]) -> list[str]:
         return lines
     phase = _available_text(runtime.get("phase"))
     if phase is not None:
-        phase_parts = [f"phase={phase}"]
+        displayed_phase = "acquiring_comsol_license" if phase in {"starting_solver", "acquiring_comsol_license"} else phase
+        phase_parts = [f"phase={displayed_phase}"]
         if phase in {"stationary_airflow", "transient_drying"}:
             progress = _available_text(_format_comsol_stage(runtime.get("comsol_progress_percent")))
             if progress is not None:
                 phase_parts.append(f"progress={progress}")
         lines.append(f"  {'  '.join(phase_parts)}")
+    if phase in {"starting_solver", "acquiring_comsol_license"}:
+        window = _float_value(runtime.get("license_window_seconds"))
+        limit = _float_value(runtime.get("license_window_limit_seconds"))
+        checkouts = _available_text(runtime.get("license_checkout_attempt_count"))
+        acquisition_parts = []
+        if window is not None and limit is not None:
+            acquisition_parts.append(f"window={window:.0f} s / {limit:g} s")
+        if checkouts is not None:
+            acquisition_parts.append(f"checkouts={checkouts}")
+        if acquisition_parts:
+            lines.append(f"  {'  '.join(acquisition_parts)}")
+        last_result = _bounded_text(runtime.get("last_license_result"), maximum=_MAX_REASON_CHARACTERS)
+        if last_result is not None:
+            lines.append(f"  last_result={last_result}")
     if phase in {"stationary_airflow", "transient_drying"} and runtime.get("parser_state") == "available":
         solver_values = (
             ("simulated_time", _format_simulated_time(runtime.get("simulated_time_seconds"))),
@@ -247,6 +262,20 @@ def _scheduler_pending_lines(case: Mapping[str, Any]) -> list[str]:
 def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
     """Return concise operational license retry detail without raw evidence."""
     lines = [_case_heading(case, include_runtime=False), "  state=license_blocked"]
+    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    if reason is not None:
+        lines.append(f"  reason={reason}")
+    window = case.get("in_allocation_license_window")
+    if isinstance(window, dict):
+        realised = _float_value(window.get("realised_window_seconds"))
+        checkouts = _available_text(window.get("checkout_attempt_count"))
+        window_parts = []
+        if realised is not None:
+            window_parts.append(f"window={realised:.0f} s")
+        if checkouts is not None:
+            window_parts.append(f"checkouts={checkouts}")
+        if window_parts:
+            lines.append(f"  {'  '.join(window_parts)}")
     retry = case.get("temporary_license_retry")
     if isinstance(retry, dict):
         retry_parts = []
@@ -473,21 +502,10 @@ def format_campaign_status_summary(
             "  "
             f"pending={_text(component_values.get('pending'))}  "
             f"starting={_text(component_values.get('starting'))}  "
-            f"license_waiting={_text(component_values.get('license_waiting'))}  "
-            f"retrying={_text(component_values.get('retrying'))}"
+            f"acquiring_license={_text(component_values.get('acquiring_license'))}  "
+            f"license_waiting={_text(component_values.get('license_waiting'))}"
         ),
     ]
-    pacing = status.get("license_retry_launch_pacing")
-    if isinstance(pacing, dict) and pacing.get("active") is True:
-        pacing_parts = []
-        next_launch = _available_text(pacing.get("next_launch_at"))
-        spacing = _float_value(pacing.get("spacing_seconds"))
-        if next_launch is not None:
-            pacing_parts.append(f"next_launch={next_launch}")
-        if spacing is not None:
-            pacing_parts.append(f"stagger={spacing:g} s")
-        if pacing_parts:
-            lines.extend(("License retry:", f"  {'  '.join(pacing_parts)}"))
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
     _actionable_section(lines, "Running cases", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
     _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)

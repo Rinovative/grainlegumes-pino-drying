@@ -17,6 +17,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -525,3 +526,526 @@ def wait_record_is_eligible(
         message = "Retry eligibility comparison requires a timezone-aware time."
         raise ValueError(message)
     return current.astimezone(timezone.utc) >= eligible
+
+
+_WINDOW_SCHEMA_KIND: Final = "generation_in_allocation_license_window"
+_WINDOW_SCHEMA_VERSION: Final = 1
+_WINDOW_DIRECTORY_NAME: Final = "license_retry_windows"
+_MAX_RECENT_CHECKOUT_SUMMARIES: Final = 8
+_MAX_CHECKOUT_EXCERPT_CHARACTERS: Final = 512
+_WINDOW_OUTCOMES: Final = frozenset({"solver_progress_started", "window_exhausted"})
+_SCIENTIFIC_DIGEST_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
+class InAllocationLicenseCheckoutSummary:
+    """One compact completed COMSOL checkout attempt within an allocation."""
+
+    checkout_index: int
+    started_at: datetime
+    ended_at: datetime
+    started_monotonic_seconds: float
+    ended_monotonic_seconds: float
+    process_exit_code: int | None
+    classification: TemporaryLicenseCapacityClassification | None
+    solver_progress_started: bool
+
+    def __post_init__(self) -> None:
+        """Validate bounded, monotonic checkout evidence at construction."""
+        if isinstance(self.checkout_index, bool) or self.checkout_index < 1:
+            message = "In-allocation checkout index must be a positive integer."
+            raise ValueError(message)
+        for label, monotonic_value in (
+            ("checkout start", self.started_monotonic_seconds),
+            ("checkout end", self.ended_monotonic_seconds),
+        ):
+            if isinstance(monotonic_value, bool) or not isinstance(monotonic_value, (int, float)) or not 0.0 <= float(monotonic_value) < float("inf"):
+                message = f"In-allocation {label} monotonic time must be finite and non-negative."
+                raise ValueError(message)
+        if self.ended_monotonic_seconds < self.started_monotonic_seconds:
+            message = "In-allocation checkout end cannot precede its start."
+            raise ValueError(message)
+        for label, timestamp_value in (("checkout start", self.started_at), ("checkout end", self.ended_at)):
+            if timestamp_value.tzinfo is None or timestamp_value.utcoffset() is None:
+                message = f"In-allocation {label} timestamp must be timezone-aware."
+                raise ValueError(message)
+        if self.ended_at < self.started_at:
+            message = "In-allocation checkout timestamp end cannot precede its start."
+            raise ValueError(message)
+        if self.process_exit_code is not None and (isinstance(self.process_exit_code, bool) or not isinstance(self.process_exit_code, int)):
+            message = "In-allocation checkout exit code must be an integer or null."
+            raise TypeError(message)
+        if self.solver_progress_started and self.classification is not None:
+            message = "Solver-progress checkout evidence cannot be temporary-capacity classified."
+            raise ValueError(message)
+
+    @property
+    def duration_seconds(self) -> float:
+        """Return the monotonic duration of this completed checkout."""
+        return float(self.ended_monotonic_seconds - self.started_monotonic_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class InAllocationLicenseWindowResult:
+    """One completed bounded license-acquisition window for one Slurm allocation."""
+
+    campaign_run_id: str
+    batch_id: str
+    case_id: str
+    work_unit_id: str
+    scientific_config_digest: str
+    job_id: str
+    hostname: str
+    window_started_at: datetime
+    window_ended_at: datetime
+    window_started_monotonic_seconds: float
+    window_ended_monotonic_seconds: float
+    configured_window_seconds: float
+    checkout_summaries: tuple[InAllocationLicenseCheckoutSummary, ...]
+    solver_progress_started: bool
+    outcome: str
+    reason: str
+    next_controller_retry_basis: str | None
+
+    def __post_init__(self) -> None:
+        """Validate the immutable operational result before persistence."""
+        if _JOB_ID_PATTERN.fullmatch(self.job_id) is None:
+            message = "In-allocation license window requires one numeric Slurm job ID."
+            raise ValueError(message)
+        for label, text_value in (
+            ("campaign_run_id", self.campaign_run_id),
+            ("batch_id", self.batch_id),
+            ("case_id", self.case_id),
+            ("hostname", self.hostname),
+        ):
+            if not isinstance(text_value, str) or not text_value:
+                message = f"In-allocation license window {label} must be non-empty text."
+                raise ValueError(message)
+        if self.work_unit_id != f"{self.batch_id}/{self.case_id}":
+            message = "In-allocation license window work-unit identity is inconsistent."
+            raise ValueError(message)
+        if not isinstance(self.scientific_config_digest, str) or _SCIENTIFIC_DIGEST_PATTERN.fullmatch(self.scientific_config_digest) is None:
+            message = "In-allocation license window scientific digest is malformed."
+            raise ValueError(message)
+        for label, timestamp_value in (("window start", self.window_started_at), ("window end", self.window_ended_at)):
+            if timestamp_value.tzinfo is None or timestamp_value.utcoffset() is None:
+                message = f"In-allocation {label} timestamp must be timezone-aware."
+                raise ValueError(message)
+        if self.window_ended_at < self.window_started_at:
+            message = "In-allocation window end cannot precede its start."
+            raise ValueError(message)
+        for label, numeric_value in (
+            ("window start", self.window_started_monotonic_seconds),
+            ("window end", self.window_ended_monotonic_seconds),
+            ("configured window", self.configured_window_seconds),
+        ):
+            if isinstance(numeric_value, bool) or not isinstance(numeric_value, (int, float)) or not 0.0 < float(numeric_value) < float("inf"):
+                message = f"In-allocation {label} duration must be finite and positive."
+                raise ValueError(message)
+        if self.window_ended_monotonic_seconds < self.window_started_monotonic_seconds:
+            message = "In-allocation window monotonic end cannot precede its start."
+            raise ValueError(message)
+        indexes = tuple(summary.checkout_index for summary in self.checkout_summaries)
+        if indexes != tuple(range(1, len(indexes) + 1)):
+            message = "In-allocation checkout summaries must use contiguous indexes."
+            raise ValueError(message)
+        if self.outcome not in _WINDOW_OUTCOMES:
+            message = "In-allocation license window outcome is unsupported."
+            raise ValueError(message)
+        if self.outcome == "solver_progress_started":
+            if not self.solver_progress_started or self.reason != "solver_progress_started" or self.next_controller_retry_basis is not None:
+                message = "Solver-progress license window outcome is inconsistent."
+                raise ValueError(message)
+        elif (
+            self.solver_progress_started
+            or self.reason != "in_allocation_license_window_exhausted"
+            or self.next_controller_retry_basis != "controller_temporary_license_retry"
+        ):
+            message = "Exhausted license window outcome is inconsistent."
+            raise ValueError(message)
+
+    @property
+    def realised_window_seconds(self) -> float:
+        """Return the complete monotonic license-acquisition window duration."""
+        return float(self.window_ended_monotonic_seconds - self.window_started_monotonic_seconds)
+
+
+def in_allocation_license_window_directory(
+    campaign_run_id: str,
+    batch_id: str,
+    case_id: str,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return the strict append-only receipt directory for one logical case."""
+    run_directory = campaign_evidence.campaign_run_directory(campaign_run_id, storage_root=storage_root)
+    safe_batch = common.paths.validate_logical_name(batch_id, label="batch_id")
+    safe_case = common.paths.validate_logical_name(case_id, label="case_id")
+    return run_directory / _WINDOW_DIRECTORY_NAME / safe_batch / safe_case
+
+
+def _checkout_summary_payload(summary: InAllocationLicenseCheckoutSummary) -> dict[str, Any]:
+    """Return one bounded JSON-safe checkout summary."""
+    classification = summary.classification
+    excerpt = None if classification is None else _bounded_raw_excerpt(classification.raw_excerpt)[-_MAX_CHECKOUT_EXCERPT_CHARACTERS:]
+    return {
+        "checkout_index": summary.checkout_index,
+        "started_at": summary.started_at.astimezone(timezone.utc).isoformat(),
+        "ended_at": summary.ended_at.astimezone(timezone.utc).isoformat(),
+        "duration_seconds": summary.duration_seconds,
+        "process_exit_code": summary.process_exit_code,
+        "classification": None if classification is None else classification.classification,
+        "feature": None if classification is None else classification.feature,
+        "error_code": None if classification is None else classification.license_code,
+        "solver_progress_started": summary.solver_progress_started,
+        "raw_excerpt_sha256": None if excerpt is None else hashlib.sha256(excerpt.encode()).hexdigest(),
+        "raw_excerpt": excerpt,
+    }
+
+
+def in_allocation_license_window_result(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    job_id: str,
+    hostname: str,
+    window_started_at: datetime,
+    window_ended_at: datetime,
+    window_started_monotonic_seconds: float,
+    window_ended_monotonic_seconds: float,
+    checkout_summaries: tuple[InAllocationLicenseCheckoutSummary, ...],
+    solver_progress_started: bool,
+    outcome: str,
+) -> InAllocationLicenseWindowResult:
+    """Build one validated final result from injected worker lifecycle evidence."""
+    policy = config.execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"]
+    case_id = config.case_id(case_index)
+    exhausted = outcome == "window_exhausted"
+    return InAllocationLicenseWindowResult(
+        campaign_run_id=common.paths.validate_logical_name(campaign_run_id, label="campaign_run_id"),
+        batch_id=config.batch_id,
+        case_id=case_id,
+        work_unit_id=f"{config.batch_id}/{case_id}",
+        scientific_config_digest=config.scientific_config_digest,
+        job_id=job_id,
+        hostname=hostname,
+        window_started_at=window_started_at,
+        window_ended_at=window_ended_at,
+        window_started_monotonic_seconds=window_started_monotonic_seconds,
+        window_ended_monotonic_seconds=window_ended_monotonic_seconds,
+        configured_window_seconds=float(policy["maximum_window_seconds"]),
+        checkout_summaries=checkout_summaries,
+        solver_progress_started=solver_progress_started,
+        outcome=outcome,
+        reason="in_allocation_license_window_exhausted" if exhausted else "solver_progress_started",
+        next_controller_retry_basis="controller_temporary_license_retry" if exhausted else None,
+    )
+
+
+def _window_payload(result: InAllocationLicenseWindowResult) -> dict[str, Any]:
+    """Return one deterministic bounded allocation-window receipt payload."""
+    summaries = result.checkout_summaries[-_MAX_RECENT_CHECKOUT_SUMMARIES:]
+    features = sorted({summary.classification.feature for summary in result.checkout_summaries if summary.classification is not None})
+    error_codes = sorted(
+        {
+            summary.classification.license_code
+            for summary in result.checkout_summaries
+            if summary.classification is not None and summary.classification.license_code is not None
+        }
+    )
+    return {
+        "schema_kind": _WINDOW_SCHEMA_KIND,
+        "schema_version": _WINDOW_SCHEMA_VERSION,
+        "campaign_run_id": result.campaign_run_id,
+        "batch_id": result.batch_id,
+        "case_id": result.case_id,
+        "work_unit_id": result.work_unit_id,
+        "scientific_config_digest": result.scientific_config_digest,
+        "slurm_job_id": result.job_id,
+        "hostname": result.hostname,
+        "window_started_at": result.window_started_at.astimezone(timezone.utc).isoformat(),
+        "window_ended_at": result.window_ended_at.astimezone(timezone.utc).isoformat(),
+        "configured_window_seconds": result.configured_window_seconds,
+        "realised_window_seconds": result.realised_window_seconds,
+        "checkout_attempt_count": len(result.checkout_summaries),
+        "checkout_capacity_failure_count": sum(summary.classification is not None for summary in result.checkout_summaries),
+        "observed_features": features,
+        "observed_error_codes": error_codes,
+        "first_checkout_started_at": None
+        if not result.checkout_summaries
+        else result.checkout_summaries[0].started_at.astimezone(timezone.utc).isoformat(),
+        "last_checkout_ended_at": None
+        if not result.checkout_summaries
+        else result.checkout_summaries[-1].ended_at.astimezone(timezone.utc).isoformat(),
+        "solver_progress_started": result.solver_progress_started,
+        "outcome": result.outcome,
+        "reason": result.reason,
+        "next_controller_retry_basis": result.next_controller_retry_basis,
+        "controller_retry_increment": result.outcome == "window_exhausted",
+        "recent_checkout_summaries": [_checkout_summary_payload(summary) for summary in summaries],
+    }
+
+
+def _validate_checkout_summary_payload(payload: object) -> dict[str, Any]:
+    """Validate one bounded recent checkout summary from persisted evidence."""
+    keys = {
+        "checkout_index",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "process_exit_code",
+        "classification",
+        "feature",
+        "error_code",
+        "solver_progress_started",
+        "raw_excerpt_sha256",
+        "raw_excerpt",
+    }
+    if not isinstance(payload, dict) or set(payload) != keys:
+        message = "In-allocation checkout summary is malformed."
+        raise ValueError(message)
+    index = payload["checkout_index"]
+    duration = payload["duration_seconds"]
+    exit_code = payload["process_exit_code"]
+    started = _parse_timestamp(payload["started_at"], label="in-allocation checkout start")
+    ended = _parse_timestamp(payload["ended_at"], label="in-allocation checkout end")
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 1
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not 0.0 <= float(duration) < float("inf")
+        or ended < started
+        or (exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)))
+        or not isinstance(payload["solver_progress_started"], bool)
+    ):
+        message = "In-allocation checkout timing or process evidence is malformed."
+        raise ValueError(message)
+    classification = payload["classification"]
+    feature = payload["feature"]
+    error_code = payload["error_code"]
+    excerpt_digest = payload["raw_excerpt_sha256"]
+    excerpt = payload["raw_excerpt"]
+    if classification is None:
+        if any(value is not None for value in (feature, error_code, excerpt_digest, excerpt)):
+            message = "Unclassified in-allocation checkout retains inconsistent license evidence."
+            raise ValueError(message)
+    elif (
+        classification != TEMPORARY_LICENSE_CAPACITY
+        or not isinstance(feature, str)
+        or not feature
+        or (error_code is not None and not isinstance(error_code, str))
+        or not isinstance(excerpt, str)
+        or not excerpt
+        or len(excerpt) > _MAX_CHECKOUT_EXCERPT_CHARACTERS
+        or not isinstance(excerpt_digest, str)
+        or _SCIENTIFIC_DIGEST_PATTERN.fullmatch(excerpt_digest) is None
+        or hashlib.sha256(excerpt.encode()).hexdigest() != excerpt_digest
+        or payload["solver_progress_started"] is True
+    ):
+        message = "Temporary-capacity checkout summary is malformed."
+        raise ValueError(message)
+    return payload
+
+
+def load_in_allocation_license_window(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    campaign_run_id: str,
+    job_id: str,
+    storage_root: Path | str | None,
+) -> dict[str, Any] | None:
+    """Load one immutable allocation-window receipt for its exact Slurm job."""
+    if _JOB_ID_PATTERN.fullmatch(job_id) is None:
+        message = "In-allocation license window lookup requires one numeric Slurm job ID."
+        raise ValueError(message)
+    case_id = config.case_id(case_index)
+    directory = in_allocation_license_window_directory(
+        campaign_run_id,
+        config.batch_id,
+        case_id,
+        storage_root=storage_root,
+    )
+    if not directory.exists():
+        return None
+    if directory.is_symlink() or not directory.is_dir():
+        message = f"In-allocation license window directory is unsafe: {directory}"
+        raise ValueError(message)
+    path = directory / f"{job_id}.json"
+    entries = tuple(directory.iterdir())
+    if any(
+        entry.is_symlink() or not entry.is_file() or _JOB_ID_PATTERN.fullmatch(entry.stem) is None or entry.suffix != ".json" for entry in entries
+    ):
+        message = f"In-allocation license window directory contains unexpected entries: {directory}"
+        raise ValueError(message)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Could not load in-allocation license window evidence: {path}"
+        raise ValueError(message) from error
+    required = {
+        "schema_kind",
+        "schema_version",
+        "campaign_run_id",
+        "batch_id",
+        "case_id",
+        "work_unit_id",
+        "scientific_config_digest",
+        "slurm_job_id",
+        "hostname",
+        "window_started_at",
+        "window_ended_at",
+        "configured_window_seconds",
+        "realised_window_seconds",
+        "checkout_attempt_count",
+        "checkout_capacity_failure_count",
+        "observed_features",
+        "observed_error_codes",
+        "first_checkout_started_at",
+        "last_checkout_ended_at",
+        "solver_progress_started",
+        "outcome",
+        "reason",
+        "next_controller_retry_basis",
+        "controller_retry_increment",
+        "recent_checkout_summaries",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        message = f"In-allocation license window evidence is malformed for {config.batch_id}/{case_id}."
+        raise ValueError(message)
+    if (
+        payload["schema_kind"] != _WINDOW_SCHEMA_KIND
+        or payload["schema_version"] != _WINDOW_SCHEMA_VERSION
+        or payload["campaign_run_id"] != campaign_run_id
+        or payload["batch_id"] != config.batch_id
+        or payload["case_id"] != case_id
+        or payload["work_unit_id"] != f"{config.batch_id}/{case_id}"
+        or payload["scientific_config_digest"] != config.scientific_config_digest
+        or payload["slurm_job_id"] != job_id
+        or not isinstance(payload["hostname"], str)
+        or not payload["hostname"]
+        or payload["outcome"] not in _WINDOW_OUTCOMES
+        or not isinstance(payload["solver_progress_started"], bool)
+        or not isinstance(payload["controller_retry_increment"], bool)
+    ):
+        message = f"In-allocation license window identity is malformed for {config.batch_id}/{case_id}."
+        raise ValueError(message)
+    start = _parse_timestamp(payload["window_started_at"], label="in-allocation license window start")
+    end = _parse_timestamp(payload["window_ended_at"], label="in-allocation license window end")
+    if end < start:
+        message = f"In-allocation license window timestamps are inconsistent for {case_id}."
+        raise ValueError(message)
+    numeric_keys = ("configured_window_seconds", "realised_window_seconds")
+    if any(isinstance(payload[key], bool) or not isinstance(payload[key], (int, float)) or float(payload[key]) < 0.0 for key in numeric_keys):
+        message = f"In-allocation license window durations are malformed for {case_id}."
+        raise ValueError(message)
+    expected_window = config.execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"]["maximum_window_seconds"]
+    if float(payload["configured_window_seconds"]) != float(expected_window):
+        message = f"In-allocation license window policy is inconsistent for {case_id}."
+        raise ValueError(message)
+    summaries = payload["recent_checkout_summaries"]
+    attempts = payload["checkout_attempt_count"]
+    failures = payload["checkout_capacity_failure_count"]
+    features = payload["observed_features"]
+    error_codes = payload["observed_error_codes"]
+    if (
+        isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 1
+        or isinstance(failures, bool)
+        or not isinstance(failures, int)
+        or not 0 <= failures <= attempts
+        or not isinstance(summaries, list)
+        or len(summaries) != min(attempts, _MAX_RECENT_CHECKOUT_SUMMARIES)
+        or not isinstance(features, list)
+        or features != sorted(set(features))
+        or not all(isinstance(value, str) and value for value in features)
+        or not isinstance(error_codes, list)
+        or error_codes != sorted(set(error_codes))
+        or not all(isinstance(value, str) and value for value in error_codes)
+    ):
+        message = f"In-allocation checkout counts or aggregates are malformed for {case_id}."
+        raise ValueError(message)
+    validated_summaries = [_validate_checkout_summary_payload(summary) for summary in summaries]
+    expected_indexes = list(range(attempts - len(validated_summaries) + 1, attempts + 1))
+    if [summary["checkout_index"] for summary in validated_summaries] != expected_indexes:
+        message = f"In-allocation recent checkout ordering is malformed for {case_id}."
+        raise ValueError(message)
+    first_checkout = _parse_timestamp(payload["first_checkout_started_at"], label="first in-allocation checkout start")
+    last_checkout = _parse_timestamp(payload["last_checkout_ended_at"], label="last in-allocation checkout end")
+    if last_checkout < first_checkout or first_checkout < start or last_checkout > end:
+        message = f"In-allocation checkout timestamps escape their window for {case_id}."
+        raise ValueError(message)
+    exhausted = payload["outcome"] == "window_exhausted"
+    if (
+        exhausted != payload["controller_retry_increment"]
+        or (
+            exhausted
+            and (
+                failures != attempts
+                or any(summary["classification"] != TEMPORARY_LICENSE_CAPACITY for summary in validated_summaries)
+                or payload["solver_progress_started"]
+                or payload["reason"] != "in_allocation_license_window_exhausted"
+                or payload["next_controller_retry_basis"] != "controller_temporary_license_retry"
+            )
+        )
+        or (
+            not exhausted
+            and (
+                failures >= attempts
+                or validated_summaries[-1]["solver_progress_started"] is not True
+                or not payload["solver_progress_started"]
+                or payload["reason"] != "solver_progress_started"
+                or payload["next_controller_retry_basis"] is not None
+            )
+        )
+    ):
+        message = f"In-allocation license window outcome is inconsistent for {case_id}."
+        raise ValueError(message)
+    return payload
+
+
+def record_in_allocation_license_window(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    result: InAllocationLicenseWindowResult,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Append one immutable per-numeric-job allocation-window receipt."""
+    case_id = config.case_id(case_index)
+    if result.batch_id != config.batch_id or result.case_id != case_id or result.scientific_config_digest != config.scientific_config_digest:
+        message = "In-allocation license window result does not bind the configured case."
+        raise ValueError(message)
+    directory = in_allocation_license_window_directory(
+        result.campaign_run_id,
+        result.batch_id,
+        result.case_id,
+        storage_root=storage_root,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        message = f"In-allocation license window directory is unsafe: {directory}"
+        raise ValueError(message)
+    path = directory / f"{result.job_id}.json"
+    payload = _window_payload(result)
+    serialized = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        message = f"In-allocation license window receipt already exists for Slurm job {result.job_id}."
+        raise FileExistsError(message) from None
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path

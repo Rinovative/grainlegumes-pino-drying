@@ -91,6 +91,19 @@ fail() {
   exit "${status}"
 }
 
+fail_preserving_interrupt() {
+  local observed_status="$1" failure_status="$2"
+  shift 2
+  (( observed_status != 130 )) || exit 130
+  fail "${failure_status}" "$@"
+}
+
+SSH_TRANSPORT_HELPER="${SCRIPT_DIRECTORY}/generation_ssh_transport.sh"
+[[ -f "${SSH_TRANSPORT_HELPER}" && ! -L "${SSH_TRANSPORT_HELPER}" ]] ||
+  fail 1 "Generation SSH transport helper is missing or unsafe: ${SSH_TRANSPORT_HELPER}"
+# shellcheck source=scripts/generation_ssh_transport.sh
+source "${SSH_TRANSPORT_HELPER}"
+
 generation_console_stage() {
   local index="$1" total="$2" label="$3" status="$4" detail="${5:-}"
   local decorated="${label} "
@@ -408,19 +421,11 @@ collection_mode_argument() {
 }
 
 remote_bash() {
-  local host="$1"
-  shift
-  local command="bash -l -s --"
-  local argument quoted
-  for argument in "$@"; do
-    printf -v quoted '%q' "${argument}"
-    command+=" ${quoted}"
-  done
-  ssh -o BatchMode=yes -- "${host}" "${command}"
+  remote_bash_once "$@"
 }
 
 read_remote_home() {
-  remote_bash "$1" <<'REMOTE'
+  remote_bash_retryable "remote HOME resolution" "$1" <<'REMOTE'
 set -euo pipefail
 printf '%s\n' "${HOME}"
 REMOTE
@@ -430,7 +435,8 @@ resolve_remote_layout() {
   ensure_execution_bootstrap
   require_command ssh "CPU login control"
   validate_host "${CPU_HOST}"
-  REMOTE_HOME="$(read_remote_home "${CPU_HOST}")" || fail 1 "Could not resolve remote HOME."
+  REMOTE_HOME="$(read_remote_home "${CPU_HOST}")" ||
+    fail_preserving_interrupt "$?" 1 "Could not resolve remote HOME."
   validate_path "remote HOME" "${REMOTE_HOME}"
   [[ -n "${REMOTE_ROOT}" ]] || REMOTE_ROOT="${REMOTE_HOME}/grainlegumes-generation"
   validate_path "remote root" "${REMOTE_ROOT}"
@@ -1025,7 +1031,7 @@ verify_remote_setup() {
     "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
     "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${PYTHON_MODULE}" "${PYTHON_EXECUTABLE}"
   [[ "${REMOTE_SETUP_IDENTITY}" != "${setup_identity}" ]] || return 0
-  if remote_bash "${CPU_HOST}" \
+  if remote_bash_retryable "remote setup verification" "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${PYTHON_MODULE}" \
     "${PYTHON_EXECUTABLE}" <<'REMOTE'
@@ -1158,7 +1164,7 @@ technical_smoke_evidence_status_cpu() {
   resolve_remote_layout
   local remote_campaign
   remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
-  remote_bash "${CPU_HOST}" \
+  remote_bash_retryable "technical-smoke evidence status" "${CPU_HOST}" \
     "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
     "${remote_campaign}" "${comsol_version_output}" "${PYTHON_MODULE}" <<'REMOTE'
 set -euo pipefail
@@ -1174,7 +1180,8 @@ REMOTE
 
 
 remote_comsol_version() {
-  remote_bash "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
+  remote_bash_retryable "remote COMSOL version query" \
+    "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
 set -euo pipefail
 comsol_module="$1"; comsol_executable="$2"
 if ! module load "${comsol_module}"; then
@@ -1229,7 +1236,8 @@ fi
 REMOTE
   technical_smoke_evidence_status_cpu \
     "${campaign_argument}" "${comsol_version_output}" >/dev/null ||
-    fail 2 "CPU-side technical-smoke evidence is missing, stale, or incomplete after transfer."
+    fail_preserving_interrupt "$?" 2 \
+      "CPU-side technical-smoke evidence is missing, stale, or incomplete after transfer."
 }
 
 finalize_smoke_runs() {
@@ -1307,11 +1315,20 @@ launch_campaign() {
   printf 'campaign_run_id=%s\n' "${RUN_ID}"
 }
 
-remote_cli() {
+_remote_cli_with_transport() {
+  local transport_kind="$1" operation="$2"
+  shift 2
   verify_remote_setup_for_output || return $?
   validate_commit "${REQUESTED_COMMIT}"
-  remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${PYTHON_MODULE}" "$@" <<'REMOTE'
+  local -a transport=(remote_bash)
+  case "${transport_kind}" in
+    once) ;;
+    retryable) transport=(remote_bash_retryable "${operation}") ;;
+    *) fail 2 "Unsupported remote CLI transport kind: ${transport_kind}" ;;
+  esac
+  "${transport[@]}" "${CPU_HOST}" "${REMOTE_REPOSITORY}" \
+    "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${REQUESTED_COMMIT}" \
+    "${PYTHON_MODULE}" "$@" <<'REMOTE'
 set -euo pipefail
 repository="$1"; storage="$2"; venv="$3"; commit="$4"; python_module="$5"
 shift 5
@@ -1324,8 +1341,19 @@ cd "${repository}"
 REMOTE
 }
 
+remote_cli() {
+  _remote_cli_with_transport once "" "$@"
+}
+
+remote_cli_retryable() {
+  local operation="$1"
+  shift
+  _remote_cli_with_transport retryable "${operation}" "$@"
+}
+
 remote_transfer_plan() {
-  remote_cli campaign-transfer-plan "${RUN_ID}" --format tsv --storage-root "${REMOTE_STORAGE_ROOT}"
+  remote_cli_retryable "campaign transfer-plan read" campaign-transfer-plan \
+    "${RUN_ID}" --format tsv --storage-root "${REMOTE_STORAGE_ROOT}"
 }
 
 resolve_local_storage() {
@@ -1399,8 +1427,13 @@ gpu_publication_is_valid() {
 
 repair_existing_campaign_publication() {
   local authority
-  authority="$(remote_cli campaign-transfer-authority "${RUN_ID}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}")" || return 1
+  authority="$(remote_cli_retryable "campaign transfer-authority read" \
+    campaign-transfer-authority "${RUN_ID}" \
+    --storage-root "${REMOTE_STORAGE_ROOT}")" || {
+    local status=$?
+    (( status != 130 )) || exit 130
+    return 1
+  }
   local_cli repair-transferred-campaign "${RUN_ID}" \
     --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}" \
     --authority-json "${authority}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1
@@ -1425,7 +1458,8 @@ collect_campaign() {
       fail 1 "Could not record exact pre-cleanup CPU pilot storage."
   fi
   local plan
-  plan="$(remote_transfer_plan)" || fail 1 "Remote campaign is not terminally valid."
+  plan="$(remote_transfer_plan)" ||
+    fail_preserving_interrupt "$?" 1 "Remote campaign is not terminally valid."
   local -a directories=()
   local kind field2 field3 field4 field5 field6 field7 extra
   while IFS=$'\t' read -r kind field2 field3 field4 field5 field6 field7 extra; do
@@ -1508,13 +1542,15 @@ build_datasets() {
 }
 
 remote_campaign_monitor() {
-  remote_cli campaign-status "${RUN_ID}" --format monitor --max-active-cases 8 \
+  remote_cli_retryable "campaign status read" campaign-status \
+    "${RUN_ID}" --format monitor --max-active-cases 8 \
     --storage-root "${REMOTE_STORAGE_ROOT}"
 }
 
 read_remote_campaign_monitor() {
   local output header kind state state_signature progress_signature extra
-  output="$(remote_campaign_monitor)" || fail 1 "Could not reconstruct campaign case status."
+  output="$(remote_campaign_monitor)" ||
+    fail_preserving_interrupt "$?" 1 "Could not reconstruct campaign case status."
   [[ "${output}" == *$'\n'* ]] || fail 1 "Malformed campaign monitor output."
   header="${output%%$'\n'*}"
   IFS=$'\t' read -r kind state state_signature progress_signature extra <<< "${header}"
@@ -1528,7 +1564,8 @@ read_remote_campaign_monitor() {
 }
 
 remote_source_status_tsv() {
-  remote_cli campaign-source-status "${RUN_ID}" --query-scheduler --format tsv \
+  remote_cli_retryable "campaign source-status read" campaign-source-status \
+    "${RUN_ID}" --query-scheduler --format tsv \
     --storage-root "${REMOTE_STORAGE_ROOT}"
 }
 
@@ -1672,13 +1709,13 @@ storage_status_report() {
   fi
   if [[ -n "${RUN_ID}" ]]; then
     printf 'Campaign status:\n'
-    remote_cli campaign-status "${RUN_ID}" --format summary \
-      --storage-root "${REMOTE_STORAGE_ROOT}"
+    remote_cli_retryable "campaign status read" campaign-status \
+      "${RUN_ID}" --format summary --storage-root "${REMOTE_STORAGE_ROOT}"
   fi
   printf 'GPU storage status:\n'
   local_cli "${local_arguments[@]}"
   printf 'CPU storage status:\n'
-  remote_cli "${remote_arguments[@]}"
+  remote_cli_retryable "CPU storage-status read" "${remote_arguments[@]}"
   if [[ -n "${RUN_ID}" ]]; then
     local_cli validate-pilot-check "${RUN_ID}" --if-present --format summary \
       --storage-root "${LOCAL_STORAGE_ROOT}"
@@ -1886,9 +1923,10 @@ collect_core_benchmark() {
     return
   fi
   local plan kind plan_run plan_commit relative inventory_sha file_count size_bytes extra staging receipt
-  plan="$(remote_cli core-benchmark-transfer-plan "${RUN_ID}" --format tsv \
+  plan="$(remote_cli_retryable "benchmark transfer-plan read" \
+    core-benchmark-transfer-plan "${RUN_ID}" --format tsv \
     --storage-root "${REMOTE_STORAGE_ROOT}")" ||
-    fail 1 "Remote core benchmark is not terminally valid."
+    fail_preserving_interrupt "$?" 1 "Remote core benchmark is not terminally valid."
   IFS=$'\t' read -r kind plan_run plan_commit relative inventory_sha file_count size_bytes extra <<< "${plan}"
   [[ "${kind}" == benchmark && "${plan_run}" == "${RUN_ID}" \
     && "${plan_commit}" == "${REQUESTED_COMMIT}" \
@@ -2080,7 +2118,8 @@ monitor_generation_units() {
   while true; do
     case "$monitor_kind" in
       campaign)
-        remote_cli resume-campaign "$RUN_ID"           --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+        remote_cli_retryable "campaign resume reconciliation" \
+          resume-campaign "$RUN_ID" --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
         read_remote_campaign_monitor
         read_remote_source_status
         local campaign_detail
@@ -2088,7 +2127,9 @@ monitor_generation_units() {
         generation_console_progress units 5 9 "Work units" RUNNING           "$REMOTE_CAMPAIGN_STATE_SIGNATURE|$REMOTE_SOURCE_STATE|$REMOTE_SOURCE_ACTIVE"           "$campaign_detail"           "$REMOTE_CAMPAIGN_PROGRESS_SIGNATURE|$CPU_BYTES_RETAINED"
         case "$REMOTE_CAMPAIGN_STATE" in
           successful|transfer_complete)
-            remote_cli validate-campaign-terminal "$RUN_ID"               --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+            remote_cli_retryable "campaign terminal validation" \
+              validate-campaign-terminal "$RUN_ID" \
+              --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
             disarm_campaign_interrupt
             return
             ;;
@@ -2113,9 +2154,11 @@ monitor_generation_units() {
         remote_cli resume-core-benchmark "$RUN_ID" \
           --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
         local output header state state_signature progress_signature detail extra
-        output="$(remote_cli core-benchmark-status "$RUN_ID" \
+        output="$(remote_cli_retryable "benchmark status read" \
+          core-benchmark-status "$RUN_ID" \
           --storage-root "$REMOTE_STORAGE_ROOT" --format monitor)" ||
-          fail 1 "Could not reconstruct benchmark work-unit status."
+          fail_preserving_interrupt "$?" 1 \
+            "Could not reconstruct benchmark work-unit status."
         header="${output%%$'\n'*}"
         detail="${output#*$'\n'}"
         IFS=$'\t' read -r _monitor_record state state_signature progress_signature extra <<< "$header"
@@ -2302,8 +2345,11 @@ print("\t".join((
 
 benchmark_deferred_report() {
   local output record source_state bytes extra
-  output="$(remote_cli core-benchmark-source-status "$RUN_ID"     --format tsv --storage-root "$REMOTE_STORAGE_ROOT")" ||
-    fail 1 "Could not reconstruct deferred benchmark source state."
+  output="$(remote_cli_retryable "benchmark source-status read" \
+    core-benchmark-source-status "$RUN_ID" --format tsv \
+    --storage-root "$REMOTE_STORAGE_ROOT")" ||
+    fail_preserving_interrupt "$?" 1 \
+      "Could not reconstruct deferred benchmark source state."
   IFS=$'\t' read -r _kind _run _run_state source_state bytes _eligibility _active extra <<< "$output"
   [[ -z "${extra:-}" ]] || fail 1 "Malformed deferred benchmark source state."
   printf 'benchmark_run_id=%s\nstate=awaiting_collection\nsource_state=%s\nretained_cpu_bytes=%s\n'     "$RUN_ID" "$source_state" "$bytes"
@@ -2752,10 +2798,11 @@ benchmark_status_report() {
   resolve_local_python
   resolve_remote_layout
   printf 'Benchmark status:\n'
-  remote_cli core-benchmark-status "${RUN_ID}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}" --format summary
+  remote_cli_retryable "benchmark status read" core-benchmark-status \
+    "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}" --format summary
   printf 'CPU source status:\n'
-  remote_cli core-benchmark-source-status "${RUN_ID}" \
+  remote_cli_retryable "benchmark source-status read" \
+    core-benchmark-source-status "${RUN_ID}" \
     --storage-root "${REMOTE_STORAGE_ROOT}"
   if local_cli validate-core-benchmark "${RUN_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then

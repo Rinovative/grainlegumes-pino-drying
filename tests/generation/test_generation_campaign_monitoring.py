@@ -242,7 +242,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
             "pending": 1,
             "starting": 0,
             "license_waiting": 1,
-            "retrying": 0,
+            "acquiring_license": 0,
         },
     }
     state_with_progress = status["campaign_state"]
@@ -485,15 +485,8 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
                 "pending": 0,
                 "starting": 0,
                 "license_waiting": 2,
-                "retrying": 0,
+                "acquiring_license": 0,
             },
-        },
-        "license_retry_launch_pacing": {
-            "active": True,
-            "spacing_seconds": 7.5,
-            "last_launch_at": "2026-08-20T00:00:00+00:00",
-            "next_launch_at": "2026-08-20T00:00:07.500000+00:00",
-            "launch_allowed": False,
         },
         "cases": [],
     }
@@ -506,13 +499,70 @@ def test_human_summary_exposes_pinned_execution_resources() -> None:
     assert "max_admission_cases=2" in rendered
     assert "max_running_cases=3" in rendered
     assert "Admission: 2/2" in rendered
-    assert "pending=0  starting=0  license_waiting=2  retrying=0" in rendered
-    assert "License retry:" in rendered
-    assert "next_launch=" in rendered
-    assert "stagger=7.5 s" in rendered
+    assert "pending=0  starting=0  acquiring_license=0  license_waiting=2" in rendered
+    assert "stagger=" not in rendered
 
     status["submission_config"]["max_running_cases"] = None
     assert "max_running_cases=unlimited" in status_service.format_campaign_status_summary(status)
+
+
+def test_human_summary_compacts_active_and_exhausted_license_windows() -> None:
+    """Show bounded operational counts without retained FlexNet excerpts."""
+    status = {
+        "campaign_run_id": "license-windows__0123456789abcdef",
+        "campaign_state": "running",
+        "admission": {
+            "count": 2,
+            "maximum": 2,
+            "components": {
+                "pending": 0,
+                "starting": 0,
+                "acquiring_license": 1,
+                "license_waiting": 1,
+            },
+        },
+        "cases": [
+            {
+                "case_id": "case_0001",
+                "batch_name": "transient_drying__lentil__natural",
+                "state": "running",
+                "runtime_progress": {
+                    "availability": "available",
+                    "phase": "acquiring_comsol_license",
+                    "license_window_seconds": 47.0,
+                    "license_window_limit_seconds": 120.0,
+                    "license_checkout_attempt_count": 4,
+                    "last_license_result": "temporary_license_capacity",
+                },
+            },
+            {
+                "case_id": "case_0002",
+                "batch_name": "transient_drying__lentil__natural",
+                "state": "license_blocked",
+                "reason": "in_allocation_license_window_exhausted",
+                "in_allocation_license_window": {
+                    "realised_window_seconds": 120.3,
+                    "checkout_attempt_count": 8,
+                    "raw_excerpt": "Licensed number of users already reached",
+                },
+                "temporary_license_retry": {
+                    "retry_count": 2,
+                    "next_retry_at": "2026-08-20T00:00:15+00:00",
+                    "cumulative_wait_seconds": 45.0,
+                },
+            },
+        ],
+    }
+
+    rendered = status_service.format_campaign_status_summary(status)
+
+    assert "phase=acquiring_comsol_license" in rendered
+    assert "window=47 s / 120 s" in rendered
+    assert "checkouts=4" in rendered
+    assert "reason=in_allocation_license_window_exhausted" in rendered
+    assert "window=120 s  checkouts=8" in rendered
+    assert "Licensed number of users" not in rendered
+    assert "{" not in rendered
 
 
 def test_human_summary_keeps_license_capacity_out_of_failed_cases() -> None:
@@ -768,7 +818,7 @@ def test_admission_waiting_is_distinct_from_never_started_in_status() -> None:
 
     rendered = status_service.format_campaign_status_summary(
         {
-            "campaign_run_id": "paced-admission",
+            "campaign_run_id": "reserved-admission",
             "campaign_state": "license_blocked",
             "cases": [waiting, unsent],
         }

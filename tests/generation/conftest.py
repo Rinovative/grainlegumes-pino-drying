@@ -191,6 +191,9 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         license_initial_delay_seconds: float = 2.0,
         license_maximum_delay_seconds: float = 5.0,
         license_maximum_wait_seconds: float = 12.0,
+        in_allocation_retry_enabled: bool = True,
+        in_allocation_maximum_window_seconds: float = 0.08,
+        in_allocation_pause_after_capacity_failure_seconds: float = 0.01,
         grid_overrides: Mapping[str, int | float] | None = None,
         campaign_purpose: str = "technical_runtime_smoke",
     ) -> tuple[Path, Path]:
@@ -237,6 +240,11 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                     "initial_delay_seconds": license_initial_delay_seconds,
                     "maximum_delay_seconds": license_maximum_delay_seconds,
                     "maximum_wait_seconds": license_maximum_wait_seconds,
+                    "in_allocation_retry": {
+                        "enabled": in_allocation_retry_enabled,
+                        "maximum_window_seconds": in_allocation_maximum_window_seconds,
+                        "pause_after_capacity_failure_seconds": in_allocation_pause_after_capacity_failure_seconds,
+                    },
                 },
             }
         )
@@ -456,9 +464,25 @@ if sys.argv[1:] == ["-version"]:
     raise SystemExit(0)
 
 mode = os.environ.get("FAKE_COMSOL_MODE", "success")
+if mode == "license_capacity_twice_then_success":
+    counter_path = pathlib.Path("runtime/fake_license_checkout_count")
+    previous = int(counter_path.read_text(encoding="utf-8")) if counter_path.exists() else 0
+    counter_path.write_text(str(previous + 1), encoding="utf-8")
+    mode = "license_capacity" if previous < 2 else "success_after_capacity"
 if mode == "failure":
     print("synthetic failure", file=sys.stderr)
     raise SystemExit(7)
+if mode == "license_capacity_delayed":
+    update_tracker(1)
+    try:
+        wait_for_expected_starts()
+        print("Could not obtain license for 'Brinkman Equations (br)'.")
+        print("License error: -4.", file=sys.stderr)
+        print("Licensed number of users already reached.", file=sys.stderr)
+        time.sleep(0.1)
+    finally:
+        update_tracker(-1)
+    raise SystemExit(0)
 if mode in {"license_capacity", "success_with_license_warning"}:
     print("Could not obtain license for 'Brinkman Equations (br)'.")
     print("Required product: CFD Module.")
@@ -468,6 +492,8 @@ if mode in {"license_capacity", "success_with_license_warning"}:
     print("FlexNet Licensing error:-4,132", file=sys.stderr)
     if mode == "license_capacity":
         raise SystemExit(0)
+if mode == "success_after_capacity":
+    print("Time-Dependent Solver 1 in Transient Drying", flush=True)
 update_tracker(1)
 try:
     wait_for_expected_starts()

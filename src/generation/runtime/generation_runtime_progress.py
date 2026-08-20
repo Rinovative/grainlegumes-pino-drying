@@ -41,6 +41,7 @@ _TERMINAL_PHASES: Final = frozenset({"completed", "failed"})
 _PHASES: Final = frozenset(
     {
         "preparing",
+        "acquiring_comsol_license",
         "starting_solver",
         "stationary_airflow",
         "transient_drying",
@@ -67,6 +68,10 @@ _OPTIONAL_KEYS: Final = (
     "nonlinear_failures",
     "nonlinear_iteration",
     "last_solver_log_update_at",
+    "license_window_seconds",
+    "license_window_limit_seconds",
+    "license_checkout_attempt_count",
+    "last_license_result",
 )
 _COMMON_RECORD_KEYS: Final = frozenset(
     {
@@ -372,6 +377,12 @@ class RuntimeProgressReporter:
         self._started_at = started_at or _utc_now()
         self._last_write_at: datetime | None = None
         self._last_signature: str | None = None
+        self._license_acquisition: dict[str, Any] = {
+            "license_window_seconds": None,
+            "license_window_limit_seconds": None,
+            "license_checkout_attempt_count": None,
+            "last_license_result": None,
+        }
 
     @property
     def path(self) -> Path:
@@ -385,6 +396,17 @@ class RuntimeProgressReporter:
             message = "Runtime progress reporter stdout source is already bound."
             raise ValueError(message)
         self._stdout_path = candidate
+
+    def reset_stdout(self, path: Path | str) -> None:
+        """Reset parsing after the same owned stdout file is safely truncated."""
+        candidate = Path(path)
+        if self._stdout_path is not None and self._stdout_path != candidate:
+            message = "Runtime progress reporter stdout source cannot change between checkout attempts."
+            raise ValueError(message)
+        self._stdout_path = candidate
+        self._offset = 0
+        self._trailing = b""
+        self._parser = ComsolProgressParser()
 
     @classmethod
     def create(
@@ -453,7 +475,7 @@ class RuntimeProgressReporter:
             "terminal": terminal,
         }
         for key in _OPTIONAL_KEYS:
-            payload[key] = parsed.get(key)
+            payload[key] = self._license_acquisition.get(key, parsed.get(key))
         return payload
 
     def _write(self, payload: Mapping[str, Any], *, force: bool, now: datetime) -> bool:
@@ -476,6 +498,33 @@ class RuntimeProgressReporter:
         self._last_signature = signature
         self._last_write_at = now
         return True
+
+    def update_license_acquisition(
+        self,
+        *,
+        window_seconds: float,
+        window_limit_seconds: float,
+        checkout_attempt_count: int,
+        last_result: str | None,
+        force: bool = False,
+    ) -> bool:
+        """Persist one compact in-allocation license-acquisition snapshot."""
+        if not _is_nonnegative_number(window_seconds) or not _is_nonnegative_number(window_limit_seconds):
+            message = "License acquisition window values must be finite non-negative numbers."
+            raise ValueError(message)
+        if not _is_nonnegative_integer(checkout_attempt_count):
+            message = "License acquisition checkout count must be a non-negative integer."
+            raise ValueError(message)
+        if last_result not in {None, "temporary_license_capacity"}:
+            message = "License acquisition last result is unsupported."
+            raise ValueError(message)
+        self._license_acquisition = {
+            "license_window_seconds": float(window_seconds),
+            "license_window_limit_seconds": float(window_limit_seconds),
+            "license_checkout_attempt_count": checkout_attempt_count,
+            "last_license_result": last_result,
+        }
+        return self.update(phase="acquiring_comsol_license", force=force)
 
     def update(self, *, phase: str, terminal: bool = False, force: bool = False) -> bool:
         """Consume appended stdout and best-effort persist current progress."""
@@ -614,8 +663,14 @@ def _payload_is_supported(payload: object, expected: Mapping[str, Any]) -> bool:
         "time_failures",
         "nonlinear_failures",
         "nonlinear_iteration",
+        "license_checkout_attempt_count",
     )
-    number_keys = ("simulated_time_seconds", "step_size_seconds")
+    number_keys = (
+        "simulated_time_seconds",
+        "step_size_seconds",
+        "license_window_seconds",
+        "license_window_limit_seconds",
+    )
     stage = payload.get("comsol_progress_percent")
     section = payload.get("comsol_section")
     log_updated_at = payload.get("last_solver_log_update_at")
@@ -636,6 +691,7 @@ def _payload_is_supported(payload: object, expected: Mapping[str, Any]) -> bool:
         and all(payload[key] is None or _is_nonnegative_integer(payload[key]) for key in integer_keys)
         and all(payload[key] is None or _is_nonnegative_number(payload[key]) for key in number_keys)
         and (log_updated_at is None or _parse_timestamp(log_updated_at) is not None)
+        and payload.get("last_license_result") in {None, "temporary_license_capacity"}
     )
 
 

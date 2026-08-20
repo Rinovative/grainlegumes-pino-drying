@@ -183,6 +183,46 @@ tmux attach-session -t "$TMUX_SESSION"
 Inside `tmux`, press Ctrl+B and then D to detach. A host reboot ends the
 controller but not durable run evidence; invoke the same config again.
 
+### Transient SSH interruptions
+
+The bare-host controller depends on non-interactive SSH from `hpc115` to the
+configured CPU cluster. Every connection retains `BatchMode=yes`; Generation
+never falls back to a password prompt. No user `~/.ssh/config` change,
+ControlMaster, control socket, or permanently running SSH process is required.
+
+Safe remote control reads automatically tolerate a bounded SSH transport or
+authentication interruption. The first attempt is immediate, followed by at
+most four retries after 5, 15, 30, and 60 seconds. Thus one logical operation
+has at most five attempts and 110 seconds of retry waiting. Retry requires SSH
+status 255 plus an explicitly recognized transport diagnostic, such as a
+permission denial, timeout, reset, closed/refused connection, route or name
+resolution failure, broken pipe, or key-exchange interruption. Host-key
+changes, unsafe SSH configuration or file permissions, and ordinary remote
+command failures are not retried.
+
+The retry scope is explicit. It includes remote HOME resolution, setup and
+version verification, campaign and benchmark status/source-status reads,
+terminal and transfer-plan reads, and campaign resume reconciliation. Campaign
+resume is durable and submission-deduplicated. Benchmark resume, initial
+submission, cancellation, cleanup/source deletion, transfer publication,
+finalization, and other remotely mutating operations remain one-shot because a
+lost acknowledgement could make blind replay ambiguous.
+
+A retry replays the same buffered remote script and positional arguments inside
+the same logical monitoring operation. It does not advance the regular poll,
+query unrelated scheduler state, submit a new campaign, consume admission,
+write workflow-failure evidence, or cancel CPU-side Slurm jobs. Recovery
+continues the current foreground or background controller iteration. If all
+attempts fail, the normal failure report retains the exact run identity, CPU
+source evidence and bytes, and the same copy-ready config continuation command;
+active work is not cancelled. Restore permanent non-interactive SSH access
+before rerunning that command.
+
+`--defer-collection` controls whether host transfer and finalization run after
+CPU completion. It is not the SSH retry mechanism; the bounded transport policy
+applies equally with default collection, `--keep-cpu-source`, and
+`--defer-collection`.
+
 ## Airflow ID Dataset campaign
 
 `configs/generation/campaigns/steady_flow/id_dataset.yaml` is the only primary
@@ -374,66 +414,67 @@ slot. `max_running_cases: null` remains independent, so the admission limit is
 not a limit of two simultaneous solvers.
 
 For example, if A and B are both `license_blocked`, admission is 2/2 and C remains
-never-started even though no Slurm allocation is active. A and B retain those
-logical slots throughout backoff and may both retry independently; there is no
-separate probe limit. The controller orders due retries by `next_retry_at`, first
-blocked time, resolved campaign-plan order, and stable case identity, then paces
-their Slurm submissions through one campaign-level launch gate. The spacing is
-derived from the existing initial retry delay divided by the admission limit.
-With the maintained 15-second initial delay and two admission cases, the initial
-target is approximately 7.5 seconds. This is deterministic de-synchronization,
-not a real-time guarantee: controller polling and Slurm startup determine the
-observed cadence.
+never-started. When their controller backoffs expire, A and B may both enter Slurm
+PENDING, receive separate nodes, and search for licenses independently. There is
+no campaign launch stagger, one-probe gate, random jitter, or cross-node COMSOL
+launch mutex. The logical admission limit, rather than a process-launch lock,
+keeps the pre-solver population bounded at two.
 
-Each case still obeys its own 15-to-30-second retry backoff and is never launched
-before its durable `next_retry_at`. When both cases reach 30-second per-case
-backoff, two cases cannot sustain one attempt every 7.5 seconds indefinitely;
-the achievable average may be about one attempt every 15 seconds. The controller
-does not admit extra cases to increase retry frequency. It also applies the same
-gate to a fresh pre-solver launch while current strong temporary-capacity
-evidence remains active, without throttling unrelated campaigns, already-running
-solvers, or postprocessing replay.
+After Slurm allocates a node, the worker completes preflight and prepares its one
+isolated case workspace. It starts a monotonic acquisition window immediately
+before the first COMSOL subprocess launch; queue time, module loading, canonical
+input preparation, and workspace preparation are outside this window. The first
+checkout starts immediately. A completed checkout is repeated only when the
+authoritative classifier finds strong temporary-capacity evidence, solver
+progress has not started, and required exports are absent. Each such result is
+followed by the maintained five-second pause. No new checkout starts after the
+maintained 120-second deadline.
 
-A fresh case admitted while that gate is closed is recorded only as a durable
-controller-side admission reservation in the schema-version-1 campaign
-operational manifest. Status classifies this lifecycle as `admission_waiting`,
-never as `never_started`. It immediately consumes its one logical slot but remains
-outside Slurm until the gate opens, so restart cannot lose the admission decision
-and no node or CPU is retained merely for stagger waiting. This mutable field is
-excluded from scientific, Dataset, Generation, workflow, schedule, benchmark,
-case, and publication identities and their compatibility digests.
+Each retry overwrites only the worker-owned startup stdout and stderr files after
+strict checks prove that no solved model, status command, or export artifact was
+left behind. Canonical scientific inputs and the source model are prepared once.
+The immutable schema-version-1 allocation receipt retains aggregate counts and
+only the latest eight bounded checkout summaries; it does not retain model
+copies, input CSVs, exports, HDF5 files, or per-checkout workspaces.
 
-When job-bound evidence from the common progress parser proves A obtained a
-license and actual solver execution began, A immediately becomes ordinary
-running, admission becomes 1/2, and the controller may next admit C under the
-same pacing policy. If C then starts, D may be admitted. If B and D later become
-blocked, admission returns to 2/2 and E remains never-started. This progressively
-discovers available concurrency while preventing a campaign from accumulating
-many cases that all fail on temporary capacity. Increasing admission merely to
-create a large queue is not a substitute for license integration.
+When stdout proves solver execution has started, the worker publishes progress
+and the successful allocation receipt immediately. That same COMSOL process
+remains alive and continues through solved-model writing, export, conversion,
+validation, and publication. The controller therefore releases the logical
+admission slot at solver start rather than at case completion. Earlier
+capacity-only subprocess durations and pauses remain operational timing; they do
+not enter `comsol_process_seconds`, benchmark runtime, core-hour, throughput, or
+successful-measurement accounting.
 
-The controller waits outside compute allocations. Maintained retry backoff starts
-at 15 seconds, is capped at 30 seconds, and continues indefinitely because
-`maximum_wait_seconds: null`; the regular controller poll submits on the first
-advancement after both `next_retry_at` and the campaign launch gate permit it.
-The maintained poll interval is 15 seconds, so the first normal advancement may
-occur materially after the 7.5-second target; no sub-poll or real-time cadence is
-claimed. The restart-safe gate derives its latest relevant launch from the
-schema-version-1 campaign submission history rather than process memory. A
-blocked case retains only its logical admission slot: no CPU, memory, node, Slurm
-allocation, or COMSOL process is held during the wait. This improves
-responsiveness and improves the chance of observing a briefly available license,
-but it neither reserves a FlexNet license nor guarantees fairness against other
-users. License-only attempts never consume the scientific failure budget or
-benchmark runtime, core-hour, throughput, or ranking measurements.
+If the 120-second window ends after only strong capacity failures, the worker
+terminates and reaps any active COMSOL process, writes and validates an
+`in_allocation_license_window_exhausted` receipt, cleans marked scratch, and exits
+zero. Slurm may consequently report `COMPLETED` with exit code `0:0`, while the
+scientific case remains `license_blocked`. `COMPLETED` alone is never scientific
+success: canonical completed-case evidence proves success, while the job-bound
+window receipt plus controller wait record proves operational blocking. Missing,
+invalid, or mismatched evidence fails closed.
 
-Each blocked work unit owns one mutable schema-version-1 `license_wait.json`. The
-compact payload records work-unit and scientific identities, the observed
-feature, error code, exact matched signatures, COMSOL exit code, solver-progress
-and export flags, first and latest blocked timestamps, retry count, latest and
-bounded recent job IDs, next retry time, cumulative wait, and a bounded raw
-excerpt. A new license-only event creates no scientific attempt directory and
-copies no canonical input.
+The strict allocation hold may exceed the configured 120 seconds by the existing
+process-termination margin: the owned process receives TERM and may be given up
+to five seconds before KILL and final reap. The 120 seconds is therefore the
+checkout-launch deadline, not an assertion that Slurm releases the allocation at
+exactly 120.000 seconds.
+
+One exhausted allocation increments the controller-level license retry count
+once, irrespective of its number of COMSOL checkout subprocesses. The same
+logical case retains its admission slot, `first_blocked_at`, and append-only
+historical job IDs. The controller derives `next_retry_at` from the existing
+15-second initial and 30-second maximum backoff, with no maximum cumulative wait,
+and later submits the same logical case. Checkout count, allocation-window retry
+count, and scientific attempt count remain distinct; license search consumes no
+scientific attempt or failure budget.
+
+This mechanism can hold two 16-core allocations for roughly two minutes while
+searching. It improves the chance of observing temporarily available FlexNet
+capacity, but it is not a FlexNet queue, reserves no license, and provides no
+fairness guarantee against other users. Administrator-managed Slurm license
+integration remains the preferred long-term solution.
 
 
 ## Attempt retention
@@ -540,7 +581,7 @@ Execution: commit=a1b2c3d4  config_digest=9f8e7d6c
 Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=unlimited
 Cases: successful=5  running=1  scheduler_pending=1  license_blocked=1  never_started=9  failed=1  total=18
 Admission: 2/2
-  pending=1  starting=0  license_waiting=1  retrying=0
+  pending=1  starting=0  acquiring_license=0  license_waiting=1
 
 Running cases:
 case_0002  batch=kidney_bean  job=629565  node=hpc119  elapsed=40:41
@@ -556,6 +597,8 @@ case_0003  batch=kidney_bean  job=629844
 License-blocked cases:
 case_0001  batch=kidney_bean  job=629820
   state=license_blocked
+  reason=in_allocation_license_window_exhausted
+  window=120 s  checkouts=8
   retry=5  next_retry=2026-08-20T00:06:24Z
   cumulative_wait=135 s
 

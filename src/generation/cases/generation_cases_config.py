@@ -1841,6 +1841,7 @@ def _validated_temporary_license_retry(value: Any) -> dict[str, Any]:
             "initial_delay_seconds",
             "maximum_delay_seconds",
             "maximum_wait_seconds",
+            "in_allocation_retry",
         },
         optional=set(),
         label="execution.runtime.temporary_license_retry",
@@ -1875,6 +1876,32 @@ def _validated_temporary_license_retry(value: Any) -> dict[str, Any]:
     if maximum_wait is not None and maximum_wait < retry["initial_delay_seconds"]:
         message = "execution.runtime.temporary_license_retry.maximum_wait_seconds must be at least initial_delay_seconds."
         raise GenerationConfigError(message)
+    in_allocation = _mapping(
+        retry["in_allocation_retry"],
+        label="execution.runtime.temporary_license_retry.in_allocation_retry",
+    )
+    _exact_keys(
+        in_allocation,
+        required={
+            "enabled",
+            "maximum_window_seconds",
+            "pause_after_capacity_failure_seconds",
+        },
+        optional=set(),
+        label="execution.runtime.temporary_license_retry.in_allocation_retry",
+    )
+    if not isinstance(in_allocation["enabled"], bool):
+        message = "execution.runtime.temporary_license_retry.in_allocation_retry.enabled must be boolean."
+        raise TypeError(message)
+    for key in ("maximum_window_seconds", "pause_after_capacity_failure_seconds"):
+        in_allocation[key] = _finite(
+            in_allocation[key],
+            label=f"execution.runtime.temporary_license_retry.in_allocation_retry.{key}",
+        )
+        if in_allocation[key] <= 0.0:
+            message = f"execution.runtime.temporary_license_retry.in_allocation_retry.{key} must be positive."
+            raise GenerationConfigError(message)
+    retry["in_allocation_retry"] = in_allocation
     return retry
 
 

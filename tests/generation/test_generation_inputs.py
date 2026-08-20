@@ -1148,6 +1148,32 @@ def test_transient_bulk_moisture_tolerance_validation(
         generation.cases.config.load_campaign_config(config_path)
 
 
+def test_maintained_cluster_license_acquisition_contract() -> None:
+    """Protect the documented two-slot, 16-core bounded acquisition policy."""
+    execution_path = common.paths.get_project_root() / "configs/generation/execution/cluster_cpu.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    retry = execution["runtime"]["temporary_license_retry"]
+
+    assert execution["schema_version"] == 1
+    assert execution["submission"] == {
+        "max_admission_cases": 2,
+        "poll_interval_seconds": 15,
+        "max_running_cases": None,
+    }
+    assert execution["cluster"]["cores_per_case"] == 16
+    assert retry == {
+        "enabled": True,
+        "initial_delay_seconds": 15,
+        "maximum_delay_seconds": 30,
+        "maximum_wait_seconds": None,
+        "in_allocation_retry": {
+            "enabled": True,
+            "maximum_window_seconds": 120,
+            "pause_after_capacity_failure_seconds": 5,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("key", "value", "exception", "message"),
     [
@@ -1197,6 +1223,60 @@ def test_temporary_license_retry_configuration_validation(
 
     with pytest.raises(exception, match=message):
         generation.cases.config.load_campaign_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "exception", "message"),
+    [
+        ("enabled", 1, TypeError, "must be boolean"),
+        ("maximum_window_seconds", 0, generation.cases.config.GenerationConfigError, "must be positive"),
+        ("pause_after_capacity_failure_seconds", float("inf"), generation.cases.config.GenerationConfigError, "finite real value"),
+    ],
+)
+def test_in_allocation_license_retry_configuration_validation(
+    generation_config_factory: Any,
+    key: str,
+    value: object,
+    exception: type[Exception],
+    message: str,
+) -> None:
+    """Reject invalid controls and durations for the worker-owned retry window."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    retry = execution["runtime"]["temporary_license_retry"]
+    retry["in_allocation_retry"] = {
+        "enabled": True,
+        "maximum_window_seconds": 17.0,
+        "pause_after_capacity_failure_seconds": 3.0,
+    }
+    retry["in_allocation_retry"][key] = value
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(exception, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_in_allocation_license_retry_preserves_non_default_worker_policy(
+    generation_config_factory: Any,
+) -> None:
+    """Resolve a test-owned bounded acquisition window without controller defaults."""
+    config_path, _template = generation_config_factory()
+    execution_path = config_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["runtime"]["temporary_license_retry"]["in_allocation_retry"] = {
+        "enabled": True,
+        "maximum_window_seconds": 17.0,
+        "pause_after_capacity_failure_seconds": 3.0,
+    }
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    assert campaign.batches[0].execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"] == {
+        "enabled": True,
+        "maximum_window_seconds": 17.0,
+        "pause_after_capacity_failure_seconds": 3.0,
+    }
 
 
 def test_temporary_license_retry_allows_indefinite_controller_wait(

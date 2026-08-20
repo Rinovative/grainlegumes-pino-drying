@@ -283,6 +283,41 @@ def test_loader_is_read_only_and_marks_missing_malformed_and_stale(
     assert malformed["availability"] == "unavailable"
 
 
+def test_checkout_log_reset_cannot_reuse_stale_solver_progress(tmp_path: Path) -> None:
+    """Reset parser offsets and state when the owned startup log is truncated."""
+    identity = {
+        "schema_kind": "generation_campaign_runtime_progress",
+        "schema_version": 1,
+        "campaign_run_id": "campaign__0123456789abcdef",
+        "batch_name": "batch",
+        "batch_id": "batch-id",
+        "case_index": 1,
+        "case_id": "case_0001",
+        "slurm_job_id": "42",
+    }
+    receipt = tmp_path / "42.json"
+    stdout = tmp_path / "stdout.log"
+    stdout.write_text("Time-Dependent Solver 1 in Transient Drying\n", encoding="utf-8")
+    reporter = progress.create_bound_runtime_progress_reporter(identity, receipt, hostname="node-a", stdout_path=stdout)
+    assert reporter.update(phase="starting_solver", force=True)
+    assert progress.load_bound_runtime_progress(identity, receipt)["phase"] == "transient_drying"
+
+    stdout.write_text("Licensed number of users already reached\n", encoding="utf-8")
+    reporter.reset_stdout(stdout)
+    assert reporter.update_license_acquisition(
+        window_seconds=3.0,
+        window_limit_seconds=17.0,
+        checkout_attempt_count=2,
+        last_result="temporary_license_capacity",
+        force=True,
+    )
+
+    loaded = progress.load_bound_runtime_progress(identity, receipt)
+    assert loaded["phase"] == "acquiring_comsol_license"
+    assert loaded["parser_state"] == "unavailable"
+    assert loaded["license_checkout_attempt_count"] == 2
+
+
 @pytest.mark.integration
 def test_monitoring_failure_does_not_change_the_simulated_case_path(
     generation_config_factory: Any,

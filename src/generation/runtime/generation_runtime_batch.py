@@ -1210,7 +1210,150 @@ def _solver_environment(prepared: PreparedCase) -> dict[str, str]:
     return environment
 
 
-def execute_prepared_case(
+def _reset_runtime_progress_stdout(
+    reporter: progress_service.RuntimeProgressReporter | None,
+    stdout_path: Path,
+) -> None:
+    """Best-effort reset parsing after one owned checkout log is truncated."""
+    if reporter is None:
+        return
+    try:
+        reporter.reset_stdout(stdout_path)
+    except Exception:  # noqa: BLE001 -- monitoring cannot terminate a case
+        return
+
+
+def _update_license_acquisition_progress(
+    reporter: progress_service.RuntimeProgressReporter | None,
+    *,
+    window_started_monotonic: float,
+    window_limit_seconds: float,
+    checkout_attempt_count: int,
+    last_result: str | None,
+    force: bool = False,
+) -> None:
+    """Best-effort publish compact current allocation-window progress."""
+    if reporter is None:
+        return
+    try:
+        reporter.update_license_acquisition(
+            window_seconds=max(0.0, time.monotonic() - window_started_monotonic),
+            window_limit_seconds=window_limit_seconds,
+            checkout_attempt_count=checkout_attempt_count,
+            last_result=last_result,
+            force=force,
+        )
+    except Exception:  # noqa: BLE001 -- monitoring cannot terminate a case
+        return
+
+
+def _captured_startup_text(prepared: PreparedCase) -> str:
+    """Return bounded current stdout and stderr for one owned startup attempt."""
+    chunks = []
+    for name in ("stdout.log", "stderr.log"):
+        candidate = prepared.runtime_directory / name
+        if candidate.is_file() and not candidate.is_symlink():
+            chunks.append(_bounded_log_text(candidate, maximum_bytes=32_768))
+    return "\n".join(chunks)
+
+
+def _wait_for_solver_start_or_exit(
+    process: subprocess.Popen[str],
+    prepared: PreparedCase,
+    *,
+    deadline: float | None,
+    window_started_monotonic: float,
+    window_limit_seconds: float,
+    checkout_attempt_count: int,
+    last_result: str | None,
+    progress_reporter: progress_service.RuntimeProgressReporter | None,
+) -> tuple[str, int | None]:
+    """Wait until solver evidence, process exit, cancellation, or window deadline."""
+    poll_seconds = 0.25
+    while True:
+        captured = _captured_startup_text(prepared)
+        if license_service.solver_progress_started(captured):
+            _update_runtime_progress(progress_reporter, phase="starting_solver", force=True)
+            return "solver_progress_started", None
+        completed = process.poll()
+        if completed is not None:
+            return "process_exited", process.wait()
+        if runtime_cancellation_requested():
+            return "cancelled", _terminate_solver_and_wait(process)
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            return "window_deadline", _terminate_solver_and_wait(process)
+        wait_seconds = poll_seconds if deadline is None else min(poll_seconds, max(0.0, deadline - now))
+        try:
+            completed = process.wait(timeout=wait_seconds)
+        except subprocess.TimeoutExpired:
+            _update_license_acquisition_progress(
+                progress_reporter,
+                window_started_monotonic=window_started_monotonic,
+                window_limit_seconds=window_limit_seconds,
+                checkout_attempt_count=checkout_attempt_count,
+                last_result=last_result,
+            )
+            continue
+        return "process_exited", completed
+
+
+def _assert_capacity_retry_workspace_is_clean(
+    config: config_contract.GenerationConfig,
+    prepared: PreparedCase,
+    solved_models_before: Mapping[str, _SolvedModelInventoryEntry],
+) -> None:
+    """Fail closed unless only owned startup logs need resetting for another checkout."""
+    if _solved_model_inventory(prepared.work_directory) != solved_models_before:
+        message = "Temporary-capacity checkout changed solved-model artifacts before retry."
+        raise CaseExecutionError(message, work_directory=prepared.work_directory)
+    status_path = stop_service.derive_stop_status_path(prepared.work_directory)
+    if status_path.exists():
+        message = "Temporary-capacity checkout left a COMSOL status file before retry."
+        raise CaseExecutionError(message, work_directory=prepared.work_directory)
+    export_root = prepared.work_directory / str(config.scientific_values["output_contract"]["exports_root"])
+    if export_root.exists() and (export_root.is_symlink() or not export_root.is_dir() or any(export_root.iterdir())):
+        message = "Temporary-capacity checkout left unexpected export artifacts before retry."
+        raise CaseExecutionError(message, work_directory=prepared.work_directory)
+
+
+def _persist_in_allocation_window(
+    config: config_contract.GenerationConfig,
+    prepared: PreparedCase,
+    summaries: tuple[license_service.InAllocationLicenseCheckoutSummary, ...],
+    *,
+    window_started_at: datetime,
+    window_started_monotonic: float,
+    outcome: str,
+) -> Path | None:
+    """Persist one final campaign allocation-window receipt when identity is available."""
+    campaign_run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID")
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if campaign_run_id is None or job_id is None:
+        return None
+    result = license_service.in_allocation_license_window_result(
+        config,
+        int(prepared.bundle.case_payload["case_index"]),
+        campaign_run_id=campaign_run_id,
+        job_id=job_id,
+        hostname=socket.gethostname(),
+        window_started_at=window_started_at,
+        window_ended_at=datetime.now(timezone.utc),
+        window_started_monotonic_seconds=window_started_monotonic,
+        window_ended_monotonic_seconds=time.monotonic(),
+        checkout_summaries=summaries,
+        solver_progress_started=outcome == "solver_progress_started",
+        outcome=outcome,
+    )
+    return license_service.record_in_allocation_license_window(
+        config,
+        int(prepared.bundle.case_payload["case_index"]),
+        result,
+        storage_root=prepared.storage_root,
+    )
+
+
+def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL process lifecycle
     config: config_contract.GenerationConfig,
     prepared: PreparedCase,
     *,
@@ -1266,82 +1409,259 @@ def execute_prepared_case(
         allocated_node=allocated_node,
     )
     hostname = socket.gethostname()
-    started_at = _utc_now()
-    monotonic_start = time.monotonic()
     stdout_path = prepared.runtime_directory / "stdout.log"
     stderr_path = prepared.runtime_directory / "stderr.log"
     _bind_runtime_progress_stdout(progress_reporter, stdout_path)
+    retry_policy = config.execution_values["runtime"]["temporary_license_retry"]
+    in_allocation_policy = retry_policy["in_allocation_retry"]
+    in_allocation_enabled = bool(scheduler_kind == "slurm" and retry_policy["enabled"] and in_allocation_policy["enabled"])
+    window_started_at = datetime.now(timezone.utc)
+    window_started_monotonic = time.monotonic()
+    window_deadline = window_started_monotonic + float(in_allocation_policy["maximum_window_seconds"]) if in_allocation_enabled else None
+    checkout_summaries: list[license_service.InAllocationLicenseCheckoutSummary] = []
+    in_allocation_license_window_seconds = 0.0
+    in_allocation_pause_seconds = 0.0
     process: subprocess.Popen[str] | None = None
     stop_result: stop_service.StopResult | None = None
     timed_out = False
     exit_code: int | None = None
-    with (
-        stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
-        stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
-    ):
-        _update_runtime_progress(progress_reporter, phase="starting_solver", force=True)
-        try:
-            process = subprocess.Popen(  # noqa: S603 -- validated argument vector without a shell
-                command,
-                cwd=prepared.work_directory,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_stream,
-                stderr=stderr_stream,
-                text=True,
-                start_new_session=True,
-                env=_solver_environment(prepared),
+    started_at = _utc_now()
+    monotonic_start = window_started_monotonic
+    while True:
+        if window_deadline is not None and time.monotonic() >= window_deadline:
+            if not checkout_summaries or checkout_summaries[-1].classification is None:
+                message = "In-allocation COMSOL startup deadline elapsed without strong temporary-capacity evidence."
+                raise CaseExecutionError(message, work_directory=prepared.work_directory, command=tuple(command))
+            _persist_in_allocation_window(
+                config,
+                prepared,
+                tuple(checkout_summaries),
+                window_started_at=window_started_at,
+                window_started_monotonic=window_started_monotonic,
+                outcome="window_exhausted",
             )
+            last = checkout_summaries[-1]
+            evidence = last.classification
+            if evidence is None:
+                message = "Exhausted allocation window lacks temporary-capacity evidence."
+                raise RuntimeError(message)
+            message = "In-allocation COMSOL license-acquisition window exhausted."
+            raise license_service.TemporaryLicenseCapacityError(
+                message,
+                work_directory=prepared.work_directory,
+                command=tuple(command),
+                exit_code=last.process_exit_code,
+                evidence=evidence,
+            )
+        attempt_started_at = datetime.now(timezone.utc)
+        attempt_started_monotonic = time.monotonic()
+        started_at = attempt_started_at.isoformat()
+        monotonic_start = attempt_started_monotonic
+        with (
+            stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
+            stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
+        ):
+            _reset_runtime_progress_stdout(progress_reporter, stdout_path)
+            if in_allocation_enabled:
+                _update_license_acquisition_progress(
+                    progress_reporter,
+                    window_started_monotonic=window_started_monotonic,
+                    window_limit_seconds=float(in_allocation_policy["maximum_window_seconds"]),
+                    checkout_attempt_count=len(checkout_summaries) + 1,
+                    last_result=(None if not checkout_summaries else license_service.TEMPORARY_LICENSE_CAPACITY),
+                    force=True,
+                )
+            else:
+                _update_runtime_progress(progress_reporter, phase="starting_solver", force=True)
+            try:
+                process = subprocess.Popen(  # noqa: S603 -- validated argument vector without a shell
+                    command,
+                    cwd=prepared.work_directory,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_stream,
+                    stderr=stderr_stream,
+                    text=True,
+                    start_new_session=True,
+                    env=_solver_environment(prepared),
+                )
+            except OSError as error:
+                ended_at = _utc_now()
+                _complete_execution_provenance(
+                    execution_provenance,
+                    state="start_failed",
+                    exit_code=None,
+                    timed_out=False,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    runtime_seconds=time.monotonic() - monotonic_start,
+                )
+                msg = f"Could not start COMSOL command {command!r}: {error}"
+                raise CaseExecutionError(msg, work_directory=prepared.work_directory, command=tuple(command)) from error
             _register_solver(process)
             try:
-                stop_controller = stop_service.SolverStopController(
+                if not in_allocation_enabled:
+                    stop_controller = stop_service.SolverStopController(
+                        process,
+                        prepared.work_directory,
+                        timeout_seconds=float(config.execution_values["runtime"]["timeout_seconds"]),
+                        graceful_stop_reserve_seconds=float(config.execution_values["runtime"]["graceful_stop_reserve_seconds"]),
+                        monotonic_clock=time.monotonic,
+                    )
+                    stop_result = stop_controller.wait_for_exit(
+                        cancellation_requested=runtime_cancellation_requested,
+                        force_requested=runtime_force_cancellation_requested,
+                        progress_callback=lambda: _update_runtime_progress(
+                            progress_reporter,
+                            phase="starting_solver",
+                        ),
+                    )
+                    exit_code = stop_result.exit_code
+                    timed_out = stop_result.timed_out
+                    break
+                startup_outcome, startup_exit_code = _wait_for_solver_start_or_exit(
                     process,
-                    prepared.work_directory,
-                    timeout_seconds=float(config.execution_values["runtime"]["timeout_seconds"]),
-                    graceful_stop_reserve_seconds=float(config.execution_values["runtime"]["graceful_stop_reserve_seconds"]),
-                    monotonic_clock=time.monotonic,
+                    prepared,
+                    deadline=window_deadline,
+                    window_started_monotonic=window_started_monotonic,
+                    window_limit_seconds=float(in_allocation_policy["maximum_window_seconds"]),
+                    checkout_attempt_count=len(checkout_summaries) + 1,
+                    last_result=(None if not checkout_summaries else license_service.TEMPORARY_LICENSE_CAPACITY),
+                    progress_reporter=progress_reporter,
                 )
-                stop_result = stop_controller.wait_for_exit(
-                    cancellation_requested=runtime_cancellation_requested,
-                    force_requested=runtime_force_cancellation_requested,
-                    progress_callback=lambda: _update_runtime_progress(
-                        progress_reporter,
-                        phase="starting_solver",
-                    ),
-                )
-                exit_code = stop_result.exit_code
-                timed_out = stop_result.timed_out
+                if startup_outcome == "cancelled":
+                    message = "Campaign cancellation terminated the COMSOL process during license acquisition."
+                    raise CaseInterruptedError(  # noqa: TRY301 -- translated at the owned process boundary
+                        message,
+                        work_directory=prepared.work_directory,
+                        command=tuple(command),
+                        exit_code=startup_exit_code,
+                    )
+                if startup_outcome == "solver_progress_started":
+                    checkout_summaries.append(
+                        license_service.InAllocationLicenseCheckoutSummary(
+                            checkout_index=len(checkout_summaries) + 1,
+                            started_at=attempt_started_at,
+                            ended_at=datetime.now(timezone.utc),
+                            started_monotonic_seconds=attempt_started_monotonic,
+                            ended_monotonic_seconds=time.monotonic(),
+                            process_exit_code=None,
+                            classification=None,
+                            solver_progress_started=True,
+                        )
+                    )
+                    if in_allocation_enabled:
+                        in_allocation_license_window_seconds = time.monotonic() - window_started_monotonic
+                        _persist_in_allocation_window(
+                            config,
+                            prepared,
+                            tuple(checkout_summaries),
+                            window_started_at=window_started_at,
+                            window_started_monotonic=window_started_monotonic,
+                            outcome="solver_progress_started",
+                        )
+                    elapsed_before_solver_wait = time.monotonic() - attempt_started_monotonic
+                    timeout_seconds = float(config.execution_values["runtime"]["timeout_seconds"])
+                    reserve_seconds = float(config.execution_values["runtime"]["graceful_stop_reserve_seconds"])
+                    remaining_timeout = timeout_seconds - elapsed_before_solver_wait
+                    if remaining_timeout <= reserve_seconds:
+                        terminated_exit_code = _terminate_solver_and_wait(process)
+                        message = "COMSOL case exhausted its runtime timeout during startup resolution."
+                        raise CaseExecutionError(  # noqa: TRY301 -- translated at the owned process boundary
+                            message,
+                            work_directory=prepared.work_directory,
+                            command=tuple(command),
+                            exit_code=terminated_exit_code,
+                            timed_out=True,
+                        )
+                    stop_controller = stop_service.SolverStopController(
+                        process,
+                        prepared.work_directory,
+                        timeout_seconds=remaining_timeout,
+                        graceful_stop_reserve_seconds=reserve_seconds,
+                        monotonic_clock=time.monotonic,
+                    )
+                    stop_result = stop_controller.wait_for_exit(
+                        cancellation_requested=runtime_cancellation_requested,
+                        force_requested=runtime_force_cancellation_requested,
+                        progress_callback=lambda: _update_runtime_progress(progress_reporter, phase="starting_solver"),
+                    )
+                    exit_code = stop_result.exit_code
+                    timed_out = stop_result.timed_out
+                    break
+                exit_code = startup_exit_code
             except stop_service.UnexpectedStopStatusContentError as error:
                 terminated_exit_code = _terminate_solver_and_wait(process)
                 raise error.with_runtime_evidence(
                     exit_code=terminated_exit_code,
-                    required_exports_present=_expected_exports_exist(
-                        config,
-                        prepared.work_directory,
-                    ),
+                    required_exports_present=_expected_exports_exist(config, prepared.work_directory),
                     replay_available=False,
                 ) from error
             except BaseException:
-                _terminate_solver_and_wait(process)
+                if process.poll() is None:
+                    _terminate_solver_and_wait(process)
                 raise
             finally:
                 _unregister_solver(process)
-        except OSError as error:
-            ended_at = _utc_now()
-            _complete_execution_provenance(
-                execution_provenance,
-                state="start_failed",
-                exit_code=None,
-                timed_out=False,
-                started_at=started_at,
-                ended_at=ended_at,
-                runtime_seconds=time.monotonic() - monotonic_start,
+        solver_log = _write_solver_log(prepared)
+        captured_solver_text = solver_log.read_text(encoding="utf-8", errors="replace")
+        license_evidence = license_service.classify_temporary_license_capacity(captured_solver_text)
+        solver_started = license_service.solver_progress_started(captured_solver_text)
+        expected_exports_exist = _expected_exports_exist(config, prepared.work_directory)
+        if license_evidence is not None and not solver_started and not expected_exports_exist:
+            checkout_summaries.append(
+                license_service.InAllocationLicenseCheckoutSummary(
+                    checkout_index=len(checkout_summaries) + 1,
+                    started_at=attempt_started_at,
+                    ended_at=datetime.now(timezone.utc),
+                    started_monotonic_seconds=attempt_started_monotonic,
+                    ended_monotonic_seconds=time.monotonic(),
+                    process_exit_code=exit_code,
+                    classification=license_evidence,
+                    solver_progress_started=False,
+                )
             )
-            msg = f"Could not start COMSOL command {command!r}: {error}"
-            raise CaseExecutionError(
-                msg,
-                work_directory=prepared.work_directory,
-                command=tuple(command),
-            ) from error
+            if not in_allocation_enabled:
+                message = f"COMSOL could not obtain temporary floating-license capacity for {license_evidence.feature!r}."
+                raise license_service.TemporaryLicenseCapacityError(
+                    message,
+                    work_directory=prepared.work_directory,
+                    command=tuple(command),
+                    exit_code=exit_code,
+                    evidence=license_evidence,
+                )
+            _assert_capacity_retry_workspace_is_clean(config, prepared, solved_models_before)
+            if window_deadline is None:
+                message = "Enabled in-allocation retry requires a monotonic deadline."
+                raise RuntimeError(message)
+            remaining = max(0.0, window_deadline - time.monotonic())
+            pause_seconds = min(float(in_allocation_policy["pause_after_capacity_failure_seconds"]), remaining)
+            if pause_seconds > 0.0:
+                time.sleep(pause_seconds)
+                in_allocation_pause_seconds += pause_seconds
+            continue
+        if in_allocation_enabled and (solver_started or expected_exports_exist):
+            in_allocation_license_window_seconds = time.monotonic() - window_started_monotonic
+            checkout_summaries.append(
+                license_service.InAllocationLicenseCheckoutSummary(
+                    checkout_index=len(checkout_summaries) + 1,
+                    started_at=attempt_started_at,
+                    ended_at=datetime.now(timezone.utc),
+                    started_monotonic_seconds=attempt_started_monotonic,
+                    ended_monotonic_seconds=time.monotonic(),
+                    process_exit_code=exit_code,
+                    classification=None,
+                    solver_progress_started=True,
+                )
+            )
+            _persist_in_allocation_window(
+                config,
+                prepared,
+                tuple(checkout_summaries),
+                window_started_at=window_started_at,
+                window_started_monotonic=window_started_monotonic,
+                outcome="solver_progress_started",
+            )
+        break
     elapsed = time.monotonic() - monotonic_start
     timing = {
         "schema_kind": "simulation_case_timing",
@@ -1495,6 +1815,9 @@ def execute_prepared_case(
     timing.update(
         {
             "comsol_process_seconds": elapsed,
+            "in_allocation_license_window_seconds": in_allocation_license_window_seconds,
+            "in_allocation_capacity_pause_seconds": in_allocation_pause_seconds,
+            "in_allocation_checkout_attempt_count": len(checkout_summaries),
             "export_conversion_s": export_conversion_seconds,
             "export_conversion_seconds": export_conversion_seconds,
             "complete_execution_s": time.monotonic() - monotonic_start,
@@ -3706,6 +4029,13 @@ def run_case(
                 print(
                     f"Temporary COMSOL license capacity recorded; Slurm allocation will be released: {retry_path}",
                     flush=True,
+                )
+                return CaseRunOutcome(
+                    status="license_blocked",
+                    case_id=config.case_id(case_index),
+                    processed_directory=processed_case_directory(config, case_index, storage_root=storage),
+                    work_directory=None,
+                    message="in_allocation_license_window_exhausted",
                 )
             raise
         try:

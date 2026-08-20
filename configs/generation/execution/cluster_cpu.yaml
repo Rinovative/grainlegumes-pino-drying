@@ -10,13 +10,17 @@ runtime:
     initial_delay_seconds: 15
     maximum_delay_seconds: 30
     maximum_wait_seconds: null
+    in_allocation_retry:
+      enabled: true
+      maximum_window_seconds: 120
+      pause_after_capacity_failure_seconds: 5
 retention:
   family_generalization: compact
   steady_flow_id_dataset: compact
   technical_runtime_smoke: full
   pilot_check: full
 submission:
-  max_admission_cases: 3
+  max_admission_cases: 2
   poll_interval_seconds: 15
   max_running_cases: null
 cluster:

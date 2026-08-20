@@ -59,6 +59,9 @@ def _harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     workflow = scripts / "generation_workflow.sh"
     shutil.copyfile(repository / "scripts/generation_workflow.sh", workflow)
     workflow.chmod(workflow.stat().st_mode | 0o111)
+    ssh_transport = scripts / "generation_ssh_transport.sh"
+    shutil.copyfile(repository / "scripts/generation_ssh_transport.sh", ssh_transport)
+    ssh_transport.chmod(ssh_transport.stat().st_mode | 0o111)
     docker_python = scripts / "docker_python.sh"
     shutil.copyfile(repository / "scripts/docker_python.sh", docker_python)
     docker_python.chmod(docker_python.stat().st_mode | 0o111)
@@ -182,6 +185,21 @@ fi
 """.replace("$", "$"),
     )
     _executable(
+        fake_bin / "sleep",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${FAKE_BYPASS_SSH_RETRY_SLEEP:-false}" == true ]]; then
+  case "${1:-}" in
+    5|15|30|60)
+      printf '%s\n' "$1" >> "${FAKE_SSH_RETRY_SLEEP_LOG}"
+      exit 0
+      ;;
+  esac
+fi
+exec "${FAKE_REAL_SLEEP}" "$@"
+""",
+    )
+    _executable(
         fake_bin / "tmux",
         r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -271,6 +289,19 @@ payload="$(cat)"
 printf 'ssh-start\n' >> "${FAKE_COMMAND_LOG}"
 for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}"; done
 printf 'ssh-stdin-start\n%s\nssh-stdin-end\n' "${payload}" >> "${FAKE_COMMAND_LOG}"
+if [[ "${FAKE_SSH_FAILURE_PHASE:-before}" != after \
+  && -n "${FAKE_SSH_FAILURE_MATCH:-}" \
+  && " $*"$'\n'"${payload}" == *"${FAKE_SSH_FAILURE_MATCH}"* ]]; then
+  failure_count=0
+  [[ ! -f "${FAKE_SSH_FAILURE_COUNT_FILE}" ]] ||
+    read -r failure_count < "${FAKE_SSH_FAILURE_COUNT_FILE}"
+  if (( failure_count < FAKE_SSH_FAILURE_LIMIT )); then
+    printf '%s\n' "$((failure_count + 1))" > "${FAKE_SSH_FAILURE_COUNT_FILE}"
+    printf 'ssh-injected-failure <%s>\n' "${FAKE_SSH_FAILURE_MATCH}" >> "${FAKE_COMMAND_LOG}"
+    printf '%s\n' "${FAKE_SSH_FAILURE_MESSAGE}" >&2
+    exit "${FAKE_SSH_FAILURE_STATUS}"
+  fi
+fi
 next_campaign_state() {
   local state="${FAKE_CAMPAIGN_STATE}" index=0
   if [[ -n "${FAKE_CAMPAIGN_STATES:-}" ]]; then
@@ -475,6 +506,19 @@ elif [[ " $* " == *' plan-campaign'* ]]; then
   printf '%s\n' '{"filesystem_mutated":false,"state":"planned"}'
 elif [[ "${payload}" == *'sbatch --wait --parsable'* ]]; then
   printf 'preflight\t12345\t/remote/preflight/fixture\n'
+fi
+if [[ "${FAKE_SSH_FAILURE_PHASE:-before}" == after \
+  && -n "${FAKE_SSH_FAILURE_MATCH:-}" \
+  && " $*"$'\n'"${payload}" == *"${FAKE_SSH_FAILURE_MATCH}"* ]]; then
+  failure_count=0
+  [[ ! -f "${FAKE_SSH_FAILURE_COUNT_FILE}" ]] ||
+    read -r failure_count < "${FAKE_SSH_FAILURE_COUNT_FILE}"
+  if (( failure_count < FAKE_SSH_FAILURE_LIMIT )); then
+    printf '%s\n' "$((failure_count + 1))" > "${FAKE_SSH_FAILURE_COUNT_FILE}"
+    printf 'ssh-injected-failure-after <%s>\n' "${FAKE_SSH_FAILURE_MATCH}" >> "${FAKE_COMMAND_LOG}"
+    printf '%s\n' "${FAKE_SSH_FAILURE_MESSAGE}" >&2
+    exit "${FAKE_SSH_FAILURE_STATUS}"
+  fi
 fi
 """.replace("$", "$"),
     )
@@ -917,6 +961,7 @@ fi
             "FAKE_DOCKER_CONTINUE_FILE": "",
             "FAKE_REALPATH": shutil.which("realpath", path=os.defpath) or "/usr/bin/realpath",
             "FAKE_REAL_DATE": shutil.which("date", path=os.defpath) or "/usr/bin/date",
+            "FAKE_REAL_SLEEP": shutil.which("sleep", path=os.defpath) or "/usr/bin/sleep",
             "GENERATION_REPOSITORY_URL": "git@github.com:Rinovative/grainlegumes-pino-drying.git",
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
@@ -947,6 +992,14 @@ fi
             "FAKE_INVENTORY_SHA": _INVENTORY_SHA,
             "FAKE_CLEANUP_RECEIPT_SHA": _CLEANUP_RECEIPT_SHA,
             "FAKE_LOGIN_PREFLIGHT_STDOUT": "false",
+            "FAKE_SSH_FAILURE_MATCH": "",
+            "FAKE_SSH_FAILURE_PHASE": "before",
+            "FAKE_SSH_FAILURE_LIMIT": "0",
+            "FAKE_SSH_FAILURE_STATUS": "255",
+            "FAKE_SSH_FAILURE_MESSAGE": "Connection timed out",
+            "FAKE_SSH_FAILURE_COUNT_FILE": str(state_root / "ssh-failure-count"),
+            "FAKE_BYPASS_SSH_RETRY_SLEEP": "false",
+            "FAKE_SSH_RETRY_SLEEP_LOG": str(state_root / "ssh-retry-sleep"),
             "FAKE_TRACK_SINGLE_SUBMISSION": "false",
             "FAKE_SUBMISSION_FILE": str(state_root / "submission"),
             "FAKE_GPU_PUBLISHED_FILE": str(state_root / "gpu-published"),
@@ -1265,6 +1318,195 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
     assert prepare_index < plan_index < submit_index
     assert sum("submit-campaign" in line for line in command_lines) == 1
+
+
+def test_transient_permission_denial_during_remote_home_resolution_recovers(
+    tmp_path: Path,
+) -> None:
+    """Continue the same workflow after a short-lived login authentication failure."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
+    environment["FAKE_SSH_FAILURE_MATCH"] = "${HOME}"
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "1"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)."
+    environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"campaign_run_id={_RUN_ID}" in result.stdout
+    assert "WARNING: transient SSH failure during remote HOME resolution" in result.stderr
+    assert "SSH connection recovered:" in result.stderr
+    assert "FAILED:" not in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert log_text.count("submit-campaign") == 1
+    assert "cancel-campaign" not in log_text
+    assert "record-workflow-failure" not in log_text
+    assert Path(environment["FAKE_SSH_RETRY_SLEEP_LOG"]).read_text(encoding="utf-8").splitlines() == ["5"]
+
+
+def test_transient_campaign_status_failure_retries_same_monitor_iteration(
+    tmp_path: Path,
+) -> None:
+    """Retry one status read without another resume, submission, or cancellation."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
+    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "1"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "Connection reset by peer"
+    environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Campaign: {_RUN_ID}" in result.stdout
+    assert "WARNING: transient SSH failure during campaign status read" in result.stderr
+    assert "FAILED:" not in result.stderr
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
+    assert sum(" resume-campaign " in line for line in remote_commands) == 1
+    assert sum(" campaign-status " in line for line in remote_commands) == 2
+    assert sum("submit-campaign" in line for line in remote_commands) == 1
+    assert not any("cancel-campaign" in line for line in command_lines)
+    assert not any("record-workflow-failure" in line for line in command_lines)
+
+
+def test_persistent_campaign_status_transport_failure_preserves_resume_evidence(
+    tmp_path: Path,
+) -> None:
+    """Fail closed after five attempts without cancelling or duplicating the run."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_CAMPAIGN_STATES"] = "running"
+    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "5"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)."
+    environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
+    campaign = _campaign(workflow)
+
+    result = _run(
+        workflow,
+        ["run", str(campaign), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+
+    assert result.returncode != 0
+    assert "Persistent SSH transport/authentication failure after 5 attempts" in result.stderr
+    assert f"campaign_run_id: {_RUN_ID}" in result.stderr
+    assert "CPU bytes retained:" in result.stderr
+    assert "generation_workflow.sh run" in result.stderr
+    assert campaign.name in result.stderr
+    assert "--defer-collection" in result.stderr
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
+    assert sum(" campaign-status " in line for line in remote_commands) == 5
+    assert sum(" resume-campaign " in line for line in remote_commands) == 1
+    assert sum("submit-campaign" in line for line in remote_commands) == 1
+    assert not any("cancel-campaign" in line for line in command_lines)
+    assert any("record-workflow-failure" in line for line in command_lines)
+
+
+def test_lost_campaign_resume_acknowledgement_replays_deduplicated_resume(
+    tmp_path: Path,
+) -> None:
+    """Replay only durable campaign reconciliation after its SSH response is lost."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
+    environment["FAKE_SSH_FAILURE_MATCH"] = " resume-campaign "
+    environment["FAKE_SSH_FAILURE_PHASE"] = "after"
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "1"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "Broken pipe"
+    environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"campaign_run_id={_RUN_ID}" in result.stdout
+    assert "WARNING: transient SSH failure during campaign resume reconciliation" in result.stderr
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
+    assert sum(" resume-campaign " in line for line in remote_commands) == 2
+    assert sum("submit-campaign" in line for line in remote_commands) == 1
+    assert not any("cancel-campaign" in line for line in command_lines)
+    assert not any("record-workflow-failure" in line for line in command_lines)
+
+
+def test_transient_benchmark_status_failure_retries_without_replaying_resume(
+    tmp_path: Path,
+) -> None:
+    """Keep ambiguous benchmark resume one-shot while retrying its status read."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_BENCHMARK_STATE"] = "complete"
+    environment["FAKE_SSH_FAILURE_MATCH"] = " --format monitor"
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "1"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "kex_exchange_identification: read: Connection reset by peer"
+    environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
+
+    result = _run(
+        workflow,
+        ["run", str(_benchmark_suite(workflow)), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Run: {_BENCHMARK_RUN_ID}" in result.stdout
+    assert "WARNING: transient SSH failure during benchmark status read" in result.stderr
+    command_lines = log.read_text(encoding="utf-8").splitlines()
+    remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
+    assert sum(" resume-core-benchmark " in line for line in remote_commands) == 1
+    assert sum(" core-benchmark-status " in line and "--format monitor" in line for line in remote_commands) == 2
+    assert sum("submit-core-benchmark" in line for line in remote_commands) == 1
+    assert not any("cancel-core-benchmark" in line for line in command_lines)
+
+
+def test_interrupt_during_ssh_retry_wait_preserves_owned_cancellation_contract(
+    tmp_path: Path,
+) -> None:
+    """Keep graceful/force ownership and status 130 while retry sleep is active."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    environment["FAKE_CAMPAIGN_STATES"] = "running"
+    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_LIMIT"] = "5"
+    environment["FAKE_SSH_FAILURE_MESSAGE"] = "Connection timed out"
+    environment["FAKE_GRACEFUL_CANCEL_DELAY_SECONDS"] = "10"
+    process = _run_interruptible(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options(), "--defer-collection"],
+        environment,
+    )
+    try:
+        _wait_for_log(log, "ssh-injected-failure < campaign-status >")
+        os.killpg(process.pid, signal.SIGINT)
+        _wait_for_log(log, " cancel-campaign ")
+        os.killpg(process.pid, signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        _terminate_test_process(process)
+
+    assert process.returncode == 130
+    assert stdout
+    assert stderr.count("Graceful campaign cancellation requested.") == 1
+    assert stderr.count("Force campaign cancellation requested.") == 1
+    remote_commands = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("<bash -l -s --")]
+    cancellation_commands = [line for line in remote_commands if " cancel-campaign " in line]
+    assert len(cancellation_commands) == 2
+    assert all(_RUN_ID in line for line in cancellation_commands)
+    assert sum(" --force" in line for line in cancellation_commands) == 1
 
 
 def test_foreground_interrupts_request_graceful_then_force_cancellation(
