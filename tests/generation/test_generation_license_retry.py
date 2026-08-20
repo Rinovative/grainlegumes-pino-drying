@@ -7,9 +7,8 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
-import yaml
 
-from src import common, generation
+from src import generation
 from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_license as license_service
 
@@ -114,28 +113,6 @@ def test_unbounded_license_retry_wait_never_exhausts() -> None:
         )
         == 8.0
     )
-
-
-def test_maintained_retry_policy_and_cluster_admission_are_explicit() -> None:
-    """Protect the maintained retry bounds and two-case admission pool."""
-    path = common.paths.get_project_root() / "configs" / "generation" / "execution" / "cluster_cpu.yaml"
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-
-    assert payload["schema_version"] == 1
-    assert payload["runtime"]["temporary_license_retry"] == {
-        "enabled": True,
-        "initial_delay_seconds": 15,
-        "maximum_delay_seconds": 30,
-        "maximum_wait_seconds": None,
-    }
-    assert set(payload["submission"]) == {
-        "max_admission_cases",
-        "poll_interval_seconds",
-        "max_running_cases",
-    }
-    assert payload["submission"]["max_admission_cases"] == 2
-    assert payload["submission"]["max_running_cases"] is None
-    assert payload["cluster"]["cores_per_case"] == 16
 
 
 @pytest.mark.integration

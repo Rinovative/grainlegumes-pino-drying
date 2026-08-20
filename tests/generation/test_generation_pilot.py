@@ -253,21 +253,22 @@ def test_nominal_duration_states_do_not_fabricate_censored_times(
     }
 
 
-def test_nominal_duration_uses_configured_horizon() -> None:
-    """Protect the configured horizon as the nominal upper diagnostic bound."""
-    result = analysis_service.duration_diagnostic(
-        case_kind="nominal_reference",
-        target_reached=True,
-        final_time_h=49.0,
-        last_regular_time_h=48.0,
-        final_x_wb_bulk=0.08,
-        final_f_wet_dm=0.04,
-        configured_threshold=0.05,
-        configured_horizon_h=48.0,
-        previous_regular_f_wet_dm=0.06,
-    )
-    assert result["result"] == "INVALID_RESULT"
-    assert result["adequacy_window_h"]["maximum"] == 48.0
+@pytest.mark.parametrize("case_kind", ["nominal_reference", "natural_pilot"])
+@pytest.mark.parametrize("target_reached", [True, False])
+def test_duration_rejects_post_horizon_final_times(case_kind: str, target_reached: bool) -> None:
+    """Protect the configured horizon from fabricated observed or censoring times."""
+    with pytest.raises(ValueError, match="horizon"):
+        analysis_service.duration_diagnostic(
+            case_kind=case_kind,
+            target_reached=target_reached,
+            final_time_h=49.0,
+            last_regular_time_h=48.0,
+            final_x_wb_bulk=0.08,
+            final_f_wet_dm=0.04 if target_reached else 0.2,
+            configured_threshold=0.05,
+            configured_horizon_h=48.0,
+            previous_regular_f_wet_dm=0.06,
+        )
 
 
 def test_physical_bounds_extrema_monotonicity_and_schedule_are_generic() -> None:

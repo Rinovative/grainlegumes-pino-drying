@@ -225,18 +225,15 @@ def duration_diagnostic(
     if case_kind not in config_service.PILOT_CASE_KINDS or not all(math.isfinite(value) for value in numeric) or configured_horizon_h <= 0.0:
         message = "Duration diagnostics received malformed pilot state."
         raise ValueError(message)
+    if final_time_h > configured_horizon_h:
+        message = "Final pilot time exceeds the configured simulation horizon."
+        raise ValueError(message)
     if target_reached:
         drying_time_h: float | None = final_time_h
         stop_reason = "target_stop"
+        result = "TARGET_REACHED"
         if case_kind == "nominal_reference":
-            if final_time_h < _PILOT_ADEQUACY_MIN_DURATION_H:
-                result = "TOO_FAST"
-            elif final_time_h <= configured_horizon_h:
-                result = "PASS"
-            else:
-                result = "INVALID_RESULT"
-        else:
-            result = "TARGET_REACHED"
+            result = "TOO_FAST" if final_time_h < _PILOT_ADEQUACY_MIN_DURATION_H else "PASS"
     else:
         drying_time_h = None
         stop_reason = "time_horizon"

@@ -227,15 +227,15 @@ two_compartment_kinetics:
   record_id: kidney_bean_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 5.0e-06
+      nominal: 1.7e-05
       support:
-        lower: 2.0e-06
-        upper: 1.0e-05
+        lower: 8.0e-06
+        upper: 3.0e-05
       transform: log
     r_int_surf:
       nominal: 0.1
       support:
-        lower: 0.04
+        lower: 0.08
         upper: 0.22
       transform: log
     f_surf:
@@ -246,11 +246,11 @@ two_compartment_kinetics:
       transform: logit
   ood_records:
   - record_id: slow_internal_limited
-    r_surf_0: 1.25e-06
+    r_surf_0: 4.25e-06
     r_int_surf: 0.05
     f_surf: 0.23
   - record_id: fast_surface_exposed
-    r_surf_0: 1.7500000000000002e-05
+    r_surf_0: 5.95e-05
     r_int_surf: 0.15000000000000002
     f_surf: 0.53
   selection_rule: complete_record_atomic
@@ -261,8 +261,10 @@ two_compartment_kinetics:
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: use pilot nominal, run only engineering preflight, treat as a calibration
-        prior and do not claim experimental validation
+      limitation: Kinetics were conservatively aligned using a limited numerical pilot
+        to reduce seven-day right-censoring and produce informative neural-operator
+        transients; they were not fitted to experiments or validated as real drying-time
+        predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

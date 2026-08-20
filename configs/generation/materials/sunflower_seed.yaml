@@ -235,15 +235,15 @@ two_compartment_kinetics:
   record_id: sunflower_seed_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 8.0e-06
+      nominal: 1.0e-05
       support:
-        lower: 3.0e-06
-        upper: 1.6e-05
+        lower: 5.0e-06
+        upper: 1.8e-05
       transform: log
     r_int_surf:
       nominal: 0.15
       support:
-        lower: 0.05
+        lower: 0.10
         upper: 0.3
       transform: log
     f_surf:
@@ -254,11 +254,11 @@ two_compartment_kinetics:
       transform: logit
   ood_records:
   - record_id: slow_internal_limited
-    r_surf_0: 2.0e-06
+    r_surf_0: 2.5e-06
     r_int_surf: 0.075
     f_surf: 0.3
   - record_id: fast_surface_exposed
-    r_surf_0: 2.8e-05
+    r_surf_0: 3.5e-05
     r_int_surf: 0.225
     f_surf: 0.6
   selection_rule: complete_record_atomic
@@ -269,8 +269,10 @@ two_compartment_kinetics:
     applicability:
       evidence_scope: A desired nominal drying duration, or preferably independent
         whole-seed X_db(t) curves at known T, RH/omega and airflow.
-      limitation: use the pilot nominal unchanged; label all results engineering stress-test
-        only
+      limitation: Kinetics were conservatively aligned using a limited numerical pilot
+        to reduce seven-day right-censoring and produce informative neural-operator
+        transients; they were not fitted to experiments or validated as real drying-time
+        predictions, and sunflower remains an engineering stress-test material.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []

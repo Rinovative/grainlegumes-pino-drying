@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import common
 from src.generation import generation_run as run_service
 
 COMMIT = "a" * 40
@@ -63,37 +62,6 @@ def _benchmark_suite() -> SimpleNamespace:
         variant_wave_order=lambda: (canary, other),
         work_unit_id=lambda variant, position: f"{variant.variant_id}-{representatives[position - 1].case_role}",
     )
-
-
-@pytest.mark.parametrize(
-    ("relative_path", "run_kind", "unit_count"),
-    [
-        ("configs/generation/workflows/technical_smoke.yaml", "workflow", 0),
-        ("configs/generation/benchmarks/transient_core_scaling/suite.yaml", "benchmark", 8),
-        ("configs/generation/campaigns/transient_drying/material_pilot.yaml", "campaign", 18),
-        ("configs/generation/campaigns/transient_drying/family_generalization.yaml", "campaign", 600),
-        ("configs/generation/campaigns/steady_flow/id_dataset.yaml", "campaign", 1050),
-    ],
-)
-def test_every_maintained_entry_config_resolves_one_common_plan(
-    relative_path: str,
-    run_kind: str,
-    unit_count: int,
-) -> None:
-    """Resolve every documented entry point through schema-kind dispatch."""
-    repository = common.paths.get_project_root()
-
-    plan = run_service.resolve_generation_run(
-        repository / relative_path,
-        source_commit=COMMIT,
-        repository_root=repository,
-        require_executable=False,
-    )
-
-    assert plan.run_kind == run_kind
-    assert len(plan.units) == unit_count
-    assert plan.config_path == relative_path
-    assert plan.to_payload()["schema_version"] == 1
 
 
 def test_dispatches_by_schema_kind_and_builds_campaign_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

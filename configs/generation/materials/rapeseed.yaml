@@ -222,15 +222,15 @@ two_compartment_kinetics:
   record_id: rapeseed_two_compartment_kinetics_v1
   components:
     r_surf_0:
-      nominal: 1.2e-05
+      nominal: 2.0e-05
       support:
-        lower: 5.0e-06
-        upper: 2.5e-05
+        lower: 1.1e-05
+        upper: 3.3e-05
       transform: log
     r_int_surf:
       nominal: 0.22
       support:
-        lower: 0.08
+        lower: 0.12
         upper: 0.4
       transform: log
     f_surf:
@@ -241,11 +241,11 @@ two_compartment_kinetics:
       transform: logit
   ood_records:
   - record_id: slow_internal_limited
-    r_surf_0: 3.0e-06
+    r_surf_0: 5.0e-06
     r_int_surf: 0.11
     f_surf: 0.35
   - record_id: fast_surface_exposed
-    r_surf_0: 4.2e-05
+    r_surf_0: 7.0e-05
     r_int_surf: 0.33
     f_surf: 0.65
   selection_rule: complete_record_atomic
@@ -256,8 +256,10 @@ two_compartment_kinetics:
     applicability:
       evidence_scope: independent whole-particle X_db(t) or moisture-ratio curves
         at known T, RH/omega, airflow and product state; T(t) if available
-      limitation: use pilot nominal, run only engineering preflight, treat as a calibration
-        prior and do not claim experimental validation
+      limitation: Kinetics were conservatively aligned using a limited numerical pilot
+        to reduce seven-day right-censoring and produce informative neural-operator
+        transients; they were not fitted to experiments or validated as real drying-time
+        predictions.
   ood_provenance:
     evidence: synthetic_design
     source_refs: []
