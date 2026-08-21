@@ -14,12 +14,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import learning_losses_factory as factory
     from . import learning_losses_pino as pino
+    from . import learning_losses_transient as transient
 
 _MODULES = {
     "factory": "learning_losses_factory",
     "pino": "learning_losses_pino",
+    "transient": "learning_losses_transient",
 }
-__all__ = ["factory", "pino"]
+__all__ = ["factory", "pino", "transient"]
 
 
 def __getattr__(name: str) -> object:

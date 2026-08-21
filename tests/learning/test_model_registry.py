@@ -1,6 +1,8 @@
 # ruff: noqa: S101
 """Exercise semantic registry lookup and model construction boundaries."""
 
+import sys
+import types
 from collections.abc import Callable
 from typing import Any
 
@@ -99,3 +101,73 @@ def test_model_factory_uses_only_supplied_concrete_device(
         learning.models.factory.build_model(config, device="cpu")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="indexed CUDA device"):
         learning.models.factory.build_model(config, device=torch.device("cuda"))
+
+
+def test_rno_requires_official_constructor_and_single_step_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pass explicit one-step RNO semantics to the official constructor boundary."""
+    captured: dict[str, Any] = {}
+
+    class FakeRNO(torch.nn.Module):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+            captured.update(kwargs)
+
+    models = types.ModuleType("neuralop.models")
+    models.__dict__["RNO"] = FakeRNO
+    package = types.ModuleType("neuralop")
+    package.__dict__["models"] = models
+    monkeypatch.setitem(sys.modules, "neuralop", package)
+    monkeypatch.setitem(sys.modules, "neuralop.models", models)
+    model = learning.models.factory.build_rno(
+        in_channels=3,
+        out_channels=4,
+        n_modes=[2, 2],
+        hidden_channels=5,
+        positional_embedding=None,
+        return_sequences=False,
+    )
+    assert isinstance(model, FakeRNO)
+    assert captured["return_sequences"] is False
+    assert captured["positional_embedding"] is None
+    with pytest.raises(ValueError, match="return_sequences=False"):
+        learning.models.factory.build_rno(in_channels=3, out_channels=4, n_modes=[2, 2], hidden_channels=5, return_sequences=True)
+    with pytest.raises(ValueError, match="Unknown model identifier"):
+        learning.models.factory.resolve_model_kind("uno-rno")
+
+
+def test_transient_spectral_admission_uses_full_y_x_axes() -> None:
+    """Admit full-axis modes and reject values beyond the Train grid."""
+    config = {
+        "task": "transient_drying",
+        "model": {"kind": "fno", "params": {"n_modes": [128, 160]}},
+    }
+    learning.models.factory.validate_transient_model_spatial_shape(config, (251, 401))
+    config["model"]["params"]["n_modes"] = [252, 160]
+    with pytest.raises(ValueError, match="modes_y"):
+        learning.models.factory.validate_transient_model_spatial_shape(config, (251, 401))
+    config["model"]["params"]["n_modes"] = [128, 402]
+    with pytest.raises(ValueError, match="modes_x"):
+        learning.models.factory.validate_transient_model_spatial_shape(config, (251, 401))
+
+
+def test_transient_uno_schedule_preserves_y_x_axis_order() -> None:
+    """Reject a downsampled UNO block whose [Y, X] modes no longer fit."""
+    config = {
+        "task": "transient_drying",
+        "model": {
+            "kind": "uno",
+            "params": {
+                "modes_y": 16,
+                "modes_x": 24,
+                "n_layers": 5,
+                "mode_ratio": 0.5,
+                "uno_scalings": [[1.0, 1.0], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
+            },
+        },
+    }
+    learning.models.factory.validate_transient_model_spatial_shape(config, (32, 48))
+    config["model"]["params"]["modes_x"] = 49
+    with pytest.raises(ValueError, match="modes_x"):
+        learning.models.factory.validate_transient_model_spatial_shape(config, (32, 48))

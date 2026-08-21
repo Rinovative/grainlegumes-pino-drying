@@ -1,3 +1,4 @@
+# ruff: noqa: D417
 """
 learning_training_checkpoint.py
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 
 CheckpointRole = Literal["best", "last"]
 CHECKPOINT_SCHEMA_VERSION = 1
+_TRANSIENT_CHECKPOINT_SCHEMA_VERSION: Final = 2
 _SHA256_LENGTH: Final = 64
 _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
     {
@@ -147,8 +149,12 @@ def effective_config_identity_payload(
             "task": copy.deepcopy(config["task"]),
             "temporal": copy.deepcopy(dict(temporal)),
         }
-    unknown = sorted(keys.difference(_CONFIG_SEMANTIC_ROOT_KEYS | _CONFIG_PROVENANCE_ROOT_KEYS))
-    missing = sorted(_CONFIG_SEMANTIC_ROOT_KEYS.difference(keys))
+    is_transient = config.get("task") == "transient_drying"
+    transient_roots = frozenset({"input_profile", "temporal", "scaling"}) if is_transient else frozenset()
+    allowed_roots = _CONFIG_SEMANTIC_ROOT_KEYS | _CONFIG_PROVENANCE_ROOT_KEYS | transient_roots
+    required_roots = _CONFIG_SEMANTIC_ROOT_KEYS | transient_roots
+    unknown = sorted(keys.difference(allowed_roots))
+    missing = sorted(required_roots.difference(keys))
     if missing or unknown:
         message = f"Resolved training config fields are unclassified: missing={missing}, unknown={unknown}."
         raise ValueError(message)
@@ -160,8 +166,22 @@ def effective_config_identity_payload(
     )
     data = _selected_config_mapping(
         config["data"],
-        semantic_keys=_DATA_SEMANTIC_KEYS,
-        ignored_keys=_DATA_EXECUTION_KEYS,
+        semantic_keys=(frozenset({"train_dataset", "ood_datasets", "batch_size"}) if is_transient else _DATA_SEMANTIC_KEYS),
+        ignored_keys=(
+            frozenset(
+                {
+                    "num_workers",
+                    "pin_memory",
+                    "persistent_workers",
+                    "transient_backend_preference",
+                    "transient_backend_required",
+                    "hdf5_cache_size",
+                    "allow_technical_smoke",
+                }
+            )
+            if is_transient
+            else _DATA_EXECUTION_KEYS
+        ),
         label="data",
     )
     task_contract = _required_mapping(config["task_contract"], label="config task_contract")
@@ -173,7 +193,7 @@ def effective_config_identity_payload(
     training = copy.deepcopy(dict(_required_mapping(config["training"], label="config training")))
     if not include_epochs:
         training.pop("epochs", None)
-    return {
+    payload = {
         "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
         "task": copy.deepcopy(config["task"]),
         "task_contract": {key: copy.deepcopy(task_contract[key]) for key in sorted(required_task_contract)},
@@ -186,6 +206,11 @@ def effective_config_identity_payload(
         "scheduler": copy.deepcopy(config["scheduler"]),
         "training": training,
     }
+    if is_transient:
+        payload["input_profile"] = copy.deepcopy(config["input_profile"])
+        payload["temporal"] = copy.deepcopy(config["temporal"])
+        payload["scaling"] = copy.deepcopy(config["scaling"])
+    return payload
 
 
 def config_digest(config: Mapping[str, Any]) -> str:
@@ -264,9 +289,12 @@ def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
         _required_sha256(identity[key], label=f"{label}.{key}")
     objective = _validate_objective(identity["objective"], label=f"{label}.objective")
     normalized_roles: dict[str, dict[str, Any]] = {}
+    membership_roles = (
+        {"train", "scaling_train_one_step", "evaluation", "id_test", "ood"} if identity["task"] == "transient_drying" else {"train", "eval", "ood"}
+    )
     for key, roles in (
         ("dataset_fingerprints", {"train", "ood"}),
-        ("split_membership_digests", {"train", "eval", "ood"}),
+        ("split_membership_digests", membership_roles),
     ):
         values = _required_mapping(identity[key], label=f"{label}.{key}")
         if set(values) != roles:
@@ -316,6 +344,73 @@ def build_checkpoint_identity(
         raise TypeError(message)
     task_digest = _required_sha256(task_digest, label="config task_contract.digest")
     normalizer_digest = _required_sha256(normalizer_sha256, label="normalizer_sha256")
+    if task == "transient_drying":
+        required = {
+            "schema_kind",
+            "schema_version",
+            "task",
+            "task_contract_digest",
+            "data_contract_digest",
+            "tensorizer",
+            "sampling",
+            "dataset_identity",
+            "ood_fraction",
+            "split_seed",
+            "roles",
+            "runtime_provenance",
+        }
+        if set(split_indices) != required:
+            message = "Transient checkpoint split does not match the v2 training-split schema."
+            raise ValueError(message)
+        if split_indices["task"] != task or split_indices["task_contract_digest"] != task_digest:
+            message = "Transient checkpoint split task identity does not match the config contract."
+            raise ValueError(message)
+        identities = _required_mapping(split_indices["dataset_identity"], label="transient dataset_identity")
+        roles = _required_mapping(split_indices["roles"], label="transient roles")
+        train_identity = _required_mapping(identities.get("train"), label="transient train identity")
+        ood_identity = identities.get("ood")
+        if not isinstance(ood_identity, list) or not ood_identity:
+            message = "Transient checkpoint requires OOD package identities."
+            raise ValueError(message)
+
+        def membership(role: str) -> str:
+            if role == "ood":
+                ood_roles = _required_mapping(roles.get("ood"), label="transient ood roles").get("parts")
+                if not isinstance(ood_roles, list) or not ood_roles:
+                    message = "Transient checkpoint OOD membership evidence is invalid."
+                    raise ValueError(message)
+                return common.serialization.canonical_json_sha256(ood_roles)
+            evidence = _required_mapping(roles.get(role), label=f"transient {role} role")
+            return _required_sha256(evidence.get("membership_digest"), label=f"transient {role} membership_digest")
+
+        membership_values = {role: membership(role) for role in ("train", "scaling_train_one_step", "evaluation", "id_test", "ood")}
+        dataset_ids = {
+            "train": str(train_identity.get("dataset_id", "")),
+            "ood": common.serialization.canonical_json_sha256(ood_identity),
+        }
+        fingerprints = {
+            "train": _required_sha256(train_identity.get("index_digest"), label="transient train index_digest"),
+            "ood": common.serialization.canonical_json_sha256(ood_identity),
+        }
+        scientific_split = dict(split_indices)
+        scientific_split.pop("runtime_provenance")
+        persisted = dict(persisted_config or config)
+        return _validate_checkpoint_identity(
+            {
+                "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
+                "task": task,
+                "task_contract_digest": task_digest,
+                "effective_config_digest": config_digest(persisted),
+                "resume_contract_digest": resume_contract_digest(persisted),
+                "dataset_ids": dataset_ids,
+                "dataset_fingerprints": fingerprints,
+                "split_contract_digest": common.serialization.canonical_json_sha256(scientific_split),
+                "split_membership_digests": membership_values,
+                "normalizer_sha256": normalizer_digest,
+                "objective": objective,
+            },
+            label="built identity",
+        )
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     if split_contract.task != task or split_contract.task_contract_digest != task_digest:
         message = "Split task identity must match the checkpoint config contract."
@@ -461,6 +556,7 @@ def make_checkpoint(
     objective_history: list[dict[str, Any]],
     train_loader: DataLoader[Any],
     runtime_device: torch.device,
+    adapter: Any | None = None,
 ) -> dict[str, Any]:
     """
     Capture a complete epoch-boundary checkpoint payload.
@@ -526,10 +622,17 @@ def make_checkpoint(
         raise ValueError(msg)
 
     validated_identity = _validate_checkpoint_identity(identity, label="identity")
+    adapter_state: dict[str, Any] | None = None
+    if adapter is not None:
+        raw_adapter_state = adapter.state_dict()
+        if not isinstance(raw_adapter_state, Mapping):
+            msg = "Checkpoint adapter.state_dict() must return a mapping."
+            raise TypeError(msg)
+        adapter_state = dict(raw_adapter_state)
     generator = _train_loader_generator(train_loader)
     active_cuda_devices = _active_cuda_devices(model, runtime_device=runtime_device)
-    return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+    payload = {
+        "schema_version": _TRANSIENT_CHECKPOINT_SCHEMA_VERSION if adapter is not None else CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_role": role,
         "identity": validated_identity,
         "completed_epoch": completed_epoch,
@@ -551,6 +654,9 @@ def make_checkpoint(
         "train_loader_generator_state": generator.get_state(),
         "train_sampler_state_dict": _sampler_state(train_loader),
     }
+    if adapter_state is not None:
+        payload["adapter_state_dict"] = copy.deepcopy(adapter_state)
+    return payload
 
 
 def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
@@ -561,6 +667,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     scheduler_expected: bool,
     amp_expected: bool,
     require_best: bool,
+    adapter_expected: bool = False,
 ) -> dict[str, Any]:
     """
     Validate a checkpoint completely before runtime state restoration.
@@ -599,15 +706,20 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     generators before the checkpoint can reach transactional restoration.
 
     """
-    missing = sorted(_CHECKPOINT_KEYS.difference(payload))
-    unknown = sorted(set(payload).difference(_CHECKPOINT_KEYS))
+    expected_keys = _CHECKPOINT_KEYS | ({"adapter_state_dict"} if adapter_expected else set())
+    missing = sorted(expected_keys.difference(payload))
+    unknown = sorted(set(payload).difference(expected_keys))
     if missing or unknown:
         msg = f"Checkpoint schema mismatch. Missing keys: {missing}. Unknown keys: {unknown}."
         raise ValueError(msg)
     schema_version = payload["schema_version"]
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != CHECKPOINT_SCHEMA_VERSION:
-        msg = f"Unsupported checkpoint schema_version {schema_version!r}. Expected integer {CHECKPOINT_SCHEMA_VERSION}."
+    expected_schema = _TRANSIENT_CHECKPOINT_SCHEMA_VERSION if adapter_expected else CHECKPOINT_SCHEMA_VERSION
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != expected_schema:
+        msg = f"Unsupported checkpoint schema_version {schema_version!r}. Expected integer {expected_schema}."
         raise ValueError(msg)
+    if adapter_expected and not isinstance(payload["adapter_state_dict"], Mapping):
+        msg = "Transient checkpoint adapter_state_dict must be a mapping."
+        raise TypeError(msg)
     if payload["checkpoint_role"] != expected_role:
         msg = f"Checkpoint role mismatch: expected {expected_role!r}, got {payload['checkpoint_role']!r}."
         raise ValueError(msg)
@@ -767,6 +879,7 @@ def load_checkpoint(
     scheduler_expected: bool,
     amp_expected: bool,
     require_best: bool,
+    adapter_expected: bool = False,
 ) -> dict[str, Any]:
     """
     Load and validate one checkpoint under the strict saved schema.
@@ -807,6 +920,7 @@ def load_checkpoint(
         scheduler_expected=scheduler_expected,
         amp_expected=amp_expected,
         require_best=require_best,
+        adapter_expected=adapter_expected,
     )
 
 
@@ -821,6 +935,8 @@ def restore_checkpoint(
     amp_enabled: bool,
     loss: nn.Module,
     train_loader: DataLoader[Any],
+    adapter: Any | None = None,
+    adapter_expected: bool = False,
 ) -> dict[str, Any]:
     """
     Restore a validated last checkpoint transactionally.
@@ -868,7 +984,11 @@ def restore_checkpoint(
         scheduler_expected=scheduler is not None,
         amp_expected=amp_enabled,
         require_best=False,
+        adapter_expected=adapter_expected,
     )
+    if adapter_expected and adapter is None:
+        msg = "Transient checkpoint restoration requires an adapter."
+        raise ValueError(msg)
     generator = _train_loader_generator(train_loader)
     sampler_state = checkpoint["train_sampler_state_dict"]
     sampler = getattr(train_loader, "sampler", None)
@@ -894,6 +1014,7 @@ def restore_checkpoint(
         "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()) if scheduler is not None else None,
         "scaler_state_dict": copy.deepcopy(scaler.state_dict()) if scaler is not None else None,
         "loss_state_dict": copy.deepcopy(loss.state_dict()),
+        "adapter_state_dict": copy.deepcopy(adapter.state_dict()) if adapter is not None else None,
         "train_loader_generator_state": generator.get_state().clone(),
         "train_sampler_state_dict": copy.deepcopy(current_sampler_state),
         "python_rng_state": random.getstate(),
@@ -910,6 +1031,8 @@ def restore_checkpoint(
         if scaler is not None:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
+        if adapter_expected and adapter is not None:
+            adapter.load_state_dict(dict(checkpoint["adapter_state_dict"]))
 
         generator.set_state(checkpoint["train_loader_generator_state"])
         if sampler_state is not None and callable(sampler_load_state):
@@ -951,6 +1074,12 @@ def restore_checkpoint(
             lambda: loss.load_state_dict(snapshot["loss_state_dict"], strict=True),
             rollback_errors,
         )
+        if adapter is not None:
+            _attempt_rollback(
+                "adapter",
+                lambda: adapter.load_state_dict(cast("dict[str, Any]", snapshot["adapter_state_dict"])),
+                rollback_errors,
+            )
         _attempt_rollback(
             "train loader generator",
             lambda: generator.set_state(snapshot["train_loader_generator_state"]),
@@ -997,4 +1126,58 @@ def restore_checkpoint(
         "best_metric": checkpoint["best_metric"],
         "best_epoch": checkpoint["best_epoch"],
         "objective_history": copy.deepcopy(checkpoint["objective_history"]),
+    }
+
+
+def restore_handoff_checkpoint(
+    payload: Mapping[str, Any],
+    *,
+    expected_source_identity: Mapping[str, Any],
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: Any | None,
+    scaler: Any | None,
+    amp_enabled: bool,
+    loss: nn.Module,
+    train_loader: DataLoader[Any],
+) -> dict[str, Any]:
+    """
+    Restore the common state from an immutable transient teacher best checkpoint.
+
+    The source adapter state is required and validated but deliberately not
+    applied: the target arm owns a fresh controller and curriculum.
+    """
+    source = validate_checkpoint(
+        payload,
+        expected_identity=expected_source_identity,
+        expected_role="best",
+        scheduler_expected=scheduler is not None,
+        amp_expected=amp_enabled,
+        require_best=True,
+        adapter_expected=True,
+    )
+    common_payload = dict(source)
+    common_payload.pop("adapter_state_dict")
+    common_payload["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+    common_payload["checkpoint_role"] = "last"
+    restored = restore_checkpoint(
+        common_payload,
+        expected_identity=expected_source_identity,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        amp_enabled=amp_enabled,
+        loss=loss,
+        train_loader=train_loader,
+        adapter=None,
+        adapter_expected=False,
+    )
+    return {
+        "source_completed_epoch": source["completed_epoch"],
+        "source_global_step": source["global_step"],
+        "source_best_metric": source["best_metric"],
+        "source_best_epoch": source["best_epoch"],
+        "source_identity": copy.deepcopy(source["identity"]),
+        "restored_common_state": restored,
     }

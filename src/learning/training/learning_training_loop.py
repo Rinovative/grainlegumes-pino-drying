@@ -1,3 +1,4 @@
+# ruff: noqa: D417, EM101, EM102, TRY003
 """
 learning_training_loop.py
 
@@ -24,6 +25,8 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
+import inspect
 import math
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -36,9 +39,11 @@ from torch import nn
 from torch.amp.grad_scaler import GradScaler
 
 from src import common
+from src.learning.metrics import learning_metrics as metric_impl
 
 from . import learning_training_checkpoint as checkpoints
 from . import learning_training_events as training_events
+from .learning_training_adapter import OptimizerWork
 
 if TYPE_CHECKING:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -46,7 +51,9 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
 TensorBatch = dict[str, torch.Tensor]
+_TRANSIENT_VIEW_RANK = 5
 EpochEndCallback = Callable[[int, dict[str, float]], None]
+EpochStateCallback = Callable[[int, dict[str, float]], None]
 
 
 class PhysicsMonitorEvaluationError(RuntimeError):
@@ -153,6 +160,149 @@ def _training_batch_size(batch: TensorBatch) -> int:
     return y_samples
 
 
+def _require_adapter_step(step: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor], int, int, int]:
+    """Validate one adapter microbatch result before backward work begins."""
+    loss, components = getattr(step, "loss", None), getattr(step, "components", None)
+    counts = (getattr(step, "sample_count", None), getattr(step, "processed_target_transitions", None), getattr(step, "forward_transitions", None))
+    if not isinstance(loss, torch.Tensor) or loss.numel() != 1 or not bool(torch.isfinite(loss.detach()).all().item()):
+        raise FloatingPointError("Adapter training loss must be one finite scalar before backward.")
+    if not isinstance(components, Mapping) or "total" not in components:
+        raise TypeError("Adapter training_step components must contain total.")
+    for name, value in components.items():
+        if not isinstance(value, torch.Tensor) or value.numel() != 1 or not bool(torch.isfinite(value.detach()).all().item()):
+            raise FloatingPointError(f"Adapter component {name!r} must be finite and scalar.")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in counts):
+        raise ValueError("Adapter work counts must be positive integers.")
+    return loss, dict(components), cast("int", counts[0]), cast("int", counts[1]), cast("int", counts[2])
+
+
+def _train_adapter_one_epoch(  # noqa: C901
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: Optimizer,
+    loss_fn: nn.Module,
+    device: torch.device,
+    adapter: Any,
+    *,
+    scaler: Any | None,
+    use_amp: bool,
+) -> dict[str, float]:
+    """Train task-owned batches with transition-weighted accumulation."""
+    accumulation = getattr(adapter, "gradient_accumulation_steps", None)
+    if isinstance(accumulation, bool) or not isinstance(accumulation, int) or accumulation <= 0:
+        msg = "Adapter gradient_accumulation_steps must be a positive integer."
+        raise ValueError(msg)
+    model.train()
+    sums: dict[str, float] = {}
+    samples = processed = forwarded = microbatches = groups = successful_steps = 0
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    optimizer.zero_grad()
+    group: list[tuple[int, int, Any, Any]] = []
+    group_started = 0.0
+
+    def finish() -> None:
+        nonlocal groups, successful_steps, group
+        if not group:
+            return
+        total = sum(item[0] for item in group)
+        if use_amp and scaler is not None:
+            scaler.unscale_(optimizer)
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(total)
+        if use_amp and scaler is not None:
+            scale_before = float(scaler.get_scale())
+            scaler.step(optimizer)
+            scaler.update()
+            successful = float(scaler.get_scale()) >= scale_before
+        else:
+            optimizer.step()
+            successful = True
+        optimizer.zero_grad()
+        if device.type == "cuda":
+            group[-1][3].record(torch.cuda.current_stream(device))
+            torch.cuda.synchronize(device)
+            seconds = sum(float(start.elapsed_time(end)) / 1000.0 for _, _, start, end in group)
+            if not math.isfinite(seconds) or seconds < 0.0:
+                msg = "Adapter CUDA timing is invalid."
+                raise RuntimeError(msg)
+        else:
+            seconds = None
+        adapter.record_optimizer_work(
+            OptimizerWork(
+                successful=successful,
+                microbatches=len(group),
+                processed_target_transitions=total,
+                forward_transitions=sum(item[1] for item in group),
+                optimizer_device_seconds=seconds,
+                wall_seconds=time.perf_counter() - group_started,
+                peak_cuda_memory_bytes=(int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None),
+            )
+        )
+        groups += 1
+        successful_steps += int(successful)
+        group = []
+
+    for raw_batch in train_loader:
+        if not group:
+            group_started = time.perf_counter()
+        batch = adapter.prepare_batch(raw_batch, device=device, training=True)
+        start_event = end_event = None
+        if device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream(device))
+        if use_amp and scaler is not None:
+            with torch.autocast(device_type="cuda"):
+                step = adapter.training_step(model, batch, loss_fn)
+            loss, components, count, targets, forward = _require_adapter_step(step)
+            scaler.scale(loss * targets).backward()
+        else:
+            step = adapter.training_step(model, batch, loss_fn)
+            loss, components, count, targets, forward = _require_adapter_step(step)
+            (loss * targets).backward()
+        if end_event is not None and len(group) + 1 < accumulation:
+            end_event.record(torch.cuda.current_stream(device))
+        for name, value in components.items():
+            sums[name] = sums.get(name, 0.0) + float(value.detach().item()) * targets
+        samples += count
+        processed += targets
+        forwarded += forward
+        microbatches += 1
+        group.append((targets, forward, start_event, end_event))
+        if len(group) == accumulation:
+            finish()
+            if bool(adapter.should_stop()):
+                break
+    finish()
+    if samples == 0:
+        msg = "Adapter training loader produced no work."
+        raise RuntimeError(msg)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    duration = time.perf_counter() - started
+    if not math.isfinite(duration) or duration <= 0.0:
+        msg = f"Training phase has invalid duration {duration}."
+        raise RuntimeError(msg)
+    averaged = {name: value / processed for name, value in sums.items()}
+    result = {
+        "train/loss_total": averaged["total"],
+        "train/loss_data": averaged.get("data", averaged["total"]),
+        "system/train_duration_seconds": duration,
+        "system/train_samples_per_second": samples / duration,
+        "optimizer_steps": float(successful_steps),
+        "transient/train/samples": float(samples),
+        "transient/train/processed_target_transitions": float(processed),
+        "transient/train/forward_transitions": float(forwarded),
+        "transient/train/microbatches": float(microbatches),
+        "transient/train/optimizer_groups": float(groups),
+    }
+    result.update({f"train/loss_{name}": value for name, value in averaged.items()})
+    return result
+
+
 def train_one_epoch(
     model: nn.Module,
     train_loader: DataLoader,
@@ -162,6 +312,7 @@ def train_one_epoch(
     data_processor: Any | None = None,
     scaler: Any | None = None,
     use_amp: bool = False,
+    adapter: Any | None = None,
 ) -> dict[str, float]:
     """
     Execute one training epoch and sample-weight every named loss component.
@@ -216,6 +367,10 @@ def train_one_epoch(
     if use_amp and scaler is None:
         msg = "Mixed-precision training requires a CUDA GradScaler."
         raise ValueError(msg)
+    if adapter is not None:
+        if data_processor is not None:
+            raise ValueError("Adapter training and data_processor are mutually exclusive.")
+        return _train_adapter_one_epoch(model, train_loader, optimizer, loss_fn, device, adapter, scaler=scaler, use_amp=use_amp)
 
     model.train()
     component_sums: dict[str, float] = {}
@@ -436,6 +591,7 @@ def eval_one_epoch(
     eval_metrics: dict[str, Any],
     device: torch.device,
     data_processor: Any | None = None,
+    adapter: Any | None = None,
 ) -> dict[str, float]:
     """
     Execute evaluation with explicit tensor spaces and dataset accumulation.
@@ -476,6 +632,10 @@ def eval_one_epoch(
     No batch-level metric means are averaged.
 
     """
+    if adapter is not None:
+        if data_processor is not None:
+            raise ValueError("Adapter evaluation and data_processor are mutually exclusive.")
+        return _eval_adapter_one_epoch(model, eval_loader, eval_metrics, device, adapter)
     model.eval()
     for metric_id, metric in eval_metrics.items():
         if getattr(metric, "id", metric_id) != metric_id:
@@ -536,6 +696,93 @@ def eval_one_epoch(
     return {metric_id: metric.compute() for metric_id, metric in eval_metrics.items()}
 
 
+def _eval_adapter_one_epoch(
+    model: nn.Module,
+    eval_loader: Iterable[Any],
+    eval_metrics: dict[str, Any],
+    device: torch.device,
+    adapter: Any,
+) -> dict[str, float]:
+    """Accumulate adapter-provided BLCHW views through resolved metric objects."""
+    model.eval()
+    guardrails = {metric_id: copy.deepcopy(metric) for metric_id, metric in eval_metrics.items()}
+    for metric_id, metric in eval_metrics.items():
+        if getattr(metric, "id", metric_id) != metric_id:
+            msg = f"Evaluation metric key {metric_id!r} does not match its resolved id."
+            raise ValueError(msg)
+        metric.reset()
+        guardrails[metric_id].reset()
+    w_abs = w_sq = 0.0
+    w_count = 0
+    with torch.no_grad():
+        for batch_index, raw_batch in enumerate(eval_loader):
+            views = adapter.evaluation_step(model, adapter.prepare_batch(raw_batch, device=device, training=False))
+            source_views = (
+                views.normalized_prediction,
+                views.normalized_target,
+                views.physical_prediction,
+                views.physical_target,
+            )
+            if any(not isinstance(value, torch.Tensor) or value.ndim != _TRANSIENT_VIEW_RANK for value in source_views):
+                msg = "Adapter evaluation views must be BLCHW tensors."
+                raise ValueError(msg)
+            normalized = (views.normalized_prediction.flatten(0, 1), views.normalized_target.flatten(0, 1))
+            physical = (views.physical_prediction.flatten(0, 1), views.physical_target.flatten(0, 1))
+            for metric_id, metric in eval_metrics.items():
+                pred, target = normalized if metric.space == "normalized" else physical if metric.space == "physical" else (None, None)
+                if pred is None:
+                    msg = f"Metric {metric.id!r} requested unavailable space."
+                    raise RuntimeError(msg)
+                kwargs: dict[str, Any] = {"space": metric.space, "batch_index": batch_index}
+                mask = views.valid_mask
+                if mask is not None and "mask" in inspect.signature(metric.update).parameters:
+                    kwargs["mask"] = mask.flatten(0, 1)
+                metric.update(pred, target, **kwargs)
+                guard_kwargs: dict[str, Any] = {"space": metric.space, "batch_index": batch_index}
+                if mask is not None and "mask" in inspect.signature(guardrails[metric_id].update).parameters:
+                    guard_kwargs["mask"] = mask[:, 0]
+                source_pred, source_target = (
+                    (views.normalized_prediction[:, 0], views.normalized_target[:, 0])
+                    if metric.space == "normalized"
+                    else (views.physical_prediction[:, 0], views.physical_target[:, 0])
+                )
+                guardrails[metric_id].update(source_pred, source_target, **guard_kwargs)
+            if views.f_surf is not None:
+                fraction = (
+                    views.f_surf.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, views.physical_prediction.shape[-2], views.physical_prediction.shape[-1])
+                )
+                predicted_w = metric_impl.compute_grain_moisture(views.physical_prediction[:, :, 2], views.physical_prediction[:, :, 3], fraction)
+                target_w = metric_impl.compute_grain_moisture(views.physical_target[:, :, 2], views.physical_target[:, :, 3], fraction)
+                difference = predicted_w - target_w
+                moisture_mask = views.valid_mask
+                if moisture_mask is not None:
+                    try:
+                        expanded_mask = torch.broadcast_to(moisture_mask, views.physical_prediction.shape).select(2, 0)
+                    except RuntimeError as error:
+                        raise ValueError("Transient valid_mask must broadcast to physical prediction evidence.") from error
+                    if not bool(expanded_mask.any().item()):
+                        raise ValueError("Transient valid_mask has no valid physical moisture telemetry elements.")
+                    selected_difference = difference[expanded_mask]
+                else:
+                    selected_difference = difference
+                w_abs += float(selected_difference.abs().sum().item())
+                w_sq += float(selected_difference.square().sum().item())
+                w_count += selected_difference.numel()
+    result = {metric_id: float(metric.compute()) for metric_id, metric in eval_metrics.items()}
+    for metric_id, metric in eval_metrics.items():
+        components = getattr(metric, "components", None)
+        if callable(components):
+            component_values = components()
+            if not isinstance(component_values, Mapping):
+                raise TypeError("Metric components must return one mapping.")
+            for name, value in component_values.items():
+                result[f"{metric_id}/component/{name}"] = float(value)
+    result.update({f"guardrail/one_step/{metric_id}": float(metric.compute()) for metric_id, metric in guardrails.items()})
+    if w_count:
+        result.update({"physical/w_gr_mae": w_abs / w_count, "physical/w_gr_rmse": math.sqrt(w_sq / w_count)})
+    return result
+
+
 def evaluate_selected_checkpoint(
     *,
     config: Mapping[str, Any],
@@ -551,6 +798,7 @@ def evaluate_selected_checkpoint(
     scheduler_expected: bool,
     amp_expected: bool,
     max_physics_cases: int,
+    adapter: Any | None = None,
 ) -> dict[str, Any]:
     """Load and evaluate the authoritative best checkpoint on one shared science state."""
     payload = checkpoints.load_checkpoint(
@@ -560,6 +808,7 @@ def evaluate_selected_checkpoint(
         scheduler_expected=scheduler_expected,
         amp_expected=amp_expected,
         require_best=True,
+        adapter_expected=adapter is not None,
     )
     model.load_state_dict(payload["model_state_dict"], strict=True)
     train_loss.load_state_dict(payload["loss_state_dict"], strict=True)
@@ -568,8 +817,12 @@ def evaluate_selected_checkpoint(
     if selected_epoch != int(payload["best_epoch"]):
         msg = "Selected best checkpoint epoch disagrees with its best-objective epoch."
         raise RuntimeError(msg)
-    id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
-    ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+    if adapter is None:
+        id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+        ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+    else:
+        id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor, adapter)
+        ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor, adapter)
     objective_id = str(cast("Mapping[str, Any]", config["evaluation"])["objective"]["id"])
     if objective_id not in id_metrics or objective_id not in ood_metrics:
         msg = f"Selected checkpoint evaluation did not produce objective {objective_id!r} for both ID and OOD."
@@ -578,17 +831,18 @@ def evaluate_selected_checkpoint(
     selected: dict[str, float] = {f"selected/id/{name}": float(value) for name, value in id_metrics.items()}
     selected.update({f"selected/ood/{name}": float(value) for name, value in ood_metrics.items()})
     selected["selected/generalization/objective_gap"] = float(ood_metrics[objective_id]) - float(id_metrics[objective_id])
-    physics = evaluate_physics_monitor(
-        model,
-        eval_loader,
-        train_loss,
-        device,
-        data_processor,
-        max_cases=max_physics_cases,
-    )
-    for history_key, value in physics.items():
-        suffix = history_key.removeprefix("physics/id/")
-        selected[f"selected/physics/{suffix}"] = float(value)
+    if adapter is None:
+        physics = evaluate_physics_monitor(
+            model,
+            eval_loader,
+            train_loss,
+            device,
+            data_processor,
+            max_cases=max_physics_cases,
+        )
+        for history_key, value in physics.items():
+            suffix = history_key.removeprefix("physics/id/")
+            selected[f"selected/physics/{suffix}"] = float(value)
 
     physics_config = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["physics"])
     telemetry = getattr(train_loss, "telemetry_state", None)
@@ -625,8 +879,10 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     use_amp: bool = False,
     resume_from: Path | str | None = None,
     epoch_end_callback: EpochEndCallback | None = None,
+    epoch_state_callback: EpochStateCallback | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
     scaler: Any | None = None,
+    adapter: Any | None = None,
 ) -> dict[str, Any]:
     """
     Train through exact completed-epoch checkpoints.
@@ -656,6 +912,10 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Callback invoked after every completed epoch is safely checkpointed.
         ID, OOD, and physics values are present only when their shared predicate
         is due under each phase's independently resolved interval.
+    epoch_state_callback : Callable | None, optional
+        Adapter-only callback invoked after all completed-epoch evidence is known
+        and before ``last_checkpoint.pt`` publication. It owns durable local
+        history that may safely be truncated to the preceding checkpoint on resume.
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
     scaler : Any | None, optional
@@ -683,6 +943,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     if not identity:
         msg = "Canonical training requires a non-empty checkpoint_identity."
         raise ValueError(msg)
+    if adapter is not None and data_processor is not None:
+        raise ValueError("Adapter training and data_processor are mutually exclusive.")
 
     if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
         msg = f"Training requires one concrete CPU or CUDA torch.device, got {device!r}."
@@ -751,6 +1013,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             scheduler_expected=scheduler is not None,
             amp_expected=amp_enabled,
             require_best=False,
+            adapter_expected=adapter is not None,
         )
         restored = checkpoints.restore_checkpoint(
             last_payload,
@@ -762,6 +1025,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             amp_enabled=amp_enabled,
             loss=train_loss,
             train_loader=train_loader,
+            adapter=adapter,
+            adapter_expected=adapter is not None,
         )
         start_epoch_index = int(restored["next_epoch"]) - 1
         global_step = int(restored["global_step"])
@@ -793,6 +1058,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         if callable(set_epoch):
             set_epoch(epoch_index)
 
+        if adapter is not None:
+            adapter.begin_epoch(epoch_index=epoch_index, total_epochs=n_epochs)
         with _training_phase("training_epoch", completed_epoch):
             train_metrics = train_one_epoch(
                 model,
@@ -803,6 +1070,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                 data_processor,
                 scaler,
                 amp_enabled,
+                adapter=adapter,
             )
         optimizer_steps = int(train_metrics.pop("optimizer_steps"))
         global_step += optimizer_steps
@@ -811,7 +1079,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         id_metrics: dict[str, float] = {}
         ood_metrics: dict[str, float] = {}
         current_metric: float | None = None
-        should_evaluate_id = training_events.is_completed_epoch_event(
+        should_evaluate_id = (adapter is not None and bool(adapter.should_stop())) or training_events.is_completed_epoch_event(
             completed_epoch,
             interval=eval_interval,
             target_epoch=n_epochs,
@@ -831,9 +1099,14 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             _synchronize_device(device)
             id_started = time.perf_counter()
             with _training_phase("id_evaluation", completed_epoch):
-                id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+                if adapter is None:
+                    id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+                else:
+                    id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor, adapter)
             _synchronize_device(device)
             evaluated["system/id_evaluation_duration_seconds"] = time.perf_counter() - id_started
+            if adapter is not None:
+                adapter.record_validation_work(evaluated["system/id_evaluation_duration_seconds"])
             evaluated["system/id_evaluation_case_count"] = float(_loader_case_count(eval_loader))
             current_metric = id_metrics.get(objective_id)
             if current_metric is None:
@@ -852,6 +1125,10 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                 }
             )
 
+            if adapter is not None:
+                # Adapter work stops at the first crossing optimizer group, so this
+                # evaluation cannot observe additional post-budget parameter updates.
+                adapter.record_within_budget_evaluation(current_metric, epoch_index=epoch_index)
             if scheduler is not None:
                 old_learning_rate = float(optimizer.param_groups[0]["lr"])
                 with _training_phase("scheduler_update", completed_epoch):
@@ -885,6 +1162,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                     objective_history=objective_history,
                     train_loader=train_loader,
                     runtime_device=device,
+                    adapter=adapter,
                 )
                 with _training_phase("best_checkpoint", completed_epoch):
                     checkpoints.save_checkpoint(best_payload, best_path)
@@ -893,7 +1171,10 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             _synchronize_device(device)
             ood_started = time.perf_counter()
             with _training_phase("ood_evaluation", completed_epoch):
-                ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+                if adapter is None:
+                    ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+                else:
+                    ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor, adapter)
             _synchronize_device(device)
             evaluated["system/ood_evaluation_duration_seconds"] = time.perf_counter() - ood_started
             evaluated["system/ood_evaluation_case_count"] = float(_loader_case_count(ood_loader))
@@ -919,27 +1200,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             evaluated["system/physics_monitor_duration_seconds"] = time.perf_counter() - physics_started
             evaluated["system/physics_monitor_case_count"] = float(min(physics_monitor_max_cases, _loader_case_count(eval_loader)))
 
-        last_payload = checkpoints.make_checkpoint(
-            role="last",
-            identity=identity,
-            completed_epoch=completed_epoch,
-            global_step=global_step,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            amp_enabled=amp_enabled,
-            loss=train_loss,
-            best_metric=best_metric,
-            best_epoch=best_epoch,
-            objective_history=objective_history,
-            train_loader=train_loader,
-            runtime_device=device,
-        )
-        with _training_phase("last_checkpoint", completed_epoch):
-            checkpoints.save_checkpoint(last_payload, last_path)
-        evaluated["checkpoint/last_published"] = 1.0
-
         train_metrics["global_step"] = float(global_step)
         train_metrics["optimization/learning_rate"] = epoch_learning_rate
         epoch_duration = time.perf_counter() - epoch_started
@@ -956,14 +1216,49 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         if device.type == "cuda":
             train_metrics["system/cuda_peak_memory_allocated_bytes"] = float(torch.cuda.max_memory_allocated(device))
 
+        if adapter is not None:
+            train_metrics.update({f"transient/{key}": float(value) for key, value in adapter.telemetry_state().items() if value is not None})
+            train_metrics["transient/budget_complete"] = float(bool(adapter.should_stop()))
         terminal_epoch_metrics = {**train_metrics, **evaluated}
+        if epoch_state_callback is not None:
+            if adapter is None:
+                raise ValueError("epoch_state_callback is reserved for task-owned adapter training.")
+            with _training_phase("epoch_state", completed_epoch):
+                epoch_state_callback(completed_epoch, copy.deepcopy(terminal_epoch_metrics))
+
+        last_payload = checkpoints.make_checkpoint(
+            role="last",
+            identity=identity,
+            completed_epoch=completed_epoch,
+            global_step=global_step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            loss=train_loss,
+            best_metric=best_metric,
+            best_epoch=best_epoch,
+            objective_history=objective_history,
+            train_loader=train_loader,
+            runtime_device=device,
+            adapter=adapter,
+        )
+        with _training_phase("last_checkpoint", completed_epoch):
+            checkpoints.save_checkpoint(last_payload, last_path)
+        terminal_epoch_metrics["checkpoint/last_published"] = 1.0
         if epoch_end_callback is not None:
             with _training_phase("epoch_observers", completed_epoch):
                 epoch_end_callback(completed_epoch, terminal_epoch_metrics)
+        if adapter is not None and adapter.should_stop():
+            break
 
+    terminal_epoch = completed_epoch
     if best_metric is None or best_epoch is None:
         msg = "Training produced no finite objective and cannot be marked completed."
         raise RuntimeError(msg)
+    if adapter is not None:
+        adapter.validate_terminal_state(best_metric=best_metric, best_epoch=best_epoch)
     best_checkpoint = checkpoints.load_checkpoint(
         best_path,
         expected_identity=identity,
@@ -971,6 +1266,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         scheduler_expected=scheduler is not None,
         amp_expected=amp_enabled,
         require_best=True,
+        adapter_expected=adapter is not None,
     )
     last_checkpoint = checkpoints.load_checkpoint(
         last_path,
@@ -979,8 +1275,9 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         scheduler_expected=scheduler is not None,
         amp_expected=amp_enabled,
         require_best=True,
+        adapter_expected=adapter is not None,
     )
-    if last_checkpoint["completed_epoch"] != n_epochs:
+    if last_checkpoint["completed_epoch"] != terminal_epoch:
         msg = "Last checkpoint does not represent the configured terminal epoch."
         raise RuntimeError(msg)
     if best_checkpoint["best_metric"] != last_checkpoint["best_metric"] or best_checkpoint["best_epoch"] != last_checkpoint["best_epoch"]:
@@ -988,14 +1285,14 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         raise RuntimeError(msg)
 
     return {
-        "completed_epoch": n_epochs,
-        "next_epoch": n_epochs + 1,
+        "completed_epoch": terminal_epoch,
+        "next_epoch": terminal_epoch + 1,
         "global_step": global_step,
         "best_epoch": best_epoch,
         "best_metric": best_metric,
         "objective": dict(objective),
         "objective_history": objective_history,
-        "terminal_epoch": n_epochs,
+        "terminal_epoch": terminal_epoch,
         "terminal_metrics": {key: value for key, value in terminal_epoch_metrics.items() if key.startswith("train/")},
         "checkpoint_path": str(best_path),
         "best_checkpoint_path": str(best_path),

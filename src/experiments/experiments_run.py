@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -38,12 +39,19 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+from torch.amp.grad_scaler import GradScaler
 
 from src import common, datasets, learning
+from src.learning.transient import learning_transient_adapter as transient_adapter
+from src.learning.transient import learning_transient_handoff as transient_handoff
+from src.learning.transient import learning_transient_history as transient_adapter_history
+from src.learning.transient import learning_transient_scaling as transient_scaling
+from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 
 from . import experiments_console as console
 from . import experiments_tracking as tracking
 from .config import experiments_config_loader as config_loader
+from .config import experiments_config_transient_plan as transient_plan
 
 RUN_SUMMARY_SCHEMA_VERSION = 1
 RUN_DURATION_CONTRACT: dict[str, Any] = {
@@ -708,6 +716,29 @@ def _validate_saved_data_contract(
     CPU before resume, inference, or artifact consumers may use the state.
     """
     task = config_loader.validate_resolved_task_contract(config)
+    if task.id == "transient_drying":
+        try:
+            artifact = transient_scaling.TransientScalingArtifact.from_state_dict(normalizer_artifact)
+            tensorizer = TransientTensorizerSpec.from_mapping(
+                {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
+            )
+            admitted = datasets.runtime.transient_training.admit_transient_training_split(
+                split_indices,
+                tensorizer=tensorizer,
+                sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
+                ood_fraction=float(config["data"].get("ood_fraction", 1.0)),
+                split_seed=derive_subseed(int(config["run"]["seed"]), "split"),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            message = f"Saved transient data contract is invalid: {error}"
+            raise RunLifecycleError(message) from error
+        if artifact.tensorizer != tensorizer or artifact.scale_mode != config["scaling"]["mode"]:
+            message = "Saved transient scaling conflicts with the resolved tensorizer or scaling mode."
+            raise RunLifecycleError(message)
+        if artifact.train_membership_digest != admitted["roles"]["scaling_train_one_step"]["membership_digest"]:
+            message = "Saved transient scaling Train membership disagrees with split evidence."
+            raise RunLifecycleError(message)
+        return artifact  # type: ignore[return-value]
     data_config = config.get("data")
     run_config = config.get("run")
     if not isinstance(data_config, Mapping) or not isinstance(run_config, Mapping):
@@ -1034,7 +1065,13 @@ def prepare_fresh_run(
         )
 
 
-def _mark_failure(run_dir: Path, error: BaseException, *, interrupted: bool) -> None:
+def _mark_failure(
+    run_dir: Path,
+    error: BaseException,
+    *,
+    interrupted: bool,
+    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
+) -> None:
     """
     Best-effort publish failed or interrupted status without masking the cause.
 
@@ -1042,6 +1079,14 @@ def _mark_failure(run_dir: Path, error: BaseException, *, interrupted: bool) -> 
     this helper runs while propagating a primary lifecycle exception.
     """
     status = "interrupted" if interrupted else "failed"
+    if not interrupted and terminal_status_resolver is not None:
+        with suppress(Exception):
+            resolved_status = terminal_status_resolver(error)
+            if resolved_status is not None:
+                if resolved_status not in _TERMINAL_RUN_STATUSES:
+                    message = f"Terminal status resolver returned unsupported status: {resolved_status!r}."
+                    raise ValueError(message)
+                status = resolved_status
     with suppress(Exception):
         transition_run_status(
             run_dir,
@@ -1088,7 +1133,7 @@ def _validate_training_result_objective(
         raise RunLifecycleError(msg)
 
 
-def _execute_prepared_run_locked(
+def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     config: dict[str, Any],
     *,
     run_dir: Path,
@@ -1099,6 +1144,7 @@ def _execute_prepared_run_locked(
     epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
     summary_extra: Mapping[str, Any] | None = None,
     device_resolution: learning.device.DeviceResolution,
+    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
 ) -> dict[str, Any]:
     """
     Build and execute one fresh or explicit-resume run in an allocated leaf.
@@ -1155,31 +1201,71 @@ def _execute_prepared_run_locked(
             },
         )
         configure_reproducibility(config, device=device)
+        is_transient = config["task"] == "transient_drying"
+        handoff_manifest: dict[str, Any] | None = None
+        handoff_directory: Path | None = None
+        handoff_scaling = restored_data_processor
+        if is_transient and config["training"]["teacher_handoff"] is not None:
+            if resume_from is None:
+                source_name = str(config["training"]["teacher_handoff"]["source_run_name"])
+                source_dir = common.paths.resolve_run_output_dir(config["task"], source_name, output_root=config["paths"]["output_root"])
+                source_completed = validate_completed_run(source_dir)
+                handoff_directory = source_dir / "stage_a_handoff"
+                handoff_manifest = transient_handoff.validate_stage_a_handoff(
+                    handoff_directory, target_config=config, device=device_resolution.as_dict(), expected_source_run_name=source_name
+                )
+                handoff_scaling = transient_scaling.TransientScalingArtifact.from_state_dict(
+                    _load_mapping_artifact(handoff_directory / "normalizer.pt", label="teacher scaling")
+                )
+                if handoff_manifest["checkpoint_identity"] != source_completed["checkpoint_identity"]:
+                    message = "Teacher handoff checkpoint identity disagrees with its completed source run."
+                    raise RunLifecycleError(message)  # noqa: TRY301
+            else:
+                local_normalizer = common.paths.resolve_normalizer_path(run_dir)
+                handoff_manifest = transient_handoff.validate_local_teacher_handoff(
+                    run_dir / "teacher_handoff_manifest.json",
+                    local_normalizer_path=local_normalizer,
+                    target_config=config,
+                    device=device_resolution.as_dict(),
+                )
+                handoff_scaling = transient_scaling.TransientScalingArtifact.from_state_dict(
+                    _load_mapping_artifact(local_normalizer, label="local teacher scaling")
+                )
         dataloaders = config_loader.create_dataloaders_from_config(
             config,
             split_indices=saved_split_indices,
-            data_processor=restored_data_processor,
+            data_processor=handoff_scaling,
             seed_plan=seed_plan,
         )
         data_processor = dataloaders["data_processor"]
         split_indices = dataloaders["split_indices"]
 
         if resume_from is None:
-            split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-            normalizer_artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
-                data_processor,
-                task=config_loader.validate_resolved_task_contract(config),
-                split_contract=split_contract,
-            )
-            common.serialization.atomic_torch_save(
-                normalizer_artifact,
-                common.paths.resolve_normalizer_path(run_dir),
-            )
-            common.serialization.atomic_torch_save(
-                split_indices,
-                common.paths.resolve_split_indices_path(run_dir),
-            )
-        else:
+            if is_transient:
+                if handoff_directory is not None:
+                    if handoff_manifest is None:
+                        message = "Teacher handoff directory requires one validated manifest."
+                        raise RunLifecycleError(message)  # noqa: TRY301
+                    normalizer_path = common.paths.resolve_normalizer_path(run_dir)
+                    temporary_normalizer = normalizer_path.with_name(f".{normalizer_path.name}.{uuid.uuid4().hex}.tmp")
+                    try:
+                        shutil.copyfile(handoff_directory / "normalizer.pt", temporary_normalizer)
+                        temporary_normalizer.replace(normalizer_path)
+                    finally:
+                        temporary_normalizer.unlink(missing_ok=True)
+                    common.serialization.atomic_write_json(run_dir / "teacher_handoff_manifest.json", handoff_manifest)
+                else:
+                    common.serialization.atomic_torch_save(data_processor.state_dict(), common.paths.resolve_normalizer_path(run_dir))
+            else:
+                split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
+                normalizer_artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
+                    data_processor,
+                    task=config_loader.validate_resolved_task_contract(config),
+                    split_contract=split_contract,
+                )
+                common.serialization.atomic_torch_save(normalizer_artifact, common.paths.resolve_normalizer_path(run_dir))
+            common.serialization.atomic_torch_save(split_indices, common.paths.resolve_split_indices_path(run_dir))
+        elif not is_transient:
             _validate_reused_data_state(
                 data_processor=data_processor,
                 restored_data_processor=restored_data_processor,
@@ -1188,6 +1274,11 @@ def _execute_prepared_run_locked(
             )
 
         seed_process(seed_plan["model_init"], device=device)
+        if is_transient:
+            learning.models.factory.validate_transient_model_spatial_shape(
+                config,
+                data_processor.spatial_shape,
+            )
         model = learning.models.factory.build_model(config, device=device)
         train_loss = learning.losses.factory.build_training_loss(config, device=device)
         set_normalizers = getattr(train_loss, "set_normalizers", None)
@@ -1196,11 +1287,31 @@ def _execute_prepared_run_locked(
                 in_normalizer=data_processor.in_normalizer,
                 out_normalizer=data_processor.out_normalizer,
             )
-        data_processor.to(device)
+        adapter = None
+        loop_data_processor = data_processor
+        if is_transient:
+            teacher_identity = None
+            if handoff_manifest is not None:
+                teacher_identity = transient_adapter.TeacherHandoffIdentity(
+                    source_run_name=handoff_manifest["source_run_name"],
+                    source_checkpoint_sha256=handoff_manifest["files"]["checkpoint"]["sha256"],
+                    source_scaling_sha256=handoff_manifest["files"]["scaling"]["sha256"],
+                    task_contract_sha256=handoff_manifest["task_contract_digest"],
+                    tensorizer_sha256=handoff_manifest["tensorizer_digest"],
+                    model_kind=handoff_manifest["model_kind"],
+                    input_profile=handoff_manifest["input_profile"],
+                )
+            adapter = transient_adapter.build_transient_training_adapter(
+                config, scaling=data_processor, device=device, teacher_handoff=teacher_identity
+            )
+            loop_data_processor = None
+        else:
+            data_processor.to(device)
+        output_standard_deviations = data_processor.state_std if is_transient else data_processor.out_normalizer.std
         eval_metrics = learning.metrics.metrics.build_evaluation_metrics(
             config,
             device=device,
-            output_standard_deviations=data_processor.out_normalizer.std,
+            output_standard_deviations=output_standard_deviations,
         )
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
@@ -1211,6 +1322,35 @@ def _execute_prepared_run_locked(
             persisted_config=persisted_config,
         )
 
+        transient_history_callback = None
+        if is_transient:
+            completed_epoch = 0
+            if resume_from is not None:
+                saved_last = learning.training.checkpoint.load_checkpoint(
+                    resume_from,
+                    expected_identity=identity,
+                    expected_role="last",
+                    scheduler_expected=scheduler is not None,
+                    amp_expected=amp_enabled,
+                    require_best=False,
+                    adapter_expected=True,
+                )
+                completed_epoch = int(saved_last["completed_epoch"])
+            initial_history = transient_adapter_history.reconcile_history(
+                run_dir,
+                task=str(config["task"]),
+                run_name=str(config["run"]["name"]),
+                checkpoint_identity=identity,
+                completed_epoch=completed_epoch,
+            )
+            transient_history_callback = transient_adapter_history.make_epoch_state_callback(
+                run_dir,
+                task=str(config["task"]),
+                run_name=str(config["run"]["name"]),
+                checkpoint_identity=identity,
+                initial_history=initial_history,
+            )
+
         def state_updater(updates: Mapping[str, Any]) -> None:
             """Persist W&B observer facts while the run writer lease is already held."""
             _update_runtime_session_locked(
@@ -1219,6 +1359,33 @@ def _execute_prepared_run_locked(
                 updates,
             )
 
+        transient_scaling_payload: Mapping[str, Any] | None = None
+        if is_transient:
+            scaling_state = data_processor.state_dict()
+            transient_scaling_payload = {
+                key: copy.deepcopy(scaling_state[key])
+                for key in (
+                    "schema_kind",
+                    "schema_version",
+                    "task_contract_digest",
+                    "data_contract_digest",
+                    "tensorizer",
+                    "dataset_identity",
+                    "train_membership_digest",
+                    "scale_mode",
+                    "numerical_floor",
+                    "unique_train_state_count",
+                    "unique_transition_count",
+                    "transition_count",
+                    "spatial_shape",
+                    "state_names",
+                    "static_names",
+                    "boundary_names",
+                    "scalar_names",
+                    "horizon",
+                )
+            }
+            transient_scaling_payload["semantic_digest"] = data_processor.digest
         monitor_membership = tracking.build_monitor_membership(config, split_indices)
         if monitor_membership is not None:
             state_updater({"monitor": monitor_membership})
@@ -1239,6 +1406,10 @@ def _execute_prepared_run_locked(
                 model=model,
                 device_metadata=device_resolution.as_dict(),
                 duration_contract=RUN_DURATION_CONTRACT,
+                runtime_provenance=(dataloaders.get("runtime_provenance") if is_transient else None),
+                transient_scaling=transient_scaling_payload,
+                transient_handoff=handoff_manifest,
+                tuning_context=(dict(summary_extra) if summary_extra and "study_name" in summary_extra else None),
             )
 
         console_reporter.startup(resolved_device=str(device))
@@ -1253,6 +1424,29 @@ def _execute_prepared_run_locked(
             state_updater=state_updater,
         )
 
+        handoff_scaler = GradScaler("cuda") if amp_enabled else None
+        if handoff_manifest is not None and handoff_directory is not None:
+            teacher_payload = learning.training.checkpoint.load_checkpoint(
+                handoff_directory / "best_checkpoint.pt",
+                expected_identity=handoff_manifest["checkpoint_identity"],
+                expected_role="best",
+                scheduler_expected=scheduler is not None,
+                amp_expected=amp_enabled,
+                require_best=True,
+                adapter_expected=True,
+            )
+            learning.training.checkpoint.restore_handoff_checkpoint(
+                teacher_payload,
+                expected_source_identity=handoff_manifest["checkpoint_identity"],
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=handoff_scaler,
+                amp_enabled=amp_enabled,
+                loss=train_loss,
+                train_loader=dataloaders["train"],
+            )
+
         result = learning.training.loop.train_loop(
             config=config,
             device=device,
@@ -1263,7 +1457,7 @@ def _execute_prepared_run_locked(
             train_loss=train_loss,
             eval_metrics=eval_metrics,
             ood_loader=dataloaders["ood"],
-            data_processor=data_processor,
+            data_processor=loop_data_processor,
             scheduler=scheduler,
             save_dir=run_dir,
             use_amp=config["training"].get("mixed_precision", False),
@@ -1274,6 +1468,9 @@ def _execute_prepared_run_locked(
                 tracking.epoch_callback(tracker),
             ),
             checkpoint_identity=identity,
+            adapter=adapter,
+            epoch_state_callback=transient_history_callback,
+            scaler=handoff_scaler,
         )
         objective = config_loader.get_resolved_objective(config)
         _validate_training_result_objective(result, objective)
@@ -1285,16 +1482,75 @@ def _execute_prepared_run_locked(
             ood_loader=dataloaders["ood"],
             eval_metrics=eval_metrics,
             device=device,
-            data_processor=data_processor,
+            data_processor=loop_data_processor,
             checkpoint_identity=identity,
             best_checkpoint_path=result["best_checkpoint_path"],
             scheduler_expected=scheduler is not None,
             amp_expected=amp_enabled,
             max_physics_cases=int(config["tracking"]["wandb"]["monitor"]["max_cases"]),
+            adapter=adapter,
         )
         result.update(selected)
+        published_handoff: dict[str, Any] | None = None
+        if is_transient and config["training"]["comparison_arm"] == "a0":
+            tensorizer_digest = common.serialization.canonical_json_sha256(dataloaders["tensorizer"].as_dict())
+            published_handoff = transient_handoff.publish_stage_a_handoff(
+                run_dir,
+                source_run_name=str(config["run"]["name"]),
+                checkpoint_identity=identity,
+                best_epoch=int(result["best_epoch"]),
+                global_step=int(result["global_step"]),
+                scaling_semantic_digest=data_processor.digest,
+                task_contract_digest=str(config["task_contract"]["digest"]),
+                tensorizer_digest=tensorizer_digest,
+                model_kind=str(config["model"]["kind"]),
+                input_profile=str(config["input_profile"]),
+                device=device_resolution.as_dict(),
+                config=config,
+            )
         end_time = datetime.now(timezone.utc)
         console_reporter.final(result, total_wall_seconds=(end_time - start_time).total_seconds())
+        transient_completion_evidence: dict[str, Any] = {}
+        if is_transient:
+            if adapter is None or transient_scaling_payload is None:
+                message = "Transient completion requires adapter and scaling evidence."
+                raise AssertionError(message)  # noqa: TRY301
+            controller = adapter.budget_state()
+            terminal_controller_keys = (
+                "arm",
+                "stage",
+                "clock_kind",
+                "post_handoff_optimizer_device_seconds",
+                "post_handoff_optimizer_steps",
+                "successful_optimizer_steps",
+                "teacher_forcing_optimizer_device_seconds",
+                "teacher_forcing_optimizer_steps",
+                "processed_target_transitions",
+                "forward_transitions",
+                "wall_seconds",
+                "validation_seconds",
+                "peak_cuda_memory_bytes",
+                "budget_complete",
+                "crossing_epoch",
+                "crossing_microbatch",
+                "best_within_budget_metric",
+                "best_within_budget_epoch",
+                "planned_teacher_forcing_budget_seconds",
+                "planned_teacher_forcing_budget_steps",
+                "rollout_reference_compute_seconds",
+                "rollout_reference_compute_steps",
+            )
+            transient_completion_evidence = {
+                "checkpoint_identity": copy.deepcopy(identity),
+                "transient_scaling": copy.deepcopy(dict(transient_scaling_payload)),
+                "runtime_backend_provenance": copy.deepcopy(dict(dataloaders["runtime_provenance"])),
+                "terminal_controller": {key: controller[key] for key in terminal_controller_keys},
+                "terminal_curriculum": {
+                    "active_stage": adapter.curriculum_state.active_stage,
+                    "max_horizon": adapter.curriculum_state.max_horizon,
+                    "draw_index": adapter.curriculum_state.draw_index,
+                },
+            }
         completed_updates = {
             "task": config["task"],
             "run_name": config["run"]["name"],
@@ -1322,6 +1578,14 @@ def _execute_prepared_run_locked(
             "ended_at": end_time.isoformat(),
             "error": None,
             "error_type": None,
+            "teacher_handoff": handoff_manifest,
+            "teacher_handoff_manifest_sha256": (
+                common.serialization.file_sha256(run_dir / "teacher_handoff_manifest.json")
+                if (run_dir / "teacher_handoff_manifest.json").is_file()
+                else None
+            ),
+            "stage_a_handoff": published_handoff,
+            **transient_completion_evidence,
             **dict(summary_extra or {}),
         }
         transition_run_status(run_dir, "completed", updates=completed_updates)
@@ -1342,10 +1606,15 @@ def _execute_prepared_run_locked(
                 },
             )
         console_reporter.failure(error, status=tracking_status)
-        _mark_failure(run_dir, error, interrupted=True)
+        _mark_failure(run_dir, error, interrupted=True, terminal_status_resolver=terminal_status_resolver)
         raise
     except BaseException as error:
         tracking_error = error
+        if terminal_status_resolver is not None:
+            with suppress(Exception):
+                resolved_status = terminal_status_resolver(error)
+                if resolved_status in _TERMINAL_RUN_STATUSES:
+                    tracking_status = resolved_status
         if tracking_enabled and tracker is None and not tracking_initialization_attempted:
             _update_runtime_session_locked(
                 run_dir,
@@ -1358,7 +1627,7 @@ def _execute_prepared_run_locked(
                 },
             )
         console_reporter.failure(error, status=tracking_status)
-        _mark_failure(run_dir, error, interrupted=False)
+        _mark_failure(run_dir, error, interrupted=False, terminal_status_resolver=terminal_status_resolver)
         raise
     finally:
         if tracker is not None:
@@ -1389,6 +1658,7 @@ def execute_prepared_run(
     epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
     summary_extra: Mapping[str, Any] | None = None,
     device_resolution: learning.device.DeviceResolution,
+    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
 ) -> dict[str, Any]:
     """
     Execute a prepared fresh or resume run under its exclusive writer lease.
@@ -1417,6 +1687,9 @@ def execute_prepared_run(
         Caller-owned facts merged into lifecycle publications.
     device_resolution : learning.device.DeviceResolution
         Concrete service-resolved device and serializable runtime metadata.
+    terminal_status_resolver : Callable[[BaseException], str | None] | None, optional
+        Optional caller-owned classifier for terminal trial outcomes. The returned
+        status must be an admitted run terminal status.
 
     Returns
     -------
@@ -1456,6 +1729,7 @@ def execute_prepared_run(
             epoch_end_callback=epoch_end_callback,
             summary_extra=summary_extra,
             device_resolution=device_resolution,
+            terminal_status_resolver=terminal_status_resolver,
         )
 
 
@@ -1465,7 +1739,7 @@ def _evaluable_run_result(
     summary: Mapping[str, Any],
     config: Mapping[str, Any],
     split_indices: Mapping[str, Any],
-    normalizer_state: Mapping[str, Any],
+    normalizer_state: Mapping[str, Any] | transient_scaling.TransientScalingArtifact,
     checkpoint_identity: Mapping[str, Any],
     best_checkpoint: Mapping[str, Any],
     lifecycle_status: str,
@@ -1475,12 +1749,15 @@ def _evaluable_run_result(
     scientific_run_name = str(config["run"]["name"])
     checkpoint_path = common.paths.resolve_best_checkpoint_file(path)
     normalizer_path = common.paths.resolve_normalizer_path(path)
+    serialized_normalizer = (
+        normalizer_state.state_dict() if isinstance(normalizer_state, transient_scaling.TransientScalingArtifact) else dict(normalizer_state)
+    )
     return {
         "run_dir": path,
         "summary": dict(summary),
         "config": dict(config),
         "split_indices": dict(split_indices),
-        "normalizer_state": dict(normalizer_state),
+        "normalizer_state": serialized_normalizer,
         "checkpoint_identity": dict(checkpoint_identity),
         "best_checkpoint": dict(best_checkpoint),
         "lifecycle_status": lifecycle_status,
@@ -1646,6 +1923,84 @@ def validate_evaluable_run(run_dir: Path | str) -> dict[str, Any]:
         return admitted
 
 
+def _validate_transient_completed_summary(
+    *,
+    summary: Mapping[str, Any],
+    config: Mapping[str, Any],
+    split_indices: Mapping[str, Any],
+    normalizer_state: Any,
+    checkpoint_identity: Mapping[str, Any],
+    last_checkpoint: Mapping[str, Any],
+) -> None:
+    """Cross-check bounded transient completion evidence against durable state."""
+    required = {
+        "checkpoint_identity",
+        "transient_scaling",
+        "runtime_backend_provenance",
+        "terminal_controller",
+        "terminal_curriculum",
+    }
+    if not required.issubset(summary):
+        message = "Completed transient run summary lacks required completion evidence."
+        raise RunLifecycleError(message)
+    if summary["checkpoint_identity"] != checkpoint_identity:
+        message = "Completed transient summary checkpoint identity mismatch."
+        raise RunLifecycleError(message)
+    scaling = summary["transient_scaling"]
+    if not isinstance(scaling, Mapping) or scaling.get("semantic_digest") != normalizer_state.digest:
+        message = "Completed transient summary scaling identity mismatch."
+        raise RunLifecycleError(message)
+    if scaling.get("task_contract_digest") != config["task_contract"]["digest"]:
+        message = "Completed transient summary task contract digest mismatch."
+        raise RunLifecycleError(message)
+    provenance = summary["runtime_backend_provenance"]
+    expected_provenance = split_indices.get("runtime_provenance")
+    if not isinstance(provenance, Mapping) or provenance != expected_provenance:
+        message = "Completed transient summary runtime backend provenance disagrees with saved split evidence."
+        raise RunLifecycleError(message)
+    adapter_state = last_checkpoint.get("adapter_state_dict")
+    if not isinstance(adapter_state, Mapping) or not isinstance(adapter_state.get("controller"), Mapping):
+        message = "Completed transient last checkpoint lacks controller evidence."
+        raise RunLifecycleError(message)
+    controller = adapter_state["controller"]
+    terminal = summary["terminal_controller"]
+    terminal_keys = {
+        "arm",
+        "stage",
+        "clock_kind",
+        "post_handoff_optimizer_device_seconds",
+        "post_handoff_optimizer_steps",
+        "successful_optimizer_steps",
+        "teacher_forcing_optimizer_device_seconds",
+        "teacher_forcing_optimizer_steps",
+        "processed_target_transitions",
+        "forward_transitions",
+        "wall_seconds",
+        "validation_seconds",
+        "peak_cuda_memory_bytes",
+        "budget_complete",
+        "crossing_epoch",
+        "crossing_microbatch",
+        "best_within_budget_metric",
+        "best_within_budget_epoch",
+        "planned_teacher_forcing_budget_seconds",
+        "planned_teacher_forcing_budget_steps",
+        "rollout_reference_compute_seconds",
+        "rollout_reference_compute_steps",
+    }
+    if not isinstance(terminal, Mapping) or set(terminal) != terminal_keys or any(terminal[key] != controller.get(key) for key in terminal_keys):
+        message = "Completed transient summary terminal controller mismatch."
+        raise RunLifecycleError(message)
+    curriculum = adapter_state.get("curriculum")
+    terminal_curriculum = summary["terminal_curriculum"]
+    if not isinstance(curriculum, Mapping) or not isinstance(terminal_curriculum, Mapping):
+        message = "Completed transient curriculum evidence is invalid."
+        raise RunLifecycleError(message)
+    if terminal_curriculum != {key: curriculum.get(key) for key in ("active_stage", "max_horizon", "draw_index")}:
+        message = "Completed transient summary terminal curriculum mismatch."
+        raise RunLifecycleError(message)
+
+
 def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     """
     Validate and return the completed/loadable run contract.
@@ -1721,6 +2076,7 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
         scheduler_expected=scheduler_expected,
         amp_expected=amp_enabled,
         require_best=True,
+        adapter_expected=config["task"] == "transient_drying",
     )
     last = learning.training.checkpoint.load_checkpoint(
         common.paths.resolve_last_checkpoint_file(path),
@@ -1729,6 +2085,7 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
         scheduler_expected=scheduler_expected,
         amp_expected=amp_enabled,
         require_best=True,
+        adapter_expected=config["task"] == "transient_drying",
     )
     saved_identities = (best["identity"], last["identity"])
     if saved_identities[0] != saved_identities[1] or summary.get("effective_config_digest") != saved_identities[0]["effective_config_digest"]:
@@ -1746,6 +2103,26 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     if last["best_metric"] != best["best_metric"] or last["best_epoch"] != best["best_epoch"]:
         msg = "Completed run best and last checkpoints disagree."
         raise RunLifecycleError(msg)
+    if config["task"] == "transient_drying":
+        _validate_transient_completed_summary(
+            summary=summary,
+            config=config,
+            split_indices=split_indices,
+            normalizer_state=normalizer_state,
+            checkpoint_identity=best["identity"],
+            last_checkpoint=last,
+        )
+        try:
+            transient_adapter_history.validate_completed_history(
+                path,
+                task=str(config["task"]),
+                run_name=str(config["run"]["name"]),
+                checkpoint_identity=last["identity"],
+                completed_epoch=int(last["completed_epoch"]),
+            )
+        except (FileNotFoundError, TypeError, ValueError) as error:
+            message = f"Completed transient history admission failed: {error}"
+            raise RunLifecycleError(message) from error
     expected_summary_values = {
         "task": config.get("task"),
         "run_name": config.get("run", {}).get("name") if isinstance(config.get("run"), Mapping) else None,
@@ -1775,12 +2152,13 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     }
 
 
-def run_experiment(
-    config_path: Path | str,
+def _run_resolved_experiment(
+    requested: dict[str, Any],
     *,
+    config_path: Path | str,
     resume: Path | str | None = None,
-    device: str | None = None,
     output_root: Path | str | None = None,
+    device_resolution: learning.device.DeviceResolution | None = None,
 ) -> dict[str, Any]:
     """
     Resolve and execute a fresh or explicit-resume experiment.
@@ -1792,14 +2170,15 @@ def run_experiment(
 
     Parameters
     ----------
+    requested : dict[str, Any]
+        Fully resolved ordinary single-run configuration.
     config_path : pathlib.Path | str
-        Semantic experiment YAML resolved under the strict current schema.
+        Semantic request source used only for lifecycle diagnostics.
+    device_resolution : learning.device.DeviceResolution | None, optional
+        Pre-resolved concrete device shared by a higher-level sequencer when supplied.
     resume : pathlib.Path | str | None, optional
         Existing run directory explicitly continued from ``last_checkpoint.pt``.
         ``None`` requires exclusive allocation of a new run leaf.
-    device : {"auto", "cuda", "cpu"} | None, optional
-        Runtime policy override. Strict ``cuda`` never falls back. ``None`` keeps
-        the YAML policy. The concrete resolution is recorded per runtime session.
     output_root : pathlib.Path | str | None, optional
         Fresh-run destination override. On resume it must resolve to the exact
         saved task/run leaf. Dataset roots remain unchanged.
@@ -1843,22 +2222,6 @@ def run_experiment(
     W&B session fails the operation after durable local evidence is published.
 
     """
-    raw_requested = config_loader.load_yaml(config_path)
-    if device is not None:
-        raw_run = raw_requested.get("run")
-        if raw_run is None:
-            raw_run = {}
-            raw_requested["run"] = raw_run
-        if not isinstance(raw_run, dict):
-            msg = "run must be a mapping before applying --device."
-            raise config_loader.ConfigError(msg)
-        raw_run["device"] = device
-    requested = config_loader.resolve_config(raw_requested)
-    config_loader.validate_task_directory_identity(
-        config_path,
-        raw_task=raw_requested.get("task"),
-        resolved_task=requested.get("task"),
-    )
     fresh_destination: Path | None = None
     if resume is None:
         if output_root is not None:
@@ -1875,10 +2238,11 @@ def run_experiment(
                 config_path=config_path,
             )
 
-    device_resolution = learning.device.resolve_device(
-        requested["run"]["device"],
-        path="run.device",
-    )
+    if device_resolution is None:
+        device_resolution = learning.device.resolve_device(
+            requested["run"]["device"],
+            path="run.device",
+        )
     learning.device.validate_mixed_precision_device(
         requested["training"]["mixed_precision"],
         device_resolution,
@@ -1896,7 +2260,7 @@ def run_experiment(
                 persisted_config=requested,
                 device_resolution=device_resolution,
             )
-        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution}
+        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution, "task": str(requested["task"])}
 
     run_dir = Path(resume).expanduser().resolve()
     if not run_dir.is_dir():
@@ -1922,7 +2286,11 @@ def run_experiment(
         split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
         normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
         normalizer_state = _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
-        data_processor = datasets.preprocessing.normalization.data_processor_from_state(normalizer_state, device="cpu")
+        data_processor = (
+            normalizer_state
+            if saved_config["task"] == "transient_drying"
+            else datasets.preprocessing.normalization.data_processor_from_state(normalizer_state, device="cpu")
+        )
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,
             split_indices,
@@ -1937,6 +2305,7 @@ def run_experiment(
             scheduler_expected=runtime_config.get("scheduler") is not None,
             amp_expected=amp_enabled,
             require_best=False,
+            adapter_expected=runtime_config["task"] == "transient_drying",
         )
         best_path = common.paths.resolve_best_checkpoint_file(run_dir)
         if last["best_metric"] is None:
@@ -1951,6 +2320,7 @@ def run_experiment(
                 scheduler_expected=runtime_config.get("scheduler") is not None,
                 amp_expected=amp_enabled,
                 require_best=True,
+                adapter_expected=runtime_config["task"] == "transient_drying",
             )
             if best["best_metric"] != last["best_metric"] or best["best_epoch"] != last["best_epoch"]:
                 msg = "Resume run best and last checkpoints disagree about selected objective state."
@@ -1971,4 +2341,205 @@ def run_experiment(
             resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
             device_resolution=device_resolution,
         )
-        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution}
+        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution, "task": str(requested["task"])}
+
+
+def _apply_device_override(raw: dict[str, Any], device: str | None) -> None:
+    """Apply one CLI device policy before authored-plan or single-run resolution."""
+    if device is None:
+        return
+    run = raw.get("run")
+    if run is None:
+        run = {}
+        raw["run"] = run
+    if not isinstance(run, dict):
+        message = "run must be a mapping before applying --device."
+        raise config_loader.ConfigError(message)
+    run["device"] = device
+
+
+def _with_output_root(config: Mapping[str, Any], output_root: Path | str | None) -> dict[str, Any]:
+    """Return an isolated resolved config with an optional fresh-output root override."""
+    resolved = copy.deepcopy(dict(config))
+    if output_root is not None:
+        resolved["paths"]["output_root"] = str(Path(output_root).expanduser())
+    return resolved
+
+
+def _stage_destination(config: Mapping[str, Any]) -> Path:
+    """Return the deterministic leaf for one resolved transient stage."""
+    return common.paths.resolve_run_output_dir(
+        str(config["task"]),
+        str(config["run"]["name"]),
+        output_root=Path(config["paths"]["output_root"]),
+    )
+
+
+def _validate_reusable_stage_a(
+    run_dir: Path,
+    *,
+    requested_a: Mapping[str, Any],
+    requested_b: Mapping[str, Any],
+    device_resolution: learning.device.DeviceResolution,
+) -> None:
+    """Admit a completed A leaf only when config and immutable handoff match the plan."""
+    completed = validate_completed_run(run_dir)
+    saved = config_loader.validate_resolved_config(completed["config"])
+    if saved != dict(requested_a):
+        message = "Completed Stage A config differs from the derived requested Stage A config."
+        raise RunLifecycleError(message)
+    transient_handoff.validate_stage_a_handoff(
+        run_dir / "stage_a_handoff",
+        target_config=requested_b,
+        device=device_resolution.as_dict(),
+        expected_source_run_name=str(requested_a["run"]["name"]),
+    )
+
+
+def _run_transient_two_stage_plan(
+    raw: dict[str, Any],
+    *,
+    config_path: Path | str,
+    resume: Path | str | None,
+    output_root: Path | str | None,
+) -> dict[str, Any]:
+    """Execute or explicitly resume the two independently persisted transient stages."""
+    plan = transient_plan.resolve_transient_training_plan(raw)
+    config_loader.validate_task_directory_identity(
+        config_path,
+        raw_task=raw.get("task"),
+        resolved_task=plan.stage_a.get("task"),
+    )
+    a_config = _with_output_root(plan.stage_a, output_root)
+    b_config = _with_output_root(plan.stage_b, output_root)
+    device_resolution = learning.device.resolve_device(a_config["run"]["device"], path="run.device")
+    learning.device.validate_mixed_precision_device(a_config["training"]["mixed_precision"], device_resolution)
+    validate_deterministic_model_device_policy(a_config, device_resolution)
+    a_dir = _stage_destination(a_config)
+    b_dir = _stage_destination(b_config)
+
+    if resume is not None:
+        resume_dir = Path(resume).expanduser().resolve()
+        if resume_dir == a_dir:
+            if b_dir.exists():
+                raise reject_existing_fresh_run(b_dir, b_config, config_path=config_path)
+            a_outcome = _run_resolved_experiment(
+                a_config,
+                config_path=config_path,
+                resume=resume_dir,
+                output_root=output_root,
+                device_resolution=device_resolution,
+            )
+            _validate_reusable_stage_a(
+                a_outcome["run_dir"],
+                requested_a=a_config,
+                requested_b=b_config,
+                device_resolution=device_resolution,
+            )
+            b_outcome = _run_resolved_experiment(
+                b_config,
+                config_path=config_path,
+                output_root=output_root,
+                device_resolution=device_resolution,
+            )
+        elif resume_dir == b_dir:
+            _validate_reusable_stage_a(
+                a_dir,
+                requested_a=a_config,
+                requested_b=b_config,
+                device_resolution=device_resolution,
+            )
+            b_outcome = _run_resolved_experiment(
+                b_config,
+                config_path=config_path,
+                resume=resume_dir,
+                output_root=output_root,
+                device_resolution=device_resolution,
+            )
+        else:
+            message = f"--resume must name the derived Stage A or Stage B run leaf: {resume_dir}"
+            raise ValueError(message)
+        return {**b_outcome, "stage_runs": {"a": a_dir, "b": b_dir}}
+
+    if b_dir.exists():
+        raise reject_existing_fresh_run(b_dir, b_config, config_path=config_path)
+    if a_dir.exists():
+        try:
+            _validate_reusable_stage_a(
+                a_dir,
+                requested_a=a_config,
+                requested_b=b_config,
+                device_resolution=device_resolution,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError, RunLifecycleError):
+            raise reject_existing_fresh_run(a_dir, a_config, config_path=config_path) from None
+    else:
+        a_outcome = _run_resolved_experiment(
+            a_config,
+            config_path=config_path,
+            output_root=output_root,
+            device_resolution=device_resolution,
+        )
+        _validate_reusable_stage_a(
+            a_outcome["run_dir"],
+            requested_a=a_config,
+            requested_b=b_config,
+            device_resolution=device_resolution,
+        )
+    b_outcome = _run_resolved_experiment(
+        b_config,
+        config_path=config_path,
+        output_root=output_root,
+        device_resolution=device_resolution,
+    )
+    return {**b_outcome, "stage_runs": {"a": a_dir, "b": b_dir}}
+
+
+def run_experiment(
+    config_path: Path | str,
+    *,
+    resume: Path | str | None = None,
+    device: str | None = None,
+    output_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve and execute one single-stage experiment or authored transient A0-to-B plan.
+
+    Parameters
+    ----------
+    config_path : Path | str
+        Authored ordinary experiment YAML or strict transient two-stage plan YAML.
+    resume : Path | str | None, optional
+        Explicit existing leaf to resume. Two-stage plans admit only their derived A or B leaf.
+    device : str | None, optional
+        Device-policy override applied before configuration or plan resolution.
+    output_root : Path | str | None, optional
+        Fresh output root shared by all derived plan stages.
+
+    Returns
+    -------
+    dict[str, Any]
+        Final single-run or Stage-B outcome. Authored plans additionally expose ``stage_runs``.
+
+    """
+    raw_requested = config_loader.load_yaml(config_path)
+    _apply_device_override(raw_requested, device)
+    if transient_plan.is_transient_two_stage_config(raw_requested):
+        return _run_transient_two_stage_plan(
+            raw_requested,
+            config_path=config_path,
+            resume=resume,
+            output_root=output_root,
+        )
+    requested = config_loader.resolve_config(raw_requested)
+    config_loader.validate_task_directory_identity(
+        config_path,
+        raw_task=raw_requested.get("task"),
+        resolved_task=requested.get("task"),
+    )
+    return _run_resolved_experiment(
+        requested,
+        config_path=config_path,
+        resume=resume,
+        output_root=output_root,
+    )

@@ -30,6 +30,6 @@ dependencies:
       - basedpyright
       - pandas-stubs
       - types-PyYAML
-      - neuraloperator==2.0.*
+      - neuraloperator @ git+https://github.com/neuraloperator/neuraloperator.git@86a8bc7812a31b42c4f7895693cf4ac11521c066
       - optuna
       - wandb == 0.28.1

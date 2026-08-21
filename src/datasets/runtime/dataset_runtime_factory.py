@@ -157,16 +157,12 @@ def _select_transient(
         membership=membership,
         ood_group=ood_group,
     )
-    dataset.close()
-    dataset_type = transient.TransientPTShardDataset if isinstance(dataset, transient.TransientPTShardDataset) else transient.TransientPhysicalDataset
-    return dataset_type(
-        dataset.index_path,
-        sampling=dataset.sampling,
-        source_root=dataset.source_root,
-        hdf5_cache_size=dataset.hdf5_cache_size,
-        sample_indices=indices,
-        transform=dataset.transform,
+    case_ids = tuple(
+        dict.fromkeys(
+            str(dataset.payload["cases"][int(dataset.payload["samples"][position]["case_index"])]["package_case_id"]) for position in indices
+        )
     )
+    return transient.select_transient_cases(dataset, case_ids)
 
 
 def _create_dataset_from_manifest(

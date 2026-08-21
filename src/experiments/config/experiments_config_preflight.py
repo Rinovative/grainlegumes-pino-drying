@@ -8,6 +8,7 @@ from pathlib import Path
 from src import common
 
 from . import experiments_config_loader as loader
+from . import experiments_config_transient_plan as transient_plan
 
 EXPERIMENT_FAMILY = "experiment"
 OPTUNA_FAMILY = "optuna"
@@ -72,7 +73,15 @@ def inspect_config(path: Path | str) -> ConfigPreflight:
     raw = loader.load_yaml(source)
     family = _classify_root(raw)
     if family == EXPERIMENT_FAMILY:
-        resolved = loader.load_and_resolve_config(source)
+        if transient_plan.is_transient_two_stage_config(raw):
+            resolved = transient_plan.resolve_transient_training_plan(raw).stage_a
+            loader.validate_task_directory_identity(
+                source,
+                raw_task=raw.get("task"),
+                resolved_task=resolved.get("task"),
+            )
+        else:
+            resolved = loader.load_and_resolve_config(source)
     else:
         from src.experiments.tuning import experiments_tuning_optuna as optuna  # noqa: PLC0415
 

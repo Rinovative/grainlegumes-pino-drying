@@ -1,8 +1,9 @@
 """
-Saved-run inference reconstruction.
+Saved-run steady and transient inference reconstruction.
 
 Provides:
-- context: model, normalizer, split, and dataloader reconstruction
+- context: steady model, normalizer, split, and dataloader reconstruction
+- transient: explicit transient-drying model and physical rollout service
 """
 
 from __future__ import annotations
@@ -12,9 +13,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import learning_inference as context
+    from . import learning_inference_transient as transient
 
-_MODULES = {"context": "learning_inference"}
-__all__ = ["context"]
+_MODULES = {"context": "learning_inference", "transient": "learning_inference_transient"}
+__all__ = ["context", "transient"]
 
 
 def __getattr__(name: str) -> object:

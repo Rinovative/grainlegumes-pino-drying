@@ -29,10 +29,12 @@ from typing import Literal
 TASK_SCHEMA_VERSION = 1
 
 FieldRole = Literal[
+    "airflow",
+    "boundary",
     "coordinate",
+    "material",
     "permeability",
     "porosity",
-    "boundary",
     "state",
 ]
 MetricSpace = Literal["normalized", "physical"]
@@ -47,7 +49,7 @@ OptimizationDirection = Literal["minimize", "maximize"]
 _SUPPORTED_TENSOR_LAYOUT = ("batch", "channel", "y", "x")
 _SUPPORTED_OPERATOR_AXES = (2, 3)
 _SUPPORTED_NORMALIZATION_AXES = (0, 2, 3)
-_FIELD_ROLES = frozenset({"coordinate", "permeability", "porosity", "boundary", "state"})
+_FIELD_ROLES = frozenset({"airflow", "boundary", "coordinate", "material", "permeability", "porosity", "state"})
 _METRIC_SPACES = frozenset({"normalized", "physical"})
 _METRIC_REDUCTIONS = frozenset(
     {
@@ -122,6 +124,52 @@ class FieldSpec:
             "unit": self.unit,
             "representation": self.representation,
             "source_name": self.source_name,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class InputProfileSpec:
+    """
+    Describe one versioned task-owned model input profile.
+
+    Attributes
+    ----------
+    id : str
+        Stable profile identifier persisted with runs and checkpoints.
+    fields : tuple[str, ...]
+        Exact ordered subset of the task input fields.
+    coordinate_policy : str
+        Exclusive coordinate representation used by every supported model.
+
+    """
+
+    id: str
+    fields: tuple[str, ...]
+    coordinate_policy: str
+
+    def __post_init__(self) -> None:
+        """Reject empty identifiers, duplicate fields, and implicit coordinates."""
+        if not isinstance(self.id, str) or not self.id:
+            msg = "Input profile id must be a non-empty string."
+            raise ValueError(msg)
+        if (
+            not isinstance(self.fields, tuple)
+            or not self.fields
+            or any(not isinstance(field, str) or not field for field in self.fields)
+            or len(set(self.fields)) != len(self.fields)
+        ):
+            msg = f"Input profile {self.id!r} fields must be a unique non-empty tuple of strings."
+            raise ValueError(msg)
+        if not isinstance(self.coordinate_policy, str) or not self.coordinate_policy:
+            msg = f"Input profile {self.id!r} coordinate_policy must be a non-empty string."
+            raise ValueError(msg)
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the JSON-serializable profile identity."""
+        return {
+            "id": self.id,
+            "fields": list(self.fields),
+            "coordinate_policy": self.coordinate_policy,
         }
 
 
@@ -473,7 +521,18 @@ class TaskSpec:
         Task-owned physics selector.
     output_groups : tuple[OutputGroupSpec, ...]
         Ordered physical output quantities. When declared, the groups form an
-        exact ordered partition of the task outputs.
+        exact ordered partition of the task metric fields.
+    metric_fields : tuple[FieldSpec, ...], optional
+        Reconstructed physical fields used for metric reporting when model
+        outputs represent increments or another derived quantity.
+    input_profiles : tuple[InputProfileSpec, ...], optional
+        Exact named model input subsets retained in the persisted contract.
+    primary_input_profile : str | None, optional
+        Default input-profile identifier, or ``None`` when all inputs apply.
+    temporal_conditioning_kinds : tuple[str, ...], optional
+        Explicit task-supported temporal conditioning identifiers.
+    training_airflow_source : str | None, optional
+        Semantic provenance identifier for the airflow fields used in training.
 
     Raises
     ------
@@ -505,9 +564,22 @@ class TaskSpec:
     default_metrics: tuple[MetricSpec, ...]
     physics: PhysicsSpec
     output_groups: tuple[OutputGroupSpec, ...] = ()
+    metric_fields: tuple[FieldSpec, ...] = ()
+    input_profiles: tuple[InputProfileSpec, ...] = ()
+    primary_input_profile: str | None = None
+    temporal_conditioning_kinds: tuple[str, ...] = ()
+    training_airflow_source: str | None = None
 
     def __post_init__(self) -> None:
         """Reject structurally ambiguous task declarations."""
+        self._validate_identity_and_axes()
+        self._validate_field_and_nested_contracts()
+        self._validate_metrics_and_losses()
+        self._validate_input_profiles_and_temporal_contract()
+        self._validate_output_groups_and_metric_references()
+
+    def _validate_identity_and_axes(self) -> None:
+        """Validate the task identifier, schema version, and fixed 2D axes."""
         if not isinstance(self.id, str) or not self.id:
             msg = "Task id must be a non-empty string."
             raise ValueError(msg)
@@ -523,67 +595,110 @@ class TaskSpec:
                 f"operator={_SUPPORTED_OPERATOR_AXES!r}, normalization={_SUPPORTED_NORMALIZATION_AXES!r}."
             )
             raise ValueError(msg)
-        if (
-            not isinstance(self.inputs, tuple)
-            or not self.inputs
-            or any(not isinstance(field, FieldSpec) for field in self.inputs)
-            or not isinstance(self.outputs, tuple)
-            or not self.outputs
-            or any(not isinstance(field, FieldSpec) for field in self.outputs)
-        ):
+
+    def _validate_field_and_nested_contracts(self) -> None:
+        """Validate field tuples and required nested declarations."""
+        valid_fields = (
+            isinstance(self.inputs, tuple)
+            and self.inputs
+            and all(isinstance(field, FieldSpec) for field in self.inputs)
+            and isinstance(self.outputs, tuple)
+            and self.outputs
+            and all(isinstance(field, FieldSpec) for field in self.outputs)
+        )
+        if not valid_fields:
             msg = f"Task {self.id!r} must declare non-empty FieldSpec input/output tuples."
             raise ValueError(msg)
-        if not isinstance(self.default_datasets, DatasetDefaults):
-            msg = f"Task {self.id!r} default_datasets must be a DatasetDefaults declaration."
-            raise TypeError(msg)
-        if not isinstance(self.preprocessing, PreprocessingSpec):
-            msg = f"Task {self.id!r} preprocessing must be a PreprocessingSpec declaration."
-            raise TypeError(msg)
-        if not isinstance(self.physics, PhysicsSpec):
-            msg = f"Task {self.id!r} physics must be a PhysicsSpec declaration."
-            raise TypeError(msg)
-        if not isinstance(self.output_groups, tuple) or any(not isinstance(group, OutputGroupSpec) for group in self.output_groups):
+        for value, expected, label in (
+            (self.default_datasets, DatasetDefaults, "default_datasets"),
+            (self.preprocessing, PreprocessingSpec, "preprocessing"),
+            (self.physics, PhysicsSpec, "physics"),
+        ):
+            if not isinstance(value, expected):
+                msg = f"Task {self.id!r} {label} must be a {expected.__name__} declaration."
+                raise TypeError(msg)
+        if not isinstance(self.output_groups, tuple) or not all(isinstance(group, OutputGroupSpec) for group in self.output_groups):
             msg = f"Task {self.id!r} output_groups must be an OutputGroupSpec tuple."
             raise TypeError(msg)
-        if not isinstance(self.data_losses, tuple) or not self.data_losses:
-            msg = f"Task {self.id!r} must declare at least one semantic data loss."
-            raise ValueError(msg)
-        if any(not isinstance(loss, str) or not loss for loss in self.data_losses) or len(set(self.data_losses)) != len(self.data_losses):
-            msg = f"Task {self.id!r} data_losses must be unique non-empty strings."
-            raise ValueError(msg)
-        if (
-            not isinstance(self.default_metrics, tuple)
-            or not self.default_metrics
-            or any(not isinstance(metric, MetricSpec) for metric in self.default_metrics)
-        ):
-            msg = f"Task {self.id!r} must declare a non-empty MetricSpec tuple."
-            raise ValueError(msg)
-
+        if not isinstance(self.metric_fields, tuple) or not all(isinstance(field, FieldSpec) for field in self.metric_fields):
+            msg = f"Task {self.id!r} metric_fields must be a FieldSpec tuple."
+            raise TypeError(msg)
         names = (*self.input_names, *self.output_names)
         if len(names) != len(set(names)):
             msg = f"Task {self.id!r} contains duplicate field names: {names!r}."
             raise ValueError(msg)
+        if len(self.metric_names) != len(set(self.metric_names)):
+            msg = f"Task {self.id!r} contains duplicate metric field names: {self.metric_names!r}."
+            raise ValueError(msg)
 
-        if self.output_groups:
-            group_ids = tuple(group.id for group in self.output_groups)
-            if len(group_ids) != len(set(group_ids)):
-                msg = f"Task {self.id!r} contains duplicate output group ids: {group_ids!r}."
-                raise ValueError(msg)
-            grouped_fields = tuple(field for group in self.output_groups for field in group.fields)
-            if grouped_fields != self.output_names:
-                msg = (
-                    f"Task {self.id!r} output groups must partition outputs in declared order: "
-                    f"expected {self.output_names!r}, got {grouped_fields!r}."
-                )
-                raise ValueError(msg)
-
+    def _validate_metrics_and_losses(self) -> None:
+        """Validate task-owned data losses and metric declarations."""
+        if not isinstance(self.data_losses, tuple) or not self.data_losses:
+            msg = f"Task {self.id!r} must declare at least one semantic data loss."
+            raise ValueError(msg)
+        if not all(isinstance(loss, str) and loss for loss in self.data_losses) or len(set(self.data_losses)) != len(self.data_losses):
+            msg = f"Task {self.id!r} data_losses must be unique non-empty strings."
+            raise ValueError(msg)
+        valid_metrics = (
+            isinstance(self.default_metrics, tuple)
+            and self.default_metrics
+            and all(isinstance(metric, MetricSpec) for metric in self.default_metrics)
+        )
+        if not valid_metrics:
+            msg = f"Task {self.id!r} must declare a non-empty MetricSpec tuple."
+            raise ValueError(msg)
         metric_ids = tuple(metric.id for metric in self.default_metrics)
         if len(metric_ids) != len(set(metric_ids)):
             msg = f"Task {self.id!r} contains duplicate default metric ids: {metric_ids!r}."
             raise ValueError(msg)
-        unknown_metric_fields = sorted({field for metric in self.default_metrics for field in metric.fields if field not in self.output_names})
-        if unknown_metric_fields:
-            msg = f"Task {self.id!r} metrics reference unknown output fields: {unknown_metric_fields!r}."
+        unknown = sorted({field for metric in self.default_metrics for field in metric.fields if field not in self.metric_names})
+        if unknown:
+            msg = f"Task {self.id!r} metrics reference unknown output fields: {unknown!r}."
+            raise ValueError(msg)
+
+    def _validate_input_profiles_and_temporal_contract(self) -> None:
+        """Validate optional input profiles and temporal provenance declarations."""
+        if not isinstance(self.input_profiles, tuple) or not all(isinstance(profile, InputProfileSpec) for profile in self.input_profiles):
+            msg = f"Task {self.id!r} input_profiles must be an InputProfileSpec tuple."
+            raise TypeError(msg)
+        if self.input_profiles:
+            profile_ids = tuple(profile.id for profile in self.input_profiles)
+            if len(profile_ids) != len(set(profile_ids)) or self.primary_input_profile not in profile_ids:
+                msg = f"Task {self.id!r} primary_input_profile must select one uniquely declared profile."
+                raise ValueError(msg)
+            unknown = sorted({field for profile in self.input_profiles for field in profile.fields if field not in self.input_names})
+            if unknown:
+                msg = f"Task {self.id!r} input profiles reference unknown fields: {unknown!r}."
+                raise ValueError(msg)
+        elif self.primary_input_profile is not None:
+            msg = f"Task {self.id!r} cannot declare primary_input_profile without input_profiles."
+            raise ValueError(msg)
+        valid_temporal = (
+            isinstance(self.temporal_conditioning_kinds, tuple)
+            and all(isinstance(kind, str) and kind for kind in self.temporal_conditioning_kinds)
+            and len(set(self.temporal_conditioning_kinds)) == len(self.temporal_conditioning_kinds)
+        )
+        if not valid_temporal:
+            msg = f"Task {self.id!r} temporal_conditioning_kinds must be a unique tuple of non-empty strings."
+            raise ValueError(msg)
+        if self.training_airflow_source is not None and (not isinstance(self.training_airflow_source, str) or not self.training_airflow_source):
+            msg = f"Task {self.id!r} training_airflow_source must be None or a non-empty string."
+            raise ValueError(msg)
+
+    def _validate_output_groups_and_metric_references(self) -> None:
+        """Validate that optional output groups partition metric fields exactly."""
+        if not self.output_groups:
+            return
+        group_ids = tuple(group.id for group in self.output_groups)
+        if len(group_ids) != len(set(group_ids)):
+            msg = f"Task {self.id!r} contains duplicate output group ids: {group_ids!r}."
+            raise ValueError(msg)
+        grouped_fields = tuple(field for group in self.output_groups for field in group.fields)
+        if grouped_fields != self.metric_names:
+            msg = (
+                f"Task {self.id!r} output groups must partition metric fields in declared order: "
+                f"expected {self.metric_names!r}, got {grouped_fields!r}."
+            )
             raise ValueError(msg)
 
     @property
@@ -611,6 +726,45 @@ class TaskSpec:
 
         """
         return tuple(field.name for field in self.outputs)
+
+    @property
+    def metric_names(self) -> tuple[str, ...]:
+        """Return ordered reconstructed-state metric field names."""
+        selected = self.metric_fields or self.outputs
+        return tuple(field.name for field in selected)
+
+    def metric_field(self, name: str) -> FieldSpec:
+        """Resolve one exact metric field without conflating model outputs."""
+        selected = self.metric_fields or self.outputs
+        for field in selected:
+            if field.name == name:
+                return field
+        available = ", ".join(self.metric_names)
+        msg = f"Unknown metric field {name!r} for task {self.id!r}. Available fields: {available}."
+        raise ValueError(msg)
+
+    def input_profile(self, profile_id: str | None = None) -> InputProfileSpec:
+        """Resolve one declared input profile, defaulting only to the task primary."""
+        selected_id = self.primary_input_profile if profile_id is None else profile_id
+        if selected_id is None:
+            return InputProfileSpec(
+                id="task_inputs",
+                fields=self.input_names,
+                coordinate_policy="task_declared",
+            )
+        for profile in self.input_profiles:
+            if profile.id == selected_id:
+                return profile
+        available = ", ".join(profile.id for profile in self.input_profiles)
+        msg = f"Unknown input profile {selected_id!r} for task {self.id!r}. Available profiles: {available}."
+        raise ValueError(msg)
+
+    def in_channels_for_profile(self, profile_id: str | None = None, *, temporal_channels: int = 0) -> int:
+        """Return profile-derived channels plus explicit temporal features."""
+        if isinstance(temporal_channels, bool) or not isinstance(temporal_channels, int) or temporal_channels < 0:
+            msg = "temporal_channels must be a non-negative integer."
+            raise ValueError(msg)
+        return len(self.input_profile(profile_id).fields) + temporal_channels
 
     @property
     def in_channels(self) -> int:
@@ -694,7 +848,7 @@ class TaskSpec:
         not alter learned tensor content and therefore remain outside this digest.
 
         """
-        return {
+        payload: dict[str, object] = {
             "task": self.id,
             "inputs": [field.as_dict() for field in self.inputs],
             "outputs": [field.as_dict() for field in self.outputs],
@@ -703,6 +857,16 @@ class TaskSpec:
             "normalization_axes": list(self.normalization_axes),
             "preprocessing": self.preprocessing.as_dict(),
         }
+        if self.metric_fields:
+            payload["metric_fields"] = [field.as_dict() for field in self.metric_fields]
+        if self.input_profiles:
+            payload["input_profiles"] = [profile.as_dict() for profile in self.input_profiles]
+            payload["primary_input_profile"] = self.primary_input_profile
+        if self.temporal_conditioning_kinds:
+            payload["temporal_conditioning_kinds"] = list(self.temporal_conditioning_kinds)
+        if self.training_airflow_source is not None:
+            payload["training_airflow_source"] = self.training_airflow_source
+        return payload
 
     @property
     def data_contract_digest(self) -> str:
@@ -733,7 +897,7 @@ class TaskSpec:
             Complete JSON-serializable task contract without derived digest metadata.
 
         """
-        return {
+        payload: dict[str, object] = {
             "task": self.id,
             "schema_version": self.schema_version,
             "inputs": [field.as_dict() for field in self.inputs],
@@ -746,9 +910,19 @@ class TaskSpec:
             "default_datasets": self.default_datasets.as_dict(),
             "preprocessing": self.preprocessing.as_dict(),
             "data_losses": list(self.data_losses),
-            "default_metrics": [metric.as_dict(all_fields=self.output_names) for metric in self.default_metrics],
+            "default_metrics": [metric.as_dict(all_fields=self.metric_names) for metric in self.default_metrics],
             "physics": self.physics.as_dict(),
         }
+        if self.metric_fields:
+            payload["metric_fields"] = [field.as_dict() for field in self.metric_fields]
+        if self.input_profiles:
+            payload["input_profiles"] = [profile.as_dict() for profile in self.input_profiles]
+            payload["primary_input_profile"] = self.primary_input_profile
+        if self.temporal_conditioning_kinds:
+            payload["temporal_conditioning_kinds"] = list(self.temporal_conditioning_kinds)
+        if self.training_airflow_source is not None:
+            payload["training_airflow_source"] = self.training_airflow_source
+        return payload
 
     @property
     def contract_digest(self) -> str:

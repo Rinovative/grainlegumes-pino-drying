@@ -19,9 +19,10 @@ two-dimensional Darcy–Brinkman `steady_flow` task:
 Python generates profile-specific fields and transient inlet schedules, COMSOL
 provides reference solutions, and validated outputs are published as immutable
 Dataset packages. The established steady workflow trains and evaluates FNO,
-U-NO, PI-FNO, and PI-U-NO models. Transient generation and Dataset views exist;
-a trainable transient TaskSpec, trainer, tuning workflow, EDA, and Evaluation
-extensions are not yet implemented.
+U-NO, PI-FNO, and PI-U-NO models. The transient workflow now trains FNO, U-NO,
+and official RNO models through an automatic teacher-forced Stage A followed by
+autonomous Stage B. Transient EDA and Evaluation remain future work; see the
+[transient training guide](docs/transient_training.md).
 
 Generation, Dataset publication, preprocessing, training, resume, and evaluation
 are identity-bound and fail closed. Current values, campaign inventories, seeds,
@@ -84,6 +85,7 @@ flowchart TD
 | Interpret Generation parameters and assumptions | Validated YAML under `configs/generation` | [Scientific parameter reference](docs/generation_parameter_reference.md) |
 | Publish declared immutable Dataset packages | Automatic stage of `run CONFIG` | [Generation operations](docs/simulation_generation.md#common-plan-and-lifecycle) |
 | Train, tune, and build artifacts | `src.experiments.cli` commands | Commands below and `configs/learning` |
+| Train transient A0 then B | One architecture-first YAML under `configs/learning/transient_drying/experiments` | [Transient training](docs/transient_training.md) |
 
 The stable package facades are `src.generation` and `src.datasets`. Reusable
 logic lives under `src/`; command-line modules, notebooks, and shell wrappers
@@ -115,6 +117,7 @@ Generation workflow commands run from the bare `hpc115` checkout. Start with:
 ./scripts/generation_workflow.sh --help
 ./scripts/generation_workflow.sh run \
   configs/generation/campaigns/steady_flow/id_dataset.yaml
+```
 
 Inside the development container, the established learning commands are:
 
@@ -124,6 +127,12 @@ python -m src.experiments.cli.cli_train <experiment_config>
 python -m src.experiments.cli.cli_optuna <optuna_config>
 python -m src.experiments.cli.cli_build_artifacts --task steady_flow
 ```
+
+For transient drying, one normal architecture config automatically persists its
+Stage A0 best-model handoff and then starts a separately named Stage B run. The
+CLI prints both run directories. Transient post-training artifacts are not yet
+implemented; details and resume rules are in the
+[transient training guide](docs/transient_training.md).
 
 From the host, `scripts/docker_job.sh` supplies the corresponding GPU-queue
 workflow.
@@ -177,7 +186,8 @@ python -m pytest -q -m "not real_data" tests
 ├── configs/
 │   ├── generation/
 │   └── learning/
-│       └── steady_flow/
+│       ├── steady_flow/
+│       └── transient_drying/
 ├── docs/
 ├── notebooks/
 ├── scripts/

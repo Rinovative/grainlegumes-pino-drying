@@ -32,6 +32,7 @@ _COMMON_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
     "data.batch_size": frozenset({"categorical", "int"}),
     "optimizer.lr": frozenset({"categorical", "float"}),
     "optimizer.weight_decay": frozenset({"categorical", "float"}),
+    "training.gradient_accumulation_steps": frozenset({"categorical", "int"}),
 }
 _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
     "fno": {
@@ -46,6 +47,12 @@ _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
         "model.params.hidden_channels": frozenset({"categorical"}),
         "model.params.n_layers": frozenset({"categorical"}),
         "model.params.mode_ratio": frozenset({"categorical", "float"}),
+    },
+    "rno": {
+        "model.params.n_modes.0": frozenset({"categorical"}),
+        "model.params.n_modes.1": frozenset({"categorical"}),
+        "model.params.hidden_channels": frozenset({"categorical"}),
+        "model.params.n_layers": frozenset({"categorical"}),
     },
 }
 _PHYSICS_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {

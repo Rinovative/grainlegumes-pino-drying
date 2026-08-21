@@ -26,13 +26,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
+import torch
 
 from src import domain
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    import torch
 
 MetricSpace = Literal["normalized", "physical"]
 MetricReduction = Literal[
@@ -88,6 +88,18 @@ _METRIC_KINDS = MappingProxyType(
             kind="rmse",
             spaces=frozenset({"normalized", "physical"}),
             reductions=frozenset({"element_mean"}),
+            direction="minimize",
+        ),
+        "mae": MetricKindSpec(
+            kind="mae",
+            spaces=frozenset({"normalized", "physical"}),
+            reductions=frozenset({"element_mean"}),
+            direction="minimize",
+        ),
+        "drying_group_macro_rmse": MetricKindSpec(
+            kind="drying_group_macro_rmse",
+            spaces=frozenset({"normalized"}),
+            reductions=frozenset({"group_macro_element_mean"}),
             direction="minimize",
         ),
         "group_macro_rmse": MetricKindSpec(
@@ -550,6 +562,186 @@ class RMSEMetric(DatasetMetric):
         return value
 
 
+def compute_grain_moisture(
+    w_surf: torch.Tensor,
+    w_int: torch.Tensor,
+    f_surf: torch.Tensor,
+) -> torch.Tensor:
+    """Return physical grain moisture from surface and interior moisture fields."""
+    if not all(isinstance(value, torch.Tensor) for value in (w_surf, w_int, f_surf)):
+        msg = "w_surf, w_int, and f_surf must be tensors."
+        raise TypeError(msg)
+    if w_surf.shape != w_int.shape or w_surf.shape != f_surf.shape:
+        msg = "w_surf, w_int, and f_surf must share one shape."
+        raise ValueError(msg)
+    if not all(value.is_floating_point() and not value.is_complex() for value in (w_surf, w_int, f_surf)):
+        msg = "grain moisture inputs must be real floating-point tensors."
+        raise TypeError(msg)
+    if not all(value.device == w_surf.device for value in (w_int, f_surf)):
+        msg = "grain moisture inputs must share one device."
+        raise ValueError(msg)
+    if not all(bool(torch.isfinite(value).all().item()) for value in (w_surf, w_int, f_surf)):
+        msg = "grain moisture inputs must be finite."
+        raise ValueError(msg)
+    return f_surf * w_surf + (1.0 - f_surf) * w_int
+
+
+class MAEMetric(DatasetMetric):
+    """Accumulate global absolute error without averaging batch means."""
+
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """Add double-precision absolute-error sum and element count."""
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        absolute_error = (selected_pred.double() - selected_target.double()).abs()
+        batch_sum = float(absolute_error.sum().detach().cpu().item())
+        if not np.isfinite(batch_sum):
+            msg = f"Metric {self.id!r} produced non-finite absolute error in evaluation batch {batch_index}."
+            raise FloatingPointError(msg)
+        self._sum += batch_sum
+        self._count += absolute_error.numel()
+
+    def compute(self) -> float:
+        """Return total absolute error divided by total selected elements."""
+        if self._count == 0:
+            msg = f"Metric {self.id!r} cannot finalize without samples."
+            raise RuntimeError(msg)
+        value = self._sum / self._count
+        if not np.isfinite(value):
+            msg = f"Metric {self.id!r} finalized to a non-finite value."
+            raise FloatingPointError(msg)
+        return float(value)
+
+
+class DryingGroupMacroRMSEMetric(DatasetMetric):
+    """
+    Weight normalized reconstructed drying-state field RMSE values exactly.
+
+    Temperature and relative humidity each receive one third. Surface and
+    internal moisture each receive one sixth. Every field RMSE is finalized from
+    global squared-error sums and counts, preserving batch-partition invariance.
+    """
+
+    _EXPECTED_FIELDS = ("T", "phi", "w_surf", "w_int")
+    _WEIGHTS = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0)
+
+    def __init__(
+        self,
+        definition: ResolvedMetric,
+        *,
+        device: torch.device,
+    ) -> None:
+        """Require the exact reconstructed-state field order."""
+        if definition.fields != self._EXPECTED_FIELDS:
+            msg = f"Drying group-macro RMSE requires fields {list(self._EXPECTED_FIELDS)} in exact order."
+            raise ValueError(msg)
+        super().__init__(definition, device=device)
+
+    def reset(self) -> None:
+        """Clear independent per-field squared-error sufficient statistics."""
+        self._field_sums = [0.0] * len(self.fields)
+        self._field_counts = [0] * len(self.fields)
+
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """Accumulate global normalized squared error with optional valid masks."""
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        valid_mask: torch.Tensor | None = None
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor) or mask.dtype is not torch.bool:
+                msg = "Drying metric mask must be one boolean tensor."
+                raise TypeError(msg)
+            if mask.device != selected_pred.device:
+                msg = "Drying metric mask must share prediction device."
+                raise ValueError(msg)
+            if mask.ndim != selected_pred.ndim or mask.shape[1] not in {1, selected_pred.shape[1]}:
+                msg = "Drying metric mask must have singleton or all-field channel shape."
+                raise ValueError(msg)
+            try:
+                valid_mask = torch.broadcast_to(mask, selected_pred.shape)
+            except RuntimeError as error:
+                msg = "Drying metric mask must broadcast to selected prediction shape."
+                raise ValueError(msg) from error
+        squared_error = (selected_pred.double() - selected_target.double()).square()
+        for index, field in enumerate(self.fields):
+            field_error = squared_error[:, index]
+            if valid_mask is None:
+                selected_error = field_error
+            else:
+                field_mask = valid_mask[:, index]
+                if not bool(field_mask.any().item()):
+                    msg = f"Drying metric mask has no valid values for field {field!r}."
+                    raise ValueError(msg)
+                selected_error = field_error[field_mask]
+            batch_sum = float(selected_error.sum().detach().cpu().item())
+            if not np.isfinite(batch_sum):
+                msg = f"Metric {self.id!r} produced non-finite squared error for field {field!r} in evaluation batch {batch_index}."
+                raise FloatingPointError(msg)
+            self._field_sums[index] += batch_sum
+            self._field_counts[index] += selected_error.numel()
+
+    def components(self) -> dict[str, float]:
+        """Return global normalized per-field RMSE components and macro result."""
+        if any(count == 0 for count in self._field_counts):
+            msg = f"Metric {self.id!r} cannot finalize without samples."
+            raise RuntimeError(msg)
+        values = {field: float(np.sqrt(total / count)) for field, total, count in zip(self.fields, self._field_sums, self._field_counts, strict=True)}
+        values["grain_moisture_error"] = 0.5 * (values["w_surf"] + values["w_int"])
+        values["normalized_drying_group_macro_rmse"] = sum(weight * values[field] for field, weight in zip(self.fields, self._WEIGHTS, strict=True))
+        return values
+
+    def compute(self) -> float:
+        """Return the exact weighted macro of global per-field RMSE values."""
+        if any(count == 0 for count in self._field_counts):
+            msg = f"Metric {self.id!r} cannot finalize without samples."
+            raise RuntimeError(msg)
+        values = [
+            float(np.sqrt(total / count))
+            for total, count in zip(
+                self._field_sums,
+                self._field_counts,
+                strict=True,
+            )
+        ]
+        result = float(
+            sum(
+                weight * value
+                for weight, value in zip(
+                    self._WEIGHTS,
+                    values,
+                    strict=True,
+                )
+            )
+        )
+        if not np.isfinite(result):
+            msg = f"Metric {self.id!r} finalized to a non-finite value."
+            raise FloatingPointError(msg)
+        return result
+
+
 class _PhysicalGroupSSEMetric(DatasetMetric):
     """Accumulate physical per-field SSE/count for task-owned output groups."""
 
@@ -824,8 +1016,8 @@ def _resolved_output_groups(
         msg = f"Metric {metric_id!r} requires task-owned output groups."
         raise ValueError(msg)
     if kind == "group_macro_rmse":
-        if fields != task.output_names:
-            msg = f"Metric {metric_id!r} must select every TaskSpec output field in declared order: {list(task.output_names)}."
+        if fields != task.metric_names:
+            msg = f"Metric {metric_id!r} must select every TaskSpec output field in declared order: {list(task.metric_names)}."
             raise ValueError(msg)
         return task.output_groups
     matches = tuple(group for group in task.output_groups if group.fields == fields)
@@ -885,7 +1077,7 @@ def build_evaluation_metrics(
         raise TypeError(msg)
     resolved_scales = _resolved_output_standard_deviations(
         output_standard_deviations,
-        task_fields=task.output_names,
+        task_fields=task.metric_names,
     )
 
     built: dict[str, DatasetMetric] = {}
@@ -903,7 +1095,7 @@ def build_evaluation_metrics(
         kind_spec = validate_metric_semantics(kind, space=space, reduction=reduction)
         fields = _resolved_metric_fields(
             raw_metric["fields"],
-            task_fields=task.output_names,
+            task_fields=task.metric_names,
             metric_id=metric_id,
         )
         groups = _resolved_output_groups(
@@ -916,11 +1108,11 @@ def build_evaluation_metrics(
             msg = f"Metric {metric_id!r} requires raw train-fitted output standard deviations."
             raise ValueError(msg)
         if space == "physical" and len(fields) != 1 and not groups:
-            selected_units = sorted({task.field(field).unit for field in fields})
+            selected_units = sorted({task.metric_field(field).unit for field in fields})
             msg = f"Physical metric {metric_id!r} must select exactly one field. Selected units are {selected_units}."
             raise ValueError(msg)
         if kind == "vector_rmse":
-            vector_units = {task.field(field).unit for field in fields}
+            vector_units = {task.metric_field(field).unit for field in fields}
             if len(vector_units) != 1:
                 msg = f"Physical vector metric {metric_id!r} fields must share one unit, got {sorted(vector_units)}."
                 raise ValueError(msg)
@@ -933,16 +1125,25 @@ def build_evaluation_metrics(
             kind=kind,
             space=cast("MetricSpace", space),
             fields=fields,
-            field_indices=tuple(task.output_names.index(field) for field in fields),
+            field_indices=tuple(task.metric_names.index(field) for field in fields),
             reduction=cast("MetricReduction", reduction),
             direction=cast("MetricDirection", direction),
-            unit=task.field(fields[0]).unit if kind == "vector_rmse" else (task.field(fields[0]).unit if space == "physical" and not groups else "1"),
+            unit=task.metric_field(fields[0]).unit
+            if kind == "vector_rmse"
+            else (task.metric_field(fields[0]).unit if space == "physical" and not groups else "1"),
             operator_dimensionality=task.operator_dimensionality,
             groups=groups,
             field_standard_deviations=tuple(resolved_scales[field] for field in fields) if groups else (),
         )
         if kind == "rmse":
             built[metric_id] = RMSEMetric(definition, device=device)
+        elif kind == "mae":
+            built[metric_id] = MAEMetric(definition, device=device)
+        elif kind == "drying_group_macro_rmse":
+            built[metric_id] = DryingGroupMacroRMSEMetric(
+                definition,
+                device=device,
+            )
         elif kind == "group_macro_rmse":
             built[metric_id] = GroupMacroRMSEMetric(definition, device=device)
         elif kind == "group_rmse":

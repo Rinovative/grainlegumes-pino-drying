@@ -1,11 +1,12 @@
 """
 learning_models_factory.py
 
-Construct FNO and UNO models from resolved experiment configs.
+Construct FNO, UNO, and capability-gated RNO models from resolved experiment configs.
 
 Responsibilities:
   - Build FNO models from channel, mode and layer settings
   - Build UNO models with configured mode schedules
+  - Build official neuraloperator RNO models when the installed dependency exposes it
   - Declare the maintained neuraloperator UNO resampling semantics
   - Resolve semantic model identifiers from strict registries
 
@@ -16,7 +17,7 @@ Design principles:
   - Device placement happens only when requested by the caller
 
 This module does NOT:
-  - Implement FNO or UNO architectures. ``neuraloperator`` supplies them
+  - Implement FNO, UNO, or RNO architectures. ``neuraloperator`` supplies them
   - Orchestrate training. ``learning.training.loop`` owns execution
   - Derive task channels or axes. Task contracts and config resolution own them
 """
@@ -24,16 +25,18 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import importlib
 import io
 import math
 import sys
+from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterator
 
     import torch
     from neuralop.models import FNO, UNO
@@ -117,6 +120,7 @@ def build_fno(
     fno_skip: str = "linear",
     channel_mlp_skip: str = "soft-gating",
     implementation: str = "factorized",
+    positional_embedding: str | None = "grid",
     device: torch.device | str | None = None,
 ) -> FNO:
     """
@@ -144,6 +148,8 @@ def build_fno(
         Skip connection type for channel MLP (default: "soft-gating")
     implementation : str, optional
         Implementation type (default: "factorized")
+    positional_embedding : str | None, optional
+        Neuraloperator positional embedding (default: "grid")
     device : torch.device | str | None, optional
         Device to place model on (default: None - caller handles)
 
@@ -160,18 +166,21 @@ def build_fno(
         msg = f"FNO requires exactly two n_modes entries, got: {n_modes!r}"
         raise ValueError(msg)
 
-    model = FNO(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        n_modes=n_modes_tuple,
-        hidden_channels=hidden_channels,
-        n_layers=n_layers,
-        lifting_channel_ratio=lifting_channel_ratio,
-        projection_channel_ratio=projection_channel_ratio,
-        fno_skip=_validate_skip("fno_skip", fno_skip),
-        channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
-        implementation=implementation,
-    )
+    kwargs: dict[str, Any] = {
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "n_modes": n_modes_tuple,
+        "hidden_channels": hidden_channels,
+        "n_layers": n_layers,
+        "lifting_channel_ratio": lifting_channel_ratio,
+        "projection_channel_ratio": projection_channel_ratio,
+        "fno_skip": _validate_skip("fno_skip", fno_skip),
+        "channel_mlp_skip": _validate_skip("channel_mlp_skip", channel_mlp_skip),
+        "implementation": implementation,
+    }
+    if positional_embedding != "grid":
+        kwargs["positional_embedding"] = positional_embedding
+    model = FNO(**kwargs)
 
     if device is not None:
         model.to(device)
@@ -193,6 +202,106 @@ def _filter_uno_constructor_stdout() -> Iterator[None]:
                 sys.stdout.write(line)
 
 
+def _validate_transient_axis_modes(
+    *,
+    label: str,
+    n_modes: tuple[int, int],
+    spatial_shape: tuple[int, int],
+) -> None:
+    """Require [Y, X] spectral modes to fit one concrete transient grid."""
+    y_size, x_size = spatial_shape
+    y_modes, x_modes = n_modes
+    if y_modes > y_size:
+        message = f"{label} modes_y={y_modes} exceeds admitted Y axis {y_size}."
+        raise ValueError(message)
+    if x_modes > x_size:
+        message = f"{label} modes_x={x_modes} exceeds admitted X axis {x_size}."
+        raise ValueError(message)
+
+
+def _uno_mode_schedule(
+    *,
+    n_layers: int,
+    modes_y: int,
+    modes_x: int,
+    mode_ratio: float,
+) -> list[list[int]]:
+    """Build the authoritative UNO [Y, X] spectral-mode schedule."""
+    mid_y = max(_MIN_UNO_MODE, int(modes_y * mode_ratio))
+    mid_x = max(_MIN_UNO_MODE, int(modes_x * mode_ratio))
+    middle = [[mid_y, mid_x]] * (n_layers - 2)
+    return [[modes_y, modes_x], *middle, [modes_y, modes_x]]
+
+
+def _scaled_axis_size(size: int, scale: float) -> int:
+    """Return neuraloperator's positive integer resampling target size."""
+    return max(1, round(size * scale))
+
+
+def validate_transient_model_spatial_shape(
+    config: Mapping[str, Any],
+    spatial_shape: tuple[int, int],
+) -> None:
+    """Validate transient model spectral modes against Train-admitted [Y, X]."""
+    if config.get("task") != "transient_drying":
+        return
+    if (
+        not isinstance(spatial_shape, tuple)
+        or len(spatial_shape) != _FNO_MODE_DIMENSIONS
+        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < 1 for axis in spatial_shape)
+    ):
+        message = "Transient spatial_shape must contain positive exact [Y, X] integers."
+        raise ValueError(message)
+    model = config.get("model")
+    if not isinstance(model, Mapping) or not isinstance(model.get("params"), Mapping):
+        message = "Transient model validation requires resolved model.params."
+        raise TypeError(message)
+    kind = model.get("kind")
+    params = model["params"]
+    if kind in {"fno", "rno"}:
+        raw_modes = params.get("n_modes")
+        if not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != _FNO_MODE_DIMENSIONS:
+            message = "Transient FNO/RNO requires exact n_modes [Y, X]."
+            raise ValueError(message)
+        axis_modes = tuple(raw_modes)
+        if any(isinstance(mode, bool) or not isinstance(mode, int) or mode < 1 for mode in axis_modes):
+            message = "Transient FNO/RNO n_modes must contain positive exact integers."
+            raise ValueError(message)
+        _validate_transient_axis_modes(
+            label=str(kind).upper(),
+            n_modes=(axis_modes[0], axis_modes[1]),
+            spatial_shape=spatial_shape,
+        )
+    elif kind == "uno":
+        modes_y = params.get("modes_y")
+        modes_x = params.get("modes_x")
+        n_layers = params.get("n_layers")
+        ratio = params.get("mode_ratio", 0.5)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (modes_y, modes_x, n_layers)):
+            message = "Transient UNO modes_y, modes_x, and n_layers must be positive exact integers."
+            raise ValueError(message)
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(float(ratio)) or float(ratio) <= 0:
+            message = "Transient UNO mode_ratio must be one positive finite number."
+            raise ValueError(message)
+        scalings = resolve_uno_scalings(n_layers, params.get("uno_scalings"))
+        shape = spatial_shape
+        for index, block_modes in enumerate(
+            _uno_mode_schedule(
+                n_layers=n_layers,
+                modes_y=modes_y,
+                modes_x=modes_x,
+                mode_ratio=float(ratio),
+            )
+        ):
+            _validate_transient_axis_modes(
+                label=f"UNO block {index}",
+                n_modes=(block_modes[0], block_modes[1]),
+                spatial_shape=shape,
+            )
+            scale_y, scale_x = scalings[index]
+            shape = (_scaled_axis_size(shape[0], scale_y), _scaled_axis_size(shape[1], scale_x))
+
+
 def build_uno(
     in_channels: int,
     out_channels: int,
@@ -203,6 +312,7 @@ def build_uno(
     mode_ratio: float = 0.5,
     uno_scalings: list[list[float]] | None = None,
     channel_mlp_skip: str = "linear",
+    positional_embedding: str | None = "grid",
     device: torch.device | str | None = None,
 ) -> UNO:
     """
@@ -228,6 +338,8 @@ def build_uno(
         Layer-specific spatial scalings (default: None - auto-computed)
     channel_mlp_skip : str, optional
         Skip connection type for channel MLP (default: "linear")
+    positional_embedding : str | None, optional
+        Neuraloperator positional embedding (default: "grid")
     device : torch.device | str | None, optional
         Device to place model on (default: None - caller handles)
 
@@ -245,34 +357,18 @@ def build_uno(
 
     uno_scalings = resolve_uno_scalings(n_layers, uno_scalings)
 
-    # Compute mode schedule from base modes and ratio
-    mid_x = max(_MIN_UNO_MODE, int(modes_x * mode_ratio))
-    mid_y = max(_MIN_UNO_MODE, int(modes_y * mode_ratio))
-
-    if n_layers == _UNO_LAYERS_5:
-        uno_n_modes = [
-            [modes_x, modes_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [modes_x, modes_y],
-        ]
-    elif n_layers == _UNO_LAYERS_7:
-        uno_n_modes = [
-            [modes_x, modes_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [mid_x, mid_y],
-            [modes_x, modes_y],
-        ]
-    else:
-        msg = f"Internal UNO layer validation failed for n_layers={n_layers}."
-        raise AssertionError(msg)
+    uno_n_modes = _uno_mode_schedule(
+        n_layers=n_layers,
+        modes_y=modes_y,
+        modes_x=modes_x,
+        mode_ratio=mode_ratio,
+    )
 
     uno_out_channels = [hidden_channels] * n_layers
 
+    constructor_options: dict[str, Any] = {}
+    if positional_embedding != "grid":
+        constructor_options["positional_embedding"] = positional_embedding
     with _filter_uno_constructor_stdout():
         model = UNO(
             in_channels=in_channels,
@@ -283,12 +379,76 @@ def build_uno(
             uno_n_modes=uno_n_modes,
             uno_scalings=uno_scalings,
             channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
+            **constructor_options,
         )
 
     if device is not None:
         model.to(device)
 
     return model
+
+
+def build_rno(
+    in_channels: int,
+    out_channels: int,
+    n_modes: list[int] | tuple[int, int],
+    hidden_channels: int,
+    n_layers: int = 4,
+    rno_skip: bool = False,
+    lifting_channel_ratio: float = 2,
+    projection_channel_ratio: float = 2,
+    positional_embedding: str | None = "grid",
+    channel_mlp_skip: str = "soft-gating",
+    fno_skip: str = "linear",
+    return_sequences: bool = False,
+    device: torch.device | str | None = None,
+) -> torch.nn.Module:
+    """Build the official neuraloperator recurrent neural operator."""
+    if return_sequences is not False:
+        message = "RNO requires return_sequences=False; transient rollouts carry hidden state explicitly."
+        raise ValueError(message)
+    rno_builder = _resolve_rno_builder()
+    if rno_builder is None:
+        message = "The installed neuraloperator package does not expose official RNO support."
+        raise RuntimeError(message)
+    n_modes_tuple = tuple(int(mode) for mode in n_modes)
+    if len(n_modes_tuple) != _FNO_MODE_DIMENSIONS:
+        message = f"RNO requires exactly two n_modes entries, got: {n_modes!r}"
+        raise ValueError(message)
+    model = rno_builder(
+        n_modes=n_modes_tuple,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        hidden_channels=hidden_channels,
+        n_layers=n_layers,
+        rno_skip=rno_skip,
+        lifting_channel_ratio=lifting_channel_ratio,
+        projection_channel_ratio=projection_channel_ratio,
+        positional_embedding=positional_embedding,
+        channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
+        fno_skip=_validate_skip("fno_skip", fno_skip),
+        return_sequences=False,
+    )
+    if device is not None:
+        model.to(device)
+    return model
+
+
+def _resolve_rno_builder() -> Callable[..., torch.nn.Module] | None:
+    """Return the official neuraloperator RNO constructor when exposed."""
+    try:
+        models = importlib.import_module("neuralop.models")
+    except ImportError:
+        return None
+    builder = getattr(models, "RNO", None)
+    if not callable(builder):
+        return None
+    return cast("Callable[..., torch.nn.Module]", builder)
+
+
+def _rno_is_available() -> bool:
+    """Return whether the installed neuraloperator exposes official RNO."""
+    return _resolve_rno_builder() is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,6 +504,7 @@ _MODEL_KINDS = MappingProxyType(
                     "fno_skip",
                     "channel_mlp_skip",
                     "implementation",
+                    "positional_embedding",
                 }
             ),
             required_params=frozenset(
@@ -371,6 +532,7 @@ _MODEL_KINDS = MappingProxyType(
                     "mode_ratio",
                     "uno_scalings",
                     "channel_mlp_skip",
+                    "positional_embedding",
                 }
             ),
             required_params=frozenset(
@@ -383,6 +545,39 @@ _MODEL_KINDS = MappingProxyType(
                     "modes_y",
                 }
             ),
+        ),
+        "rno": ModelKindSpec(
+            kind="rno",
+            builder=build_rno,
+            defaults=MappingProxyType(
+                {
+                    "n_layers": 4,
+                    "rno_skip": False,
+                    "lifting_channel_ratio": 2,
+                    "projection_channel_ratio": 2,
+                    "positional_embedding": "grid",
+                    "channel_mlp_skip": "soft-gating",
+                    "fno_skip": "linear",
+                    "return_sequences": False,
+                }
+            ),
+            allowed_params=frozenset(
+                {
+                    "in_channels",
+                    "out_channels",
+                    "n_modes",
+                    "hidden_channels",
+                    "n_layers",
+                    "rno_skip",
+                    "lifting_channel_ratio",
+                    "projection_channel_ratio",
+                    "positional_embedding",
+                    "channel_mlp_skip",
+                    "fno_skip",
+                    "return_sequences",
+                }
+            ),
+            required_params=frozenset({"in_channels", "out_channels", "n_modes", "hidden_channels"}),
         ),
     }
 )
@@ -398,7 +593,10 @@ def available_model_kinds() -> tuple[str, ...]:
         Exact model kinds accepted by the factory.
 
     """
-    return tuple(sorted(_MODEL_KINDS))
+    kinds = set(_MODEL_KINDS)
+    if not _rno_is_available():
+        kinds.discard("rno")
+    return tuple(sorted(kinds))
 
 
 def resolve_model_kind(kind: str) -> ModelKindSpec:
@@ -496,11 +694,15 @@ def validate_model_params(
         msg = f"model.params is missing required key(s) for {kind!r}: {missing}."
         raise ValueError(msg)
 
-    if kind == "fno" and "n_modes" in params:
+    if kind in {"fno", "rno"} and "n_modes" in params:
         n_modes = params["n_modes"]
         if not isinstance(n_modes, (list, tuple)) or len(n_modes) != operator_dimensionality:
             msg = f"model.params.n_modes must contain exactly {operator_dimensionality} entries for this task, got: {n_modes!r}."
             raise ValueError(msg)
+
+    if kind == "rno" and params.get("return_sequences", False) is not False:
+        message = "model.params.return_sequences must be false for RNO."
+        raise ValueError(message)
 
     if kind == "uno":
         n_layers = params["n_layers"]

@@ -510,3 +510,53 @@ def test_running_trial_persists_distinct_terminal_states(
 def test_public_run_statuses_distinguish_core_terminal_outcomes() -> None:
     """Keep completed, pruned, failed, and interrupted persistence distinct."""
     assert {"completed", "pruned", "failed", "interrupted"} <= (experiments.run.RUN_STATUSES)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exception", "expected_status"),
+    [
+        (
+            optuna_runtime.RecoverableTrialError("recoverable allocator out of memory"),
+            optuna_runtime.RecoverableTrialError,
+            "recoverable_failed",
+        ),
+        (
+            RuntimeError("CUDA out of memory"),
+            optuna.TrialPruned,
+            "oom_pruned",
+        ),
+    ],
+)
+def test_transient_trial_preserves_recoverable_precedence_over_oom_text(
+    error: BaseException,
+    expected_exception: type[BaseException],
+    expected_status: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Classify explicit recoverable failures before allocator-text RuntimeErrors."""
+    config = {
+        "task": "transient_drying",
+        "training": {"stage": "a", "mixed_precision": False, "evaluation_interval": 1, "epochs": 1},
+        "run": {"device": "cpu"},
+    }
+    study: Any = SimpleNamespace(base_config=config, study={"pruner": {}}, search_space=())
+    trial = _Trial()
+    objective = {"id": "normalized_drying_group_macro_rmse", "direction": "minimize"}
+
+    monkeypatch.setattr(optuna_runtime, "_prepare_trial_config", lambda *_args: (config, {}))
+    monkeypatch.setattr(optuna_runtime, "_validate_transient_study_policy", lambda *_args: None)
+    monkeypatch.setattr(optuna_runtime, "_transient_model_digest", lambda *_args: "digest")
+    monkeypatch.setattr(optuna_runtime.learning.device, "resolve_device", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(optuna_runtime.learning.device, "validate_mixed_precision_device", lambda *_args: None)
+    monkeypatch.setattr(optuna_runtime.experiments.config.loader, "get_resolved_objective", lambda *_args: objective)
+    monkeypatch.setattr(optuna_runtime, "_trial_run_dir", lambda *_args: tmp_path / "transient-trial")
+    monkeypatch.setattr(optuna_runtime.experiments.run, "prepare_fresh_run", lambda *_args, **_kwargs: tmp_path / "transient-trial")
+    monkeypatch.setattr(optuna_runtime.experiments.run, "execute_prepared_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    with pytest.raises(expected_exception) as caught:
+        optuna_runtime._run_transient_trial(study, trial)  # noqa: SLF001
+
+    if expected_exception is optuna_runtime.RecoverableTrialError:
+        assert caught.value is error
+    assert trial.attrs["terminal_status"] == expected_status

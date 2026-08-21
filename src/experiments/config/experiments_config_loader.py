@@ -37,8 +37,11 @@ from src import common, datasets, domain, learning
 from src.learning.losses import learning_losses_factory as loss_factory
 from src.learning.metrics import learning_metrics as metric_registry
 from src.learning.models import learning_models_factory as model_factory
+from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
+from src.learning.transient.learning_transient_curriculum import RolloutCurriculum
 
 from . import experiments_config_defaults as config_defaults
+from . import experiments_config_temporal as config_temporal
 
 
 class ConfigError(ValueError):
@@ -55,6 +58,9 @@ CANONICAL_EXPERIMENT_SECTION_ORDER = (
     "task",
     "run",
     "data",
+    "input_profile",
+    "temporal",
+    "scaling",
     "model",
     "loss",
     "evaluation",
@@ -100,6 +106,10 @@ _SECTION_KEYS = {
             "num_workers",
             "pin_memory",
             "persistent_workers",
+            "transient_backend_preference",
+            "transient_backend_required",
+            "hdf5_cache_size",
+            "allow_technical_smoke",
         }
     ),
     "model": frozenset({"kind", "params"}),
@@ -107,7 +117,21 @@ _SECTION_KEYS = {
     "evaluation": frozenset({"metrics", "objective"}),
     "optimizer": frozenset({"kind", "lr", "weight_decay", "betas", "second_moment_floor"}),
     "scheduler": frozenset({"kind", "factor", "patience", "min_lr"}),
-    "training": frozenset({"epochs", "evaluation_interval", "ood_evaluation_interval", "mixed_precision"}),
+    "training": frozenset(
+        {
+            "epochs",
+            "evaluation_interval",
+            "ood_evaluation_interval",
+            "mixed_precision",
+            "stage",
+            "comparison_arm",
+            "gradient_accumulation_steps",
+            "fixed_evaluation_horizon",
+            "curriculum",
+            "matched_compute",
+            "teacher_handoff",
+        }
+    ),
     "tracking": frozenset({"wandb"}),
 }
 
@@ -165,7 +189,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         loss = _as_mapping(user_config["loss"], path="loss")
         if "data" in loss:
             data_loss = _as_mapping(loss["data"], path="loss.data")
-            _reject_unknown(data_loss, frozenset({"kind", "space", "weight"}), path="loss.data")
+            _reject_unknown(data_loss, frozenset({"kind", "space", "weight", "beta", "channel_weights", "state_aux_weight"}), path="loss.data")
         if "physics" in loss:
             physics = _as_mapping(loss["physics"], path="loss.physics")
             _reject_unknown(
@@ -500,9 +524,10 @@ def _metric_fields(
     ``all`` expands in exact TaskSpec output order. Empty, duplicate, or unknown
     fields raise ``ConfigError`` at ``path``.
     """
+    available_fields = task.metric_names if task.id == "transient_drying" else task.output_names
     raw_fields = metric.get("fields", "all")
     if raw_fields == "all":
-        fields = task.output_names
+        fields = available_fields
         metric["fields"] = list(fields)
         return fields
     if isinstance(raw_fields, (str, bytes)) or not isinstance(raw_fields, Sequence):
@@ -515,9 +540,9 @@ def _metric_fields(
     if len(fields) != len(set(fields)):
         msg = f"{path}.fields contains duplicates: {list(fields)}."
         raise ConfigError(msg)
-    unknown = [field for field in fields if field not in task.output_names]
+    unknown = [field for field in fields if field not in available_fields]
     if unknown:
-        msg = f"{path}.fields references unknown task output field(s): {unknown}. Available outputs: {list(task.output_names)}."
+        msg = f"{path}.fields references unknown task metric field(s): {unknown}. Available fields: {list(available_fields)}."
         raise ConfigError(msg)
     metric["fields"] = list(fields)
     return fields
@@ -807,6 +832,9 @@ def resolved_model_variant(config: Mapping[str, Any]) -> str:
         scalings = _format_uno_scalings(params)
         mode_ratio = _format_mode_ratio(params["mode_ratio"])
         return f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_{scalings}_r{mode_ratio}"
+    if kind == "rno":
+        modes = params["n_modes"]
+        return f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
     domain.tasks.registry.get_task(task)
     msg = f"Unknown model identifier {kind!r} while generating a run name."
     raise ConfigError(msg)
@@ -1227,6 +1255,220 @@ def generate_run_name(config: dict[str, Any]) -> str:
     return "__".join(parts)
 
 
+_TRANSIENT_STATE_CHANNELS = 4
+
+
+def _raise_config_error(message: str) -> None:
+    """Raise one path-owned configuration violation from a constructed message."""
+    raise ConfigError(message)
+
+
+def _validate_transient_loss(config: dict[str, Any]) -> None:
+    """Validate the data-only scaled-increment loss branch."""
+    loss = _as_mapping(config["loss"], path="loss")
+    data = _as_mapping(loss["data"], path="loss.data")
+    required = {"kind", "space", "weight", "beta", "channel_weights", "state_aux_weight"}
+    if set(data) != required or data["kind"] not in {"huber", "mse"} or data["space"] != "scaled_increment":
+        _raise_config_error("Transient loss.data must be the complete scaled-increment huber/mse mapping.")
+    if any(
+        isinstance(data[key], bool) or not isinstance(data[key], (int, float)) or not math.isfinite(float(data[key])) or float(data[key]) < 0
+        for key in ("weight", "state_aux_weight")
+    ):
+        _raise_config_error("Transient loss weights must be non-negative finite numbers.")
+    if (
+        isinstance(data["beta"], bool)
+        or not isinstance(data["beta"], (int, float))
+        or not math.isfinite(float(data["beta"]))
+        or float(data["beta"]) <= 0
+    ):
+        _raise_config_error("Transient loss.data.beta must be positive and finite.")
+    weights = data["channel_weights"]
+    if (
+        not isinstance(weights, list)
+        or len(weights) != _TRANSIENT_STATE_CHANNELS
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0 for value in weights
+        )
+        or sum(float(value) for value in weights) <= 0
+    ):
+        _raise_config_error("Transient loss.data.channel_weights must contain four non-negative finite values with positive sum.")
+    physics = _as_mapping(loss["physics"], path="loss.physics")
+    if physics != {"enabled": False, "continuity": "none"}:
+        _raise_config_error("Transient physics must be exactly disabled with continuity='none'.")
+    config["loss"] = {
+        "data": {
+            **data,
+            "weight": float(data["weight"]),
+            "beta": float(data["beta"]),
+            "channel_weights": [float(value) for value in weights],
+            "state_aux_weight": float(data["state_aux_weight"]),
+        },
+        "physics": physics,
+    }
+
+
+def _validate_transient_extensions(  # noqa: C901, PLR0912
+    config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
+) -> None:
+    """Resolve strict transient-only temporal, loader, and curriculum semantics."""
+    if authored is not None:
+        for key in ("input_profile", "temporal", "scaling"):
+            if key not in authored:
+                _raise_config_error(f"Transient config requires top-level {key!r}.")
+    task = domain.tasks.registry.get_task("transient_drying")
+    profile = config.get("input_profile")
+    if not isinstance(profile, str):
+        _raise_config_error("input_profile must be a registered transient profile identifier.")
+    try:
+        task.input_profile(profile)
+        temporal = config_temporal.resolve_transient_temporal_config(_as_mapping(config["temporal"], path="temporal"))
+    except (TypeError, ValueError) as error:
+        msg = f"temporal/input_profile: {error}"
+        raise ConfigError(msg) from error
+    scaling = _as_mapping(config.get("scaling"), path="scaling")
+    if set(scaling) != {"mode"} or scaling["mode"] not in {"state_std", "delta_rms"}:
+        _raise_config_error("scaling must be exactly {'mode': 'state_std' | 'delta_rms'}.")
+    tensorizer = TransientTensorizerSpec.from_mapping({"input_profile": profile, "temporal_conditioning": temporal["temporal_conditioning"]})
+    config["input_profile"] = profile
+    config["temporal"] = temporal
+    config["scaling"] = {"mode": scaling["mode"]}
+    data = _as_mapping(config["data"], path="data")
+    required_data = {
+        "train_dataset",
+        "ood_datasets",
+        "batch_size",
+        "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "transient_backend_preference",
+        "transient_backend_required",
+        "hdf5_cache_size",
+        "allow_technical_smoke",
+    }
+    if set(data) != required_data:
+        _raise_config_error("Transient data keys do not match the loader contract.")
+    if (
+        data["transient_backend_preference"] not in {"pt_shards", "canonical_hdf5"}
+        or type(data["transient_backend_required"]) is not bool
+        or type(data["allow_technical_smoke"]) is not bool
+    ):
+        _raise_config_error("Transient backend and technical-smoke settings are invalid.")
+    if isinstance(data["hdf5_cache_size"], bool) or not isinstance(data["hdf5_cache_size"], int) or data["hdf5_cache_size"] < 0:
+        _raise_config_error("data.hdf5_cache_size must be an integer >= 0.")
+    training = _as_mapping(config["training"], path="training")
+    required_training = {
+        "epochs",
+        "evaluation_interval",
+        "ood_evaluation_interval",
+        "mixed_precision",
+        "stage",
+        "comparison_arm",
+        "gradient_accumulation_steps",
+        "fixed_evaluation_horizon",
+        "curriculum",
+        "matched_compute",
+        "teacher_handoff",
+    }
+    if set(training) != required_training:
+        _raise_config_error("Transient training keys do not match the curriculum contract.")
+    stage, arm = training["stage"], training["comparison_arm"]
+    if stage not in {"a", "b"} or arm not in {"a0", "a_plus", "b"} or (stage == "a" and arm not in {"a0", "a_plus"}) or (stage == "b" and arm != "b"):
+        _raise_config_error("Transient training stage and comparison_arm are inconsistent.")
+    for key in ("gradient_accumulation_steps", "fixed_evaluation_horizon"):
+        if isinstance(training[key], bool) or not isinstance(training[key], int) or training[key] <= 0:
+            _raise_config_error(f"training.{key} must be a positive integer.")
+    curriculum = _as_mapping(training["curriculum"], path="training.curriculum")
+    if (
+        set(curriculum) != {"lengths", "milestone_fractions", "seed"}
+        or not isinstance(curriculum["lengths"], list)
+        or not curriculum["lengths"]
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in curriculum["lengths"])
+        or curriculum["lengths"] != sorted(set(curriculum["lengths"]))
+    ):
+        _raise_config_error("training.curriculum.lengths must be ascending unique positive integers.")
+    fractions = curriculum["milestone_fractions"]
+    if (
+        not isinstance(fractions, list)
+        or len(fractions) != len(curriculum["lengths"])
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not 0 <= float(item) <= 1 for item in fractions)
+        or [float(item) for item in fractions] != sorted(float(item) for item in fractions)
+    ):
+        _raise_config_error("training.curriculum.milestone_fractions must align with lengths and be ascending in [0, 1].")
+    if isinstance(curriculum["seed"], bool) or not isinstance(curriculum["seed"], int) or curriculum["seed"] < 0:
+        _raise_config_error("training.curriculum.seed must be a non-negative integer.")
+    try:
+        resolved_curriculum = RolloutCurriculum(
+            lengths=tuple(curriculum["lengths"]),
+            milestone_fractions=tuple(float(item) for item in fractions),
+        )
+    except (TypeError, ValueError) as error:
+        message = f"training.curriculum: {error}"
+        raise ConfigError(message) from error
+    sampling = temporal["sampling"]
+    rollout_length = sampling.get("rollout_length") if sampling["mode"] == "rollout_window" else 1
+    requires_sequence = stage == "b" or (stage == "a" and config["model"]["kind"] == "rno")
+    if requires_sequence and sampling["mode"] != "rollout_window":
+        _raise_config_error("Stage B and Stage-A RNO require temporal.sampling.mode='rollout_window'.")
+    if resolved_curriculum.lengths[-1] > rollout_length or training["fixed_evaluation_horizon"] > rollout_length:
+        _raise_config_error("training curriculum and fixed_evaluation_horizon must fit temporal.sampling rollout length.")
+    if training["fixed_evaluation_horizon"] not in resolved_curriculum.lengths:
+        _raise_config_error("training.fixed_evaluation_horizon must be one admitted curriculum horizon.")
+    matched = _as_mapping(training["matched_compute"], path="training.matched_compute")
+    matched_keys = {"planned_seconds", "planned_steps", "rollout_reference_seconds", "rollout_reference_steps"}
+    if set(matched) != matched_keys:
+        _raise_config_error("training.matched_compute keys do not match the contract.")
+    for key, value in matched.items():
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0 or not math.isfinite(float(value))
+        ):
+            _raise_config_error(f"training.matched_compute.{key} must be null or positive finite.")
+    handoff = training["teacher_handoff"]
+    if handoff is not None and (
+        not isinstance(handoff, Mapping)
+        or set(handoff) != {"source_run_name"}
+        or not isinstance(handoff["source_run_name"], str)
+        or not handoff["source_run_name"]
+    ):
+        _raise_config_error("training.teacher_handoff must be null or contain only source_run_name.")
+    requires_handoff = arm in {"a_plus", "b"}
+    if requires_handoff != (handoff is not None):
+        _raise_config_error("A+ and B require a teacher handoff; A0 forbids one.")
+    values = tuple(matched.values())
+    if arm == "a0" and any(value is not None for value in values):
+        _raise_config_error("A0 must not declare a matched-compute budget.")
+    seconds_budget = matched["planned_seconds"] is not None
+    steps_budget = matched["planned_steps"] is not None
+    seconds_reference = matched["rollout_reference_seconds"] is not None
+    steps_reference = matched["rollout_reference_steps"] is not None
+    if requires_handoff:
+        if seconds_budget == steps_budget:
+            _raise_config_error("Matched transient arms require exactly one planned budget unit.")
+        if seconds_reference and steps_reference:
+            _raise_config_error("Matched transient arms cannot mix rollout-reference units.")
+        if (seconds_reference and not seconds_budget) or (steps_reference and not steps_budget):
+            _raise_config_error("Matched transient planned and rollout-reference budgets must use one unit.")
+        if arm == "a_plus" and not (seconds_reference or steps_reference):
+            _raise_config_error("A+ requires completed-B rollout-reference matched-compute evidence.")
+    config["training"] = {
+        **training,
+        "curriculum": {
+            "lengths": list(curriculum["lengths"]),
+            "milestone_fractions": [float(item) for item in fractions],
+            "seed": curriculum["seed"],
+        },
+        "matched_compute": dict(matched),
+        "teacher_handoff": None if handoff is None else {"source_run_name": handoff["source_run_name"]},
+    }
+    config["_transient_tensorizer"] = tensorizer
+
+
+def _reject_transient_roots_for_steady(config: Mapping[str, Any]) -> None:
+    """Keep the steady configuration schema byte-for-byte semantic compatible."""
+    unexpected = sorted({"input_profile", "temporal", "scaling"}.intersection(config))
+    if unexpected:
+        _raise_config_error(f"Steady-flow config does not admit transient root key(s): {unexpected}.")
+
+
 def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     """
     Strictly resolve one semantic experiment configuration.
@@ -1270,6 +1512,11 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
 
     effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
     effective["task"] = task_id
+    is_transient = task_id == "transient_drying"
+    if is_transient:
+        _validate_transient_extensions(effective, authored=user_config)
+    else:
+        _reject_transient_roots_for_steady(user_config)
 
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")
@@ -1288,8 +1535,17 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     except ValueError as error:
         msg = f"model: {error}"
         raise ConfigError(msg) from error
-    params["in_channels"] = task.in_channels
-    params["out_channels"] = task.out_channels
+    if is_transient:
+        tensorizer = effective.pop("_transient_tensorizer")
+        if params.get("positional_embedding", None) is not None:
+            msg = "Transient models require model.params.positional_embedding: null because x/y are explicit channels."
+            raise ConfigError(msg)
+        params["in_channels"] = tensorizer.in_channels
+        params["out_channels"] = 4
+        params["positional_embedding"] = None
+    else:
+        params["in_channels"] = task.in_channels
+        params["out_channels"] = task.out_channels
     model["params"] = params
     effective["model"] = model
 
@@ -1309,7 +1565,10 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(msg)
         effective["scheduler"] = deep_merge(config_defaults.SCHEDULER_DEFAULTS[scheduler_kind], scheduler_mapping)
 
-    _validate_loss(effective, task=task)
+    if is_transient:
+        _validate_transient_loss(effective)
+    else:
+        _validate_loss(effective, task=task)
     _validate_evaluation(effective, task=task)
     _validate_runtime_sections(effective, require_derived_tracking=False)
 
@@ -1406,7 +1665,10 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
         msg = "Resolved experiment config must be a mapping."
         raise ConfigError(msg)
     effective = copy.deepcopy(dict(config))
-    allowed = _ROOT_KEYS.union({"task_contract", "paths"})
+    task_id = effective.get("task")
+    transient_roots = frozenset({"input_profile", "temporal", "scaling"})
+    roots = _ROOT_KEYS if task_id == "transient_drying" else _ROOT_KEYS.difference(transient_roots)
+    allowed = roots.union({"task_contract", "paths"})
     missing = sorted(allowed.difference(effective))
     unknown = sorted(set(effective).difference(allowed))
     if missing or unknown:
@@ -1414,6 +1676,13 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ConfigError(msg)
 
     task = validate_resolved_task_contract(effective)
+    is_transient = task.id == "transient_drying"
+    if is_transient:
+        _validate_transient_extensions(effective)
+        tensorizer = effective.pop("_transient_tensorizer")
+    else:
+        _reject_transient_roots_for_steady(effective)
+        tensorizer = None
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")
     if not isinstance(kind, str) or not kind:
@@ -1430,13 +1699,21 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     except ValueError as error:
         msg = f"model: {error}"
         raise ConfigError(msg) from error
-    if params.get("in_channels") != task.in_channels or params.get("out_channels") != task.out_channels:
+    expected_in_channels = tensorizer.in_channels if tensorizer is not None else task.in_channels
+    expected_out_channels = 4 if tensorizer is not None else task.out_channels
+    if params.get("in_channels") != expected_in_channels or params.get("out_channels") != expected_out_channels:
         msg = "Resolved model channels do not match the task contract."
+        raise ConfigError(msg)
+    if tensorizer is not None and params.get("positional_embedding") is not None:
+        msg = "Transient models require null positional_embedding because x/y are explicit channels."
         raise ConfigError(msg)
     model["params"] = params
     effective["model"] = model
 
-    _validate_loss(effective, task=task)
+    if is_transient:
+        _validate_transient_loss(effective)
+    else:
+        _validate_loss(effective, task=task)
     _validate_resolved_metric_keys(effective)
     _validate_evaluation(effective, task=task)
     _validate_runtime_sections(effective, require_derived_tracking=True)
@@ -1526,6 +1803,47 @@ def create_dataloaders_from_config(
     """
     task = validate_resolved_task_contract(config)
     data_cfg = _as_mapping(config.get("data"), path="data")
+    if task.id == "transient_drying":
+        tensorizer = TransientTensorizerSpec.from_mapping(
+            {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
+        )
+        seeds = dict(seed_plan or {})
+        run_seed = int(config["run"]["seed"])
+        settings = datasets.runtime.factory.LoaderSettings(
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            pin_memory=data_cfg["pin_memory"],
+            persistent_workers=data_cfg["persistent_workers"],
+            hdf5_cache_size=data_cfg["hdf5_cache_size"],
+        )
+        loaders = datasets.runtime.transient_training.create_transient_training_loaders(
+            train_dataset_id=data_cfg["train_dataset"],
+            ood_dataset_ids=data_cfg["ood_datasets"],
+            tensorizer=tensorizer,
+            train_sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
+            loader_settings=settings,
+            storage_root=config["paths"]["storage_root"],
+            transient_backend_preference=data_cfg["transient_backend_preference"],
+            transient_backend_required=data_cfg["transient_backend_required"],
+            scale_mode=config["scaling"]["mode"],
+            split_seed=seeds.get("split", run_seed),
+            loader_seed=seeds.get("loader", run_seed),
+            worker_seed=seeds.get("worker", run_seed),
+            saved_split=split_indices,
+            restored_scaling_artifact=data_processor,
+            allow_technical_smoke=data_cfg["allow_technical_smoke"],
+        )
+        return {
+            "train": loaders.train,
+            "eval": loaders.evaluation,
+            "ood": loaders.ood,
+            "id_test": loaders.id_test,
+            "data_processor": loaders.scaling_artifact,
+            "split_indices": loaders.split,
+            "dataset_identity": loaders.dataset_identity,
+            "runtime_provenance": loaders.runtime_provenance,
+            "tensorizer": tensorizer,
+        }
     dataset_root = Path(config["paths"]["dataset_root"])
 
     train_dataset_name = common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset")

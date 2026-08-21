@@ -127,6 +127,133 @@ def _definition(
     )
 
 
+def _transient_history_metric_definitions(
+    evaluation_metrics: Sequence[Mapping[str, Any]],
+    *,
+    objective_id: str,
+    cuda_enabled: bool,
+) -> tuple[HistoryMetricDefinition, ...]:
+    """Register only authoritative transient training-loop telemetry."""
+    definitions: list[HistoryMetricDefinition] = []
+    loop_owner = "src.learning.training.learning_training_loop.train_loop"
+    for source, destination in (
+        ("train/loss_total", "Transient/Loss/train_total"),
+        ("train/loss_data", "Transient/Loss/train_data"),
+        ("train/loss_data_T", "Transient/Loss/train_data_T"),
+        ("train/loss_data_phi", "Transient/Loss/train_data_phi"),
+        ("train/loss_data_w_surf", "Transient/Loss/train_data_w_surf"),
+        ("train/loss_data_w_int", "Transient/Loss/train_data_w_int"),
+        ("train/loss_state_aux", "Transient/Loss/train_state_aux"),
+        ("transient/curriculum_progress", "Transient/Curriculum/progress"),
+        ("transient/curriculum_active_stage", "Transient/Curriculum/active_stage"),
+        ("transient/curriculum_max_horizon", "Transient/Curriculum/max_horizon"),
+        ("transient/curriculum_draw_index", "Transient/Curriculum/draw_index"),
+        ("transient/self_fed_stage", "Transient/Curriculum/self_fed_stage"),
+        ("transient/planned_teacher_forcing_budget_seconds", "Transient/Compute/planned_seconds"),
+        ("transient/planned_teacher_forcing_budget_steps", "Transient/Compute/planned_steps"),
+        ("transient/rollout_reference_compute_seconds", "Transient/Compute/rollout_reference_seconds"),
+        ("transient/rollout_reference_compute_steps", "Transient/Compute/rollout_reference_steps"),
+        ("transient/post_handoff_optimizer_device_seconds", "Transient/Compute/post_handoff_seconds"),
+        ("transient/post_handoff_optimizer_steps", "Transient/Compute/post_handoff_steps"),
+        ("transient/successful_optimizer_steps", "Transient/Compute/successful_optimizer_steps"),
+        ("transient/processed_target_transitions", "Transient/Compute/processed_target_transitions"),
+        ("transient/forward_transitions", "Transient/Compute/forward_transitions"),
+        ("transient/validation_seconds", "Transient/Compute/validation_seconds"),
+        ("transient/budget_complete", "Transient/Compute/budget_complete"),
+        ("transient/selected_rollout_horizon", "Transient/Curriculum/selected_horizon"),
+        ("transient/last_origin_min", "Transient/Curriculum/origin_min"),
+        ("transient/last_origin_max", "Transient/Curriculum/origin_max"),
+        ("transient/teacher_forcing_optimizer_steps", "Transient/Compute/teacher_forcing_steps"),
+        ("transient/teacher_forcing_optimizer_device_seconds", "Transient/Compute/teacher_forcing_seconds"),
+        ("transient/remaining_to_planned_teacher_forcing_budget_seconds", "Transient/Compute/remaining_planned_seconds"),
+        ("transient/remaining_teacher_forcing_compute_to_match_rollout_seconds", "Transient/Compute/remaining_matched_seconds"),
+        ("transient/remaining_to_planned_teacher_forcing_budget_steps", "Transient/Compute/remaining_planned_steps"),
+        ("transient/remaining_teacher_forcing_compute_to_match_rollout_steps", "Transient/Compute/remaining_matched_steps"),
+        ("transient/wall_seconds", "Transient/Diagnostics/wall_seconds"),
+        ("transient/peak_cuda_memory_bytes", "Transient/Diagnostics/peak_cuda_memory_bytes"),
+        ("transient/train/samples", "Transient/Train/samples"),
+        ("transient/train/processed_target_transitions", "Transient/Train/processed_target_transitions"),
+        ("transient/train/forward_transitions", "Transient/Train/forward_transitions"),
+        ("transient/train/microbatches", "Transient/Train/microbatches"),
+        ("transient/train/optimizer_groups", "Transient/Train/optimizer_groups"),
+        ("system/train_samples_per_second", "Transient/Diagnostics/train_samples_per_second"),
+        ("system/train_duration_seconds", "Transient/Diagnostics/train_duration_seconds"),
+        ("system/epoch_duration_seconds", "Transient/Diagnostics/epoch_duration_seconds"),
+        ("system/estimated_remaining_seconds", "Transient/Diagnostics/estimated_remaining_seconds"),
+    ):
+        definitions.append(
+            _definition(
+                source,
+                destination,
+                owner=loop_owner,
+                computation_cost="existing training-loop telemetry",
+                scientific_question="What does this authoritative transient training value report?",
+            )
+        )
+    metric_ids = tuple(str(metric["id"]) for metric in evaluation_metrics)
+    for role in ("id", "ood"):
+        for metric_id in metric_ids:
+            definitions.append(
+                _definition(
+                    f"{role}/{metric_id}",
+                    f"Transient/{role.upper()}/{metric_id}",
+                    owner=loop_owner,
+                    computation_cost="existing evaluation pass",
+                    scientific_question="What is the authoritative transient evaluation metric?",
+                )
+            )
+            definitions.append(
+                _definition(
+                    f"{role}/guardrail/one_step/{metric_id}",
+                    f"Transient/{role.upper()}/Guardrail/one_step/{metric_id}",
+                    owner=loop_owner,
+                    computation_cost="existing adapter evaluation pass",
+                    scientific_question="How does the one-step diagnostic compare?",
+                )
+            )
+        definitions.extend(
+            _definition(
+                f"{role}/{metric_id}",
+                f"Transient/{role.upper()}/{metric_id}",
+                owner=loop_owner,
+                computation_cost="existing adapter evaluation pass",
+                scientific_question="What is the reconstructed grain-moisture diagnostic?",
+            )
+            for metric_id in ("physical/w_gr_mae", "physical/w_gr_rmse")
+        )
+        if objective_id in metric_ids:
+            definitions.append(
+                _definition(
+                    f"{role}/{objective_id}/component/T",
+                    f"Transient/{role.upper()}/{objective_id}/component/T",
+                    owner=loop_owner,
+                    computation_cost="existing metric accumulator",
+                    scientific_question="What is the temperature component?",
+                )
+            )
+            definitions.extend(
+                _definition(
+                    f"{role}/{objective_id}/component/{component}",
+                    f"Transient/{role.upper()}/{objective_id}/component/{component}",
+                    owner=loop_owner,
+                    computation_cost="existing metric accumulator",
+                    scientific_question="What is this drying-group component?",
+                )
+                for component in ("phi", "w_surf", "w_int", "grain_moisture_error", "normalized_drying_group_macro_rmse")
+            )
+    if cuda_enabled:
+        definitions.append(
+            _definition(
+                "system/cuda_peak_memory_allocated_bytes",
+                "Transient/Diagnostics/cuda_peak_memory_allocated_bytes",
+                owner=loop_owner,
+                computation_cost="existing CUDA allocator counter",
+                scientific_question="What CUDA memory was allocated?",
+            )
+        )
+    return tuple(definitions)
+
+
 def automatic_history_metric_definitions(
     evaluation_metrics: Sequence[Mapping[str, Any]],
     *,
@@ -136,6 +263,7 @@ def automatic_history_metric_definitions(
     physics_monitor_enabled: bool,
     cuda_enabled: bool,
     optuna_trial: bool = False,
+    task_id: str | None = None,
 ) -> tuple[HistoryMetricDefinition, ...]:
     """
     Return the ordered automatic-personal-workspace history contract.
@@ -146,6 +274,36 @@ def automatic_history_metric_definitions(
     Diagnostics registration order. W&B itself does not guarantee that a
     personal workspace will preserve registration order in its UI.
     """
+    if task_id == "transient_drying":
+        transient_definitions = _transient_history_metric_definitions(
+            evaluation_metrics,
+            objective_id=objective_id,
+            cuda_enabled=cuda_enabled,
+        )
+        if optuna_trial:
+            transient_definitions = (
+                *transient_definitions,
+                _definition(
+                    "optuna/objective",
+                    "Optuna/objective",
+                    owner="src.experiments.tuning.experiments_tuning_optuna",
+                    computation_cost="existing Optuna report",
+                    scientific_question="What held-out objective was reported to Optuna?",
+                ),
+                _definition(
+                    "optuna/best_objective_so_far",
+                    "Optuna/best_objective_so_far",
+                    owner="src.experiments.tuning.experiments_tuning_optuna",
+                    computation_cost="existing Optuna reporter state",
+                    scientific_question="What is the best reported trial objective so far?",
+                ),
+            )
+        source_keys = [definition.source_key for definition in transient_definitions]
+        wandb_keys = [definition.wandb_key for definition in transient_definitions]
+        if len(source_keys) != len(set(source_keys)) or len(wandb_keys) != len(set(wandb_keys)):
+            message = "Automatic transient W&B history definitions must have unique source and destination keys."
+            raise RuntimeError(message)
+        return transient_definitions
     metric_ids = frozenset(str(metric["id"]) for metric in evaluation_metrics)
     accuracy_metric_ids = _accuracy_history_metric_ids(evaluation_metrics, objective_id=objective_id)
     definitions: list[HistoryMetricDefinition] = []
@@ -523,6 +681,70 @@ def _package_versions() -> dict[str, str | None]:
     return versions
 
 
+def _build_transient_semantic_config(
+    config: Mapping[str, Any],
+    *,
+    split_indices: Mapping[str, Any],
+    split_indices_sha256: str,
+    normalizer_sha256: str,
+    checkpoint_identity: Mapping[str, Any],
+    model: Any,
+    device_metadata: Mapping[str, Any],
+    duration_contract: Mapping[str, Any],
+    runtime_provenance: Mapping[str, Any] | None,
+    transient_scaling: Mapping[str, Any] | None,
+    transient_handoff: Mapping[str, Any] | None,
+    tuning_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build bounded transient-drying provenance without steady split assumptions."""
+    task_contract = cast("Mapping[str, Any]", config["task_contract"])
+    roles = cast("Mapping[str, Any]", split_indices["roles"])
+    datasets_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", split_indices["dataset_identity"])))
+    split_payload = {
+        "schema_kind": split_indices["schema_kind"],
+        "schema_version": split_indices["schema_version"],
+        "artifact": "split_indices.pt",
+        "artifact_sha256": split_indices_sha256,
+        "sampling": copy.deepcopy(split_indices["sampling"]),
+        "ood_fraction": split_indices["ood_fraction"],
+        "split_seed": split_indices["split_seed"],
+        "roles": copy.deepcopy(dict(roles)),
+    }
+    scaling_payload = copy.deepcopy(dict(transient_scaling or {}))
+    scaling_payload["artifact"] = "normalizer.pt"
+    scaling_payload["artifact_sha256"] = normalizer_sha256
+    model_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["model"])))
+    model_payload["parameter_counts"] = model_parameter_counts(model)
+    payload: dict[str, Any] = {
+        "task": {"id": config["task"], "contract_digest": task_contract.get("digest"), "contract": copy.deepcopy(dict(task_contract))},
+        "data": {"datasets": datasets_payload, "split": split_payload, "normalization": scaling_payload},
+        "tensorizer": copy.deepcopy(split_indices["tensorizer"]),
+        "model": model_payload,
+        "loss": copy.deepcopy(config["loss"]),
+        "evaluation": copy.deepcopy(config["evaluation"]),
+        "optimizer": copy.deepcopy(config["optimizer"]),
+        "scheduler": copy.deepcopy(config.get("scheduler")),
+        "training": copy.deepcopy(config["training"]),
+        "checkpoint": copy.deepcopy(dict(checkpoint_identity)),
+        "teacher_handoff": copy.deepcopy(dict(transient_handoff)) if transient_handoff is not None else None,
+        "provenance": {
+            "repository": _git_metadata(),
+            "config_digest": checkpoint_identity.get("effective_config_digest"),
+            "task_contract_digest": task_contract.get("digest"),
+            "runtime_backend": copy.deepcopy(dict(runtime_provenance or {})),
+            "schema_versions": {"run": 1, "checkpoint": 2, "tracking_integration": TRACKING_INTEGRATION_VERSION},
+        },
+        "runtime": {
+            "device": copy.deepcopy(dict(device_metadata)),
+            "packages": {**_package_versions(), "pytorch": device_metadata.get("pytorch_version")},
+            "duration_contract": copy.deepcopy(dict(duration_contract)),
+        },
+    }
+    if tuning_context is not None:
+        payload["tuning"] = copy.deepcopy(dict(tuning_context))
+    return cast("dict[str, Any]", _sanitize_semantic_value(payload))
+
+
 def build_semantic_config(
     config: Mapping[str, Any],
     *,
@@ -534,8 +756,26 @@ def build_semantic_config(
     device_metadata: Mapping[str, Any],
     duration_contract: Mapping[str, Any],
     tuning_context: Mapping[str, Any] | None = None,
+    runtime_provenance: Mapping[str, Any] | None = None,
+    transient_scaling: Mapping[str, Any] | None = None,
+    transient_handoff: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one complete, nested, path-free scientific W&B configuration."""
+    if config.get("task") == "transient_drying":
+        return _build_transient_semantic_config(
+            config,
+            split_indices=split_indices,
+            split_indices_sha256=split_indices_sha256,
+            normalizer_sha256=normalizer_sha256,
+            checkpoint_identity=checkpoint_identity,
+            model=model,
+            device_metadata=device_metadata,
+            duration_contract=duration_contract,
+            runtime_provenance=runtime_provenance,
+            transient_scaling=transient_scaling,
+            transient_handoff=transient_handoff,
+            tuning_context=tuning_context,
+        )
     task_contract = config.get("task_contract")
     if not isinstance(task_contract, Mapping):
         msg = "Semantic tracking config requires a resolved task contract."
@@ -1270,6 +1510,7 @@ def initialize_wandb(
         physics_monitor_enabled=bool(monitor_settings["enabled"]),
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
+        task_id=task_id,
     )
 
     sdk_run: _WandbRun | None = None

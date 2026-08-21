@@ -200,6 +200,7 @@ def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Leave SDK and disk untouched when tracking is disabled."""
+    config = _resolved_config(mode="disabled")
     monkeypatch.setattr(
         tracking.importlib,
         "import_module",
@@ -207,7 +208,7 @@ def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
     )
     state, update = _state_recorder()
     session = tracking.initialize_wandb(
-        _resolved_config(mode="disabled"),
+        config,
         run_dir=tmp_path,
         state_updater=update,
     )
@@ -335,6 +336,69 @@ def test_semantic_config_is_path_free_and_preserves_active_science(
     assert secret not in serialized
     assert "WANDB_API_KEY" not in serialized
     assert str(Path.home()) not in serialized
+
+
+def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys() -> None:
+    """Keep transient observer keys fixed while preserving local evidence ownership."""
+    config = _resolved_config(mode="disabled")
+    config["task"] = "transient_drying"
+    config["task_contract"] = {
+        "digest": "a" * 64,
+        "id": "transient_drying",
+        "preprocessing": {"fit_split": "train"},
+        "physics": {"kind": "none"},
+    }
+    config["evaluation"]["metrics"] = [
+        {"id": "normalized_drying_group_macro_rmse", "kind": "drying_group_macro_rmse", "fields": ["T", "phi", "w_surf", "w_int"]},
+        {"id": "physical_mae_T", "kind": "mae", "fields": ["T"]},
+    ]
+    config["evaluation"]["objective"] = {"id": "normalized_drying_group_macro_rmse", "direction": "minimize"}
+    split = {
+        "schema_kind": "transient_drying_training_split",
+        "schema_version": 1,
+        "tensorizer": {"input_profile": "complete", "temporal_conditioning": "none"},
+        "sampling": {"window": 2},
+        "ood_fraction": 0.2,
+        "split_seed": 7,
+        "dataset_identity": {"train": {"dataset_id": "train", "index_digest": "b" * 64}, "ood": [{"dataset_id": "ood", "index_digest": "c" * 64}]},
+        "roles": {
+            "train": {"case_ids": ["a"]},
+            "scaling_train_one_step": {"case_ids": ["a"]},
+            "evaluation": {"case_ids": ["b"]},
+            "id_test": {"case_ids": ["c"]},
+            "ood": {"parts": [{"case_ids": ["d"]}]},
+        },
+    }
+    payload = tracking.build_semantic_config(
+        config,
+        split_indices=split,
+        split_indices_sha256="d" * 64,
+        normalizer_sha256="e" * 64,
+        checkpoint_identity={"effective_config_digest": "f" * 64},
+        model=torch.nn.Linear(2, 3),
+        device_metadata={"resolved_device": "cpu", "pytorch_version": torch.__version__},
+        duration_contract=experiments.run.RUN_DURATION_CONTRACT,
+        runtime_provenance={"train": "pt_shards"},
+        transient_scaling={"semantic_digest": "1" * 64, "scale_mode": "delta_rms"},
+        transient_handoff={"source_run_name": "a0", "compatibility_digest": "2" * 64},
+    )
+    assert payload["data"]["split"]["roles"]["evaluation"]["case_ids"] == ["b"]
+    assert payload["data"]["normalization"]["semantic_digest"] == "1" * 64
+    assert payload["provenance"]["runtime_backend"] == {"train": "pt_shards"}
+    definitions = tracking.automatic_history_metric_definitions(
+        config["evaluation"]["metrics"],
+        objective_id="normalized_drying_group_macro_rmse",
+        physics_training_enabled=False,
+        continuity="none",
+        physics_monitor_enabled=False,
+        cuda_enabled=False,
+        task_id="transient_drying",
+    )
+    destinations = {definition.wandb_key for definition in definitions}
+    assert "Transient/Loss/train_data_w_int" in destinations
+    assert "Transient/ID/normalized_drying_group_macro_rmse" in destinations
+    assert "Transient/ID/Guardrail/one_step/physical_mae_T" in destinations
+    assert len(destinations) == len(definitions)
 
 
 def test_model_parameter_counts_ignore_device_and_dtype() -> None:

@@ -41,7 +41,7 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from src import common, datasets, experiments, learning
+from src import common, datasets, domain, experiments, learning
 
 from . import experiments_tuning_search_space as search_space
 
@@ -55,6 +55,9 @@ _SAMPLER_METADATA_ATTR = "sampler_metadata"
 _STUDY_SUMMARY_FILENAME = "study_summary.json"
 _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS = 20
 _STUDY_ROLES = frozenset({"production", "smoke"})
+_TRANSIENT_OPTUNA_HORIZON = 32
+_TRANSIENT_OPTUNA_CURRICULUM = (2, 4, 8, 16, 32)
+_TRANSIENT_OOM_PRUNED_MESSAGE = "Trial pruned after allocator out-of-memory failure"
 OPTUNA_ROOT_KEYS = frozenset({"study", "experiment", "search_space"})
 _TRIAL_OUTCOMES = (
     "completed",
@@ -638,6 +641,7 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     search_parameters = search_space.parse_search_space(raw_mapping["search_space"])
     search_space.validate_search_space_paths(base_config, search_parameters)
     _validate_search_space_choices(base_config, search_parameters)
+    _validate_transient_study_policy(base_config, search_parameters)
 
     return OptunaStudyConfig(
         path=source_path,
@@ -725,6 +729,7 @@ def _validate_study_contract(config: OptunaStudyConfig) -> tuple[OptunaStudyConf
         raise ValueError(msg)
     search_space.validate_search_space_paths(base_config, config.search_space)
     _validate_search_space_choices(base_config, config.search_space)
+    _validate_transient_study_policy(base_config, config.search_space)
     return replace(config, base_config=base_config), objective
 
 
@@ -894,6 +899,32 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
 
     task = experiments.config.loader.validate_resolved_task_contract(config)
     paths = _as_mapping(config.get("paths"), label="experiment.paths")
+    if config.get("task") == "transient_drying":
+        storage_root = Path(_require_nonempty_string(paths.get("storage_root"), label="paths.storage_root"))
+
+        def summarize_transient(dataset_id: str) -> dict[str, Any]:
+            manifest = datasets.dataset_packages.load_package_manifest_evidence(
+                dataset_id,
+                storage_root=storage_root,
+            )
+            index_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
+            index = datasets.packages.trajectory.load_transient_index(index_path)
+            if index["dataset_id"] != manifest["dataset_id"] or index["contract_digest"] != manifest["channel_contract_digest"]:
+                message = "Transient package index identity disagrees with its validated package manifest."
+                raise ValueError(message)
+            return {
+                "dataset_id": manifest["dataset_id"],
+                "dataset_view": manifest["dataset_view"],
+                "manifest_schema": {"kind": manifest["schema_kind"], "version": manifest["schema_version"]},
+                "manifest_payload_sha256": manifest["payload_sha256"],
+                "index_digest": index["index_digest"],
+                "sample_count": index["sample_count"],
+                "source_case_count": index["source_case_count"],
+                "data_contract_digest": index["contract_digest"],
+                "validation": "validated_package_manifest_and_compact_transient_index",
+            }
+
+        return {"id": summarize_transient(train_dataset), "ood": [summarize_transient(dataset_id) for dataset_id in ood_datasets]}
 
     def summarize(dataset_id: str) -> dict[str, Any]:
         summary = datasets.contracts.metadata.load_dataset_metadata_summary(
@@ -1249,6 +1280,145 @@ def _validate_completed_reporting(
         raise RuntimeError(msg)
 
 
+def _transient_model_digest(config: Mapping[str, Any]) -> str:
+    """Return the immutable resolved transient model architecture digest."""
+    return common.serialization.canonical_json_sha256(copy.deepcopy(dict(_as_mapping(config["model"], label="config.model"))))
+
+
+def _validate_transient_study_policy(
+    config: Mapping[str, Any],
+    parameters: Sequence[search_space.SearchSpaceParameter],
+) -> None:
+    """Enforce stage-aware transient Optuna search ownership."""
+    if config.get("task") != "transient_drying":
+        return
+    objective = experiments.config.loader.get_resolved_objective(config)
+    transient_task = domain.tasks.registry.get_task("transient_drying")
+    expected_metric = next(metric for metric in transient_task.default_metrics if metric.id == "normalized_drying_group_macro_rmse")
+    expected_objective = expected_metric.as_dict(all_fields=transient_task.output_names)
+    if objective != expected_objective:
+        message = "Transient Optuna requires the TaskSpec-owned normalized drying group-macro objective."
+        raise ValueError(message)
+    training = _as_mapping(config["training"], label="experiment.training")
+    stage = training["stage"]
+    model_paths = tuple(parameter.path for parameter in parameters if parameter.path.startswith("model."))
+    forbidden_b = tuple(parameter.path for parameter in parameters if parameter.path.startswith(("model.", "optimizer.", "loss.")))
+    if stage == "b":
+        if training["fixed_evaluation_horizon"] != _TRANSIENT_OPTUNA_HORIZON or training["curriculum"]["lengths"] != list(
+            _TRANSIENT_OPTUNA_CURRICULUM
+        ):
+            message = "Stage-B transient Optuna requires the canonical cumulative horizon-32 curriculum."
+            raise ValueError(message)
+        if forbidden_b:
+            message = "Stage-B transient Optuna may tune only compatible continuation controls; model, optimizer, and loss paths are forbidden."
+            raise ValueError(message)
+        allowed = {"data.batch_size", "training.gradient_accumulation_steps"}
+        unsupported = sorted({parameter.path for parameter in parameters}.difference(allowed))
+        if unsupported:
+            message = f"Stage-B transient Optuna has unsupported continuation path(s): {unsupported}."
+            raise ValueError(message)
+        if not {parameter.path for parameter in parameters}.issuperset(allowed):
+            message = "Stage-B transient Optuna requires both batch size and gradient-accumulation controls."
+            raise ValueError(message)
+    elif stage == "a":
+        if training["comparison_arm"] != "a0":
+            message = "Stage-A transient Optuna must use the immutable A0 comparison arm."
+            raise ValueError(message)
+    else:
+        message = "Transient Optuna supports only Stage A or Stage B."
+        raise ValueError(message)
+    if model_paths and config["model"]["kind"] not in {"fno", "uno", "rno"}:
+        message = "Transient Optuna architecture search admits only FNO, UNO, and RNO."
+        raise ValueError(message)
+
+
+def _transient_terminal_status(error: BaseException, trial_pruned: type[BaseException]) -> str | None:
+    """Classify Optuna-local terminal outcomes for shared lifecycle publication."""
+    if isinstance(error, trial_pruned):
+        return "pruned"
+    if isinstance(error, FloatingPointError):
+        return "nonfinite_pruned"
+    if isinstance(error, RecoverableTrialError):
+        return "recoverable_failed"
+    if isinstance(error, (torch.cuda.OutOfMemoryError, MemoryError)) or (isinstance(error, RuntimeError) and _runtime_error_is_allocation_oom(error)):
+        return "oom_pruned"
+    return None
+
+
+def _run_transient_trial(study_config: OptunaStudyConfig, trial: TrialProtocol) -> float:
+    """Execute one transient trial through the authoritative prepared-run lifecycle."""
+    config, context = _prepare_trial_config(study_config, trial)
+    _validate_transient_study_policy(config, study_config.search_space)
+    base_digest = _transient_model_digest(study_config.base_config)
+    if config["training"]["stage"] == "b" and _transient_model_digest(config) != base_digest:
+        message = "Stage-B trial overrides changed the immutable restored model architecture."
+        raise ValueError(message)
+    device_resolution = learning.device.resolve_device(config["run"]["device"], path="run.device")
+    learning.device.validate_mixed_precision_device(config["training"]["mixed_precision"], device_resolution)
+    objective = experiments.config.loader.get_resolved_objective(config)
+    reporter = OptunaEpochReporter(
+        trial=trial,
+        objective_id=str(objective["id"]),
+        direction=str(objective["direction"]),
+        evaluation_interval=int(config["training"]["evaluation_interval"]),
+        target_epoch=int(config["training"]["epochs"]),
+        pruner_config=study_config.study["pruner"],
+    )
+    trial_pruned = _trial_pruned_error()
+    run_dir = experiments.run.prepare_fresh_run(
+        config,
+        run_dir=_trial_run_dir(config, context),
+        summary_extra=context,
+    )
+
+    def callback(epoch: int, metrics: dict[str, float]) -> None:
+        """Report only completed ID objective observations to Optuna."""
+        key = f"id/{objective['id']}"
+        if key not in metrics:
+            return
+        guardrail_key = f"id/guardrail/one_step/{objective['id']}"
+        if guardrail_key not in metrics or not math.isfinite(float(metrics[guardrail_key])):
+            message = "Transient one-step guardrail must be finite at each reported evaluation."
+            raise NonFiniteTrialError(message)
+        reporter(epoch, metrics)
+        if reporter.last_reported_objective is not None:
+            metrics["optuna/objective"] = reporter.last_reported_objective
+        if reporter.best_value is not None:
+            metrics["optuna/best_objective_so_far"] = reporter.best_value
+
+    try:
+        result = experiments.run.execute_prepared_run(
+            config,
+            run_dir=run_dir,
+            persisted_config=config,
+            epoch_end_callback=callback,
+            summary_extra=context,
+            device_resolution=device_resolution,
+            terminal_status_resolver=lambda error: _transient_terminal_status(error, trial_pruned),
+        )
+        _validate_completed_reporting(reporter, result)
+        value = _finite_objective_value(result, objective)
+        trial.set_user_attr("terminal_status", "completed")
+    except trial_pruned:
+        trial.set_user_attr("terminal_status", "pruned")
+        raise
+    except FloatingPointError as error:
+        trial.set_user_attr("terminal_status", "nonfinite_pruned")
+        raise trial_pruned(str(error)) from None
+    except RecoverableTrialError:
+        trial.set_user_attr("terminal_status", "recoverable_failed")
+        raise
+    except (torch.cuda.OutOfMemoryError, MemoryError) as error:
+        trial.set_user_attr("terminal_status", "oom_pruned")
+        raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
+    except RuntimeError as error:
+        if _runtime_error_is_allocation_oom(error):
+            trial.set_user_attr("terminal_status", "oom_pruned")
+            raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
+        raise
+    return value
+
+
 def run_trial(  # noqa: C901, PLR0912, PLR0915
     study_config: OptunaStudyConfig,
     trial: TrialProtocol,
@@ -1285,6 +1455,8 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
 
     """
     study_config, _ = _validate_study_contract(study_config)
+    if study_config.base_config["task"] == "transient_drying":
+        return _run_transient_trial(study_config, trial)
     device_resolution = learning.device.resolve_device(
         study_config.base_config["run"]["device"],
         path="run.device",

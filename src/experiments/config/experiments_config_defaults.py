@@ -87,6 +87,7 @@ WANDB_ENTITY = "Rinovative-Hub"
 WANDB_REPOSITORY_PROJECT = "grainlegumes-pino-drying"
 WANDB_TASK_PROJECTS = {
     "steady_flow": WANDB_REPOSITORY_PROJECT,
+    "transient_drying": "grainlegumes-pino-drying-transient",
 }
 WANDB_MAX_TAGS = 2
 WANDB_WORKFLOWS = (
@@ -138,6 +139,62 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
 
     """
     task = domain.tasks.registry.get_task(task_id)
+    if task_id == "transient_drying":
+        return {
+            "run": RUN_DEFAULTS,
+            "data": {
+                "batch_size": 2,
+                "num_workers": 0,
+                "pin_memory": False,
+                "persistent_workers": False,
+                "transient_backend_preference": "pt_shards",
+                "transient_backend_required": False,
+                "hdf5_cache_size": 0,
+                "allow_technical_smoke": False,
+            },
+            "input_profile": task.primary_input_profile,
+            "temporal": {"sampling": {"mode": "one_step_transition"}, "temporal_conditioning": {"kind": "none"}},
+            "scaling": {"mode": "state_std"},
+            "loss": {
+                "data": {
+                    "kind": "huber",
+                    "space": "scaled_increment",
+                    "weight": 1.0,
+                    "beta": 1.0,
+                    "channel_weights": [1.0, 1.0, 1.0, 1.0],
+                    "state_aux_weight": 0.0,
+                },
+                "physics": {"enabled": False, "continuity": "none"},
+            },
+            "evaluation": {"metrics": [metric.as_dict(all_fields=task.metric_names) for metric in task.default_metrics]},
+            "optimizer": OPTIMIZER_DEFAULTS["adamw"],
+            "scheduler": SCHEDULER_DEFAULTS["reduce_on_plateau"],
+            "training": {
+                "epochs": 100,
+                "evaluation_interval": 1,
+                "ood_evaluation_interval": 1,
+                "mixed_precision": False,
+                "stage": "a",
+                "comparison_arm": "a0",
+                "gradient_accumulation_steps": 1,
+                "fixed_evaluation_horizon": 1,
+                "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": 9},
+                "matched_compute": {
+                    "planned_seconds": None,
+                    "planned_steps": None,
+                    "rollout_reference_seconds": None,
+                    "rollout_reference_steps": None,
+                },
+                "teacher_handoff": None,
+            },
+            "tracking": {
+                "wandb": {
+                    **TRACKING_DEFAULTS["wandb"],
+                    "project": WANDB_TASK_PROJECTS[task_id],
+                    "monitor": {"enabled": False, "interval": 1, "max_cases": 1},
+                },
+            },
+        }
     return {
         "run": RUN_DEFAULTS,
         "data": dict(DATA_RUNTIME_DEFAULTS),

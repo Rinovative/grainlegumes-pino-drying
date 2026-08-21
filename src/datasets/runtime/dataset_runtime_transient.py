@@ -161,6 +161,18 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         """Return the Generation-configured temporal normalization horizon."""
         return float(self.payload["configured_regular_horizon"]["value"])
 
+    def runtime_item_ids(self) -> tuple[str, ...]:
+        """Return stable IDs for the fully expanded runtime sampling items."""
+        if self.sampling.mode == "one_step_transition":
+            return tuple(str(self.payload["samples"][position]["sample_id"]) for position in self.sample_indices)
+        item_ids: list[str] = []
+        for reference in self._item_references:
+            first = self.payload["samples"][reference.sample_positions[0]]
+            last = self.payload["samples"][reference.sample_positions[-1]]
+            case = self.payload["cases"][reference.case_index]
+            item_ids.append(f"{case['package_case_id']}__window_{int(first['time_index_n']):04d}_{int(last['time_index_n_plus_1']):04d}")
+        return tuple(item_ids)
+
     def _build_item_references(self) -> tuple[_ItemReference, ...]:
         """Resolve deterministic item references from one shared transition index."""
         if not self.sample_indices:
@@ -568,6 +580,58 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         """Best-effort release of process-local mmap-backed shard payloads."""
         with suppress(AttributeError, OSError, RuntimeError):
             self._clear_shard_cache()
+
+
+def select_transient_cases(
+    dataset: TransientPhysicalDataset,
+    package_case_ids: Sequence[str],
+) -> TransientPhysicalDataset:
+    """
+    Reconstruct one same-backend runtime restricted to complete package cases.
+
+    The original runtime remains usable when replacement admission fails. The
+    selected runtime preserves its storage backend, sampling contract, source
+    root, cache policy, and transform without opening storage outside that
+    backend's constructor.
+    """
+    if not isinstance(dataset, TransientPhysicalDataset):
+        message = "dataset must be one admitted transient physical runtime."
+        raise TypeError(message)
+    selected_ids = tuple(package_case_ids)
+    if (
+        not selected_ids
+        or any(not isinstance(case_id, str) or not case_id for case_id in selected_ids)
+        or len(selected_ids) != len(set(selected_ids))
+    ):
+        message = "Transient case selection must contain ordered unique non-empty package case IDs."
+        raise ValueError(message)
+    available: dict[str, list[int]] = {}
+    for position in dataset.sample_indices:
+        sample = dataset.payload["samples"][position]
+        case = dataset.payload["cases"][int(sample["case_index"])]
+        case_id = str(case["package_case_id"])
+        available.setdefault(case_id, []).append(position)
+    if any(case_id not in available for case_id in selected_ids):
+        message = "Transient case selection contains package case IDs unavailable in this runtime."
+        raise ValueError(message)
+    positions = tuple(sorted(position for case_id in selected_ids for position in available[case_id]))
+    if not positions:
+        message = "Transient case selection contains no runtime transition positions."
+        raise ValueError(message)
+    replacement = type(dataset)(
+        dataset.index_path,
+        sampling=dataset.sampling,
+        source_root=dataset.source_root,
+        hdf5_cache_size=dataset.hdf5_cache_size,
+        sample_indices=positions,
+        transform=dataset.transform,
+    )
+    if replacement.storage_backend != dataset.storage_backend:
+        replacement.close()
+        message = "Transient runtime reconstruction changed storage backend."
+        raise RuntimeError(message)
+    dataset.close()
+    return replacement
 
 
 def select_transient_sample_indices(

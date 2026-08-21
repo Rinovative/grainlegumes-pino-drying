@@ -6,6 +6,7 @@ Provides:
 - package_validation: published-package inspection and loader smoke validation
 - steady: materialized steady-flow Dataset runtime
 - training: split and training DataLoader orchestration
+- transient_training: transient split, scaling, and DataLoader orchestration
 - transient: lazy physical-unit transient Dataset runtime
 """
 
@@ -20,15 +21,17 @@ if TYPE_CHECKING:
     from . import dataset_runtime_steady as steady
     from . import dataset_runtime_training as training
     from . import dataset_runtime_transient as transient
+    from . import dataset_runtime_transient_training as transient_training
 
 _MODULES = {
     "factory": "dataset_runtime_factory",
     "package_validation": "dataset_runtime_package_validation",
     "steady": "dataset_runtime_steady",
     "training": "dataset_runtime_training",
+    "transient_training": "dataset_runtime_transient_training",
     "transient": "dataset_runtime_transient",
 }
-__all__ = ["factory", "package_validation", "steady", "training", "transient"]
+__all__ = ["factory", "package_validation", "steady", "training", "transient", "transient_training"]
 
 
 def __getattr__(name: str) -> object:

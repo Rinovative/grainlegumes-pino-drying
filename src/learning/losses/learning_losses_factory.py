@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from src import domain
 
@@ -56,6 +56,8 @@ _DATA_LOSS_KINDS = MappingProxyType(
     {
         "relative_h1": DataLossKindSpec("relative_h1", frozenset({"normalized"})),
         "relative_l2": DataLossKindSpec("relative_l2", frozenset({"normalized"})),
+        "huber": DataLossKindSpec("huber", frozenset({"scaled_increment"})),
+        "mse": DataLossKindSpec("mse", frozenset({"scaled_increment"})),
     }
 )
 
@@ -156,7 +158,7 @@ def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
     )
 
 
-def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino.SemanticComposedLoss:
+def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.Module:
     """
     Build the unified semantic training loss from resolved configuration.
 
@@ -196,7 +198,6 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         msg = f"Loss construction requires one concrete CPU or CUDA torch.device, got {device!r}."
         raise TypeError(msg)
     task = domain.tasks.registry.get_task(str(config["task"]))
-    task_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
     loss_config = config.get("loss")
     if not isinstance(loss_config, dict):
         msg = "Resolved config must contain a loss mapping."
@@ -207,6 +208,33 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         msg = "Resolved loss config must contain data and physics mappings."
         raise TypeError(msg)
 
+    if task.id == "transient_drying":
+        from . import learning_losses_transient as transient  # noqa: PLC0415
+
+        kind = str(data_config.get("kind"))
+        space = str(data_config.get("space"))
+        validate_data_loss_semantics(kind, space=space)
+        if physics_config.get("enabled") is not False:
+            msg = "Transient drying supports data-only training; loss.physics.enabled must be false."
+            raise ValueError(msg)
+        if physics_config.get("continuity") != "none":
+            msg = "Transient drying loss.physics.continuity must be 'none'."
+            raise ValueError(msg)
+        transient_loss = transient.TransientIncrementLoss(
+            kind=cast("transient.TransientDataLossKind", kind),
+            channel_weights=data_config.get(
+                "channel_weights",
+                (1.0, 1.0, 1.0, 1.0),
+            ),
+            data_weight=float(data_config.get("weight", 1.0)),
+            huber_beta=float(data_config.get("beta", 1.0)),
+            state_aux_weight=float(
+                data_config.get("state_aux_weight", 0.0),
+            ),
+        )
+        return transient_loss.to(device)
+
+    task_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
     continuity = physics_config.get("continuity")
     if not isinstance(continuity, str) or not continuity:
         msg = "loss.physics.continuity must be a non-empty semantic identifier."
@@ -234,7 +262,7 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         operator_dimensionality=task.operator_dimensionality,
         weight=1.0,
     )
-    loss = pino.SemanticComposedLoss(
+    steady_loss = pino.SemanticComposedLoss(
         data_loss=data_loss,
         data_weight=float(data_config["weight"]),
         physics_enabled=bool(physics_config["enabled"]),
@@ -248,4 +276,4 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         boundary_weight=_resolved_weight(physics_config, "boundary_weight"),
         interior_crop=int(physics_config["interior_crop"]),
     )
-    return loss.to(device)
+    return steady_loss.to(device)

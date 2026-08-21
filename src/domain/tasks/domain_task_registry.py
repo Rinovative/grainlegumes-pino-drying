@@ -27,9 +27,10 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from .domain_task_spec import PhysicsSpec, TaskSpec
 from .domain_task_steady_flow import STEADY_FLOW
+from .domain_task_transient_drying import TRANSIENT_DRYING
 
-_TASKS: Final = MappingProxyType({STEADY_FLOW.id: STEADY_FLOW})
-_PHYSICS: Final = MappingProxyType({STEADY_FLOW.physics.kind: STEADY_FLOW.physics})
+_TASKS: Final = MappingProxyType({STEADY_FLOW.id: STEADY_FLOW, TRANSIENT_DRYING.id: TRANSIENT_DRYING})
+_PHYSICS: Final = MappingProxyType({STEADY_FLOW.physics.kind: STEADY_FLOW.physics, TRANSIENT_DRYING.physics.kind: TRANSIENT_DRYING.physics})
 
 
 def available_tasks() -> tuple[str, ...]:

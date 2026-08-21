@@ -160,12 +160,19 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = outcome["run_dir"]
     device_resolution = outcome["device_resolution"]
     print("Training status: completed")
+    stage_runs = outcome.get("stage_runs")
+    if isinstance(stage_runs, dict):
+        print(f"Stage A run directory: {stage_runs.get('a')}")
+        print(f"Stage B run directory: {stage_runs.get('b')}")
     print(f"Run directory: {run_dir}")
     print("Best checkpoint: best_checkpoint.pt")
     print(f"Best epoch: {result['best_epoch']}")
     print(f"Best metric: {result['best_metric']:.6f}")
     if args.no_build_artifacts:
         print("Post-training artifacts: skipped by --no-build-artifacts")
+        return 0
+    if "stage_runs" in outcome or outcome.get("task") == "transient_drying":
+        print("Post-training artifacts: not implemented for transient_drying")
         return 0
 
     try:
