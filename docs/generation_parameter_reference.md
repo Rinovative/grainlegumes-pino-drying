@@ -124,13 +124,20 @@ Generation validates derived relative humidity continuously, including interior
 extrema. Infeasible stochastic schedules are deterministically resampled as a
 whole rather than clipped.
 
-The transient startup handoff begins at `T_init`. Its inlet relative humidity is
-the minimum initial bed-equilibrium RH minus the configured absolute drying
-margin:
+The transient startup handoff begins at `T_init`. The configured absolute drying
+margin is a minimum requirement: it sets an upper bound from the minimum initial
+bed-equilibrium RH. The inlet target selects the strictest compatible upper
+bound, including the dedicated startup ceiling:
 
 ```text
-phi_in_start = min(phi_eq_init) - initial_equilibrium_rh_dry_margin
+phi_in_start = min(
+    min(phi_eq_init) - initial_equilibrium_rh_dry_margin,
+    startup_max_relative_humidity
+)
 ```
+
+The resulting target must remain physically above zero; a tighter startup ceiling
+therefore increases, rather than reduces, the realized drying margin.
 
 Temperature and humidity ratio then ramp to the unchanged canonical schedule at
 the configured rejoin time. Startup-only RH bounds, canonical operating bounds,

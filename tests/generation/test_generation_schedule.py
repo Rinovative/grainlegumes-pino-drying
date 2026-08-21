@@ -245,14 +245,67 @@ def test_deterministic_startup_may_exceed_canonical_humidity_ratio_without_clipp
     assert np.all(handoff.values[1:, 2] <= _FIXED["omega_max"])
 
 
-def test_enabled_startup_above_dedicated_maximum_fails_without_clipping() -> None:
-    """Reject the exact target above 0.90 instead of clipping or reducing margin."""
-    equilibrium = np.asarray((0.96, 0.97, 0.98), dtype=np.float64)
+def test_startup_maximum_is_selected_when_stricter_than_margin_upper_bound() -> None:
+    """Treat the startup ceiling as a compatible stricter drying requirement."""
+    equilibrium = np.asarray((0.9517694178004942, 0.97, 0.98), dtype=np.float64)
 
-    with pytest.raises(ValueError, match=r"target=0\.9099999999999999.*violated_bound=\(0, 0\.9\]"):
-        _build_handoff(
-            _schedule(),
-            equilibrium_relative_humidity=equilibrium,
+    handoff = _build_handoff(
+        _schedule(),
+        equilibrium_relative_humidity=equilibrium,
+    )
+    startup = handoff.metadata["boundary_handoff"]["startup_ramp"]
+
+    assert startup["startup_target_relative_humidity"] == pytest.approx(0.90)
+    assert startup["startup_target_relative_humidity"] <= float(np.min(equilibrium)) - 0.05
+    assert startup["realized_minimum_initial_cell_to_inlet_rh_margin"] >= 0.05
+
+
+@pytest.mark.parametrize(
+    ("equilibrium_minimum", "startup_maximum", "expected_target"),
+    [
+        (0.80, 0.90, 0.75),
+        (0.95, 0.90, 0.90),
+    ],
+    ids=("margin_upper_bound_is_stricter", "upper_bounds_are_equal"),
+)
+def test_initial_equilibrium_startup_selects_the_strictest_compatible_upper_bound(
+    equilibrium_minimum: float,
+    startup_maximum: float,
+    expected_target: float,
+) -> None:
+    """Select the deterministic minimum of the margin and startup upper bounds."""
+    state = schedule_service.derive_initial_equilibrium_startup(
+        _initial_moisture(
+            np.asarray((equilibrium_minimum, 0.97, 0.98), dtype=np.float64),
+            initial_temperature=293.15,
+        ),
+        initial_temperature=293.15,
+        source_air_temperature=293.15,
+        oswin_parameters=_OSWIN,
+        dry_margin=0.05,
+        pressure=float(_FIXED["p_ref"]),
+        startup_relative_humidity_maximum=startup_maximum,
+    )
+
+    assert state.target_relative_humidity == pytest.approx(expected_target)
+    assert state.target_relative_humidity <= state.minimum - 0.05 + schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE
+    assert state.realized_minimum_margin >= 0.05
+
+
+def test_initial_equilibrium_startup_rejects_an_empty_physical_interval() -> None:
+    """Fail only when the margin-derived feasible RH interval is genuinely empty."""
+    with pytest.raises(ValueError, match="empty feasible RH interval"):
+        schedule_service.derive_initial_equilibrium_startup(
+            _initial_moisture(
+                np.asarray((0.04, 0.50, 0.60), dtype=np.float64),
+                initial_temperature=293.15,
+            ),
+            initial_temperature=293.15,
+            source_air_temperature=293.15,
+            oswin_parameters=_OSWIN,
+            dry_margin=0.05,
+            pressure=float(_FIXED["p_ref"]),
+            startup_relative_humidity_maximum=0.90,
         )
 
 

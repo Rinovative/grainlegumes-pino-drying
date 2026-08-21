@@ -48,6 +48,7 @@ SCHEDULE_GENERATOR_VERSION: Final = 1
 COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
 STARTUP_RELATIVE_HUMIDITY_TOLERANCE: Final = 1.0e-12
 STARTUP_POLICY_ID: Final = "coupled_temperature_humidity_equilibrium_minimum_margin_v1"
+_STARTUP_HUMIDITY_START_POLICY: Final = "select_strictest_startup_rh_upper_bound_from_minimum_equilibrium_margin"
 STARTUP_RELATIVE_HUMIDITY_MAX_BASIS: Final = "synthetic_startup_design_bound"
 CORRELATION_TOLERANCE: Final = 2.0e-12
 MINIMUM_SMOOTH_SCALE_INTERVALS: Final = 4.0
@@ -232,7 +233,7 @@ def derive_initial_equilibrium_startup(
     oswin_parameters : Mapping[str, Any]
         Exact A_osw, B_osw, and C_osw material coefficients.
     dry_margin : float
-        Absolute RH reduction from the global equilibrium-field minimum.
+        Minimum absolute RH reduction from the global equilibrium-field minimum.
     pressure : float
         Active absolute reference pressure in pascals.
     startup_relative_humidity_maximum : float
@@ -251,8 +252,10 @@ def derive_initial_equilibrium_startup(
 
     Notes
     -----
-    The global minimum of the maintained inverse-Oswin field owns the target.
-    No clipping or sampled approximation is applied.
+    The global minimum of the maintained inverse-Oswin field sets the
+    margin-derived upper bound. The deterministic target is the strictest
+    compatible applicable upper bound; no clipping or sampled approximation is
+    applied.
 
     """
     moisture = np.asarray(dry_basis_moisture, dtype=np.float64)
@@ -312,21 +315,19 @@ def derive_initial_equilibrium_startup(
         msg = "Initial equilibrium RH statistics are non-finite or outside physical bounds."
         raise ValueError(msg)
 
-    target = minimum - dry_margin
+    margin_upper_bound = minimum - dry_margin
     if not math.isfinite(startup_relative_humidity_maximum) or not 0.0 < startup_relative_humidity_maximum <= 1.0:
         msg = "Startup-handoff relative-humidity maximum must be finite and lie inside (0, 1]."
         raise ValueError(msg)
+    physical_upper_bound = 1.0
+    target = min(margin_upper_bound, startup_relative_humidity_maximum, physical_upper_bound)
     if not 0.0 < target < 1.0:
         msg = (
-            "Initial equilibrium RH dry margin is infeasible: "
-            f"minimum={minimum!r}, requested_margin={dry_margin!r}, target={target!r}, violated_bound=(0, 1)."
-        )
-        raise ValueError(msg)
-    if target > startup_relative_humidity_maximum:
-        msg = (
-            "Initial equilibrium RH dry margin violates the startup-handoff RH maximum: "
-            f"minimum={minimum!r}, requested_margin={dry_margin!r}, target={target!r}, "
-            f"violated_bound=(0, {startup_relative_humidity_maximum!r}]."
+            "Initial equilibrium startup target has an empty feasible RH interval: "
+            f"equilibrium_minimum={minimum!r}, requested_margin={dry_margin!r}, "
+            f"margin_upper_bound={margin_upper_bound!r}, "
+            f"startup_relative_humidity_maximum={startup_relative_humidity_maximum!r}, "
+            f"physical_interval=(0, {physical_upper_bound!r}], resulting_interval=(0, {target!r}]."
         )
         raise ValueError(msg)
 
@@ -438,7 +439,7 @@ def _startup_ramp_metadata(
         "enabled": True,
         "duration_h": duration_h,
         "temperature_start_policy": "use_initial_temperature_exactly",
-        "humidity_start_policy": "derive_from_global_minimum_initial_equilibrium_rh_minus_absolute_margin",
+        "humidity_start_policy": _STARTUP_HUMIDITY_START_POLICY,
         "relative_humidity_policy": "derive_from_T_in_bc_and_omega_in_bc",
         "initial_temperature_K": initial_temperature,
         "initial_equilibrium_rh_minimum": startup.minimum,
@@ -712,7 +713,7 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
             and startup_metadata["enabled"] is True
             and float(startup_metadata["duration_h"]) == duration_h
             and startup_metadata["temperature_start_policy"] == "use_initial_temperature_exactly"
-            and startup_metadata["humidity_start_policy"] == "derive_from_global_minimum_initial_equilibrium_rh_minus_absolute_margin"
+            and startup_metadata["humidity_start_policy"] == _STARTUP_HUMIDITY_START_POLICY
             and startup_metadata["relative_humidity_policy"] == "derive_from_T_in_bc_and_omega_in_bc"
             and float(startup_metadata["initial_temperature_K"]) == initial_temperature
             and float(startup_metadata["initial_equilibrium_rh_dry_margin"]) == dry_margin
@@ -754,10 +755,15 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
             or initial_mean > initial_maximum + STARTUP_RELATIVE_HUMIDITY_TOLERANCE
             or not math.isclose(
                 target,
-                initial_minimum - dry_margin,
+                min(
+                    initial_minimum - dry_margin,
+                    startup_relative_humidity_maximum,
+                    1.0,
+                ),
                 rel_tol=0.0,
                 abs_tol=STARTUP_RELATIVE_HUMIDITY_TOLERANCE,
             )
+            or target > initial_minimum - dry_margin + STARTUP_RELATIVE_HUMIDITY_TOLERANCE
             or not math.isclose(
                 realized_margin,
                 initial_minimum - target,
