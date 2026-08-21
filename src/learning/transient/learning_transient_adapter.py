@@ -35,6 +35,7 @@ from src.learning.training import learning_training_adapter as training_adapter
 
 from .learning_transient_contracts import TransientTensorizerSpec
 from .learning_transient_curriculum import (
+    BudgetControl,
     ClockKind,
     ComparisonArm,
     MatchedComputeController,
@@ -76,6 +77,7 @@ class TransientTrainingAdapter:
             raise ValueError("epoch_index must be a non-negative integer.")
         if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) or total_epochs < 1:
             raise ValueError("total_epochs must be a positive integer.")
+        self.spec.controller.begin_epoch(epoch_index=epoch_index, total_epochs=total_epochs)
         self._epoch_index = epoch_index
         self._optimizer_events = 0
 
@@ -190,10 +192,10 @@ class TransientTrainingAdapter:
     def validate_terminal_state(self, *, best_metric: float | None, best_epoch: int | None) -> None:
         """Require a completed budget and exact budget-boundary checkpoint selection."""
         controller = self.spec.controller
-        if controller.arm == "A0":
+        if controller.arm == "A0" and controller.budget_control == "matched_compute":
             return
         if not controller.budget_complete:
-            raise RuntimeError("Matched transient training ended before its planned compute budget completed.")
+            raise RuntimeError("Transient training ended before its configured budget completed.")
         if controller.best_within_budget_metric is None or controller.best_within_budget_epoch is None:
             raise RuntimeError("Matched transient training has no selected metric at or before its budget boundary.")
         if best_metric != controller.best_within_budget_metric or best_epoch != controller.best_within_budget_epoch + 1:
@@ -211,6 +213,8 @@ class TransientTrainingAdapter:
             "last_origin_min": getattr(self, "_last_origin_min", None),
             "last_origin_max": getattr(self, "_last_origin_max", None),
             "self_fed_stage": int(self.spec.stage == "stage_b_self_fed"),
+            "planned_stage_epochs": controller.planned_stage_epochs,
+            "completed_stage_epochs": controller.completed_stage_epochs,
             "planned_teacher_forcing_budget_seconds": controller.planned_teacher_forcing_budget_seconds,
             "planned_teacher_forcing_budget_steps": controller.planned_teacher_forcing_budget_steps,
             "rollout_reference_compute_seconds": controller.rollout_reference_compute_seconds,
@@ -405,11 +409,25 @@ def build_transient_training_adapter(
     except (TypeError, ValueError) as error:
         raise ValueError("Resolved transient adapter semantics must be canonical JSON.") from error
     config_digest = hashlib.sha256(encoded_config).hexdigest()
+    matched_limits = tuple(
+        matched.get(key)
+        for key in (
+            "planned_seconds",
+            "planned_steps",
+            "rollout_reference_seconds",
+            "rollout_reference_steps",
+        )
+    )
+    budget_control: BudgetControl = (
+        "stage_epochs" if arm == "A0" or (arm == "B" and all(value is None for value in matched_limits)) else "matched_compute"
+    )
     controller = MatchedComputeController(
         arm=arm,
         stage=stage,
         clock_kind=clock_kind,
         config_digest=config_digest,
+        budget_control=budget_control,
+        planned_stage_epochs=int(training["epochs"]) if budget_control == "stage_epochs" else None,
         teacher_handoff=teacher_handoff,
         planned_teacher_forcing_budget_seconds=matched.get("planned_seconds"),
         planned_teacher_forcing_budget_steps=matched.get("planned_steps"),

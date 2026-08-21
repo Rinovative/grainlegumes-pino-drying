@@ -73,6 +73,7 @@ INPUT_GENERATION_IDENTITY_FIELDS = (
     "template_sha256",
     "resolved_config_sha256",
 )
+INPUT_GENERATION_COMPATIBILITY_FIELDS = tuple(field for field in INPUT_GENERATION_IDENTITY_FIELDS if field != "git_commit")
 INPUT_MANIFEST_KEYS = frozenset(
     {
         *INPUT_GENERATION_IDENTITY_FIELDS,

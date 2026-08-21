@@ -35,6 +35,7 @@ def _handoff() -> TeacherHandoffIdentity:
 def test_curriculum_retains_shorter_horizons_and_resumes_exact_draws() -> None:
     """Use compute progress and private RNG state for reproducible valid windows."""
     curriculum = RolloutCurriculum()
+    assert curriculum.as_dict()["schema_version"] == 1
     state = RolloutCurriculumState.create(curriculum, seed=17)
     first_horizon, first_origins = state.select(progress=0.85, available_length=32, batch_size=9)
     assert first_horizon in curriculum.eligible_lengths(0.85)
@@ -220,3 +221,42 @@ def test_budget_crossing_group_is_selectable_and_no_later_work_is_admitted() -> 
     assert controller.best_within_budget_epoch == 0
     with pytest.raises(RuntimeError, match="cannot continue"):
         controller.record_completed_work(**work)
+
+
+def test_stage_epoch_budget_completes_only_after_the_terminal_evaluation() -> None:
+    """Run every allocated epoch without a competing matched-compute stop."""
+    controller = MatchedComputeController(
+        arm="B",
+        stage="stage_b_self_fed",
+        clock_kind="optimizer_steps",
+        config_digest=_digest("epoch-budget"),
+        budget_control="stage_epochs",
+        planned_stage_epochs=2,
+        teacher_handoff=_handoff(),
+    )
+    work = {
+        "successful": True,
+        "optimizer_device_seconds": None,
+        "microbatches": 1,
+        "processed_target_transitions": 2,
+        "forward_transitions": 2,
+        "wall_seconds": 0.1,
+        "microbatch_index": 0,
+    }
+
+    controller.begin_epoch(epoch_index=0, total_epochs=2)
+    controller.record_completed_work(**work, epoch_index=0)
+    controller.record_within_budget_evaluation(0.5, epoch_index=0)
+    assert controller.progress == pytest.approx(0.5)
+    assert controller.budget_complete is False
+
+    controller.begin_epoch(epoch_index=1, total_epochs=2)
+    controller.record_completed_work(**work, epoch_index=1)
+    assert controller.budget_complete is False
+    controller.record_within_budget_evaluation(0.25, epoch_index=1)
+
+    assert controller.progress == pytest.approx(1.0)
+    assert controller.completed_stage_epochs == 2
+    assert controller.budget_complete is True
+    assert controller.crossing_epoch == 1
+    assert controller.crossing_microbatch is None

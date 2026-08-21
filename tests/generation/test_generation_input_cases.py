@@ -13,6 +13,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from src import common, generation
 from src.generation.cli import cli_generation
@@ -20,6 +21,8 @@ from src.generation.runtime import generation_runtime_preparation as runtime_pre
 
 _FAKE_GIT_COMMIT = "a" * 40
 _OTHER_GIT_COMMIT = "b" * 40
+_THIRD_GIT_COMMIT = "c" * 40
+_FOURTH_GIT_COMMIT = "d" * 40
 
 
 def _load_config(
@@ -965,3 +968,289 @@ def test_generation_cli_renders_context_for_unexpected_key_errors(
         "stage": "list-campaigns",
         "status": "error",
     }
+
+
+def test_prepare_campaign_inputs_reuses_one_compatible_historical_source(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reuse byte-validated inputs across an execution-only commit change."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        original = service.generate_input_cases(campaign.batches[0], 2, storage_root=storage)
+    reused = service.prepare_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+    selected = reused["batches"][0]
+    assert selected["input_generation_id"] == original.input_generation_id
+    assert selected["source_git_commit"] == _FAKE_GIT_COMMIT
+    assert selected["generated_case_count"] == 0
+    assert selected["reused_case_count"] == 2
+
+
+def test_prepare_campaign_inputs_prefers_exact_current_source(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Prefer exact execution evidence without consulting compatible history."""
+    config_path, _template = generation_config_factory(natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        service.generate_input_cases(batch, 1, storage_root=storage)
+    with service._generation_git_commit(_OTHER_GIT_COMMIT):
+        current = service.generate_input_cases(batch, 1, storage_root=storage)
+
+    selected = service.prepare_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+
+    assert selected["batches"][0]["input_generation_id"] == current.input_generation_id
+    assert selected["batches"][0]["source_git_commit"] == _OTHER_GIT_COMMIT
+
+
+def test_prepare_campaign_inputs_rejects_ambiguous_compatible_history(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Fail closed instead of choosing between two valid historical sources."""
+    config_path, _template = generation_config_factory(natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    for commit in (_FAKE_GIT_COMMIT, _THIRD_GIT_COMMIT):
+        with service._generation_git_commit(commit):
+            service.generate_input_cases(batch, 1, storage_root=storage)
+
+    with pytest.raises(FileExistsError, match="ambiguous"):
+        service.prepare_campaign_inputs(campaign, git_commit=_FOURTH_GIT_COMMIT, storage_root=storage)
+
+
+def test_prepare_campaign_inputs_fails_closed_for_corrupt_candidate(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reject corrupt same-batch discovery evidence before regeneration."""
+    config_path, _template = generation_config_factory(natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        historical = service.generate_input_cases(campaign.batches[0], 1, storage_root=storage)
+    manifest_path = historical.metadata_directory / "input_generation_manifest.json"
+    manifest_path.write_text("{not-json\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="corrupt evidence"):
+        service.prepare_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+
+
+def test_latin_hypercube_membership_is_not_a_prefix_contract() -> None:
+    """Protect case identity assignment without assuming SciPy prefix stability."""
+    sampler = generation.cases.sampling
+    first = sampler._lhs_design(count=160, dimensions=3, seed=17)
+    second = sampler._lhs_design(count=50, dimensions=3, seed=17)
+    assert first.shape == (160, first.shape[1])
+    assert second.shape == (50, second.shape[1])
+    assert not (first[:50] == second).all()
+
+
+def test_prepared_input_admission_reuses_the_selected_historical_source(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Keep the prepare/submit boundary on one immutable historical source."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        original = service.generate_input_cases(campaign.batches[0], 2, storage_root=storage)
+
+    service.prepare_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+    admitted = service.admit_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+
+    assert admitted["batches"][0]["input_generation_id"] == original.input_generation_id
+    assert admitted["batches"][0]["source_git_commit"] == _FAKE_GIT_COMMIT
+    assert admitted["batches"][0]["case_indices"] == list(campaign.batches[0].case_indices)
+
+    with pytest.raises(RuntimeError, match="persisted source commit"):
+        service.admit_configured_input_references(
+            campaign.batches[0],
+            git_commit=_OTHER_GIT_COMMIT,
+            input_generation_id=original.input_generation_id,
+            input_source_git_commit=_THIRD_GIT_COMMIT,
+            storage_root=storage,
+        )
+
+
+def test_dataset_package_only_change_preserves_compatible_input_source(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Keep downstream package declarations outside simulation-input identity."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    original_campaign = generation.cases.config.load_campaign_config(config_path)
+    service = generation.cases.input_generation
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        original = service.generate_input_cases(original_campaign.batches[0], 2, storage_root=storage)
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    authored["dataset_packages"][0]["dataset_view"] = "transient_drying"
+    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    revised_campaign = generation.cases.config.load_campaign_config(config_path)
+
+    selected = service.prepare_campaign_inputs(
+        revised_campaign,
+        git_commit=_OTHER_GIT_COMMIT,
+        storage_root=storage,
+    )
+
+    assert revised_campaign.batches[0].batch_id == original_campaign.batches[0].batch_id
+    assert selected["batches"][0]["input_generation_id"] == original.input_generation_id
+    assert selected["generated_case_count"] == 0
+
+
+@pytest.mark.parametrize("change", ["scientific", "template", "case_count"])
+def test_input_affecting_changes_do_not_reuse_historical_inputs(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    change: str,
+) -> None:
+    """Generate a new exact source for scientific, template, or membership changes."""
+    config_path, template = generation_config_factory(natural_count=2)
+    original_campaign = generation.cases.config.load_campaign_config(config_path)
+    service = generation.cases.input_generation
+    storage = tmp_path / change
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        original = service.generate_input_cases(original_campaign.batches[0], 2, storage_root=storage)
+
+    if change == "scientific":
+        operations_path = config_path.with_name("operations.yaml")
+        authored = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
+        authored["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.3
+        operations_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    elif change == "template":
+        template.write_bytes(template.read_bytes() + b"scientific template revision\n")
+        template.with_suffix(".sha256").write_text(
+            common.serialization.file_sha256(template) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        authored["sampling"]["counts"]["natural"]["lentil"] = 3
+        config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    revised_campaign = generation.cases.config.load_campaign_config(config_path)
+
+    prepared = service.prepare_campaign_inputs(
+        revised_campaign,
+        git_commit=_OTHER_GIT_COMMIT,
+        storage_root=storage,
+    )
+
+    assert revised_campaign.batches[0].batch_id != original_campaign.batches[0].batch_id
+    assert prepared["batches"][0]["input_generation_id"] != original.input_generation_id
+    assert prepared["generated_case_count"] == len(revised_campaign.batches[0].case_indices)
+
+
+def test_campaign_requires_complete_persisted_input_sources(
+    generation_config_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require complete source provenance before campaign input admission."""
+    config_path, _template = generation_config_factory(natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    source_id = "input-" + "1" * 24
+    manifest = {
+        "batches": [
+            {
+                "batch_name": batch.batch_name,
+                "input_generation_id": source_id,
+                "input_source_git_commit": _FAKE_GIT_COMMIT,
+                "input_case_indices": list(batch.case_indices),
+            }
+        ]
+    }
+    selected = generation.campaign._persisted_input_sources(manifest)
+    assert selected == {
+        batch.batch_name: {
+            "input_generation_id": source_id,
+            "source_git_commit": _FAKE_GIT_COMMIT,
+            "case_indices": list(batch.case_indices),
+        }
+    }
+    with pytest.raises(RuntimeError, match="incomplete or corrupt"):
+        generation.campaign._persisted_input_sources({"batches": [{"batch_name": batch.batch_name}]})
+    with pytest.raises(RuntimeError, match="incomplete or corrupt"):
+        generation.campaign._persisted_input_sources(
+            {
+                "batches": [
+                    {
+                        "batch_name": batch.batch_name,
+                        "input_generation_id": source_id,
+                    }
+                ]
+            }
+        )
+
+    calls: list[dict[str, Any]] = []
+
+    def admit(_batch: Any, **kwargs: Any) -> dict[int, Any]:
+        calls.append(dict(kwargs))
+        return {}
+
+    monkeypatch.setattr(generation.campaign.input_service, "admit_configured_input_references", admit)
+    generation.campaign._campaign_input_references(
+        campaign,
+        git_commit=_OTHER_GIT_COMMIT,
+        storage_root=None,
+        input_sources=selected,
+    )
+    assert calls == [
+        {
+            "storage_root": None,
+            "validation_depth": "evidence",
+            "git_commit": _OTHER_GIT_COMMIT,
+            "input_generation_id": source_id,
+            "input_source_git_commit": _FAKE_GIT_COMMIT,
+        }
+    ]
+
+
+def test_campaign_rejects_persisted_input_case_membership_drift(
+    generation_config_factory: Any,
+) -> None:
+    """Bind persisted input membership to the exact active campaign batch."""
+    config_path, _template = generation_config_factory(natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    batch = campaign.batches[0]
+    selected = {
+        batch.batch_name: {
+            "input_generation_id": "input-" + "1" * 24,
+            "source_git_commit": _FAKE_GIT_COMMIT,
+            "case_indices": list(reversed(batch.case_indices)),
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="case membership disagrees"):
+        generation.campaign._campaign_input_references(
+            campaign,
+            git_commit=_OTHER_GIT_COMMIT,
+            storage_root=None,
+            input_sources=selected,
+        )
+
+
+def test_campaign_execution_commit_remains_part_of_run_identity(
+    generation_config_factory: Any,
+) -> None:
+    """Keep compatible input reuse separate from solver-execution identity."""
+    config_path, _template = generation_config_factory(natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+
+    first = generation.campaign.campaign_run_id(campaign, git_commit=_FAKE_GIT_COMMIT)
+    second = generation.campaign.campaign_run_id(campaign, git_commit=_OTHER_GIT_COMMIT)
+
+    assert first != second

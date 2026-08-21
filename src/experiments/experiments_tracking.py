@@ -732,7 +732,7 @@ def _build_transient_semantic_config(
             "config_digest": checkpoint_identity.get("effective_config_digest"),
             "task_contract_digest": task_contract.get("digest"),
             "runtime_backend": copy.deepcopy(dict(runtime_provenance or {})),
-            "schema_versions": {"run": 1, "checkpoint": 2, "tracking_integration": TRACKING_INTEGRATION_VERSION},
+            "schema_versions": {"run": 1, "checkpoint": 1, "tracking_integration": TRACKING_INTEGRATION_VERSION},
         },
         "runtime": {
             "device": copy.deepcopy(dict(device_metadata)),

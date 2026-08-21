@@ -6,8 +6,7 @@ run:
   suffix: technical_smoke
 data:
   train_dataset: transient_drying__material_pilot__id
-  ood_datasets:
-  - transient_drying__family_generalization__ood
+  ood_datasets: []
   batch_size: 1
   transient_backend_preference: canonical_hdf5
   transient_backend_required: false
@@ -50,6 +49,15 @@ scheduler:
   min_lr: 1.0e-06
 training:
   epochs: 1
+  stage_schedule:
+    mode: stage_a_only
+    budget_unit: epochs
+    total_epochs: 1
+    stage_a_fraction: null
+    stage_b_fraction: null
+    stage_a_epochs: 1
+    stage_b_epochs: 0
+    rounding: not_applicable
   evaluation_interval: 1
   ood_evaluation_interval: 1
   mixed_precision: false

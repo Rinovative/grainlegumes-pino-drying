@@ -11,7 +11,7 @@ import pytest
 from src import experiments
 from src.experiments.config import experiments_config_transient_plan as transient_plan
 
-_CONFIG = Path("configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__material_pilot__s9.yaml")
+_CONFIG = Path("configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml")
 
 
 def _install_sequence_fakes(

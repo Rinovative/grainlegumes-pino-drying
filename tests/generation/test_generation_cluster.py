@@ -53,6 +53,18 @@ def _scheduler(
     }
 
 
+def _synthetic_input_sources(campaign: Any) -> dict[str, dict[str, Any]]:
+    """Return current persisted source ownership for isolated resume tests."""
+    return {
+        batch.batch_name: {
+            "input_generation_id": f"input-{index:024x}",
+            "source_git_commit": "a" * 40,
+            "case_indices": list(batch.case_indices),
+        }
+        for index, batch in enumerate(campaign.batches, start=1)
+    }
+
+
 def _synthetic_input_references(campaign: Any) -> dict[str, dict[int, Any]]:
     """Return opaque references for tests that replace content validation."""
     references: dict[str, dict[int, Any]] = {}
@@ -299,7 +311,8 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     submit_commands: list[list[str]] = []
     retry_eligible = {"value": False}
     retry_active = {"value": False}
-    probe_progress = {"value": False}
+    solver_window_recorded = {"value": False}
+    old_solver_window_recorded = {"value": False}
     completed_cases: set[int] = set()
     wait_record = {
         "classification": "temporary_license_capacity",
@@ -331,13 +344,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     ) -> dict[str, Any] | None:
         return wait_record if job_id == "4101" else None
 
-    def runtime_progress(_run_id: str, job_id: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        if job_id == "4102" and probe_progress["value"]:
-            return {
-                "availability": "available",
-                "phase": "transient_drying",
-                "parser_state": "available",
-            }
+    def runtime_progress(_run_id: str, _job_id: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
             "availability": "unavailable",
             "reason": "not_reported",
@@ -373,6 +380,18 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
         "load_in_allocation_license_window",
         lambda *_args, job_id, **_kwargs: (
             {
+                "solver_progress_started": True,
+                "outcome": "solver_progress_started",
+                "reason": "solver_progress_started",
+            }
+            if job_id == "4102" and solver_window_recorded["value"]
+            else {
+                "solver_progress_started": True,
+                "outcome": "solver_progress_started",
+                "reason": "solver_progress_started",
+            }
+            if job_id == "4101" and old_solver_window_recorded["value"]
+            else {
                 "outcome": "window_exhausted",
                 "reason": "in_allocation_license_window_exhausted",
             }
@@ -449,7 +468,11 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     assert visible_snapshots[0]["failed_cases"] == 0
     assert visible_snapshots[0]["failure_circuit_breaker_tripped"] is False
 
-    probe_progress["value"] = True
+    old_solver_window_recorded["value"] = True
+    unreleased = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    assert unreleased["slurm_job_ids"] == ["4101", "4102"]
+
+    solver_window_recorded["value"] = True
     released = generation.campaign.feed_campaign(run_id, storage_root=storage)
     assert released["slurm_job_ids"] == ["4101", "4102", "4103"]
     assert released["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
@@ -681,6 +704,11 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     )
     monkeypatch.setattr(
         generation.campaign,
+        "_persisted_input_sources",
+        lambda _manifest: _synthetic_input_sources(campaign),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
         "_campaign_input_references",
         lambda *_args, **_kwargs: _synthetic_input_references(campaign),
     )
@@ -840,6 +868,19 @@ def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
             }
             if scheduler_state.get(job_id, [None, None])[1] == "RUNNING"
             else {"availability": "unavailable", "reason": "not_reported"}
+        ),
+    )
+    monkeypatch.setattr(
+        generation.campaign.license_service,
+        "load_in_allocation_license_window",
+        lambda *_args, job_id, **_kwargs: (
+            {
+                "solver_progress_started": True,
+                "outcome": "solver_progress_started",
+                "reason": "solver_progress_started",
+            }
+            if scheduler_state.get(job_id, [None, None])[1] == "RUNNING"
+            else None
         ),
     )
     storage = tmp_path / "storage"
@@ -1260,6 +1301,11 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
     monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: (views, 0, 0))
     monkeypatch.setattr(
         generation.campaign,
+        "_persisted_input_sources",
+        lambda _manifest: _synthetic_input_sources(campaign),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
         "_campaign_input_references",
         lambda *_args, **_kwargs: _synthetic_input_references(campaign),
     )
@@ -1358,6 +1404,15 @@ def _admission_view(
             if solver_started
             else {"availability": "unavailable", "reason": "not_reported"}
         ),
+        "in_allocation_license_window": (
+            {
+                "solver_progress_started": True,
+                "outcome": "solver_progress_started",
+                "reason": "solver_progress_started",
+            }
+            if solver_started
+            else None
+        ),
         "license_retry_active": False,
         "license_retry_eligible": retry_eligible,
         "license_first_blocked_at": (f"2026-01-01T00:00:{task.case_index:02d}+00:00" if state == "license_blocked" else None),
@@ -1408,6 +1463,15 @@ def test_logical_admission_membership_is_lifecycle_owned(
             }
             if solver_started
             else {"availability": "unavailable"}
+        ),
+        "in_allocation_license_window": (
+            {
+                "solver_progress_started": True,
+                "outcome": "solver_progress_started",
+                "reason": "solver_progress_started",
+            }
+            if solver_started
+            else None
         ),
     }
     assert generation.campaign._view_consumes_admission(view) is expected
@@ -1578,6 +1642,58 @@ def test_admission_block_reason_is_independent_of_displayed_failure_count(
         )
         is expected_circuit_breaker
     )
+
+
+def test_excess_stable_admission_blocks_monitoring_without_submission(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep monitoring an over-limit historical pool without admitting fresh work."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=6,
+        max_admission_cases=4,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    views = [*(_admission_view(task, "pending") for task in tasks[:5]), _admission_view(tasks[5], "never_started")]
+    manifest: dict[str, Any] = {
+        "campaign_run_id": "over-limit__0123456789abcdef",
+        "git_commit": "a" * 40,
+        "submission_config": {
+            "max_admission_cases": 4,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
+        },
+        "submission_intent": None,
+        "submissions": [],
+        "admission_reservations": [],
+        "state": "active",
+    }
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "a" * 40)
+    monkeypatch.setattr(generation.campaign.common.serialization, "atomic_write_json", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_submit_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("over-limit admission submitted work")),
+    )
+
+    assert generation.campaign._normal_admission_status(manifest, views, running_jobs=5) == (
+        True,
+        "max_admission_cases_exceeded",
+    )
+    generation.campaign._fill_submission_capacity(
+        manifest,
+        campaign,
+        views,
+        pending_jobs=5,
+        running_jobs=0,
+        scheduler={"active": {}},
+        storage_root=tmp_path,
+    )
+    assert manifest["state"] == "active"
 
 
 def test_durable_submission_intent_counts_one_logical_case() -> None:
@@ -2091,34 +2207,34 @@ def test_admission_reservations_are_exact_unsent_plan_members(
 def test_license_retry_activity_ends_at_common_solver_progress() -> None:
     """Keep pending and starting retries in admission until solver work."""
     retry = {"mode": "license_retry"}
-    unavailable = {"availability": "unavailable", "reason": "not_reported"}
     starting = {
         "availability": "available",
         "phase": "starting_solver",
         "parser_state": "unavailable",
     }
-    solving = {
-        "availability": "available",
-        "phase": "transient_drying",
-        "parser_state": "available",
-    }
 
-    assert generation.campaign._license_retry_is_active("pending", retry, unavailable)
-    assert generation.campaign._license_retry_is_active("active", retry, starting)
-    assert not generation.campaign._license_retry_is_active("active", retry, solving)
+    solver_receipt = {
+        "solver_progress_started": True,
+        "outcome": "solver_progress_started",
+        "reason": "solver_progress_started",
+    }
+    assert generation.campaign._license_retry_is_active("pending", retry, None)
+    assert generation.campaign._license_retry_is_active("active", retry, None)
+    assert not generation.campaign._license_retry_is_active("active", retry, solver_receipt)
 
     retrying_view = {
         "batch_id": "batch",
         "case_index": 1,
         "state": "active",
         "runtime_progress": starting,
+        "in_allocation_license_window": None,
         "license_retry_active": True,
     }
     waiting_view = {
         "batch_id": "batch",
         "case_index": 2,
         "state": "license_blocked",
-        "runtime_progress": unavailable,
+        "runtime_progress": {"availability": "unavailable", "reason": "not_reported"},
         "license_retry_active": False,
     }
     manifest = {

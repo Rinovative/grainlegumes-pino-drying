@@ -43,8 +43,17 @@ def _patch_synthetic_input_references(
     monkeypatch: pytest.MonkeyPatch,
     campaign: Any,
 ) -> None:
-    """Supply inert references when a test replaces the admission owner."""
+    """Supply inert current source ownership when a test replaces admission."""
+    sources = {
+        batch.batch_name: {
+            "input_generation_id": f"input-{index:024x}",
+            "source_git_commit": "a" * 40,
+            "case_indices": list(batch.case_indices),
+        }
+        for index, batch in enumerate(campaign.batches, start=1)
+    }
     references = {batch.batch_name: {case_index: object() for case_index in batch.case_indices} for batch in campaign.batches}
+    monkeypatch.setattr(generation.campaign, "_persisted_input_sources", lambda _manifest: sources)
     monkeypatch.setattr(
         generation.campaign,
         "_campaign_input_references",
@@ -271,11 +280,11 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     assert status["cases"][5]["latest_job_id"] is None
     assert status["cases"][5]["runtime_progress"]["reason"] == "no_job"
     assert status["admission"] == {
-        "count": 2,
+        "count": 3,
         "maximum": 3,
         "components": {
             "pending": 1,
-            "starting": 0,
+            "starting": 1,
             "license_waiting": 1,
             "acquiring_license": 0,
         },

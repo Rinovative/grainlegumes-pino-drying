@@ -264,12 +264,27 @@ case " $* " in
     ;;
   *" checkout --quiet --detach "*)
     root="$(git_root)"
+    commit="${arguments[${#arguments[@]}-1]}"
     cp -a -- "${FAKE_COMMITTED_ROOT}/." "${root}/"
     mkdir -p "${root}/.git"
+    printf '%s\n' "${commit}" > "${root}/.git/fake-head"
     ;;
   *" fetch --quiet --depth=1 --no-tags "*) ;;
   *" rev-parse --show-toplevel "*) git_root ;;
-  *" rev-parse HEAD "*) printf '%s\n' "${FAKE_GIT_COMMIT}" ;;
+  *" rev-parse --verify "*)
+    requested="${arguments[${#arguments[@]}-1]}"
+    requested="${requested%\^\{commit\}}"
+    [[ "${requested}" != "${FAKE_UNAVAILABLE_GIT_COMMIT:-}" ]] || exit 1
+    printf '%s\n' "${requested}"
+    ;;
+  *" rev-parse HEAD "*)
+    root="$(git_root)"
+    if [[ -f "${root}/.git/fake-head" ]]; then
+      cat "${root}/.git/fake-head"
+    else
+      printf '%s\n' "${FAKE_GIT_COMMIT}"
+    fi
+    ;;
   *" status --porcelain"*)
     root="$(git_root)"
     if [[ "${root}" == "${FAKE_PROJECT_ROOT}" ]]; then
@@ -2479,7 +2494,7 @@ exec "${FAKE_REAL_RM}" "$@"
 
 
 def test_exact_requested_commit_validation_survives_dirty_safe_source_resolution(tmp_path: Path) -> None:
-    """Reject malformed and non-HEAD commits before remote workflow operations."""
+    """Reject malformed and unavailable commits before remote workflow operations."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     _project, _source_probe, commit = _initialize_snapshot_repository(workflow, environment)
     mismatch = ("f" * 40) if commit != ("f" * 40) else ("e" * 40)
@@ -2494,13 +2509,57 @@ def test_exact_requested_commit_validation_survives_dirty_safe_source_resolution
     ]
 
     malformed = _run(workflow, [*common, "--git-commit", "short"], environment)
-    mismatched = _run(workflow, [*common, "--git-commit", mismatch], environment)
+    environment["FAKE_UNAVAILABLE_GIT_COMMIT"] = mismatch
+    unavailable = _run(workflow, [*common, "--git-commit", mismatch], environment)
 
     assert malformed.returncode == 2
     assert "Git commit must be one lowercase 40-character identifier." in malformed.stderr
-    assert mismatched.returncode == 1
-    assert "Requested commit differs from local HEAD." in mismatched.stderr
+    assert unavailable.returncode == 1
+    assert "Requested commit is unavailable in the local repository" in unavailable.stderr
     assert "ssh-start" not in log.read_text(encoding="utf-8")
+
+
+def test_explicit_historical_commit_runs_its_pinned_config_after_head_advances(tmp_path: Path) -> None:
+    """Run an available historical commit without reading newer worktree content."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    project, source_probe, commit_a = _initialize_snapshot_repository(workflow, environment)
+    campaign = _campaign(workflow)
+    historical_campaign = campaign.read_text(encoding="utf-8")
+    commit_b = "b" * 40
+    environment["FAKE_GIT_COMMIT"] = commit_b
+    environment["FAKE_GIT_STATUS"] = " M configs/generation/campaigns/steady_flow/id_dataset.yaml\n"
+    campaign.write_text(historical_campaign + "\n# NEWER_HEAD_ONLY\n", encoding="utf-8")
+    source_probe.write_text("newer dirty generation behavior", encoding="utf-8")
+    environment["FAKE_REJECT_CONFIG_TEXT"] = "NEWER_HEAD_ONLY"
+    environment["FAKE_EXPECT_SOURCE_FILE"] = source_probe.relative_to(project).as_posix()
+    environment["FAKE_EXPECT_SOURCE_TEXT"] = "committed generation behavior"
+
+    result = _run(
+        workflow,
+        [
+            "run",
+            str(campaign),
+            "--dry-run",
+            "--cpu-host",
+            "cpu.example",
+            "--remote-root",
+            "/remote/generation root",
+            "--git-commit",
+            commit_a,
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.splitlines()[:2] == [
+        f"Source: explicit commit {commit_a} (local HEAD {commit_b})",
+        "Local worktree: dirty; uncommitted changes ignored",
+    ]
+    assert f"local-python-commit <{commit_a}>" in log.read_text(encoding="utf-8")
+    assert "Dirty tracked configuration reached local Python." not in result.stderr
+    assert "Local Python did not receive the committed Generation source." not in result.stderr
+    assert campaign.read_text(encoding="utf-8").endswith("# NEWER_HEAD_ONLY\n")
+    assert source_probe.read_text(encoding="utf-8") == "newer dirty generation behavior"
 
 
 def test_repository_admission_rejects_escape_ambiguous_and_container_paths(tmp_path: Path) -> None:

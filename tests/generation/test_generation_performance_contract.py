@@ -146,7 +146,6 @@ def _install_operation_counters(
     original_json_loads = json.loads
     original_yaml_load = yaml.safe_load
     original_hdf5_file = h5py.File
-    original_batch_references = input_service.admit_configured_input_references
     original_case_reference = admission_service._case_reference
     original_reconciled = generation.campaign._reconciled
     original_completed = batch_runtime.completed_case_is_valid
@@ -223,10 +222,6 @@ def _install_operation_counters(
         counts["hdf5_opens"] += 1
         return original_hdf5_file(*args, **kwargs)
 
-    def counted_batch_references(*args: Any, **kwargs: Any) -> Any:
-        counts["batch_reference_constructions"] += 1
-        return original_batch_references(*args, **kwargs)
-
     def counted_case_reference(*args: Any, **kwargs: Any) -> Any:
         counts["case_reference_constructions"] += 1
         return original_case_reference(*args, **kwargs)
@@ -265,7 +260,6 @@ def _install_operation_counters(
     monkeypatch.setattr(json, "loads", counted_json_loads)
     monkeypatch.setattr(yaml, "safe_load", counted_yaml_load)
     monkeypatch.setattr(h5py, "File", counted_hdf5_file)
-    monkeypatch.setattr(input_service, "admit_configured_input_references", counted_batch_references)
     monkeypatch.setattr(admission_service, "_case_reference", counted_case_reference)
     monkeypatch.setattr(generation.campaign, "_reconciled", counted_reconciliation)
     monkeypatch.setattr(batch_runtime, "completed_case_is_valid", counted_completed)
@@ -554,7 +548,6 @@ def test_stage4_reuses_stage3_evidence_with_linear_metadata_work(
         assert counts["hdf5_opens"] == 0
         assert counts["recursive_directory_traversals"] == 0
         assert counts["yaml_parser_calls"] == 0
-        assert counts["batch_reference_constructions"] == len(campaign.batches)
         assert counts["case_reference_constructions"] == campaign.total_case_count
         assert counts["campaign_reconciliations"] == 1
         assert counts["completed_case_validations"] == campaign.total_case_count
@@ -710,7 +703,6 @@ def test_unchanged_monitor_scaling_is_linear_metadata_work(
         assert counts["csv_parser_calls"] == 0
         assert counts["hdf5_opens"] == 0
         assert counts["recursive_directory_traversals"] == 0
-        assert counts["batch_reference_constructions"] == len(campaign.batches)
         assert counts["case_reference_constructions"] == case_count
         assert counts["campaign_reconciliations"] == 1
         assert counts["completed_case_validations"] == case_count + 1

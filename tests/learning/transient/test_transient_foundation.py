@@ -278,6 +278,7 @@ def test_scaling_serialization_is_strict_and_device_independent() -> None:
     """Reject tensorizer tampering and keep runtime transfer hash-stable."""
     artifact = _artifact()
     state = artifact.state_dict()
+    assert state["schema_version"] == 1
     restored = TransientScalingArtifact.from_state_dict(state)
     on_cpu = restored.to(torch.device("cpu"))
 

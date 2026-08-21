@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 optuna_runtime = experiments.tuning.optuna
+_PRODUCTION_EPOCH_BUDGET = 200
 _TRANSIENT_ROLLOUT_HORIZON = 32
 search_space = experiments.tuning.search_space
 
@@ -198,12 +199,8 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
 @pytest.mark.parametrize(
     "filename",
     [
-        "fno_stage_a.yaml",
-        "fno_stage_b.yaml",
-        "uno_stage_a.yaml",
-        "uno_stage_b.yaml",
-        "rno_stage_a.yaml",
-        "rno_stage_b.yaml",
+        "transient_drying_lentil_chickpea_stage_a_only.yaml",
+        "transient_drying_lentil_chickpea_joint_ab.yaml",
     ],
 )
 def test_transient_optuna_recipes_admit_strictly(filename: str) -> None:
@@ -211,25 +208,31 @@ def test_transient_optuna_recipes_admit_strictly(filename: str) -> None:
     path = Path("configs/learning/transient_drying/optuna") / filename
     loaded = optuna_runtime.load_optuna_study_config(path)
     assert loaded.base_config["task"] == "transient_drying"
+    assert optuna_runtime._maximum_study_epochs(loaded) == _PRODUCTION_EPOCH_BUDGET
     if loaded.base_config["training"]["stage"] == "b":
         assert loaded.base_config["training"]["fixed_evaluation_horizon"] == _TRANSIENT_ROLLOUT_HORIZON
         assert loaded.base_config["training"]["curriculum"]["lengths"][-1] == _TRANSIENT_ROLLOUT_HORIZON
 
 
-def test_transient_stage_b_rejects_model_search_path() -> None:
-    """Protect exact restored Stage-B model identity from trial overrides."""
-    loaded = optuna_runtime.load_optuna_study_config(Path("configs/learning/transient_drying/optuna/fno_stage_b.yaml"))
-    forbidden = search_space.SearchSpaceParameter(
-        path="model.params.hidden_channels",
-        name="hidden",
-        kind="categorical",
-        values=(64,),
+def test_transient_optuna_rejects_b_only_mode() -> None:
+    """Keep the maintained study contract restricted to Stage-A-only or joint A+B."""
+    loaded = optuna_runtime.load_optuna_study_config(
+        Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml")
     )
-    with pytest.raises(ValueError, match="model, optimizer, and loss"):
-        optuna_runtime._validate_transient_study_policy(
-            loaded.base_config,
-            (*loaded.search_space, forbidden),
-        )
+    invalid = copy.deepcopy(loaded.study)
+    invalid["mode"] = "stage_b_only"
+    with pytest.raises(ValueError, match=r"study\.mode"):
+        optuna_runtime._validate_study_contract(replace(loaded, study=invalid))
+
+
+def test_in_memory_transient_mode_drift_is_rejected() -> None:
+    """Revalidate authored-plan and study-mode consistency after loading."""
+    loaded = optuna_runtime.load_optuna_study_config(Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml"))
+    invalid_study = copy.deepcopy(loaded.study)
+    invalid_study["mode"] = "stage_a_only"
+
+    with pytest.raises(ValueError, match="stage_a_only"):
+        optuna_runtime._validate_study_contract(replace(loaded, study=invalid_study))
 
 
 def test_transient_identity_uses_storage_derived_package_root(
@@ -237,7 +240,9 @@ def test_transient_identity_uses_storage_derived_package_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bind compact transient index evidence through the canonical storage owner."""
-    loaded = optuna_runtime.load_optuna_study_config(Path("configs/learning/transient_drying/optuna/fno_stage_a.yaml"))
+    loaded = optuna_runtime.load_optuna_study_config(
+        Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml")
+    )
     config = copy.deepcopy(loaded.base_config)
     config["paths"]["storage_root"] = str(tmp_path / "storage")
     config["paths"].pop("dataset_packages_root", None)
@@ -249,11 +254,16 @@ def test_transient_identity_uses_storage_derived_package_root(
         return {
             "dataset_id": dataset_id,
             "dataset_view": "transient_drying",
+            "dataset_digest": "d" * 64,
             "schema_kind": "dataset_package",
             "schema_version": 1,
             "payload_filename": "compact-index.json",
             "payload_sha256": "a" * 64,
             "channel_contract_digest": "b" * 64,
+            "split_membership": {"train": ["case_a"], "validation": ["case_b"], "test": []},
+            "membership_counts": {"train": 1, "validation": 1, "test": 0},
+            "material_counts": {"lentil": 1, "chickpea": 1},
+            "source_case_identities": [{"case_id": "case_a"}, {"case_id": "case_b"}],
         }
 
     def load_index(path: Path) -> dict[str, object]:
@@ -272,18 +282,57 @@ def test_transient_identity_uses_storage_derived_package_root(
 
     identities = optuna_runtime._configured_dataset_identities(config)
 
-    assert captured["storage_roots"] == [Path(config["paths"]["storage_root"])] * 2
-    assert captured["index_paths"] == [
-        package_root / config["data"]["train_dataset"] / "compact-index.json",
-        package_root / config["data"]["ood_datasets"][0] / "compact-index.json",
-    ]
+    assert captured["storage_roots"] == [Path(config["paths"]["storage_root"])]
+    assert captured["index_paths"] == [package_root / config["data"]["train_dataset"] / "compact-index.json"]
     assert identities["id"]["manifest_payload_sha256"] == "a" * 64
     assert identities["id"]["index_digest"] == "c" * 64
+    assert identities["id"]["split_membership"]["validation"] == ["case_b"]
+    assert identities["id"]["source_case_identity_digest"] == common.serialization.canonical_json_sha256(
+        [{"case_id": "case_a"}, {"case_id": "case_b"}]
+    )
+
+
+def test_transient_run_requires_physical_package_before_database(
+    tmp_path: Path,
+) -> None:
+    """Fail a transient invocation before creating study state when its package is absent."""
+    loaded = optuna_runtime.load_optuna_study_config(
+        Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml")
+    )
+    base = copy.deepcopy(loaded.base_config)
+    base["paths"]["storage_root"] = str(tmp_path / "missing-storage")
+    output_root = tmp_path / "outputs"
+
+    with pytest.raises(FileNotFoundError):
+        optuna_runtime.run_optuna_study(
+            replace(loaded, base_config=base),
+            n_trials=1,
+            output_root=output_root,
+        )
+
+    assert not output_root.exists()
+
+
+def test_transient_study_signature_binds_physical_package_identity() -> None:
+    """Change study identity when validated physical Dataset evidence changes."""
+    loaded = optuna_runtime.load_optuna_study_config(
+        Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml")
+    )
+    first = replace(loaded, dataset_identities={"id": {"dataset_digest": "a" * 64}, "ood": []})
+    second = replace(loaded, dataset_identities={"id": {"dataset_digest": "b" * 64}, "ood": []})
+
+    first_signature = optuna_runtime.build_study_signature(first)
+    second_signature = optuna_runtime.build_study_signature(second)
+
+    assert first_signature["digest"] != second_signature["digest"]
+    assert first_signature["payload"]["dataset_roles"]["binding"] == "validated_physical_packages"
 
 
 def test_transient_optuna_rejects_noncentral_declared_objective() -> None:
     """Keep Optuna selection bound to the TaskSpec drying group-macro metric."""
-    loaded = optuna_runtime.load_optuna_study_config(Path("configs/learning/transient_drying/optuna/fno_stage_a.yaml"))
+    loaded = optuna_runtime.load_optuna_study_config(
+        Path("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml")
+    )
     config = copy.deepcopy(loaded.base_config)
     alternate = next(metric for metric in config["evaluation"]["metrics"] if metric["id"] == "normalized_rmse_T")
     config["evaluation"]["objective"] = copy.deepcopy(alternate)

@@ -1,5 +1,6 @@
 study:
-  name: transient_drying_fno_stage_b_search
+  name: transient_drying_lentil_chickpea_stage_a_only
+  mode: stage_a_only
   role: production
   seed: 9
   n_trials: 30
@@ -17,24 +18,20 @@ experiment:
   run:
     seed: 9
     deterministic: true
-    device: cuda
-    suffix: optuna_stage_b
+    device: auto
+    suffix: optuna_stage_a
   data:
-    train_dataset: transient_drying__material_pilot__id
-    ood_datasets:
-    - transient_drying__family_generalization__ood
+    train_dataset: transient_drying__lentil+chickpea__id
+    ood_datasets: []
     batch_size: 2
     transient_backend_preference: pt_shards
-    transient_backend_required: false
+    transient_backend_required: true
     hdf5_cache_size: 0
     allow_technical_smoke: false
   input_profile: canonical_physics_complete_v1
   temporal:
     sampling:
-      mode: rollout_window
-      rollout_length: 32
-      window_stride: 32
-      window_offset: 0
+      mode: one_step_transition
     temporal_conditioning:
       kind: none
   scaling:
@@ -67,35 +64,35 @@ experiment:
     patience: 10
     min_lr: 1.0e-06
   training:
-    epochs: 100
+    epochs: 200
+    stage_schedule:
+      mode: stage_a_only
+      budget_unit: epochs
+      total_epochs: 200
+      stage_a_fraction: null
+      stage_b_fraction: null
+      stage_a_epochs: 200
+      stage_b_epochs: 0
+      rounding: not_applicable
     evaluation_interval: 1
     ood_evaluation_interval: 1
     mixed_precision: false
-    stage: b
-    comparison_arm: b
+    stage: a
+    comparison_arm: a0
     gradient_accumulation_steps: 1
-    fixed_evaluation_horizon: 32
+    fixed_evaluation_horizon: 1
     curriculum:
       lengths:
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
+      - 1
       milestone_fractions:
       - 0.0
-      - 0.2
-      - 0.4
-      - 0.6
-      - 0.8
       seed: 9
     matched_compute:
-      planned_seconds: 3600.0
+      planned_seconds: null
       planned_steps: null
       rollout_reference_seconds: null
       rollout_reference_steps: null
-    teacher_handoff:
-      source_run_name: fno_a0_teacher
+    teacher_handoff: null
   tracking:
     wandb:
       mode: offline
@@ -120,11 +117,29 @@ experiment:
       positional_embedding: null
 
 search_space:
+  model.params.n_modes.0:
+    name: modes_y
+    kind: categorical
+    values: [64, 96, 128]
+  model.params.n_modes.1:
+    name: modes_x
+    kind: categorical
+    values: [96, 128, 160]
+  model.params.hidden_channels:
+    name: hidden_channels
+    kind: categorical
+    values: [32, 64, 96]
+  model.params.n_layers:
+    name: n_layers
+    kind: categorical
+    values: [3, 4]
+  optimizer.lr:
+    name: learning_rate
+    kind: float
+    low: 0.0001
+    high: 0.003
+    log: true
   data.batch_size:
     name: batch_size
-    kind: categorical
-    values: [1, 2, 4]
-  training.gradient_accumulation_steps:
-    name: gradient_accumulation_steps
     kind: categorical
     values: [1, 2, 4]

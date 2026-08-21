@@ -21,8 +21,8 @@ _B_STEPS = 7
 def _plan(model_kind: str = "fno") -> transient_plan.TransientTrainingPlan:
     """Return one resolved maintained transient two-stage plan."""
     names = {
-        "fno": "fno_m128x160_h64_l3__material_pilot__s9.yaml",
-        "rno": "rno_m24x24_h16_l3__material_pilot__s9.yaml",
+        "fno": "fno_m128x160_h64_l3__lentil_chickpea__s9.yaml",
+        "rno": "rno_m24x24_h16_l3__lentil_chickpea__s9.yaml",
     }
     return transient_plan.load_and_resolve_transient_training_plan(Path("configs/learning/transient_drying/experiments") / names[model_kind])
 

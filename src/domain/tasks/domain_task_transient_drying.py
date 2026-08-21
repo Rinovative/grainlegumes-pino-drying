@@ -91,8 +91,8 @@ TRANSIENT_DRYING = TaskSpec(
     operator_axes=(2, 3),
     normalization_axes=(0, 2, 3),
     default_datasets=DatasetDefaults(
-        train="transient_drying__material_pilot__id",
-        ood=("transient_drying__family_generalization__ood",),
+        train="transient_drying__lentil+chickpea__id",
+        ood=("transient_drying__kidney_bean__near_family_ood",),
     ),
     preprocessing=PreprocessingSpec(
         input_normalization="train_only_group_specific_scaling_with_unique_state_deduplication",

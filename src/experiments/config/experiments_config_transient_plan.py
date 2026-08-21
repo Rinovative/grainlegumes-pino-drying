@@ -34,10 +34,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 StageName = Literal["a", "b"]
-_STAGE_KEYS = frozenset({"mixed_precision", "stage_a", "stage_b"})
+_STAGE_KEYS = frozenset({"mixed_precision", "stage_schedule", "stage_a", "stage_b"})
 _STAGE_A_KEYS = frozenset(
     {
-        "epochs",
         "evaluation_interval",
         "ood_evaluation_interval",
         "gradient_accumulation_steps",
@@ -117,11 +116,17 @@ def _null_matched_compute() -> dict[str, None]:
     return dict.fromkeys(sorted(_MATCHED_KEYS))
 
 
+def resolve_stage_epoch_allocation(stage_schedule: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the loader-owned canonical transient epoch allocation."""
+    return loader.resolve_transient_stage_schedule(stage_schedule)
+
+
 def _derive_child(
     raw: Mapping[str, Any],
     *,
     stage: StageName,
     stage_config: Mapping[str, Any],
+    stage_schedule: Mapping[str, Any],
     source_run_name: str | None,
 ) -> dict[str, Any]:
     """Build one ordinary raw child config from the authored shared plan mapping."""
@@ -133,7 +138,8 @@ def _derive_child(
     run["suffix"] = _stage_suffix(run.get("suffix"), stage_token="stage_a0" if stage == "a" else "stage_b")
     child["run"] = run
     training: dict[str, Any] = {
-        "epochs": stage_config["epochs"],
+        "epochs": stage_schedule["stage_a_epochs"] if stage == "a" else stage_schedule["stage_b_epochs"],
+        "stage_schedule": copy.deepcopy(dict(stage_schedule)),
         "evaluation_interval": stage_config["evaluation_interval"],
         "ood_evaluation_interval": stage_config["ood_evaluation_interval"],
         "mixed_precision": raw["training"]["mixed_precision"],
@@ -177,6 +183,7 @@ def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTraining
     _validate_exact_keys(training, _STAGE_KEYS, path="training")
     temporal = _mapping(authored.get("temporal"), path="temporal")
     _validate_exact_keys(temporal, _TEMPORAL_KEYS, path="temporal")
+    stage_schedule = resolve_stage_epoch_allocation(_mapping(training.get("stage_schedule"), path="training.stage_schedule"))
     stage_a = _mapping(training.get("stage_a"), path="training.stage_a")
     stage_b = _mapping(training.get("stage_b"), path="training.stage_b")
     _validate_exact_keys(stage_a, _STAGE_A_KEYS, path="training.stage_a")
@@ -185,10 +192,22 @@ def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTraining
         _mapping(stage_b["matched_compute"], path="training.stage_b.matched_compute"), _MATCHED_KEYS, path="training.stage_b.matched_compute"
     )
 
-    a_raw = _derive_child(authored, stage="a", stage_config=stage_a, source_run_name=None)
+    a_raw = _derive_child(
+        authored,
+        stage="a",
+        stage_config=stage_a,
+        stage_schedule=stage_schedule,
+        source_run_name=None,
+    )
     resolved_a = loader.resolve_config(a_raw)
     resolved_a = loader.validate_resolved_config(resolved_a)
-    b_raw = _derive_child(authored, stage="b", stage_config=stage_b, source_run_name=resolved_a["run"]["name"])
+    b_raw = _derive_child(
+        authored,
+        stage="b",
+        stage_config=stage_b,
+        stage_schedule=stage_schedule,
+        source_run_name=resolved_a["run"]["name"],
+    )
     resolved_b = loader.resolve_config(b_raw)
     resolved_b = loader.validate_resolved_config(resolved_b)
     handoff = resolved_b["training"]["teacher_handoff"]

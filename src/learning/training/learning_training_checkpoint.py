@@ -43,7 +43,6 @@ if TYPE_CHECKING:
 
 CheckpointRole = Literal["best", "last"]
 CHECKPOINT_SCHEMA_VERSION = 1
-_TRANSIENT_CHECKPOINT_SCHEMA_VERSION: Final = 2
 _SHA256_LENGTH: Final = 64
 _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
     {
@@ -360,7 +359,7 @@ def build_checkpoint_identity(
             "runtime_provenance",
         }
         if set(split_indices) != required:
-            message = "Transient checkpoint split does not match the v2 training-split schema."
+            message = "Transient checkpoint split does not match the current training-split schema."
             raise ValueError(message)
         if split_indices["task"] != task or split_indices["task_contract_digest"] != task_digest:
             message = "Transient checkpoint split task identity does not match the config contract."
@@ -632,7 +631,7 @@ def make_checkpoint(
     generator = _train_loader_generator(train_loader)
     active_cuda_devices = _active_cuda_devices(model, runtime_device=runtime_device)
     payload = {
-        "schema_version": _TRANSIENT_CHECKPOINT_SCHEMA_VERSION if adapter is not None else CHECKPOINT_SCHEMA_VERSION,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_role": role,
         "identity": validated_identity,
         "completed_epoch": completed_epoch,
@@ -713,7 +712,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         msg = f"Checkpoint schema mismatch. Missing keys: {missing}. Unknown keys: {unknown}."
         raise ValueError(msg)
     schema_version = payload["schema_version"]
-    expected_schema = _TRANSIENT_CHECKPOINT_SCHEMA_VERSION if adapter_expected else CHECKPOINT_SCHEMA_VERSION
+    expected_schema = CHECKPOINT_SCHEMA_VERSION
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != expected_schema:
         msg = f"Unsupported checkpoint schema_version {schema_version!r}. Expected integer {expected_schema}."
         raise ValueError(msg)

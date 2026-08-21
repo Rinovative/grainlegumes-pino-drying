@@ -515,16 +515,23 @@ materialize_pinned_source() {
   require_command git
   require_command mktemp
   require_command rm
-  local head status temporary_parent container source snapshot_head snapshot_status
+  local head requested resolved_commit status temporary_parent container source snapshot_head snapshot_status
   head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
     fail 1 "Could not resolve Git HEAD."
   validate_commit "${head}"
-  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]] ||
-    fail 1 "Requested commit differs from local HEAD."
+  requested="${REQUESTED_COMMIT:-${head}}"
+  resolved_commit="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse --verify "${requested}^{commit}")" ||
+    fail 1 "Requested commit is unavailable in the local repository: ${requested}."
+  [[ "${resolved_commit}" == "${requested}" ]] ||
+    fail 1 "Requested Git object is not the exact commit ${requested}."
   status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ||
     fail 1 "Could not inspect the local worktree for committed HEAD ${head}."
-  REQUESTED_COMMIT="${head}"
-  printf 'Source: committed HEAD %s\n' "${head}" >&2
+  REQUESTED_COMMIT="${requested}"
+  if [[ "${requested}" == "${head}" ]]; then
+    printf 'Source: committed HEAD %s\n' "${head}" >&2
+  else
+    printf 'Source: explicit commit %s (local HEAD %s)\n' "${requested}" "${head}" >&2
+  fi
   if [[ -n "${status}" ]]; then
     printf 'Local worktree: dirty; uncommitted changes ignored\n' >&2
   else
@@ -549,12 +556,12 @@ materialize_pinned_source() {
   PINNED_SOURCE_CONTAINER="${container}"
   PINNED_SOURCE_PARENT="${temporary_parent}"
   printf 'generation-workflow-source\t%s\t%s\n' \
-    "${head}" "${DEVELOPMENT_REPO_ROOT}" > "${container}/.generation-workflow-source"
+    "${requested}" "${DEVELOPMENT_REPO_ROOT}" > "${container}/.generation-workflow-source"
   source="${container}/repo"
   if ! git init --quiet "${source}" \
     || ! git -C "${source}" fetch --quiet --depth=1 --no-tags \
-      "${DEVELOPMENT_REPO_ROOT}" "${head}" \
-    || ! git -C "${source}" -c advice.detachedHead=false checkout --quiet --detach "${head}"; then
+      "${DEVELOPMENT_REPO_ROOT}" "${requested}" \
+    || ! git -C "${source}" -c advice.detachedHead=false checkout --quiet --detach "${requested}"; then
     cleanup_pinned_source || true
     fail 1 "Could not materialize the exact committed Generation source."
   fi
@@ -566,13 +573,13 @@ materialize_pinned_source() {
     cleanup_pinned_source || true
     fail 1 "Could not verify the materialized source worktree."
   }
-  [[ "${snapshot_head}" == "${head}" && -z "${snapshot_status}" ]] || {
+  [[ "${snapshot_head}" == "${requested}" && -z "${snapshot_status}" ]] || {
     cleanup_pinned_source || true
     fail 1 "Materialized Generation source is not the exact clean pinned commit."
   }
   HOST_REPO_ROOT="$(realpath -e -- "${source}")"
   DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
-  PINNED_SOURCE_COMMIT="${head}"
+  PINNED_SOURCE_COMMIT="${requested}"
 }
 
 resolve_local_commit() {
@@ -644,12 +651,15 @@ resolve_background_host_runtime() {
     fail 2 "Internal background clean-check selector is invalid."
   resolve_bootstrap_requested_commit
   resolve_host_layout
-  local head status
+  local head requested resolved_commit status
   head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
     fail 1 "Could not resolve the background workflow source commit."
   validate_commit "${head}"
-  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${head}" ]] ||
-    fail 1 "Requested commit differs from local HEAD."
+  requested="${REQUESTED_COMMIT:-${head}}"
+  resolved_commit="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse --verify "${requested}^{commit}")" ||
+    fail 1 "Requested commit is unavailable in the local repository: ${requested}."
+  [[ "${resolved_commit}" == "${requested}" ]] ||
+    fail 1 "Requested Git object is not the exact commit ${requested}."
   if [[ "${require_clean}" == true ]]; then
     status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status \
       --porcelain=v1 --untracked-files=all)" ||
@@ -657,8 +667,8 @@ resolve_background_host_runtime() {
     [[ -z "${status}" ]] ||
       fail 1 "--background requires the stable host checkout to be clean and committed."
   fi
-  REQUESTED_COMMIT="${head}"
-  PINNED_SOURCE_COMMIT="${head}"
+  REQUESTED_COMMIT="${requested}"
+  PINNED_SOURCE_COMMIT="${requested}"
   HOST_REPO_ROOT="${DEVELOPMENT_REPO_ROOT}"
   DOCKER_PYTHON="${DEVELOPMENT_REPO_ROOT}/scripts/docker_python.sh"
   [[ -x "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \

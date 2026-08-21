@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, SLF001
 """Package-only Generation continuation and immutable extension evidence."""
 
 from __future__ import annotations
@@ -38,6 +38,32 @@ def _record(plan: dict[str, Any], dataset_id: str) -> dict[str, Any]:
         "manifest_sha256": "b" * 64,
         "payload_sha256": "c" * 64,
     }
+
+
+def test_package_receipt_requires_current_payload_size(tmp_path: Path) -> None:
+    """Reject package receipts missing current immutable payload-size evidence."""
+    incomplete = {
+        "dataset_name": "transient_drying__lentil_chickpea__id",
+        "dataset_id": "dataset-id",
+        "dataset_view": "transient_drying",
+        "evaluation_regime": "id",
+        "build_status": "complete",
+        "manifest_relative_path": "metadata/dataset_manifest.json",
+        "manifest_sha256": "a" * 64,
+        "payload_relative_path": "packages/compact-index.json",
+        "payload_sha256": "b" * 64,
+        "source_case_count": 1,
+        "sample_count": 1,
+        "transition_count": 1,
+        "inspection": {},
+        "loader_smoke": {},
+    }
+
+    with pytest.raises(ValueError, match="package keys are invalid"):
+        generation.workflow._validate_package_record(
+            incomplete,
+            storage_root=tmp_path,
+        )
 
 
 def test_missing_package_extension_is_append_only_and_idempotent(
@@ -322,7 +348,7 @@ def test_package_smoke_uses_manifest_training_eligibility(
 
     monkeypatch.setattr(package_validation_service, "_smoke_dataset_package", smoke)
 
-    generation.workflow._package_runtime_evidence(  # noqa: SLF001
+    generation.workflow._package_runtime_evidence(
         "steady-flow-id",
         storage_root=storage,
     )

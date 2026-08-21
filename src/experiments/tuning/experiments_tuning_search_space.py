@@ -33,6 +33,7 @@ _COMMON_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
     "optimizer.lr": frozenset({"categorical", "float"}),
     "optimizer.weight_decay": frozenset({"categorical", "float"}),
     "training.gradient_accumulation_steps": frozenset({"categorical", "int"}),
+    "training.stage_schedule.stage_a_fraction": frozenset({"float"}),
 }
 _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
     "fno": {

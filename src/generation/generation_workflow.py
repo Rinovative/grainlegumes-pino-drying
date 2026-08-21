@@ -315,7 +315,7 @@ def _validate_package_record(
     expected_plan: Mapping[str, Any] | None = None,
     campaign: config_service.CampaignConfig | None = None,
 ) -> dict[str, Any]:
-    """Admit current evidence or deeply validate legacy package records."""
+    """Admit one package receipt against the current strict evidence contract."""
     if validation_depth not in {"evidence", "full"}:
         message = f"Unsupported package validation depth: {validation_depth!r}."
         raise ValueError(message)
@@ -325,7 +325,7 @@ def _validate_package_record(
     if not isinstance(record, dict):
         message = "Dataset receipt package records must be JSON objects."
         raise TypeError(message)
-    legacy_required = {
+    required = {
         "dataset_name",
         "dataset_id",
         "dataset_view",
@@ -335,47 +335,38 @@ def _validate_package_record(
         "manifest_sha256",
         "payload_relative_path",
         "payload_sha256",
+        "payload_size_bytes",
         "source_case_count",
         "sample_count",
         "transition_count",
         "inspection",
         "loader_smoke",
     }
-    current_required = legacy_required | {"payload_size_bytes"}
     keys = set(record)
-    if keys not in (legacy_required, current_required):
+    if keys != required:
         message = f"Dataset receipt package keys are invalid for {record.get('dataset_id')!r}."
         raise ValueError(message)
     dataset_id = common.paths.validate_logical_name(
         record["dataset_id"],
         label="dataset_id",
     )
-    current_record = keys == current_required
-    if current_record:
-        from src.datasets.packages import dataset_packages_manifest as manifest_service  # noqa: PLC0415
+    from src.datasets.packages import dataset_packages_manifest as manifest_service  # noqa: PLC0415
 
-        manifest_loader = manifest_service.load_package_manifest if validation_depth == "full" else manifest_service.load_package_manifest_evidence
-        manifest = manifest_loader(
-            dataset_id,
-            storage_root=storage_root,
-        )
-        inspection = record["inspection"]
-        smoke = record["loader_smoke"]
-        if (
-            not isinstance(inspection, dict)
-            or inspection.get("dataset_id") != dataset_id
-            or not isinstance(smoke, dict)
-            or any(
-                not isinstance(value, dict) or value.get("dataset_id") != dataset_id or value.get("status") != "loaded" for value in smoke.values()
-            )
-        ):
-            message = f"Dataset receipt runtime evidence is malformed for {dataset_id!r}."
-            raise ValueError(message)
-    else:
-        manifest, inspection, smoke = _package_runtime_evidence(
-            dataset_id,
-            storage_root=storage_root,
-        )
+    manifest_loader = manifest_service.load_package_manifest if validation_depth == "full" else manifest_service.load_package_manifest_evidence
+    manifest = manifest_loader(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    inspection = record["inspection"]
+    smoke = record["loader_smoke"]
+    if (
+        not isinstance(inspection, dict)
+        or inspection.get("dataset_id") != dataset_id
+        or not isinstance(smoke, dict)
+        or any(not isinstance(value, dict) or value.get("dataset_id") != dataset_id or value.get("status") != "loaded" for value in smoke.values())
+    ):
+        message = f"Dataset receipt runtime evidence is malformed for {dataset_id!r}."
+        raise ValueError(message)
     if expected_plan is not None and campaign is not None:
         _validate_package_plan_binding(manifest, expected_plan, campaign)
     manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / dataset_id / "dataset_manifest.json"
@@ -388,15 +379,14 @@ def _validate_package_record(
         "manifest_relative_path": manifest_path.relative_to(storage_root).as_posix(),
         "manifest_sha256": common.serialization.file_sha256(manifest_path),
         "payload_relative_path": payload_path.relative_to(storage_root).as_posix(),
-        "payload_sha256": (str(manifest["payload_sha256"]) if current_record else common.serialization.file_sha256(payload_path)),
+        "payload_sha256": str(manifest["payload_sha256"]),
+        "payload_size_bytes": payload_path.stat().st_size,
         "source_case_count": manifest["source_case_count"],
         "sample_count": manifest["sample_count"],
         "transition_count": manifest["transition_count"],
         "inspection": inspection,
         "loader_smoke": smoke,
     }
-    if current_record:
-        expected["payload_size_bytes"] = payload_path.stat().st_size
     if any(record.get(key) != value for key, value in expected.items()):
         message = f"Dataset receipt no longer binds package {dataset_id!r}."
         raise ValueError(message)

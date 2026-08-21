@@ -27,9 +27,10 @@ import copy
 import math
 import re
 from collections.abc import Mapping, Sequence
+from decimal import ROUND_HALF_UP, Decimal
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import yaml
 
@@ -120,6 +121,7 @@ _SECTION_KEYS = {
     "training": frozenset(
         {
             "epochs",
+            "stage_schedule",
             "evaluation_interval",
             "ood_evaluation_interval",
             "mixed_precision",
@@ -724,10 +726,10 @@ def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(objective)
 
 
-def _ood_datasets(data: Mapping[str, Any], *, path: str) -> tuple[str, ...]:
-    """Return one or more independently configured OOD dataset identifiers."""
+def _ood_datasets(data: Mapping[str, Any], *, path: str, allow_empty: bool = False) -> tuple[str, ...]:
+    """Return configured OOD dataset identifiers, with explicit Optuna absence only."""
     value = data.get("ood_datasets")
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list) or (not value and not allow_empty):
         msg = f"{path}.ood_datasets must contain one or more logical dataset ids."
         raise ConfigError(msg)
     try:
@@ -1181,7 +1183,9 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    _ood_datasets(data, path="data")
+    tracking = _as_mapping(config["tracking"], path="tracking")
+    wandb = _as_mapping(tracking["wandb"], path="tracking.wandb")
+    _ood_datasets(data, path="data", allow_empty=wandb.get("workflow") == "optuna_trial" or data.get("allow_technical_smoke") is True)
 
     _validate_tracking(config, require_derived=require_derived_tracking)
 
@@ -1258,7 +1262,7 @@ def generate_run_name(config: dict[str, Any]) -> str:
 _TRANSIENT_STATE_CHANNELS = 4
 
 
-def _raise_config_error(message: str) -> None:
+def _raise_config_error(message: str) -> NoReturn:
     """Raise one path-owned configuration violation from a constructed message."""
     raise ConfigError(message)
 
@@ -1305,6 +1309,52 @@ def _validate_transient_loss(config: dict[str, Any]) -> None:
         },
         "physics": physics,
     }
+
+
+def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve canonical transient epoch-allocation evidence."""
+    raw = _as_mapping(schedule, path="training.stage_schedule")
+    mode = raw.get("mode")
+    if raw.get("budget_unit") != "epochs" or mode not in {"joint_ab", "stage_a_only"}:
+        _raise_config_error("training.stage_schedule must declare an admitted epoch allocation mode.")
+    total = raw.get("total_epochs")
+    if type(total) is not int or total < (2 if mode == "joint_ab" else 1):
+        _raise_config_error("training.stage_schedule.total_epochs is invalid for its mode.")
+    if mode == "stage_a_only":
+        expected = {
+            "mode": mode,
+            "budget_unit": "epochs",
+            "total_epochs": total,
+            "stage_a_fraction": None,
+            "stage_b_fraction": None,
+            "stage_a_epochs": total,
+            "stage_b_epochs": 0,
+            "rounding": "not_applicable",
+        }
+    else:
+        fraction = raw.get("stage_a_fraction")
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            _raise_config_error("training.stage_schedule.stage_a_fraction must be finite.")
+        decimal = Decimal(str(fraction))
+        if not decimal.is_finite() or not Decimal(0) < decimal < Decimal(1):
+            _raise_config_error("training.stage_schedule.stage_a_fraction must be strictly between zero and one.")
+        a = min(max(int((Decimal(total) * decimal).quantize(Decimal(1), rounding=ROUND_HALF_UP)), 1), total - 1)
+        expected = {
+            "mode": mode,
+            "budget_unit": "epochs",
+            "total_epochs": total,
+            "stage_a_fraction": float(decimal),
+            "stage_b_fraction": float(Decimal(1) - decimal),
+            "stage_a_epochs": a,
+            "stage_b_epochs": total - a,
+            "rounding": "half_up_then_exact_remainder",
+        }
+    authored_joint = {key: raw.get(key) for key in ("mode", "budget_unit", "total_epochs", "stage_a_fraction")}
+    if raw != expected and not (
+        mode == "joint_ab" and set(raw) == set(authored_joint) and authored_joint == {key: expected[key] for key in authored_joint}
+    ):
+        _raise_config_error("training.stage_schedule must equal canonical resolved allocation evidence.")
+    return expected
 
 
 def _validate_transient_extensions(  # noqa: C901, PLR0912
@@ -1358,6 +1408,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
     training = _as_mapping(config["training"], path="training")
     required_training = {
         "epochs",
+        "stage_schedule",
         "evaluation_interval",
         "ood_evaluation_interval",
         "mixed_precision",
@@ -1371,9 +1422,13 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
     }
     if set(training) != required_training:
         _raise_config_error("Transient training keys do not match the curriculum contract.")
+    schedule = resolve_transient_stage_schedule(_as_mapping(training["stage_schedule"], path="training.stage_schedule"))
     stage, arm = training["stage"], training["comparison_arm"]
     if stage not in {"a", "b"} or arm not in {"a0", "a_plus", "b"} or (stage == "a" and arm not in {"a0", "a_plus"}) or (stage == "b" and arm != "b"):
         _raise_config_error("Transient training stage and comparison_arm are inconsistent.")
+    expected_epochs = schedule["stage_a_epochs"] if stage == "a" else schedule["stage_b_epochs"]
+    if training["epochs"] != expected_epochs:
+        _raise_config_error("training.epochs must equal the resolved stage_schedule allocation.")
     for key in ("gradient_accumulation_steps", "fixed_evaluation_horizon"):
         if isinstance(training[key], bool) or not isinstance(training[key], int) or training[key] <= 0:
             _raise_config_error(f"training.{key} must be a positive integer.")
@@ -1434,13 +1489,17 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
     if requires_handoff != (handoff is not None):
         _raise_config_error("A+ and B require a teacher handoff; A0 forbids one.")
     values = tuple(matched.values())
-    if arm == "a0" and any(value is not None for value in values):
+    has_matched_limit = any(value is not None for value in values)
+    if arm == "a0" and has_matched_limit:
         _raise_config_error("A0 must not declare a matched-compute budget.")
+    epoch_budgeted_b = arm == "b" and not has_matched_limit
+    if epoch_budgeted_b and (schedule["mode"] != "joint_ab" or schedule["budget_unit"] != "epochs"):
+        _raise_config_error("Stage B without a matched-compute limit requires the joint epoch-allocation contract.")
     seconds_budget = matched["planned_seconds"] is not None
     steps_budget = matched["planned_steps"] is not None
     seconds_reference = matched["rollout_reference_seconds"] is not None
     steps_reference = matched["rollout_reference_steps"] is not None
-    if requires_handoff:
+    if requires_handoff and not epoch_budgeted_b:
         if seconds_budget == steps_budget:
             _raise_config_error("Matched transient arms require exactly one planned budget unit.")
         if seconds_reference and steps_reference:

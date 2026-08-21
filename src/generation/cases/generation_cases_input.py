@@ -354,6 +354,72 @@ def _load_existing(
     return records, source
 
 
+def _compatible_source(
+    config: config_service.GenerationConfig,
+    base: Mapping[str, Any],
+    resolved_config: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None,
+) -> admission_service.InputSource | None:
+    """Select one exact compatible immutable source when current evidence is absent."""
+    discovery = admission_service.discover_input_batches(storage_root=storage_root)
+    relevant_issues = [issue for issue in discovery.issues if issue.directory.parent.parent.name == config.batch_storage_name]
+    if relevant_issues:
+        message = f"Compatible input-source discovery found corrupt evidence for {config.batch_storage_name}: {relevant_issues[0].directory}"
+        raise FileExistsError(message)
+    expected_indices = tuple(config.case_indices)
+    candidates = [
+        source
+        for source in discovery.sources
+        if source.batch_storage_name == config.batch_storage_name
+        and source.batch_id == config.batch_id
+        and source.resolved_config_matches(resolved_config)
+        and all(source.manifest_payload().get(field) == base[field] for field in admission_service.INPUT_GENERATION_COMPATIBILITY_FIELDS)
+        and tuple(reference.case_index for reference in source.cases) == expected_indices
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        message = f"Compatible input-source selection is ambiguous for {config.batch_name!r}."
+        raise FileExistsError(message)
+    return candidates[0]
+
+
+def _admit_selected_input_references(
+    config: config_service.GenerationConfig,
+    input_generation_id: str,
+    *,
+    input_source_git_commit: str,
+    storage_root: Path | str | None,
+    validation_depth: Literal["evidence", "full"],
+) -> dict[int, admission_service.InputCaseReference]:
+    """Admit one persisted selected source against active scientific evidence."""
+    base, resolved, _metadata, _raw = _configured_input_locations(config, storage_root=storage_root)
+    metadata = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
+    raw = common.paths.resolve_generation_input_generation_raw_directory(config.batch_storage_name, input_generation_id, storage_root=storage_root)
+    try:
+        source = admission_service.admit_input_batch_source(
+            metadata, raw_directory=raw, expected_input_generation_id=input_generation_id, validation_depth=validation_depth
+        )
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+        message = f"Selected input source is incomplete or invalid: {metadata}: {error}"
+        raise FileExistsError(message) from error
+    manifest = source.manifest_payload()
+    if manifest.get("git_commit") != source_service.validate_git_commit(input_source_git_commit):
+        message = "Selected input source disagrees with its persisted source commit."
+        raise RuntimeError(message)
+    if (
+        not source.resolved_config_matches(resolved)
+        or any(manifest.get(field) != base[field] for field in admission_service.INPUT_GENERATION_COMPATIBILITY_FIELDS)
+        or tuple(reference.case_index for reference in source.cases) != tuple(config.case_indices)
+    ):
+        message = "Selected input source disagrees with active scientific configuration or ordered membership."
+        raise RuntimeError(message)
+    return {reference.case_index: reference for reference in source.cases}
+
+
 def _configured_input_locations(
     config: config_service.GenerationConfig,
     *,
@@ -403,21 +469,25 @@ def admit_configured_input_references(
     storage_root: Path | str | None = None,
     validation_depth: Literal["evidence", "full"] = "evidence",
     git_commit: str | None = None,
+    input_generation_id: str | None = None,
+    input_source_git_commit: str | None = None,
 ) -> dict[int, admission_service.InputCaseReference]:
     """Admit one configured batch once and index its exact case references."""
     commit_context = nullcontext() if git_commit is None else _generation_git_commit(source_service.validate_git_commit(git_commit))
     with commit_context:
-        base, resolved, metadata, raw = _configured_input_locations(
-            config,
-            storage_root=storage_root,
-        )
-        records, source = _load_existing(
-            metadata,
-            raw,
-            base=base,
-            resolved_config=resolved,
-            validation_depth=validation_depth,
-        )
+        if (input_generation_id is None) != (input_source_git_commit is None):
+            message = "Selected input generation and source commit must be supplied together."
+            raise ValueError(message)
+        if input_generation_id is not None and input_source_git_commit is not None:
+            return _admit_selected_input_references(
+                config,
+                input_generation_id,
+                input_source_git_commit=input_source_git_commit,
+                storage_root=storage_root,
+                validation_depth=validation_depth,
+            )
+        base, resolved, metadata, raw = _configured_input_locations(config, storage_root=storage_root)
+        records, source = _load_existing(metadata, raw, base=base, resolved_config=resolved, validation_depth=validation_depth)
     expected = set(config.case_indices)
     if not expected.issubset(records):
         missing = tuple(sorted(expected.difference(records)))
@@ -976,23 +1046,49 @@ def prepare_campaign_inputs(
                     }
                 )
 
-            generated = generate_input_cases(
-                batch,
-                len(batch.case_indices),
-                case_start=batch.case_indices[0],
-                storage_root=storage,
-                progress=report_batch_progress,
-                existing_validation_depth=existing_validation_depth,
-            )
+            base, resolved, metadata, raw = _configured_input_locations(batch, storage_root=storage)
+            current: admission_service.InputSource | None
+            try:
+                _records, existing_source = _load_existing(
+                    metadata,
+                    raw,
+                    base=base,
+                    resolved_config=resolved,
+                    validation_depth=existing_validation_depth,
+                )
+            except FileExistsError:
+                if metadata.exists() or raw.exists():
+                    raise
+                current = _compatible_source(batch, base, resolved, storage_root=storage)
+            else:
+                current = existing_source
+            if current is None:
+                generated = generate_input_cases(
+                    batch,
+                    len(batch.case_indices),
+                    case_start=batch.case_indices[0],
+                    storage_root=storage,
+                    progress=report_batch_progress,
+                    existing_validation_depth=existing_validation_depth,
+                )
+                source_id = generated.input_generation_id
+                generated_count, reused_count = generated.generated_case_count, generated.reused_case_count
+                source_commit = commit
+            else:
+                source_id = current.source_id
+                generated_count, reused_count = 0, len(batch.case_indices)
+                source_commit = str(current.manifest_payload()["git_commit"])
             completed_offset += len(batch.case_indices)
             batches.append(
                 {
                     "batch_id": batch.batch_id,
                     "batch_storage_name": batch.batch_storage_name,
-                    "input_generation_id": generated.input_generation_id,
-                    "generated_case_count": generated.generated_case_count,
-                    "reused_case_count": generated.reused_case_count,
-                    "requested_case_count": len(generated.requested_case_indices),
+                    "input_generation_id": source_id,
+                    "source_git_commit": source_commit,
+                    "case_indices": list(batch.case_indices),
+                    "generated_case_count": generated_count,
+                    "reused_case_count": reused_count,
+                    "requested_case_count": len(batch.case_indices),
                 }
             )
     return {
@@ -1004,6 +1100,70 @@ def prepare_campaign_inputs(
     }
 
 
+def admit_campaign_inputs_with_references(
+    campaign: config_service.CampaignConfig,
+    *,
+    git_commit: str,
+    storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+) -> tuple[dict[str, Any], dict[str, dict[int, admission_service.InputCaseReference]]]:
+    """Admit campaign inputs once and return provenance with indexed references."""
+    commit = source_service.validate_git_commit(git_commit)
+    storage = Path(storage_root).expanduser() if storage_root is not None else None
+    batches: list[dict[str, Any]] = []
+    references: dict[str, dict[int, admission_service.InputCaseReference]] = {}
+    with _generation_git_commit(commit):
+        for batch in campaign.batches:
+            base, resolved, metadata, raw = _configured_input_locations(batch, storage_root=storage)
+            try:
+                records, source = _load_existing(
+                    metadata,
+                    raw,
+                    base=base,
+                    resolved_config=resolved,
+                    validation_depth=validation_depth,
+                )
+                record_indices = set(records)
+            except FileExistsError as error:
+                if metadata.exists() or raw.exists():
+                    raise
+                compatible_source = _compatible_source(batch, base, resolved, storage_root=storage)
+                if compatible_source is None:
+                    message = f"Prepared canonical input batch {batch.batch_name!r} is unavailable."
+                    raise FileNotFoundError(message) from error
+                source = compatible_source
+                record_indices = {reference.case_index for reference in source.cases}
+            expected_indices = set(batch.case_indices)
+            missing = tuple(case_index for case_index in batch.case_indices if case_index not in record_indices)
+            if missing:
+                message = f"Prepared canonical input batch {batch.batch_name!r} is missing configured cases: {missing}."
+                raise FileNotFoundError(message)
+            batch_references = {reference.case_index: reference for reference in source.cases if reference.case_index in expected_indices}
+            if set(batch_references) != expected_indices:
+                message = f"Prepared canonical input batch {batch.batch_name!r} has incomplete admitted references."
+                raise RuntimeError(message)
+            references[batch.batch_name] = batch_references
+            source_manifest = source.manifest_payload()
+            batches.append(
+                {
+                    "batch_id": batch.batch_id,
+                    "batch_storage_name": batch.batch_storage_name,
+                    "input_generation_id": source.source_id,
+                    "source_git_commit": source_manifest["git_commit"],
+                    "case_indices": list(batch.case_indices),
+                    "admitted_case_count": len(batch.case_indices),
+                }
+            )
+    evidence = {
+        "git_commit": commit,
+        "validation_depth": validation_depth,
+        "selected_batch_count": len(batches),
+        "admitted_case_count": sum(item["admitted_case_count"] for item in batches),
+        "batches": batches,
+    }
+    return evidence, references
+
+
 def admit_campaign_inputs(
     campaign: config_service.CampaignConfig,
     *,
@@ -1012,50 +1172,13 @@ def admit_campaign_inputs(
     validation_depth: Literal["evidence", "full"] = "evidence",
 ) -> dict[str, Any]:
     """Admit every configured input from immutable batch evidence without generation."""
-    commit = source_service.validate_git_commit(git_commit)
-    storage = Path(storage_root).expanduser() if storage_root is not None else None
-    batches: list[dict[str, Any]] = []
-    with _generation_git_commit(commit):
-        for batch in campaign.batches:
-            resolved_config = _resolved_config(batch)
-            base = _manifest_base(batch, resolved_config)
-            input_generation_id = str(base["input_generation_id"])
-            metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
-                batch.batch_storage_name,
-                input_generation_id,
-                storage_root=storage,
-            )
-            raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
-                batch.batch_storage_name,
-                input_generation_id,
-                storage_root=storage,
-            )
-            records, _source = _load_existing(
-                metadata_directory,
-                raw_directory,
-                base=base,
-                resolved_config=resolved_config,
-                validation_depth=validation_depth,
-            )
-            missing = tuple(case_index for case_index in batch.case_indices if case_index not in records)
-            if missing:
-                message = f"Prepared canonical input batch {batch.batch_name!r} is missing configured cases: {missing}."
-                raise FileNotFoundError(message)
-            batches.append(
-                {
-                    "batch_id": batch.batch_id,
-                    "batch_storage_name": batch.batch_storage_name,
-                    "input_generation_id": input_generation_id,
-                    "admitted_case_count": len(batch.case_indices),
-                }
-            )
-    return {
-        "git_commit": commit,
-        "validation_depth": validation_depth,
-        "selected_batch_count": len(batches),
-        "admitted_case_count": sum(item["admitted_case_count"] for item in batches),
-        "batches": batches,
-    }
+    evidence, _references = admit_campaign_inputs_with_references(
+        campaign,
+        git_commit=git_commit,
+        storage_root=storage_root,
+        validation_depth=validation_depth,
+    )
+    return evidence
 
 
 def run_campaign_input_generation(

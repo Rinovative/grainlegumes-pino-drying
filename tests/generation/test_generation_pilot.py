@@ -984,12 +984,21 @@ def test_new_commit_pilot_reuses_all_valid_cases_without_scientific_submission(
     finalized: list[bool] = []
     submissions: list[str] = []
 
+    def prepare_inputs(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        prepared.append(True)
+        return {
+            "batches": [
+                {
+                    "input_generation_id": "input-" + "1" * 24,
+                    "source_git_commit": commit,
+                    "case_indices": list(batch.case_indices),
+                }
+                for batch in campaign.batches
+            ]
+        }
+
     monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
-    monkeypatch.setattr(
-        input_service,
-        "prepare_campaign_inputs",
-        lambda *_args, **_kwargs: prepared.append(True),
-    )
+    monkeypatch.setattr(input_service, "prepare_campaign_inputs", prepare_inputs)
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     monkeypatch.setattr(
         generation.campaign,

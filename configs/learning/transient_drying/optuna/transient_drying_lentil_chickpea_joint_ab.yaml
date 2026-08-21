@@ -1,5 +1,6 @@
 study:
-  name: transient_drying_rno_stage_a_search
+  name: transient_drying_lentil_chickpea_joint_ab
+  mode: joint_ab
   role: production
   seed: 9
   n_trials: 30
@@ -17,24 +18,18 @@ experiment:
   run:
     seed: 9
     deterministic: true
-    device: auto
-    suffix: optuna_stage_a
+    device: cuda
+    suffix: null
   data:
-    train_dataset: transient_drying__material_pilot__id
-    ood_datasets:
-    - transient_drying__family_generalization__ood
+    train_dataset: transient_drying__lentil+chickpea__id
+    ood_datasets: []
     batch_size: 2
     transient_backend_preference: pt_shards
-    transient_backend_required: false
+    transient_backend_required: true
     hdf5_cache_size: 0
     allow_technical_smoke: false
   input_profile: canonical_physics_complete_v1
   temporal:
-    sampling:
-      mode: rollout_window
-      rollout_length: 32
-      window_stride: 32
-      window_offset: 0
     temporal_conditioning:
       kind: none
   scaling:
@@ -67,34 +62,54 @@ experiment:
     patience: 10
     min_lr: 1.0e-06
   training:
-    epochs: 100
-    evaluation_interval: 1
-    ood_evaluation_interval: 1
     mixed_precision: false
-    stage: a
-    comparison_arm: a0
-    gradient_accumulation_steps: 1
-    fixed_evaluation_horizon: 32
-    curriculum:
-      lengths:
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      milestone_fractions:
-      - 0.0
-      - 0.2
-      - 0.4
-      - 0.6
-      - 0.8
-      seed: 9
-    matched_compute:
-      planned_seconds: null
-      planned_steps: null
-      rollout_reference_seconds: null
-      rollout_reference_steps: null
-    teacher_handoff: null
+    stage_schedule:
+      mode: joint_ab
+      budget_unit: epochs
+      total_epochs: 200
+      stage_a_fraction: 0.5
+    stage_a:
+      evaluation_interval: 1
+      ood_evaluation_interval: 1
+      gradient_accumulation_steps: 1
+      sampling:
+        mode: one_step_transition
+      fixed_evaluation_horizon: 1
+      curriculum:
+        lengths:
+        - 1
+        milestone_fractions:
+        - 0.0
+        seed: 9
+    stage_b:
+      evaluation_interval: 1
+      ood_evaluation_interval: 1
+      gradient_accumulation_steps: 1
+      sampling:
+        mode: rollout_window
+        rollout_length: 32
+        window_stride: 32
+        window_offset: 0
+      fixed_evaluation_horizon: 32
+      curriculum:
+        lengths:
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        milestone_fractions:
+        - 0.0
+        - 0.2
+        - 0.4
+        - 0.6
+        - 0.8
+        seed: 9
+      matched_compute:
+        planned_seconds: null
+        planned_steps: null
+        rollout_reference_seconds: null
+        rollout_reference_steps: null
   tracking:
     wandb:
       mode: offline
@@ -104,38 +119,27 @@ experiment:
         interval: 1
         max_cases: 1
   model:
-    kind: rno
+    kind: fno
     params:
       n_modes:
-      - 24
-      - 24
-      hidden_channels: 16
+      - 128
+      - 160
+      hidden_channels: 64
       n_layers: 3
-      rno_skip: false
       lifting_channel_ratio: 2
       projection_channel_ratio: 2
-      channel_mlp_skip: soft-gating
       fno_skip: linear
-      return_sequences: false
+      channel_mlp_skip: soft-gating
+      implementation: factorized
       positional_embedding: null
 
 search_space:
-  model.params.n_modes.0:
-    name: modes_y
-    kind: categorical
-    values: [16, 24, 32]
-  model.params.n_modes.1:
-    name: modes_x
-    kind: categorical
-    values: [16, 24, 32]
-  model.params.hidden_channels:
-    name: hidden_channels
-    kind: categorical
-    values: [12, 16, 24]
-  model.params.n_layers:
-    name: n_layers
-    kind: categorical
-    values: [2, 3, 4]
+  training.stage_schedule.stage_a_fraction:
+    name: stage_a_fraction
+    kind: float
+    low: 0.25
+    high: 0.75
+    step: 0.05
   optimizer.lr:
     name: learning_rate
     kind: float

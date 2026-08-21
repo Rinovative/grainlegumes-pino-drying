@@ -81,6 +81,30 @@ Re-running the same config reuses valid work, reconciles active ownership, and
 submits only eligible missing work. It never treats Slurm `COMPLETED` alone as
 scientific success.
 
+### Exact source pinning and input reuse
+
+Without `--git-commit`, `run CONFIG` resolves the current committed local HEAD.
+To resume one historical campaign after local HEAD advances, pass its exact
+40-character commit:
+
+```bash
+./scripts/generation_workflow.sh run CONFIG --git-commit HISTORICAL_COMMIT --cpu-host "$CPU_HOST"
+```
+
+The launcher verifies that object locally, materializes a clean detached source,
+and runs both the workflow and config from that source. A dirty development
+worktree is ignored; it is never executed under the historical provenance label.
+The CPU checkout must equal the requested commit before campaign work proceeds.
+
+Immutable Generation inputs retain their original `input_generation_id` and
+source commit. A newer execution may reference one older input generation only
+when every scientific, template, schema, batch, and ordered case-membership field
+matches exactly; only the execution commit may differ. The current exact source
+is preferred, while ambiguous or corrupt compatible history fails closed. Each
+campaign manifest persists its selected input source. Execution run identity
+continues to include the execution commit, and completed solver outputs are not
+reused merely because their inputs are compatible.
+
 For the all-material pilot, `current_pilot_gpu_permanent_bytes` is the
 validated destination transfer inventory plus all regular durable files owned
 by the pilot-check directory: the receipt, pre-cleanup snapshot, finalized

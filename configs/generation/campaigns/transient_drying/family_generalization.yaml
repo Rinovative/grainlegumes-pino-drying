@@ -11,36 +11,28 @@ material_roles:
   seen:
   - lentil
   - chickpea
-  - kidney_bean
   near_family_ood:
-  - field_pea
-  far_family_ood:
-  - rapeseed
-  extreme_family_ood:
-  - sunflower_seed
+  - kidney_bean
+  far_family_ood: []
+  extreme_family_ood: []
 sampling:
   method: lhs
   seed_base: 9200
   counts:
     natural:
-      lentil: 160
-      chickpea: 160
-      kidney_bean: 160
-      field_pea: 40
-      rapeseed: 40
-      sunflower_seed: 40
+      lentil: 50
+      chickpea: 50
+      kidney_bean: 20
     parameter_ood:
       lentil: 0
       chickpea: 0
-      kidney_bean: 0
 membership:
   seed: 9250
   per_seen_material:
-    train: 128
-    validation: 16
-    id_test: 16
+    train: 40
+    validation: 5
+    id_test: 5
 dataset_packages:
-# Transient-Drying-Pakete
 - dataset_view: transient_drying
   evaluation_regime: id
   source_role: seen
@@ -53,28 +45,9 @@ dataset_packages:
   training_payload:
     backend: pt_shards
     required: true
-- dataset_view: transient_drying
-  evaluation_regime: far_family_ood
-  source_role: far_family_ood
-  training_payload:
-    backend: pt_shards
-    required: true
-- dataset_view: transient_drying
-  evaluation_regime: extreme_family_ood
-  source_role: extreme_family_ood
-  training_payload:
-    backend: pt_shards
-    required: true
-# Steady-Flow-View aus denselben transienten HDF5-Fällen
 - dataset_view: steady_flow
   evaluation_regime: id
   source_role: seen
 - dataset_view: steady_flow
   evaluation_regime: near_family_ood
   source_role: near_family_ood
-- dataset_view: steady_flow
-  evaluation_regime: far_family_ood
-  source_role: far_family_ood
-- dataset_view: steady_flow
-  evaluation_regime: extreme_family_ood
-  source_role: extreme_family_ood

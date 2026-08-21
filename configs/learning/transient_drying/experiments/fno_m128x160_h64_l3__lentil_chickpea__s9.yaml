@@ -5,12 +5,12 @@ run:
   device: cuda
   suffix: null
 data:
-  train_dataset: transient_drying__material_pilot__id
+  train_dataset: transient_drying__lentil+chickpea__id
   ood_datasets:
-  - transient_drying__family_generalization__ood
+  - transient_drying__kidney_bean__near_family_ood
   batch_size: 2
   transient_backend_preference: pt_shards
-  transient_backend_required: false
+  transient_backend_required: true
   hdf5_cache_size: 0
   allow_technical_smoke: false
 input_profile: canonical_physics_complete_v1
@@ -48,33 +48,25 @@ scheduler:
   min_lr: 1.0e-06
 training:
   mixed_precision: false
+  stage_schedule:
+    mode: joint_ab
+    budget_unit: epochs
+    total_epochs: 200
+    stage_a_fraction: 0.5
   stage_a:
-    epochs: 100
     evaluation_interval: 1
     ood_evaluation_interval: 1
     gradient_accumulation_steps: 1
     sampling:
-      mode: rollout_window
-      rollout_length: 32
-      window_stride: 32
-      window_offset: 0
-    fixed_evaluation_horizon: 32
+      mode: one_step_transition
+    fixed_evaluation_horizon: 1
     curriculum:
       lengths:
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
+      - 1
       milestone_fractions:
       - 0.0
-      - 0.2
-      - 0.4
-      - 0.6
-      - 0.8
       seed: 9
   stage_b:
-    epochs: 100
     evaluation_interval: 1
     ood_evaluation_interval: 1
     gradient_accumulation_steps: 1
@@ -99,7 +91,7 @@ training:
       - 0.8
       seed: 9
     matched_compute:
-      planned_seconds: 3600.0
+      planned_seconds: null
       planned_steps: null
       rollout_reference_seconds: null
       rollout_reference_steps: null
@@ -112,17 +104,16 @@ tracking:
       interval: 1
       max_cases: 1
 model:
-  kind: rno
+  kind: fno
   params:
     n_modes:
-    - 24
-    - 24
-    hidden_channels: 16
+    - 128
+    - 160
+    hidden_channels: 64
     n_layers: 3
-    rno_skip: false
     lifting_channel_ratio: 2
     projection_channel_ratio: 2
-    channel_mlp_skip: soft-gating
     fno_skip: linear
-    return_sequences: false
+    channel_mlp_skip: soft-gating
+    implementation: factorized
     positional_embedding: null

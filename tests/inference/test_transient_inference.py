@@ -122,7 +122,7 @@ def _request(length: int = 3) -> _Request:
     }
 
 
-def test_completed_loader_uses_admitted_v2_scaling_and_best_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """Load only admitted transient bundle state and validate its spatial model contract first."""
     scaling = _scaling()
     model = _IncrementModel()
@@ -135,7 +135,7 @@ def test_completed_loader_uses_admitted_v2_scaling_and_best_checkpoint(monkeypat
     completed = {
         "config": config,
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": 2, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
     }
     observed: list[tuple[dict[str, Any], tuple[int, int]]] = []
     monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _run_dir: completed)

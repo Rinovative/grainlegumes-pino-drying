@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, SLF001
 """Protect Optuna persistence, resume, pruning, and terminal-state behavior."""
 
 from __future__ import annotations
@@ -95,7 +95,10 @@ def test_signature_excludes_runtime_location_but_covers_science(
 ) -> None:
     """Separate study continuation identity from invocation-only settings."""
     loaded = _load(tmp_path)
-    baseline = optuna_runtime.build_study_signature(loaded)["digest"]
+    signature = optuna_runtime.build_study_signature(loaded)
+    assert signature["schema_version"] == 1
+    assert signature["payload"]["schema_version"] == 1
+    baseline = signature["digest"]
 
     operational_base = copy.deepcopy(loaded.base_config)
     operational_base["run"]["device"] = "cuda"
@@ -540,7 +543,7 @@ def test_transient_trial_preserves_recoverable_precedence_over_oom_text(
         "training": {"stage": "a", "mixed_precision": False, "evaluation_interval": 1, "epochs": 1},
         "run": {"device": "cpu"},
     }
-    study: Any = SimpleNamespace(base_config=config, study={"pruner": {}}, search_space=())
+    study: Any = SimpleNamespace(base_config=config, study={"mode": "stage_a_only", "pruner": {}}, search_space=())
     trial = _Trial()
     objective = {"id": "normalized_drying_group_macro_rmse", "direction": "minimize"}
 
@@ -555,8 +558,129 @@ def test_transient_trial_preserves_recoverable_precedence_over_oom_text(
     monkeypatch.setattr(optuna_runtime.experiments.run, "execute_prepared_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
 
     with pytest.raises(expected_exception) as caught:
-        optuna_runtime._run_transient_trial(study, trial)  # noqa: SLF001
+        optuna_runtime._run_transient_trial(study, trial)
 
     if expected_exception is optuna_runtime.RecoverableTrialError:
         assert caught.value is error
     assert trial.attrs["terminal_status"] == expected_status
+
+
+def _joint_study(tmp_path: Path) -> optuna_runtime.OptunaStudyConfig:
+    """Load the maintained joint recipe with one test-owned runtime root."""
+    loaded = optuna_runtime.load_optuna_study_config("configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml")
+    return optuna_runtime.with_runtime_overrides(
+        loaded,
+        device="cuda",
+        output_root=tmp_path,
+    )
+
+
+def test_joint_transient_trial_runs_one_handoff_with_monotonic_global_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run both allocated stages and select only the final Stage-B objective."""
+    study = _joint_study(tmp_path)
+    trial = _Trial()
+    stage_a, context = optuna_runtime._prepare_trial_config(study, trial)
+    stage_b = context["joint_stage_b_config"]
+    objective = experiments.config.loader.get_resolved_objective(stage_a)
+    executions: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(optuna_runtime.learning.device, "resolve_device", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(optuna_runtime.learning.device, "validate_mixed_precision_device", lambda *_args: None)
+    monkeypatch.setattr(
+        optuna_runtime.experiments.run,
+        "prepare_fresh_run",
+        lambda _config, *, run_dir, **_kwargs: run_dir,
+    )
+
+    def execute(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        callback = kwargs["epoch_end_callback"]
+        stage = config["training"]["stage"]
+        executions.append(copy.deepcopy(config))
+        for epoch in range(1, int(config["training"]["epochs"]) + 1):
+            callback(
+                epoch,
+                {
+                    f"id/{objective['id']}": 1.0 / (len(trial.reports) + 1),
+                    f"id/guardrail/one_step/{objective['id']}": 0.5,
+                    "global_step": float(epoch),
+                },
+            )
+        return {
+            "objective": objective,
+            "best_metric": 0.25 if stage == "b" else 0.5,
+            "completed_epoch": config["training"]["epochs"],
+        }
+
+    monkeypatch.setattr(optuna_runtime.experiments.run, "execute_prepared_run", execute)
+
+    value = optuna_runtime._run_joint_transient_trial(
+        study,
+        trial,
+        stage_a=stage_a,
+        stage_b=stage_b,
+        context=context,
+    )
+
+    allocation = context["stage_allocation"]
+    assert value == pytest.approx(0.25)
+    assert [step for _value, step in trial.reports] == list(range(1, allocation["total_epochs"] + 1))
+    assert [config["training"]["stage"] for config in executions] == ["a", "b"]
+    assert executions[1]["training"]["teacher_handoff"] == {"source_run_name": executions[0]["run"]["name"]}
+    assert all(config["paths"]["output_root"].startswith(str(tmp_path)) for config in executions)
+    assert trial.attrs["stage_allocation"] == allocation
+    assert trial.attrs["completed_stage_a"] is True
+    assert trial.attrs["current_stage"] == "b"
+    assert trial.attrs["consumed_global_epoch_budget"] == allocation["total_epochs"]
+    assert trial.attrs["terminal_status"] == "completed"
+
+
+def test_pruned_joint_trial_retains_sampled_allocation_and_consumed_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persist allocation and actual global consumption before Stage-A pruning."""
+    study = _joint_study(tmp_path)
+    trial = _Trial(prune=True)
+    stage_a, context = optuna_runtime._prepare_trial_config(study, trial)
+    stage_b = context["joint_stage_b_config"]
+    objective = experiments.config.loader.get_resolved_objective(stage_a)
+
+    monkeypatch.setattr(optuna_runtime.learning.device, "resolve_device", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(optuna_runtime.learning.device, "validate_mixed_precision_device", lambda *_args: None)
+    monkeypatch.setattr(
+        optuna_runtime.experiments.run,
+        "prepare_fresh_run",
+        lambda _config, *, run_dir, **_kwargs: run_dir,
+    )
+
+    def execute(_config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        kwargs["epoch_end_callback"](
+            1,
+            {
+                f"id/{objective['id']}": 0.5,
+                f"id/guardrail/one_step/{objective['id']}": 0.5,
+                "global_step": 1.0,
+            },
+        )
+        pytest.fail("Pruning must stop the active stage immediately.")
+
+    monkeypatch.setattr(optuna_runtime.experiments.run, "execute_prepared_run", execute)
+
+    with pytest.raises(optuna.TrialPruned):
+        optuna_runtime._run_joint_transient_trial(
+            study,
+            trial,
+            stage_a=stage_a,
+            stage_b=stage_b,
+            context=context,
+        )
+
+    assert trial.attrs["stage_allocation"] == context["stage_allocation"]
+    assert trial.attrs["current_stage"] == "a"
+    assert trial.attrs["completed_stage_a"] is False
+    assert trial.attrs["consumed_global_epoch_budget"] == 1
+    assert set(trial.attrs["stage_runs"]) == {"a", "b"}
+    assert trial.attrs["terminal_status"] == "pruned"

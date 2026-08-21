@@ -17,19 +17,21 @@ artifact builder.
 
 Normal experiments use one architecture-first YAML per model:
 
-- `configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__material_pilot__s9.yaml`
-- `configs/learning/transient_drying/experiments/uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__material_pilot__s9.yaml`
-- `configs/learning/transient_drying/experiments/rno_m24x24_h16_l3__material_pilot__s9.yaml`
+- `configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml`
+- `configs/learning/transient_drying/experiments/uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__lentil_chickpea__s9.yaml`
+- `configs/learning/transient_drying/experiments/rno_m24x24_h16_l3__lentil_chickpea__s9.yaml`
 
 The filename makes the architecture recognizable during scheduling and review.
 The resolved YAML remains authoritative; filenames do not replace persisted
 configuration, Dataset identity, seeds, or checkpoint hashes.
 
 Each file is an authored two-stage plan. Shared sections define the task, data,
-model, loss, optimizer, scaling, and tracking policy. `training.stage_a` and
-`training.stage_b` define only the stage-owned duration, sampling, curriculum,
-and matched-compute decisions. There are no separate Stage A and Stage B normal
-config directories.
+model, loss, optimizer, scaling, and tracking policy. One
+`training.stage_schedule` owns the fixed total epoch budget and the explicit
+`stage_a_fraction`; the loader deterministically gives Stage B the exact integer
+remainder. `training.stage_a` and `training.stage_b` own only stage-specific
+sampling, evaluation, accumulation, and curriculum settings. There are no
+separate Stage A and Stage B normal config directories.
 
 ```text
 authored architecture plan
@@ -51,7 +53,9 @@ Official RNO Stage A uses contiguous teacher-forced reference sequences, carries
 hidden state inside each sequence, and resets it at independent boundaries.
 Stage B is autonomous and self-fed for all three architectures. Its configured
 curriculum advances continuously through eligible rollout horizons, normally
-`2 -> 4 -> 8 -> 16 -> 32`, without restarting Stage A.
+`2 -> 4 -> 8 -> 16 -> 32`, without restarting Stage A. Maintained joint plans
+are epoch-budgeted: neither stage carries a competing matched-compute stop, and
+each must complete its exact derived epoch allocation.
 
 ## Preflight and training
 
@@ -59,14 +63,14 @@ Run preflight before allocating any experiment directory:
 
 ```bash
 python -m src.experiments.cli.cli_config_preflight train \
-  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__material_pilot__s9.yaml
+  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml
 ```
 
 Start the complete A0-to-B workflow with the same file:
 
 ```bash
 python -m src.experiments.cli.cli_train \
-  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__material_pilot__s9.yaml
+  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml
 ```
 
 The CLI prints both derived run directories. If the exact Stage A leaf already
@@ -119,10 +123,11 @@ digests, Dataset identity, Train membership, tensorizer selection, spatial
 shape, channel names, horizon, and fitted statistics. The same admitted artifact
 is used by both stages, resume, and inference.
 
-Production plans prefer PT shards but can use the admitted canonical HDF5
-backend when shards are unavailable. Backend provenance and split membership are
-persisted. Once valid PT shards and their publication evidence exist, Training
-does not depend on the deleted CPU Generation source.
+Production plans require PT shards bound to the exact immutable family package;
+missing or incompatible shard publication fails preflight. The technical smoke
+config alone explicitly permits canonical HDF5 and the material-pilot package.
+Backend provenance and split membership are persisted, so admitted production
+Training does not depend on the deleted CPU Generation workspace.
 
 ## Losses, metrics, and model implementations
 
@@ -174,35 +179,57 @@ it.
 
 ## Optuna and W&B
 
-Optuna studies remain stage-specific because Stage A teacher forcing and Stage B
-autonomous rollout have different objectives, failure modes, and handoff
-requirements. Maintained templates are:
+Exactly two transient scientific study recipes are maintained:
 
 ```text
 configs/learning/transient_drying/optuna/
-├── fno_stage_a.yaml
-├── fno_stage_b.yaml
-├── rno_stage_a.yaml
-├── rno_stage_b.yaml
-├── uno_stage_a.yaml
-└── uno_stage_b.yaml
+├── transient_drying_lentil_chickpea_stage_a_only.yaml
+└── transient_drying_lentil_chickpea_joint_ab.yaml
 ```
 
-Run a study with:
+The Stage-A-only study trains the teacher-forced Stage A for the full configured
+200-epoch budget and has no allocation parameter. The joint study runs one
+model through Stage A, the immutable selected-checkpoint handoff, and autonomous
+Stage B. It samples exactly one configuration-owned
+`training.stage_schedule.stage_a_fraction` from 0.25 through 0.75 in 0.05
+increments. Half-up rounding assigns Stage A at least one epoch, and Stage B
+receives the exact remainder, so every completed joint trial consumes exactly
+200 epochs. The maintained fixed FNO, U-NO, and RNO plans use the same schedule
+resolver with a fixed fraction of 0.5.
+
+Run either study with preflight first:
 
 ```bash
-python -m src.experiments.cli.cli_config_preflight optuna OPTUNA_CONFIG.yaml
-python -m src.experiments.cli.cli_optuna OPTUNA_CONFIG.yaml
+python -m src.experiments.cli.cli_config_preflight optuna \
+  configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml
+python -m src.experiments.cli.cli_optuna \
+  configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml
+
+python -m src.experiments.cli.cli_config_preflight optuna \
+  configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml
+python -m src.experiments.cli.cli_optuna \
+  configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml
 ```
 
-Before a Stage B study, replace its explicit `teacher_handoff.source_run_name`
-with the admitted completed Stage A source. Studies persist locally and classify
-non-finite scientific failures, OOM pruning, and infrastructure failures
-separately.
+Both studies consume only the 80-case Train and 10-case Validation memberships
+of `transient_drying__lentil+chickpea__id`. The 10-case ID-test membership and
+the 20 kidney-bean held-out OOD package never participate in fitting, pruning,
+checkpoint selection, tie-breaking, or the objective. The study signature binds
+the validated package manifest, compact index, exact split membership, study
+mode, total and unit, allocation search space, model/training semantics,
+objective, and seeds before a database is created or reopened.
+
+Optuna reports actual completed epochs on one monotonic axis across both stages.
+A pruned joint trial retains its sampled fraction, derived A/B epoch counts,
+current stage, run leaves, and consumed global epoch count. Stage B uses the
+normal immutable handoff and returns the final joint objective. Reopening a
+study preserves completed history but follows the existing explicit
+`new_trials_only` policy: interrupted trials are restarted as fresh numbered
+trials, including Stage A, rather than partially resumed or resampled in place.
 
 Transient tracking uses W&B project `grainlegumes-pino-drying-transient` and
 supports `online`, `offline`, and `disabled` modes. Stage, curriculum, rollout,
-central metrics, matched-compute state, throughput, and memory are mapped into
+central metrics, budget evidence, throughput, and memory are mapped into
 telemetry. Local configs, summaries, histories, checkpoints, handoffs, and study
 storage remain authoritative; W&B is an observer, not the persistence owner.
 

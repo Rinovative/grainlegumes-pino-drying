@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
@@ -47,7 +48,7 @@ from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Sequence
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _CASE_ID_PATTERN: Final = re.compile(r"case_([0-9]{4,})")
@@ -333,6 +334,7 @@ def _new_campaign_manifest(
     run_directory: Path,
     scheduler_log_directory: Path,
     storage_root: Path | str | None,
+    input_sources: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Return durable feeder state before the first one-case submission."""
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
@@ -364,6 +366,9 @@ def _new_campaign_manifest(
                 "batch_id": batch.batch_id,
                 "batch_identity": batch.batch_identity,
                 "case_count": len(batch.case_indices),
+                "input_generation_id": str(input_sources[batch.batch_name]["input_generation_id"]),
+                "input_source_git_commit": str(input_sources[batch.batch_name]["source_git_commit"]),
+                "input_case_indices": list(input_sources[batch.batch_name]["case_indices"]),
                 "meta_directory": str(batch_runtime.batch_meta_directory(batch, storage_root=storage)),
                 "raw_directory": str(
                     common.paths.resolve_generated_batch_dir(
@@ -1043,14 +1048,14 @@ def _postprocessing_replay_view(
 def _license_retry_is_active(
     state: str,
     latest_submission: Mapping[str, Any] | None,
-    runtime_progress: Mapping[str, Any],
+    in_allocation_license_window: Mapping[str, Any] | None,
 ) -> bool:
     """Return whether the current pre-solver job is a license retry."""
     return bool(
         latest_submission is not None
         and latest_submission.get("mode") == "license_retry"
         and state in {"pending", "active", "scheduler_unknown"}
-        and not _runtime_proves_license_acquired({"runtime_progress": runtime_progress})
+        and not _in_allocation_window_proves_solver_started(in_allocation_license_window)
     )
 
 
@@ -1905,10 +1910,20 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
         latest_job_id=scheduler_view["latest_job_id"],
         storage_root=storage_root,
     )
+    active_submission = active_records[-1] if active_records else None
+    if active_submission is not None:
+        active_job_id = str(active_submission["job_id"])
+        allocation_window = license_service.load_in_allocation_license_window(
+            batch,
+            task.case_index,
+            campaign_run_id=str(manifest["campaign_run_id"]),
+            job_id=active_job_id,
+            storage_root=storage_root,
+        )
     license_retry_active = _license_retry_is_active(
         state,
-        latest_submission,
-        runtime_progress,
+        active_submission if state == "active" else latest_submission,
+        allocation_window,
     )
     completion_timestamp = _successful_completion_at(
         state,
@@ -2168,17 +2183,79 @@ def _campaign_input_references(
     *,
     git_commit: str,
     storage_root: Path | str | None,
+    input_sources: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[int, admission_service.InputCaseReference]]:
     """Admit each immutable input batch once for one campaign operation."""
-    return {
-        batch.batch_name: input_service.admit_configured_input_references(
+    expected_batches = {batch.batch_name for batch in campaign.batches}
+    if set(input_sources) != expected_batches:
+        message = "Campaign input-source batch membership disagrees with the active campaign."
+        raise RuntimeError(message)
+    references: dict[str, dict[int, admission_service.InputCaseReference]] = {}
+    for batch in campaign.batches:
+        selected_source = input_sources[batch.batch_name]
+        case_indices = selected_source.get("case_indices")
+        if not isinstance(case_indices, list) or tuple(case_indices) != batch.case_indices:
+            message = f"Campaign input-source case membership disagrees for batch {batch.batch_name!r}."
+            raise RuntimeError(message)
+        references[batch.batch_name] = input_service.admit_configured_input_references(
             batch,
             storage_root=storage_root,
             validation_depth="evidence",
             git_commit=git_commit,
+            input_generation_id=str(selected_source["input_generation_id"]),
+            input_source_git_commit=str(selected_source["source_git_commit"]),
         )
-        for batch in campaign.batches
-    }
+    return references
+
+
+def _persisted_input_sources(
+    manifest: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return the complete persisted input-source map."""
+    raw_batches = manifest.get("batches")
+    if not isinstance(raw_batches, list) or not raw_batches:
+        message = "Campaign input-source ownership requires a non-empty batch list."
+        raise RuntimeError(message)
+    source_fields = ("input_generation_id", "input_source_git_commit", "input_case_indices")
+    batches: list[Mapping[str, Any]] = []
+    for raw_batch in raw_batches:
+        if not isinstance(raw_batch, Mapping):
+            message = "Campaign input-source ownership contains a malformed batch record."
+            raise TypeError(message)
+        batches.append(raw_batch)
+    if any(any(batch.get(field) is None for field in source_fields) for batch in batches):
+        message = "Campaign input-source ownership is incomplete or corrupt."
+        raise RuntimeError(message)
+
+    selected: dict[str, dict[str, Any]] = {}
+    for batch in batches:
+        batch_name = common.paths.validate_logical_name(batch.get("batch_name"), label="campaign input-source batch_name")
+        input_generation_id = common.paths.validate_logical_name(
+            batch["input_generation_id"],
+            label="campaign input_generation_id",
+        )
+        if re.fullmatch(r"input-[0-9a-f]{24}", input_generation_id) is None:
+            message = "Campaign input_generation_id is malformed."
+            raise RuntimeError(message)
+        source_git_commit = source_service.validate_git_commit(batch["input_source_git_commit"])
+        case_indices = batch["input_case_indices"]
+        if (
+            not isinstance(case_indices, list)
+            or not case_indices
+            or any(type(case_index) is not int or case_index < 1 for case_index in case_indices)
+            or len(case_indices) != len(set(case_indices))
+        ):
+            message = "Campaign input-source case membership is malformed."
+            raise RuntimeError(message)
+        if batch_name in selected:
+            message = "Campaign input-source batch ownership is duplicated."
+            raise RuntimeError(message)
+        selected[batch_name] = {
+            "input_generation_id": input_generation_id,
+            "source_git_commit": source_git_commit,
+            "case_indices": list(case_indices),
+        }
+    return selected
 
 
 def _reconciled(
@@ -2210,6 +2287,7 @@ def _reconciled(
             campaign,
             git_commit=str(manifest["git_commit"]),
             storage_root=storage_root,
+            input_sources=_persisted_input_sources(manifest),
         )
         if input_references is None
         else input_references
@@ -2525,28 +2603,16 @@ def feed_campaign(
         )
 
 
-_LICENSE_ACQUIRED_RUNTIME_PHASES = frozenset(
-    {
-        "stationary_airflow",
-        "transient_drying",
-        "collecting_exports",
-        "canonicalizing",
-        "validating",
-        "publishing",
-    }
-)
-_LICENSE_RESOLVED_RUNTIME_PHASES = frozenset({"completed", "failed"})
-
-
-def _runtime_proves_license_acquired(view: Mapping[str, Any]) -> bool:
-    """Return whether existing progress proves license checkout and solver work."""
-    runtime = view.get("runtime_progress")
-    if not isinstance(runtime, dict) or runtime.get("availability") != "available":
-        return False
-    phase = runtime.get("phase")
-    if phase in {"stationary_airflow", "transient_drying"}:
-        return runtime.get("parser_state") == "available"
-    return phase in _LICENSE_ACQUIRED_RUNTIME_PHASES
+def _in_allocation_window_proves_solver_started(
+    in_allocation_license_window: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether one validated current-job receipt proves solver startup."""
+    return bool(
+        in_allocation_license_window is not None
+        and in_allocation_license_window.get("solver_progress_started") is True
+        and in_allocation_license_window.get("outcome") == "solver_progress_started"
+        and in_allocation_license_window.get("reason") == "solver_progress_started"
+    )
 
 
 def _task_identity_key(view: Mapping[str, Any]) -> tuple[str, int]:
@@ -2558,7 +2624,7 @@ def _view_consumes_admission(view: Mapping[str, Any]) -> bool:
     """Return whether one logical case currently occupies admission."""
     state = view.get("state")
     if state == "active":
-        return not _runtime_proves_license_acquired(view)
+        return not _in_allocation_window_proves_solver_started(view.get("in_allocation_license_window"))
     return state in {
         "admission_waiting",
         "pending",
@@ -2669,9 +2735,6 @@ def _admission_summary(
         message = "Campaign admission components do not match logical membership."
         raise RuntimeError(message)
     maximum = int(manifest["submission_config"]["max_admission_cases"])
-    if admission_count > maximum:
-        message = f"Campaign logical admission exceeds max_admission_cases: {admission_count} > {maximum}."
-        raise RuntimeError(message)
     return {
         "count": admission_count,
         "maximum": maximum,
@@ -2723,7 +2786,11 @@ def _normal_admission_status(
     max_running = submission_config["max_running_cases"]
     if max_running is not None and running_jobs >= int(max_running):
         return True, "max_running_cases_reached"
-    if fresh_available and len(_logical_admission_case_keys(manifest, task_views)) >= int(submission_config["max_admission_cases"]):
+    admission_count = len(_logical_admission_case_keys(manifest, task_views))
+    maximum_admission_cases = int(submission_config["max_admission_cases"])
+    if admission_count > maximum_admission_cases:
+        return True, "max_admission_cases_exceeded"
+    if fresh_available and admission_count >= maximum_admission_cases:
         return True, "max_admission_cases_reached"
     if (
         fresh_available
@@ -2946,6 +3013,9 @@ def _fill_submission_capacity(
         maximum_failed_cases=maximum_failed_cases,
     )
     has_license_blocked = any(view["state"] == "license_blocked" for view in task_views)
+    if len(admission_keys) > max_admission_cases:
+        next_state = "active" if pending_jobs or running_jobs else "license_blocked" if has_license_blocked else "active"
+        return _set_campaign_state(manifest, next_state, storage_root=storage_root)
 
     while True:
         if max_running is not None and running_jobs >= int(max_running):
@@ -3029,25 +3099,49 @@ def submit_campaign(
     if current_commit != requested_commit:
         message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
-    if not inputs_prepared:
-        input_service.prepare_campaign_inputs(
+    run_id = campaign_run_id(campaign, git_commit=requested_commit)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root)
+    path = run_directory / "campaign_run.json"
+    existing = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root) if path.exists() else None
+    prepared_input_references: dict[str, dict[int, admission_service.InputCaseReference]] | None = None
+    if existing is not None:
+        input_sources: Mapping[str, Mapping[str, Any]] = _persisted_input_sources(existing)
+    else:
+        if inputs_prepared:
+            prepared_inputs, prepared_input_references = input_service.admit_campaign_inputs_with_references(
+                campaign,
+                git_commit=requested_commit,
+                storage_root=storage_root,
+            )
+        else:
+            prepared_inputs = input_service.prepare_campaign_inputs(
+                campaign,
+                git_commit=requested_commit,
+                storage_root=storage_root,
+                progress=progress,
+                existing_validation_depth="evidence",
+            )
+        input_sources = {
+            batch.batch_name: {
+                **item,
+                "source_git_commit": str(item.get("source_git_commit", requested_commit)),
+                "case_indices": list(item.get("case_indices", batch.case_indices)),
+            }
+            for batch, item in zip(campaign.batches, prepared_inputs["batches"], strict=True)
+        }
+    input_references = (
+        prepared_input_references
+        if prepared_input_references is not None
+        else _campaign_input_references(
             campaign,
             git_commit=requested_commit,
             storage_root=storage_root,
-            progress=progress,
-            existing_validation_depth="evidence",
+            input_sources=input_sources,
         )
-    input_references = _campaign_input_references(
-        campaign,
-        git_commit=requested_commit,
-        storage_root=storage_root,
     )
-    run_id = campaign_run_id(campaign, git_commit=requested_commit)
-    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root)
     run_directory.mkdir(parents=True, exist_ok=True)
     scheduler_log_directory = run_directory / "scheduler"
     scheduler_log_directory.mkdir(exist_ok=True)
-    path = run_directory / "campaign_run.json"
     lock_path = run_directory / "submission.lock"
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         intent = _new_campaign_manifest(
@@ -3057,6 +3151,7 @@ def submit_campaign(
             run_directory=run_directory,
             scheduler_log_directory=scheduler_log_directory,
             storage_root=storage_root,
+            input_sources=input_sources,
         )
         if path.exists():
             existing = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
@@ -3199,10 +3294,12 @@ def resume_campaign(
         submission_index = _submission_index(manifest)
         scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
         _require_scheduler_evidence(scheduler)
+        persisted_sources = _persisted_input_sources(manifest)
         input_references = _campaign_input_references(
             campaign,
             git_commit=str(manifest["git_commit"]),
             storage_root=storage_root,
+            input_sources=persisted_sources,
         )
         task_views, pending_jobs, running_jobs = _reconciled(
             manifest,

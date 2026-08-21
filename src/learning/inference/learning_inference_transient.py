@@ -207,10 +207,10 @@ def load_transient_inference_context(
     best_checkpoint = completed.get("best_checkpoint")
     if (
         not isinstance(best_checkpoint, Mapping)
-        or best_checkpoint.get("schema_version") != 2
+        or best_checkpoint.get("schema_version") != learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
         or not isinstance(best_checkpoint.get("model_state_dict"), Mapping)
     ):
-        raise TypeError("Completed transient run must provide an admitted best v2 model state dict.")
+        raise TypeError("Completed transient run must provide an admitted best model state dict.")
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = _place_model_float32(model, device=resolved_device)
     model.eval()

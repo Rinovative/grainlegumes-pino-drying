@@ -37,7 +37,7 @@ from src.learning.transient import learning_transient_scaling as scaling
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 
 _SPLIT_SCHEMA_KIND: Final = "transient_drying_training_split"
-_SPLIT_SCHEMA_VERSION: Final = 2
+_SPLIT_SCHEMA_VERSION: Final = 1
 _SHA256_LENGTH: Final = 64
 
 

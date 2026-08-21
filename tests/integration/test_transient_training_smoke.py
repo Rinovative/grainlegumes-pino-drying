@@ -27,6 +27,10 @@ from tests.generation.test_generation_transient import _small_scientific_contrac
 from tests.generation.test_generation_transient_shards import _assert_item_equal
 
 pytestmark = pytest.mark.integration
+_CUDA_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA integration smoke requires an available CUDA device.",
+)
 
 
 def _publication_identity() -> dict[str, str]:
@@ -287,7 +291,7 @@ def _authored_fno_plan(
     destination: Path,
 ) -> Path:
     """Write one compact test-owned authored FNO A0-to-B plan."""
-    raw = experiments.config.loader.load_yaml("configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__material_pilot__s9.yaml")
+    raw = experiments.config.loader.load_yaml("configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml")
     raw["run"].update({"device": "cuda", "deterministic": False, "suffix": "technical"})
     raw["data"].update(
         {
@@ -302,21 +306,20 @@ def _authored_fno_plan(
     raw["scheduler"] = None
     raw["tracking"]["wandb"]["mode"] = "disabled"
     raw["training"]["mixed_precision"] = False
+    raw["training"]["stage_schedule"] = {"mode": "joint_ab", "budget_unit": "epochs", "total_epochs": 2, "stage_a_fraction": 0.5}
     raw["training"]["stage_a"].update(
         {
-            "epochs": 1,
             "fixed_evaluation_horizon": 1,
             "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": 9},
         }
     )
     raw["training"]["stage_b"].update(
         {
-            "epochs": 1,
             "sampling": {"mode": "rollout_window", "rollout_length": 2, "window_stride": 1, "window_offset": 0},
             "fixed_evaluation_horizon": 2,
             "curriculum": {"lengths": [2], "milestone_fractions": [0.0], "seed": 9},
             "matched_compute": {
-                "planned_seconds": 1.0e-9,
+                "planned_seconds": None,
                 "planned_steps": None,
                 "rollout_reference_seconds": None,
                 "rollout_reference_steps": None,
@@ -333,6 +336,7 @@ def _resolved_fno_config(root: Path, *, train_dataset: str, ood_dataset: str) ->
     return copy.deepcopy(dict(transient_plan.load_and_resolve_transient_training_plan(plan_path).stage_a))
 
 
+@_CUDA_REQUIRED
 def test_transient_a0_and_b_lifecycle_smoke(transient_smoke_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the public CUDA FNO authored A0-to-B lifecycle with fresh B state."""
     root = transient_smoke_package["root"]
@@ -355,7 +359,7 @@ def test_transient_a0_and_b_lifecycle_smoke(transient_smoke_package: dict[str, A
     assert outcome["run_dir"] == b_dir
     assert "stage_a0" in a0_dir.name
     assert "stage_b" in b_dir.name
-    assert a0["best_checkpoint"]["schema_version"] == 2
+    assert a0["best_checkpoint"]["schema_version"] == 1
     assert (a0_dir / "history.json").is_file()
     manifest = handoff.validate_stage_a_handoff(
         a0_dir / "stage_a_handoff",
@@ -365,6 +369,9 @@ def test_transient_a0_and_b_lifecycle_smoke(transient_smoke_package: dict[str, A
     )
     assert manifest["model_kind"] == "fno"
     assert b_summary["status"] == "completed"
+    assert b_summary["terminal_controller"]["budget_control"] == "stage_epochs"
+    assert b_summary["terminal_controller"]["planned_stage_epochs"] == 1
+    assert b_summary["terminal_controller"]["completed_stage_epochs"] == 1
     assert b_summary["terminal_controller"]["budget_complete"] is True
     assert b_summary["terminal_controller"]["post_handoff_optimizer_steps"] == 1
     assert b_summary["terminal_controller"]["best_within_budget_metric"] == b_summary["best_metric"]
@@ -387,8 +394,8 @@ def _resolved_direct_model_config(
 ) -> dict[str, Any]:
     """Derive and shrink a maintained architecture-specific A0 child for one update."""
     names = {
-        "uno": "uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__material_pilot__s9.yaml",
-        "rno": "rno_m24x24_h16_l3__material_pilot__s9.yaml",
+        "uno": "uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__lentil_chickpea__s9.yaml",
+        "rno": "rno_m24x24_h16_l3__lentil_chickpea__s9.yaml",
     }
     plan = transient_plan.load_and_resolve_transient_training_plan(Path("configs/learning/transient_drying/experiments") / names[model_kind])
     resolved = copy.deepcopy(dict(plan.stage_a))
@@ -480,6 +487,7 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
             _close_loader_dataset(value)
 
 
+@_CUDA_REQUIRED
 def test_transient_uno_and_rno_cuda_optimizer_smoke(transient_smoke_package: dict[str, Any]) -> None:
     """Update real UNO and official single-step recurrent RNO parameters on CUDA."""
     root = transient_smoke_package["root"]
@@ -492,6 +500,7 @@ def test_transient_uno_and_rno_cuda_optimizer_smoke(transient_smoke_package: dic
     _run_direct_cuda_update(rno, root=root)
 
 
+@_CUDA_REQUIRED
 def test_transient_completed_inference_and_tracking_smoke(transient_smoke_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     """Load completed A0 inference and observe transient W&B mapping without network access."""
     root = transient_smoke_package["root"]

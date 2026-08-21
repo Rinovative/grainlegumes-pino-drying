@@ -1,5 +1,5 @@
 # ruff: noqa: NPY002, S101, PLR2004
-"""Protect transient completed-history admission and v2 adapter rollback."""
+"""Protect transient completed-history admission and adapter rollback."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class _Adapter:
 
 
 def _identity(label: str = "transient-persistence") -> dict[str, Any]:
-    """Build the complete checkpoint identity required by strict v2 tests."""
+    """Build the complete checkpoint identity required by strict tests."""
 
     def digest(name: str) -> str:
         return hashlib.sha256(f"{label}:{name}".encode()).hexdigest()
@@ -158,7 +158,7 @@ def test_reconcile_history_repairs_only_one_ahead_crash_record(tmp_path: Any) ->
 
 
 def _components(seed: int) -> tuple[nn.Module, AdamW, _StatefulLoss, DataLoader[Any]]:
-    """Build compact stateful CPU components for exact v2 restore."""
+    """Build compact stateful CPU components for exact restore."""
     torch.manual_seed(seed)
     model = nn.Linear(2, 1)
     optimizer = AdamW(model.parameters(), lr=0.01)

@@ -162,7 +162,7 @@ def test_standalone_split_admission_recomputes_membership_digests() -> None:
     }
     split = {
         "schema_kind": "transient_drying_training_split",
-        "schema_version": 2,
+        "schema_version": 1,
         "task": task.id,
         "task_contract_digest": task.contract_digest,
         "data_contract_digest": task.data_contract_digest,

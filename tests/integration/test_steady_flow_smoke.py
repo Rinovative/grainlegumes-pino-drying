@@ -1153,7 +1153,7 @@ def _mutate_checkpoint_schema(run_dir: Path, dataset_root: Path) -> None:
     del dataset_root
     path = common.paths.resolve_best_checkpoint_file(run_dir)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["schema_version"] = 2
+    payload["schema_version"] = 0
     common.serialization.atomic_torch_save(payload, path)
     _refresh_summary_digest(
         run_dir,

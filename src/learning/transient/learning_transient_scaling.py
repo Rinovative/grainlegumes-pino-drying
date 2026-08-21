@@ -37,7 +37,7 @@ from src import datasets, domain
 from .learning_transient_contracts import TransientTensorizerSpec
 
 SCALING_SCHEMA_KIND: Final = "transient_drying_scaling"
-SCALING_SCHEMA_VERSION: Final = 3
+SCALING_SCHEMA_VERSION: Final = 1
 SCALE_FLOOR: Final = 1.0e-7
 _SHA256_LENGTH: Final = 64
 _STATE_CHANNELS: Final = 4

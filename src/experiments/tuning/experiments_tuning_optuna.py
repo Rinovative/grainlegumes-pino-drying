@@ -42,6 +42,7 @@ from typing import Any, Protocol, cast
 import torch
 
 from src import common, datasets, domain, experiments, learning
+from src.experiments.config import experiments_config_transient_plan as transient_plan
 
 from . import experiments_tuning_search_space as search_space
 
@@ -150,6 +151,9 @@ class OptunaStudyConfig:
         Base experiment resolved through config defaults
     search_space : tuple[search_space.SearchSpaceParameter, ...]
         Parsed search-space parameters.
+    dataset_identities : dict[str, Any] | None
+        Validated physical Dataset-package evidence bound before description or
+        execution. Loading remains storage-independent and leaves this unset.
 
     Notes
     -----
@@ -164,6 +168,8 @@ class OptunaStudyConfig:
     base_experiment: dict[str, Any]
     base_config: dict[str, Any]
     search_space: tuple[search_space.SearchSpaceParameter, ...]
+    is_transient_plan: bool = False
+    dataset_identities: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -461,6 +467,7 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
     """
     allowed = {
         "name",
+        "mode",
         "role",
         "objective",
         "direction",
@@ -479,6 +486,9 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
         label="study.name",
     )
     _normalise_study_role(study.get("role"))
+    if study.get("mode") not in {"standard", "stage_a_only", "joint_ab"}:
+        msg = "study.mode must be 'standard', 'stage_a_only', or 'joint_ab'."
+        raise ValueError(msg)
     _require_nonempty_string(study.get("objective"), label="study.objective")
     direction = _require_nonempty_string(study.get("direction"), label="study.direction")
     if direction not in {"minimize", "maximize"}:
@@ -506,7 +516,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
     independently from the resolved experiment objective, and all names and
     scalar types are validated before an ``OptunaStudyConfig`` is constructed.
     """
-    allowed = {"name", "role", "seed", "n_trials", "sampler", "pruner", "storage"}
+    allowed = {"name", "mode", "role", "seed", "n_trials", "sampler", "pruner", "storage"}
     unknown = sorted(set(raw_study).difference(allowed))
     if unknown:
         msg = f"study contains unknown key(s): {unknown}. Allowed keys: {sorted(allowed)}."
@@ -515,6 +525,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
     study = dict(copy.deepcopy(raw_study))
     study.setdefault("name", source_path.stem)
     study.setdefault("role", None)
+    study.setdefault("mode", "standard")
     study.setdefault("seed", base_config.get("run", {}).get("seed", 9))
     study.setdefault("n_trials", 30)
     study.setdefault(
@@ -534,6 +545,9 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
         label="study.name",
     )
     study["role"] = _normalise_study_role(study["role"])
+    if study["mode"] not in {"standard", "stage_a_only", "joint_ab"}:
+        msg = "study.mode must be 'standard', 'stage_a_only', or 'joint_ab'."
+        raise ValueError(msg)
     study["seed"] = _require_exact_int(study["seed"], label="study.seed")
     study["n_trials"] = _require_exact_int(study["n_trials"], label="study.n_trials", minimum=1)
     study["sampler"] = _normalise_sampler_config(study["sampler"])
@@ -542,6 +556,35 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
         study["storage"] = _require_nonempty_string(study["storage"], label="study.storage")
     _validate_study_settings(study)
     return study
+
+
+def _validate_transient_study_mode(
+    base_config: Mapping[str, Any],
+    search_parameters: Sequence[search_space.SearchSpaceParameter],
+    *,
+    mode: Any,
+    is_transient_plan: bool,
+) -> None:
+    """Require one internally consistent transient study mode and allocation owner."""
+    if base_config.get("task") != "transient_drying":
+        return
+    allocation_paths = [parameter.path for parameter in search_parameters if parameter.path == "training.stage_schedule.stage_a_fraction"]
+    if mode == "joint_ab":
+        if not is_transient_plan or len(allocation_paths) != 1:
+            message = "joint_ab transient Optuna requires one authored plan and exactly one allocation search path."
+            raise ValueError(message)
+        return
+    if mode == "stage_a_only":
+        schedule = _as_mapping(
+            _as_mapping(base_config.get("training"), label="experiment.training").get("stage_schedule"),
+            label="experiment.training.stage_schedule",
+        )
+        if is_transient_plan or schedule.get("mode") != "stage_a_only" or allocation_paths:
+            message = "stage_a_only transient Optuna requires a direct Stage-A-only schedule without allocation search."
+            raise ValueError(message)
+        return
+    message = "Transient Optuna supports only stage_a_only or joint_ab study modes."
+    raise ValueError(message)
 
 
 def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
@@ -630,7 +673,12 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     tracking["wandb"] = wandb_settings
     effective_experiment["tracking"] = tracking
 
-    base_config = experiments.config.loader.resolve_config(effective_experiment)
+    is_transient_plan = transient_plan.is_transient_two_stage_config(effective_experiment)
+    if is_transient_plan:
+        plan = transient_plan.resolve_transient_training_plan(effective_experiment)
+        base_config = copy.deepcopy(dict(plan.stage_a))
+    else:
+        base_config = experiments.config.loader.resolve_config(effective_experiment)
     experiments.config.loader.validate_task_directory_identity(
         source_path,
         raw_task=base_experiment.get("task"),
@@ -642,6 +690,12 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     search_space.validate_search_space_paths(base_config, search_parameters)
     _validate_search_space_choices(base_config, search_parameters)
     _validate_transient_study_policy(base_config, search_parameters)
+    _validate_transient_study_mode(
+        base_config,
+        search_parameters,
+        mode=study["mode"],
+        is_transient_plan=is_transient_plan,
+    )
 
     return OptunaStudyConfig(
         path=source_path,
@@ -649,6 +703,7 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
         base_experiment=base_experiment,
         base_config=base_config,
         search_space=search_parameters,
+        is_transient_plan=is_transient_plan,
     )
 
 
@@ -680,6 +735,8 @@ def _validate_search_space_choices(
     Optuna storage or a trial run is created.
     """
     for parameter in parameters:
+        if parameter.path == "training.stage_schedule.stage_a_fraction":
+            continue
         if parameter.kind == "categorical":
             candidates = parameter.values
         elif parameter.kind in {"float", "int"}:
@@ -710,6 +767,16 @@ def _validate_study_contract(config: OptunaStudyConfig) -> tuple[OptunaStudyConf
     _validate_study_settings(normalized_study)
     config = replace(config, study=normalized_study)
     base_config = experiments.config.loader.validate_resolved_config(config.base_config)
+    resolved_is_transient_plan = transient_plan.is_transient_two_stage_config(config.base_experiment)
+    if resolved_is_transient_plan != config.is_transient_plan:
+        message = "Optuna transient-plan identity disagrees with its authored experiment."
+        raise ValueError(message)
+    _validate_transient_study_mode(
+        base_config,
+        config.search_space,
+        mode=config.study["mode"],
+        is_transient_plan=resolved_is_transient_plan,
+    )
     reporting_interval = _validate_reporting_contract(base_config)
     pruner = _normalise_pruner_config(config.study["pruner"])
     if pruner["kind"] == "median":
@@ -774,6 +841,23 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
     pruner = _normalise_pruner_config(validated.study["pruner"])
     sampler_seed = _sampler_seed(validated.study)
     reporting_interval = _validate_reporting_contract(validated.base_config)
+    joint_stage_b_identity: dict[str, Any] | None = None
+    if validated.is_transient_plan:
+        authored = copy.deepcopy(validated.base_experiment)
+        authored["tracking"]["wandb"].update({"workflow": "optuna_trial", "study": validated.study["name"]})
+        joint_stage_b_identity = _scientific_base_config(transient_plan.resolve_transient_training_plan(authored).stage_b)
+    data = _as_mapping(validated.base_config.get("data"), label="experiment.data")
+    if validated.dataset_identities is None:
+        dataset_roles: dict[str, Any] = {
+            "binding": "configured_dataset_ids",
+            "id": data.get("train_dataset"),
+            "ood": copy.deepcopy(data.get("ood_datasets")),
+        }
+    else:
+        dataset_roles = {
+            "binding": "validated_physical_packages",
+            "roles": copy.deepcopy(validated.dataset_identities),
+        }
     payload = {
         "schema_version": STUDY_SIGNATURE_SCHEMA_VERSION,
         "task": {
@@ -782,11 +866,14 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
             "contract_digest": validated.base_config["task_contract"]["digest"],
         },
         "scientific_base_config": _scientific_base_config(validated.base_config),
+        "joint_stage_b_scientific_config": joint_stage_b_identity,
+        "dataset_roles": dataset_roles,
         "search_space": sorted(
             search_space.search_space_summary(validated.search_space),
             key=lambda item: (str(item["path"]), str(item["name"])),
         ),
         "study_role": validated.study["role"],
+        "study_mode": validated.study["mode"],
         "objective": objective,
         "direction": objective["direction"],
         "sampler": {**sampler, "seed": sampler_seed},
@@ -846,6 +933,7 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
 
     """
     validated, objective = _validate_study_contract(config)
+    validated = _bind_configured_dataset_identities(validated)
     signature = build_study_signature(validated)
     study_paths = _resolve_study_paths(validated)
     return {
@@ -858,7 +946,7 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
         "trial_root": str(study_paths.trial_root),
         "task": validated.base_config["task"],
         "model_kind": validated.base_config["model"]["kind"],
-        "dataset_roles": _configured_dataset_identities(validated.base_config),
+        "dataset_roles": copy.deepcopy(validated.dataset_identities),
         "objective": objective,
         "search_space": search_space.search_space_summary(validated.search_space),
         "semantic_signature": signature,
@@ -889,7 +977,11 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     data = _as_mapping(config.get("data"), label="experiment.data")
     train_dataset = _require_nonempty_string(data.get("train_dataset"), label="data.train_dataset")
     raw_ood = data.get("ood_datasets")
-    if not isinstance(raw_ood, list) or not raw_ood:
+    is_optuna = (
+        _as_mapping(_as_mapping(config.get("tracking"), label="experiment.tracking").get("wandb"), label="experiment.tracking.wandb").get("workflow")
+        == "optuna_trial"
+    )
+    if not isinstance(raw_ood, list) or (not raw_ood and not is_optuna):
         msg = "data.ood_datasets must contain one or more configured dataset ids."
         raise ValueError(msg)
     ood_datasets = [_require_nonempty_string(dataset_id, label=f"data.ood_datasets[{index}]") for index, dataset_id in enumerate(raw_ood)]
@@ -915,12 +1007,17 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
             return {
                 "dataset_id": manifest["dataset_id"],
                 "dataset_view": manifest["dataset_view"],
+                "dataset_digest": manifest["dataset_digest"],
                 "manifest_schema": {"kind": manifest["schema_kind"], "version": manifest["schema_version"]},
                 "manifest_payload_sha256": manifest["payload_sha256"],
                 "index_digest": index["index_digest"],
                 "sample_count": index["sample_count"],
                 "source_case_count": index["source_case_count"],
                 "data_contract_digest": index["contract_digest"],
+                "split_membership": copy.deepcopy(manifest["split_membership"]),
+                "membership_counts": copy.deepcopy(manifest["membership_counts"]),
+                "material_counts": copy.deepcopy(manifest["material_counts"]),
+                "source_case_identity_digest": common.serialization.canonical_json_sha256(manifest["source_case_identities"]),
                 "validation": "validated_package_manifest_and_compact_transient_index",
             }
 
@@ -951,6 +1048,12 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
         "id": summarize(train_dataset),
         "ood": [summarize(dataset_id) for dataset_id in ood_datasets],
     }
+
+
+def _bind_configured_dataset_identities(config: OptunaStudyConfig) -> OptunaStudyConfig:
+    """Bind current validated physical Dataset evidence to one study invocation."""
+    identities = _configured_dataset_identities(config.base_config)
+    return replace(config, dataset_identities=copy.deepcopy(identities))
 
 
 def _build_pruner(study: Mapping[str, Any]) -> Any:
@@ -1012,7 +1115,25 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
     """Sample one trial while preserving the configured fixed training seed."""
     trial_number = _require_exact_int(trial.number, label="Optuna trial.number", minimum=0)
     overrides = search_space.suggest_trial_overrides(trial, study_config.search_space)
-    config = search_space.apply_trial_overrides(study_config.base_config, overrides)
+    if study_config.is_transient_plan:
+        authored = copy.deepcopy(study_config.base_experiment)
+        tracking = dict(_as_mapping(authored.get("tracking"), label="experiment.tracking"))
+        wandb_settings = dict(_as_mapping(tracking.get("wandb"), label="experiment.tracking.wandb"))
+        wandb_settings.update({"workflow": "optuna_trial", "study": str(study_config.study["name"])})
+        tracking["wandb"] = wandb_settings
+        authored["tracking"] = tracking
+        authored = search_space.apply_trial_overrides(authored, overrides)
+        authored["run"] = dict(_as_mapping(authored.get("run"), label="experiment.run"))
+        authored["run"]["suffix"] = f"optuna_trial_{trial_number:03d}"
+        plan = transient_plan.resolve_transient_training_plan(authored)
+        config = copy.deepcopy(dict(plan.stage_a))
+        joint_stage_b = copy.deepcopy(dict(plan.stage_b))
+        for stage_config in (config, joint_stage_b):
+            stage_config["run"]["device"] = study_config.base_config["run"]["device"]
+            stage_config["paths"]["output_root"] = study_config.base_config["paths"]["output_root"]
+    else:
+        config = search_space.apply_trial_overrides(study_config.base_config, overrides)
+        joint_stage_b = None
     training_seed = _require_exact_int(config["run"]["seed"], label="experiment.run.seed", minimum=0)
     sampler_seed = _sampler_seed(study_config.study)
     wandb_settings = config["tracking"]["wandb"]
@@ -1023,6 +1144,13 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
     config["run"].pop("name", None)
     config["run"]["name"] = experiments.config.loader.generate_run_name(config)
     config = experiments.config.loader.validate_resolved_config(config)
+    if joint_stage_b is not None:
+        joint_stage_b["tracking"]["wandb"].update(config["tracking"]["wandb"])
+        joint_stage_b["run"]["suffix"] = f"optuna_trial_{trial_number:03d}"
+        joint_stage_b["training"]["teacher_handoff"] = {"source_run_name": config["run"]["name"]}
+        joint_stage_b["run"].pop("name", None)
+        joint_stage_b["run"]["name"] = experiments.config.loader.generate_run_name(joint_stage_b)
+        joint_stage_b = experiments.config.loader.validate_resolved_config(joint_stage_b)
 
     base_objective = experiments.config.loader.get_resolved_objective(study_config.base_config)
     trial_objective = experiments.config.loader.get_resolved_objective(config)
@@ -1036,6 +1164,7 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
     context = {
         "study_name": str(study_config.study["name"]),
         "study_role": study_config.study["role"],
+        "study_mode": study_config.study["mode"],
         "trial_number": trial_number,
         "training_seed": training_seed,
         "sampler_seed": sampler_seed,
@@ -1043,11 +1172,17 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         "analysis_parameters": analysis_parameters,
         "search_signature": build_study_signature(study_config)["digest"],
     }
+    if joint_stage_b is not None:
+        schedule = config["training"]["stage_schedule"]
+        context["joint_stage_b_config"] = joint_stage_b
+        context["stage_allocation"] = copy.deepcopy(schedule)
+        trial.set_user_attr("stage_allocation", copy.deepcopy(schedule))
 
     trial.set_user_attr("run_name", config["run"]["name"])
     trial.set_user_attr("run_seed", training_seed)
     trial.set_user_attr("sampler_seed", sampler_seed)
     trial.set_user_attr("study_role", context["study_role"])
+    trial.set_user_attr("study_mode", context["study_mode"])
     trial.set_user_attr("overrides", overrides)
     return config, context
 
@@ -1280,6 +1415,23 @@ def _validate_completed_reporting(
         raise RuntimeError(msg)
 
 
+def _validate_joint_stage_completion(
+    result: Mapping[str, Any],
+    *,
+    stage: str,
+    expected_epochs: int,
+) -> None:
+    """Require one joint stage to consume its exact derived epoch allocation."""
+    completed = _require_exact_int(
+        result.get("completed_epoch"),
+        label=f"joint Stage-{stage} completed_epoch",
+        minimum=1,
+    )
+    if completed != expected_epochs:
+        message = f"Joint Stage {stage} did not consume its exact allocated epoch budget."
+        raise RuntimeError(message)
+
+
 def _transient_model_digest(config: Mapping[str, Any]) -> str:
     """Return the immutable resolved transient model architecture digest."""
     return common.serialization.canonical_json_sha256(copy.deepcopy(dict(_as_mapping(config["model"], label="config.model"))))
@@ -1345,9 +1497,147 @@ def _transient_terminal_status(error: BaseException, trial_pruned: type[BaseExce
     return None
 
 
+def _run_joint_transient_trial(
+    study_config: OptunaStudyConfig,
+    trial: TrialProtocol,
+    *,
+    stage_a: dict[str, Any],
+    stage_b: dict[str, Any],
+    context: Mapping[str, Any],
+) -> float:
+    """Execute one joint trial through the normal A-to-B handoff lifecycle."""
+    device_resolution = learning.device.resolve_device(stage_a["run"]["device"], path="run.device")
+    learning.device.validate_mixed_precision_device(stage_a["training"]["mixed_precision"], device_resolution)
+    objective = experiments.config.loader.get_resolved_objective(stage_a)
+    allocation = _as_mapping(context["stage_allocation"], label="joint stage allocation")
+    study_root = (
+        common.paths.resolve_study_dir(
+            str(stage_a["task"]),
+            str(context["study_name"]),
+            output_root=Path(stage_a["paths"]["output_root"]),
+        )
+        / "joint_trials"
+    )
+    stage_a = copy.deepcopy(stage_a)
+    stage_b = copy.deepcopy(stage_b)
+    stage_a["paths"]["output_root"] = str(study_root)
+    stage_b["paths"]["output_root"] = str(study_root)
+    a_dir = common.paths.resolve_run_output_dir(
+        str(stage_a["task"]),
+        str(stage_a["run"]["name"]),
+        output_root=Path(stage_a["paths"]["output_root"]),
+    )
+    b_dir = common.paths.resolve_run_output_dir(
+        str(stage_b["task"]),
+        str(stage_b["run"]["name"]),
+        output_root=Path(stage_b["paths"]["output_root"]),
+    )
+    reporter = OptunaEpochReporter(
+        trial=trial,
+        objective_id=str(objective["id"]),
+        direction=str(objective["direction"]),
+        evaluation_interval=int(stage_a["training"]["evaluation_interval"]),
+        target_epoch=int(allocation["total_epochs"]),
+        pruner_config=study_config.study["pruner"],
+    )
+    trial_pruned = _trial_pruned_error()
+    summary_context = {key: value for key, value in context.items() if key != "joint_stage_b_config"}
+    trial.set_user_attr("stage_runs", {"a": str(a_dir), "b": str(b_dir)})
+    trial.set_user_attr("current_stage", "a")
+    trial.set_user_attr("completed_stage_a", False)
+    trial.set_user_attr("consumed_global_epoch_budget", 0)
+
+    def callback(stage: str, offset: int) -> Callable[[int, dict[str, float]], None]:
+        def report(epoch: int, metrics: dict[str, float]) -> None:
+            global_epoch = offset + epoch
+            trial.set_user_attr("current_stage", stage)
+            trial.set_user_attr("consumed_global_epoch_budget", global_epoch)
+            key = f"id/{objective['id']}"
+            if key not in metrics:
+                return
+            guardrail_key = f"id/guardrail/one_step/{objective['id']}"
+            if guardrail_key not in metrics or not math.isfinite(float(metrics[guardrail_key])):
+                message = "Transient one-step guardrail must be finite at each reported evaluation."
+                raise NonFiniteTrialError(message)
+            reporter(global_epoch, metrics)
+            if reporter.last_reported_objective is not None:
+                metrics["optuna/objective"] = reporter.last_reported_objective
+            if reporter.best_value is not None:
+                metrics["optuna/best_objective_so_far"] = reporter.best_value
+
+        return report
+
+    try:
+        experiments.run.prepare_fresh_run(stage_a, run_dir=a_dir, summary_extra=summary_context)
+        stage_a_result = experiments.run.execute_prepared_run(
+            stage_a,
+            run_dir=a_dir,
+            persisted_config=stage_a,
+            epoch_end_callback=callback("a", 0),
+            summary_extra=summary_context,
+            device_resolution=device_resolution,
+            terminal_status_resolver=lambda error: _transient_terminal_status(error, trial_pruned),
+        )
+        _validate_joint_stage_completion(
+            stage_a_result,
+            stage="A",
+            expected_epochs=int(allocation["stage_a_epochs"]),
+        )
+        trial.set_user_attr("current_stage", "b")
+        trial.set_user_attr("completed_stage_a", True)
+        trial.set_user_attr("consumed_global_epoch_budget", int(allocation["stage_a_epochs"]))
+        experiments.run.prepare_fresh_run(stage_b, run_dir=b_dir, summary_extra=summary_context)
+        result = experiments.run.execute_prepared_run(
+            stage_b,
+            run_dir=b_dir,
+            persisted_config=stage_b,
+            epoch_end_callback=callback("b", int(allocation["stage_a_epochs"])),
+            summary_extra=summary_context,
+            device_resolution=device_resolution,
+            terminal_status_resolver=lambda error: _transient_terminal_status(error, trial_pruned),
+        )
+        _validate_joint_stage_completion(
+            result,
+            stage="B",
+            expected_epochs=int(allocation["stage_b_epochs"]),
+        )
+        _validate_completed_reporting(
+            reporter,
+            {**result, "completed_epoch": int(allocation["total_epochs"])},
+        )
+        value = _finite_objective_value(result, objective)
+    except trial_pruned:
+        trial.set_user_attr("terminal_status", "pruned")
+        raise
+    except FloatingPointError as error:
+        trial.set_user_attr("terminal_status", "nonfinite_pruned")
+        raise trial_pruned(str(error)) from None
+    except RecoverableTrialError:
+        trial.set_user_attr("terminal_status", "recoverable_failed")
+        raise
+    except (torch.cuda.OutOfMemoryError, MemoryError) as error:
+        trial.set_user_attr("terminal_status", "oom_pruned")
+        raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
+    except RuntimeError as error:
+        if _runtime_error_is_allocation_oom(error):
+            trial.set_user_attr("terminal_status", "oom_pruned")
+            raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
+        raise
+    else:
+        trial.set_user_attr("terminal_status", "completed")
+        trial.set_user_attr("consumed_global_epoch_budget", int(allocation["total_epochs"]))
+        return value
+
+
 def _run_transient_trial(study_config: OptunaStudyConfig, trial: TrialProtocol) -> float:
     """Execute one transient trial through the authoritative prepared-run lifecycle."""
     config, context = _prepare_trial_config(study_config, trial)
+    if study_config.study["mode"] == "joint_ab":
+        stage_b = context.get("joint_stage_b_config")
+        if not isinstance(stage_b, dict):
+            msg = "Joint transient Optuna requires an authored two-stage experiment plan."
+            raise ValueError(msg)
+        return _run_joint_transient_trial(study_config, trial, stage_a=config, stage_b=stage_b, context=context)
     _validate_transient_study_policy(config, study_config.search_space)
     base_digest = _transient_model_digest(study_config.base_config)
     if config["training"]["stage"] == "b" and _transient_model_digest(config) != base_digest:
@@ -2088,7 +2378,7 @@ def with_runtime_overrides(
     if output_root is not None:
         base_config["paths"]["output_root"] = str(Path(output_root).expanduser())
     base_config = experiments.config.loader.validate_resolved_config(base_config)
-    return replace(config, base_config=base_config)
+    return replace(config, base_config=base_config, dataset_identities=None)
 
 
 def _publish_study_signature(study: Any, signature: Mapping[str, Any], objective: Mapping[str, Any]) -> None:
@@ -2340,6 +2630,17 @@ def _emit_study_summary(summary: Mapping[str, Any], *, storage: str, summary_fil
     )
 
 
+def _maximum_study_epochs(config: OptunaStudyConfig) -> int:
+    """Return the full global epoch axis advertised for one study mode."""
+    if config.study["mode"] == "joint_ab":
+        training = _as_mapping(config.base_experiment.get("training"), label="experiment.training")
+        schedule = transient_plan.resolve_stage_epoch_allocation(
+            _as_mapping(training.get("stage_schedule"), label="experiment.training.stage_schedule")
+        )
+        return int(schedule["total_epochs"])
+    return int(config.base_config["training"]["epochs"])
+
+
 def run_optuna_study(
     config: OptunaStudyConfig | Path | str,
     *,
@@ -2384,6 +2685,8 @@ def run_optuna_study(
     study_config = load_optuna_study_config(config) if isinstance(config, (str, Path)) else config
     study_config = with_runtime_overrides(study_config, device=device, output_root=output_root)
     study_config, objective = _validate_study_contract(study_config)
+    if study_config.base_config["task"] == "transient_drying":
+        study_config = _bind_configured_dataset_identities(study_config)
     signature = build_study_signature(study_config)
 
     raw_trial_count = n_trials if n_trials is not None else study_config.study["n_trials"]
@@ -2436,7 +2739,7 @@ def run_optuna_study(
         invocation_trials=trial_count,
         timeout="none",
         parallelism=1,
-        maximum_epochs=int(study_config.base_config["training"]["epochs"]),
+        maximum_epochs=_maximum_study_epochs(study_config),
         id_interval=reporting_interval,
         ood_interval=reporting_interval,
         physics_interval=reporting_interval,

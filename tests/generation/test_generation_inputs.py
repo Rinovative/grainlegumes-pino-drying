@@ -24,8 +24,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() -> None:
-    """Protect the commissioned campaign allocation and Seen split contract."""
+def test_transient_family_campaign_resolves_the_120_case_scientific_contract() -> None:
+    """Protect the deliberate production materials, split, and package contract."""
     campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/transient_drying/family_generalization.yaml"
     campaign = generation.cases.config.load_campaign_config(
         campaign_path,
@@ -33,27 +33,55 @@ def test_first_transient_family_campaign_resolves_exactly_six_hundred_cases() ->
     )
     case_counts = {(batch.material_family, batch.sampling_regime): len(batch.case_indices) for batch in campaign.batches}
 
-    assert case_counts == {
-        ("chickpea", "natural"): 160,
-        ("field_pea", "natural"): 40,
-        ("kidney_bean", "natural"): 160,
-        ("lentil", "natural"): 160,
-        ("rapeseed", "natural"): 40,
-        ("sunflower_seed", "natural"): 40,
+    assert campaign.material_roles == {
+        "seen": ("lentil", "chickpea"),
+        "near_family_ood": ("kidney_bean",),
+        "far_family_ood": (),
+        "extreme_family_ood": (),
     }
-    assert campaign.total_case_count == 600
+    assert case_counts == {
+        ("chickpea", "natural"): 50,
+        ("kidney_bean", "natural"): 20,
+        ("lentil", "natural"): 50,
+    }
+    assert campaign.total_case_count == 120
     assert campaign.membership["per_seen_material"] == {
-        "train": 128,
-        "validation": 16,
-        "id_test": 16,
+        "train": 40,
+        "validation": 5,
+        "id_test": 5,
     }
     assert {name: count * len(campaign.material_roles["seen"]) for name, count in campaign.membership["per_seen_material"].items()} == {
-        "train": 384,
-        "validation": 48,
-        "id_test": 48,
+        "train": 80,
+        "validation": 10,
+        "id_test": 10,
     }
     assert all(batch.sampling_regime != "parameter_ood" for batch in campaign.batches)
-    assert campaign.profile.available_learning_views == ("steady_flow", "transient_drying")
+
+    packages = {(package["dataset_view"], package["evaluation_regime"]): package for package in campaign.dataset_packages}
+    assert set(packages) == {
+        ("transient_drying", "id"),
+        ("transient_drying", "near_family_ood"),
+        ("steady_flow", "id"),
+        ("steady_flow", "near_family_ood"),
+    }
+    for view in ("transient_drying", "steady_flow"):
+        identity = packages[(view, "id")]
+        held_out = packages[(view, "near_family_ood")]
+        assert identity["dataset_name"] == f"{view}__lentil+chickpea__id"
+        assert identity["materials"] == ["lentil", "chickpea"]
+        assert identity["source_case_count"] == 100
+        assert identity["membership"]["totals"] == {
+            "train": 80,
+            "validation": 10,
+            "id_test": 10,
+        }
+        assert held_out["dataset_name"] == f"{view}__kidney_bean__near_family_ood"
+        assert held_out["materials"] == ["kidney_bean"]
+        assert held_out["source_case_count"] == 20
+        assert "membership" not in held_out
+    assert packages[("transient_drying", "id")]["training_payload"]["required"] is True
+    assert packages[("transient_drying", "near_family_ood")]["training_payload"]["required"] is True
+    assert all("training_payload" not in package for key, package in packages.items() if key[0] == "steady_flow")
 
 
 def test_steady_flow_id_dataset_is_independent_and_balanced() -> None:

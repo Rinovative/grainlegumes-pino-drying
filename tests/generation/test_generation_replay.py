@@ -162,13 +162,13 @@ def test_post_horizon_conversion_failure_replays_without_comsol(
     original_convert = storage_service.convert_exports_to_hdf5
 
     def reject_old_converter(*_args: Any, **_kwargs: Any) -> None:
-        message = "legacy converter rejected post-horizon state"
+        message = "converter rejected post-horizon state"
         raise ValueError(message)
 
     monkeypatch.setenv("FAKE_COMSOL_TRANSIENT_TIME_MODE", "post_horizon")
     with monkeypatch.context() as scoped:
         scoped.setattr(storage_service, "convert_exports_to_hdf5", reject_old_converter)
-        with pytest.raises(generation.runtime.CaseExecutionError, match="legacy converter"):
+        with pytest.raises(generation.runtime.CaseExecutionError, match="converter rejected"):
             generation.runtime.run_case(
                 config,
                 1,

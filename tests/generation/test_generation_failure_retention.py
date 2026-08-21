@@ -351,7 +351,7 @@ def test_attempt_admission_requires_exact_version_one_schema(
     } == {1}
 
     malformed_receipts = (
-        {**original, "schema_version": 2},
+        {**original, "schema_version": 0},
         {**original, "unexpected_field": "not admitted"},
         {**original, "solver_state": "succeeded"},
     )
