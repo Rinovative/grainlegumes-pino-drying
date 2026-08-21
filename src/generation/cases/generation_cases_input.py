@@ -18,18 +18,20 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shlex
 import shutil
 import tempfile
-from contextlib import contextmanager
+from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator
 
 from src import common
 from src.generation.contracts import generation_contracts_source as source_service
@@ -152,6 +154,7 @@ def admit_persisted_input_case(
     input_generation_id: str,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "full",
 ) -> admission_service.InputCaseReference:
     """
     Admit one persisted input case against its immutable scientific identity.
@@ -166,6 +169,8 @@ def admit_persisted_input_case(
         Persisted generation identity, including its original source commit.
     storage_root : Path | str | None, optional
         Canonical storage root override.
+    validation_depth : {"evidence", "full"}, optional
+        Metadata evidence or selected-case content validation depth.
 
     Returns
     -------
@@ -199,10 +204,12 @@ def admit_persisted_input_case(
         generation_id,
         storage_root=storage_root,
     )
-    source = admission_service.admit_input_batch_source(
+    reference = admission_service.admit_input_case_evidence(
         metadata_directory,
+        case_index,
         raw_directory=raw_directory,
         expected_input_generation_id=generation_id,
+        validation_depth=validation_depth,
     )
     expected = {
         "source_id": generation_id,
@@ -213,15 +220,13 @@ def admit_persisted_input_case(
         "material_family": config.material_family,
         "sampling_regime": config.sampling_regime,
         "campaign_purpose": config.scientific_values["campaign_purpose"],
+        "case_id": case_id,
+        "case_index": case_index,
     }
-    if any(getattr(source, key) != value for key, value in expected.items()):
+    if any(getattr(reference, key) != value for key, value in expected.items()):
         message = f"Persisted input generation disagrees with the active scientific configuration: {metadata_directory}"
         raise RuntimeError(message)
-    matches = tuple(reference for reference in source.cases if reference.case_id == case_id)
-    if len(matches) != 1 or matches[0].case_index != case_index:
-        message = f"Persisted input manifest does not declare exactly one {case_id}."
-        raise RuntimeError(message)
-    return matches[0]
+    return reference
 
 
 def select_case_indices(
@@ -251,7 +256,8 @@ def select_case_indices(
 def _case_record(directory: Path) -> dict[str, Any]:
     """Build manifest identity and hash evidence for one generated case."""
     case_json = directory / "case.json"
-    payload = json.loads(case_json.read_text(encoding="utf-8"))
+    serialized = case_json.read_bytes()
+    payload = json.loads(serialized)
     if not isinstance(payload, dict):
         message = f"Generated case payload must be a JSON object: {case_json}"
         raise TypeError(message)
@@ -261,10 +267,19 @@ def _case_record(directory: Path) -> dict[str, Any]:
         "case_id": payload["case_id"],
         "case_input_id": payload["case_input_id"],
         "simulation_case_id": payload["simulation_case_id"],
-        "case_json_sha256": common.serialization.file_sha256(case_json),
+        "case_json_sha256": hashlib.sha256(serialized).hexdigest(),
         "seed_evidence_sha256": common.serialization.canonical_json_sha256(payload["seed_evidence"]),
         "input_files": payload["input_files"],
     }
+
+
+def _mutable_json_evidence(value: Any) -> Any:
+    """Copy validated frozen JSON evidence without serializing it again."""
+    if isinstance(value, Mapping):
+        return {str(key): _mutable_json_evidence(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable_json_evidence(item) for item in value]
+    return value
 
 
 def _complete_manifest(
@@ -276,7 +291,7 @@ def _complete_manifest(
     return {
         **base,
         "case_indices": indices,
-        "cases": [dict(records[index]) for index in indices],
+        "cases": [_mutable_json_evidence(records[index]) for index in indices],
     }
 
 
@@ -318,6 +333,7 @@ def _load_existing(
     *,
     base: Mapping[str, Any],
     resolved_config: Mapping[str, Any],
+    validation_depth: Literal["evidence", "full"] = "full",
 ) -> tuple[dict[int, Mapping[str, Any]], admission_service.InputSource]:
     """Admit existing canonical evidence and require the same source request."""
     try:
@@ -325,17 +341,39 @@ def _load_existing(
             metadata_directory,
             raw_directory=raw_directory,
             expected_input_generation_id=str(base["input_generation_id"]),
+            validation_depth=validation_depth,
         )
-        manifest = json.loads((metadata_directory / "input_generation_manifest.json").read_text(encoding="utf-8"))
-        persisted_config = json.loads((metadata_directory / "resolved_generation_config.json").read_text(encoding="utf-8"))
+        manifest = source.manifest_payload()
     except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
         message = f"Canonical input-generation evidence is incomplete or invalid: {metadata_directory}: {error}"
         raise FileExistsError(message) from error
-    if persisted_config != resolved_config or any(manifest.get(key) != value for key, value in base.items()):
+    if not source.resolved_config_matches(resolved_config) or any(manifest.get(key) != value for key, value in base.items()):
         message = "Canonical input batch belongs to different source evidence."
         raise FileExistsError(message)
     records = {int(record["case_index"]): record for record in manifest["cases"]}
     return records, source
+
+
+def _configured_input_locations(
+    config: config_service.GenerationConfig,
+    *,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
+    """Resolve exact maintained input evidence locations for one batch."""
+    resolved_config = _resolved_config(config)
+    base = _manifest_base(config, resolved_config)
+    input_generation_id = str(base["input_generation_id"])
+    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+        config.batch_storage_name,
+        input_generation_id,
+        storage_root=storage_root,
+    )
+    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name,
+        input_generation_id,
+        storage_root=storage_root,
+    )
+    return base, resolved_config, metadata_directory, raw_directory
 
 
 def admit_configured_input_case(
@@ -344,28 +382,52 @@ def admit_configured_input_case(
     *,
     storage_root: Path | str | None = None,
 ) -> admission_service.InputCaseReference:
-    """Admit one persisted raw case against the exact active configuration."""
+    """Fully admit one configured raw case without rebuilding its batch."""
     config.case_id(case_index)
-    resolved_config = _resolved_config(config)
-    base = _manifest_base(config, resolved_config)
-    input_generation_id = str(base["input_generation_id"])
-    metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
-        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    base, _resolved, metadata, raw = _configured_input_locations(
+        config,
+        storage_root=storage_root,
     )
-    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
-        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    return admission_service.admit_input_case_evidence(
+        metadata,
+        case_index,
+        raw_directory=raw,
+        expected_input_generation_id=str(base["input_generation_id"]),
+        validation_depth="full",
     )
-    _records, source = _load_existing(
-        metadata_directory,
-        raw_directory,
-        base=base,
-        resolved_config=resolved_config,
-    )
-    matches = tuple(reference for reference in source.cases if reference.case_index == case_index)
-    if len(matches) != 1:
-        message = f"Canonical raw input manifest does not declare exactly one {config.case_id(case_index)}."
+
+
+def admit_configured_input_references(
+    config: config_service.GenerationConfig,
+    *,
+    storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+    git_commit: str | None = None,
+) -> dict[int, admission_service.InputCaseReference]:
+    """Admit one configured batch once and index its exact case references."""
+    commit_context = nullcontext() if git_commit is None else _generation_git_commit(source_service.validate_git_commit(git_commit))
+    with commit_context:
+        base, resolved, metadata, raw = _configured_input_locations(
+            config,
+            storage_root=storage_root,
+        )
+        records, source = _load_existing(
+            metadata,
+            raw,
+            base=base,
+            resolved_config=resolved,
+            validation_depth=validation_depth,
+        )
+    expected = set(config.case_indices)
+    if not expected.issubset(records):
+        missing = tuple(sorted(expected.difference(records)))
+        message = f"Canonical raw input manifest is missing configured cases: {missing}."
+        raise FileNotFoundError(message)
+    references = {reference.case_index: reference for reference in source.cases if reference.case_index in expected}
+    if set(references) != expected:
+        message = "Canonical raw input references do not cover configured membership exactly."
         raise RuntimeError(message)
-    return matches[0]
+    return references
 
 
 def _estimate_case_bytes(config: config_service.GenerationConfig, case_index: int) -> int:
@@ -559,12 +621,41 @@ def _write_input_transaction_journal(
     )
 
 
+def _emit_case_progress(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    *,
+    operation: str,
+    cases_completed: int,
+    cases_total: int,
+    generated_cases: int,
+    reused_cases: int,
+) -> None:
+    """Emit at most about twenty factual checkpoints for one input batch."""
+    if callback is None:
+        return
+    interval = max(1, (cases_total + 19) // 20)
+    if cases_completed not in {0, cases_total} and cases_completed % interval != 0:
+        return
+    callback(
+        {
+            "operation": operation,
+            "cases_completed": cases_completed,
+            "cases_total": cases_total,
+            "generated_cases": generated_cases,
+            "reused_cases": reused_cases,
+            "eta": "unavailable",
+        }
+    )
+
+
 def generate_input_cases(
     config: config_service.GenerationConfig,
     case_count: int,
     *,
     case_start: int | None = None,
     storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    existing_validation_depth: Literal["evidence", "full"] = "full",
 ) -> GeneratedInputBatch:
     """Generate or exactly reuse bounded cases in one canonical raw batch."""
     requested = select_case_indices(config, case_count, case_start)
@@ -603,30 +694,65 @@ def generate_input_cases(
             raise FileExistsError(message)
         records: dict[int, Mapping[str, Any]] = {}
         if manifest_exists:
+            _emit_case_progress(
+                progress,
+                operation="canonical_input_validation",
+                cases_completed=0,
+                cases_total=len(requested),
+                generated_cases=0,
+                reused_cases=0,
+            )
             records, _source = _load_existing(
                 metadata_directory,
                 raw_directory,
                 base=base,
                 resolved_config=resolved_config,
+                validation_depth=existing_validation_depth,
             )
         elif raw_directory.exists():
             message = f"Unmanifested canonical raw batch blocks publication: {raw_directory}"
             raise FileExistsError(message)
         generated_indices = [index for index in requested if index not in records]
         reused_count = len(requested) - len(generated_indices)
+        _emit_case_progress(
+            progress,
+            operation="canonical_input_generation",
+            cases_completed=reused_count,
+            cases_total=len(requested),
+            generated_cases=0,
+            reused_cases=reused_count,
+        )
         if generated_indices:
             transaction.parent.mkdir(parents=True, exist_ok=True)
             transaction.mkdir()
             staged_raw = transaction / "raw" / config.batch_storage_name / "input_generations" / input_generation_id
             staged_metadata = transaction / "meta" / config.batch_storage_name / "input_generations" / input_generation_id
             try:
-                for case_index in generated_indices:
+                for generated_count, case_index in enumerate(
+                    generated_indices,
+                    start=1,
+                ):
                     case_id = config.case_id(case_index)
                     target_case = raw_directory / case_id
-                    _require_case_publication_target(target_case, declared=False)
+                    _require_case_publication_target(
+                        target_case,
+                        declared=False,
+                    )
                     staged_case = staged_raw / case_id
-                    case_service.generate_case_input_bundle(config, case_index, staged_case)
+                    case_service.generate_case_input_bundle(
+                        config,
+                        case_index,
+                        staged_case,
+                    )
                     records[case_index] = _case_record(staged_case)
+                    _emit_case_progress(
+                        progress,
+                        operation="canonical_input_generation",
+                        cases_completed=reused_count + generated_count,
+                        cases_total=len(requested),
+                        generated_cases=generated_count,
+                        reused_cases=reused_count,
+                    )
                 manifest = _complete_manifest(base, records)
                 _write_staged_metadata(
                     staged_metadata,
@@ -649,6 +775,7 @@ def generate_input_cases(
                     staged_metadata,
                     raw_directory=raw_directory,
                     expected_input_generation_id=input_generation_id,
+                    validation_depth="evidence",
                 )
                 common.serialization.atomic_write_json(
                     metadata_directory / "input_generation_manifest.json",
@@ -791,6 +918,8 @@ def prepare_campaign_inputs(
     *,
     git_commit: str,
     storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    existing_validation_depth: Literal["evidence", "full"] = "evidence",
 ) -> dict[str, Any]:
     """
     Materialize or admit every selected campaign case before submission.
@@ -803,6 +932,10 @@ def prepare_campaign_inputs(
         Lowercase source commit used in every input-generation identity.
     storage_root : Path | str | None, optional
         Canonical storage root, or the configured default when omitted.
+    progress : Callable[[Mapping[str, Any]], None] | None, optional
+        Receives bounded progress snapshots from the active generation loop.
+    existing_validation_depth : {"evidence", "full"}, optional
+        Integrity depth for already published immutable inputs.
 
     Returns
     -------
@@ -820,14 +953,38 @@ def prepare_campaign_inputs(
     commit = source_service.validate_git_commit(git_commit)
     storage = Path(storage_root).expanduser() if storage_root is not None else None
     batches: list[dict[str, Any]] = []
+    total_cases = sum(len(batch.case_indices) for batch in campaign.batches)
+    completed_offset = 0
     with _generation_git_commit(commit):
-        for batch in campaign.batches:
+        for batch_index, batch in enumerate(campaign.batches):
+
+            def report_batch_progress(
+                event: Mapping[str, Any],
+                *,
+                offset: int = completed_offset,
+                ordinal: int = batch_index,
+            ) -> None:
+                if progress is None:
+                    return
+                progress(
+                    {
+                        **dict(event),
+                        "cases_completed": (offset + int(event["cases_completed"])),
+                        "cases_total": total_cases,
+                        "batches_completed": ordinal,
+                        "batches_total": len(campaign.batches),
+                    }
+                )
+
             generated = generate_input_cases(
                 batch,
                 len(batch.case_indices),
                 case_start=batch.case_indices[0],
                 storage_root=storage,
+                progress=report_batch_progress,
+                existing_validation_depth=existing_validation_depth,
             )
+            completed_offset += len(batch.case_indices)
             batches.append(
                 {
                     "batch_id": batch.batch_id,
@@ -843,6 +1000,60 @@ def prepare_campaign_inputs(
         "selected_batch_count": len(batches),
         "generated_case_count": sum(item["generated_case_count"] for item in batches),
         "reused_case_count": sum(item["reused_case_count"] for item in batches),
+        "batches": batches,
+    }
+
+
+def admit_campaign_inputs(
+    campaign: config_service.CampaignConfig,
+    *,
+    git_commit: str,
+    storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+) -> dict[str, Any]:
+    """Admit every configured input from immutable batch evidence without generation."""
+    commit = source_service.validate_git_commit(git_commit)
+    storage = Path(storage_root).expanduser() if storage_root is not None else None
+    batches: list[dict[str, Any]] = []
+    with _generation_git_commit(commit):
+        for batch in campaign.batches:
+            resolved_config = _resolved_config(batch)
+            base = _manifest_base(batch, resolved_config)
+            input_generation_id = str(base["input_generation_id"])
+            metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
+                batch.batch_storage_name,
+                input_generation_id,
+                storage_root=storage,
+            )
+            raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+                batch.batch_storage_name,
+                input_generation_id,
+                storage_root=storage,
+            )
+            records, _source = _load_existing(
+                metadata_directory,
+                raw_directory,
+                base=base,
+                resolved_config=resolved_config,
+                validation_depth=validation_depth,
+            )
+            missing = tuple(case_index for case_index in batch.case_indices if case_index not in records)
+            if missing:
+                message = f"Prepared canonical input batch {batch.batch_name!r} is missing configured cases: {missing}."
+                raise FileNotFoundError(message)
+            batches.append(
+                {
+                    "batch_id": batch.batch_id,
+                    "batch_storage_name": batch.batch_storage_name,
+                    "input_generation_id": input_generation_id,
+                    "admitted_case_count": len(batch.case_indices),
+                }
+            )
+    return {
+        "git_commit": commit,
+        "validation_depth": validation_depth,
+        "selected_batch_count": len(batches),
+        "admitted_case_count": sum(item["admitted_case_count"] for item in batches),
         "batches": batches,
     }
 

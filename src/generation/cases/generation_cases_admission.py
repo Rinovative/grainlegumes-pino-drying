@@ -17,12 +17,13 @@ This module does NOT:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -36,6 +37,7 @@ from . import generation_cases_schedule as schedule_service
 
 _MINIMUM_ROWS = 2
 _SCALAR_COLUMNS = 3
+_SHA256_LENGTH = 64
 INPUT_BATCH_SCHEMA_KIND = "generation_input_batch"
 INPUT_BATCH_SCHEMA_VERSION = 1
 _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
@@ -189,9 +191,20 @@ class InputCaseReference:
     case_index: int
     case_input_id: str
     simulation_case_id: str
+    case_json_sha256: str
+    case_json_size_bytes: int
     case_directory: Path
     input_directory: Path
     parameter_metadata: Mapping[str, Any] | None
+    _case_payload_json: str
+
+    def case_payload(self) -> dict[str, Any]:
+        """Return an independent copy of the validated case metadata."""
+        value = json.loads(self._case_payload_json)
+        if not isinstance(value, dict):
+            message = "Validated input case metadata is no longer an object."
+            raise TypeError(message)
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +222,20 @@ class InputSource:
     campaign_purpose: str
     directory: Path
     cases: tuple[InputCaseReference, ...]
+    _manifest: Mapping[str, Any]
+    _resolved_config: Mapping[str, Any]
+
+    def manifest_payload(self) -> Mapping[str, Any]:
+        """Return the immutable validated source manifest."""
+        return self._manifest
+
+    def resolved_config_evidence(self) -> Mapping[str, Any]:
+        """Return the immutable validated resolved configuration."""
+        return self._resolved_config
+
+    def resolved_config_matches(self, value: Mapping[str, Any]) -> bool:
+        """Compare JSON semantics without materializing or reparsing evidence."""
+        return _json_evidence_matches(self._resolved_config, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +265,17 @@ class InputDiscoveryIssue:
     source_id: str
     directory: Path
     message: str
+
+
+def _json_evidence_matches(left: Any, right: Any) -> bool:
+    """Compare frozen and ordinary JSON containers without allocating copies."""
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return set(left) == set(right) and all(_json_evidence_matches(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _json_evidence_matches(left_item, right_item) for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _freeze_json_evidence(value: Any) -> Any:
@@ -523,15 +561,6 @@ def admit_input_case(
     )
 
 
-def _assert_input_only_trees(*roots: Path) -> None:
-    """Reject execution or success artifacts from canonical input-only trees."""
-    for root in roots:
-        for name in _INPUT_EXECUTION_ARTIFACT_NAMES:
-            if next(root.rglob(name), None) is not None:
-                message = f"Input-generated raw evidence contains an execution or success artifact under {root}: {name}."
-                raise ValueError(message)
-
-
 @dataclass(frozen=True, slots=True)
 class _InputBatchMetadata:
     """Hold validated manifest-first input-batch metadata without adapter arrays."""
@@ -541,6 +570,7 @@ class _InputBatchMetadata:
     manifest: Mapping[str, Any]
     resolved_config: Mapping[str, Any]
     records: tuple[Mapping[str, Any], ...]
+    case_payloads: tuple[Mapping[str, Any], ...]
     parameter_metadata: Mapping[str, Any]
 
 
@@ -600,13 +630,24 @@ def _validated_batch_locators(
     return batch_id, batch_storage_name
 
 
-def _load_input_batch_metadata(
+@dataclass(frozen=True, slots=True)
+class _InputBatchEnvelope:
+    """Hold validated batch identity before any per-case reconstruction."""
+
+    directory: Path
+    raw_directory: Path
+    manifest: Mapping[str, Any]
+    resolved_config: Mapping[str, Any]
+    parameter_metadata: Mapping[str, Any]
+
+
+def _load_input_batch_envelope(
     directory: Path | str,
     *,
-    raw_directory: Path | str | None = None,
-    expected_input_generation_id: str | None = None,
-) -> _InputBatchMetadata:
-    """Validate one input batch through metadata, identity, and raw membership."""
+    raw_directory: Path | str | None,
+    expected_input_generation_id: str | None,
+) -> _InputBatchEnvelope:
+    """Validate immutable batch identity before bounded case reconstruction."""
     directory = Path(directory).expanduser().resolve()
     if not directory.is_dir():
         message = f"Input-generation metadata directory does not exist: {directory}"
@@ -618,15 +659,16 @@ def _load_input_batch_metadata(
         raise ValueError(message)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, Mapping) or not isinstance(resolved, Mapping):
+    if not isinstance(manifest, Mapping) or not isinstance(
+        resolved,
+        Mapping,
+    ):
         message = "Input-generation manifest and resolved configuration must be JSON objects."
         raise TypeError(message)
     _validate_input_manifest_shape(
         manifest,
         expected_input_generation_id=expected_input_generation_id,
     )
-    records = manifest["cases"]
-    indices = manifest["case_indices"]
     generation_id = manifest["input_generation_id"]
     if compute_input_generation_id(manifest) != generation_id:
         message = "Input-generation manifest disagrees with its deterministic source identity."
@@ -677,7 +719,11 @@ def _load_input_batch_metadata(
         or scientific_digest != manifest["batch_identity"]
         or case_input_digest != manifest["case_input_config_digest"]
         or expected_batch_name != manifest["batch_name"]
-        or config_service.build_batch_id(expected_batch_name, scientific_digest) != batch_id
+        or config_service.build_batch_id(
+            expected_batch_name,
+            scientific_digest,
+        )
+        != batch_id
         or config_service.build_batch_storage_name(
             profile_id,
             str(manifest["material_family"]),
@@ -696,86 +742,147 @@ def _load_input_batch_metadata(
             storage_root=directory.parents[4],
         )
     raw = Path(raw_directory).expanduser().resolve()
-    if not raw.is_dir():
-        message = f"Canonical input raw batch is missing: {raw}"
+    if not raw.is_dir() or raw.is_symlink():
+        message = f"Canonical input raw batch is missing or unsafe: {raw}"
         raise ValueError(message)
     if raw.name != generation_id or raw.parent.name != "input_generations" or raw.parent.parent.name != batch_storage_name:
         message = "Input-generation raw directory must use its exact current generation identity."
         raise ValueError(message)
-    _assert_input_only_trees(raw)
-    expected_names: set[str] = set()
-    normalized_records: list[Mapping[str, Any]] = []
-    for record, index in zip(records, indices, strict=True):
-        if (
-            not isinstance(record, Mapping)
-            or set(record) != INPUT_CASE_RECORD_KEYS
-            or record.get("case_index") != index
-            or not isinstance(record.get("case_id"), str)
-            or not isinstance(record.get("case_input_id"), str)
-            or not isinstance(record.get("simulation_case_id"), str)
-            or not isinstance(record.get("case_json_sha256"), str)
-            or not isinstance(record.get("seed_evidence_sha256"), str)
-            or not isinstance(record.get("input_files"), Mapping)
-        ):
-            message = "Input-generation case identity or hash inventory is invalid."
-            raise ValueError(message)
-        case_id = str(record["case_id"])
-        case_directory = raw / case_id
-        input_directory = case_directory / "inputs"
-        case_payload_path = case_directory / "case.json"
-        try:
-            case_payload = json.loads(case_payload_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            message = f"Canonical raw case payload is unreadable: {case_payload_path}"
-            raise ValueError(message) from error
-        if not isinstance(case_payload, dict):
-            message = f"Canonical raw case payload must be a JSON object: {case_payload_path}"
-            raise TypeError(message)
-        case_service.validate_case_payload_schema(case_payload)
-        case_bindings = {
-            "simulation_profile": manifest["simulation_profile"],
-            "batch_id": manifest["batch_id"],
-            "batch_identity": manifest["batch_identity"],
-            "scientific_config_digest": manifest["scientific_config_digest"],
-            "case_input_config_digest": manifest["case_input_config_digest"],
-            "material_family": manifest["material_family"],
-            "sampling_regime": manifest["sampling_regime"],
-            "git_commit": manifest["git_commit"],
-            "generator_version": manifest["generator_version"],
-        }
-        template = case_payload.get("template")
-        if (
-            any(case_payload.get(key) != value for key, value in case_bindings.items())
-            or not isinstance(template, Mapping)
-            or template.get("relative_path") != manifest["template_relative_path"]
-            or template.get("sha256") != manifest["template_sha256"]
-        ):
-            message = f"Canonical raw case source identity disagrees with its manifest: {case_payload_path}"
-            raise ValueError(message)
-        if (
-            not case_directory.is_dir()
-            or case_directory.is_symlink()
-            or {entry.name for entry in case_directory.iterdir()} != {"case.json", "inputs"}
-            or not input_directory.is_dir()
-            or input_directory.is_symlink()
-            or {entry.name for entry in input_directory.iterdir()} != set(record["input_files"])
-            or any(not entry.is_file() or entry.is_symlink() for entry in input_directory.iterdir())
-        ):
-            message = f"Canonical raw case layout is invalid: {case_directory}"
-            raise ValueError(message)
-        expected_names.add(case_id)
-        normalized_records.append(record)
-    observed_names = {entry.name for entry in raw.iterdir()}
-    if len(expected_names) != len(records) or observed_names != expected_names or any(not (raw / case_id).is_dir() for case_id in expected_names):
-        message = "Input-generation raw case membership is not exact."
-        raise ValueError(message)
-    return _InputBatchMetadata(
+    return _InputBatchEnvelope(
         directory=directory,
         raw_directory=raw,
         manifest=manifest,
         resolved_config=resolved,
-        records=tuple(normalized_records),
         parameter_metadata=resolved["registry_metadata"],
+    )
+
+
+def _raise_for_execution_artifact(*roots: Path) -> None:
+    """Preserve exact artifact classification only after layout evidence conflicts."""
+    for root in roots:
+        for name in _INPUT_EXECUTION_ARTIFACT_NAMES:
+            if next(root.rglob(name), None) is not None:
+                message = f"Input-generated raw evidence contains an execution or success artifact under {root}: {name}."
+                raise ValueError(message)
+
+
+def _validate_input_case_record(
+    envelope: _InputBatchEnvelope,
+    record: Any,
+    index: int,
+    *,
+    validation_depth: Literal["evidence", "full"],
+) -> Mapping[str, Any]:
+    """Validate one manifest-selected case without rebuilding its batch."""
+    manifest = envelope.manifest
+    if (
+        not isinstance(record, Mapping)
+        or set(record) != INPUT_CASE_RECORD_KEYS
+        or record.get("case_index") != index
+        or not isinstance(record.get("case_id"), str)
+        or not isinstance(record.get("case_input_id"), str)
+        or not isinstance(record.get("simulation_case_id"), str)
+        or not isinstance(record.get("case_json_sha256"), str)
+        or not isinstance(record.get("seed_evidence_sha256"), str)
+        or not isinstance(record.get("input_files"), Mapping)
+    ):
+        message = "Input-generation case identity or hash inventory is invalid."
+        raise ValueError(message)
+    case_id = str(record["case_id"])
+    case_directory = envelope.raw_directory / case_id
+    input_directory = case_directory / "inputs"
+    case_payload_path = case_directory / "case.json"
+    try:
+        case_payload_bytes = case_payload_path.read_bytes()
+        case_payload = json.loads(case_payload_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Canonical raw case payload is unreadable: {case_payload_path}"
+        raise ValueError(message) from error
+    if not isinstance(case_payload, dict):
+        message = f"Canonical raw case payload must be a JSON object: {case_payload_path}"
+        raise TypeError(message)
+    if validation_depth == "full" and hashlib.sha256(case_payload_bytes).hexdigest() != record["case_json_sha256"]:
+        message = f"Canonical raw case payload digest disagrees with its manifest: {case_payload_path}"
+        raise ValueError(message)
+    case_service.validate_case_payload_schema(case_payload)
+    case_bindings = {
+        "simulation_profile": manifest["simulation_profile"],
+        "batch_id": manifest["batch_id"],
+        "batch_identity": manifest["batch_identity"],
+        "scientific_config_digest": manifest["scientific_config_digest"],
+        "case_input_config_digest": manifest["case_input_config_digest"],
+        "material_family": manifest["material_family"],
+        "sampling_regime": manifest["sampling_regime"],
+        "git_commit": manifest["git_commit"],
+        "generator_version": manifest["generator_version"],
+    }
+    template = case_payload.get("template")
+    if (
+        any(case_payload.get(key) != value for key, value in case_bindings.items())
+        or not isinstance(template, Mapping)
+        or template.get("relative_path") != manifest["template_relative_path"]
+        or template.get("sha256") != manifest["template_sha256"]
+    ):
+        message = f"Canonical raw case source identity disagrees with its manifest: {case_payload_path}"
+        raise ValueError(message)
+    case_entries = tuple(case_directory.iterdir()) if case_directory.is_dir() and not case_directory.is_symlink() else ()
+    input_entries = tuple(input_directory.iterdir()) if input_directory.is_dir() and not input_directory.is_symlink() else ()
+    if (
+        {entry.name for entry in case_entries} != {"case.json", "inputs"}
+        or {entry.name for entry in input_entries} != set(record["input_files"])
+        or any(not entry.is_file() or entry.is_symlink() for entry in input_entries)
+    ):
+        _raise_for_execution_artifact(case_directory)
+        message = f"Canonical raw case layout is invalid: {case_directory}"
+        raise ValueError(message)
+    return case_payload
+
+
+def _load_input_batch_metadata(
+    directory: Path | str,
+    *,
+    raw_directory: Path | str | None = None,
+    expected_input_generation_id: str | None = None,
+    validation_depth: Literal["evidence", "full"] = "full",
+) -> _InputBatchMetadata:
+    """Validate one input batch through identity and exact raw membership."""
+    envelope = _load_input_batch_envelope(
+        directory,
+        raw_directory=raw_directory,
+        expected_input_generation_id=expected_input_generation_id,
+    )
+    records = envelope.manifest["cases"]
+    indices = envelope.manifest["case_indices"]
+    normalized_records: list[Mapping[str, Any]] = []
+    case_payloads: list[Mapping[str, Any]] = []
+    expected_names: set[str] = set()
+    for record, index in zip(records, indices, strict=True):
+        case_payload = _validate_input_case_record(
+            envelope,
+            record,
+            index,
+            validation_depth=validation_depth,
+        )
+        expected_names.add(str(record["case_id"]))
+        normalized_records.append(record)
+        case_payloads.append(case_payload)
+    observed_names = {entry.name for entry in envelope.raw_directory.iterdir()}
+    if (
+        len(expected_names) != len(records)
+        or observed_names != expected_names
+        or any(not (envelope.raw_directory / case_id).is_dir() for case_id in expected_names)
+    ):
+        _raise_for_execution_artifact(envelope.raw_directory)
+        message = "Input-generation raw case membership is not exact."
+        raise ValueError(message)
+    return _InputBatchMetadata(
+        directory=envelope.directory,
+        raw_directory=envelope.raw_directory,
+        manifest=envelope.manifest,
+        resolved_config=envelope.resolved_config,
+        records=tuple(normalized_records),
+        case_payloads=tuple(case_payloads),
+        parameter_metadata=envelope.parameter_metadata,
     )
 
 
@@ -794,42 +901,50 @@ def _case_reference(
     *,
     source: InputSource,
     record: Mapping[str, Any],
+    case_payload: Mapping[str, Any],
     case_directory: Path,
     input_directory: Path,
     parameter_metadata: Mapping[str, Any] | None,
+    validation_depth: Literal["evidence", "full"],
 ) -> InputCaseReference:
-    """Bind one validated case identity record without parsing adapter arrays."""
+    """Bind one case from admitted metadata with optional byte validation."""
+    if validation_depth not in {"evidence", "full"}:
+        message = f"Unsupported input admission depth: {validation_depth!r}."
+        raise ValueError(message)
     payload_path = case_directory / "case.json"
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        message = "Input source case.json must be a JSON object."
-        raise TypeError(message)
     identity_fields = (
         "case_index",
         "case_id",
         "case_input_id",
         "simulation_case_id",
     )
-    if any(payload.get(key) != record[key] for key in identity_fields):
+    if any(case_payload.get(key) != record[key] for key in identity_fields):
         message = "Input source case.json disagrees with metadata identity evidence."
         raise ValueError(message)
-    if (
-        common.serialization.file_sha256(payload_path) != record["case_json_sha256"]
-        or common.serialization.canonical_json_sha256(payload.get("seed_evidence")) != record["seed_evidence_sha256"]
-        or payload.get("input_files") != record["input_files"]
-    ):
+    input_files = record["input_files"]
+    if case_payload.get("input_files") != input_files or any(case_payload.get(key) != getattr(source, key) for key in ("batch_id", "batch_identity")):
+        message = "Input source case.json disagrees with source metadata evidence."
+        raise ValueError(message)
+    if common.serialization.canonical_json_sha256(case_payload.get("seed_evidence")) != record["seed_evidence_sha256"]:
         message = "Input source case.json disagrees with metadata hash inventory."
         raise ValueError(message)
-    if any(payload.get(key) != getattr(source, key) for key in ("batch_id", "batch_identity")):
-        message = "Input source case.json disagrees with source batch identity."
-        raise ValueError(message)
-    for filename, identity in record["input_files"].items():
+    for filename, identity in input_files.items():
         path = input_directory / str(filename)
+        size_bytes = identity.get("size_bytes") if isinstance(identity, Mapping) else None
+        digest = identity.get("sha256") if isinstance(identity, Mapping) else None
         if (
             not path.is_file()
+            or path.is_symlink()
             or not isinstance(identity, Mapping)
-            or path.stat().st_size != identity.get("size_bytes")
-            or common.serialization.file_sha256(path) != identity.get("sha256")
+            or set(identity) != {"sha256", "size_bytes"}
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or not isinstance(digest, str)
+            or len(digest) != _SHA256_LENGTH
+            or any(character not in "0123456789abcdef" for character in digest)
+            or path.stat().st_size != size_bytes
+            or (validation_depth == "full" and common.serialization.file_sha256(path) != digest)
         ):
             message = f"Input source adapter hash or size disagrees with metadata: {path}"
             raise ValueError(message)
@@ -847,9 +962,76 @@ def _case_reference(
         int(record["case_index"]),
         str(record["case_input_id"]),
         str(record["simulation_case_id"]),
+        str(record["case_json_sha256"]),
+        payload_path.stat().st_size,
         case_directory,
         input_directory,
         parameter_metadata,
+        json.dumps(case_payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+    )
+
+
+def admit_input_case_evidence(
+    directory: Path | str,
+    case_index: int,
+    *,
+    raw_directory: Path | str | None = None,
+    expected_input_generation_id: str | None = None,
+    validation_depth: Literal["evidence", "full"] = "full",
+) -> InputCaseReference:
+    """Admit one selected immutable case without reconstructing its batch."""
+    if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 1:
+        message = "Input case index must be a positive integer."
+        raise ValueError(message)
+    envelope = _load_input_batch_envelope(
+        directory,
+        raw_directory=raw_directory,
+        expected_input_generation_id=expected_input_generation_id,
+    )
+    matches = [
+        record
+        for record, index in zip(
+            envelope.manifest["cases"],
+            envelope.manifest["case_indices"],
+            strict=True,
+        )
+        if index == case_index
+    ]
+    if len(matches) != 1:
+        message = f"Input manifest does not declare exactly one case index {case_index}."
+        raise ValueError(message)
+    record = matches[0]
+    case_payload = _validate_input_case_record(
+        envelope,
+        record,
+        case_index,
+        validation_depth=validation_depth,
+    )
+    manifest = envelope.manifest
+    provisional = InputSource(
+        str(manifest["input_generation_id"]),
+        "input_generated",
+        str(manifest["simulation_profile"]),
+        str(manifest["batch_id"]),
+        str(manifest["batch_storage_name"]),
+        str(manifest["batch_identity"]),
+        str(manifest["material_family"]),
+        str(manifest["sampling_regime"]),
+        str(manifest["campaign_purpose"]),
+        envelope.directory,
+        (),
+        _freeze_json_evidence(manifest),
+        _freeze_json_evidence(envelope.resolved_config),
+    )
+    case_id = str(record["case_id"])
+    return _case_reference(
+        source=provisional,
+        record=record,
+        case_payload=case_payload,
+        case_directory=envelope.raw_directory / case_id,
+        input_directory=envelope.raw_directory / case_id / "inputs",
+        parameter_metadata=envelope.parameter_metadata,
+        validation_depth=validation_depth,
     )
 
 
@@ -889,6 +1071,7 @@ def admit_input_batch(
         directory,
         raw_directory=raw_directory,
         expected_input_generation_id=expected_input_generation_id,
+        validation_depth="full",
     )
     manifest = metadata.manifest
     provisional = InputSource(
@@ -903,16 +1086,24 @@ def admit_input_batch(
         str(manifest["campaign_purpose"]),
         metadata.directory,
         (),
+        _freeze_json_evidence(manifest),
+        _freeze_json_evidence(metadata.resolved_config),
     )
     cases = []
-    for record in metadata.records:
+    for record, case_payload in zip(
+        metadata.records,
+        metadata.case_payloads,
+        strict=True,
+    ):
         case_id = str(record["case_id"])
         reference = _case_reference(
             source=provisional,
             record=record,
+            case_payload=case_payload,
             case_directory=metadata.raw_directory / case_id,
             input_directory=metadata.raw_directory / case_id / "inputs",
             parameter_metadata=metadata.parameter_metadata,
+            validation_depth="full",
         )
         case = admit_input_case_reference(reference)
         if any(
@@ -937,12 +1128,17 @@ def admit_input_batch_source(
     maximum_cases: int | None = None,
     raw_directory: Path | str | None = None,
     expected_input_generation_id: str | None = None,
+    validation_depth: Literal["evidence", "full"] = "full",
 ) -> InputSource:
-    """Validate one canonical input source without loading adapter arrays."""
+    """Admit one canonical source with metadata-only or full byte checks."""
+    if validation_depth not in {"evidence", "full"}:
+        message = f"Unsupported input admission depth: {validation_depth!r}."
+        raise ValueError(message)
     metadata = _load_input_batch_metadata(
         directory,
         raw_directory=raw_directory,
         expected_input_generation_id=expected_input_generation_id,
+        validation_depth=validation_depth,
     )
     manifest = metadata.manifest
     provisional = InputSource(
@@ -957,16 +1153,25 @@ def admit_input_batch_source(
         str(manifest["campaign_purpose"]),
         metadata.directory,
         (),
+        _freeze_json_evidence(manifest),
+        _freeze_json_evidence(metadata.resolved_config),
     )
+    bounded_records = _bounded_case_records(metadata.records, maximum_cases)
     references = tuple(
         _case_reference(
             source=provisional,
             record=record,
+            case_payload=case_payload,
             case_directory=metadata.raw_directory / str(record["case_id"]),
             input_directory=metadata.raw_directory / str(record["case_id"]) / "inputs",
             parameter_metadata=metadata.parameter_metadata,
+            validation_depth=validation_depth,
         )
-        for record in _bounded_case_records(metadata.records, maximum_cases)
+        for record, case_payload in zip(
+            bounded_records,
+            metadata.case_payloads[: len(bounded_records)],
+            strict=True,
+        )
     )
     return InputSource(
         provisional.source_id,
@@ -980,6 +1185,8 @@ def admit_input_batch_source(
         provisional.campaign_purpose,
         provisional.directory,
         references,
+        provisional.manifest_payload(),
+        provisional.resolved_config_evidence(),
     )
 
 

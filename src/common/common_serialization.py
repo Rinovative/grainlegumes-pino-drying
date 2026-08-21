@@ -33,6 +33,41 @@ from typing import Any
 
 PathWriter = Callable[[Path], None]
 
+_ATOMIC_TEMPORARY_SUFFIX = ".tmp"
+
+
+def atomic_write_temporary_destination(candidate: Path | str) -> Path | None:
+    """
+    Return the destination named by one atomic-write temporary sibling.
+
+    Parameters
+    ----------
+    candidate : Path | str
+        Candidate sibling path to classify lexically.
+
+    Returns
+    -------
+    Path | None
+        The same-directory destination encoded by atomic_path_write, or None
+        when the candidate does not match that naming contract.
+
+    Notes
+    -----
+    This function classifies only the common atomic naming contract. Callers
+    must still validate the candidate file type and require the derived
+    destination name to belong to their authoritative domain.
+
+    """
+    candidate_path = Path(candidate)
+    name = candidate_path.name
+    if not name.startswith(".") or not name.endswith(_ATOMIC_TEMPORARY_SUFFIX):
+        return None
+    body = name[1 : -len(_ATOMIC_TEMPORARY_SUFFIX)]
+    destination_name, separator, random_name = body.rpartition(".")
+    if not separator or not destination_name or not random_name:
+        return None
+    return candidate_path.with_name(destination_name)
+
 
 def _fsync_file(path: Path) -> None:
     """
@@ -106,7 +141,7 @@ def atomic_path_write(destination: Path | str, writer: PathWriter) -> Path:
     descriptor, raw_temp_path = tempfile.mkstemp(
         dir=final_path.parent,
         prefix=f".{final_path.name}.",
-        suffix=".tmp",
+        suffix=_ATOMIC_TEMPORARY_SUFFIX,
     )
     os.close(descriptor)
     temp_path = Path(raw_temp_path)

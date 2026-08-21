@@ -746,7 +746,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect evidence-first cleanup, timeout handling, exports, and locking."""
-    config_path, _template = generation_config_factory(executable=fake_comsol, timeout=0.1)
+    config_path, _template = generation_config_factory(executable=fake_comsol, timeout=1.0)
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch=_natural_batch_name("transient_drying"),

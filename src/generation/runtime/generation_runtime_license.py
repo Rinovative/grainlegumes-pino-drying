@@ -22,6 +22,7 @@ import json
 import os
 import re
 import socket
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Final
@@ -366,6 +367,17 @@ def _validate_wait_record(
     return payload
 
 
+def _owned_atomic_temporary_entry(path: Path, *, destination: Path) -> bool:
+    """Return whether a safe present or just-published atomic sibling is owned."""
+    if common.serialization.atomic_write_temporary_destination(path) != destination:
+        return False
+    try:
+        entry_status = path.lstat()
+    except FileNotFoundError:
+        return True
+    return stat.S_ISREG(entry_status.st_mode)
+
+
 def load_temporary_license_wait(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -386,10 +398,20 @@ def load_temporary_license_wait(
         message = f"Temporary-license retry evidence directory is unsafe: {directory}"
         raise ValueError(message)
     entries = sorted(directory.iterdir())
-    if not entries:
-        return None
     wait_path = directory / _WAIT_FILENAME
-    if len(entries) != 1 or entries[0] != wait_path or wait_path.is_symlink() or not wait_path.is_file():
+    for entry in entries:
+        if entry == wait_path:
+            if entry.is_symlink() or not entry.is_file():
+                message = f"Temporary-license retry evidence directory contains unexpected entries: {directory}"
+                raise ValueError(message)
+            continue
+        if _owned_atomic_temporary_entry(entry, destination=wait_path):
+            continue
+        message = f"Temporary-license retry evidence directory contains unexpected entries: {directory}"
+        raise ValueError(message)
+    if not wait_path.exists():
+        return None
+    if wait_path.is_symlink() or not wait_path.is_file():
         message = f"Temporary-license retry evidence directory contains unexpected entries: {directory}"
         raise ValueError(message)
     try:
@@ -1397,6 +1419,13 @@ def load_in_allocation_status_artifact_recoveries(
         raise ValueError(message)
     records: list[dict[str, Any]] = []
     for path in sorted(directory.iterdir(), key=lambda candidate: candidate.name):
+        temporary_destination = common.serialization.atomic_write_temporary_destination(path)
+        if (
+            temporary_destination is not None
+            and _STATUS_RECOVERY_FILENAME_PATTERN.fullmatch(temporary_destination.name) is not None
+            and _owned_atomic_temporary_entry(path, destination=temporary_destination)
+        ):
+            continue
         match = _STATUS_RECOVERY_FILENAME_PATTERN.fullmatch(path.name)
         if path.is_symlink() or not path.is_file() or match is None:
             message = f"Status-artifact recovery directory contains an unsafe entry: {path}"

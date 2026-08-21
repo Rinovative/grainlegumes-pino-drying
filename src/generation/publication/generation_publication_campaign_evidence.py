@@ -30,7 +30,7 @@ from src.generation.contracts import generation_contracts_paths as path_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
@@ -142,6 +142,22 @@ def resolve_campaign_config_path(value: Any) -> Path:
     return resolved
 
 
+def _validate_campaign_scheduler_job_ids(
+    value: object,
+    *,
+    run_id: str,
+) -> list[str]:
+    """Validate the ordered scheduler identities persisted by one campaign."""
+    if (
+        not isinstance(value, list)
+        or len(value) != len(set(value))
+        or not all(isinstance(job_id, str) and _JOB_ID_PATTERN.fullmatch(job_id) is not None for job_id in value)
+    ):
+        message = f"Campaign-run submission state is malformed: {run_id}."
+        raise ValueError(message)
+    return value
+
+
 def _validate_campaign_run_header(
     manifest: Mapping[str, Any],
     *,
@@ -185,15 +201,13 @@ def _validate_campaign_run_header(
         "cancel_requested",
         "force_cancel_requested",
     }
-    job_ids = manifest.get("slurm_job_ids")
-    if (
-        manifest.get("state") not in states
-        or not isinstance(job_ids, list)
-        or len(job_ids) != len(set(job_ids))
-        or not all(isinstance(job_id, str) and _JOB_ID_PATTERN.fullmatch(job_id) is not None for job_id in job_ids)
-    ):
+    if manifest.get("state") not in states:
         message = f"Campaign-run submission state is malformed: {run_id}."
         raise ValueError(message)
+    job_ids = _validate_campaign_scheduler_job_ids(
+        manifest.get("slurm_job_ids"),
+        run_id=run_id,
+    )
     common.paths.validate_logical_name(
         manifest.get("scheduler_job_name"),
         label="scheduler_job_name",
@@ -438,6 +452,42 @@ def load_campaign_run(
     return manifest
 
 
+def load_campaign_scheduler_job_ids(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> tuple[str, ...]:
+    """Load only exact persisted scheduler ownership for one campaign run."""
+    path = campaign_run_manifest_path(run_id, storage_root=storage_root)
+    if not path.is_file() or path.is_symlink():
+        message = f"Campaign-run manifest is missing or unsafe: {path}"
+        raise FileNotFoundError(message)
+    manifest = load_json_object(path, label="campaign-run manifest")
+    if (
+        manifest.get("schema_kind") != "generation_campaign_run"
+        or manifest.get("schema_version") != _RUN_MANIFEST_SCHEMA_VERSION
+        or manifest.get("campaign_run_id") != run_id
+    ):
+        message = f"Unsupported or malformed campaign-run manifest: {run_id}."
+        raise ValueError(message)
+    job_ids = _validate_campaign_scheduler_job_ids(
+        manifest.get("slurm_job_ids"),
+        run_id=run_id,
+    )
+    persisted_ids, unresolved = _validate_submission_records(
+        manifest,
+        run_id=run_id,
+    )
+    if persisted_ids != job_ids:
+        message = f"Campaign-run job IDs disagree with submission records: {run_id}."
+        raise ValueError(message)
+    intent = manifest.get("submission_intent")
+    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
+        message = f"Campaign-run durable submission intent is inconsistent: {run_id}."
+        raise ValueError(message)
+    return tuple(job_ids)
+
+
 def _validate_admission_reservations_for_campaign(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -491,7 +541,9 @@ def campaign_from_manifest(
     current_by_name = {str(package["dataset_name"]): package for package in campaign.dataset_packages}
     snapshot_names = [str(package.get("dataset_name")) for package in snapshot]
     if len(snapshot_names) != len(set(snapshot_names)) or any(
-        current_by_name.get(name) != package for name, package in zip(snapshot_names, snapshot, strict=True)
+        current_by_name.get(name) is None
+        or config_service.dataset_package_scientific_plan(current_by_name[name]) != config_service.dataset_package_scientific_plan(package)
+        for name, package in zip(snapshot_names, snapshot, strict=True)
     ):
         message = "Campaign launch-time Dataset package declarations were removed or changed."
         raise RuntimeError(message)
@@ -558,12 +610,12 @@ def _relative_path_is_ignored(
     return any(relative_path == ignored or relative_path.startswith(f"{ignored}/") for ignored in ignored_relative_paths)
 
 
-def transfer_inventory_from_plan(
+def _planned_transfer_files(
     plan: Mapping[str, Any],
     *,
     storage_root: Path,
-) -> dict[str, Any]:
-    """Return the exact symlink-free campaign transfer inventory."""
+) -> list[tuple[str, Path, int]]:
+    """Enumerate exact planned files once without reading their payload bytes."""
     relative_directories = [
         directory
         for batch in plan["batches"]
@@ -575,7 +627,7 @@ def transfer_inventory_from_plan(
         )
     ]
     relative_directories.append(plan["campaign_directory"])
-    records: list[dict[str, Any]] = []
+    files: list[tuple[str, Path, int]] = []
     seen: set[str] = set()
     for relative_value in relative_directories:
         relative = Path(relative_value)
@@ -586,46 +638,203 @@ def transfer_inventory_from_plan(
         if not directory.is_relative_to(storage_root) or not directory.is_dir() or directory.is_symlink():
             message = f"Transfer source is missing or unsafe: {directory}"
             raise FileNotFoundError(message)
-        ignored_relative_paths = POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
-        for path in sorted(directory.rglob("*")):
-            if path.is_symlink():
-                message = f"Transfer source contains a symbolic link: {path}"
+        ignored = POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
+        for candidate in sorted(directory.rglob("*")):
+            if candidate.is_symlink():
+                message = f"Transfer source contains a symbolic link: {candidate}"
                 raise ValueError(message)
-            relative_to_directory = path.relative_to(directory).as_posix()
-            if not path.is_file() or _relative_path_is_ignored(relative_to_directory, ignored_relative_paths):
+            child = candidate.relative_to(directory).as_posix()
+            if not candidate.is_file() or _relative_path_is_ignored(child, ignored):
                 continue
-            relative_path = path.relative_to(storage_root).as_posix()
+            relative_path = candidate.relative_to(storage_root).as_posix()
             if relative_path in seen:
                 message = f"Transfer inventory contains a duplicate path: {relative_path!r}"
                 raise RuntimeError(message)
             seen.add(relative_path)
-            records.append(
-                {
-                    "relative_path": relative_path,
-                    "size_bytes": path.stat().st_size,
-                    "sha256": common.serialization.file_sha256(path),
-                }
+            files.append(
+                (
+                    relative_path,
+                    candidate,
+                    candidate.stat().st_size,
+                )
             )
-    records.sort(key=lambda record: str(record["relative_path"]))
+    return sorted(files, key=lambda item: item[0])
+
+
+def _emit_inventory_progress(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    *,
+    files_validated: int,
+    files_total: int,
+    bytes_validated: int,
+    bytes_total: int,
+) -> None:
+    """Emit bounded factual progress without another inventory traversal."""
+    if callback is None:
+        return
+    interval = max(1, (files_total + 19) // 20)
+    if files_validated not in {0, files_total} and files_validated % interval != 0:
+        return
+    callback(
+        {
+            "operation": "transfer_content_validation",
+            "files_validated": files_validated,
+            "files_total": files_total,
+            "bytes_validated": bytes_validated,
+            "bytes_total": bytes_total,
+            "eta": "unavailable",
+        }
+    )
+
+
+def transfer_inventory_from_plan(
+    plan: Mapping[str, Any],
+    *,
+    storage_root: Path,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Hash each exact campaign transfer file once with bounded progress."""
+    planned = _planned_transfer_files(plan, storage_root=storage_root)
+    files_total = len(planned)
+    bytes_total = sum(size_bytes for _, _, size_bytes in planned)
+    bytes_validated = 0
+    records: list[dict[str, Any]] = []
+    _emit_inventory_progress(
+        progress,
+        files_validated=0,
+        files_total=files_total,
+        bytes_validated=0,
+        bytes_total=bytes_total,
+    )
+    for index, (relative_path, candidate, size_bytes) in enumerate(
+        planned,
+        start=1,
+    ):
+        records.append(
+            {
+                "relative_path": relative_path,
+                "size_bytes": size_bytes,
+                "sha256": common.serialization.file_sha256(candidate),
+            }
+        )
+        bytes_validated += size_bytes
+        _emit_inventory_progress(
+            progress,
+            files_validated=index,
+            files_total=files_total,
+            bytes_validated=bytes_validated,
+            bytes_total=bytes_total,
+        )
     return {
-        "file_count": len(records),
-        "size_bytes": sum(int(record["size_bytes"]) for record in records),
+        "file_count": files_total,
+        "size_bytes": bytes_total,
         "files": records,
         "inventory_sha256": common.serialization.canonical_json_sha256(records),
     }
 
 
-def validate_transfer_receipt(
+def admit_transfer_inventory(
+    inventory: Mapping[str, Any],
+    *,
+    storage_root: Path,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Admit a persisted transfer inventory with metadata-only file checks.
+
+    This path proves receipt shape, safe regular-file membership, persisted
+    sizes, and the aggregate identity.  It intentionally does not hash payload
+    bytes; callers requiring fresh content validation must reconstruct the
+    inventory through :func:`transfer_inventory_from_plan`.
+    """
+    required = {"file_count", "size_bytes", "files", "inventory_sha256"}
+    if set(inventory) != required:
+        message = "Transfer inventory has an unsupported schema."
+        raise ValueError(message)
+    records = inventory.get("files")
+    if not isinstance(records, list):
+        message = "Transfer inventory files must be a list."
+        raise TypeError(message)
+    planned = (
+        None
+        if plan is None
+        else {
+            relative_path: size_bytes
+            for relative_path, _path, size_bytes in _planned_transfer_files(
+                plan,
+                storage_root=storage_root,
+            )
+        }
+    )
+    seen: set[str] = set()
+    previous = ""
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"relative_path", "size_bytes", "sha256"}:
+            message = "Transfer inventory file record is malformed."
+            raise ValueError(message)
+        relative_value = record["relative_path"]
+        size_bytes = record["size_bytes"]
+        digest = record["sha256"]
+        relative = Path(relative_value) if isinstance(relative_value, str) else None
+        if (
+            relative is None
+            or not relative_value
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative_value in seen
+            or relative_value <= previous
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            message = "Transfer inventory file record is malformed."
+            raise ValueError(message)
+        if planned is None:
+            candidate = storage_root
+            for part in relative.parts:
+                candidate = candidate / part
+                if candidate.is_symlink():
+                    message = f"Transferred file is missing, unsafe, or has a changed size: {relative_value!r}."
+                    raise FileNotFoundError(message)
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(storage_root) or not resolved.is_file() or resolved.stat().st_size != size_bytes:
+                message = f"Transferred file is missing, unsafe, or has a changed size: {relative_value!r}."
+                raise FileNotFoundError(message)
+        elif planned.get(relative_value) != size_bytes:
+            message = f"Transferred file is missing, unsafe, extra, or has a changed size: {relative_value!r}."
+            raise FileNotFoundError(message)
+        seen.add(relative_value)
+        previous = relative_value
+    if planned is not None and set(planned) != seen:
+        message = "Transferred file membership differs from its inventory."
+        raise FileNotFoundError(message)
+    if (
+        inventory.get("file_count") != len(records)
+        or inventory.get("size_bytes") != sum(int(record["size_bytes"]) for record in records)
+        or inventory.get("inventory_sha256") != common.serialization.canonical_json_sha256(records)
+    ):
+        message = "Transfer inventory aggregate evidence is malformed."
+        raise ValueError(message)
+    return dict(inventory)
+
+
+def _validate_transfer_receipt_against_inventory(
     run_id: str,
     *,
     terminal: Mapping[str, Any],
     plan: Mapping[str, Any],
-    storage_root: Path | str | None = None,
+    storage_root: Path,
+    inventory: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate immutable GPU publication against explicit terminal evidence."""
-    destination = path_contract.resolve_storage_root(storage_root, create=False)
-    inventory = transfer_inventory_from_plan(plan, storage_root=destination)
-    run_directory = campaign_run_directory(run_id, storage_root=destination)
+    """Validate one receipt against either fresh or admitted inventory evidence."""
+    admitted_inventory = admit_transfer_inventory(
+        inventory,
+        storage_root=storage_root,
+        plan=plan,
+    )
+    run_directory = campaign_run_directory(run_id, storage_root=storage_root)
     terminal_path = run_directory / "campaign_terminal.json"
     receipt_path = run_directory / "transfer_complete.json"
     receipt = load_json_object(receipt_path, label="transfer completion receipt")
@@ -674,12 +883,12 @@ def validate_transfer_receipt(
         or receipt.get("campaign_run_id") != run_id
         or receipt.get("campaign_id") != terminal["campaign_id"]
         or receipt.get("git_commit") != terminal["git_commit"]
-        or receipt.get("destination_storage_root") != str(destination)
+        or receipt.get("destination_storage_root") != str(storage_root)
         or receipt.get("campaign_terminal_sha256") != common.serialization.file_sha256(terminal_path)
-        or receipt.get("transferred_file_count") != inventory["file_count"]
-        or receipt.get("transferred_bytes") != inventory["size_bytes"]
-        or receipt.get("transfer_inventory_sha256") != inventory["inventory_sha256"]
-        or receipt.get("files") != inventory["files"]
+        or receipt.get("transferred_file_count") != admitted_inventory["file_count"]
+        or receipt.get("transferred_bytes") != admitted_inventory["size_bytes"]
+        or receipt.get("transfer_inventory_sha256") != admitted_inventory["inventory_sha256"]
+        or receipt.get("files") != admitted_inventory["files"]
         or observed_directories != expected_directories
         or receipt.get("terminal_validation") != {"status": "pass", "batch_count": len(terminal["batches"])}
         or receipt.get("source_removed") is not False
@@ -698,3 +907,48 @@ def validate_transfer_receipt(
         message = f"Transfer source identity is invalid: {receipt_path}"
         raise ValueError(message)
     return receipt
+
+
+def validate_transfer_receipt(
+    run_id: str,
+    *,
+    terminal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Fully rehash immutable GPU publication against terminal evidence."""
+    destination = path_contract.resolve_storage_root(storage_root, create=False)
+    inventory = transfer_inventory_from_plan(plan, storage_root=destination)
+    return _validate_transfer_receipt_against_inventory(
+        run_id,
+        terminal=terminal,
+        plan=plan,
+        storage_root=destination,
+        inventory=inventory,
+    )
+
+
+def admit_transfer_receipt(
+    run_id: str,
+    *,
+    terminal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Admit immutable transfer evidence without rehashing campaign payloads."""
+    destination = path_contract.resolve_storage_root(storage_root, create=False)
+    receipt_path = campaign_run_directory(run_id, storage_root=destination) / "transfer_complete.json"
+    receipt = load_json_object(receipt_path, label="transfer completion receipt")
+    inventory = {
+        "file_count": receipt.get("transferred_file_count"),
+        "size_bytes": receipt.get("transferred_bytes"),
+        "files": receipt.get("files"),
+        "inventory_sha256": receipt.get("transfer_inventory_sha256"),
+    }
+    return _validate_transfer_receipt_against_inventory(
+        run_id,
+        terminal=terminal,
+        plan=plan,
+        storage_root=destination,
+        inventory=inventory,
+    )

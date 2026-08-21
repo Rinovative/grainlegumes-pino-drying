@@ -112,6 +112,7 @@ from src.datasets.packages import (
     dataset_packages_generated_batch,
     dataset_packages_manifest,
     dataset_packages_planning,
+    dataset_packages_transient_shards,
 )
 from src.datasets.preprocessing import (
     dataset_preprocessing_normalization,
@@ -148,6 +149,7 @@ modules = (
     dataset_packages_generated_batch,
     dataset_packages_manifest,
     dataset_packages_planning,
+    dataset_packages_transient_shards,
     dataset_preprocessing_normalization,
     dataset_preprocessing_splits,
     dataset_runtime_factory,
@@ -185,6 +187,8 @@ assert dataset_package_services.builder.build_campaign_packages is dataset_packa
 assert dataset_package_services.generated_batch.load_generated_batch is dataset_packages_generated_batch.load_generated_batch
 assert dataset_package_services.manifest.load_package_manifest is dataset_packages_manifest.load_package_manifest
 assert dataset_package_services.planning.prepare_campaign_packages is dataset_packages_planning.prepare_campaign_packages
+assert dataset_package_services.transient_shards is dataset_packages_transient_shards
+assert dataset_package_services.transient_shards.build_transient_shards is dataset_packages_transient_shards.build_transient_shards
 assert dataset_package_services.inspect_dataset_package is dataset_packages.inspect_dataset_package
 assert dataset_preprocessing.normalization.build_normalizer_artifact is dataset_preprocessing_normalization.build_normalizer_artifact
 assert dataset_preprocessing.splits.admit_split_contract is dataset_preprocessing_splits.admit_split_contract

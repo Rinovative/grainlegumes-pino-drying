@@ -28,6 +28,7 @@ from typing import Any, Final
 import yaml
 
 from src import common
+from src.datasets.packages import DEFAULT_TRANSIENT_PT_SHARD_BYTES
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_provenance as provenance_service
@@ -1631,6 +1632,13 @@ def _package_source_count(
     return source_count
 
 
+def dataset_package_scientific_plan(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return package membership semantics without derived Training storage policy."""
+    plan = copy.deepcopy(dict(value))
+    plan.pop("training_payload", None)
+    return plan
+
+
 def _validate_dataset_packages(
     value: Any,
     *,
@@ -1657,12 +1665,42 @@ def _validate_dataset_packages(
         _exact_keys(
             package,
             required={"evaluation_regime", "source_role"},
-            optional={"dataset_view"},
+            optional={"dataset_view", "training_payload"},
             label=label,
         )
         regime = package["evaluation_regime"]
         source_role = package["source_role"]
         dataset_view = package.get("dataset_view")
+        training_payload = package.get("training_payload")
+        if training_payload is not None:
+            training_payload = _mapping(
+                training_payload,
+                label=f"{label}.training_payload",
+            )
+            _exact_keys(
+                training_payload,
+                required={"backend", "required"},
+                optional={"target_shard_bytes"},
+                label=f"{label}.training_payload",
+            )
+            target_shard_bytes = training_payload.get(
+                "target_shard_bytes",
+                DEFAULT_TRANSIENT_PT_SHARD_BYTES,
+            )
+            if (
+                training_payload["backend"] != "pt_shards"
+                or not isinstance(training_payload["required"], bool)
+                or isinstance(target_shard_bytes, bool)
+                or not isinstance(target_shard_bytes, int)
+                or target_shard_bytes < 1
+            ):
+                message = f"{label}.training_payload must declare pt_shards, one boolean required flag, and optional positive target_shard_bytes."
+                raise GenerationConfigError(message)
+            if dataset_view == "steady_flow":
+                message = f"{label}.training_payload applies only to transient_drying."
+                raise GenerationConfigError(message)
+            training_payload["target_shard_bytes"] = target_shard_bytes
+            package["training_payload"] = training_payload
         if dataset_view is not None and dataset_view not in profile.available_learning_views:
             message = f"{label}.dataset_view must be one of {list(profile.available_learning_views)}, got {dataset_view!r}."
             raise GenerationConfigError(message)
@@ -1721,6 +1759,8 @@ def _validate_dataset_packages(
                     "parameter_ood": regime == "parameter_ood" and campaign_purpose == "family_generalization",
                 },
             }
+            if dataset_view != "transient_drying":
+                package.pop("training_payload", None)
             if is_id:
                 per_material = copy.deepcopy(dict(membership["per_seen_material"]))
                 package["membership"] = {

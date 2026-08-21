@@ -99,6 +99,20 @@ def load_package_manifest(
     return package_manifest.load_package_manifest(dataset_id, storage_root=storage_root)
 
 
+def load_package_manifest_evidence(
+    dataset_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Admit one package manifest and payload metadata without content rehashing."""
+    from .packages import dataset_packages_manifest as package_manifest  # noqa: PLC0415
+
+    return package_manifest.load_package_manifest_evidence(
+        dataset_id,
+        storage_root=storage_root,
+    )
+
+
 def load_dataset_package_manifest(
     dataset_id: str,
     *,

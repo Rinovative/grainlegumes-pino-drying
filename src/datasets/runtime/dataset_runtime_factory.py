@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 
@@ -29,6 +29,7 @@ from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_manifest as package_manifest
+from src.datasets.packages import dataset_packages_transient_shards as transient_shards
 
 from . import dataset_runtime_steady as steady
 from . import dataset_runtime_transient as transient
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import torch
+
+
+TransientBackendPreference = Literal["pt_shards", "canonical_hdf5"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,8 @@ class DatasetRequest:
     transient_sampling: transient_contract.TransientSamplingSpec | None = None
     storage_root: Path | str | None = None
     allow_technical_smoke: bool = False
+    transient_backend_preference: TransientBackendPreference = "pt_shards"
+    transient_backend_required: bool = False
 
     def __post_init__(self) -> None:
         """Reject selectors that are ambiguous or invalid for their regime."""
@@ -75,6 +81,15 @@ class DatasetRequest:
         if not isinstance(self.allow_technical_smoke, bool):
             message = "allow_technical_smoke must be boolean."
             raise TypeError(message)
+        if self.transient_backend_preference not in {"pt_shards", "canonical_hdf5"}:
+            message = "transient_backend_preference must be 'pt_shards' or 'canonical_hdf5'."
+            raise ValueError(message)
+        if not isinstance(self.transient_backend_required, bool):
+            message = "transient_backend_required must be boolean."
+            raise TypeError(message)
+        if self.dataset_view != "transient_drying" and self.transient_backend_required:
+            message = "Steady-flow Dataset requests cannot require a transient backend."
+            raise ValueError(message)
         if self.evaluation_regime == "id":
             if self.ood_group is not None:
                 message = "ID package selection cannot include an OOD group."
@@ -143,7 +158,8 @@ def _select_transient(
         ood_group=ood_group,
     )
     dataset.close()
-    return transient.TransientPhysicalDataset(
+    dataset_type = transient.TransientPTShardDataset if isinstance(dataset, transient.TransientPTShardDataset) else transient.TransientPhysicalDataset
+    return dataset_type(
         dataset.index_path,
         sampling=dataset.sampling,
         source_root=dataset.source_root,
@@ -153,17 +169,14 @@ def _select_transient(
     )
 
 
-def create_dataset(
+def _create_dataset_from_manifest(
     request: DatasetRequest,
+    manifest: Mapping[str, Any],
     *,
     hdf5_cache_size: int = 0,
     transient_transform: transient.TransientTransform | None = None,
 ) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
-    """Resolve, validate, and select one package-backed runtime dataset."""
-    manifest = package_manifest.load_package_manifest(
-        request.dataset_id,
-        storage_root=request.storage_root,
-    )
+    """Construct one runtime from package evidence admitted by its caller."""
     if manifest["dataset_view"] != request.dataset_view or manifest["evaluation_regime"] != request.evaluation_regime:
         message = (
             f"Dataset request {request.dataset_view!r}/{request.evaluation_regime!r} "
@@ -193,13 +206,30 @@ def create_dataset(
     if sampling is None:
         message = "Validated transient Dataset request lost its explicit sampling specification."
         raise RuntimeError(message)
-    transient_dataset = transient.TransientPhysicalDataset(
-        payload_path,
-        sampling=sampling,
-        source_root=request.storage_root,
-        hdf5_cache_size=hdf5_cache_size,
-        transform=transient_transform,
+    shard_directory = transient_shards.transient_shard_directory(
+        request.dataset_id,
+        storage_root=request.storage_root,
     )
+    transient_dataset: transient.TransientPhysicalDataset
+    if request.transient_backend_preference == "pt_shards" and shard_directory.exists():
+        transient_dataset = transient.TransientPTShardDataset(
+            payload_path,
+            sampling=sampling,
+            source_root=request.storage_root,
+            hdf5_cache_size=hdf5_cache_size,
+            transform=transient_transform,
+        )
+    elif request.transient_backend_preference == "pt_shards" and request.transient_backend_required:
+        message = f"Required transient PT shard payload is missing for {request.dataset_id!r}."
+        raise FileNotFoundError(message)
+    else:
+        transient_dataset = transient.TransientPhysicalDataset(
+            payload_path,
+            sampling=sampling,
+            source_root=request.storage_root,
+            hdf5_cache_size=hdf5_cache_size,
+            transform=transient_transform,
+        )
     if (
         transient_dataset.payload["dataset_id"] != manifest["dataset_id"]
         or transient_dataset.payload["evaluation_regime"] != manifest["evaluation_regime"]
@@ -209,6 +239,25 @@ def create_dataset(
         message = f"Transient index does not bind its package manifest: {payload_path}."
         raise ValueError(message)
     return _select_transient(transient_dataset, request)
+
+
+def create_dataset(
+    request: DatasetRequest,
+    *,
+    hdf5_cache_size: int = 0,
+    transient_transform: transient.TransientTransform | None = None,
+) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
+    """Resolve, validate, and select one package-backed runtime dataset."""
+    manifest = package_manifest.load_package_manifest(
+        request.dataset_id,
+        storage_root=request.storage_root,
+    )
+    return _create_dataset_from_manifest(
+        request,
+        manifest,
+        hdf5_cache_size=hdf5_cache_size,
+        transient_transform=transient_transform,
+    )
 
 
 def _collate_steady_metadata(values: Sequence[Any]) -> Any:

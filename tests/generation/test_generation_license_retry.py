@@ -8,12 +8,13 @@ import signal
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from queue import Queue
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import yaml
 
-from src import generation
+from src import common, generation
 from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_batch as batch_runtime
 from src.generation.runtime import generation_runtime_license as license_service
@@ -334,6 +335,394 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     assert records[0]["checkout_index"] == 3
     assert records[0]["solver_progress_started"] is False
     assert records[0]["required_exports_exist"] is False
+
+
+def _status_recovery_artifact(work_directory: Path, *, checkout_index: int) -> tuple[Any, Any]:
+    """Return one synthetic COMSOL status artifact and capacity classification."""
+    work_directory.mkdir(parents=True)
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=checkout_index,
+    )
+    (work_directory / stop_service.STOP_STATUS_FILENAME).write_text(
+        "1787228251108\nError",
+        encoding="utf-8",
+    )
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=7731 + checkout_index,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+    classification = license_service.classify_temporary_license_capacity(
+        _OBSERVED_CAPACITY_TEXT,
+    )
+    assert artifact is not None
+    assert classification is not None
+    return artifact, classification
+
+
+def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read no partial receipt, then preserve pending-to-complete publication."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    run_id = "concurrent_status_recovery__0123456789abcdef"
+    job_id = "638283"
+    artifact, classification = _status_recovery_artifact(
+        tmp_path / "status-work",
+        checkout_index=3,
+    )
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    ended_at = started_at + timedelta(seconds=1)
+    staged: Queue[Path] = Queue()
+    releases: Queue[None] = Queue()
+    original_fsync = common.serialization._fsync_file
+
+    def gated_fsync(temporary_path: Path) -> None:
+        original_fsync(temporary_path)
+        staged.put(temporary_path)
+        releases.get(timeout=10.0)
+
+    monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
+    publication = {
+        "campaign_run_id": run_id,
+        "job_id": job_id,
+        "checkout_started_at": started_at,
+        "checkout_ended_at": ended_at,
+        "hostname": "synthetic-node",
+        "artifact": artifact,
+        "classification": classification,
+        "storage_root": storage,
+    }
+    expected = (
+        license_service.in_allocation_status_recovery_directory(
+            run_id,
+            config.batch_id,
+            config.case_id(1),
+            job_id,
+            storage_root=storage,
+        )
+        / "checkout_0003.json"
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending_future = executor.submit(
+            license_service.record_in_allocation_status_artifact_recovery,
+            config,
+            1,
+            **publication,
+            cleanup_state="pending",
+        )
+        try:
+            pending_temporary = staged.get(timeout=10.0)
+            assert pending_temporary.is_file()
+            assert common.serialization.atomic_write_temporary_destination(pending_temporary) == expected
+            assert not expected.exists()
+            assert (
+                license_service.load_in_allocation_status_artifact_recoveries(
+                    config,
+                    1,
+                    campaign_run_id=run_id,
+                    job_id=job_id,
+                    storage_root=storage,
+                )
+                == ()
+            )
+        finally:
+            releases.put(None)
+        assert pending_future.result(timeout=10.0) == expected
+
+        pending_records = license_service.load_in_allocation_status_artifact_recoveries(
+            config,
+            1,
+            campaign_run_id=run_id,
+            job_id=job_id,
+            storage_root=storage,
+        )
+        assert [record["cleanup_state"] for record in pending_records] == ["pending"]
+        stop_service.remove_capacity_checkout_status(artifact)
+
+        complete_future = executor.submit(
+            license_service.record_in_allocation_status_artifact_recovery,
+            config,
+            1,
+            **publication,
+            cleanup_state="complete",
+        )
+        try:
+            complete_temporary = staged.get(timeout=10.0)
+            assert complete_temporary.is_file()
+            assert common.serialization.atomic_write_temporary_destination(complete_temporary) == expected
+            during_completion = license_service.load_in_allocation_status_artifact_recoveries(
+                config,
+                1,
+                campaign_run_id=run_id,
+                job_id=job_id,
+                storage_root=storage,
+            )
+            assert [record["cleanup_state"] for record in during_completion] == ["pending"]
+        finally:
+            releases.put(None)
+        assert complete_future.result(timeout=10.0) == expected
+
+    complete_records = license_service.load_in_allocation_status_artifact_recoveries(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id=job_id,
+        storage_root=storage,
+    )
+    assert [record["cleanup_state"] for record in complete_records] == ["complete"]
+    assert complete_records[0]["checkout_index"] == 3
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_match"),
+    [
+        ("unexpected_temporary", "unsafe entry"),
+        ("atomic_temporary_symlink", "unsafe entry"),
+        ("malformed_final", "Could not load"),
+        ("conflicting_checkout", "filename is malformed"),
+    ],
+)
+def test_status_recovery_directory_remains_fail_closed(
+    mutation: str,
+    error_match: str,
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Reject every non-owned, unsafe, malformed, or identity-conflicting entry."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    run_id = f"fail_closed_{mutation}__0123456789abcdef"
+    job_id = "638284"
+    artifact, classification = _status_recovery_artifact(
+        tmp_path / "status-work",
+        checkout_index=3,
+    )
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    receipt = license_service.record_in_allocation_status_artifact_recovery(
+        config,
+        1,
+        campaign_run_id=run_id,
+        job_id=job_id,
+        checkout_started_at=started_at,
+        checkout_ended_at=started_at + timedelta(seconds=1),
+        hostname="synthetic-node",
+        artifact=artifact,
+        classification=classification,
+        cleanup_state="pending",
+        storage_root=storage,
+    )
+    if mutation == "unexpected_temporary":
+        (receipt.parent / ".checkout_0003.json.foreign.extra.tmp").write_text(
+            "foreign",
+            encoding="utf-8",
+        )
+    elif mutation == "atomic_temporary_symlink":
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        (receipt.parent / ".checkout_0004.json.abcdefgh.tmp").symlink_to(outside)
+    elif mutation == "malformed_final":
+        receipt.write_text("{", encoding="utf-8")
+    else:
+        conflicting = json.loads(receipt.read_text(encoding="utf-8"))
+        conflicting["checkout_index"] = 4
+        common.serialization.atomic_write_json(receipt, conflicting)
+
+    with pytest.raises(ValueError, match=error_match):
+        license_service.load_in_allocation_status_artifact_recoveries(
+            config,
+            1,
+            campaign_run_id=run_id,
+            job_id=job_id,
+            storage_root=storage,
+        )
+
+
+def test_concurrent_status_recovery_directories_remain_independent(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile two actively publishing case/job directories independently."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=2,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    run_id = "parallel_status_recovery__0123456789abcdef"
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    classification = license_service.classify_temporary_license_capacity(
+        _OBSERVED_CAPACITY_TEXT,
+    )
+    assert classification is not None
+    publications: list[tuple[int, str, Any]] = []
+    for case_index, job_id in ((1, "638285"), (2, "638286")):
+        artifact, _classification = _status_recovery_artifact(
+            tmp_path / f"status-work-{case_index}",
+            checkout_index=1,
+        )
+        publications.append((case_index, job_id, artifact))
+
+    staged: Queue[Path] = Queue()
+    releases: Queue[None] = Queue()
+    original_fsync = common.serialization._fsync_file
+
+    def gated_fsync(temporary_path: Path) -> None:
+        original_fsync(temporary_path)
+        staged.put(temporary_path)
+        releases.get(timeout=10.0)
+
+    monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                license_service.record_in_allocation_status_artifact_recovery,
+                config,
+                case_index,
+                campaign_run_id=run_id,
+                job_id=job_id,
+                checkout_started_at=started_at,
+                checkout_ended_at=started_at + timedelta(seconds=1),
+                hostname=f"synthetic-node-{case_index}",
+                artifact=artifact,
+                classification=classification,
+                cleanup_state="pending",
+                storage_root=storage,
+            )
+            for case_index, job_id, artifact in publications
+        ]
+        try:
+            temporary_paths = {staged.get(timeout=10.0), staged.get(timeout=10.0)}
+            expected_destinations = {
+                license_service.in_allocation_status_recovery_directory(
+                    run_id,
+                    config.batch_id,
+                    config.case_id(case_index),
+                    job_id,
+                    storage_root=storage,
+                )
+                / "checkout_0001.json"
+                for case_index, job_id, _artifact in publications
+            }
+            assert {common.serialization.atomic_write_temporary_destination(path) for path in temporary_paths} == expected_destinations
+            for case_index, job_id, _artifact in publications:
+                assert (
+                    license_service.load_in_allocation_status_artifact_recoveries(
+                        config,
+                        case_index,
+                        campaign_run_id=run_id,
+                        job_id=job_id,
+                        storage_root=storage,
+                    )
+                    == ()
+                )
+        finally:
+            releases.put(None)
+            releases.put(None)
+        assert {future.result(timeout=10.0) for future in futures} == expected_destinations
+
+    for case_index, job_id, _artifact in publications:
+        records = license_service.load_in_allocation_status_artifact_recoveries(
+            config,
+            case_index,
+            campaign_run_id=run_id,
+            job_id=job_id,
+            storage_root=storage,
+        )
+        assert len(records) == 1
+        assert records[0]["case_id"] == config.case_id(case_index)
+        assert records[0]["slurm_job_id"] == job_id
+
+
+def test_temporary_license_wait_loader_admits_atomic_update(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore only the exact mutable wait receipt's in-flight atomic sibling."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    storage = tmp_path / "storage"
+    run_id = "concurrent_license_wait__0123456789abcdef"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    monkeypatch.setenv("SLURM_JOB_ID", "638287")
+    staged: Queue[Path] = Queue()
+    releases: Queue[None] = Queue()
+    original_fsync = common.serialization._fsync_file
+
+    def gated_fsync(temporary_path: Path) -> None:
+        original_fsync(temporary_path)
+        staged.put(temporary_path)
+        releases.get(timeout=10.0)
+
+    monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            license_service.record_temporary_license_wait,
+            config,
+            1,
+            _capacity_error(tmp_path / "license-work"),
+            storage_root=storage,
+        )
+        try:
+            temporary_path = staged.get(timeout=10.0)
+            expected = (
+                license_service.temporary_license_wait_directory(
+                    run_id,
+                    config.batch_id,
+                    config.case_id(1),
+                    storage_root=storage,
+                )
+                / "license_wait.json"
+            )
+            assert temporary_path.is_file()
+            assert common.serialization.atomic_write_temporary_destination(temporary_path) == expected
+            assert (
+                license_service.load_temporary_license_wait(
+                    config,
+                    1,
+                    campaign_run_id=run_id,
+                    storage_root=storage,
+                )
+                is None
+            )
+        finally:
+            releases.put(None)
+        assert future.result(timeout=10.0) == expected
+
+    wait = license_service.load_temporary_license_wait(
+        config,
+        1,
+        campaign_run_id=run_id,
+        storage_root=storage,
+    )
+    assert wait is not None
+    assert wait["latest_job_id"] == "638287"
+    assert wait["retry_count"] == 1
 
 
 def test_license_retry_backoff_is_exponential_and_bounded() -> None:

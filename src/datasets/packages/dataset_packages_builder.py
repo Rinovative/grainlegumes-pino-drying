@@ -313,7 +313,7 @@ def _transient_sources(prepared: planning.PreparedPackage) -> tuple[trajectory.T
     sources: list[trajectory.TransientSourceCase] = []
     for candidate in prepared.candidates:
         case = candidate["case_evidence"]
-        artifact = case.artifact("processed", "case.h5")
+        artifact = case.artifact_evidence("processed", "case.h5")
         if artifact.sha256 != case.case_hdf5_sha256:
             message = f"Admitted transient HDF5 evidence disagrees for {case.case_id!r}."
             raise RuntimeError(message)
@@ -340,10 +340,10 @@ def _publish(
     *,
     dataset_id: str,
     payload_filename: str,
-    manifest: Mapping[str, Any],
-    build_payload: Callable[[Path], None],
+    manifest_prefix: Mapping[str, Any],
+    build_payload: Callable[[Path], Mapping[str, int]],
     storage_root: Path | str | None,
-) -> tuple[Path, Path, bool]:
+) -> tuple[Path, Path, bool, dict[str, Any]]:
     """Atomically publish or integrity-reuse one locked immutable package."""
     payload_root = common.paths.get_dataset_packages_root(storage_root=storage_root)
     metadata_root = common.paths.get_dataset_metadata_root(storage_root=storage_root)
@@ -352,22 +352,31 @@ def _publish(
     destination = destination_dir / payload_filename
     manifest_path = metadata_dir / "dataset_manifest.json"
     lock_path = common.paths.resolve_dataset_build_lock_path(dataset_id, storage_root=storage_root)
-    requested_manifest = dict(manifest)
+    requested_prefix = dict(manifest_prefix)
+    published_manifest: dict[str, Any]
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         if destination.is_file() and manifest_path.is_file():
             try:
-                existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 message = f"Existing package manifest is unreadable: {manifest_path}."
                 raise ValueError(message) from error
-            if not isinstance(existing_manifest, dict):
+            if not isinstance(raw_manifest, dict):
                 message = f"Existing package manifest is malformed: {manifest_path}."
                 raise TypeError(message)
-            payload_sha256 = existing_manifest.pop("payload_sha256", None)
-            if existing_manifest != requested_manifest or payload_sha256 != common.serialization.file_sha256(destination):
+            if any(raw_manifest.get(key) != value for key, value in requested_prefix.items()):
                 message = f"Existing package content conflicts with {dataset_id!r}."
                 raise FileExistsError(message)
-            return destination, manifest_path, True
+            try:
+                existing_manifest = package_manifest.validate_manifest_content(
+                    raw_manifest,
+                    dataset_id=dataset_id,
+                    payload_path=destination,
+                )
+            except (FileNotFoundError, TypeError, ValueError) as error:
+                message = f"Existing package content conflicts with {dataset_id!r}."
+                raise FileExistsError(message) from error
+            return destination, manifest_path, True, existing_manifest
         if destination_dir.exists() or metadata_dir.exists():
             message = f"Partial or conflicting dataset package already exists: {dataset_id!r}."
             raise FileExistsError(message)
@@ -380,14 +389,24 @@ def _publish(
         staged_metadata_dir.mkdir()
         try:
             staged_payload = staged_payload_dir / payload_filename
-            build_payload(staged_payload)
-            complete_manifest = {
-                **requested_manifest,
+            payload_metadata = dict(build_payload(staged_payload))
+            if set(payload_metadata) != {"sample_count", "transition_count"}:
+                message = "Dataset payload builder returned invalid manifest metadata."
+                raise RuntimeError(message)
+            published_manifest = {
+                **requested_prefix,
+                **payload_metadata,
                 "payload_sha256": common.serialization.file_sha256(staged_payload),
             }
+            package_manifest.validate_manifest_content(
+                published_manifest,
+                dataset_id=dataset_id,
+                payload_path=staged_payload,
+                validate_payload_hash=False,
+            )
             common.serialization.atomic_write_json(
                 staged_metadata_dir / "dataset_manifest.json",
-                complete_manifest,
+                published_manifest,
             )
             destination_dir.parent.mkdir(parents=True, exist_ok=True)
             metadata_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -395,7 +414,14 @@ def _publish(
             staged_metadata_dir.replace(metadata_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-    return destination, manifest_path, False
+    admitted_manifest = package_manifest.load_package_manifest_evidence(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    if admitted_manifest != published_manifest:
+        message = f"Published package manifest changed during admission: {dataset_id!r}."
+        raise RuntimeError(message)
+    return destination, manifest_path, False, admitted_manifest
 
 
 def _publish_prepared(
@@ -410,10 +436,8 @@ def _publish_prepared(
     dataset_view = str(prepared.plan["dataset_view"])
     if dataset_view == "steady_flow":
         payload_filename = f"{dataset_id}.pt"
-        sample_count = len(prepared.candidates)
-        transition_count = 0
 
-        def build_payload(path: Path) -> None:
+        def build_payload(path: Path) -> Mapping[str, int]:
             _build_steady_payload(
                 campaign,
                 prepared,
@@ -421,54 +445,70 @@ def _publish_prepared(
                 provenance=provenance,
                 destination=path,
             )
+            return {
+                "sample_count": len(prepared.candidates),
+                "transition_count": 0,
+            }
 
     elif dataset_view == "transient_drying":
         payload_filename = f"{dataset_id}.json"
-        source_root = common.paths.get_storage_root(storage_root=storage_root)
-        source_cases = _transient_sources(prepared)
-        preview = trajectory.build_transient_index(
-            source_cases,
-            None,
-            dataset_name=str(prepared.plan["dataset_name"]),
-            dataset_id=dataset_id,
-            evaluation_regime=str(prepared.plan["evaluation_regime"]),
-            source_root=source_root,
-        )
-        sample_count = int(preview["sample_count"])
-        transition_count = int(preview["transition_count"])
 
-        def build_payload(path: Path) -> None:
-            built = trajectory.build_transient_index(
-                source_cases,
-                path,
+        def build_payload(path: Path) -> Mapping[str, int]:
+            source_root = common.paths.get_storage_root(storage_root=storage_root)
+            preview = trajectory.build_transient_index(
+                _transient_sources(prepared),
+                None,
                 dataset_name=str(prepared.plan["dataset_name"]),
                 dataset_id=dataset_id,
                 evaluation_regime=str(prepared.plan["evaluation_regime"]),
                 source_root=source_root,
             )
-            if built["index_digest"] != preview["index_digest"]:
-                message = "Transient transition identity changed between preview and publication."
-                raise RuntimeError(message)
+            serialized = json.dumps(
+                preview,
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+            common.serialization.atomic_write_text(path, f"{serialized}\n")
+            return {
+                "sample_count": int(preview["sample_count"]),
+                "transition_count": int(preview["transition_count"]),
+            }
 
     else:
         message = f"Unsupported dataset view: {dataset_view!r}."
         raise ValueError(message)
-    manifest = {
+    manifest_prefix = {
         **provenance,
         "dataset_id": dataset_id,
         "dataset_digest": dataset_digest,
         "payload_filename": payload_filename,
-        "sample_count": sample_count,
         "source_case_count": len(prepared.candidates),
-        "transition_count": transition_count,
     }
-    destination, manifest_path, reused = _publish(
+    if dataset_view == "steady_flow":
+        manifest_prefix.update(
+            {
+                "sample_count": len(prepared.candidates),
+                "transition_count": 0,
+            }
+        )
+    destination, manifest_path, reused, manifest = _publish(
         dataset_id=dataset_id,
         payload_filename=payload_filename,
-        manifest=manifest,
+        manifest_prefix=manifest_prefix,
         build_payload=build_payload,
         storage_root=storage_root,
     )
+    if reused and dataset_view == "transient_drying":
+        existing_index = trajectory.load_transient_index(destination)
+        if (
+            existing_index["dataset_id"] != dataset_id
+            or existing_index["sample_count"] != manifest["sample_count"]
+            or existing_index["source_case_count"] != manifest["source_case_count"]
+            or existing_index["transition_count"] != manifest["transition_count"]
+        ):
+            message = f"Existing package content conflicts with {dataset_id!r}."
+            raise FileExistsError(message)
     return {
         "dataset_name": prepared.plan["dataset_name"],
         "dataset_id": dataset_id,
@@ -476,9 +516,9 @@ def _publish_prepared(
         "evaluation_regime": prepared.plan["evaluation_regime"],
         "payload_path": destination,
         "manifest_path": manifest_path,
-        "sample_count": sample_count,
+        "sample_count": int(manifest["sample_count"]),
         "source_case_count": len(prepared.candidates),
-        "transition_count": transition_count,
+        "transition_count": int(manifest["transition_count"]),
         "status": "reused" if reused else "complete",
     }
 

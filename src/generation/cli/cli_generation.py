@@ -25,7 +25,7 @@ import signal
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src import common
 from src.generation import generation_background as background_service
@@ -51,12 +51,71 @@ from src.generation.runtime import generation_runtime_workspace as workspace_ser
 from src.generation.validation import generation_validation_pilot as pilot_service
 from src.generation.validation import generation_validation_sentinels as sentinel_service
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 
 def _add_storage_arguments(parser: argparse.ArgumentParser, *, include_work: bool = False) -> None:
     """Add shared storage and optional work-root boundaries."""
     parser.add_argument("--storage-root", type=Path)
     if include_work:
         parser.add_argument("--work-root", type=Path)
+
+
+_WORKFLOW_PROGRESS_FIELDS = (
+    "operation",
+    "campaign_run_id",
+    "dataset_id",
+    "files_validated",
+    "files_total",
+    "bytes_validated",
+    "bytes_total",
+    "packages_completed",
+    "packages_total",
+    "batches_completed",
+    "batches_total",
+    "cases_completed",
+    "cases_total",
+    "generated_cases",
+    "reused_cases",
+    "cases_packed",
+    "source_bytes_read",
+    "shards_completed",
+    "shards_total",
+    "bytes_written",
+    "training_payloads_completed",
+    "training_payloads_total",
+    "work_units_admitted",
+    "work_units_total",
+    "scheduler_submissions",
+    "jobs_running",
+    "jobs_pending",
+    "jobs_terminal",
+    "heartbeat",
+    "source_host_dependency",
+    "eta",
+)
+
+
+def _print_workflow_progress(event: Mapping[str, Any]) -> None:
+    """Emit one bounded human-readable workflow progress line to stderr."""
+    fields = []
+    for name in _WORKFLOW_PROGRESS_FIELDS:
+        value = event.get(name)
+        if isinstance(value, bool):
+            rendered = str(value).lower()
+        elif isinstance(value, int | float | str):
+            rendered = str(value)
+        else:
+            continue
+        if any(character in rendered for character in "\r\n\t"):
+            continue
+        fields.append(f"{name}={shlex.quote(rendered)}")
+    print(
+        "progress " + " ".join(fields),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _add_case_range(parser: argparse.ArgumentParser) -> None:
@@ -544,17 +603,32 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="prepare or reuse exact canonical inputs before submission",
     )
     _add_campaign_execution_arguments(prepare_campaign_inputs)
+    prepare_campaign_inputs.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress bounded batch and case progress lines on stderr",
+    )
 
     submit_campaign = subparsers.add_parser(
         "submit-campaign",
         help="submit and persist one exact-commit campaign run",
     )
     _add_campaign_execution_arguments(submit_campaign)
+    submit_campaign.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress bounded scheduler submission progress lines on stderr",
+    )
+    submit_campaign.add_argument(
+        "--inputs-prepared",
+        action="store_true",
+        help="admit immutable inputs prepared by the immediately preceding workflow stage",
+    )
 
     campaign_status = subparsers.add_parser("campaign-status", help="reconstruct persistent campaign and scheduler status")
     campaign_status.add_argument("campaign_run_id")
     campaign_status.add_argument("--no-scheduler", action="store_true")
-    campaign_status.add_argument("--format", choices=("json", "state", "summary", "monitor"), default="json")
+    campaign_status.add_argument("--format", choices=("json", "state", "summary", "monitor", "workflow-monitor"), default="json")
     campaign_status.add_argument("--max-active-cases", type=int)
     _add_storage_arguments(campaign_status)
 
@@ -585,6 +659,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="advance one case through the campaign resume matrix",
     )
     resume.add_argument("campaign_run_id")
+    resume.add_argument(
+        "--format",
+        choices=("json", "workflow-monitor"),
+        default="json",
+    )
+    resume.add_argument("--max-active-cases", type=int)
     _add_storage_arguments(resume)
 
     interruption = subparsers.add_parser(
@@ -606,6 +686,11 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     publish_transfer.add_argument("--source-host", required=True)
     publish_transfer.add_argument("--source-storage-root", required=True)
     publish_transfer.add_argument("--partial", action="store_true")
+    publish_transfer.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress bounded file and byte progress lines on stderr",
+    )
 
     campaign_terminal = subparsers.add_parser("validate-campaign-terminal", help="validate and publish terminal campaign evidence")
     campaign_terminal.add_argument("campaign_run_id")
@@ -726,11 +811,28 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     build_datasets.add_argument("--partial", action="store_true")
     _add_storage_arguments(build_datasets)
 
+    prepare_gpu_datasets = subparsers.add_parser(
+        "prepare-gpu-datasets",
+        help="prepare missing Dataset packages and transient PT shards from terminal GPU data",
+    )
+    prepare_gpu_datasets.add_argument("campaign_run_id")
+    prepare_gpu_datasets.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress bounded progress lines on stderr",
+    )
+    _add_storage_arguments(prepare_gpu_datasets)
+
     validate_package_state = subparsers.add_parser(
         "validate-campaign-package-state",
         help="validate the immutable base and all current package extensions",
     )
     validate_package_state.add_argument("campaign_run_id")
+    validate_package_state.add_argument(
+        "--full-content",
+        action="store_true",
+        help="rehash package and derived payload bytes for explicit diagnostics",
+    )
     _add_storage_arguments(validate_package_state)
 
     prepare_all = subparsers.add_parser(
@@ -792,6 +894,17 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     source_status.add_argument("campaign_run_id")
     source_status.add_argument("--query-scheduler", action="store_true")
+    source_size_mode = source_status.add_mutually_exclusive_group()
+    source_size_mode.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="report exact lifecycle state without recursive source sizing (default)",
+    )
+    source_size_mode.add_argument(
+        "--include-sizes",
+        action="store_true",
+        help="explicitly perform recursive source sizing",
+    )
     source_status.add_argument("--format", choices=("json", "tsv"), default="json")
     _add_storage_arguments(source_status)
 
@@ -802,6 +915,22 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     storage_status.add_argument("--role", choices=("gpu", "cpu"), required=True)
     storage_status.add_argument("--campaign-run-id")
     storage_status.add_argument("--query-scheduler", action="store_true")
+    storage_size_mode = storage_status.add_mutually_exclusive_group()
+    storage_size_mode.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="skip recursive size and payload inspection work (default)",
+    )
+    storage_size_mode.add_argument(
+        "--include-sizes",
+        action="store_true",
+        help="explicitly perform recursive size and payload inspection work",
+    )
+    storage_status.add_argument(
+        "--omit-run-status",
+        action="store_true",
+        help="omit campaign reconciliation already reported by another snapshot",
+    )
     _add_storage_arguments(storage_status)
 
     shared_setup_idle = subparsers.add_parser(
@@ -1562,8 +1691,8 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
             query_scheduler=not args.no_scheduler,
         )
-        if args.max_active_cases is not None and args.format not in {"summary", "monitor"}:
-            message = "--max-active-cases requires --format summary or monitor."
+        if args.max_active_cases is not None and args.format not in {"summary", "monitor", "workflow-monitor"}:
+            message = "--max-active-cases requires --format summary, monitor, or workflow-monitor."
             raise ValueError(message)
         if args.format == "state":
             print(status["campaign_state"])
@@ -1578,6 +1707,19 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             print(
                 campaign_status_service.format_campaign_monitor(
                     status,
+                    max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
+                )
+            )
+        elif args.format == "workflow-monitor":
+            source_status = workflow_service.campaign_source_status_from_snapshot(
+                args.campaign_run_id,
+                campaign_status=status,
+                storage_root=args.storage_root,
+            )
+            print(
+                campaign_status_service.format_workflow_monitor(
+                    status,
+                    source_status,
                     max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
                 )
             )
@@ -1607,11 +1749,34 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(manifest, sort_keys=True))
         return 0
     if args.command == "resume-campaign":
-        manifest = campaign_runtime.resume_campaign(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(manifest, sort_keys=True))
+        if args.max_active_cases is not None and args.format != "workflow-monitor":
+            message = "--max-active-cases requires --format workflow-monitor."
+            raise ValueError(message)
+        if args.format == "workflow-monitor":
+            snapshot = campaign_runtime.resume_campaign_monitor_snapshot(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+                progress=_print_workflow_progress,
+            )
+            status = snapshot["status"]
+            source_status = workflow_service.campaign_source_status_from_snapshot(
+                args.campaign_run_id,
+                campaign_status=status,
+                storage_root=args.storage_root,
+            )
+            print(
+                campaign_status_service.format_workflow_monitor(
+                    status,
+                    source_status,
+                    max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
+                )
+            )
+        else:
+            manifest = campaign_runtime.resume_campaign(
+                args.campaign_run_id,
+                storage_root=args.storage_root,
+            )
+            print(json.dumps(manifest, sort_keys=True))
         return 0
     if args.command == "record-worker-interruption":
         path = campaign_runtime.record_worker_interruption(
@@ -1630,6 +1795,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             source_host=args.source_host,
             source_storage_root=args.source_storage_root,
             partial=args.partial,
+            progress=(None if args.quiet_progress else _print_workflow_progress),
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
@@ -1873,10 +2039,19 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
+    if args.command == "prepare-gpu-datasets":
+        result = workflow_service.prepare_gpu_datasets(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            progress=None if args.quiet_progress else _print_workflow_progress,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "validate-campaign-package-state":
         state = workflow_service.validate_campaign_package_state(
             args.campaign_run_id,
             storage_root=args.storage_root,
+            validation_depth=("full" if args.full_content else "evidence"),
         )
         print(json.dumps(state, sort_keys=True))
         return 0
@@ -1981,6 +2156,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             args.campaign_run_id,
             storage_root=args.storage_root,
             query_scheduler=args.query_scheduler,
+            include_sizes=args.include_sizes,
         )
         if args.format == "json":
             print(json.dumps(status, sort_keys=True))
@@ -1992,7 +2168,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                         str(status["campaign_run_id"]),
                         str(status["campaign_state"]),
                         str(status["source_state"]),
-                        str(status["reclaimable_bytes"]),
+                        "unavailable" if status["reclaimable_bytes"] is None else str(status["reclaimable_bytes"]),
                         str(status["cleanup_eligibility"]),
                         str(status["active_slurm"]),
                     )
@@ -2005,6 +2181,8 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             role=args.role,
             run_id=args.campaign_run_id,
             query_scheduler=args.query_scheduler,
+            include_sizes=args.include_sizes,
+            include_runs=not args.omit_run_status,
         )
         print(json.dumps(status, sort_keys=True))
         return 0
@@ -2099,6 +2277,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 campaign,
                 git_commit=args.git_commit,
                 storage_root=args.storage_root,
+                progress=(None if args.quiet_progress else _print_workflow_progress),
             )
             print(f"canonical-inputs\t{readiness['generated_case_count']}\t{readiness['reused_case_count']}")
             return 0
@@ -2106,6 +2285,8 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             campaign,
             git_commit=args.git_commit,
             storage_root=args.storage_root,
+            progress=(None if args.quiet_progress else _print_workflow_progress),
+            inputs_prepared=args.inputs_prepared,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0

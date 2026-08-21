@@ -18,7 +18,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from collections import OrderedDict
@@ -37,6 +36,7 @@ from torch.utils.data import Dataset
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.packages import dataset_packages_trajectory as trajectory
+from src.datasets.packages import dataset_packages_transient_shards as transient_shards
 
 
 class TransientTime(TypedDict):
@@ -119,6 +119,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         self.sampling = sampling
         self.hdf5_cache_size = hdf5_cache_size
         self.transform = transform
+        self.storage_backend = "canonical_hdf5"
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:
@@ -135,8 +136,20 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         self._item_references = self._build_item_references()
         self._process_id: int | None = None
         self._handles: OrderedDict[Path, h5py.File] = OrderedDict()
-        self._source_paths = tuple(self._validate_case_source(case) for case in self.payload["cases"])
-        self._source_stats = tuple((path.stat().st_size, path.stat().st_mtime_ns) for path in self._source_paths)
+        selected_cases = {int(self.payload["samples"][position]["case_index"]) for position in self.sample_indices}
+        source_paths: list[Path | None] = []
+        source_stats: list[tuple[int, int] | None] = []
+        for case_index, case in enumerate(self.payload["cases"]):
+            if case_index not in selected_cases:
+                source_paths.append(None)
+                source_stats.append(None)
+                continue
+            source_path = self._validate_case_source(case)
+            stat = source_path.stat()
+            source_paths.append(source_path)
+            source_stats.append((stat.st_size, stat.st_mtime_ns))
+        self._source_paths = tuple(source_paths)
+        self._source_stats = tuple(source_stats)
 
     @property
     def dataset_id(self) -> str:
@@ -236,6 +249,9 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
     def _validate_runtime_source(self, case_index: int) -> Path:
         """Reject a source whose stat or hash changed after dataset admission."""
         path = self._source_paths[case_index]
+        if path is None:
+            message = f"Transient runtime case {case_index} was not admitted by its sample selection."
+            raise RuntimeError(message)
         stat = path.stat()
         observed_stat = (stat.st_size, stat.st_mtime_ns)
         if observed_stat != self._source_stats[case_index]:
@@ -299,139 +315,65 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         path = self._validate_runtime_source(case_index)
         handle, close_after = self._open_handle(path)
         try:
-            transient_dataset = trajectory.require_hdf5_dataset(handle, "transient/fields")
-            static_dataset = trajectory.require_hdf5_dataset(handle, "static/fields")
-            schedule_dataset = trajectory.require_hdf5_dataset(handle, "schedule/values")
-            scalar_dataset = trajectory.require_hdf5_dataset(handle, "scalar/values")
-            time_dataset = trajectory.require_hdf5_dataset(handle, "time")
-            transient_names = trajectory.decode_json_string_list(transient_dataset.attrs["field_names"], label="transient.field_names")
-            static_names = trajectory.decode_json_string_list(static_dataset.attrs["field_names"], label="static.field_names")
-            schedule_names = trajectory.decode_json_string_list(schedule_dataset.attrs["field_names"], label="schedule.field_names")
-            scalar_names = trajectory.decode_json_string_list(scalar_dataset.attrs["field_names"], label="scalar.field_names")
-            state_indices = [int(samples[0]["time_index_n"]), *[int(sample["time_index_n_plus_1"]) for sample in samples]]
-            time_values = np.asarray(time_dataset[state_indices], dtype=np.float64)
-            tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
-            time_unit = time_dataset.attrs.get("unit")
-            if isinstance(time_unit, bytes):
-                time_unit = time_unit.decode("utf-8")
-            dt_values = np.diff(time_values)
-            if (
-                time_values.shape != (len(samples) + 1,)
-                or not np.isfinite(time_values).all()
-                or not math.isfinite(tolerance)
-                or tolerance <= 0.0
-                or time_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit
-                or not np.allclose(
-                    dt_values,
-                    transient_contract.TRANSIENT_STEP_CONTRACT.time_step,
-                    rtol=0.0,
-                    atol=tolerance,
-                )
-            ):
-                message = f"Transient indexed time coordinates are invalid: {path}."
-                raise trajectory.TransientDataContractError(message)
-            dynamic_indices = [transient_names.index(field.name) for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state]
-            states_array = np.stack(
-                [np.asarray(transient_dataset[time_index, dynamic_indices, :, :], dtype=np.float32) for time_index in state_indices],
-                axis=0,
-            )
-            x_axis = np.asarray(trajectory.require_hdf5_dataset(handle, "coords/x")[:], dtype=np.float32)
-            y_axis = np.asarray(trajectory.require_hdf5_dataset(handle, "coords/y")[:], dtype=np.float32)
-            x_grid, y_grid = np.meshgrid(x_axis, y_axis)
-            static_values: dict[str, np.ndarray] = {"x": x_grid, "y": y_grid}
-            for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning:
-                if field.name not in static_values:
-                    static_values[field.name] = np.asarray(static_dataset[static_names.index(field.name), :, :], dtype=np.float32)
-            static_array = np.stack(
-                [static_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning],
-                axis=0,
-            )
-            scalar_lookup = {
-                field.name: float(scalar_dataset[scalar_names.index(field.name)])
-                for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
-            }
-            scalar_lookup["T_amb"] = float(scalar_dataset[scalar_names.index("T_amb")])
-            raw_handoff = schedule_dataset.attrs.get("boundary_handoff")
-            if isinstance(raw_handoff, bytes):
-                raw_handoff = raw_handoff.decode("utf-8")
-            if not isinstance(raw_handoff, str):
-                message = f"Transient source lacks boundary-handoff metadata: {path}."
-                raise trajectory.TransientDataContractError(message)
-            try:
-                boundary_handoff = json.loads(raw_handoff)
-            except json.JSONDecodeError as error:
-                message = f"Transient source boundary-handoff metadata is invalid: {path}."
-                raise trajectory.TransientDataContractError(message) from error
-            startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
-            if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
-                message = f"Transient source startup-handoff metadata is invalid: {path}."
-                raise trajectory.TransientDataContractError(message)
-            startup_time = startup.get("duration_h")
-            if isinstance(startup_time, bool) or not isinstance(startup_time, (int, float)) or not math.isfinite(float(startup_time)):
-                message = f"Transient source startup duration is invalid: {path}."
-                raise trajectory.TransientDataContractError(message)
-            startup_time_value = float(startup_time)
-            boundary_rows: list[list[float]] = []
-            for sample in samples:
-                schedule_n = int(sample["schedule_index_n"])
-                schedule_n_plus_1 = int(sample["schedule_index_n_plus_1"])
-                raw_support_index = sample["schedule_support_index"]
-                schedule_time_n = float(schedule_dataset[schedule_n, schedule_names.index("t")])
-                schedule_time_n_plus_1 = float(schedule_dataset[schedule_n_plus_1, schedule_names.index("t")])
-                support_required = bool(startup["enabled"] and schedule_time_n < startup_time_value < schedule_time_n_plus_1)
-                if support_required != (raw_support_index is not None):
-                    message = f"Transient index startup support disagrees with source handoff: {path}."
-                    raise trajectory.TransientDataContractError(message)
-                support_index = schedule_n if raw_support_index is None else int(raw_support_index)
-                if raw_support_index is not None and not math.isclose(
-                    float(schedule_dataset[support_index, schedule_names.index("t")]),
-                    startup_time_value,
-                    rel_tol=0.0,
-                    abs_tol=tolerance,
-                ):
-                    message = f"Transient index startup support points to the wrong source row: {path}."
-                    raise trajectory.TransientDataContractError(message)
-                support_time_offset = (
-                    0.0
-                    if raw_support_index is None
-                    else float(schedule_dataset[support_index, schedule_names.index("t")])
-                    - float(schedule_dataset[schedule_n, schedule_names.index("t")])
-                )
-                boundary_values = {
-                    "T_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in_bc")]),
-                    "T_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("T_in_bc")]),
-                    "omega_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("omega_in_bc")]),
-                    "omega_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("omega_in_bc")]),
-                    "T_amb": scalar_lookup["T_amb"],
-                    "startup_support_time_offset": support_time_offset,
-                    "T_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("T_in_bc")]),
-                    "omega_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("omega_in_bc")]),
-                    "startup_support_present": float(raw_support_index is not None),
-                }
-                boundary_rows.append([boundary_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning])
-            boundary_array = np.asarray(boundary_rows, dtype=np.float32)
-            scalar_array = np.asarray(
-                [scalar_lookup[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning],
-                dtype=np.float32,
+            arrays = trajectory.read_transient_case_arrays(
+                handle,
+                path,
+                case,
+                samples,
+                expected_regular_horizon=self.configured_regular_horizon,
             )
         finally:
             if close_after:
                 handle.close()
-        states = self._finite_tensor(states_array, label="state sequence", path=path)
+        return self._materialize_item(
+            case=case,
+            samples=samples,
+            states_array=arrays.states,
+            static_array=arrays.static,
+            boundary_array=arrays.boundary,
+            scalar_array=arrays.scalars,
+            time_values=arrays.time,
+            source_label=path,
+        )
+
+    def _materialize_item(
+        self,
+        *,
+        case: Mapping[str, Any],
+        samples: Sequence[Mapping[str, Any]],
+        states_array: Any,
+        static_array: Any,
+        boundary_array: Any,
+        scalar_array: Any,
+        time_values: Any,
+        source_label: Path,
+    ) -> TransientItem:
+        """Build one backend-independent TransientItem from physical arrays."""
+        times = np.asarray(time_values, dtype=np.float64)
+        dt_values = np.diff(times)
+        states = self._finite_tensor(states_array, label="state sequence", path=source_label)
         target_sequence = states[1:] - states[:-1]
-        boundary = self._finite_tensor(boundary_array, label="boundary conditioning", path=path)
-        t_n = self._finite_tensor(time_values[:-1], label="current time", path=path)
-        t_n_plus_1 = self._finite_tensor(time_values[1:], label="next time", path=path)
-        dt = self._finite_tensor(dt_values, label="time increment", path=path)
+        boundary = self._finite_tensor(boundary_array, label="boundary conditioning", path=source_label)
+        t_n = self._finite_tensor(times[:-1], label="current time", path=source_label)
+        t_n_plus_1 = self._finite_tensor(times[1:], label="next time", path=source_label)
+        dt = self._finite_tensor(dt_values, label="time increment", path=source_label)
         one_step = self.sampling.mode == "one_step_transition"
         first_time_index = int(samples[0]["time_index_n"])
         last_time_index = int(samples[-1]["time_index_n_plus_1"])
         sample_id = str(samples[0]["sample_id"]) if one_step else f"{case['package_case_id']}__window_{first_time_index:04d}_{last_time_index:04d}"
         item: TransientItem = {
             "state": states[0],
-            "static": self._finite_tensor(static_array, label="static conditioning", path=path),
+            "static": self._finite_tensor(
+                static_array,
+                label="static conditioning",
+                path=source_label,
+            ),
             "boundary": boundary[0] if one_step else boundary,
-            "scalars": self._finite_tensor(scalar_array, label="scalar conditioning", path=path),
+            "scalars": self._finite_tensor(
+                scalar_array,
+                label="scalar conditioning",
+                path=source_label,
+            ),
             "time": {
                 "t_n": t_n[0] if one_step else t_n,
                 "t_n_plus_1": t_n_plus_1[0] if one_step else t_n_plus_1,
@@ -478,6 +420,154 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         """Best-effort close of process-local read-only HDF5 handles."""
         with suppress(AttributeError, OSError, RuntimeError):
             self._close_handles()
+
+
+class TransientPTShardDataset(TransientPhysicalDataset):
+    """Expose the same physical samples from validated Dataset-bound PT shards."""
+
+    def __init__(
+        self,
+        index_path: Path | str,
+        *,
+        sampling: transient_contract.TransientSamplingSpec,
+        source_root: Path | str | None = None,
+        hdf5_cache_size: int = 0,
+        sample_indices: Sequence[int] | None = None,
+        transform: TransientTransform | None = None,
+    ) -> None:
+        """Admit shard evidence without opening canonical source HDF5 files."""
+        if not isinstance(sampling, transient_contract.TransientSamplingSpec):
+            message = "sampling must be one validated TransientSamplingSpec."
+            raise TypeError(message)
+        if isinstance(hdf5_cache_size, bool) or not isinstance(hdf5_cache_size, int) or hdf5_cache_size < 0:
+            message = "hdf5_cache_size must be a non-negative integer."
+            raise ValueError(message)
+        self.index_path = Path(index_path).expanduser().resolve()
+        self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
+        self.payload = trajectory.load_transient_index(self.index_path)
+        self.sampling = sampling
+        self.hdf5_cache_size = hdf5_cache_size
+        self.transform = transform
+        self.storage_backend = "pt_shards"
+        if sample_indices is None:
+            selected = tuple(range(len(self.payload["samples"])))
+        else:
+            selected = tuple(sample_indices)
+            if (
+                any(isinstance(position, bool) or not isinstance(position, int) for position in selected)
+                or any(position < 0 or position >= len(self.payload["samples"]) for position in selected)
+                or len(selected) != len(set(selected))
+                or selected != tuple(sorted(selected))
+            ):
+                message = "Transient sample_indices must be unique ordered valid integer positions."
+                raise ValueError(message)
+        self.sample_indices = selected
+        self._item_references = self._build_item_references()
+        self._process_id: int | None = None
+        self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._shard_receipt = transient_shards.load_transient_shard_receipt(
+            self.dataset_id,
+            storage_root=self.source_root,
+            validation_depth="evidence",
+        )
+        if self._shard_receipt["index_digest"] != self.payload["index_digest"]:
+            message = "Transient PT shard receipt does not bind the selected index."
+            raise trajectory.TransientDataContractError(message)
+        case_offsets: dict[int, int] = {}
+        sample_offsets: list[int] = []
+        for sample in self.payload["samples"]:
+            case_index = int(sample["case_index"])
+            offset = case_offsets.get(case_index, 0)
+            sample_offsets.append(offset)
+            case_offsets[case_index] = offset + 1
+        self._sample_offsets = tuple(sample_offsets)
+
+    def _clear_shard_cache(self) -> None:
+        """Release every process-local mmap-backed shard payload reference."""
+        self._shard_cache.clear()
+
+    def close(self) -> None:
+        """Release bounded process-local shard cache resources."""
+        self._clear_shard_cache()
+        self._process_id = None
+
+    def _ensure_process(self) -> None:
+        """Discard inherited shard mappings before use in another process."""
+        process_id = os.getpid()
+        if self._process_id != process_id:
+            self._clear_shard_cache()
+            self._process_id = process_id
+
+    def _load_shard(self, shard_index: int) -> dict[str, Any]:
+        """Return one fully validated shard through a bounded process-local LRU."""
+        self._ensure_process()
+        cached = self._shard_cache.pop(shard_index, None)
+        if cached is not None:
+            self._shard_cache[shard_index] = cached
+            return cached
+        payload = transient_shards.load_transient_shard_payload(
+            self.dataset_id,
+            shard_index,
+            storage_root=self.source_root,
+            receipt=self._shard_receipt,
+        )
+        if self.hdf5_cache_size > 0:
+            self._shard_cache[shard_index] = payload
+            while len(self._shard_cache) > self.hdf5_cache_size:
+                self._shard_cache.popitem(last=False)
+        return payload
+
+    def __getitem__(self, index: int) -> TransientItem:
+        """Materialize one semantic item from exactly one whole-case shard."""
+        reference = self._item_references[index]
+        samples = [self.payload["samples"][position] for position in reference.sample_positions]
+        case = self.payload["cases"][reference.case_index]
+        case_id = str(case["package_case_id"])
+        location = self._shard_receipt["case_locator"][case_id]
+        shard_index = int(location["shard_index"])
+        shard = self._load_shard(shard_index)
+        case_payload = shard["cases"][int(location["case_position"])]
+        if case_payload["case_index"] != reference.case_index or case_payload["case_record"] != case:
+            message = f"Transient shard case lookup conflicts for {case_id!r}."
+            raise trajectory.TransientDataContractError(message)
+        state_indices = [
+            int(samples[0]["time_index_n"]),
+            *[int(sample["time_index_n_plus_1"]) for sample in samples],
+        ]
+        boundary_indices = [self._sample_offsets[position] for position in reference.sample_positions]
+        shard_record = self._shard_receipt["shards"][shard_index]
+        source_label = transient_shards.transient_shard_directory(
+            self.dataset_id,
+            storage_root=self.source_root,
+        ) / str(shard_record["filename"])
+        return self._materialize_item(
+            case=case,
+            samples=samples,
+            states_array=case_payload["states"][state_indices],
+            static_array=case_payload["static"],
+            boundary_array=case_payload["boundary"][boundary_indices],
+            scalar_array=case_payload["scalars"],
+            time_values=case_payload["state_time"][state_indices],
+            source_label=source_label,
+        )
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Exclude mmap-backed shard payloads from worker serialization."""
+        state = dict(self.__dict__)
+        state["_process_id"] = None
+        state["_shard_cache"] = OrderedDict()
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore one worker-local dataset without inherited shard mappings."""
+        self.__dict__.update(state)
+        self._process_id = None
+        self._shard_cache = OrderedDict()
+
+    def __del__(self) -> None:
+        """Best-effort release of process-local mmap-backed shard payloads."""
+        with suppress(AttributeError, OSError, RuntimeError):
+            self._clear_shard_cache()
 
 
 def select_transient_sample_indices(

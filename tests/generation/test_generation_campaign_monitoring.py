@@ -4,18 +4,25 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from src import generation
+from src import common, generation
 from src.generation import generation_campaign_status as status_service
 from src.generation.cli import cli_generation
 from src.generation.runtime import generation_runtime_cluster as cluster
+from src.generation.runtime import generation_runtime_license as license_service
+from src.generation.runtime import generation_runtime_stop as stop_service
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def _synthetic_retry_policy(
@@ -30,6 +37,19 @@ def _synthetic_retry_policy(
         "maximum_delay_seconds": maximum_delay_seconds,
         "maximum_wait_seconds": None,
     }
+
+
+def _patch_synthetic_input_references(
+    monkeypatch: pytest.MonkeyPatch,
+    campaign: Any,
+) -> None:
+    """Supply inert references when a test replaces the admission owner."""
+    references = {batch.batch_name: {case_index: object() for case_index in batch.case_indices} for batch in campaign.batches}
+    monkeypatch.setattr(
+        generation.campaign,
+        "_campaign_input_references",
+        lambda _campaign, **_kwargs: references,
+    )
 
 
 def _submission(task: cluster.CampaignTask, job_id: str, index: int) -> dict[str, Any]:
@@ -97,6 +117,7 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     """Map successful, active, failed, retry, and unsent cases without new queries."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm", natural_count=6)
     campaign = generation.cases.config.load_campaign_config(config_path)
+    _patch_synthetic_input_references(monkeypatch, campaign)
     tasks = cluster.campaign_tasks(campaign)
     assert len(tasks) == 6
     run_id = "synthetic_campaign__0123456789abcdef"
@@ -271,6 +292,187 @@ def test_campaign_status_exposes_deterministic_cases_from_one_scheduler_query(
     assert without_progress["campaign_state"] == state_with_progress
     assert without_progress["admission"]["count"] == 3
     assert without_progress["admission"]["components"]["starting"] == 1
+
+
+def test_resume_reconciles_during_atomic_status_recovery_publication(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep one active campaign observable while a worker publishes recovery."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=1,
+        max_admission_cases=1,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    _patch_synthetic_input_references(monkeypatch, campaign)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    run_id = "resume_concurrent_recovery__0123456789abcdef"
+    run_directory = tmp_path / "campaign"
+    run_directory.mkdir()
+    submission = _submission(task, "638288", 1)
+    manifest = {
+        "campaign_run_id": run_id,
+        "git_commit": "a" * 40,
+        "slurm_job_ids": ["638288"],
+        "scheduler_job_name": "campaign",
+        "scheduler_log_directory": str(run_directory / "scheduler"),
+        "submission_config": {
+            "cores_per_case": 16,
+            "max_admission_cases": 1,
+            "max_running_cases": None,
+            "maximum_failed_cases": 5,
+            "temporary_license_retry": _synthetic_retry_policy(),
+        },
+        "submission_intent": None,
+        "admission_reservations": [],
+        "submissions": [submission],
+        "state": "active",
+        "remote_storage_root": str(tmp_path),
+        "campaign_meta_directory": str(run_directory),
+    }
+    scheduler = {
+        "squeue": {"command": ["squeue"], "output": "638288|RUNNING", "error": None},
+        "sacct": {"command": ["sacct"], "output": "", "error": None},
+        "active": {
+            "638288": [
+                "638288",
+                "RUNNING",
+                "None",
+                "node-a",
+                "2026-08-20T09:00:00",
+                "2026-08-20T09:01:00",
+                "00:01:00",
+            ]
+        },
+        "accounted": {},
+    }
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: campaign,
+    )
+    monkeypatch.setattr(
+        generation.campaign.campaign_evidence,
+        "campaign_run_directory",
+        lambda *_args, **_kwargs: run_directory,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_evidence",
+        lambda _job_ids: scheduler,
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "completed_case_is_valid",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        generation.campaign.batch_runtime,
+        "case_failure_is_recorded",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        generation.campaign.progress_service,
+        "load_runtime_progress",
+        lambda *_args, **_kwargs: {
+            "availability": "unavailable",
+            "reason": "not_reported",
+            "age_seconds": None,
+            "stale": None,
+        },
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_write_campaign_manifest",
+        lambda payload, **_kwargs: dict(payload),
+    )
+
+    work_directory = tmp_path / "status-work"
+    work_directory.mkdir()
+    prelaunch = stop_service.prepare_capacity_checkout_status(
+        work_directory,
+        checkout_index=3,
+    )
+    (work_directory / stop_service.STOP_STATUS_FILENAME).write_text(
+        "1787228251108\nError",
+        encoding="utf-8",
+    )
+    artifact = stop_service.inspect_capacity_checkout_status(
+        prelaunch,
+        process_id=7734,
+        process_exit_code=0,
+        temporary_capacity_classified=True,
+        solver_progress_started=False,
+        required_exports_exist=False,
+        scientific_result_exists=False,
+    )
+    classification = license_service.classify_temporary_license_capacity(
+        """Could not obtain license for 'CFD Module'.
+Licensed number of users already reached.
+"""
+    )
+    assert artifact is not None
+    assert classification is not None
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    staged: Queue[Path] = Queue()
+    releases: Queue[None] = Queue()
+    original_fsync = common.serialization._fsync_file
+
+    def gated_fsync(temporary_path: Path) -> None:
+        original_fsync(temporary_path)
+        staged.put(temporary_path)
+        releases.get(timeout=10.0)
+
+    monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
+    statuses: list[Mapping[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            license_service.record_in_allocation_status_artifact_recovery,
+            batch,
+            task.case_index,
+            campaign_run_id=run_id,
+            job_id="638288",
+            checkout_started_at=started_at,
+            checkout_ended_at=started_at + timedelta(seconds=1),
+            hostname="synthetic-node",
+            artifact=artifact,
+            classification=classification,
+            cleanup_state="pending",
+            storage_root=tmp_path,
+        )
+        try:
+            temporary_path = staged.get(timeout=10.0)
+            assert temporary_path.is_file()
+            resumed = generation.campaign.resume_campaign(
+                run_id,
+                storage_root=tmp_path,
+                status_callback=statuses.append,
+            )
+            assert resumed["state"] == "active"
+            assert len(statuses) == 1
+            assert statuses[0]["cases"][0]["state"] == "running"
+            assert statuses[0]["status_artifact_recovery_count"] == 0
+        finally:
+            releases.put(None)
+        receipt_path = future.result(timeout=10.0)
+
+    recoveries = license_service.load_in_allocation_status_artifact_recoveries(
+        batch,
+        task.case_index,
+        campaign_run_id=run_id,
+        job_id="638288",
+        storage_root=tmp_path,
+    )
+    assert receipt_path.name == "checkout_0003.json"
+    assert [record["cleanup_state"] for record in recoveries] == ["pending"]
 
 
 def test_conversion_failure_cannot_terminalize_an_active_campaign(
@@ -897,6 +1099,160 @@ def test_common_status_categories_are_disjoint_and_solver_progress_is_phase_boun
     assert "Tfail=" not in exporting_text
 
 
+def test_scheduler_unknown_projects_as_nonterminal_pending_work() -> None:
+    """Keep missing scheduler visibility explicit without inventing failure."""
+    public = generation.campaign._public_task_view(
+        {
+            "batch_name": "transient_drying__lentil__natural",
+            "batch_id": "batch-id",
+            "case_index": 1,
+            "case_id": "case_0001",
+            "state": "scheduler_unknown",
+            "reason": "4102",
+            "latest_job_id": "4102",
+            "runtime_progress": {"availability": "unavailable", "reason": "not_reported"},
+        }
+    )
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "retry-visibility__0123456789abcdef",
+            "campaign_state": "submission_pending_or_unknown",
+            "cases": [public],
+            "admission": {
+                "count": 1,
+                "maximum": 4,
+                "components": {
+                    "pending": 0,
+                    "starting": 1,
+                    "acquiring_license": 0,
+                    "license_waiting": 0,
+                },
+            },
+            "admission_blocked": False,
+            "admission_block_reason": None,
+        }
+    )
+
+    assert public["state"] == "scheduler_pending"
+    assert public["classified_state"] == "scheduler_unknown"
+    assert "scheduler_pending=1" in rendered
+    assert "failed=0" in rendered
+    assert "reason=scheduler_visibility_unknown" in rendered
+    assert "Failures:" not in rendered
+    assert "Recently failed cases" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("include_failure", "block_reason"),
+    [
+        (False, "max_admission_cases_reached"),
+        (True, "max_admission_cases_reached"),
+        (True, "solver_failure_threshold_exceeded"),
+    ],
+)
+def test_admission_block_reason_is_separate_from_failure_summary(
+    include_failure: bool,
+    block_reason: str,
+) -> None:
+    """Render the authoritative admission reason without causal ambiguity."""
+    cases = [
+        {
+            "case_id": "case_0001",
+            "batch_name": "transient_drying__lentil__natural",
+            "state": "scheduler_pending",
+            "latest_job_id": "4102",
+        },
+        {
+            "case_id": "case_0002",
+            "batch_name": "transient_drying__lentil__natural",
+            "state": "never_started",
+        },
+    ]
+    if include_failure:
+        cases.append(
+            {
+                "case_id": "case_0003",
+                "batch_name": "transient_drying__lentil__natural",
+                "state": "failed",
+                "failure_stage": "solver",
+            }
+        )
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "admission-reason__0123456789abcdef",
+            "campaign_state": "running",
+            "cases": cases,
+            "admission": {
+                "count": 1,
+                "maximum": 1,
+                "components": {
+                    "pending": 1,
+                    "starting": 0,
+                    "acquiring_license": 0,
+                    "license_waiting": 0,
+                },
+            },
+            "admission_blocked": True,
+            "admission_block_reason": block_reason,
+        }
+    )
+
+    assert "state=blocked" in rendered
+    assert f"reason={block_reason}" in rendered
+    assert "admission_blocked=" not in rendered
+    assert ("Failures: 1 terminal" in rendered) is include_failure
+
+
+def test_active_case_display_groups_execution_before_license_acquisition() -> None:
+    """Order active detail by semantic phase and then stable case identity."""
+
+    def active(case_id: str, phase: str) -> dict[str, Any]:
+        return {
+            "case_id": case_id,
+            "batch_name": "transient_drying__lentil__natural",
+            "state": "running",
+            "runtime_progress": {
+                "availability": "available",
+                "phase": phase,
+                "parser_state": ("available" if phase in {"stationary_airflow", "transient_drying"} else "unavailable"),
+            },
+        }
+
+    rendered = status_service.format_campaign_status_summary(
+        {
+            "campaign_run_id": "semantic-order__0123456789abcdef",
+            "campaign_state": "running",
+            "cases": [
+                active("case_0001", "acquiring_comsol_license"),
+                active("case_0004", "transient_drying"),
+                active("case_0002", "canonicalizing"),
+                active("case_0003", "preparing"),
+                {
+                    "case_id": "case_0005",
+                    "batch_name": "transient_drying__lentil__natural",
+                    "state": "license_blocked",
+                },
+                {
+                    "case_id": "case_0006",
+                    "batch_name": "transient_drying__lentil__natural",
+                    "state": "scheduler_pending",
+                },
+                {
+                    "case_id": "case_0007",
+                    "batch_name": "transient_drying__lentil__natural",
+                    "state": "failed",
+                    "failure_stage": "solver",
+                },
+            ],
+        }
+    )
+
+    assert "Active cases:" in rendered
+    assert "Running cases:" not in rendered
+    assert rendered.index("case_0002") < rendered.index("case_0004") < rendered.index("case_0001") < rendered.index("case_0003")
+    assert rendered.index("License-blocked cases:") < rendered.index("Scheduler-pending cases:") < rendered.index("Recently failed cases")
+
+
 def test_not_admitted_is_distinct_from_every_admission_component() -> None:
     """Project a reserved case as active while leaving an unsent case unadmitted."""
     waiting = {
@@ -1026,6 +1382,7 @@ def test_resume_preserves_success_with_naive_slurm_end_and_admits_other_case(
         maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
+    _patch_synthetic_input_references(monkeypatch, campaign)
     first, second = cluster.campaign_tasks(campaign)
     run_id = "naive-terminal-resume__0123456789abcdef"
     run_directory = tmp_path / "naive-terminal-resume"
@@ -1079,6 +1436,7 @@ def test_resume_preserves_success_with_naive_slurm_end_and_admits_other_case(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         assert mode == "initial"
@@ -1191,6 +1549,7 @@ def test_case_local_presentation_failure_is_cached_without_starving_admission(
         maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
+    _patch_synthetic_input_references(monkeypatch, campaign)
     first, active, fresh = cluster.campaign_tasks(campaign)
     run_id = "case-local-reconciliation__0123456789abcdef"
     run_directory = tmp_path / "case-local-reconciliation"
@@ -1249,6 +1608,7 @@ def test_case_local_presentation_failure_is_cached_without_starving_admission(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         assert mode == "initial"
@@ -1374,6 +1734,7 @@ def test_global_case_integrity_error_still_escapes_reconciliation(
         natural_count=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
+    _patch_synthetic_input_references(monkeypatch, campaign)
     manifest: dict[str, Any] = {
         "campaign_run_id": "global-integrity__0123456789abcdef",
         "git_commit": "c" * 40,

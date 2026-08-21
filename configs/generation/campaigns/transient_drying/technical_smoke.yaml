@@ -23,3 +23,7 @@ sampling:
 dataset_packages:
 - evaluation_regime: id
   source_role: seen
+  training_payload:
+    backend: pt_shards
+    required: true
+    target_shard_bytes: 1048576

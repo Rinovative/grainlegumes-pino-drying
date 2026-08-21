@@ -53,6 +53,14 @@ def _scheduler(
     }
 
 
+def _synthetic_input_references(campaign: Any) -> dict[str, dict[int, Any]]:
+    """Return opaque references for tests that replace content validation."""
+    references: dict[str, dict[int, Any]] = {}
+    for task in cluster.campaign_tasks(campaign):
+        references.setdefault(task.batch_name, {})[task.case_index] = object()
+    return references
+
+
 def test_one_case_submission_and_local_only_concurrency(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -156,10 +164,12 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     monkeypatch.setattr(generation.campaign.subprocess, "run", fake_scheduler)
 
+    first_progress: list[dict[str, Any]] = []
     first = generation.campaign.submit_campaign(
         campaign,
         git_commit=commit,
         storage_root=storage,
+        progress=lambda event: first_progress.append(dict(event)),
     )
     assert first["slurm_job_ids"] == ["12345"]
     assert [command[0] for command in calls] == ["sbatch"]
@@ -168,8 +178,10 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         storage_root=storage,
     )
     assert persisted["submissions"][0]["job_id"] == "12345"
+    assert [event["scheduler_submissions"] for event in first_progress if event.get("operation") == "scheduler_submission"] == [1]
 
     blocked = AssertionError("Current canonical inputs were regenerated before resubmission.")
+    active_progress: list[dict[str, Any]] = []
     with monkeypatch.context() as scoped:
         scoped.setattr(
             generation.cases.input_generation.case_service,
@@ -180,9 +192,21 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
             campaign,
             git_commit=commit,
             storage_root=storage,
+            progress=lambda event: active_progress.append(dict(event)),
         )
     assert active["slurm_job_ids"] == ["12345"]
     assert [command[0] for command in calls].count("sbatch") == 1
+    assert not any(event.get("operation") == "scheduler_submission" for event in active_progress)
+
+    unchanged_progress: list[dict[str, Any]] = []
+    unchanged = generation.campaign.feed_campaign(
+        first["campaign_run_id"],
+        storage_root=storage,
+        progress=lambda event: unchanged_progress.append(dict(event)),
+    )
+    assert unchanged["slurm_job_ids"] == ["12345"]
+    assert [command[0] for command in calls].count("sbatch") == 1
+    assert not any(event.get("operation") == "scheduler_submission" for event in unchanged_progress)
 
     scheduler_mode["value"] = "completed"
     first_case = tasks[0]
@@ -196,13 +220,15 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         "_successful_status_summary",
         lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
-    advanced = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
+    advanced_progress: list[dict[str, Any]] = []
+    advanced = generation.campaign.feed_campaign(
+        first["campaign_run_id"],
         storage_root=storage,
+        progress=lambda event: advanced_progress.append(dict(event)),
     )
     assert advanced["slurm_job_ids"] == ["12345", "12346"]
     assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
+    assert [event["scheduler_submissions"] for event in advanced_progress if event.get("operation") == "scheduler_submission"] == [2]
 
 
 def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
@@ -383,17 +409,45 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     assert waiting["slurm_job_ids"] == ["4101"]
 
     retry_eligible["value"] = True
-    retried = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    retry_snapshots: list[dict[str, Any]] = []
+    retried = generation.campaign.resume_campaign(
+        run_id,
+        storage_root=storage,
+        status_callback=lambda status: retry_snapshots.append(dict(status)),
+    )
     assert retried["slurm_job_ids"] == ["4101", "4102"]
     assert [record["mode"] for record in retried["submissions"]] == [
         "initial",
         "license_retry",
     ]
     assert retried["submissions"][1]["case"] == retried["submissions"][0]["case"]
+    assert len(retry_snapshots) == 1
+    retry_snapshot = retry_snapshots[0]
+    retry_case = next(case for case in retry_snapshot["cases"] if case["case_id"] == tasks[0].case_id)
+    assert retry_case["state"] == "scheduler_pending"
+    assert retry_case["classified_state"] == "pending"
+    assert retry_case["reason"] == "scheduler_snapshot_predates_submission"
+    assert retry_case["automatic_continuation_allowed"] is True
+    assert retry_snapshot["failed_cases"] == 0
+    assert retry_snapshot["work_unit_counts"]["failed"] == 0
+    assert retry_snapshot["failure_circuit_breaker_tripped"] is False
+    assert retry_snapshot["admission_blocked"] is True
+    assert retry_snapshot["admission_block_reason"] == "max_admission_cases_reached"
 
-    unresolved = generation.campaign.feed_campaign(run_id, storage_root=storage)
+    visible_snapshots: list[dict[str, Any]] = []
+    unresolved = generation.campaign.resume_campaign(
+        run_id,
+        storage_root=storage,
+        status_callback=lambda status: visible_snapshots.append(dict(status)),
+    )
     assert unresolved["slurm_job_ids"] == ["4101", "4102"]
     assert len(submit_commands) == 2
+    assert len(visible_snapshots) == 1
+    visible_case = next(case for case in visible_snapshots[0]["cases"] if case["case_id"] == tasks[0].case_id)
+    assert visible_case["state"] == "running"
+    assert visible_case["classified_state"] == "active"
+    assert visible_snapshots[0]["failed_cases"] == 0
+    assert visible_snapshots[0]["failure_circuit_breaker_tripped"] is False
 
     probe_progress["value"] = True
     released = generation.campaign.feed_campaign(run_id, storage_root=storage)
@@ -579,6 +633,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         "campaign_run_id": run_id,
         "git_commit": commit,
         "slurm_job_ids": [],
+        "submissions": [],
         "submission_intent": None,
         "submission_config": {
             "max_admission_cases": 1,
@@ -626,6 +681,11 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     )
     monkeypatch.setattr(
         generation.campaign,
+        "_campaign_input_references",
+        lambda *_args, **_kwargs: _synthetic_input_references(campaign),
+    )
+    monkeypatch.setattr(
+        generation.campaign,
         "_repository_commit",
         lambda: commit,
     )
@@ -642,6 +702,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         submissions.append((task.case_id, mode))
@@ -669,6 +730,11 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
         case_is_valid,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_successful_status_summary",
+        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
     monkeypatch.setattr(
         generation.campaign,
@@ -1010,6 +1076,7 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
             "temporary_license_retry": _synthetic_retry_policy(),
         },
         "submission_intent": None,
+        "submissions": [],
         "state": "active",
     }
 
@@ -1045,6 +1112,7 @@ def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         submitted.append((task.case_id, mode))
@@ -1190,8 +1258,18 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
     monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
     monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
     monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: (views, 0, 0))
+    monkeypatch.setattr(
+        generation.campaign,
+        "_campaign_input_references",
+        lambda *_args, **_kwargs: _synthetic_input_references(campaign),
+    )
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     monkeypatch.setattr(generation.campaign, "_write_campaign_manifest", lambda payload, **_kwargs: dict(payload))
+    monkeypatch.setattr(
+        generation.campaign,
+        "_refresh_resume_task_views",
+        lambda *_args, **_kwargs: [dict(view) for view in views],
+    )
     monkeypatch.setattr(generation.campaign.batch_runtime, "completed_case_is_valid", lambda *_args, **_kwargs: False)
 
     def submit_one(
@@ -1201,6 +1279,7 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         assert mode == "initial"
@@ -1390,6 +1469,7 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         assert mode == "initial"
@@ -1423,6 +1503,80 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
             maximum_failed_cases=5,
         )
         is False
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "failure_count",
+        "capacity_occupied",
+        "maximum_failed_cases",
+        "expected_blocked",
+        "expected_reason",
+        "expected_circuit_breaker",
+    ),
+    [
+        (0, True, 5, True, "max_admission_cases_reached", False),
+        (1, False, 5, False, None, False),
+        (1, True, 5, True, "max_admission_cases_reached", False),
+        (2, False, 1, True, "solver_failure_threshold_exceeded", True),
+    ],
+)
+def test_admission_block_reason_is_independent_of_displayed_failure_count(
+    generation_config_factory: Any,
+    failure_count: int,
+    capacity_occupied: bool,
+    maximum_failed_cases: int,
+    expected_blocked: bool,
+    expected_reason: str | None,
+    expected_circuit_breaker: bool,
+) -> None:
+    """Attribute capacity and failure-budget blocks to their actual owner."""
+    config_path, _template = generation_config_factory(
+        scheduler_kind="slurm",
+        natural_count=4,
+        max_admission_cases=1,
+        maximum_failed_cases=maximum_failed_cases,
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    views = [
+        {
+            **_admission_view(task, "failed"),
+            "failure_stage": "solver",
+            "temporary_license_retry": None,
+        }
+        for task in tasks[:failure_count]
+    ]
+    if capacity_occupied:
+        views.append(_admission_view(tasks[failure_count], "pending"))
+    fresh_index = failure_count + int(capacity_occupied)
+    views.extend(_admission_view(task, "never_started") for task in tasks[fresh_index:])
+    manifest = {
+        "submission_config": {
+            "max_admission_cases": 1,
+            "max_running_cases": None,
+            "maximum_failed_cases": maximum_failed_cases,
+        },
+        "submission_intent": None,
+        "submissions": [],
+        "admission_reservations": [],
+    }
+
+    blocked, reason = generation.campaign._normal_admission_status(
+        manifest,
+        views,
+        running_jobs=0,
+    )
+
+    assert blocked is expected_blocked
+    assert reason == expected_reason
+    assert (
+        generation.campaign._solver_failure_threshold_exceeded(
+            views,
+            maximum_failed_cases=maximum_failed_cases,
+        )
+        is expected_circuit_breaker
     )
 
 
@@ -1497,6 +1651,7 @@ def test_two_due_license_retries_submit_independently(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         submitted.append((task.case_id, mode))
@@ -1652,6 +1807,7 @@ def test_repeated_independent_retries_do_not_accumulate_blocked_cases(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del mode, storage_root
         payload["submissions"].append(
@@ -1659,6 +1815,7 @@ def test_repeated_independent_retries_do_not_accumulate_blocked_cases(
                 "submission_index": len(payload["submissions"]) + 1,
                 "mode": "license_retry",
                 "status": "submitted",
+                "job_id": str(len(payload["submissions"]) + 1),
                 "recorded_at": clock["value"].isoformat(),
                 "case": {
                     "batch_id": task.batch_id,
@@ -1729,6 +1886,7 @@ def test_restart_reconstructs_blocked_admission_without_admitting_more(
                         "submission_index": index,
                         "mode": "license_retry",
                         "status": "submitted",
+                        "job_id": str(index),
                         "case": {
                             "batch_id": task.batch_id,
                             "case_index": task.case_index,
@@ -1833,6 +1991,7 @@ def test_solver_start_releases_slots_for_progressive_discovery(
         *,
         mode: str,
         storage_root: Path | str | None,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         del storage_root
         submitted.append(task.case_id)
@@ -1841,6 +2000,7 @@ def test_solver_start_releases_slots_for_progressive_discovery(
                 "submission_index": len(payload["submissions"]) + 1,
                 "mode": mode,
                 "status": "submitted",
+                "job_id": str(len(payload["submissions"]) + 1),
                 "recorded_at": "2026-01-01T00:00:00+00:00",
                 "case": {
                     "batch_id": task.batch_id,

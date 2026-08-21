@@ -11,6 +11,7 @@ import pytest
 
 from src import common, generation
 from src.datasets import packages as package_service
+from src.datasets.runtime import dataset_runtime_package_validation as package_validation_service
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -100,7 +101,7 @@ def test_missing_package_extension_is_append_only_and_idempotent(
     )
     monkeypatch.setattr(
         generation.workflow.campaign_runtime,
-        "validate_transferred_campaign",
+        "admit_transferred_campaign",
         lambda *_args, **_kwargs: {"status": "transfer_complete"},
     )
     monkeypatch.setattr(
@@ -162,10 +163,12 @@ def test_missing_package_extension_is_append_only_and_idempotent(
     first = generation.workflow.build_campaign_datasets(
         _RUN_ID,
         storage_root=storage,
+        prepare_training_payloads=False,
     )
     second = generation.workflow.build_campaign_datasets(
         _RUN_ID,
         storage_root=storage,
+        prepare_training_payloads=False,
     )
 
     assert first == second
@@ -254,7 +257,7 @@ def test_compatible_source_discovery_rejects_multiple_completed_runs(
     )
     monkeypatch.setattr(
         generation.workflow.campaign_runtime,
-        "validate_transferred_campaign",
+        "admit_transferred_campaign",
         lambda *_args, **_kwargs: {"transfer_inventory_sha256": "e" * 64},
     )
     monkeypatch.setattr(
@@ -297,13 +300,13 @@ def test_package_smoke_uses_manifest_training_eligibility(
         "training_eligible": True,
     }
     monkeypatch.setattr(
-        package_service,
-        "load_package_manifest",
+        package_validation_service.package_manifest,
+        "load_package_manifest_evidence",
         lambda *_args, **_kwargs: manifest,
     )
     monkeypatch.setattr(
-        package_service,
-        "inspect_dataset_package",
+        package_validation_service,
+        "_inspect_dataset_package",
         lambda *_args, **_kwargs: {"status": "inspected"},
     )
 
@@ -317,7 +320,7 @@ def test_package_smoke_uses_manifest_training_eligibility(
         calls.append((membership, num_workers))
         return {"status": "loaded"}
 
-    monkeypatch.setattr(package_service, "smoke_dataset_package", smoke)
+    monkeypatch.setattr(package_validation_service, "_smoke_dataset_package", smoke)
 
     generation.workflow._package_runtime_evidence(  # noqa: SLF001
         "steady-flow-id",

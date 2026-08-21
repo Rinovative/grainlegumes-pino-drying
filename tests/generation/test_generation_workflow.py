@@ -338,7 +338,8 @@ if [[ "${FAKE_LOGIN_PREFLIGHT_STDOUT:-false}" == true \
     'Preflight domain=CPU login check=command:git status=pass detail=resolved' \
     'Generation-venv-runtime status=pass'
 fi
-if [[ " $* " == *' campaign-status '* || " $* " == *' feed-campaign '* ]]; then
+if [[ " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* \
+  || " $* " == *' feed-campaign '* ]]; then
   if [[ " $* " != *" ${FAKE_GIT_COMMIT} "* ]]; then
     printf '%s\n' 'Remote Generation operation omitted the pinned commit argument.' >&2
     exit 76
@@ -413,7 +414,7 @@ elif [[ " $* " == *' campaign-source-status '* ]]; then
     printf 'source-status\t%s\trunning\t%s\t%s\tineligible\tFalse\n' \
       "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
   fi
-elif [[ " $* " == *' campaign-status '* \
+elif [[ ( " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* ) \
   && "${FAKE_CAMPAIGN_STATUS_FAIL:-false}" == true ]]; then
   printf '%s\n' 'Synthetic initial campaign status failure.' >&2
   exit 79
@@ -445,6 +446,43 @@ elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; 
   fi
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
   printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
+  printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
+  printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
+  printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
+  printf '  phase=transient_drying  sim_time=%s h  step=0.075 s\n' "${progress_value}"
+  printf '  order=2  Tfail=1  NLfail=3  updated=4 s ago\n'
+elif [[ ( " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* ) \
+  && " $* " == *' --format workflow-monitor '* ]]; then
+  state="$(next_campaign_state)"
+  case "${state}" in
+    feeding) state_signature="$(printf '1%.0s' {1..64})" ;;
+    running) state_signature="$(printf '2%.0s' {1..64})" ;;
+    successful|transfer_complete) state_signature="$(printf '3%.0s' {1..64})" ;;
+    completed_with_failures|cancelled) state_signature="$(printf '4%.0s' {1..64})" ;;
+    *) state_signature="$(printf '5%.0s' {1..64})" ;;
+  esac
+  progress_signature="${state_signature}"
+  progress_value="0.100"
+  state_index=1
+  [[ ! -f "${FAKE_CAMPAIGN_STATE_INDEX_FILE}" ]] ||
+    read -r state_index < "${FAKE_CAMPAIGN_STATE_INDEX_FILE}"
+  sequence_index=$(( state_index > 0 ? state_index - 1 : 0 ))
+  if [[ -n "${FAKE_CAMPAIGN_PROGRESS_SIGNATURES:-}" ]]; then
+    IFS=',' read -r -a signatures <<< "${FAKE_CAMPAIGN_PROGRESS_SIGNATURES}"
+    if (( sequence_index >= ${#signatures[@]} )); then sequence_index=$(( ${#signatures[@]} - 1 )); fi
+    progress_signature="${signatures[sequence_index]}"
+  fi
+  if [[ -n "${FAKE_PROGRESS_VALUES:-}" ]]; then
+    IFS=',' read -r -a values <<< "${FAKE_PROGRESS_VALUES}"
+    value_index="${sequence_index}"
+    if (( value_index >= ${#values[@]} )); then value_index=$(( ${#values[@]} - 1 )); fi
+    progress_value="${values[value_index]}"
+  fi
+  printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
+  printf 'source-monitor\t%s\t%s\t%s\tunavailable\tineligible\tFalse\n' \
+    "${FAKE_RUN_ID}" "${state}" "${FAKE_SOURCE_STATE}"
+  printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' \
+    "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
   printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
   printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
   printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
@@ -768,9 +806,10 @@ if [[ " $* " == *' -c '* ]]; then
     fi
   elif [[ " $* " == *'reason = str(value.get'* ]]; then
     if [[ "${FAKE_CAMPAIGN_STATE}" == completed_with_failures ]]; then
-      printf 'incomplete\tpartial campaign completion\n'
+      printf 'incomplete\tpartial campaign completion\t%s\n' \
+        "${FAKE_DECLARED_PACKAGE_COUNT:-1}"
     else
-      printf 'complete\t-\n'
+      printf 'complete\t-\t%s\n' "${FAKE_DECLARED_PACKAGE_COUNT:-1}"
     fi
   elif [[ " $* " == *'keys = ("status"'* ]]; then
     printf 'created\tgw-20260818T154501Z-run-01234567\tgw-run-154501-01234567\t%s\t' \
@@ -818,12 +857,10 @@ if [[ " $* " == *' -c '* ]]; then
       "${catalog_prefix}configs/generation/campaigns/transient_drying/technical_smoke.yaml" \
       "${catalog_prefix}configs/generation/campaigns/steady_flow/id_dataset.yaml" \
       "${catalog_prefix}configs/generation/campaigns/transient_drying/family_generalization.yaml"
-  elif [[ " $* " == *'counts = tuple'* ]]; then
-    printf 'pilot\tpilot_check\t4\t20\n'
   elif [[ " $* " == *'execution_resources'* ]]; then
     purpose="$(cat "${FAKE_CAMPAIGN_PURPOSE_FILE}")"
     printf 'execution\t%s\t16\t01:00:00\t48\t2\t1\t-\tfixture.cluster\tslurm\tfixture\t'\
-'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\n' "${purpose}"
+'Python/fixture-3.12\tComsol/fixture-9.9\tfixture-python\tfixture-comsol\t1\t1\n' "${purpose}"
   elif [[ " $* " == *'value["completed_cases"]'* ]]; then
     printf 'deferred\t%s\t%s\t1\t0\t0\n' "${FAKE_RUN_ID}" "${FAKE_GIT_COMMIT}"
   elif [[ " $* " == *'campaign_purpose'* ]]; then
@@ -902,13 +939,13 @@ elif [[ " $* " == *' build-campaign-datasets '* ]]; then
     exit 5
   fi
   if [[ " $* " == *' --partial '* || "${FAKE_CAMPAIGN_STATE}" == completed_with_failures ]]; then
-    printf '%s\n' '{"status":"incomplete","packages":[]}'
+    printf '%s\n' '{"status":"incomplete","declared_package_count":1,"packages":[]}'
   else
     if [[ "${FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE:-missing}" != extension_required ]]; then
       : > "${FAKE_DATASETS_COMPLETE_FILE}"
     fi
     : > "${FAKE_PACKAGE_STATE_READY_FILE}"
-    printf '%s\n' '{"status":"complete","packages":[{"dataset_id":"synthetic"}]}'
+    printf '{"status":"complete","declared_package_count":%s,"packages":[{"dataset_id":"synthetic"}]}\n' "${FAKE_DECLARED_PACKAGE_COUNT:-1}"
   fi
 elif [[ " $* " == *' prepare-all-workflow '* ]]; then
   : > "${FAKE_WORKFLOW_READY_FILE}"
@@ -1109,24 +1146,6 @@ def _terminate_test_process(process: subprocess.Popen[str]) -> None:
         process.communicate(timeout=5)
 
 
-def _real_git(
-    repository: Path,
-    *arguments: str,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    """Run the host Git executable against one test-owned repository."""
-    executable = shutil.which("git", path=os.defpath)
-    if executable is None:
-        message = "The workflow source tests require Git."
-        raise RuntimeError(message)
-    return subprocess.run(
-        [executable, "-C", str(repository), *arguments],
-        check=check,
-        capture_output=True,
-        text=True,
-    )
-
-
 def _execution_config_with_cores(content: str, cores_per_case: int) -> str:
     """Return test-owned execution YAML with one replaced cluster core value."""
     lines = content.splitlines(keepends=True)
@@ -1138,36 +1157,23 @@ def _execution_config_with_cores(content: str, cores_per_case: int) -> str:
     return "".join(lines)
 
 
-def _initialize_real_repository(
+def _initialize_snapshot_repository(
     workflow: Path,
     environment: dict[str, str],
 ) -> tuple[Path, Path, str]:
-    """Commit the compact harness and route workflow Git calls to real Git."""
+    """Freeze one committed fixture and keep workflow Git at a fake boundary."""
     project = workflow.parent.parent
     source_probe = project / "src/generation/source_probe.py"
     source_probe.parent.mkdir(parents=True)
     source_probe.write_text("committed generation behavior", encoding="utf-8")
-    _real_git(project, "init", "--quiet")
-    _real_git(project, "config", "user.name", "Generation Test")
-    _real_git(project, "config", "user.email", "generation-test@example.invalid")
-    _real_git(project, "add", ".")
-    _real_git(project, "commit", "--quiet", "-m", "test: committed generation source")
-    commit = _real_git(project, "rev-parse", "HEAD").stdout.strip()
-    assert len(commit) == 40
-
-    executable = shutil.which("git", path=os.defpath)
-    assert executable is not None
-    fake_bin = Path(environment["PATH"].split(os.pathsep, maxsplit=1)[0])
-    _executable(
-        fake_bin / "git",
-        r"""#!/usr/bin/env bash
-set -euo pipefail
-printf 'git <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
-exec "${FAKE_REAL_GIT}" "$@"
-""",
-    )
-    environment["FAKE_REAL_GIT"] = executable
+    committed_root = Path(environment["FAKE_COMMITTED_ROOT"])
+    shutil.copytree(project, committed_root, dirs_exist_ok=True)
+    git_directory = project / ".git"
+    git_directory.mkdir()
+    (git_directory / "index").write_bytes(b"synthetic immutable index\n")
+    commit = _COMMIT
     environment["FAKE_GIT_COMMIT"] = commit
+    environment["FAKE_GIT_STATUS"] = ""
     return project, source_probe, commit
 
 
@@ -1272,7 +1278,7 @@ def test_campaign_source_status_cli_emits_positional_tsv(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Keep the source-status producer to one parseable seven-field TSV record."""
+    """Keep the source-status TSV stable while making sizing explicit opt-in."""
     status = {
         "campaign_run_id": _RUN_ID,
         "campaign_state": "active",
@@ -1281,23 +1287,26 @@ def test_campaign_source_status_cli_emits_positional_tsv(
         "cleanup_eligibility": "ineligible",
         "active_slurm": True,
     }
+    include_sizes: list[bool] = []
+
+    def source_status(*_args: object, **kwargs: object) -> dict[str, object]:
+        include_sizes.append(bool(kwargs["include_sizes"]))
+        return status
+
     monkeypatch.setattr(
         cli_generation.workflow_service,
         "campaign_source_status",
-        lambda *_args, **_kwargs: status,
+        source_status,
     )
-
-    result = cli_generation.main(
-        [
-            "campaign-source-status",
-            _RUN_ID,
-            "--query-scheduler",
-            "--format",
-            "tsv",
-            "--storage-root",
-            str(tmp_path),
-        ]
-    )
+    common_arguments = [
+        "campaign-source-status",
+        _RUN_ID,
+        "--format",
+        "tsv",
+        "--storage-root",
+        str(tmp_path),
+    ]
+    result = cli_generation.main([*common_arguments, "--query-scheduler"])
 
     assert result == 0
     captured = capsys.readouterr()
@@ -1311,6 +1320,42 @@ def test_campaign_source_status_cli_emits_positional_tsv(
     assert int(fields[4]) == status["reclaimable_bytes"]
     assert fields[5] == status["cleanup_eligibility"]
     assert fields[6] == str(status["active_slurm"])
+    assert include_sizes == [False]
+
+    assert cli_generation.main([*common_arguments, "--include-sizes"]) == 0
+    capsys.readouterr()
+    assert include_sizes == [False, True]
+
+
+def test_storage_status_cli_sizes_are_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep recursive storage sizing behind an explicit administrative flag."""
+    include_sizes: list[bool] = []
+
+    def storage_status(*_args: object, **kwargs: object) -> dict[str, object]:
+        include_sizes.append(bool(kwargs["include_sizes"]))
+        return {"role": kwargs["role"]}
+
+    monkeypatch.setattr(
+        cli_generation.workflow_service,
+        "storage_status",
+        storage_status,
+    )
+    common_arguments = [
+        "storage-status",
+        "--role",
+        "gpu",
+        "--storage-root",
+        str(tmp_path),
+    ]
+    assert cli_generation.main(common_arguments) == 0
+    capsys.readouterr()
+    assert cli_generation.main([*common_arguments, "--include-sizes"]) == 0
+    capsys.readouterr()
+    assert include_sizes == [False, True]
 
 
 def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> None:
@@ -1342,12 +1387,30 @@ def test_fresh_campaign_monitoring_reports_concise_success(tmp_path: Path) -> No
     assert Path(environment["FAKE_SUBMISSION_FILE"]).read_text(encoding="utf-8") == "591776\n"
     assert "reused=0 generated=1" in result.stdout
     log_text = log.read_text(encoding="utf-8")
-    command_lines = log_text.splitlines()
-    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
-    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
-    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
-    assert prepare_index < plan_index < submit_index
-    assert sum("submit-campaign" in line for line in command_lines) == 1
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    prepare_index = next(index for index, line in enumerate(remote_commands) if " prepare-campaign-inputs " in line)
+    submit_index = next(index for index, line in enumerate(remote_commands) if " submit-campaign " in line)
+    assert prepare_index < submit_index
+    assert not any(" plan-campaign " in line for line in remote_commands)
+    assert sum(" submit-campaign " in line for line in remote_commands) == 1
+
+
+def test_zero_declared_packages_reports_finalizer_only_success(tmp_path: Path) -> None:
+    """Describe zero-package campaigns without claiming package construction."""
+    workflow, _log, environment, storage, _mirror = _harness(tmp_path)
+    environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_DECLARED_PACKAGE_COUNT"] = "0"
+    campaign = workflow.parent.parent / "configs/generation/campaigns/transient_drying/material_pilot.yaml"
+
+    result = _run(
+        workflow,
+        ["run", str(campaign), *_remote_options(), "--keep-cpu-source"],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "no Dataset packages declared; package finalizer gates validated" in result.stdout
+    assert storage.exists()
 
 
 def test_transient_permission_denial_during_remote_home_resolution_recovers(
@@ -1374,20 +1437,20 @@ def test_transient_permission_denial_during_remote_home_resolution_recovers(
     assert "SSH connection recovered:" in result.stderr
     assert "FAILED:" not in result.stderr
     log_text = log.read_text(encoding="utf-8")
-    assert log_text.count("submit-campaign") == 1
+    assert log_text.count(" submit-campaign Python/") == 1
     assert "cancel-campaign" not in log_text
     assert "record-workflow-failure" not in log_text
     assert Path(environment["FAKE_SSH_RETRY_SLEEP_LOG"]).read_text(encoding="utf-8").splitlines() == ["5"]
 
 
-def test_transient_campaign_status_failure_retries_same_monitor_iteration(
+def test_transient_combined_monitor_failure_retries_same_iteration(
     tmp_path: Path,
 ) -> None:
-    """Retry one status read without another resume, submission, or cancellation."""
+    """Retry one combined snapshot without another submission or cancellation."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
     environment["FAKE_CAMPAIGN_STATES"] = "successful"
-    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_MATCH"] = " resume-campaign "
     environment["FAKE_SSH_FAILURE_LIMIT"] = "1"
     environment["FAKE_SSH_FAILURE_MESSAGE"] = "Connection reset by peer"
     environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
@@ -1400,25 +1463,25 @@ def test_transient_campaign_status_failure_retries_same_monitor_iteration(
 
     assert result.returncode == 0, result.stderr
     assert f"Campaign: {_RUN_ID}" in result.stdout
-    assert "WARNING: transient SSH failure during campaign status read" in result.stderr
+    assert "WARNING: transient SSH failure during campaign resume and status snapshot" in result.stderr
     assert "FAILED:" not in result.stderr
     command_lines = log.read_text(encoding="utf-8").splitlines()
     remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
-    assert sum(" resume-campaign " in line for line in remote_commands) == 1
-    assert sum(" campaign-status " in line for line in remote_commands) == 2
+    assert sum(" resume-campaign " in line for line in remote_commands) == 2
+    assert not any(" campaign-status " in line for line in remote_commands)
     assert sum("submit-campaign" in line for line in remote_commands) == 1
     assert not any("cancel-campaign" in line for line in command_lines)
     assert not any("record-workflow-failure" in line for line in command_lines)
 
 
-def test_persistent_campaign_status_transport_failure_preserves_resume_evidence(
+def test_persistent_combined_monitor_failure_preserves_resume_evidence(
     tmp_path: Path,
 ) -> None:
     """Fail closed after five attempts without cancelling or duplicating the run."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_TRACK_SINGLE_SUBMISSION"] = "true"
     environment["FAKE_CAMPAIGN_STATES"] = "running"
-    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_MATCH"] = " resume-campaign "
     environment["FAKE_SSH_FAILURE_LIMIT"] = "5"
     environment["FAKE_SSH_FAILURE_MESSAGE"] = "Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)."
     environment["FAKE_BYPASS_SSH_RETRY_SLEEP"] = "true"
@@ -1439,8 +1502,9 @@ def test_persistent_campaign_status_transport_failure_preserves_resume_evidence(
     assert "--defer-collection" in result.stderr
     command_lines = log.read_text(encoding="utf-8").splitlines()
     remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
-    assert sum(" campaign-status " in line for line in remote_commands) == 5
-    assert sum(" resume-campaign " in line for line in remote_commands) == 1
+    assert sum(" resume-campaign " in line for line in remote_commands) == 5
+    assert not any(" campaign-status " in line for line in remote_commands)
+    assert sum(" campaign-source-status " in line for line in remote_commands) == 1
     assert sum("submit-campaign" in line for line in remote_commands) == 1
     assert not any("cancel-campaign" in line for line in command_lines)
     assert any("record-workflow-failure" in line for line in command_lines)
@@ -1467,7 +1531,7 @@ def test_lost_campaign_resume_acknowledgement_replays_deduplicated_resume(
 
     assert result.returncode == 0, result.stderr
     assert f"campaign_run_id={_RUN_ID}" in result.stdout
-    assert "WARNING: transient SSH failure during campaign resume reconciliation" in result.stderr
+    assert "WARNING: transient SSH failure during campaign resume and status snapshot" in result.stderr
     command_lines = log.read_text(encoding="utf-8").splitlines()
     remote_commands = [line for line in command_lines if line.startswith("<bash -l -s --")]
     assert sum(" resume-campaign " in line for line in remote_commands) == 2
@@ -1510,7 +1574,7 @@ def test_interrupt_during_ssh_retry_wait_preserves_owned_cancellation_contract(
     """Keep graceful/force ownership and status 130 while retry sleep is active."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     environment["FAKE_CAMPAIGN_STATES"] = "running"
-    environment["FAKE_SSH_FAILURE_MATCH"] = " campaign-status "
+    environment["FAKE_SSH_FAILURE_MATCH"] = " resume-campaign "
     environment["FAKE_SSH_FAILURE_LIMIT"] = "5"
     environment["FAKE_SSH_FAILURE_MESSAGE"] = "Connection timed out"
     environment["FAKE_GRACEFUL_CANCEL_DELAY_SECONDS"] = "10"
@@ -1520,7 +1584,7 @@ def test_interrupt_during_ssh_retry_wait_preserves_owned_cancellation_contract(
         environment,
     )
     try:
-        _wait_for_log(log, "ssh-injected-failure < campaign-status >")
+        _wait_for_log(log, "ssh-injected-failure < resume-campaign >")
         os.killpg(process.pid, signal.SIGINT)
         _wait_for_log(log, " cancel-campaign ")
         os.killpg(process.pid, signal.SIGINT)
@@ -1558,7 +1622,7 @@ def test_foreground_interrupts_request_graceful_then_force_cancellation(
         environment,
     )
     try:
-        _wait_for_log(log, " --format monitor ")
+        _wait_for_log(log, " --format workflow-monitor ")
         os.killpg(process.pid, signal.SIGINT)
         _wait_for_log(log, " cancel-campaign ")
         os.killpg(process.pid, signal.SIGINT)
@@ -1600,9 +1664,9 @@ def test_interrupt_before_campaign_launch_writes_no_cancellation_request(
         _terminate_test_process(process)
 
     assert process.returncode != 0
-    log_text = log.read_text(encoding="utf-8")
-    assert " submit-campaign " not in log_text
-    assert " cancel-campaign " not in log_text
+    remote_commands = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("<bash -l -s --")]
+    assert not any(" submit-campaign " in line for line in remote_commands)
+    assert not any(" cancel-campaign " in line for line in remote_commands)
 
 
 def test_same_config_run_reapplies_the_matrix_until_campaign_success(
@@ -1660,11 +1724,11 @@ def test_valid_canonical_inputs_are_reused_before_campaign_submission(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert "reused=1 generated=0" in result.stdout
     log_text = log.read_text(encoding="utf-8")
-    command_lines = log_text.splitlines()
-    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
-    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
-    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
-    assert prepare_index < plan_index < submit_index
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    prepare_index = next(index for index, line in enumerate(remote_commands) if " prepare-campaign-inputs " in line)
+    submit_index = next(index for index, line in enumerate(remote_commands) if " submit-campaign " in line)
+    assert prepare_index < submit_index
+    assert not any(" plan-campaign " in line for line in remote_commands)
     assert "state=awaiting_collection" in result.stdout
     assert "rsync-start" not in log_text
     assert "<build-campaign-datasets>" not in log_text
@@ -1684,10 +1748,10 @@ def test_invalid_canonical_inputs_abort_before_plan_or_submission(tmp_path: Path
 
     assert result.returncode != 0
     assert "Canonical campaign input preparation failed before submission." in result.stderr
-    log_text = log.read_text(encoding="utf-8")
-    assert "prepare-campaign-inputs" in log_text
-    assert "plan-campaign" not in log_text
-    assert "submit-campaign" not in log_text
+    remote_commands = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("<bash -l -s --")]
+    assert any(" prepare-campaign-inputs " in line for line in remote_commands)
+    assert not any(" plan-campaign " in line for line in remote_commands)
+    assert not any(" submit-campaign " in line for line in remote_commands)
 
 
 def test_pilot_prepares_canonical_inputs_before_plan_and_submission(tmp_path: Path) -> None:
@@ -1704,11 +1768,11 @@ def test_pilot_prepares_canonical_inputs_before_plan_and_submission(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert "reused=0 generated=1" in result.stdout
-    command_lines = log.read_text(encoding="utf-8").splitlines()
-    prepare_index = next(index for index, line in enumerate(command_lines) if "prepare-campaign-inputs" in line)
-    plan_index = next(index for index, line in enumerate(command_lines) if "plan-campaign" in line)
-    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
-    assert prepare_index < plan_index < submit_index
+    remote_commands = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("<bash -l -s --")]
+    prepare_index = next(index for index, line in enumerate(remote_commands) if " prepare-campaign-inputs " in line)
+    submit_index = next(index for index, line in enumerate(remote_commands) if " submit-campaign " in line)
+    assert prepare_index < submit_index
+    assert not any(" plan-campaign " in line for line in remote_commands)
 
 
 def test_license_blocked_campaign_polling_reaches_publication_without_failure_evidence(tmp_path: Path) -> None:
@@ -1728,9 +1792,10 @@ def test_license_blocked_campaign_polling_reaches_publication_without_failure_ev
     assert result.returncode == 0, result.stderr
     assert result.stdout.index("State: license_blocked") < result.stdout.index("State: successful")
     log_text = log.read_text(encoding="utf-8")
-    assert sum("--format monitor" in line for line in log_text.splitlines()) == 2
-    assert sum("validate-campaign-terminal" in line for line in log_text.splitlines()) == 1
-    assert sum("submit-campaign" in line for line in log_text.splitlines()) == 1
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    assert sum(" --format workflow-monitor " in line for line in remote_commands) == 2
+    assert sum(" validate-campaign-terminal " in line for line in remote_commands) == 1
+    assert sum(" submit-campaign " in line for line in remote_commands) == 1
     assert "record-workflow-failure" not in log_text
 
 
@@ -1765,8 +1830,11 @@ def test_explicit_status_prints_campaign_summary_before_storage(tmp_path: Path) 
     assert result.stdout.index("GPU storage status:") < result.stdout.index("CPU storage status:")
     assert f"Campaign: {_RUN_ID}" in result.stdout
     assert "case_0001" in result.stdout
-    assert "campaign-status" in log.read_text(encoding="utf-8")
-    assert "--format summary" in log.read_text(encoding="utf-8")
+    commands = log.read_text(encoding="utf-8")
+    assert commands.count("campaign-status") == 1
+    assert "--format workflow-monitor" in commands
+    assert commands.count("<--metadata-only>") == 2
+    assert commands.count("<--omit-run-status>") == 2
 
 
 def test_changed_solver_progress_is_rendered_only_after_the_minimum_interval(tmp_path: Path) -> None:
@@ -1857,15 +1925,15 @@ def test_combined_smoke_records_and_checks_both_profile_evidence(tmp_path: Path)
         "technical-smoke-evidence-profile <steady_flow>",
         "technical-smoke-evidence-profile <transient_drying>",
     ]
-    lifecycle = [command for line in log_lines for command in ("prepare-campaign-inputs", "plan-campaign", "submit-campaign") if command in line]
+    remote_commands = [line for line in log_lines if line.startswith("<bash -l -s --")]
+    lifecycle = [command for line in remote_commands for command in ("prepare-campaign-inputs", "submit-campaign") if f" {command} " in line]
     assert lifecycle == [
         "prepare-campaign-inputs",
-        "plan-campaign",
         "submit-campaign",
         "prepare-campaign-inputs",
-        "plan-campaign",
         "submit-campaign",
     ]
+    assert not any(" plan-campaign " in line for line in remote_commands)
 
 
 def test_failed_technical_smoke_publishes_no_profile_evidence(tmp_path: Path) -> None:
@@ -1885,7 +1953,7 @@ def test_failed_technical_smoke_publishes_no_profile_evidence(tmp_path: Path) ->
 def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_path: Path) -> None:
     """Ignore real staged, tracked, workflow, config, and untracked edits exactly."""
     workflow, log, environment, storage, _mirror = _harness(tmp_path)
-    project, source_probe, commit = _initialize_real_repository(workflow, environment)
+    project, source_probe, commit = _initialize_snapshot_repository(workflow, environment)
     campaign = _campaign(workflow)
     dirty_marker = "# DIRTY_GENERATION_CONFIG"
     campaign.write_text(
@@ -1893,7 +1961,6 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
         encoding="utf-8",
     )
     source_probe.write_text("dirty staged generation behavior", encoding="utf-8")
-    _real_git(project, "add", source_probe.relative_to(project).as_posix())
 
     workflow_text = workflow.read_text(encoding="utf-8")
     workflow_anchor = "local_python() {\n  env GENERATION_GIT_COMMIT="
@@ -1915,13 +1982,10 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
     untracked = project / untracked_relative
     untracked.write_text("raise RuntimeError('dirty source executed')\n", encoding="utf-8")
 
-    status_before = _real_git(
-        project,
-        "--no-optional-locks",
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    ).stdout
+    environment["FAKE_GIT_STATUS"] = (
+        "M  src/generation/source_probe.py\n M scripts/generation_workflow.sh\n?? src/uncommitted_generation_behavior.py\n"
+    )
+    status_before = environment["FAKE_GIT_STATUS"]
     index_before = (project / ".git/index").read_bytes()
     file_bytes_before = {path: path.read_bytes() for path in (campaign, source_probe, workflow, untracked)}
     environment["FAKE_REJECT_CONFIG_TEXT"] = dirty_marker
@@ -1953,15 +2017,9 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
         "Local worktree: dirty; uncommitted changes ignored",
     ]
     assert (project / ".git/index").read_bytes() == index_before
-    status_after = _real_git(
-        project,
-        "--no-optional-locks",
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    ).stdout
+    status_after = environment["FAKE_GIT_STATUS"]
     assert status_after == status_before
-    assert _real_git(project, "rev-parse", "HEAD").stdout.strip() == commit
+    assert environment["FAKE_GIT_COMMIT"] == commit
     for path, expected in file_bytes_before.items():
         assert path.read_bytes() == expected
 
@@ -1988,7 +2046,7 @@ def test_dirty_worktree_uses_clean_pinned_source_without_modifying_checkout(tmp_
     assert "Local Python did not receive the committed Generation source." not in result.stderr
 
 
-def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -> None:
+def test_dirty_snapshot_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -> None:
     """Run paired Technical Smoke orchestration from committed source while dirty."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
     project = workflow.parent.parent
@@ -2000,7 +2058,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
         committed_cores,
     )
     execution_config.write_text(committed_execution, encoding="utf-8")
-    project, source_probe, commit = _initialize_real_repository(workflow, environment)
+    project, source_probe, commit = _initialize_snapshot_repository(workflow, environment)
     source_probe.write_text("dirty generation behavior", encoding="utf-8")
     execution_config.write_text(
         _execution_config_with_cores(committed_execution, dirty_cores),
@@ -2012,6 +2070,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     environment["FAKE_EXPECT_SOURCE_TEXT"] = "committed generation behavior"
     environment["FAKE_UNTRACKED_SOURCE_PATH"] = untracked.relative_to(project).as_posix()
     environment["FAKE_GPU_ALWAYS_VALID"] = "true"
+    environment["FAKE_GIT_STATUS"] = " M configs/generation/execution/cluster_cpu.yaml\n M src/generation/source_probe.py\n?? notes-in-progress.txt\n"
 
     result = _run(workflow, ["run", str(_smoke_workflow(workflow)), "--keep-cpu-source"], environment)
 
@@ -2024,7 +2083,7 @@ def test_dirty_real_worktree_runs_the_motivating_smoke_command(tmp_path: Path) -
     assert untracked.read_text(encoding="utf-8") == "continue local development\n"
     assert f"Resources: cores_per_case={committed_cores}  max_admission_cases=2  max_running_cases=null" in result.stdout
     log_text = log.read_text(encoding="utf-8")
-    assert log_text.count("submit-campaign") == 2
+    assert log_text.count(" submit-campaign Python/") == 2
     assert "<finalize-technical-smoke-evidence>" in log_text
     assert "<finalize-real-smoke>" in log_text
     assert "<cpu-cleanup-authorization>" not in log_text
@@ -2137,7 +2196,7 @@ def test_smoke_defer_collection_stops_before_host_finalization_and_cleanup(
     assert "DONE:" not in result.stdout
     assert all((mirror / relative).is_dir() for relative in source_directories)
     log_text = log.read_text(encoding="utf-8")
-    assert log_text.count("submit-campaign") == 2
+    assert log_text.count(" submit-campaign Python/") == 2
     for forbidden in (
         "rsync-start",
         "<build-campaign-datasets>",
@@ -2187,7 +2246,7 @@ def test_completed_cpu_cleaned_smoke_children_reach_parent_without_new_work(
 def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) -> None:
     """Keep one clean invocation on commit A while the development checkout reaches B."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
-    project, source_probe, commit_a = _initialize_real_repository(workflow, environment)
+    project, source_probe, commit_a = _initialize_snapshot_repository(workflow, environment)
     environment["FAKE_EXPECT_SOURCE_FILE"] = source_probe.relative_to(project).as_posix()
     environment["FAKE_EXPECT_SOURCE_TEXT"] = "committed generation behavior"
     ready = tmp_path / "source-ready"
@@ -2213,22 +2272,12 @@ def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) ->
     )
     try:
         pinned_root = Path(_wait_for_file(ready, process))
-        assert _real_git(pinned_root, "rev-parse", "HEAD").stdout.strip() == commit_a
-        assert (
-            _real_git(
-                pinned_root,
-                "--no-optional-locks",
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-            ).stdout
-            == ""
-        )
+        assert (pinned_root / source_probe.relative_to(project)).read_text(encoding="utf-8") == "committed generation behavior"
 
         (project / "after_launch.txt").write_text("commit B\n", encoding="utf-8")
-        _real_git(project, "add", "after_launch.txt")
-        _real_git(project, "commit", "--quiet", "-m", "test: advance development head")
-        commit_b = _real_git(project, "rev-parse", "HEAD").stdout.strip()
+        commit_b = "b" * 40
+        environment["FAKE_GIT_COMMIT"] = commit_b
+        environment["FAKE_GIT_STATUS"] = ""
         assert commit_b != commit_a
 
         continuation.touch()
@@ -2254,7 +2303,7 @@ def test_source_remains_pinned_when_development_head_advances(tmp_path: Path) ->
 def test_concurrent_workflows_own_independent_clean_sources(tmp_path: Path) -> None:
     """Let one invocation clean up while another exact source remains active."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
-    project, source_probe, commit = _initialize_real_repository(workflow, environment)
+    project, source_probe, commit = _initialize_snapshot_repository(workflow, environment)
     command = [
         str(workflow),
         "run",
@@ -2360,7 +2409,7 @@ def test_source_setup_failure_reports_frozen_commit_before_remote_work(tmp_path:
 def test_committed_parser_failure_cleans_its_pinned_source(tmp_path: Path) -> None:
     """Clean the bootstrap-owned source when committed argument parsing fails."""
     workflow, _log, environment, _storage, _mirror = _harness(tmp_path)
-    _initialize_real_repository(workflow, environment)
+    _initialize_snapshot_repository(workflow, environment)
     source_parent = tmp_path / "source temp"
     source_parent.mkdir()
     environment["TMPDIR"] = str(source_parent)
@@ -2432,7 +2481,7 @@ exec "${FAKE_REAL_RM}" "$@"
 def test_exact_requested_commit_validation_survives_dirty_safe_source_resolution(tmp_path: Path) -> None:
     """Reject malformed and non-HEAD commits before remote workflow operations."""
     workflow, log, environment, _storage, _mirror = _harness(tmp_path)
-    _project, _source_probe, commit = _initialize_real_repository(workflow, environment)
+    _project, _source_probe, commit = _initialize_snapshot_repository(workflow, environment)
     mismatch = ("f" * 40) if commit != ("f" * 40) else ("e" * 40)
     common = [
         "run",
@@ -2559,6 +2608,7 @@ def test_setup_refuses_active_shared_jobs_before_remote_mutation(tmp_path: Path)
 
     assert result.returncode != 0
     assert "active_dependent_jobs" in result.stderr
+    assert "active dependent scheduler jobs block shared setup" not in result.stderr
     payload = log.read_text(encoding="utf-8")
     assert "setup-idle-check <established>" in payload
     assert "assert-shared-setup-idle" in payload
@@ -2699,12 +2749,13 @@ def test_remote_campaign_launch_binds_pinned_commit_to_environment_and_cli(
     assert f"<{_COMMIT}>" in log_text
     assert 'export GENERATION_GIT_COMMIT="${commit}"' in log_text
     assert '--git-commit "${commit}"' in log_text
-    command_lines = log_text.splitlines()
-    submit_index = next(index for index, line in enumerate(command_lines) if "submit-campaign" in line)
-    status_index = next(index for index, line in enumerate(command_lines) if "campaign-status" in line)
-    assert submit_index < status_index
-    assert sum("submit-campaign" in line for line in command_lines) == 1
-    assert sum("campaign-status" in line for line in command_lines) == 1
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    submit_index = next(index for index, line in enumerate(remote_commands) if " submit-campaign " in line)
+    monitor_index = next(index for index, line in enumerate(remote_commands) if " resume-campaign " in line)
+    assert submit_index < monitor_index
+    assert sum(" submit-campaign " in line for line in remote_commands) == 1
+    assert sum(" resume-campaign " in line for line in remote_commands) == 1
+    assert not any(" campaign-status " in line for line in remote_commands)
 
 
 def test_remote_campaign_monitoring_binds_pinned_commit_to_resume_feed(
@@ -2724,9 +2775,10 @@ def test_remote_campaign_monitoring_binds_pinned_commit_to_resume_feed(
 
     assert result.returncode == 0, result.stderr
     log_text = log.read_text(encoding="utf-8")
-    assert "campaign-status" in log_text
-    assert sum("resume-campaign" in line for line in log_text.splitlines()) == 1
-    assert "feed-campaign" not in log_text
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    assert sum(" resume-campaign " in line for line in remote_commands) == 1
+    assert not any(" campaign-status " in line for line in remote_commands)
+    assert not any(" feed-campaign " in line for line in remote_commands)
     assert f" {_COMMIT} " in log_text
     assert 'commit="$4"' in log_text
     assert 'export GENERATION_GIT_COMMIT="${commit}"' in log_text
@@ -2753,7 +2805,8 @@ def test_initial_status_failure_retains_submitted_run_for_safe_inspection(
     assert "Remote launch failed." not in failed.stderr
     assert "generation_workflow.sh run" in failed.stderr
     first_log = log.read_text(encoding="utf-8")
-    assert sum("submit-campaign" in line for line in first_log.splitlines()) == 1
+    first_remote_commands = [line for line in first_log.splitlines() if line.startswith("<bash -l -s --")]
+    assert sum(" submit-campaign " in line for line in first_remote_commands) == 1
     submission_file = Path(environment["FAKE_SUBMISSION_FILE"])
     assert submission_file.read_text(encoding="utf-8") == "591776\n"
 
@@ -2763,7 +2816,8 @@ def test_initial_status_failure_retains_submitted_run_for_safe_inspection(
     assert inspected.returncode == 0, inspected.stderr
     assert f"Campaign: {_RUN_ID}" in inspected.stdout
     final_log = log.read_text(encoding="utf-8")
-    assert sum("submit-campaign" in line for line in final_log.splitlines()) == 1
+    final_remote_commands = [line for line in final_log.splitlines() if line.startswith("<bash -l -s --")]
+    assert sum(" submit-campaign " in line for line in final_remote_commands) == 1
     assert submission_file.read_text(encoding="utf-8") == "591776\n"
 
 
@@ -3066,6 +3120,9 @@ def test_failure_preserves_evidence_and_resume_is_idempotent(tmp_path: Path) -> 
     assert "dataset build" in failed.stderr.lower()
     assert "workflow_failures/failure-0001.json" in failed.stderr
     assert "local canonical=" in failed.stderr
+    assert "CPU bytes retained: 24" in failed.stderr
+    failed_commands = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("<bash -l -s --")]
+    assert sum(" campaign-source-status " in line for line in failed_commands) == 1
     assert all((mirror / relative).is_dir() for relative in source_directories)
     assert Path(environment["FAKE_GPU_PUBLISHED_FILE"]).is_file()
     first_log = log.read_text(encoding="utf-8")

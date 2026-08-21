@@ -255,10 +255,16 @@ def test_compatible_historical_conversion_attempt_replays_in_place_across_commit
         case_index=1,
         case_id=config.case_id(1),
     )
+    input_reference = generation.cases.input_generation.admit_configured_input_references(
+        config,
+        storage_root=storage,
+        validation_depth="evidence",
+    )[1]
     historical = generation.campaign._admitted_case_attempt(  # noqa: SLF001 -- tests cross-run admission
         {"campaign_run_id": target_run_id, "git_commit": "b" * 40},
         config,
         task,
+        input_reference=input_reference,
         storage_root=storage,
     )
     assert historical is not None
@@ -436,11 +442,17 @@ def test_historical_solver_failure_is_not_misclassified_as_replayable(
         case_id=config.case_id(1),
     )
 
+    input_reference = generation.cases.input_generation.admit_configured_input_references(
+        config,
+        storage_root=storage,
+        validation_depth="evidence",
+    )[1]
     assert (
         generation.campaign._admitted_case_attempt(  # noqa: SLF001 -- tests cross-run admission
             {"campaign_run_id": target_run_id, "git_commit": "b" * 40},
             config,
             task,
+            input_reference=input_reference,
             storage_root=storage,
         )
         is None

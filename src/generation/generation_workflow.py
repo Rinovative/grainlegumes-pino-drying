@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from src import common
 
@@ -35,7 +36,7 @@ from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Sequence
 
 DATASET_RECEIPT_FILENAME: Final = "dataset_packages_complete.json"
 INCOMPLETE_DATASET_RECEIPT_FILENAME: Final = "dataset_packages_incomplete.json"
@@ -50,6 +51,7 @@ ALL_WORKFLOW_SCHEMA_KIND: Final = "generation_all_workflow"
 CPU_CLEANUP_SCHEMA_KIND: Final = "generation_cpu_source_cleanup"
 CPU_CLEANUP_TRANSACTION_SCHEMA_KIND: Final = "generation_cpu_source_cleanup_transaction"
 WORKFLOW_SCHEMA_VERSION: Final = 1
+_MINIMUM_ROLLOUT_TRANSITIONS: Final = 2
 _SHA256_LENGTH: Final = 64
 _SOURCE_CLEANUP_READY_CAMPAIGN_STATES: Final = frozenset({"successful", "transfer_complete"})
 _CLEANUP_RECEIPT_IDENTITY_KEYS: Final = frozenset(
@@ -195,22 +197,48 @@ def _package_runtime_evidence(
     storage_root: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Return a validated manifest, inspection, and bounded loader smoke."""
-    from src.datasets import packages as package_service  # noqa: PLC0415
+    from src.datasets.runtime import dataset_runtime_package_validation as package_validation  # noqa: PLC0415
 
-    manifest = package_service.load_package_manifest(dataset_id, storage_root=storage_root)
-    inspection = package_service.inspect_dataset_package(dataset_id, storage_root=storage_root)
-    membership = "train" if manifest["evaluation_regime"] == "id" and manifest["training_eligible"] is True else None
-    smoke = {
-        f"workers_{num_workers}": package_service.smoke_dataset_package(
-            dataset_id,
-            storage_root=storage_root,
-            membership=membership,
-            num_workers=num_workers,
-            hdf5_cache_size=1,
-        )
-        for num_workers in (0, 2)
+    return package_validation.package_runtime_evidence(
+        dataset_id,
+        storage_root=storage_root,
+        validation_depth="evidence",
+    )
+
+
+def _training_payload_binding(
+    dataset_id: str,
+    *,
+    storage_root: Path,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+) -> dict[str, Any] | None:
+    """Return compact evidence for one optional immutable PT shard payload."""
+    from src.datasets.packages import dataset_packages_transient_shards as transient_shards  # noqa: PLC0415
+
+    directory = transient_shards.transient_shard_directory(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    if not directory.exists():
+        return None
+    receipt = transient_shards.load_transient_shard_receipt(
+        dataset_id,
+        storage_root=storage_root,
+        validation_depth=validation_depth,
+    )
+    receipt_path = directory / transient_shards.TRANSIENT_PT_RECEIPT_FILENAME
+    return {
+        "backend": "pt_shards",
+        "status": "ready",
+        "derived_payload_id": receipt["derived_payload_id"],
+        "receipt_relative_path": receipt_path.relative_to(storage_root).as_posix(),
+        "receipt_sha256": common.serialization.file_sha256(receipt_path),
+        "shard_inventory_digest": receipt["shard_inventory_digest"],
+        "target_shard_bytes": receipt["target_shard_bytes"],
+        "shard_count": receipt["shard_count"],
+        "case_count": receipt["case_count"],
+        "total_size_bytes": receipt["total_size_bytes"],
     }
-    return manifest, inspection, smoke
 
 
 def _package_record(
@@ -218,9 +246,15 @@ def _package_record(
     *,
     storage_root: Path,
 ) -> dict[str, Any]:
-    """Return exact package hashes plus inspection and loader evidence."""
-    dataset_id = common.paths.validate_logical_name(result.get("dataset_id"), label="dataset_id")
-    manifest, inspection, smoke = _package_runtime_evidence(dataset_id, storage_root=storage_root)
+    """Return exact scientific package hashes and bounded runtime evidence."""
+    dataset_id = common.paths.validate_logical_name(
+        result.get("dataset_id"),
+        label="dataset_id",
+    )
+    manifest, inspection, smoke = _package_runtime_evidence(
+        dataset_id,
+        storage_root=storage_root,
+    )
     manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / dataset_id / "dataset_manifest.json"
     payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
     return {
@@ -232,7 +266,8 @@ def _package_record(
         "manifest_relative_path": manifest_path.relative_to(storage_root).as_posix(),
         "manifest_sha256": common.serialization.file_sha256(manifest_path),
         "payload_relative_path": payload_path.relative_to(storage_root).as_posix(),
-        "payload_sha256": common.serialization.file_sha256(payload_path),
+        "payload_sha256": str(manifest["payload_sha256"]),
+        "payload_size_bytes": payload_path.stat().st_size,
         "source_case_count": manifest["source_case_count"],
         "sample_count": manifest["sample_count"],
         "transition_count": manifest["transition_count"],
@@ -241,16 +276,56 @@ def _package_record(
     }
 
 
+def _validate_package_plan_binding(
+    manifest: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+) -> None:
+    """Bind one self-validating Dataset identity to its exact scientific plan."""
+    expected = {
+        "dataset_name": plan["dataset_name"],
+        "dataset_view": plan["dataset_view"],
+        "evaluation_regime": plan["evaluation_regime"],
+        "materials": list(plan["materials"]),
+        "source_role": plan["source_role"],
+        "source_case_count": plan["source_case_count"],
+        "training_eligible": bool(plan["split_eligibility"]["train"]),
+        "campaign_name": campaign.campaign_name,
+        "campaign_id": campaign.campaign_id,
+        "campaign_digest": campaign.campaign_digest,
+        "campaign_purpose": campaign.campaign_purpose,
+        "material_roles": {name: list(values) for name, values in campaign.material_roles.items()},
+        "evaluation_regimes": list(campaign.evaluation_regimes),
+        "material_memberships": {name: list(values) for name, values in campaign.material_memberships.items()},
+    }
+    if (
+        any(manifest.get(key) != value for key, value in expected.items())
+        or set(manifest["material_counts"]) != set(plan["materials"])
+        or sum(int(value) for value in manifest["material_counts"].values()) != plan["source_case_count"]
+    ):
+        message = f"Dataset package {manifest.get('dataset_id')!r} does not bind its exact declared scientific plan."
+        raise ValueError(message)
+
+
 def _validate_package_record(
     record: Any,
     *,
     storage_root: Path,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+    expected_plan: Mapping[str, Any] | None = None,
+    campaign: config_service.CampaignConfig | None = None,
 ) -> dict[str, Any]:
-    """Validate one dataset receipt record against the current immutable package."""
+    """Admit current evidence or deeply validate legacy package records."""
+    if validation_depth not in {"evidence", "full"}:
+        message = f"Unsupported package validation depth: {validation_depth!r}."
+        raise ValueError(message)
+    if (expected_plan is None) != (campaign is None):
+        message = "Package plan validation requires both plan and campaign."
+        raise TypeError(message)
     if not isinstance(record, dict):
         message = "Dataset receipt package records must be JSON objects."
         raise TypeError(message)
-    required = {
+    legacy_required = {
         "dataset_name",
         "dataset_id",
         "dataset_view",
@@ -266,11 +341,43 @@ def _validate_package_record(
         "inspection",
         "loader_smoke",
     }
-    if set(record) != required:
+    current_required = legacy_required | {"payload_size_bytes"}
+    keys = set(record)
+    if keys not in (legacy_required, current_required):
         message = f"Dataset receipt package keys are invalid for {record.get('dataset_id')!r}."
         raise ValueError(message)
-    dataset_id = common.paths.validate_logical_name(record["dataset_id"], label="dataset_id")
-    manifest, inspection, smoke = _package_runtime_evidence(dataset_id, storage_root=storage_root)
+    dataset_id = common.paths.validate_logical_name(
+        record["dataset_id"],
+        label="dataset_id",
+    )
+    current_record = keys == current_required
+    if current_record:
+        from src.datasets.packages import dataset_packages_manifest as manifest_service  # noqa: PLC0415
+
+        manifest_loader = manifest_service.load_package_manifest if validation_depth == "full" else manifest_service.load_package_manifest_evidence
+        manifest = manifest_loader(
+            dataset_id,
+            storage_root=storage_root,
+        )
+        inspection = record["inspection"]
+        smoke = record["loader_smoke"]
+        if (
+            not isinstance(inspection, dict)
+            or inspection.get("dataset_id") != dataset_id
+            or not isinstance(smoke, dict)
+            or any(
+                not isinstance(value, dict) or value.get("dataset_id") != dataset_id or value.get("status") != "loaded" for value in smoke.values()
+            )
+        ):
+            message = f"Dataset receipt runtime evidence is malformed for {dataset_id!r}."
+            raise ValueError(message)
+    else:
+        manifest, inspection, smoke = _package_runtime_evidence(
+            dataset_id,
+            storage_root=storage_root,
+        )
+    if expected_plan is not None and campaign is not None:
+        _validate_package_plan_binding(manifest, expected_plan, campaign)
     manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / dataset_id / "dataset_manifest.json"
     payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / dataset_id / str(manifest["payload_filename"])
     expected = {
@@ -281,13 +388,15 @@ def _validate_package_record(
         "manifest_relative_path": manifest_path.relative_to(storage_root).as_posix(),
         "manifest_sha256": common.serialization.file_sha256(manifest_path),
         "payload_relative_path": payload_path.relative_to(storage_root).as_posix(),
-        "payload_sha256": common.serialization.file_sha256(payload_path),
+        "payload_sha256": (str(manifest["payload_sha256"]) if current_record else common.serialization.file_sha256(payload_path)),
         "source_case_count": manifest["source_case_count"],
         "sample_count": manifest["sample_count"],
         "transition_count": manifest["transition_count"],
         "inspection": inspection,
         "loader_smoke": smoke,
     }
+    if current_record:
+        expected["payload_size_bytes"] = payload_path.stat().st_size
     if any(record.get(key) != value for key, value in expected.items()):
         message = f"Dataset receipt no longer binds package {dataset_id!r}."
         raise ValueError(message)
@@ -338,7 +447,7 @@ def _campaign_source_artifact_identity(
             raise RuntimeError(message)
         cases: list[dict[str, Any]] = []
         for case in terminal.cases:
-            artifact = case.artifact("processed", "case.h5")
+            artifact = case.artifact_evidence("processed", "case.h5")
             cases.append(
                 {
                     **case.record_payload(),
@@ -416,6 +525,8 @@ def _validate_package_extension(
     workflow_receipt: Mapping[str, Any],
     source_artifact_set: Mapping[str, Any],
     id_companion: Mapping[str, str] | None,
+    campaign: config_service.CampaignConfig,
+    validation_depth: Literal["evidence", "full"] = "evidence",
 ) -> dict[str, Any]:
     """Validate one immutable additive package receipt and its exact source."""
     path = _dataset_extension_path(
@@ -449,6 +560,9 @@ def _validate_package_extension(
     validated_package = _validate_package_record(
         package,
         storage_root=storage_root,
+        validation_depth=validation_depth,
+        expected_plan=plan,
+        campaign=campaign,
     )
     if (
         set(receipt) != required
@@ -478,16 +592,100 @@ def _validate_package_extension(
     return validated_package
 
 
+def _validate_declared_training_payloads(
+    campaign: config_service.CampaignConfig,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    storage_root: Path,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+    allow_unready: bool = False,
+) -> list[dict[str, Any]]:
+    """Validate policy-declared derived payloads at the requested depth."""
+    if not isinstance(allow_unready, bool):
+        message = "allow_unready must be boolean."
+        raise TypeError(message)
+    records_by_key = {_package_key(record): record for record in records}
+    results: list[dict[str, Any]] = []
+    for plan in campaign.dataset_packages:
+        policy = plan.get("training_payload")
+        if plan["dataset_view"] != "transient_drying" or policy is None:
+            continue
+        record = records_by_key.get(_package_key(plan))
+        if record is None:
+            message = f"Training payload plan lacks package {plan['dataset_name']!r}."
+            raise RuntimeError(message)
+        dataset_id = str(record["dataset_id"])
+        try:
+            binding = _training_payload_binding(
+                dataset_id,
+                storage_root=storage_root,
+                validation_depth=validation_depth,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+            if not allow_unready:
+                raise
+            results.append(
+                {
+                    "dataset_id": dataset_id,
+                    "backend": "pt_shards",
+                    "required": bool(policy["required"]),
+                    "status": "invalid",
+                    "error_kind": type(error).__name__,
+                }
+            )
+            continue
+        if binding is None:
+            if policy["required"] is True and not allow_unready:
+                message = f"Required transient PT shard payload is missing for {dataset_id!r}."
+                raise FileNotFoundError(message)
+            results.append(
+                {
+                    "dataset_id": dataset_id,
+                    "backend": "pt_shards",
+                    "required": bool(policy["required"]),
+                    "status": ("missing_required" if policy["required"] is True else "missing_optional"),
+                }
+            )
+            continue
+        if binding["target_shard_bytes"] != policy["target_shard_bytes"]:
+            if not allow_unready:
+                message = f"Transient PT shard packing policy changed for {dataset_id!r}."
+                raise RuntimeError(message)
+            results.append(
+                {
+                    "dataset_id": dataset_id,
+                    "backend": "pt_shards",
+                    "required": bool(policy["required"]),
+                    "status": "conflicting_policy",
+                    "observed_target_shard_bytes": binding["target_shard_bytes"],
+                    "required_target_shard_bytes": policy["target_shard_bytes"],
+                }
+            )
+            continue
+        results.append(
+            {
+                "dataset_id": dataset_id,
+                "required": bool(policy["required"]),
+                **binding,
+            }
+        )
+    return results
+
+
 def validate_campaign_package_state(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+    allow_unready_training_payloads: bool = False,
 ) -> dict[str, Any]:
     """Validate the historical base plus every currently requested extension."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     base = validate_dataset_packages_receipt(
         run_id,
         storage_root=storage,
+        validation_depth=validation_depth,
+        require_training_payloads=not allow_unready_training_payloads,
     )
     launch_campaign = campaign_evidence.campaign_for_run(
         run_id,
@@ -500,7 +698,11 @@ def validate_campaign_package_state(
     current_plans = tuple(dict(plan) for plan in current_campaign.dataset_packages)
     current_by_key = {_package_key(plan): plan for plan in current_plans}
     launch_by_key = {_package_key(plan): dict(plan) for plan in launch_campaign.dataset_packages}
-    if any(current_by_key.get(key) != plan for key, plan in launch_by_key.items()):
+    if any(
+        current_by_key.get(key) is None
+        or config_service.dataset_package_scientific_plan(current_by_key[key]) != config_service.dataset_package_scientific_plan(plan)
+        for key, plan in launch_by_key.items()
+    ):
         message = "Current campaign removed or changed a launch-time Dataset package."
         raise RuntimeError(message)
     records = {_package_key(record): dict(record) for record in base["packages"]}
@@ -538,6 +740,8 @@ def validate_campaign_package_state(
                 workflow_receipt=workflow,
                 source_artifact_set=source_artifact_set,
                 id_companion=companion,
+                campaign=current_campaign,
+                validation_depth=validation_depth,
             )
             records[_package_key(plan)] = record
             extension_paths.append(
@@ -553,6 +757,13 @@ def validate_campaign_package_state(
     if len({record["dataset_id"] for record in ordered_records}) != len(ordered_records):
         message = "Current campaign package state resolves duplicate Dataset IDs."
         raise RuntimeError(message)
+    training_payloads = _validate_declared_training_payloads(
+        current_campaign,
+        ordered_records,
+        storage_root=storage,
+        validation_depth=validation_depth,
+        allow_unready=allow_unready_training_payloads,
+    )
     return {
         "schema_kind": PACKAGE_STATE_SCHEMA_KIND,
         "schema_version": WORKFLOW_SCHEMA_VERSION,
@@ -563,6 +774,9 @@ def validate_campaign_package_state(
         "declared_package_count": len(current_plans),
         "base_dataset_receipt_sha256": common.serialization.file_sha256(_dataset_receipt_path(run_id, storage_root=storage)),
         "packages": ordered_records,
+        "training_payloads": training_payloads,
+        "required_training_payload_count": sum(record["required"] is True for record in training_payloads),
+        "training_payload_ready_count": sum(record["status"] == "ready" for record in training_payloads),
         "extension_receipts": extension_paths,
     }
 
@@ -572,9 +786,23 @@ def _validate_dataset_receipt_payload(
     receipt: Mapping[str, Any],
     *,
     storage: Path,
+    validation_depth: Literal["evidence", "full"],
+    require_training_payloads: bool,
 ) -> None:
     """Validate one dataset receipt payload against current durable evidence."""
-    transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
+    if validation_depth == "full":
+        transfer = campaign_runtime.validate_transferred_campaign(
+            run_id,
+            storage_root=storage,
+        )
+    elif validation_depth == "evidence":
+        transfer = campaign_runtime.admit_transferred_campaign(
+            run_id,
+            storage_root=storage,
+        )
+    else:
+        message = f"Unsupported package validation depth: {validation_depth!r}."
+        raise ValueError(message)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
     campaign = campaign_evidence.campaign_for_run(run_id, storage_root=storage)
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
@@ -618,41 +846,80 @@ def _validate_dataset_receipt_payload(
     ):
         message = f"Dataset package completion receipt is invalid: {receipt_path}"
         raise ValueError(message)
-    validated = [_validate_package_record(record, storage_root=storage) for record in packages]
-    declared = {_package_key(plan) for plan in campaign.dataset_packages}
+    plans_by_key = {_package_key(plan): plan for plan in campaign.dataset_packages}
+    validated = []
+    for record in packages:
+        key = _package_key(record) if isinstance(record, Mapping) else None
+        plan = plans_by_key.get(key) if key is not None else None
+        validated.append(
+            _validate_package_record(
+                record,
+                storage_root=storage,
+                validation_depth=validation_depth,
+                expected_plan=plan,
+                campaign=campaign if plan is not None else None,
+            )
+        )
+    declared = set(plans_by_key)
     observed = {_package_key(record) for record in validated}
     if observed != declared or len({record["dataset_id"] for record in validated}) != len(validated):
         message = f"Dataset receipt does not cover each declared package exactly once: {receipt_path}"
         raise ValueError(message)
+    _validate_declared_training_payloads(
+        campaign,
+        validated,
+        storage_root=storage,
+        validation_depth=validation_depth,
+        allow_unready=not require_training_payloads,
+    )
 
 
 def _repair_dataset_receipt_transfer_binding(
     run_id: str,
     *,
     storage: Path,
+    require_training_payloads: bool = True,
 ) -> dict[str, Any]:
     """Repair only a stale transfer-receipt hash after exact revalidation."""
     receipt_path = _dataset_receipt_path(run_id, storage_root=storage)
     receipt = _load_json(receipt_path, label="dataset package completion receipt")
     candidate = dict(receipt)
     candidate["transfer_receipt_sha256"] = common.serialization.file_sha256(_transfer_receipt_path(run_id, storage_root=storage))
-    _validate_dataset_receipt_payload(run_id, candidate, storage=storage)
+    _validate_dataset_receipt_payload(
+        run_id,
+        candidate,
+        storage=storage,
+        validation_depth="full",
+        require_training_payloads=require_training_payloads,
+    )
     common.serialization.atomic_write_json(receipt_path, candidate)
-    return validate_dataset_packages_receipt(run_id, storage_root=storage)
+    return validate_dataset_packages_receipt(
+        run_id,
+        storage_root=storage,
+        require_training_payloads=require_training_payloads,
+    )
 
 
 def validate_dataset_packages_receipt(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    validation_depth: Literal["evidence", "full"] = "evidence",
+    require_training_payloads: bool = True,
 ) -> dict[str, Any]:
-    """Validate every package, inspection, smoke, and campaign-bound receipt."""
+    """Validate package evidence and optionally perform explicit content checks."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     receipt = _load_json(
         _dataset_receipt_path(run_id, storage_root=storage),
         label="dataset package completion receipt",
     )
-    _validate_dataset_receipt_payload(run_id, receipt, storage=storage)
+    _validate_dataset_receipt_payload(
+        run_id,
+        receipt,
+        storage=storage,
+        validation_depth=validation_depth,
+        require_training_payloads=require_training_payloads,
+    )
     return receipt
 
 
@@ -660,12 +927,16 @@ def build_campaign_datasets(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    prepare_training_payloads: bool = True,
 ) -> dict[str, Any]:
-    """Build the launch package set or only missing additive extensions."""
+    """Build scientific packages and optionally their derived Training payloads."""
     from src.datasets import packages as package_service  # noqa: PLC0415
 
+    if not isinstance(prepare_training_payloads, bool):
+        message = "prepare_training_payloads must be boolean."
+        raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
+    transfer = campaign_runtime.admit_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(
         run_id,
         storage_root=storage,
@@ -700,7 +971,22 @@ def build_campaign_datasets(
                     launch_campaign,
                     storage_root=storage,
                 )
-                package_records = [_package_record(result, storage_root=storage) for result in results]
+                if prepare_training_payloads:
+                    _prepare_declared_training_payloads(
+                        launch_campaign,
+                        results,
+                        run_id=run_id,
+                        storage_root=storage,
+                        terminal=terminal,
+                        transfer=transfer,
+                    )
+                package_records = [
+                    _package_record(
+                        result,
+                        storage_root=storage,
+                    )
+                    for result in results
+                ]
                 receipt = {
                     "schema_kind": DATASET_RECEIPT_SCHEMA_KIND,
                     "schema_version": WORKFLOW_SCHEMA_VERSION,
@@ -720,6 +1006,7 @@ def build_campaign_datasets(
         return validate_dataset_packages_receipt(
             run_id,
             storage_root=storage,
+            require_training_payloads=prepare_training_payloads,
         )
 
     lock_path = _dataset_receipt_lock_path(run_id, storage_root=storage)
@@ -728,11 +1015,13 @@ def build_campaign_datasets(
             base = validate_dataset_packages_receipt(
                 run_id,
                 storage_root=storage,
+                require_training_payloads=prepare_training_payloads,
             )
         except ValueError:
             base = _repair_dataset_receipt_transfer_binding(
                 run_id,
                 storage=storage,
+                require_training_payloads=prepare_training_payloads,
             )
     if not _all_receipt_path(run_id, storage_root=storage).is_file():
         return base
@@ -745,9 +1034,19 @@ def build_campaign_datasets(
     records = {_package_key(record): dict(record) for record in base["packages"]}
     missing = tuple(plan for plan in current_plans if _package_key(plan) not in records)
     if not missing:
+        if prepare_training_payloads:
+            _prepare_declared_training_payloads(
+                current_campaign,
+                tuple(records.values()),
+                run_id=run_id,
+                storage_root=storage,
+                terminal=terminal,
+                transfer=transfer,
+            )
         return validate_campaign_package_state(
             run_id,
             storage_root=storage,
+            allow_unready_training_payloads=not prepare_training_payloads,
         )
 
     workflow = validate_completed_workflow(
@@ -783,6 +1082,16 @@ def build_campaign_datasets(
                     str(plan["evaluation_regime"]),
                     storage_root=storage,
                 )
+                if prepare_training_payloads:
+                    _prepare_declared_training_payloads(
+                        current_campaign,
+                        (result,),
+                        run_id=run_id,
+                        storage_root=storage,
+                        terminal=terminal,
+                        transfer=transfer,
+                        selected_plans=(plan,),
+                    )
                 package_record = _package_record(
                     result,
                     storage_root=storage,
@@ -820,12 +1129,368 @@ def build_campaign_datasets(
                 workflow_receipt=workflow,
                 source_artifact_set=source_artifact_set,
                 id_companion=companion,
+                campaign=current_campaign,
             )
         records[_package_key(plan)] = record
     return validate_campaign_package_state(
         run_id,
         storage_root=storage,
+        allow_unready_training_payloads=not prepare_training_payloads,
     )
+
+
+def _gpu_publication_identity(
+    run_id: str,
+    *,
+    storage_root: Path,
+    terminal: Mapping[str, Any],
+    transfer: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return stable GPU evidence that never depends on one CPU pathname."""
+    terminal_path = (
+        campaign_evidence.campaign_run_directory(
+            run_id,
+            storage_root=storage_root,
+        )
+        / "campaign_terminal.json"
+    )
+    return {
+        "campaign_run_id": run_id,
+        "campaign_id": str(terminal["campaign_id"]),
+        "git_commit": str(terminal["git_commit"]),
+        "campaign_terminal_sha256": common.serialization.file_sha256(terminal_path),
+        "transfer_inventory_sha256": str(transfer["transfer_inventory_sha256"]),
+    }
+
+
+def _prepare_declared_training_payloads(
+    campaign: config_service.CampaignConfig,
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+    storage_root: Path,
+    terminal: Mapping[str, Any],
+    transfer: Mapping[str, Any],
+    selected_plans: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build and smoke every selected policy-owned transient Training payload."""
+    from src.datasets.packages import dataset_packages_transient_shards as transient_shards  # noqa: PLC0415
+
+    by_key = {_package_key(entry): entry for entry in entries}
+    plans = campaign.dataset_packages if selected_plans is None else selected_plans
+    publication_identity = _gpu_publication_identity(
+        run_id,
+        storage_root=storage_root,
+        terminal=terminal,
+        transfer=transfer,
+    )
+    smokes: dict[str, dict[str, Any]] = {}
+    for plan in plans:
+        policy = plan.get("training_payload")
+        if plan["dataset_view"] != "transient_drying" or policy is None:
+            continue
+        entry = by_key.get(_package_key(plan))
+        if entry is None:
+            message = f"Training payload plan lacks its package result: {plan['dataset_name']!r}."
+            raise RuntimeError(message)
+        dataset_id = str(entry["dataset_id"])
+        result = transient_shards.build_transient_shards(
+            dataset_id,
+            storage_root=storage_root,
+            publication_identity=publication_identity,
+            target_shard_bytes=int(policy["target_shard_bytes"]),
+        )
+        if result["status"] != "reused":
+            smokes[dataset_id] = _smoke_transient_shard_backend(
+                entry,
+                storage_root=storage_root,
+                compare_canonical=True,
+            )
+    return smokes
+
+
+def _items_match(left: Any, right: Any) -> bool:
+    """Compare one nested TransientItem without numerical tolerance."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_items_match(left[key], right[key]) for key in left)
+    if isinstance(left, list | tuple):
+        return len(left) == len(right) and all(_items_match(left_item, right_item) for left_item, right_item in zip(left, right, strict=True))
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        return left == right
+    if isinstance(left, torch.Tensor):
+        return torch.equal(left, right)
+    return left == right
+
+
+def _smoke_transient_shard_backend(
+    record: Mapping[str, Any],
+    *,
+    storage_root: Path,
+    compare_canonical: bool,
+) -> dict[str, Any]:
+    """Smoke PT items and compare new content with canonical HDF5 exactly once."""
+    if not isinstance(compare_canonical, bool):
+        message = "compare_canonical must be boolean."
+        raise TypeError(message)
+    from src.datasets.contracts import dataset_contracts_transient as transient_contract  # noqa: PLC0415
+    from src.datasets.runtime import dataset_runtime_transient as transient_runtime  # noqa: PLC0415
+
+    relative_path = record.get("payload_relative_path")
+    index_path = storage_root / str(relative_path) if relative_path is not None else Path(record["payload_path"]).expanduser().resolve()
+    index = transient_runtime.trajectory.load_transient_index(index_path)
+    first_case_positions = tuple(position for position, sample in enumerate(index["samples"]) if sample["case_index"] == 0)
+    if len(first_case_positions) < _MINIMUM_ROLLOUT_TRANSITIONS:
+        message = f"Transient shard loader smoke requires two consecutive transitions: {record['dataset_id']!r}."
+        raise RuntimeError(message)
+    modes = (
+        (
+            transient_contract.TransientSamplingSpec(
+                mode="one_step_transition",
+            ),
+            first_case_positions[:1],
+        ),
+        (
+            transient_contract.TransientSamplingSpec(
+                mode="rollout_window",
+                rollout_length=2,
+                window_stride=1,
+                window_offset=0,
+            ),
+            first_case_positions[:2],
+        ),
+    )
+    results: dict[str, Any] = {}
+    for sampling, positions in modes:
+        canonical = (
+            transient_runtime.TransientPhysicalDataset(
+                index_path,
+                sampling=sampling,
+                source_root=storage_root,
+                hdf5_cache_size=1,
+                sample_indices=positions,
+            )
+            if compare_canonical
+            else None
+        )
+        sharded = transient_runtime.TransientPTShardDataset(
+            index_path,
+            sampling=sampling,
+            source_root=storage_root,
+            hdf5_cache_size=1,
+            sample_indices=positions,
+        )
+        try:
+            canonical_item = None if canonical is None else canonical[0]
+            sharded_item = sharded[0]
+        finally:
+            if canonical is not None:
+                canonical.close()
+            sharded.close()
+        if canonical_item is not None and not _items_match(canonical_item, sharded_item):
+            message = f"Transient PT shard {sampling.mode!r} smoke disagrees with canonical HDF5 for {record['dataset_id']!r}."
+            raise RuntimeError(message)
+        results[sampling.mode] = {
+            "status": "equivalent",
+            "storage_backend": "pt_shards",
+            "sample_id": sharded_item["metadata"]["sample_id"],
+            "rollout_length": sharded_item["metadata"]["rollout_length"],
+        }
+    return results
+
+
+def prepare_gpu_datasets(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Prepare missing packages and transient PT shards from terminal GPU data."""
+    from src.datasets.packages import dataset_packages_transient_shards as transient_shards  # noqa: PLC0415
+
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
+    run_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    terminal_path = run_directory / "campaign_terminal.json"
+    transfer_path = run_directory / "transfer_complete.json"
+    if (
+        manifest.get("state") != "complete"
+        or not terminal_path.is_file()
+        or terminal_path.is_symlink()
+        or not transfer_path.is_file()
+        or transfer_path.is_symlink()
+    ):
+        result = {
+            "schema_kind": "generation_gpu_dataset_preparation",
+            "schema_version": WORKFLOW_SCHEMA_VERSION,
+            "status": "pending_generation",
+            "campaign_run_id": run_id,
+            "dataset_complete": False,
+            "training_payload_ready": False,
+            "packages": [],
+            "transient_training_payloads": [],
+            "source_host_dependency": "none",
+            "eta": "unavailable",
+        }
+        if progress is not None:
+            progress(
+                {
+                    "operation": "pending_generation",
+                    "campaign_run_id": run_id,
+                    "source_host_dependency": "none",
+                    "eta": "unavailable",
+                }
+            )
+        return result
+    transfer = campaign_runtime.admit_transferred_campaign(
+        run_id,
+        storage_root=storage,
+    )
+    terminal = _load_json(terminal_path, label="terminal campaign receipt")
+    publication_identity = _gpu_publication_identity(
+        run_id,
+        storage_root=storage,
+        terminal=terminal,
+        transfer=transfer,
+    )
+    campaign = campaign_evidence.current_campaign_for_run(
+        run_id,
+        storage_root=storage,
+    )
+    dataset_receipt_existed = _dataset_receipt_path(
+        run_id,
+        storage_root=storage,
+    ).is_file()
+    package_state = build_campaign_datasets(
+        run_id,
+        storage_root=storage,
+        prepare_training_payloads=False,
+    )
+    records = {_package_key(record): dict(record) for record in package_state["packages"]}
+    plans = tuple(dict(plan) for plan in campaign.dataset_packages)
+    if set(records) != {_package_key(plan) for plan in plans}:
+        message = "GPU preparation did not resolve every exact current Dataset package."
+        raise RuntimeError(message)
+    package_results: list[dict[str, Any]] = []
+    shard_results: list[dict[str, Any]] = []
+    for package_index, plan in enumerate(plans):
+        record = records[_package_key(plan)]
+        package_action = "reused" if dataset_receipt_existed else str(record.get("build_status", "complete"))
+        package_results.append(
+            {
+                "dataset_name": record["dataset_name"],
+                "dataset_id": record["dataset_id"],
+                "dataset_view": record["dataset_view"],
+                "evaluation_regime": record["evaluation_regime"],
+                "status": package_action,
+            }
+        )
+        if progress is not None:
+            progress(
+                {
+                    "operation": "package_reuse" if package_action == "reused" else "package_building",
+                    "packages_completed": package_index + 1,
+                    "packages_total": len(plans),
+                    "dataset_id": record["dataset_id"],
+                    "source_host_dependency": "none",
+                    "eta": "unavailable",
+                }
+            )
+        policy = plan.get("training_payload")
+        if plan["dataset_view"] != "transient_drying" or policy is None:
+            continue
+
+        def shard_progress(
+            event: Mapping[str, Any],
+            dataset_id: str = str(record["dataset_id"]),
+        ) -> None:
+            if progress is not None:
+                progress(
+                    {
+                        **dict(event),
+                        "dataset_id": dataset_id,
+                        "source_host_dependency": "none",
+                    }
+                )
+
+        shard_result = transient_shards.build_transient_shards(
+            str(record["dataset_id"]),
+            storage_root=storage,
+            publication_identity=publication_identity,
+            target_shard_bytes=int(policy["target_shard_bytes"]),
+            existing_validation_depth="evidence",
+            rebuild_invalid=True,
+            progress=shard_progress,
+        )
+        smoke = _smoke_transient_shard_backend(
+            record,
+            storage_root=storage,
+            compare_canonical=shard_result["status"] != "reused",
+        )
+        receipt = shard_result["receipt"]
+        shard_results.append(
+            {
+                "dataset_id": record["dataset_id"],
+                "backend": "pt_shards",
+                "required": bool(policy["required"]),
+                "status": shard_result["status"],
+                "derived_payload_id": receipt["derived_payload_id"],
+                "shard_count": receipt["shard_count"],
+                "case_count": receipt["case_count"],
+                "total_size_bytes": receipt["total_size_bytes"],
+                "receipt_relative_path": Path(shard_result["receipt_path"]).relative_to(storage).as_posix(),
+                "receipt_sha256": common.serialization.file_sha256(Path(shard_result["receipt_path"])),
+                "loader_smoke": smoke,
+            }
+        )
+    required_ids = {str(records[_package_key(plan)]["dataset_id"]) for plan in plans if plan.get("training_payload", {}).get("required") is True}
+    ready_ids = {str(record["dataset_id"]) for record in shard_results}
+    if not required_ids.issubset(ready_ids):
+        message = "GPU preparation did not validate every required transient Training payload."
+        raise RuntimeError(message)
+    final_package_state = validate_campaign_package_state(
+        run_id,
+        storage_root=storage,
+        validation_depth="evidence",
+    )
+    result = {
+        "schema_kind": "generation_gpu_dataset_preparation",
+        "schema_version": WORKFLOW_SCHEMA_VERSION,
+        "status": "complete",
+        "campaign_run_id": run_id,
+        "campaign_id": campaign.campaign_id,
+        "dataset_complete": True,
+        "training_payload_ready": required_ids.issubset(ready_ids),
+        "declared_package_count": len(plans),
+        "required_training_payload_count": len(required_ids),
+        "packages": package_results,
+        "transient_training_payloads": shard_results,
+        "package_state": {
+            "package_request_digest": final_package_state["package_request_digest"],
+            "training_payload_ready_count": final_package_state["training_payload_ready_count"],
+        },
+        "source_host_dependency": "none",
+        "eta": "unavailable",
+    }
+    if progress is not None:
+        progress(
+            {
+                "operation": "posthoc_preparation_complete",
+                "packages_completed": len(plans),
+                "packages_total": len(plans),
+                "training_payloads_completed": len(shard_results),
+                "training_payloads_total": len(required_ids),
+                "source_host_dependency": "none",
+                "eta": "unavailable",
+            }
+        )
+    return result
 
 
 def find_compatible_completed_campaign_source(
@@ -895,13 +1560,15 @@ def find_compatible_completed_campaign_source(
                 run_id,
                 storage_root=storage,
             )
-            transfer = campaign_runtime.validate_transferred_campaign(
+            transfer = campaign_runtime.admit_transferred_campaign(
                 run_id,
                 storage_root=storage,
             )
             workflow = validate_completed_workflow(
                 run_id,
                 storage_root=storage,
+                _admitted_transfer=transfer,
+                _validated_terminal=terminal,
             )
             launch = campaign_evidence.campaign_for_run(
                 run_id,
@@ -993,7 +1660,7 @@ def _cleanup_directory_records(
     *,
     plan: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return transferred files and per-directory bytes eligible for CPU deletion."""
+    """Return CPU-cleanup file and directory evidence in one inventory pass."""
     directories = [
         str(directory)
         for batch in plan["batches"]
@@ -1003,26 +1670,47 @@ def _cleanup_directory_records(
             batch["processed_directory"],
         )
     ]
+    if len(directories) != len(set(directories)):
+        message = "CPU cleanup plan contains duplicate directory ownership."
+        raise RuntimeError(message)
     files = transfer.get("files")
     if not isinstance(files, list):
         message = "Transfer receipt has no exact file inventory."
         raise TypeError(message)
-    eligible_files = [
-        dict(record)
-        for record in files
-        if isinstance(record, dict) and any(str(record.get("relative_path", "")).startswith(f"{directory}/") for directory in directories)
+    directory_set = set(directories)
+    grouped: dict[str, list[dict[str, Any]]] = {directory: [] for directory in directories}
+    eligible_files: list[dict[str, Any]] = []
+    for raw_record in files:
+        if not isinstance(raw_record, dict):
+            message = "Transfer receipt file inventory is malformed."
+            raise TypeError(message)
+        path_value = raw_record.get("relative_path")
+        if not isinstance(path_value, str):
+            message = "Transfer receipt file path is malformed."
+            raise TypeError(message)
+        relative_path = Path(path_value)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            message = f"Transfer receipt file path is unsafe: {path_value!r}"
+            raise ValueError(message)
+        ancestors = [Path(*relative_path.parts[:depth]).as_posix() for depth in range(1, len(relative_path.parts))]
+        owners = [ancestor for ancestor in ancestors if ancestor in directory_set]
+        if not owners:
+            continue
+        if len(owners) != 1:
+            message = f"CPU cleanup file has ambiguous directory ownership: {path_value!r}"
+            raise RuntimeError(message)
+        record = dict(raw_record)
+        grouped[owners[0]].append(record)
+        eligible_files.append(record)
+    records = [
+        {
+            "relative_path": directory,
+            "file_count": len(grouped[directory]),
+            "size_bytes": sum(int(record["size_bytes"]) for record in grouped[directory]),
+        }
+        for directory in directories
     ]
-    records: list[dict[str, Any]] = []
-    for directory in directories:
-        owned = [record for record in eligible_files if str(record["relative_path"]).startswith(f"{directory}/")]
-        records.append(
-            {
-                "relative_path": directory,
-                "file_count": len(owned),
-                "size_bytes": sum(int(record["size_bytes"]) for record in owned),
-            }
-        )
-    if len(eligible_files) != sum(int(record["file_count"]) for record in records):
+    if len(eligible_files) != sum(len(grouped[directory]) for directory in directories):
         message = "CPU cleanup directory inventory overlaps or omits transferred files."
         raise RuntimeError(message)
     return eligible_files, records
@@ -1087,7 +1775,7 @@ def prepare_all_workflow_receipt(
         message = "cleanup_requested must be boolean."
         raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
+    transfer = campaign_runtime.admit_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
     datasets_receipt = validate_dataset_packages_receipt(run_id, storage_root=storage)
     plan = campaign_runtime.campaign_transfer_plan(run_id, storage_root=storage)
@@ -1315,11 +2003,13 @@ def validate_all_workflow_receipt(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    _admitted_transfer: Mapping[str, Any] | None = None,
+    _validated_terminal: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate all local stage evidence in a pending or successful receipt."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
-    terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
+    transfer = campaign_runtime.admit_transferred_campaign(run_id, storage_root=storage) if _admitted_transfer is None else dict(_admitted_transfer)
+    terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage) if _validated_terminal is None else dict(_validated_terminal)
     datasets_receipt = validate_dataset_packages_receipt(run_id, storage_root=storage)
     receipt_path = _all_receipt_path(run_id, storage_root=storage)
     receipt = _load_json(receipt_path, label="all-workflow receipt")
@@ -1498,9 +2188,16 @@ def validate_completed_workflow(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    _admitted_transfer: Mapping[str, Any] | None = None,
+    _validated_terminal: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Require a fully successful all-workflow receipt."""
-    receipt = validate_all_workflow_receipt(run_id, storage_root=storage_root)
+    receipt = validate_all_workflow_receipt(
+        run_id,
+        storage_root=storage_root,
+        _admitted_transfer=_admitted_transfer,
+        _validated_terminal=_validated_terminal,
+    )
     if receipt["workflow_result"] != "success":
         message = f"All workflow is not terminally successful for {run_id!r}."
         raise RuntimeError(message)
@@ -1636,7 +2333,7 @@ def cpu_cleanup_authorization(
     if cleanup_status not in {"pending", "skipped_by_request", "complete"}:
         message = f"Workflow {run_id!r} is not eligible for CPU cleanup."
         raise RuntimeError(message)
-    transfer = campaign_runtime.validate_transferred_campaign(run_id, storage_root=storage)
+    transfer = campaign_runtime.admit_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(run_id, storage_root=storage)
     payload = _cleanup_authorization_payload(
         run_id,
@@ -2061,7 +2758,7 @@ def _recover_cpu_cleanup_transaction(
     if not marker_path.exists():
         entries = list(transaction.iterdir()) if transaction.is_dir() and not transaction.is_symlink() else []
         recoverable_entries = all(
-            entry.is_file() and not entry.is_symlink() and entry.name.startswith(".transaction.json.") and entry.name.endswith(".tmp")
+            entry.is_file() and not entry.is_symlink() and common.serialization.atomic_write_temporary_destination(entry) == marker_path
             for entry in entries
         )
         if transaction.is_dir() and not transaction.is_symlink() and recoverable_entries:
@@ -2535,9 +3232,24 @@ def campaign_source_status(
     *,
     storage_root: Path | str,
     query_scheduler: bool = False,
+    include_sizes: bool = True,
 ) -> dict[str, Any]:
-    """Report one host's campaign source bytes, state, and cleanup eligibility."""
+    """Report one host's campaign source state and optional exact sizes."""
+    if not isinstance(include_sizes, bool):
+        message = "include_sizes must be boolean."
+        raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    if not include_sizes:
+        snapshot = campaign_runtime.campaign_status(
+            run_id,
+            storage_root=storage,
+            query_scheduler=query_scheduler,
+        )
+        return campaign_source_status_from_snapshot(
+            run_id,
+            campaign_status=snapshot,
+            storage_root=storage,
+        )
     cleanup_path = _cleanup_receipt_path(run_id, storage_root=storage)
     campaign_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     if cleanup_path.exists():
@@ -2622,11 +3334,94 @@ def campaign_source_status(
     }
 
 
+def campaign_source_status_from_snapshot(
+    run_id: str,
+    *,
+    campaign_status: Mapping[str, Any],
+    storage_root: Path | str,
+) -> dict[str, Any]:
+    """Project source lifecycle from one campaign snapshot without tree sizing."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    if campaign_status.get("campaign_run_id") != run_id:
+        message = "Campaign source projection received status for another run."
+        raise ValueError(message)
+    cleanup_path = _cleanup_receipt_path(run_id, storage_root=storage)
+    campaign_directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    if cleanup_path.exists():
+        raw_receipt = _load_json(cleanup_path, label="CPU source cleanup receipt")
+        authorization_sha256 = raw_receipt.get("authorization_sha256")
+        if not isinstance(authorization_sha256, str):
+            message = f"CPU source cleanup receipt has no authorization identity: {cleanup_path}"
+            raise ValueError(message)
+        receipt = _validate_remote_cleanup_receipt(
+            run_id,
+            storage=storage,
+            authorization_sha256=authorization_sha256,
+        )
+        return {
+            "campaign_run_id": run_id,
+            "campaign_state": str(campaign_status["campaign_state"]),
+            "source_state": "cleaned",
+            "transfer_status": "transferred_and_cleaned",
+            "cleanup_eligibility": "already_complete",
+            "active_slurm": False,
+            "scheduler_error": None,
+            "source_directories": receipt["source_directories"],
+            "reclaimable_bytes": None,
+            "campaign_metadata_bytes": None,
+            "size_bytes": None,
+            "cleanup_receipt": str(cleanup_path),
+        }
+    scheduler_records = (
+        campaign_status.get("squeue"),
+        campaign_status.get("sacct"),
+    )
+    scheduler_errors = [str(record["error"]) for record in scheduler_records if isinstance(record, Mapping) and record.get("error") is not None]
+    scheduler_error = "; ".join(scheduler_errors) or None
+    squeue = campaign_status.get("squeue")
+    active = bool(squeue.get("output")) if isinstance(squeue, Mapping) else None
+    state = str(campaign_status["campaign_state"])
+    terminal = (campaign_directory / "campaign_terminal.json").is_file()
+    transfer_present = (campaign_directory / "transfer_complete.json").is_file()
+    cleanup_eligibility = (
+        "requires_gpu_authorization"
+        if terminal and active is False and scheduler_error is None and state in _SOURCE_CLEANUP_READY_CAMPAIGN_STATES
+        else "ineligible"
+    )
+    source_state = "retained" if terminal and transfer_present else ("awaiting_collection" if terminal else "active")
+    directories = _manifest_source_directories(run_id, storage=storage)
+    return {
+        "campaign_run_id": run_id,
+        "campaign_state": state,
+        "source_state": source_state,
+        "transfer_status": ("gpu_receipt_present" if transfer_present else "not_recorded_on_this_host"),
+        "cleanup_eligibility": cleanup_eligibility,
+        "active_slurm": active,
+        "scheduler_error": scheduler_error,
+        "source_directories": [
+            {
+                "path": str(path),
+                "exists": path.is_dir() and not path.is_symlink(),
+                "size_bytes": None,
+            }
+            for path in directories
+        ],
+        "reclaimable_bytes": None,
+        "campaign_metadata_bytes": None,
+        "size_bytes": None,
+        "cleanup_receipt": None,
+    }
+
+
 def _safe_campaign_source_status(
     run_id: str,
     *,
     storage: Path,
     query_scheduler: bool,
+    include_sizes: bool,
 ) -> dict[str, Any]:
     """Return one run status or its explicit validation error."""
     try:
@@ -2634,6 +3429,7 @@ def _safe_campaign_source_status(
             run_id,
             storage_root=storage,
             query_scheduler=query_scheduler,
+            include_sizes=include_sizes,
         )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
         return {
@@ -2641,8 +3437,8 @@ def _safe_campaign_source_status(
             "campaign_state": "invalid",
             "source_state": "invalid",
             "error": str(error),
-            "reclaimable_bytes": 0,
-            "size_bytes": 0,
+            "reclaimable_bytes": 0 if include_sizes else None,
+            "size_bytes": 0 if include_sizes else None,
         }
 
 
@@ -2652,34 +3448,39 @@ def storage_status(
     role: str,
     run_id: str | None = None,
     query_scheduler: bool = False,
+    include_sizes: bool = True,
+    include_runs: bool = True,
 ) -> dict[str, Any]:
-    """Report generation, dataset, staging, package, run, and cleanup storage state."""
+    """Report storage state with optional explicit recursive sizing."""
     if role not in {"gpu", "cpu"}:
         message = "Storage status role must be 'gpu' or 'cpu'."
         raise ValueError(message)
+    if not isinstance(include_sizes, bool) or not isinstance(include_runs, bool):
+        message = "include_sizes and include_runs must be boolean."
+        raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     generation_root = common.paths.get_generation_root(storage_root=storage)
     datasets_root = common.paths.get_datasets_root(storage_root=storage)
     experiments_root = common.paths.get_experiments_root(storage_root=storage)
     campaigns_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
-    run_ids = (
-        [common.paths.validate_logical_name(run_id, label="campaign_run_id")]
-        if run_id is not None
-        else (
-            [
-                common.paths.validate_logical_name(path.name, label="campaign_run_id")
-                for path in sorted(campaigns_root.iterdir())
-                if path.is_dir() and not path.is_symlink()
-            ]
-            if campaigns_root.is_dir()
-            else []
-        )
-    )
+    if not include_runs:
+        run_ids: list[str] = []
+    elif run_id is not None:
+        run_ids = [common.paths.validate_logical_name(run_id, label="campaign_run_id")]
+    elif campaigns_root.is_dir():
+        run_ids = [
+            common.paths.validate_logical_name(path.name, label="campaign_run_id")
+            for path in sorted(campaigns_root.iterdir())
+            if path.is_dir() and not path.is_symlink()
+        ]
+    else:
+        run_ids = []
     runs = [
         _safe_campaign_source_status(
             current_run_id,
             storage=storage,
             query_scheduler=query_scheduler,
+            include_sizes=include_sizes,
         )
         for current_run_id in run_ids
     ]
@@ -2687,6 +3488,7 @@ def storage_status(
         workspace_service.transfer_staging_candidates(
             storage_root=storage,
             run_id=run_id,
+            include_sizes=include_sizes,
         )
     )
     packages: list[dict[str, Any]] = []
@@ -2701,14 +3503,23 @@ def storage_status(
                 continue
             try:
                 dataset_id = common.paths.validate_logical_name(directory.name, label="dataset_id")
-                manifest = package_service.load_package_manifest(dataset_id, storage_root=storage)
-                package_service.inspect_dataset_package(dataset_id, storage_root=storage)
+                manifest_loader = package_service.load_package_manifest if include_sizes else package_service.load_package_manifest_evidence
+                manifest = manifest_loader(dataset_id, storage_root=storage)
+                if include_sizes:
+                    package_service.inspect_dataset_package(dataset_id, storage_root=storage)
                 packages.append(
                     {
                         "dataset_id": dataset_id,
                         "dataset_view": manifest["dataset_view"],
                         "evaluation_regime": manifest["evaluation_regime"],
-                        "size_bytes": _tree_size(directory) + _tree_size(common.paths.get_dataset_packages_root(storage_root=storage) / dataset_id),
+                        "size_bytes": (
+                            _tree_size(directory)
+                            + _tree_size(
+                                common.paths.get_dataset_packages_root(storage_root=storage) / dataset_id,
+                            )
+                            if include_sizes
+                            else None
+                        ),
                     }
                 )
             except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
@@ -2722,11 +3533,12 @@ def storage_status(
                 "dataset_view": key[0],
                 "evaluation_regime": key[1],
                 "package_count": 0,
-                "size_bytes": 0,
+                "size_bytes": 0 if include_sizes else None,
             },
         )
         group["package_count"] += 1
-        group["size_bytes"] += int(package["size_bytes"])
+        if include_sizes:
+            group["size_bytes"] += int(package["size_bytes"])
     return {
         "role": role,
         "storage_root": str(storage),
@@ -2736,15 +3548,15 @@ def storage_status(
             "experiments": str(experiments_root),
             "transfer_staging": str(storage / ".incoming"),
         },
-        "generation_total_bytes": _tree_size(generation_root),
-        "datasets_total_bytes": _tree_size(datasets_root),
-        "experiments_total_bytes": _tree_size(experiments_root),
+        "generation_total_bytes": _tree_size(generation_root) if include_sizes else None,
+        "datasets_total_bytes": _tree_size(datasets_root) if include_sizes else None,
+        "experiments_total_bytes": _tree_size(experiments_root) if include_sizes else None,
         "runs": runs,
         "packages": packages,
         "packages_by_view_regime": [package_groups[key] for key in sorted(package_groups)],
         "missing_source_errors": package_errors,
         "transfer_staging": staging,
-        "transfer_staging_bytes": sum(int(record["size_bytes"]) for record in staging),
+        "transfer_staging_bytes": (sum(int(record["size_bytes"]) for record in staging) if include_sizes else None),
         "protected_cleanup_targets": [
             str(generation_root),
             str(datasets_root),
@@ -2784,23 +3596,22 @@ def assert_shared_setup_idle(
         benchmark_root,
         label="Generation benchmark",
     )
-    active: list[dict[str, str]] = []
+    run_jobs: list[tuple[str, str, tuple[str, ...]]] = []
     errors: list[str] = []
     for directory in campaign_runs:
         run_id = common.paths.validate_logical_name(
             directory.name,
             label="campaign_run_id",
         )
-        status = _safe_campaign_source_status(
-            run_id,
-            storage=storage,
-            query_scheduler=True,
-        )
-        error = status.get("error") or status.get("scheduler_error")
-        if error is not None:
+        try:
+            job_ids = campaign_evidence.load_campaign_scheduler_job_ids(
+                run_id,
+                storage_root=storage,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             errors.append(f"campaign {run_id}: {error}")
-        elif status.get("active_slurm") is True:
-            active.append({"run_kind": "campaign", "run_id": run_id})
+            continue
+        run_jobs.append(("campaign", run_id, job_ids))
     if benchmark_runs:
         from . import generation_benchmark as benchmark_service  # noqa: PLC0415
 
@@ -2810,20 +3621,35 @@ def assert_shared_setup_idle(
                 label="benchmark_run_id",
             )
             try:
-                status = benchmark_service.core_benchmark_source_status(
+                job_ids = benchmark_service.load_core_benchmark_scheduler_job_ids(
                     run_id,
                     storage_root=storage,
-                    query_scheduler=True,
                 )
-            except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
+            except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
                 errors.append(f"benchmark {run_id}: {error}")
                 continue
-            if status.get("active_slurm") is True:
-                active.append({"run_kind": "benchmark", "run_id": run_id})
+            run_jobs.append(("benchmark", run_id, job_ids))
+    job_owners: dict[str, tuple[str, str]] = {}
+    for run_kind, run_id, job_ids in run_jobs:
+        for job_id in job_ids:
+            existing = job_owners.get(job_id)
+            if existing is not None:
+                errors.append(f"{run_kind} {run_id}: scheduler job {job_id} is also owned by {existing[0]} {existing[1]}")
+                continue
+            job_owners[job_id] = (run_kind, run_id)
     if errors:
         detail = "; ".join(errors)
-        message = f"Shared CPU setup cannot prove dependent Generation jobs are idle: {detail}"
+        message = f"Shared CPU setup cannot validate persisted Generation scheduler ownership: {detail}"
         raise RuntimeError(message)
+    try:
+        active_job_ids = frozenset(campaign_runtime.query_active_scheduler_job_ids(tuple(job_owners)))
+    except RuntimeError as error:
+        message = f"Shared CPU setup cannot query dependent Generation scheduler liveness: {error}"
+        raise RuntimeError(message) from error
+    except ValueError as error:
+        message = f"Shared CPU setup cannot validate dependent Generation scheduler liveness: {error}"
+        raise RuntimeError(message) from error
+    active = [{"run_kind": run_kind, "run_id": run_id} for run_kind, run_id, job_ids in run_jobs if active_job_ids.intersection(job_ids)]
     if active:
         detail = ", ".join(f"{record['run_kind']} {record['run_id']}" for record in active)
         message = f"Shared CPU setup is blocked by active dependent Generation jobs: {detail}"

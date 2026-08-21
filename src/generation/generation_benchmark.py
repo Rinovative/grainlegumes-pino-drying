@@ -1614,6 +1614,53 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     return _mapping(value, label=label)
 
 
+def load_core_benchmark_scheduler_job_ids(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+) -> tuple[str, ...]:
+    """Load only exact persisted scheduler ownership for one benchmark run."""
+    manifest = _load_json(
+        _manifest_path(run_id, storage_root=storage_root),
+        label="core benchmark manifest",
+    )
+    if (
+        _BENCHMARK_RUN_ID_PATTERN.fullmatch(run_id) is None
+        or manifest.get("schema_kind") != BENCHMARK_RUN_SCHEMA_KIND
+        or manifest.get("schema_version") != BENCHMARK_SCHEMA_VERSION
+        or manifest.get("benchmark_run_id") != run_id
+    ):
+        message = f"Core benchmark manifest schema or run identity is invalid: {run_id}"
+        raise ValueError(message)
+    job_ids = manifest.get("measured_job_ids")
+    if (
+        not isinstance(job_ids, list)
+        or len(job_ids) != len(set(job_ids))
+        or not all(isinstance(job_id, str) and _JOB_ID_PATTERN.fullmatch(job_id) is not None for job_id in job_ids)
+    ):
+        message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
+        raise ValueError(message)
+    history = manifest.get("submission_history")
+    if not isinstance(history, list):
+        message = f"Benchmark submission history is malformed: {run_id}"
+        raise TypeError(message)
+    history_ids: list[str] = []
+    for record in history:
+        if (
+            not isinstance(record, dict)
+            or record.get("role") != "measure"
+            or not isinstance(record.get("job_id"), str)
+            or _JOB_ID_PATTERN.fullmatch(record["job_id"]) is None
+        ):
+            message = f"Benchmark submission history is malformed: {run_id}"
+            raise ValueError(message)
+        history_ids.append(record["job_id"])
+    if history_ids != job_ids:
+        message = f"Benchmark job IDs disagree with submission history: {run_id}"
+        raise ValueError(message)
+    return tuple(job_ids)
+
+
 def load_core_benchmark_manifest(
     run_id: str,
     *,

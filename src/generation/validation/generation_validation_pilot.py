@@ -22,6 +22,7 @@ import csv
 import io
 import json
 import math
+import stat
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1592,6 +1593,18 @@ def _summary_markdown(receipt: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _owned_pilot_atomic_temporary_entry(path: Path, *, directory: Path) -> bool:
+    """Return whether one safe atomic sibling targets owned pilot metadata."""
+    destination = common.serialization.atomic_write_temporary_destination(path)
+    if destination is None or destination.parent != directory or destination.name not in _PILOT_CHECK_METADATA_FILENAMES:
+        return False
+    try:
+        entry_status = path.lstat()
+    except FileNotFoundError:
+        return True
+    return stat.S_ISREG(entry_status.st_mode)
+
+
 def _pilot_check_metadata_files(
     run_id: str,
     *,
@@ -1605,11 +1618,16 @@ def _pilot_check_metadata_files(
     if not directory.is_dir() or directory.is_symlink():
         message = f"Pilot-check metadata directory is unsafe: {directory}"
         raise ValueError(message)
-    entries = sorted(directory.iterdir())
-    if any(entry.is_symlink() or not entry.is_file() or entry.name not in _PILOT_CHECK_METADATA_FILENAMES for entry in entries):
-        message = f"Pilot-check metadata contains an unsupported or unsafe entry: {directory}"
-        raise ValueError(message)
-    return [entry for entry in entries if entry.name not in excluded_filenames]
+    files: list[Path] = []
+    for entry in sorted(directory.iterdir()):
+        if _owned_pilot_atomic_temporary_entry(entry, directory=directory):
+            continue
+        if entry.is_symlink() or not entry.is_file() or entry.name not in _PILOT_CHECK_METADATA_FILENAMES:
+            message = f"Pilot-check metadata contains an unsupported or unsafe entry: {directory}"
+            raise ValueError(message)
+        if entry.name not in excluded_filenames:
+            files.append(entry)
+    return files
 
 
 def _gpu_inventory(

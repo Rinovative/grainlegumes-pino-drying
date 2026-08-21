@@ -14,6 +14,7 @@ import torch
 import yaml
 
 from src import common, datasets, domain, generation
+from src.datasets.packages import dataset_packages_builder as package_builder
 
 pytestmark = pytest.mark.integration
 
@@ -194,6 +195,7 @@ def test_transient_case_publishes_distinct_dual_view_dataset_ids(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bind both advertised views to one canonical HDF5 without copying it."""
     config_path, _template = generation_config_factory(
@@ -238,6 +240,26 @@ def test_transient_case_publishes_distinct_dual_view_dataset_ids(
     assert transient_source["source_relative_path"] == steady_source["source_relative_path"]
     assert transient_source["case_hdf5_sha256"] == steady_source["case_hdf5_sha256"]
     assert storage / transient_source["source_relative_path"] == outcome.processed_directory / "case.h5"
+
+    def reject_transient_rebuild(*_args: Any, **_kwargs: Any) -> None:
+        message = "Immutable transient package reuse rebuilt its HDF5 index."
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        package_builder.trajectory,
+        "build_transient_index",
+        reject_transient_rebuild,
+    )
+    reused = datasets.packages.build_dataset_package(
+        campaign,
+        "transient_drying",
+        "id",
+        storage_root=storage,
+    )
+    assert reused["status"] == "reused"
+    assert reused["sample_count"] == transient["sample_count"]
+    assert reused["transition_count"] == transient["transition_count"]
+
     package_root = common.paths.get_dataset_packages_root(storage_root=storage)
     assert not tuple(package_root.rglob("case.h5"))
 

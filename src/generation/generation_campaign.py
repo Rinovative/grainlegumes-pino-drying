@@ -17,18 +17,22 @@ This module does NOT:
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
 import re
 import subprocess
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from src import common
 
+from .cases import generation_cases_admission as admission_service
 from .cases import generation_cases_config as config_service
 from .cases import generation_cases_input as input_service
 from .contracts import generation_contracts_source as source_service
@@ -43,7 +47,7 @@ from .runtime import generation_runtime_workspace as workspace_service
 from .validation import generation_validation_pilot as pilot_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _CASE_ID_PATTERN: Final = re.compile(r"case_([0-9]{4,})")
@@ -62,6 +66,8 @@ _TERMINAL_FAILURE_STATES: Final = frozenset(
 _ACTIVE_PENDING_STATE: Final = "PENDING"
 _JOB_NAME_PATTERN: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _MAX_SLURM_JOB_NAME_LENGTH: Final = 48
+_RECONCILIATION_PROGRESS_DELAY_SECONDS: Final = 2.0
+_RECONCILIATION_PROGRESS_HEARTBEAT_SECONDS: Final = 30.0
 _TRANSFER_PUBLICATION_JOURNAL: Final = ".generation-transfer-publication.json"
 _PARTIAL_TRANSFER_PUBLICATION_JOURNAL: Final = ".generation-partial-transfer-publication.json"
 _PARTIAL_CAMPAIGN_FILENAME: Final = "campaign_partial.json"
@@ -234,17 +240,26 @@ def _task_payload(task: cluster_service.CampaignTask) -> dict[str, Any]:
 def _task_from_payload(
     campaign: config_service.CampaignConfig,
     payload: Mapping[str, Any],
+    *,
+    task_index: Mapping[tuple[str, int], cluster_service.CampaignTask] | None = None,
 ) -> cluster_service.CampaignTask:
     """Re-resolve one persisted task against exact current campaign membership."""
     case_index = payload.get("case_index")
     if isinstance(case_index, bool) or not isinstance(case_index, int):
         message = "Persisted campaign task has no integer case index."
         raise TypeError(message)
-    task = cluster_service.require_campaign_task(
-        campaign,
-        batch_name=str(payload.get("batch_name")),
-        case_index=case_index,
-    )
+    if task_index is None:
+        task = cluster_service.require_campaign_task(
+            campaign,
+            batch_name=str(payload.get("batch_name")),
+            case_index=case_index,
+        )
+    else:
+        persisted_task = task_index.get((str(payload.get("batch_id")), case_index))
+        if persisted_task is None:
+            message = "Persisted campaign task is not configured campaign membership."
+            raise ValueError(message)
+        task = persisted_task
     persisted = {key: payload.get(key) for key in ("batch_name", "batch_id", "case_index", "case_id")}
     if _task_payload(task) != persisted:
         message = "Persisted campaign task no longer matches campaign membership."
@@ -404,6 +419,7 @@ def plan_campaign(
             run_id=run_id,
         ),
         attempt_index=1,
+        task_index={(task.batch_id, task.case_index): task for task in tasks},
     )
     return {
         "schema_kind": "generation_campaign_plan",
@@ -460,6 +476,53 @@ def _scheduler_output(command: list[str]) -> tuple[str, str | None]:
         detail = result.stderr.strip() or f"exit status {result.returncode}"
         return result.stdout.strip(), detail
     return result.stdout.strip(), None
+
+
+def query_active_scheduler_job_ids(
+    job_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Return exact persisted jobs still visible for the current Slurm user."""
+    persisted = tuple(job_ids)
+    if len(persisted) != len(set(persisted)) or any(not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted):
+        message = "Scheduler liveness query received malformed persisted job IDs."
+        raise ValueError(message)
+    if not persisted:
+        return ()
+    scheduler_user = getpass.getuser()
+    if not scheduler_user or any(character in scheduler_user for character in "\x00\r\n"):
+        message = "Could not determine the current scheduler user safely."
+        raise RuntimeError(message)
+    selection = ",".join(persisted)
+    command = [
+        "squeue",
+        "--noheader",
+        f"--user={scheduler_user}",
+        f"--jobs={selection}",
+        "--format=%i|%T",
+    ]
+    output, error = _scheduler_output(command)
+    if error is not None:
+        message = f"squeue failed for the current scheduler user: {error}"
+        raise RuntimeError(message)
+    owned = set(persisted)
+    active: set[str] = set()
+    expected_field_count = 2
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if (
+            len(fields) != expected_field_count
+            or fields[0] not in owned
+            or _JOB_ID_PATTERN.fullmatch(fields[0]) is None
+            or not fields[1]
+            or fields[0] in active
+        ):
+            message = f"squeue returned malformed or unowned scheduler liveness evidence: {raw_line!r}."
+            raise ValueError(message)
+        active.add(fields[0])
+    return tuple(job_id for job_id in persisted if job_id in active)
 
 
 def _parse_submitted_job_id(output: str) -> str:
@@ -595,13 +658,28 @@ def _recover_submission_intent(
     )
 
 
+def _submission_index(
+    manifest: Mapping[str, Any],
+) -> dict[tuple[str, int], tuple[Mapping[str, Any], ...]]:
+    """Index persisted submissions once for one campaign operation."""
+    records: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for record in manifest["submissions"]:
+        case = record["case"]
+        key = str(case["batch_id"]), int(case["case_index"])
+        records.setdefault(key, []).append(record)
+    return {key: tuple(values) for key, values in records.items()}
+
+
 def _task_submissions(
     manifest: Mapping[str, Any],
     task: cluster_service.CampaignTask,
+    *,
+    submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[Mapping[str, Any], ...]:
     """Return submission records for one exact case in attempt order."""
     expected = _task_payload(task)
-    return tuple(record for record in manifest["submissions"] if record["case"] == expected)
+    candidates = manifest["submissions"] if submission_index is None else submission_index.get((task.batch_id, task.case_index), ())
+    return tuple(record for record in candidates if record["case"] == expected)
 
 
 def _require_unambiguous_active_task_ownership(
@@ -711,6 +789,7 @@ def _admitted_case_attempt(
     batch: config_service.GenerationConfig,
     task: cluster_service.CampaignTask,
     *,
+    input_reference: admission_service.InputCaseReference,
     storage_root: Path | str | None,
 ) -> AdmittedCaseAttempt | None:
     """Return the newest attempt after exact campaign and case identity checks."""
@@ -737,12 +816,15 @@ def _admitted_case_attempt(
             return None
         attempt = candidate
         historical = True
-    input_reference = input_service.admit_persisted_input_case(
-        batch,
-        task.case_index,
-        str(attempt.payload["input_generation_id"]),
-        storage_root=storage,
-    )
+    persisted_input_generation_id = str(attempt.payload["input_generation_id"])
+    if persisted_input_generation_id != input_reference.source_id:
+        input_reference = input_service.admit_persisted_input_case(
+            batch,
+            task.case_index,
+            persisted_input_generation_id,
+            storage_root=storage,
+            validation_depth="evidence",
+        )
     canonical_raw_case = input_reference.case_directory.resolve().relative_to(storage).as_posix()
     expected = {
         "campaign_purpose": batch.scientific_values["campaign_purpose"],
@@ -1616,13 +1698,15 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
     task: cluster_service.CampaignTask,
     scheduler: Mapping[str, Any],
     *,
+    batch: config_service.GenerationConfig,
+    input_reference: admission_service.InputCaseReference,
     storage_root: Path | str | None,
     compact_license_attempt_payloads: bool = False,
     cached_case_reconciliation: tuple[Mapping[str, Any], Path | None] | None = None,
+    submission_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reconcile one case from processed, attempt, and exact scheduler evidence."""
-    batch = campaign.batch(task.batch_name)
-    submissions = _task_submissions(manifest, task)
+    submissions = tuple(submission_records) if submission_records is not None else _task_submissions(manifest, task)
     latest_submission = submissions[-1] if submissions else None
     active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
     _require_unambiguous_active_task_ownership(task, active_records)
@@ -1666,6 +1750,7 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
         batch,
         task.case_index,
         storage_root=storage_root,
+        input_reference=input_reference,
     ):
         state = "successful"
         reason = "validated_case_evidence"
@@ -1733,6 +1818,7 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
                 manifest,
                 batch,
                 task,
+                input_reference=input_reference,
                 storage_root=storage_root,
             )
             if admitted_attempt is not None and admitted_attempt.historical and submissions:
@@ -1964,11 +2050,35 @@ def _finalize_completed_batches(
     campaign: config_service.CampaignConfig,
     *,
     storage_root: Path | str | None,
-) -> None:
-    """Idempotently publish batch manifests once every member validates."""
+    task_views: Sequence[Mapping[str, Any]] | None = None,
+) -> bool:
+    """Publish ready batch manifests from one reconciliation or one bounded fallback."""
+    all_complete = True
     for batch in campaign.batches:
-        if all(batch_runtime.completed_case_is_valid(batch, case_index, storage_root=storage_root) for case_index in batch.case_indices):
+        expected = {(batch.batch_id, case_index) for case_index in batch.case_indices}
+        if task_views is None:
+            references = input_service.admit_configured_input_references(
+                batch,
+                storage_root=storage_root,
+                validation_depth="evidence",
+            )
+            complete = all(
+                batch_runtime.completed_case_is_valid(
+                    batch,
+                    case_index,
+                    storage_root=storage_root,
+                    input_reference=references[case_index],
+                )
+                for case_index in batch.case_indices
+            )
+        else:
+            matching = {(str(view["batch_id"]), int(view["case_index"])): view for view in task_views if view.get("batch_id") == batch.batch_id}
+            complete = set(matching) == expected and all(view["state"] == "successful" for view in matching.values())
+        if complete:
             batch_runtime.finalize_batch(batch, storage_root=storage_root)
+        else:
+            all_complete = False
+    return all_complete
 
 
 def _case_reconciliation_failed_view(
@@ -1979,11 +2089,12 @@ def _case_reconciliation_failed_view(
     evidence: Mapping[str, Any],
     evidence_path: Path | None,
     *,
+    submission_records: Sequence[Mapping[str, Any]] | None = None,
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
     """Return one isolated lifecycle view while unrelated cases continue."""
     batch = campaign.batch(task.batch_name)
-    submissions = _task_submissions(manifest, task)
+    submissions = tuple(submission_records) if submission_records is not None else _task_submissions(manifest, task)
     latest_submission = submissions[-1] if submissions else None
     active_records = [record for record in submissions if record["job_id"] in scheduler["active"]]
     unknown_records = [
@@ -2052,6 +2163,24 @@ def _case_reconciliation_failed_view(
     }
 
 
+def _campaign_input_references(
+    campaign: config_service.CampaignConfig,
+    *,
+    git_commit: str,
+    storage_root: Path | str | None,
+) -> dict[str, dict[int, admission_service.InputCaseReference]]:
+    """Admit each immutable input batch once for one campaign operation."""
+    return {
+        batch.batch_name: input_service.admit_configured_input_references(
+            batch,
+            storage_root=storage_root,
+            validation_depth="evidence",
+            git_commit=git_commit,
+        )
+        for batch in campaign.batches
+    }
+
+
 def _reconciled(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -2059,11 +2188,64 @@ def _reconciled(
     *,
     storage_root: Path | str | None,
     compact_license_attempt_payloads: bool = False,
+    input_references: Mapping[str, Mapping[int, admission_service.InputCaseReference]] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    tasks: Sequence[cluster_service.CampaignTask] | None = None,
+    submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Reconcile every case while isolating only typed case-local defects."""
+    progress_started_at = monotonic() if progress is not None else None
+    last_progress_at: float | None = None
     task_views: list[dict[str, Any]] = []
-    for task in cluster_service.campaign_tasks(campaign):
-        batch = campaign.batch(task.batch_name)
+    batches = {batch.batch_name: batch for batch in campaign.batches}
+    campaign_tasks = tuple(tasks) if tasks is not None else cluster_service.campaign_tasks(campaign)
+    submissions_by_task = _submission_index(manifest) if submission_index is None else submission_index
+    for task in campaign_tasks:
+        active_records = [
+            record for record in submissions_by_task.get((task.batch_id, task.case_index), ()) if record["job_id"] in scheduler["active"]
+        ]
+        _require_unambiguous_active_task_ownership(task, active_records)
+    references = (
+        _campaign_input_references(
+            campaign,
+            git_commit=str(manifest["git_commit"]),
+            storage_root=storage_root,
+        )
+        if input_references is None
+        else input_references
+    )
+    persisted_job_ids = set(manifest["slurm_job_ids"])
+    states = [_scheduler_state(fields[1]) for job_id, fields in scheduler["active"].items() if job_id in persisted_job_ids]
+    pending_jobs = sum(state == _ACTIVE_PENDING_STATE for state in states)
+    running_jobs = len(states) - pending_jobs
+    terminal_jobs = sum(job_id in persisted_job_ids for job_id in scheduler["accounted"])
+
+    def report_progress() -> None:
+        nonlocal last_progress_at
+        if progress is None or progress_started_at is None:
+            return
+        now = monotonic()
+        if now - progress_started_at < _RECONCILIATION_PROGRESS_DELAY_SECONDS:
+            return
+        if last_progress_at is not None and now - last_progress_at < _RECONCILIATION_PROGRESS_HEARTBEAT_SECONDS:
+            return
+        last_progress_at = now
+        progress(
+            {
+                "operation": "reconciling campaign metadata and scheduler state",
+                "cases_completed": len(task_views),
+                "cases_total": len(campaign_tasks),
+                "jobs_running": running_jobs,
+                "jobs_pending": pending_jobs,
+                "jobs_terminal": terminal_jobs,
+                "heartbeat": "active",
+                "eta": "unavailable",
+            }
+        )
+
+    for task in campaign_tasks:
+        batch = batches[task.batch_name]
+        input_reference = references[task.batch_name][task.case_index]
         cached = _matching_case_reconciliation_evidence(
             manifest,
             batch,
@@ -2078,9 +2260,11 @@ def _reconciled(
                 scheduler,
                 cached[0],
                 cached[1],
+                submission_records=submissions_by_task.get((task.batch_id, task.case_index), ()),
                 storage_root=storage_root,
             )
             task_views.append(view)
+            report_progress()
             continue
         try:
             view = _task_state(
@@ -2088,9 +2272,12 @@ def _reconciled(
                 campaign,
                 task,
                 scheduler,
+                batch=batch,
+                input_reference=input_reference,
                 storage_root=storage_root,
                 compact_license_attempt_payloads=(compact_license_attempt_payloads),
                 cached_case_reconciliation=cached,
+                submission_records=submissions_by_task.get((task.batch_id, task.case_index), ()),
             )
         except CaseLocalReconciliationError as error:
             if error.source_path is None or error.source_sha256 is None:
@@ -2126,9 +2313,12 @@ def _reconciled(
                     campaign,
                     task,
                     scheduler,
+                    batch=batch,
+                    input_reference=input_reference,
                     storage_root=storage_root,
                     compact_license_attempt_payloads=(compact_license_attempt_payloads),
                     cached_case_reconciliation=(evidence, evidence_path),
+                    submission_records=submissions_by_task.get((task.batch_id, task.case_index), ()),
                 )
             else:
                 view = _case_reconciliation_failed_view(
@@ -2138,18 +2328,16 @@ def _reconciled(
                     scheduler,
                     evidence,
                     evidence_path,
+                    submission_records=submissions_by_task.get((task.batch_id, task.case_index), ()),
                     storage_root=storage_root,
                 )
         task_views.append(view)
+        report_progress()
     reservation_keys = _admission_reservation_keys(manifest)
     waiting_keys = {_task_identity_key(view) for view in task_views if view["state"] == "admission_waiting"}
     if waiting_keys != reservation_keys:
         message = "Campaign admission reservations conflict with reconciled case evidence."
         raise RuntimeError(message)
-    persisted_job_ids = set(manifest["slurm_job_ids"])
-    states = [_scheduler_state(fields[1]) for job_id, fields in scheduler["active"].items() if job_id in persisted_job_ids]
-    pending_jobs = sum(state == _ACTIVE_PENDING_STATE for state in states)
-    running_jobs = len(states) - pending_jobs
     return task_views, pending_jobs, running_jobs
 
 
@@ -2174,17 +2362,22 @@ def _submit_one(
     *,
     mode: str,
     storage_root: Path | str | None,
+    attempt_index: int | None = None,
+    task_index: Mapping[tuple[str, int], cluster_service.CampaignTask] | None = None,
 ) -> dict[str, Any]:
     """Persist one intent, submit one case, and atomically persist its job ID."""
     if mode not in {"initial", "resume", "license_retry"}:
         message = f"Unsupported campaign submission mode: {mode!r}."
         raise ValueError(message)
     index = len(manifest["submissions"]) + 1
-    attempt_index = _next_case_attempt_index(manifest, task)
+    resolved_attempt_index = _next_case_attempt_index(manifest, task) if attempt_index is None else attempt_index
+    if isinstance(resolved_attempt_index, bool) or not isinstance(resolved_attempt_index, int) or resolved_attempt_index < 1:
+        message = "Campaign submission attempt index must be a positive integer."
+        raise ValueError(message)
     job_name = _scheduler_job_name(
         campaign,
         task,
-        attempt_index=attempt_index,
+        attempt_index=resolved_attempt_index,
         run_id=str(manifest["campaign_run_id"]),
     )
     command = cluster_service.build_campaign_case_slurm_submission_command(
@@ -2193,7 +2386,8 @@ def _submit_one(
         run_id=str(manifest["campaign_run_id"]),
         scheduler_log_directory=Path(manifest["scheduler_log_directory"]),
         scheduler_job_name=job_name,
-        attempt_index=attempt_index,
+        attempt_index=resolved_attempt_index,
+        task_index=task_index,
     )
     record = {
         "submission_index": index,
@@ -2233,10 +2427,7 @@ def _submit_one(
     manifest["submission_intent"] = None
     manifest["state"] = "active"
     common.serialization.atomic_write_json(path, manifest)
-    return campaign_evidence.load_campaign_run(
-        str(manifest["campaign_run_id"]),
-        storage_root=storage_root,
-    )
+    return manifest
 
 
 def _recover_submission_gate(
@@ -2268,6 +2459,10 @@ def feed_campaign(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    verified_repository_commit: str | None = None,
+    input_references: Mapping[str, Mapping[int, admission_service.InputCaseReference]] | None = None,
+    resolved_campaign: config_service.CampaignConfig | None = None,
 ) -> dict[str, Any]:
     """Reconcile exact jobs and fill the configured safe submission capacity."""
     run_directory = campaign_evidence.campaign_run_directory(
@@ -2282,11 +2477,9 @@ def feed_campaign(
         )
         if manifest["state"] in {"cancel_requested", "force_cancel_requested"}:
             return manifest
-        current_commit = _repository_commit()
-        if current_commit != manifest["git_commit"]:
-            message = f"CPU checkout commit {current_commit} does not match run commit {manifest['git_commit']}."
-            raise RuntimeError(message)
-        campaign = campaign_evidence.campaign_from_manifest(manifest)
+        campaign = campaign_evidence.campaign_from_manifest(manifest) if resolved_campaign is None else resolved_campaign
+        tasks = cluster_service.campaign_tasks(campaign)
+        submission_index = _submission_index(manifest)
         manifest, submission_unknown = _recover_submission_gate(
             manifest,
             storage_root=storage_root,
@@ -2301,29 +2494,21 @@ def feed_campaign(
             scheduler,
             storage_root=storage_root,
             compact_license_attempt_payloads=True,
+            input_references=input_references,
+            progress=progress,
+            tasks=tasks,
+            submission_index=submission_index,
         )
         successful = [view for view in task_views if view["state"] == "successful"]
         if len(successful) == len(task_views):
-            _finalize_completed_batches(campaign, storage_root=storage_root)
-            manifest["state"] = "complete"
-            common.serialization.atomic_write_json(
-                campaign_evidence.campaign_run_manifest_path(
-                    run_id,
-                    storage_root=storage_root,
-                ),
-                manifest,
+            _finalize_completed_batches(
+                campaign,
+                storage_root=storage_root,
+                task_views=task_views,
             )
-            return manifest
+            return _set_campaign_state(manifest, "complete", storage_root=storage_root)
         if any(view["state"] == "scheduler_unknown" for view in task_views):
-            manifest["state"] = "scheduler_unknown"
-            common.serialization.atomic_write_json(
-                campaign_evidence.campaign_run_manifest_path(
-                    run_id,
-                    storage_root=storage_root,
-                ),
-                manifest,
-            )
-            return manifest
+            return _set_campaign_state(manifest, "scheduler_unknown", storage_root=storage_root)
 
         return _fill_submission_capacity(
             manifest,
@@ -2333,6 +2518,10 @@ def feed_campaign(
             running_jobs=running_jobs,
             scheduler=scheduler,
             storage_root=storage_root,
+            progress=progress,
+            verified_repository_commit=verified_repository_commit,
+            tasks=tasks,
+            submission_index=submission_index,
         )
 
 
@@ -2618,6 +2807,83 @@ def _release_initial_launch_reservation(
     ]
 
 
+def _set_campaign_state(
+    manifest: dict[str, Any],
+    state: str,
+    *,
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Persist one campaign state only when its value changes."""
+    if manifest["state"] == state:
+        return manifest
+    manifest["state"] = state
+    common.serialization.atomic_write_json(
+        campaign_evidence.campaign_run_manifest_path(
+            str(manifest["campaign_run_id"]),
+            storage_root=storage_root,
+        ),
+        manifest,
+    )
+    return manifest
+
+
+def _submit_one_after_source_check(
+    manifest: dict[str, Any],
+    campaign: config_service.CampaignConfig,
+    task: cluster_service.CampaignTask,
+    *,
+    mode: str,
+    storage_root: Path | str | None,
+    attempt_index: int,
+    repository_verified: bool,
+    task_index: Mapping[tuple[str, int], cluster_service.CampaignTask],
+) -> tuple[dict[str, Any], bool]:
+    """Verify mutable checkout state once immediately before submission."""
+    if not repository_verified:
+        current_commit = _repository_commit()
+        if current_commit != manifest["git_commit"]:
+            message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
+            raise RuntimeError(message)
+    return (
+        _submit_one(
+            manifest,
+            campaign,
+            task,
+            mode=mode,
+            storage_root=storage_root,
+            attempt_index=attempt_index,
+            task_index=task_index,
+        ),
+        True,
+    )
+
+
+def _submitted_attempt_counts(
+    manifest: Mapping[str, Any],
+    *,
+    submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
+) -> dict[tuple[str, int], int]:
+    """Count persisted scheduler-owned attempts once per logical case."""
+    records_by_task = _submission_index(manifest) if submission_index is None else submission_index
+    return {
+        key: sum(record["status"] == "submitted" and isinstance(record["job_id"], str) and bool(record["job_id"]) for record in records)
+        for key, records in records_by_task.items()
+    }
+
+
+def _preverified_repository_commit(
+    manifest: Mapping[str, Any],
+    candidate: str | None,
+) -> bool:
+    """Validate one operation-local source check inherited by submission."""
+    if candidate is None:
+        return False
+    if source_service.validate_git_commit(candidate) != manifest["git_commit"]:
+        message = "Prevalidated repository commit disagrees with the persisted campaign source."
+        raise RuntimeError(message)
+    return True
+
+
 def _fill_submission_capacity(
     manifest: dict[str, Any],
     campaign: config_service.CampaignConfig,
@@ -2627,96 +2893,94 @@ def _fill_submission_capacity(
     running_jobs: int,
     scheduler: Mapping[str, Any],
     storage_root: Path | str | None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    verified_repository_commit: str | None = None,
+    tasks: Sequence[cluster_service.CampaignTask] | None = None,
+    submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Submit owned retries and admit fresh cases within one logical pool."""
     del scheduler
-    run_id = str(manifest["campaign_run_id"])
     max_admission_cases = int(manifest["submission_config"]["max_admission_cases"])
     max_running = manifest["submission_config"]["max_running_cases"]
     maximum_failed_cases = int(manifest["submission_config"]["maximum_failed_cases"])
+    repository_verified = _preverified_repository_commit(
+        manifest,
+        verified_repository_commit,
+    )
     admission_keys = set(_logical_admission_case_keys(manifest, task_views))
-    selected_tasks: set[tuple[str, int]] = set()
-    plan_order = {(task.batch_id, task.case_index): index for index, task in enumerate(cluster_service.campaign_tasks(campaign))}
+    campaign_tasks = tuple(tasks) if tasks is not None else cluster_service.campaign_tasks(campaign)
+    task_index = {(task.batch_id, task.case_index): task for task in campaign_tasks}
+    plan_order = {(task.batch_id, task.case_index): index for index, task in enumerate(campaign_tasks)}
+    submitted_attempt_counts = _submitted_attempt_counts(manifest, submission_index=submission_index)
 
-    while True:
-        if max_running is not None and running_jobs >= int(max_running):
-            manifest["state"] = "active"
-            common.serialization.atomic_write_json(
-                campaign_evidence.campaign_run_manifest_path(
-                    run_id,
-                    storage_root=storage_root,
-                ),
-                manifest,
-            )
-            return manifest
+    def report_submission_progress() -> None:
+        if progress is None:
+            return
+        progress(
+            {
+                "operation": "scheduler_submission",
+                "work_units_admitted": len(admission_keys),
+                "work_units_total": len(campaign_tasks),
+                "scheduler_submissions": len(manifest.get("submissions", ())),
+                "eta": "unavailable",
+            }
+        )
 
-        eligible_blocked = sorted(
-            (
-                view
-                for view in task_views
-                if view["state"] == "license_blocked" and view["license_retry_eligible"] is True and _task_identity_key(view) not in selected_tasks
-            ),
+    reservation_keys = _admission_reservation_keys(manifest)
+    retries = deque(
+        sorted(
+            (view for view in task_views if view["state"] == "license_blocked" and view["license_retry_eligible"] is True),
             key=lambda view: _retry_candidate_sort_key(
                 view,
                 plan_order=plan_order,
             ),
         )
-        next_retry = eligible_blocked[0] if eligible_blocked else None
-        next_restart = next(
-            (view for view in task_views if view["state"] in {"cancelled", "interrupted"} and _task_identity_key(view) not in selected_tasks),
-            None,
-        )
-        reservation_keys = _admission_reservation_keys(manifest)
-        next_reserved = next(
-            (
-                view
-                for view in task_views
-                if view["state"] in {"admission_waiting", "never_started"}
-                and _task_identity_key(view) in reservation_keys
-                and _task_identity_key(view) not in selected_tasks
-            ),
-            None,
-        )
-        next_unsent = next(
-            (
-                view
-                for view in task_views
-                if view["state"] == "never_started"
-                and _task_identity_key(view) not in reservation_keys
-                and _task_identity_key(view) not in selected_tasks
-            ),
-            None,
-        )
-        circuit_breaker_tripped = _solver_failure_threshold_exceeded(
-            task_views,
-            maximum_failed_cases=maximum_failed_cases,
-        )
-        next_view = next_retry or next_restart or next_reserved
-        if next_view is None and not circuit_breaker_tripped and len(admission_keys) < max_admission_cases:
-            next_view = next_unsent
+    )
+    restarts = deque(view for view in task_views if view["state"] in {"cancelled", "interrupted"})
+    reserved = deque(
+        view for view in task_views if view["state"] in {"admission_waiting", "never_started"} and _task_identity_key(view) in reservation_keys
+    )
+    unsent = deque(view for view in task_views if view["state"] == "never_started" and _task_identity_key(view) not in reservation_keys)
+    circuit_breaker_tripped = _solver_failure_threshold_exceeded(
+        task_views,
+        maximum_failed_cases=maximum_failed_cases,
+    )
+    has_license_blocked = any(view["state"] == "license_blocked" for view in task_views)
+
+    while True:
+        if max_running is not None and running_jobs >= int(max_running):
+            return _set_campaign_state(manifest, "active", storage_root=storage_root)
+
+        next_unsent = unsent[0] if unsent else None
+        if retries:
+            next_view = retries.popleft()
+        elif restarts:
+            next_view = restarts.popleft()
+        elif reserved:
+            next_view = reserved.popleft()
+        elif next_unsent is not None and not circuit_breaker_tripped and len(admission_keys) < max_admission_cases:
+            next_view = unsent.popleft()
+        else:
+            next_view = None
         if next_view is None:
             if pending_jobs or running_jobs:
-                manifest["state"] = "active"
-            elif any(view["state"] == "license_blocked" for view in task_views):
-                manifest["state"] = "license_blocked"
+                next_state = "active"
+            elif has_license_blocked:
+                next_state = "license_blocked"
             elif admission_keys:
-                manifest["state"] = "active"
+                next_state = "active"
             elif circuit_breaker_tripped and next_unsent is not None:
-                manifest["state"] = "failure_threshold_reached"
+                next_state = "failure_threshold_reached"
             else:
-                manifest["state"] = "completed_with_failures"
-            common.serialization.atomic_write_json(
-                campaign_evidence.campaign_run_manifest_path(
-                    run_id,
-                    storage_root=storage_root,
-                ),
-                manifest,
-            )
-            return manifest
+                next_state = "completed_with_failures"
+            return _set_campaign_state(manifest, next_state, storage_root=storage_root)
 
-        task = _task_from_payload(campaign, next_view)
+        task = _task_from_payload(
+            campaign,
+            next_view,
+            task_index=task_index,
+        )
         key = (task.batch_id, task.case_index)
-        selected_tasks.add(key)
         if next_view["state"] == "license_blocked":
             mode = "license_retry"
         elif next_view["state"] in {"cancelled", "interrupted"}:
@@ -2735,19 +2999,20 @@ def _fill_submission_capacity(
             message = "Retry or resume case no longer owns logical admission."
             raise RuntimeError(message)
 
-        current_commit = _repository_commit()
-        if current_commit != manifest["git_commit"]:
-            message = f"Solver admission requires the exact original campaign source commit {manifest['git_commit']}, got {current_commit}."
-            raise RuntimeError(message)
         if mode == "initial":
             _release_initial_launch_reservation(manifest, key=key)
-        manifest = _submit_one(
+        manifest, repository_verified = _submit_one_after_source_check(
             manifest,
             campaign,
             task,
             mode=mode,
             storage_root=storage_root,
+            attempt_index=submitted_attempt_counts.get(key, 0) + 1,
+            repository_verified=repository_verified,
+            task_index=task_index,
         )
+        submitted_attempt_counts[key] = submitted_attempt_counts.get(key, 0) + 1
+        report_submission_progress()
 
 
 def submit_campaign(
@@ -2755,6 +3020,8 @@ def submit_campaign(
     *,
     git_commit: str,
     storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+    inputs_prepared: bool = False,
 ) -> dict[str, Any]:
     """Create durable campaign state and fill its safe submission capacity."""
     requested_commit = source_service.validate_git_commit(git_commit)
@@ -2762,7 +3029,15 @@ def submit_campaign(
     if current_commit != requested_commit:
         message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
-    input_service.prepare_campaign_inputs(
+    if not inputs_prepared:
+        input_service.prepare_campaign_inputs(
+            campaign,
+            git_commit=requested_commit,
+            storage_root=storage_root,
+            progress=progress,
+            existing_validation_depth="evidence",
+        )
+    input_references = _campaign_input_references(
         campaign,
         git_commit=requested_commit,
         storage_root=storage_root,
@@ -2800,7 +3075,14 @@ def submit_campaign(
                 raise FileExistsError(message)
         else:
             common.serialization.atomic_write_json(path, intent)
-    return feed_campaign(run_id, storage_root=storage_root)
+    return feed_campaign(
+        run_id,
+        storage_root=storage_root,
+        progress=progress,
+        verified_repository_commit=requested_commit,
+        input_references=input_references,
+        resolved_campaign=campaign,
+    )
 
 
 def _write_campaign_manifest(
@@ -2810,12 +3092,19 @@ def _write_campaign_manifest(
 ) -> dict[str, Any]:
     """Persist and re-admit one campaign manifest state transition."""
     run_id = str(manifest["campaign_run_id"])
+    payload = dict(manifest)
+    current = campaign_evidence.load_campaign_run(
+        run_id,
+        storage_root=storage_root,
+    )
+    if current == payload:
+        return current
     common.serialization.atomic_write_json(
         campaign_evidence.campaign_run_manifest_path(
             run_id,
             storage_root=storage_root,
         ),
-        dict(manifest),
+        payload,
     )
     return campaign_evidence.load_campaign_run(
         run_id,
@@ -2823,10 +3112,70 @@ def _write_campaign_manifest(
     )
 
 
+def _refresh_resume_task_views(
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+    scheduler: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+    *,
+    changed_keys: set[tuple[str, int]],
+    input_references: Mapping[str, Mapping[int, admission_service.InputCaseReference]],
+    storage_root: Path | str | None,
+    submitted_after_scheduler_snapshot: Collection[tuple[str, int]] = frozenset(),
+    tasks: Sequence[cluster_service.CampaignTask] | None = None,
+    submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Reconcile only cases whose evidence changed during this resume call."""
+    if not changed_keys:
+        return [dict(view) for view in task_views]
+    task_sequence = tuple(tasks) if tasks is not None else cluster_service.campaign_tasks(campaign)
+    task_index = {(task.batch_id, task.case_index): task for task in task_sequence}
+    batches = {batch.batch_name: batch for batch in campaign.batches}
+    submissions_by_task = _submission_index(manifest) if submission_index is None else submission_index
+    refreshed: list[dict[str, Any]] = []
+    for prior in task_views:
+        key = _task_identity_key(prior)
+        if key not in changed_keys:
+            refreshed.append(dict(prior))
+            continue
+        task = task_index[key]
+        batch = batches[task.batch_name]
+        cached = _matching_case_reconciliation_evidence(
+            manifest,
+            batch,
+            task,
+            storage_root=storage_root,
+        )
+        view = _task_state(
+            manifest,
+            campaign,
+            task,
+            scheduler,
+            batch=batch,
+            input_reference=input_references[task.batch_name][task.case_index],
+            storage_root=storage_root,
+            cached_case_reconciliation=cached,
+            submission_records=submissions_by_task.get(key, ()),
+        )
+        # Its exact job ID was persisted after this batched scheduler snapshot;
+        # absence from that older evidence is a transition, not a terminal result.
+        if key in submitted_after_scheduler_snapshot and view["state"] == "scheduler_unknown":
+            view = {
+                **view,
+                "state": "pending",
+                "reason": "scheduler_snapshot_predates_submission",
+                "automatic_continuation_allowed": True,
+            }
+        refreshed.append(view)
+    return refreshed
+
+
 def resume_campaign(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
+    status_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Fill scheduler capacity first, then process independent local replays."""
     run_directory = campaign_evidence.campaign_run_directory(
@@ -2846,27 +3195,54 @@ def resume_campaign(
         if submission_unknown:
             return manifest
         campaign = campaign_evidence.campaign_from_manifest(manifest)
+        tasks = cluster_service.campaign_tasks(campaign)
+        submission_index = _submission_index(manifest)
         scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
         _require_scheduler_evidence(scheduler)
+        input_references = _campaign_input_references(
+            campaign,
+            git_commit=str(manifest["git_commit"]),
+            storage_root=storage_root,
+        )
         task_views, pending_jobs, running_jobs = _reconciled(
             manifest,
             campaign,
             scheduler,
             storage_root=storage_root,
             compact_license_attempt_payloads=True,
+            input_references=input_references,
+            progress=progress,
+            tasks=tasks,
+            submission_index=submission_index,
         )
         if all(view["state"] == "successful" for view in task_views):
             _finalize_completed_batches(
                 campaign,
                 storage_root=storage_root,
+                task_views=task_views,
             )
             manifest["state"] = "complete"
-            return _write_campaign_manifest(
+            result = _write_campaign_manifest(
                 manifest,
                 storage_root=storage_root,
             )
+            if status_callback is not None:
+                status_callback(
+                    _campaign_status_from_snapshot(
+                        run_id,
+                        manifest=result,
+                        campaign=campaign,
+                        scheduler=scheduler,
+                        task_views=task_views,
+                        pending_jobs=pending_jobs,
+                        running_jobs=running_jobs,
+                        storage_root=storage_root,
+                    )
+                )
+            return result
 
         submission_count_before = len(manifest.get("submissions", ()))
+        reservation_keys_before = _admission_reservation_keys(manifest)
         manifest = _fill_submission_capacity(
             manifest,
             campaign,
@@ -2875,10 +3251,13 @@ def resume_campaign(
             running_jobs=running_jobs,
             scheduler=scheduler,
             storage_root=storage_root,
+            progress=progress,
+            tasks=tasks,
+            submission_index=submission_index,
         )
-        admission_active = pending_jobs > 0 or running_jobs > 0 or len(manifest.get("submissions", ())) > submission_count_before
+        submissions_changed = len(manifest.get("submissions", ())) > submission_count_before
+        admission_active = pending_jobs > 0 or running_jobs > 0 or submissions_changed
 
-        replayed = False
         replay_failed = False
         replay_views = [
             view
@@ -2901,26 +3280,54 @@ def resume_campaign(
             ):
                 replay_failed = True
                 continue
-            if outcome.status in {"replayed", "skipped"}:
-                replayed = True
-            else:
+            if outcome.status not in {"replayed", "skipped"}:
                 replay_failed = True
 
-        if replayed:
+        batches = {batch.batch_name: batch for batch in campaign.batches}
+        newly_submitted = {
+            (str(record["case"]["batch_id"]), int(record["case"]["case_index"]))
+            for record in manifest.get("submissions", ())[submission_count_before:]
+        }
+        replayed_keys = {_task_identity_key(view) for view in replay_views}
+        completed_during_resume = {
+            _task_identity_key(view)
+            for view in task_views
+            if view["state"] != "successful"
+            and (
+                batch_runtime.processed_case_directory(
+                    batches[str(view["batch_name"])],
+                    int(view["case_index"]),
+                    storage_root=storage_root,
+                )
+                / "_SUCCESS"
+            ).is_file()
+        }
+        scheduler_evidenced_keys = {
+            _task_identity_key(view)
+            for view in task_views
+            if view.get("latest_job_id") in scheduler["active"] or view.get("latest_job_id") in scheduler["accounted"]
+        }
+        reservation_changes = reservation_keys_before.symmetric_difference(_admission_reservation_keys(manifest))
+        refresh_submission_index = _submission_index(manifest) if submissions_changed else submission_index
+        refreshed_views = _refresh_resume_task_views(
+            manifest,
+            campaign,
+            scheduler,
+            task_views,
+            changed_keys=(newly_submitted | replayed_keys | completed_during_resume | scheduler_evidenced_keys | reservation_changes),
+            input_references=input_references,
+            storage_root=storage_root,
+            submitted_after_scheduler_snapshot=newly_submitted,
+            tasks=tasks,
+            submission_index=refresh_submission_index,
+        )
+        all_successful = all(view["state"] == "successful" for view in refreshed_views)
+        if all_successful:
             _finalize_completed_batches(
                 campaign,
                 storage_root=storage_root,
+                task_views=refreshed_views,
             )
-        all_successful = all(
-            batch_runtime.completed_case_is_valid(
-                batch_config,
-                case_index,
-                storage_root=storage_root,
-            )
-            for batch_config in campaign.batches
-            for case_index in batch_config.case_indices
-        )
-        if all_successful:
             manifest["state"] = "complete"
         elif admission_active:
             manifest["state"] = "active"
@@ -2929,10 +3336,49 @@ def resume_campaign(
             "failure_threshold_reached",
         }:
             manifest["state"] = "completed_with_failures"
-        return _write_campaign_manifest(
+        result = _write_campaign_manifest(
             manifest,
             storage_root=storage_root,
         )
+        if status_callback is not None:
+            status_callback(
+                _campaign_status_from_snapshot(
+                    run_id,
+                    manifest=result,
+                    campaign=campaign,
+                    scheduler=scheduler,
+                    task_views=refreshed_views,
+                    pending_jobs=pending_jobs,
+                    running_jobs=running_jobs,
+                    storage_root=storage_root,
+                )
+            )
+        return result
+
+
+def resume_campaign_monitor_snapshot(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Resume once and return its exact post-action scheduler snapshot."""
+    statuses: list[Mapping[str, Any]] = []
+    manifest = resume_campaign(
+        run_id,
+        storage_root=storage_root,
+        status_callback=statuses.append,
+        progress=progress,
+    )
+    status = (
+        dict(statuses[-1])
+        if statuses
+        else campaign_status(
+            run_id,
+            storage_root=storage_root,
+        )
+    )
+    return {"manifest": manifest, "status": status}
 
 
 def cancel_campaign(
@@ -3129,7 +3575,7 @@ def _public_task_view(view: Mapping[str, Any]) -> dict[str, Any]:
     classified_state = str(view["state"])
     if classified_state == "active":
         state = "running"
-    elif classified_state == "pending":
+    elif classified_state in {"pending", "scheduler_unknown"}:
         state = "scheduler_pending"
     elif classified_state in {
         "successful",
@@ -3247,36 +3693,18 @@ def _pilot_license_observability(
     }
 
 
-def campaign_status(
+def _campaign_status_from_snapshot(
     run_id: str,
     *,
-    storage_root: Path | str | None = None,
-    query_scheduler: bool = True,
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+    scheduler: Mapping[str, Any],
+    task_views: Sequence[Mapping[str, Any]],
+    pending_jobs: int,
+    running_jobs: int,
+    storage_root: Path | str | None,
 ) -> dict[str, Any]:
-    """Reconstruct exact feeder, scheduler, batch, and case state."""
-    manifest = campaign_evidence.load_campaign_run(
-        run_id,
-        storage_root=storage_root,
-    )
-    campaign = campaign_evidence.campaign_from_manifest(manifest)
-    scheduler = (
-        _scheduler_evidence(manifest["slurm_job_ids"])
-        if query_scheduler
-        else {
-            "squeue": {"command": [], "output": "", "error": None},
-            "sacct": {"command": [], "output": "", "error": None},
-            "active": {},
-            "accounted": {},
-        }
-    )
-    if query_scheduler:
-        _require_scheduler_evidence(scheduler)
-    task_views, pending_jobs, running_jobs = _reconciled(
-        manifest,
-        campaign,
-        scheduler,
-        storage_root=storage_root,
-    )
+    """Project one already acquired reconciliation snapshot into public status."""
     batches = [
         _batch_status(
             batch,
@@ -3437,6 +3865,48 @@ def campaign_status(
         "campaign_meta_directory": manifest["campaign_meta_directory"],
         "suggested_next_command": next_command,
     }
+
+
+def campaign_status(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+    query_scheduler: bool = True,
+) -> dict[str, Any]:
+    """Reconstruct exact feeder, scheduler, batch, and case state."""
+    manifest = campaign_evidence.load_campaign_run(
+        run_id,
+        storage_root=storage_root,
+    )
+    campaign = campaign_evidence.campaign_from_manifest(manifest)
+    scheduler = (
+        _scheduler_evidence(manifest["slurm_job_ids"])
+        if query_scheduler
+        else {
+            "squeue": {"command": [], "output": "", "error": None},
+            "sacct": {"command": [], "output": "", "error": None},
+            "active": {},
+            "accounted": {},
+        }
+    )
+    if query_scheduler:
+        _require_scheduler_evidence(scheduler)
+    task_views, pending_jobs, running_jobs = _reconciled(
+        manifest,
+        campaign,
+        scheduler,
+        storage_root=storage_root,
+    )
+    return _campaign_status_from_snapshot(
+        run_id,
+        manifest=manifest,
+        campaign=campaign,
+        scheduler=scheduler,
+        task_views=task_views,
+        pending_jobs=pending_jobs,
+        running_jobs=running_jobs,
+        storage_root=storage_root,
+    )
 
 
 def manifest_scheduler_view(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -3943,14 +4413,18 @@ def _transfer_ignored_paths(plan: dict[str, Any], relative_value: str) -> frozen
     return frozenset()
 
 
-def _campaign_transfer_directory_records(
-    plan: dict[str, Any],
+def _transfer_directory_inventory_index(
+    plan: Mapping[str, Any],
     *,
-    staging: Path,
-) -> list[dict[str, str]]:
-    """Return journal-ready directory identities from complete incoming bytes."""
+    inventory: Mapping[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Group exact transfer file evidence by directory in one inventory pass."""
+    records = inventory.get("files")
+    if not isinstance(records, list):
+        message = "Transfer publication inventory is malformed."
+        raise TypeError(message)
     relative_directories = [
-        directory
+        str(directory)
         for batch in plan["batches"]
         for directory in (
             batch["meta_directory"],
@@ -3959,24 +4433,60 @@ def _campaign_transfer_directory_records(
             *batch["attempt_directories"],
         )
     ]
-    relative_directories.append(plan["campaign_directory"])
-    records: list[dict[str, str]] = []
-    for relative_value in relative_directories:
-        relative = Path(relative_value)
-        source = (staging / relative).resolve()
-        if relative.is_absolute() or ".." in relative.parts or not source.is_relative_to(staging):
-            message = f"Transfer plan contains an unsafe directory: {relative_value!r}"
+    relative_directories.append(str(plan["campaign_directory"]))
+    if len(relative_directories) != len(set(relative_directories)):
+        message = "Transfer plan contains duplicate directory ownership."
+        raise RuntimeError(message)
+    directory_set = set(relative_directories)
+    grouped: dict[str, dict[str, dict[str, Any]]] = {directory: {} for directory in relative_directories}
+    for directory in relative_directories:
+        relative = Path(directory)
+        if relative.is_absolute() or ".." in relative.parts:
+            message = f"Transfer plan contains an unsafe directory: {directory!r}"
             raise ValueError(message)
-        records.append(
-            {
-                "relative_path": relative_value,
-                "identity": campaign_evidence.directory_identity(
-                    source,
-                    ignored_relative_paths=_transfer_ignored_paths(plan, relative_value),
-                ),
-            }
-        )
-    return records
+    for record in records:
+        if not isinstance(record, dict):
+            message = "Transfer publication inventory record is malformed."
+            raise TypeError(message)
+        path_value = record.get("relative_path")
+        if not isinstance(path_value, str):
+            message = "Transfer publication inventory path is malformed."
+            raise TypeError(message)
+        relative_path = Path(path_value)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            message = f"Transfer publication inventory path is unsafe: {path_value!r}"
+            raise ValueError(message)
+        ancestors = [Path(*relative_path.parts[:depth]).as_posix() for depth in range(1, len(relative_path.parts))]
+        owners = [ancestor for ancestor in ancestors if ancestor in directory_set]
+        if len(owners) != 1:
+            message = f"Transfer inventory path has ambiguous directory ownership: {path_value!r}"
+            raise RuntimeError(message)
+        owner = owners[0]
+        child = relative_path.relative_to(owner).as_posix()
+        if child in grouped[owner]:
+            message = f"Transfer inventory duplicates one directory-relative file: {path_value!r}"
+            raise RuntimeError(message)
+        grouped[owner][child] = {
+            "sha256": record.get("sha256"),
+            "size_bytes": record.get("size_bytes"),
+        }
+    return grouped
+
+
+def _campaign_transfer_directory_records(
+    plan: dict[str, Any],
+    *,
+    inventory: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Derive directory identities from one grouped transfer inventory."""
+    grouped = _transfer_directory_inventory_index(plan, inventory=inventory)
+    return [
+        {
+            "relative_path": relative_value,
+            "identity": common.serialization.canonical_json_sha256(files),
+        }
+        for relative_value, files in grouped.items()
+    ]
 
 
 def _load_or_create_campaign_transfer_journal(
@@ -3987,6 +4497,7 @@ def _load_or_create_campaign_transfer_journal(
     source_host: str,
     source_storage_root: str,
     partial: bool = False,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Load or immutably establish interruption-recovery transfer evidence."""
     journal_path = staging / (_PARTIAL_TRANSFER_PUBLICATION_JOURNAL if partial else _TRANSFER_PUBLICATION_JOURNAL)
@@ -4042,6 +4553,7 @@ def _load_or_create_campaign_transfer_journal(
     source_inventory = campaign_evidence.transfer_inventory_from_plan(
         plan,
         storage_root=staging,
+        progress=progress,
     )
     journal = {
         **expected_identity,
@@ -4055,7 +4567,7 @@ def _load_or_create_campaign_transfer_journal(
         ),
         "plan": plan,
         "source_inventory": source_inventory,
-        "directories": _campaign_transfer_directory_records(plan, staging=staging),
+        "directories": _campaign_transfer_directory_records(plan, inventory=source_inventory),
     }
     common.serialization.atomic_write_json(journal_path, journal)
     return journal
@@ -4079,14 +4591,26 @@ def _campaign_directory_files(
     return files
 
 
+def _require_directory_metadata(
+    files: Mapping[str, Path],
+    expected: Mapping[str, Mapping[str, Any]],
+    *,
+    directory: Path,
+) -> None:
+    """Require exact membership and sizes without rereading payload bytes."""
+    if set(files) != set(expected) or any(path.stat().st_size != expected[relative].get("size_bytes") for relative, path in files.items()):
+        message = f"Transfer directory membership or sizes disagree with its validated inventory: {directory}"
+        raise RuntimeError(message)
+
+
 def _publish_missing_campaign_files(
     source: Path,
     target: Path,
     *,
     ignored_relative_paths: frozenset[str],
-    expected_identity: str,
-) -> None:
-    """Atomically add exact missing source files to an unchanged host subset."""
+    expected_files: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Repair an interrupted target; hash only its pre-existing conflict surface."""
     source_files = _campaign_directory_files(
         source,
         ignored_relative_paths=ignored_relative_paths,
@@ -4095,13 +4619,27 @@ def _publish_missing_campaign_files(
         target,
         ignored_relative_paths=ignored_relative_paths,
     )
+    _require_directory_metadata(
+        source_files,
+        {relative: expected_files[relative] for relative in source_files if relative in expected_files},
+        directory=source,
+    )
+    unexpected = (set(source_files) | set(target_files)) - set(expected_files)
+    missing = set(expected_files) - (set(source_files) | set(target_files))
+    if unexpected or missing:
+        message = f"Interrupted transfer membership conflicts with incoming identity: {target}"
+        raise FileExistsError(message)
     for relative, target_path in target_files.items():
-        source_path = source_files.get(relative)
-        if source_path is None or common.serialization.file_sha256(target_path) != common.serialization.file_sha256(source_path):
+        expected = expected_files[relative]
+        if target_path.stat().st_size != expected.get("size_bytes") or common.serialization.file_sha256(target_path) != expected.get("sha256"):
             message = f"Existing transfer destination conflicts with incoming identity: {target}"
             raise FileExistsError(message)
-    for relative in sorted(set(source_files).difference(target_files)):
-        source_path = source_files[relative]
+    missing_from_target = sorted(set(expected_files) - set(target_files))
+    for relative in missing_from_target:
+        source_path = source_files.get(relative)
+        if source_path is None:
+            message = f"Incomplete transfer destination lacks incoming file {relative!r}: {target}"
+            raise FileNotFoundError(message)
         target_path = (target / relative).resolve()
         if not target_path.is_relative_to(target):
             message = f"Missing transfer file escapes its destination: {relative!r}"
@@ -4111,15 +4649,16 @@ def _publish_missing_campaign_files(
             message = f"Missing transfer file parent is unsafe: {target_path.parent}"
             raise ValueError(message)
         source_path.replace(target_path)
-    if (
-        campaign_evidence.directory_identity(
-            target,
-            ignored_relative_paths=ignored_relative_paths,
-        )
-        != expected_identity
-    ):
-        message = f"Repaired transfer destination still differs from incoming identity: {target}"
-        raise RuntimeError(message)
+    final_files = _campaign_directory_files(
+        target,
+        ignored_relative_paths=ignored_relative_paths,
+    )
+    _require_directory_metadata(
+        final_files,
+        expected_files,
+        directory=target,
+    )
+    return bool(missing_from_target)
 
 
 def _publish_incoming_campaign_directories(
@@ -4128,12 +4667,14 @@ def _publish_incoming_campaign_directories(
     staging: Path,
     destination: Path,
 ) -> list[dict[str, str]]:
-    """Publish journaled incoming directories by verified atomic rename."""
+    """Publish once-validated incoming directories by atomic rename or repair."""
     plan = journal.get("plan")
     records = journal.get("directories")
-    if not isinstance(plan, dict) or not isinstance(records, list):
-        message = "Transfer publication journal plan or directories are malformed."
+    inventory = journal.get("source_inventory")
+    if not isinstance(plan, dict) or not isinstance(records, list) or not isinstance(inventory, dict):
+        message = "Transfer publication journal plan, inventory, or directories are malformed."
         raise TypeError(message)
+    inventory_index = _transfer_directory_inventory_index(plan, inventory=inventory)
     outcomes: list[dict[str, str]] = []
     for record in records:
         if not isinstance(record, dict) or set(record) != {"relative_path", "identity"}:
@@ -4151,39 +4692,51 @@ def _publish_incoming_campaign_directories(
             message = f"Transfer directory escapes a storage root: {relative_value!r}"
             raise ValueError(message)
         ignored = _transfer_ignored_paths(plan, relative_value)
+        expected_files = inventory_index.get(relative_value)
+        if expected_files is None:
+            message = f"Transfer publication journal directory is not in its inventory plan: {relative_value!r}"
+            raise RuntimeError(message)
         if target.exists():
-            target_identity = campaign_evidence.directory_identity(
-                target,
-                ignored_relative_paths=ignored,
-            )
-            if source.exists() and campaign_evidence.directory_identity(source, ignored_relative_paths=ignored) != expected_identity:
-                message = f"Incoming transfer source conflicts with its journal: {source}"
-                raise RuntimeError(message)
-            if target_identity == expected_identity:
-                status = "reused"
-            else:
-                if not source.is_dir() or source.is_symlink():
-                    message = f"Incomplete transfer destination has no safe incoming source: {target}"
-                    raise FileNotFoundError(message)
-                _publish_missing_campaign_files(
-                    source,
+            if not source.is_dir() or source.is_symlink():
+                source_files = {}
+                target_files = _campaign_directory_files(
                     target,
                     ignored_relative_paths=ignored,
-                    expected_identity=expected_identity,
                 )
-                status = "repaired"
+                if set(target_files) != set(expected_files):
+                    message = f"Incomplete transfer destination has no safe incoming source: {target}"
+                    raise FileNotFoundError(message)
+            repaired = _publish_missing_campaign_files(
+                source,
+                target,
+                ignored_relative_paths=ignored,
+                expected_files=expected_files,
+            )
+            status = "repaired" if repaired else "reused"
         else:
             if not source.is_dir() or source.is_symlink():
                 message = f"Incoming transfer source is missing or unsafe: {source}"
                 raise FileNotFoundError(message)
-            if campaign_evidence.directory_identity(source, ignored_relative_paths=ignored) != expected_identity:
-                message = f"Incoming transfer source conflicts with its journal: {source}"
-                raise RuntimeError(message)
+            source_files = _campaign_directory_files(
+                source,
+                ignored_relative_paths=ignored,
+            )
+            _require_directory_metadata(
+                source_files,
+                expected_files,
+                directory=source,
+            )
             target.parent.mkdir(parents=True, exist_ok=True)
             source.replace(target)
-            if campaign_evidence.directory_identity(target, ignored_relative_paths=ignored) != expected_identity:
-                message = f"Transferred directory identity changed during atomic publication: {target}"
-                raise RuntimeError(message)
+            target_files = _campaign_directory_files(
+                target,
+                ignored_relative_paths=ignored,
+            )
+            _require_directory_metadata(
+                target_files,
+                expected_files,
+                directory=target,
+            )
             status = "published"
         outcomes.append(
             {
@@ -4203,6 +4756,7 @@ def publish_transferred_campaign(
     source_host: str,
     source_storage_root: str,
     partial: bool = False,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Validate incoming bytes and atomically rename them into final locations."""
     if not source_host or any(character in source_host for character in "\r\n\t"):
@@ -4230,6 +4784,7 @@ def publish_transferred_campaign(
         source_host=source_host,
         source_storage_root=source_storage_root,
         partial=partial,
+        progress=progress,
     )
     plan = journal["plan"]
     source_inventory = journal["source_inventory"]
@@ -4285,9 +4840,10 @@ def publish_transferred_campaign(
             evidence_path,
             label="partial campaign evidence",
         )
-        destination_inventory = campaign_evidence.transfer_inventory_from_plan(
-            plan,
+        destination_inventory = campaign_evidence.admit_transfer_inventory(
+            source_inventory,
             storage_root=destination,
+            plan=plan,
         )
         if destination_inventory != source_inventory:
             message = "Published partial campaign inventory differs from the incoming transfer source."
@@ -4321,7 +4877,11 @@ def publish_transferred_campaign(
         )
 
     validated = validate_terminal_campaign(run_id, storage_root=destination)
-    destination_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
+    destination_inventory = campaign_evidence.admit_transfer_inventory(
+        source_inventory,
+        storage_root=destination,
+        plan=plan,
+    )
     if destination_inventory != source_inventory:
         message = "Published campaign inventory differs from the incoming transfer source."
         raise RuntimeError(message)
@@ -4342,7 +4902,10 @@ def publish_transferred_campaign(
     }
     if receipt_path.exists():
         try:
-            existing = validate_transferred_campaign(run_id, storage_root=destination)
+            existing = admit_transferred_campaign(
+                run_id,
+                storage_root=destination,
+            )
         except (FileNotFoundError, TypeError, ValueError):
             existing = None
         if existing is not None:
@@ -4364,7 +4927,10 @@ def publish_transferred_campaign(
         "source_removed": False,
     }
     common.serialization.atomic_write_json(receipt_path, receipt)
-    return validate_transferred_campaign(run_id, storage_root=destination)
+    return admit_transferred_campaign(
+        run_id,
+        storage_root=destination,
+    )
 
 
 def repair_transferred_campaign(
@@ -4483,6 +5049,23 @@ def validate_transferred_campaign(
     terminal = validate_terminal_campaign(run_id, storage_root=destination)
     plan = campaign_transfer_plan(run_id, storage_root=destination)
     return campaign_evidence.validate_transfer_receipt(
+        run_id,
+        terminal=terminal,
+        plan=plan,
+        storage_root=destination,
+    )
+
+
+def admit_transferred_campaign(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Admit immutable GPU publication evidence without payload rehashing."""
+    destination = workspace_service.resolve_storage_root(storage_root, create=False)
+    terminal = validate_terminal_campaign(run_id, storage_root=destination)
+    plan = campaign_transfer_plan(run_id, storage_root=destination)
+    return campaign_evidence.admit_transfer_receipt(
         run_id,
         terminal=terminal,
         plan=plan,

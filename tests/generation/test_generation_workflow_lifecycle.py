@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from src import common, generation
+from src import common, datasets, generation
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_workspace as workspace
 
@@ -24,6 +24,122 @@ _AUTH_DIGESTS = {
     "dataset_receipt_sha256": "2" * 64,
     "workflow_gate_sha256": "3" * 64,
 }
+
+
+def _write_setup_idle_campaign(
+    storage: Path,
+    run_id: str,
+    *,
+    job_ids: tuple[str, ...],
+    git_commit: str,
+    state: str,
+) -> Path:
+    """Write the scheduler-ownership slice of one historical campaign."""
+    directory = campaign_evidence.campaign_run_directory(
+        run_id,
+        storage_root=storage,
+    )
+    directory.mkdir(parents=True)
+    submissions = [
+        {
+            "submission_index": index,
+            "mode": "initial",
+            "recorded_at": "2026-08-21T00:00:00+00:00",
+            "case": {
+                "batch_name": "historical_batch",
+                "batch_id": "historical_batch_id",
+                "case_index": index,
+                "case_id": f"case_{index:04d}",
+            },
+            "job_name": f"setup-idle-{index}",
+            "command": [
+                "sbatch",
+                f"--job-name=setup-idle-{index}",
+                "generation_campaign_node.sh",
+            ],
+            "job_id": job_id,
+            "status": "submitted",
+            "error": None,
+        }
+        for index, job_id in enumerate(job_ids, start=1)
+    ]
+    manifest = {
+        "schema_kind": "generation_campaign_run",
+        "schema_version": 1,
+        "campaign_run_id": run_id,
+        "campaign_config": "configs/generation/campaigns/removed_historical.yaml",
+        "git_commit": git_commit,
+        "state": state,
+        "slurm_job_ids": list(job_ids),
+        "submissions": submissions,
+        "submission_intent": None,
+    }
+    path = directory / "campaign_run.json"
+    path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_setup_idle_benchmark(
+    storage: Path,
+    run_id: str,
+    *,
+    job_ids: tuple[str, ...],
+    git_commit: str,
+) -> Path:
+    """Write the scheduler-ownership slice of one historical benchmark."""
+    directory = (
+        common.paths.get_generation_performance_benchmark_root(
+            storage_root=storage,
+        )
+        / "core_scaling"
+        / run_id
+    )
+    directory.mkdir(parents=True)
+    manifest = {
+        "schema_kind": generation.benchmark.BENCHMARK_RUN_SCHEMA_KIND,
+        "schema_version": 1,
+        "benchmark_run_id": run_id,
+        "suite_config": "configs/generation/benchmarks/removed_historical.yaml",
+        "git_commit": git_commit,
+        "measured_job_ids": list(job_ids),
+        "submission_history": [{"role": "measure", "job_id": job_id} for job_id in job_ids],
+    }
+    path = directory / "benchmark_manifest.json"
+    path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _install_setup_idle_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    active_states: dict[str, str] | None = None,
+    error: str | None = None,
+) -> list[list[str]]:
+    """Install one strict fake current-user squeue response."""
+    commands: list[list[str]] = []
+    states = {} if active_states is None else dict(active_states)
+
+    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
+        commands.append(command)
+        assert command[0:2] == ["squeue", "--noheader"]
+        assert sum(argument.startswith("--user=") for argument in command) == 1
+        selection = next(argument.removeprefix("--jobs=") for argument in command if argument.startswith("--jobs="))
+        assert command[-1] == "--format=%i|%T"
+        rows = [f"{job_id}|{states[job_id]}" for job_id in selection.split(",") if job_id in states]
+        return "\n".join(rows), error
+
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_output",
+        scheduler_output,
+    )
+    return commands
 
 
 def _mock_local_gates(
@@ -104,6 +220,11 @@ def _mock_local_gates(
     )
     monkeypatch.setattr(
         generation.campaign,
+        "admit_transferred_campaign",
+        lambda *_args, **_kwargs: transfer,
+    )
+    monkeypatch.setattr(
+        generation.campaign,
         "validate_terminal_campaign",
         lambda *_args, **_kwargs: terminal,
     )
@@ -118,6 +239,73 @@ def _mock_local_gates(
         lambda *_args, **_kwargs: datasets_receipt,
     )
     return storage, transfer, terminal, datasets_receipt
+
+
+def test_transfer_evidence_admission_checks_metadata_without_payload_rehash(tmp_path: Path) -> None:
+    """Keep routine receipt admission distinct from explicit deep validation."""
+    storage = tmp_path / "storage"
+    run_directory = campaign_evidence.campaign_run_directory(_RUN_ID, storage_root=storage)
+    run_directory.mkdir(parents=True)
+    terminal = {"campaign_id": "campaign-id", "git_commit": _COMMIT, "batches": []}
+    terminal_path = run_directory / "campaign_terminal.json"
+    terminal_path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+    payload_path = run_directory / "payload.bin"
+    payload_path.write_bytes(b"first")
+    relative_directory = run_directory.relative_to(storage).as_posix()
+    files = [
+        {
+            "relative_path": path.relative_to(storage).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": common.serialization.file_sha256(path),
+        }
+        for path in (terminal_path, payload_path)
+    ]
+    files.sort(key=lambda record: record["relative_path"])
+    receipt = {
+        "schema_kind": "generation_campaign_transfer",
+        "schema_version": 1,
+        "status": "transfer_complete",
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "campaign_run_id": _RUN_ID,
+        "campaign_id": terminal["campaign_id"],
+        "git_commit": terminal["git_commit"],
+        "source_host": "cpu.example",
+        "source_storage_root": "/remote/storage",
+        "destination_storage_root": str(storage.resolve()),
+        "campaign_terminal_sha256": common.serialization.file_sha256(terminal_path),
+        "transferred_file_count": len(files),
+        "transferred_bytes": sum(record["size_bytes"] for record in files),
+        "transfer_inventory_sha256": common.serialization.canonical_json_sha256(files),
+        "files": files,
+        "directories": [{"directory": relative_directory}],
+        "terminal_validation": {"status": "pass", "batch_count": 0},
+        "source_removed": False,
+    }
+    (run_directory / "transfer_complete.json").write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    plan = {"campaign_directory": relative_directory, "batches": []}
+
+    admitted = campaign_evidence.admit_transfer_receipt(
+        _RUN_ID,
+        terminal=terminal,
+        plan=plan,
+        storage_root=storage,
+    )
+    assert admitted["transfer_inventory_sha256"] == receipt["transfer_inventory_sha256"]
+
+    payload_path.write_bytes(b"other")
+    campaign_evidence.admit_transfer_receipt(
+        _RUN_ID,
+        terminal=terminal,
+        plan=plan,
+        storage_root=storage,
+    )
+    with pytest.raises(ValueError, match=r"(?i)transfer.*invalid"):
+        campaign_evidence.validate_transfer_receipt(
+            _RUN_ID,
+            terminal=terminal,
+            plan=plan,
+            storage_root=storage,
+        )
 
 
 def test_post_transfer_operational_paths_do_not_change_campaign_transfer_identity(tmp_path: Path) -> None:
@@ -170,7 +358,7 @@ def test_dataset_finalization_lock_uses_generation_local_state(
     run_directory = campaign_evidence.campaign_run_directory(_RUN_ID, storage_root=storage)
     run_directory.mkdir(parents=True)
     (run_directory / generation.workflow.DATASET_RECEIPT_FILENAME).write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(generation.campaign, "validate_transferred_campaign", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(generation.campaign, "admit_transferred_campaign", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         generation.campaign,
         "validate_terminal_campaign",
@@ -742,29 +930,349 @@ def test_storage_status_reports_separate_protected_layers_and_staging(
     assert status["protected_cleanup_targets"] == [str(generation_root), str(datasets_root)]
 
 
+def test_metadata_only_status_avoids_tree_sizing_and_package_payload_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep normal status to metadata while exact diagnostics remain explicit."""
+    storage = tmp_path / "storage"
+    metadata = common.paths.get_dataset_metadata_root(storage_root=storage) / "dataset-id"
+    metadata.mkdir(parents=True)
+    source_directory = storage / "01_generation/raw/batch"
+    source_directory.mkdir(parents=True)
+    snapshot_calls = 0
+
+    def reject_expensive_status_work(*_args: Any, **_kwargs: Any) -> Any:
+        message = "Metadata-only status attempted recursive or payload work."
+        raise AssertionError(message)
+
+    def campaign_snapshot(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return {
+            "campaign_run_id": _RUN_ID,
+            "campaign_state": "running",
+            "squeue": {"output": "", "error": None},
+            "sacct": {"output": "", "error": None},
+        }
+
+    monkeypatch.setattr(generation.workflow, "_tree_size", reject_expensive_status_work)
+    monkeypatch.setattr(
+        generation.workflow,
+        "_manifest_source_directories",
+        lambda *_args, **_kwargs: (source_directory,),
+    )
+    monkeypatch.setattr(generation.campaign, "campaign_status", campaign_snapshot)
+    monkeypatch.setattr(
+        datasets.packages,
+        "load_package_manifest",
+        reject_expensive_status_work,
+    )
+    monkeypatch.setattr(
+        datasets.packages,
+        "inspect_dataset_package",
+        reject_expensive_status_work,
+    )
+    monkeypatch.setattr(
+        datasets.packages,
+        "load_package_manifest_evidence",
+        lambda *_args, **_kwargs: {
+            "dataset_view": "transient_drying",
+            "evaluation_regime": "id",
+        },
+    )
+
+    source_status = generation.workflow.campaign_source_status(
+        _RUN_ID,
+        storage_root=storage,
+        query_scheduler=True,
+        include_sizes=False,
+    )
+    assert snapshot_calls == 1
+    assert source_status["reclaimable_bytes"] is None
+    assert source_status["size_bytes"] is None
+    assert source_status["source_directories"] == [
+        {
+            "path": str(source_directory),
+            "exists": True,
+            "size_bytes": None,
+        }
+    ]
+
+    status = generation.workflow.storage_status(
+        storage_root=storage,
+        role="gpu",
+        run_id=_RUN_ID,
+        include_sizes=False,
+        include_runs=False,
+    )
+    assert snapshot_calls == 1
+    assert status["generation_total_bytes"] is None
+    assert status["datasets_total_bytes"] is None
+    assert status["experiments_total_bytes"] is None
+    assert status["runs"] == []
+    assert status["packages"] == [
+        {
+            "dataset_id": "dataset-id",
+            "dataset_view": "transient_drying",
+            "evaluation_regime": "id",
+            "size_bytes": None,
+        }
+    ]
+    assert status["transfer_staging_bytes"] is None
+
+
+def test_shared_setup_idle_succeeds_without_persisted_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avoid scheduler work when no persisted Generation owner exists."""
+    storage = (tmp_path / "storage").resolve()
+    storage.mkdir()
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_output",
+        lambda _command: pytest.fail("empty setup-idle check queried Slurm"),
+    )
+
+    status = generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+    assert status["status"] == "idle"
+    assert status["campaign_run_count"] == 0
+    assert status["benchmark_run_count"] == 0
+
+
+@pytest.mark.parametrize("state", ["cancel_requested", "complete"])
+def test_shared_setup_idle_accepts_idle_historical_terminal_campaign(
+    state: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore current provenance when exact historical jobs left squeue."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=("41001",),
+        git_commit="b" * 40,
+        state=state,
+    )
+    monkeypatch.delenv("GENERATION_GIT_COMMIT", raising=False)
+    commands = _install_setup_idle_scheduler(monkeypatch)
+    monkeypatch.setattr(
+        campaign_evidence,
+        "resolve_campaign_config_path",
+        lambda _value: pytest.fail("setup-idle resolved historical campaign provenance"),
+    )
+
+    status = generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+    assert status["status"] == "idle"
+    assert status["campaign_run_count"] == 1
+    assert len(commands) == 1
+
+
+def test_shared_setup_idle_preserves_failed_campaign_inputs_without_reading_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep retained canonical inputs byte-identical and reusable when jobs are idle."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=("41002",),
+        git_commit="c" * 40,
+        state="completed_with_failures",
+    )
+    payload = (
+        common.paths.resolve_generation_input_generation_raw_directory(
+            "historical_batch",
+            "historical_input_generation",
+            storage_root=storage,
+        )
+        / "case_0001"
+        / "inputs"
+        / "fields.csv"
+    )
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"x,y\n1.0,2.0\n")
+    original_open = Path.open
+    with original_open(payload, "rb") as stream:
+        expected_bytes = stream.read()
+    expected_stat = payload.stat()
+
+    def guarded_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == payload:
+            pytest.fail("setup-idle read canonical scientific payload", pytrace=False)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(
+        common.serialization,
+        "file_sha256",
+        lambda _path: pytest.fail("setup-idle hashed scientific payload"),
+    )
+    monkeypatch.setattr(
+        campaign_evidence,
+        "campaign_from_manifest",
+        lambda _manifest: pytest.fail("setup-idle reconstructed campaign provenance"),
+    )
+    monkeypatch.delenv("GENERATION_GIT_COMMIT", raising=False)
+    _install_setup_idle_scheduler(monkeypatch)
+
+    status = generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+    with original_open(payload, "rb") as stream:
+        actual_bytes = stream.read()
+    actual_stat = payload.stat()
+    assert status["status"] == "idle"
+    assert actual_bytes == expected_bytes
+    assert actual_stat.st_ino == expected_stat.st_ino
+    assert actual_stat.st_size == expected_stat.st_size
+    assert actual_stat.st_mtime_ns == expected_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize(
+    ("scheduler_state", "job_id"),
+    [("RUNNING", "41003"), ("PENDING", "41004")],
+)
+def test_shared_setup_idle_blocks_active_or_pending_persisted_job(
+    scheduler_state: str,
+    job_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block replacement for every exact persisted job still in squeue."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=(job_id,),
+        git_commit="d" * 40,
+        state="active",
+    )
+    _install_setup_idle_scheduler(
+        monkeypatch,
+        active_states={job_id: scheduler_state},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"blocked by active dependent Generation jobs.*campaign",
+    ):
+        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+
+def test_shared_setup_idle_rejects_malformed_persisted_job_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail before scheduler access when persisted ownership is malformed."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=("not-a-job-id",),
+        git_commit="e" * 40,
+        state="active",
+    )
+    monkeypatch.setattr(
+        generation.campaign,
+        "_scheduler_output",
+        lambda _command: pytest.fail("malformed persisted ID reached Slurm"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"cannot validate persisted Generation scheduler ownership.*malformed",
+    ):
+        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+
+def test_shared_setup_idle_reports_scheduler_query_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report unavailable liveness evidence without calling the job active."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=("41005",),
+        git_commit="f" * 40,
+        state="active",
+    )
+    _install_setup_idle_scheduler(monkeypatch, error="squeue unavailable")
+
+    with pytest.raises(RuntimeError) as captured:
+        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+    assert "cannot query dependent Generation scheduler liveness" in str(captured.value)
+    assert "squeue unavailable" in str(captured.value)
+    assert "blocked by active" not in str(captured.value)
+
+
+def test_shared_setup_idle_batches_historical_campaigns_from_different_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use one liveness query without resolving either historical campaign."""
+    storage = (tmp_path / "storage").resolve()
+    _write_setup_idle_campaign(
+        storage,
+        "historical_one__0123456789abcdef",
+        job_ids=("41006",),
+        git_commit="1" * 40,
+        state="complete",
+    )
+    _write_setup_idle_campaign(
+        storage,
+        "historical_two__0123456789abcdef",
+        job_ids=("41007",),
+        git_commit="2" * 40,
+        state="completed_with_failures",
+    )
+    monkeypatch.delenv("GENERATION_GIT_COMMIT", raising=False)
+    commands = _install_setup_idle_scheduler(monkeypatch)
+    monkeypatch.setattr(
+        campaign_evidence,
+        "resolve_campaign_config_path",
+        lambda _value: pytest.fail("setup-idle resolved historical campaign config"),
+    )
+
+    status = generation.workflow.assert_shared_setup_idle(storage_root=storage)
+
+    expected_campaign_count = 2
+    assert status["status"] == "idle"
+    assert status["campaign_run_count"] == expected_campaign_count
+    assert len(commands) == 1
+    assert "--jobs=41006,41007" in commands[0]
+
+
 def test_shared_setup_idle_checks_campaigns_and_benchmarks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refuse shared-installation mutation for any owned active Slurm job."""
+    """Refuse shared setup for an exact active benchmark job in the batch."""
     storage = (tmp_path / "storage").resolve()
-    campaign_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
-    campaign_root.joinpath(_RUN_ID).mkdir(parents=True)
-    benchmark_id = "core_scaling_transient__0123456789abcdef"
-    benchmark_root = common.paths.get_generation_performance_benchmark_root(storage_root=storage) / "core_scaling"
-    benchmark_root.joinpath(benchmark_id).mkdir(parents=True)
-    monkeypatch.setattr(
-        generation.workflow,
-        "_safe_campaign_source_status",
-        lambda *_args, **_kwargs: {
-            "active_slurm": False,
-            "scheduler_error": None,
-        },
+    _write_setup_idle_campaign(
+        storage,
+        _RUN_ID,
+        job_ids=("41008",),
+        git_commit="3" * 40,
+        state="complete",
     )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "core_benchmark_source_status",
-        lambda *_args, **_kwargs: {"active_slurm": True},
+    benchmark_id = "core_scaling_transient__0123456789abcdef"
+    _write_setup_idle_benchmark(
+        storage,
+        benchmark_id,
+        job_ids=("41009",),
+        git_commit="4" * 40,
+    )
+    commands = _install_setup_idle_scheduler(
+        monkeypatch,
+        active_states={"41009": "RUNNING"},
     )
 
     with pytest.raises(
@@ -772,27 +1280,8 @@ def test_shared_setup_idle_checks_campaigns_and_benchmarks(
         match=r"active dependent Generation jobs.*benchmark",
     ):
         generation.workflow.assert_shared_setup_idle(storage_root=storage)
-
-
-def test_shared_setup_idle_fails_closed_on_scheduler_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject mutation when persisted campaign scheduler state is unprovable."""
-    storage = (tmp_path / "storage").resolve()
-    campaign_root = common.paths.get_generation_meta_root(storage_root=storage) / "campaigns"
-    campaign_root.joinpath(_RUN_ID).mkdir(parents=True)
-    monkeypatch.setattr(
-        generation.workflow,
-        "_safe_campaign_source_status",
-        lambda *_args, **_kwargs: {
-            "active_slurm": None,
-            "scheduler_error": "squeue unavailable",
-        },
-    )
-
-    with pytest.raises(RuntimeError, match=r"cannot prove.*squeue unavailable"):
-        generation.workflow.assert_shared_setup_idle(storage_root=storage)
+    assert len(commands) == 1
+    assert "--jobs=41008,41009" in commands[0]
 
 
 def test_partial_completion_receipt_keeps_packages_incomplete_and_source_retained(

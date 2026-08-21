@@ -30,7 +30,7 @@ from src import common
 from . import generation_runtime_batch as runtime_service
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from src.generation.cases import generation_cases_config as config_contract
 
@@ -158,8 +158,9 @@ def run_local_batch(
         details = "; ".join(f"{config.case_id(index)}: {error}" for index, error in sorted(failures))
         message = f"Local batch reached its failure limit after {len(failures)} case(s): {details}"
         raise RuntimeError(message) from failures[0][1]
-    if selected == config.case_indices and all(
-        runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root) for case_index in config.case_indices
+    if selected == config.case_indices and _batch_publication_markers_complete(
+        config,
+        storage_root=storage_root,
     ):
         runtime_service.finalize_batch(config, storage_root=storage_root)
     return tuple(outcomes[index] for index in sorted(outcomes))
@@ -185,12 +186,34 @@ def require_campaign_task(
     batch_name: str,
     case_index: int,
 ) -> CampaignTask:
-    """Resolve one exact campaign member without relying on material ordering."""
-    matches = tuple(task for task in campaign_tasks(campaign) if task.batch_name == batch_name and task.case_index == case_index)
-    if len(matches) != 1:
-        message = f"Campaign task {batch_name!r}/{case_index!r} is not exact configured membership."
-        raise ValueError(message)
-    return matches[0]
+    """Resolve one exact campaign member without rebuilding all campaign tasks."""
+    batch = campaign.batch(batch_name)
+    case_id = batch.case_id(case_index)
+    return CampaignTask(
+        batch_name=batch.batch_name,
+        batch_id=batch.batch_id,
+        case_index=case_index,
+        case_id=case_id,
+    )
+
+
+def _batch_publication_markers_complete(
+    config: config_contract.GenerationConfig,
+    *,
+    storage_root: Path | str | None,
+) -> bool:
+    """Return whether every configured case has an atomic completion marker."""
+    return all(
+        (
+            runtime_service.processed_case_directory(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            / "_SUCCESS"
+        ).is_file()
+        for case_index in config.case_indices
+    )
 
 
 def run_campaign_case(
@@ -222,7 +245,7 @@ def run_campaign_case(
         work_root=work_root,
         blocking_lock=False,
     )
-    if all(runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root) for case_index in config.case_indices):
+    if _batch_publication_markers_complete(config, storage_root=storage_root):
         runtime_service.finalize_batch(config, storage_root=storage_root)
     return outcome
 
@@ -235,15 +258,20 @@ def build_campaign_case_slurm_submission_command(
     scheduler_log_directory: Path,
     scheduler_job_name: str,
     attempt_index: int,
+    task_index: Mapping[tuple[str, int], CampaignTask] | None = None,
 ) -> list[str]:
     """Build one ordinary non-exclusive Slurm job for one exact campaign case."""
     if campaign.execution_values["cluster"]["scheduler_kind"] != "slurm":
         message = "Campaign Slurm submission requires scheduler_kind='slurm'."
         raise ValueError(message)
-    expected = require_campaign_task(
-        campaign,
-        batch_name=task.batch_name,
-        case_index=task.case_index,
+    expected = (
+        require_campaign_task(
+            campaign,
+            batch_name=task.batch_name,
+            case_index=task.case_index,
+        )
+        if task_index is None
+        else task_index.get((task.batch_id, task.case_index))
     )
     if task != expected:
         message = "Campaign submission task identity is inconsistent."

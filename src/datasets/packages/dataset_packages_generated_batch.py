@@ -122,7 +122,7 @@ def interpret_generated_case(
     if "steady_flow" not in batch.available_learning_views:
         msg = f"Batch {batch.batch_id!r} does not advertise a steady_flow view."
         raise ValueError(msg)
-    hdf5_artifact = case.artifact("processed", "case.h5")
+    hdf5_artifact = case.artifact_evidence("processed", "case.h5")
     with h5py.File(hdf5_artifact.path, "r") as handle:
         x_axis = np.asarray(_hdf5_dataset(handle, "coords/x"), dtype=np.float64)
         y_axis = np.asarray(_hdf5_dataset(handle, "coords/y"), dtype=np.float64)

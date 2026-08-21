@@ -7,8 +7,10 @@ Provides:
 - manifest: package-manifest publication and admission
 - planning: deterministic source and membership planning
 - trajectory: transient source admission and compact trajectory indexes
+- transient_shards: Dataset-bound derived PT shard publication and admission
 - DATASET_PACKAGE_SCHEMA_KIND: canonical package-manifest schema kind
 - DATASET_PACKAGE_SCHEMA_VERSION: canonical package-manifest schema version
+- DEFAULT_TRANSIENT_PT_SHARD_BYTES: default soft PT-shard packing target
 - build_dataset_package: build one declared campaign package
 - build_campaign_packages: build every declared campaign package
 - load_package_manifest: load one canonical package manifest
@@ -21,7 +23,7 @@ Provides:
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from src.datasets.dataset_packages import (
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
         inspect_dataset_package,
         load_dataset_package_manifest,
         load_package_manifest,
+        load_package_manifest_evidence,
         smoke_dataset_package,
         storage_schema_version,
     )
@@ -39,6 +42,7 @@ if TYPE_CHECKING:
     from . import dataset_packages_manifest as manifest
     from . import dataset_packages_planning as planning
     from . import dataset_packages_trajectory as trajectory
+    from . import dataset_packages_transient_shards as transient_shards
     from .dataset_packages_manifest import (
         DATASET_PACKAGE_SCHEMA_KIND,
         DATASET_PACKAGE_SCHEMA_VERSION,
@@ -50,7 +54,9 @@ _MODULES = {
     "manifest": "dataset_packages_manifest",
     "planning": "dataset_packages_planning",
     "trajectory": "dataset_packages_trajectory",
+    "transient_shards": "dataset_packages_transient_shards",
 }
+DEFAULT_TRANSIENT_PT_SHARD_BYTES: Final = int(1.5 * 1024**3)
 _FACADE_EXPORTS = frozenset(
     {
         "build_campaign_packages",
@@ -58,6 +64,7 @@ _FACADE_EXPORTS = frozenset(
         "inspect_dataset_package",
         "load_dataset_package_manifest",
         "load_package_manifest",
+        "load_package_manifest_evidence",
         "smoke_dataset_package",
         "storage_schema_version",
     }
@@ -71,6 +78,7 @@ _MANIFEST_EXPORTS = frozenset(
 __all__ = [
     "DATASET_PACKAGE_SCHEMA_KIND",
     "DATASET_PACKAGE_SCHEMA_VERSION",
+    "DEFAULT_TRANSIENT_PT_SHARD_BYTES",
     "build_campaign_packages",
     "build_dataset_package",
     "builder",
@@ -78,11 +86,13 @@ __all__ = [
     "inspect_dataset_package",
     "load_dataset_package_manifest",
     "load_package_manifest",
+    "load_package_manifest_evidence",
     "manifest",
     "planning",
     "smoke_dataset_package",
     "storage_schema_version",
     "trajectory",
+    "transient_shards",
 ]
 
 

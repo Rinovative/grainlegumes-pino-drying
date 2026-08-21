@@ -44,15 +44,27 @@ dataset_packages:
 - dataset_view: transient_drying
   evaluation_regime: id
   source_role: seen
+  training_payload:
+    backend: pt_shards
+    required: true
 - dataset_view: transient_drying
   evaluation_regime: near_family_ood
   source_role: near_family_ood
+  training_payload:
+    backend: pt_shards
+    required: true
 - dataset_view: transient_drying
   evaluation_regime: far_family_ood
   source_role: far_family_ood
+  training_payload:
+    backend: pt_shards
+    required: true
 - dataset_view: transient_drying
   evaluation_regime: extreme_family_ood
   source_role: extreme_family_ood
+  training_payload:
+    backend: pt_shards
+    required: true
 # Steady-Flow-View aus denselben transienten HDF5-Fällen
 - dataset_view: steady_flow
   evaluation_regime: id

@@ -18,6 +18,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Final
 
@@ -30,6 +31,7 @@ from . import dataset_packages_trajectory as trajectory
 
 DATASET_PACKAGE_SCHEMA_KIND: Final = "vp2_dataset_package_manifest"
 DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
+_SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 PACKAGE_PROVENANCE_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -115,8 +117,9 @@ def validate_manifest_content(
     *,
     dataset_id: str,
     payload_path: Path,
+    validate_payload_hash: bool = True,
 ) -> dict[str, Any]:
-    """Validate one current manifest against its portable identity and payload."""
+    """Validate one current manifest, optionally hashing its exact payload."""
     if not isinstance(manifest, dict) or set(manifest) != PACKAGE_MANIFEST_KEYS:
         message = f"Dataset package manifest keys do not match the current schema for {dataset_id!r}."
         raise ValueError(message)
@@ -133,10 +136,15 @@ def validate_manifest_content(
         or manifest["dataset_id"] != expected_id
         or manifest["dataset_digest"] != expected_digest
         or manifest["payload_filename"] != payload_path.name
-        or manifest["payload_sha256"] != common.serialization.file_sha256(payload_path)
+        or not isinstance(manifest["payload_sha256"], str)
+        or _SHA256_PATTERN.fullmatch(manifest["payload_sha256"]) is None
+        or not isinstance(validate_payload_hash, bool)
         or manifest["sample_count"] < 1
         or manifest["source_case_count"] < 1
     ):
+        message = f"Dataset package manifest does not bind the exact payload identity for {dataset_id!r}."
+        raise ValueError(message)
+    if validate_payload_hash and manifest["payload_sha256"] != common.serialization.file_sha256(payload_path):
         message = f"Dataset package manifest does not bind the exact payload identity for {dataset_id!r}."
         raise ValueError(message)
     return dict(manifest)
@@ -166,6 +174,37 @@ def load_package_manifest(
         message = f"Dataset package payload is missing or unsafe: {payload_path}."
         raise FileNotFoundError(message)
     return validate_manifest_content(manifest, dataset_id=logical_id, payload_path=payload_path)
+
+
+def load_package_manifest_evidence(
+    dataset_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Admit manifest identity and payload metadata without content rehashing."""
+    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
+    metadata_path = common.paths.get_dataset_metadata_root(storage_root=storage_root) / logical_id / "dataset_manifest.json"
+    if not metadata_path.is_file() or metadata_path.is_symlink():
+        message = f"Dataset package manifest is missing or unsafe: {metadata_path}."
+        raise FileNotFoundError(message)
+    try:
+        manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Dataset package manifest is unreadable: {metadata_path}."
+        raise ValueError(message) from error
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("payload_filename"), str):
+        message = f"Dataset package manifest is malformed: {metadata_path}."
+        raise TypeError(message)
+    payload_path = common.paths.get_dataset_packages_root(storage_root=storage_root) / logical_id / manifest["payload_filename"]
+    if not payload_path.is_file() or payload_path.is_symlink():
+        message = f"Dataset package payload is missing or unsafe: {payload_path}."
+        raise FileNotFoundError(message)
+    return validate_manifest_content(
+        manifest,
+        dataset_id=logical_id,
+        payload_path=payload_path,
+        validate_payload_hash=False,
+    )
 
 
 def load_steady_package_manifest(

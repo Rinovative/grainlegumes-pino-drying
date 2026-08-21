@@ -616,8 +616,12 @@ def transfer_staging_candidates(
     *,
     storage_root: Path | str,
     run_id: str | None,
+    include_sizes: bool = True,
 ) -> tuple[dict[str, Any], ...]:
     """Return only valid marked transfer staging cleanup candidates."""
+    if not isinstance(include_sizes, bool):
+        message = "include_sizes must be boolean."
+        raise TypeError(message)
     storage = resolve_storage_root(storage_root, create=False)
     root = storage / ".incoming"
     if not root.exists():
@@ -646,7 +650,7 @@ def transfer_staging_candidates(
             {
                 "path": str(directory.resolve()),
                 "run_id": marker_run_id,
-                "size_bytes": _directory_size(directory),
+                "size_bytes": _directory_size(directory) if include_sizes else None,
             }
         )
     return tuple(candidates)

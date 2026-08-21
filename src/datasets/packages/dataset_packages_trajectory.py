@@ -68,6 +68,19 @@ class TransientSourceCase:
     ood_evidence: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class TransientCaseArrays:
+    """Hold one validated case slice shared by HDF5 and derived PT storage."""
+
+    states: np.ndarray
+    static: np.ndarray
+    boundary: np.ndarray
+    scalars: np.ndarray
+    time: np.ndarray
+    exact_stop_time: float | None
+    exact_stop_state: np.ndarray | None
+
+
 def decode_json_string_list(value: Any, *, label: str) -> list[str]:
     """Decode one HDF5 JSON string-list attribute."""
     if isinstance(value, bytes):
@@ -99,6 +112,231 @@ def require_hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
         message = f"Transient HDF5 entry {name!r} must be a dataset: {handle.filename}."
         raise TransientDataContractError(message)
     return value
+
+
+def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical HDF5 interpretation
+    handle: h5py.File,
+    path: Path,
+    case: Mapping[str, Any],
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    expected_regular_horizon: float,
+    complete_case: bool = False,
+) -> TransientCaseArrays:
+    """Read and validate one case slice in the canonical Training field order."""
+    if not samples:
+        message = f"Transient materialization requires at least one indexed transition: {path}."
+        raise TransientDataContractError(message)
+    transient_dataset = require_hdf5_dataset(handle, "transient/fields")
+    static_dataset = require_hdf5_dataset(handle, "static/fields")
+    schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
+    scalar_dataset = require_hdf5_dataset(handle, "scalar/values")
+    time_dataset = require_hdf5_dataset(handle, "time")
+    transient_names = decode_json_string_list(
+        transient_dataset.attrs["field_names"],
+        label="transient.field_names",
+    )
+    static_names = decode_json_string_list(
+        static_dataset.attrs["field_names"],
+        label="static.field_names",
+    )
+    schedule_names = decode_json_string_list(
+        schedule_dataset.attrs["field_names"],
+        label="schedule.field_names",
+    )
+    scalar_names = decode_json_string_list(
+        scalar_dataset.attrs["field_names"],
+        label="scalar.field_names",
+    )
+    if transient_names != list(_SOURCE_TRANSIENT_FIELDS):
+        message = f"Transient fields are not canonical: {path}."
+        raise TransientDataContractError(message)
+    required_static = {field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning}.difference({"x", "y"})
+    if not required_static.issubset(static_names):
+        message = f"Transient static conditioning is incomplete: {path}."
+        raise TransientDataContractError(message)
+    if schedule_names != list(_SOURCE_SCHEDULE_FIELDS) or scalar_names != list(_SOURCE_SCALAR_FIELDS):
+        message = f"Transient boundary or scalar conditioning is not canonical: {path}."
+        raise TransientDataContractError(message)
+
+    regular_time = np.asarray(time_dataset, dtype=np.float64)
+    tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
+    time_unit = _text_attribute(time_dataset.attrs.get("unit"), label="time.unit")
+    observed_horizon = configured_regular_horizon(
+        handle,
+        regular_time,
+        path=path,
+        tolerance=tolerance,
+    )
+    if (
+        regular_time.shape != (case.get("sequence_length"),)
+        or not math.isclose(
+            observed_horizon,
+            expected_regular_horizon,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        )
+        or time_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit
+    ):
+        message = f"Transient source temporal identity disagrees with its index: {path}."
+        raise TransientDataContractError(message)
+    indexed_state_indices = [
+        int(samples[0]["time_index_n"]),
+        *[int(sample["time_index_n_plus_1"]) for sample in samples],
+    ]
+    indexed_time = regular_time[indexed_state_indices]
+    indexed_dt = np.diff(indexed_time)
+    if (
+        indexed_time.shape != (len(samples) + 1,)
+        or not np.isfinite(indexed_time).all()
+        or not math.isfinite(tolerance)
+        or tolerance <= 0.0
+        or not np.allclose(
+            indexed_dt,
+            transient_contract.TRANSIENT_STEP_CONTRACT.time_step,
+            rtol=0.0,
+            atol=tolerance,
+        )
+    ):
+        message = f"Transient indexed time coordinates are invalid: {path}."
+        raise TransientDataContractError(message)
+    state_indices = list(range(regular_time.size)) if complete_case else indexed_state_indices
+    time_values = regular_time if complete_case else indexed_time
+    dynamic_indices = [transient_names.index(field.name) for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state]
+    states = np.stack(
+        [
+            np.asarray(
+                transient_dataset[time_index, dynamic_indices, :, :],
+                dtype=np.float32,
+            )
+            for time_index in state_indices
+        ],
+        axis=0,
+    )
+    x_axis = np.asarray(require_hdf5_dataset(handle, "coords/x")[:], dtype=np.float32)
+    y_axis = np.asarray(require_hdf5_dataset(handle, "coords/y")[:], dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+    static_values: dict[str, np.ndarray] = {"x": x_grid, "y": y_grid}
+    for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning:
+        if field.name not in static_values:
+            static_values[field.name] = np.asarray(
+                static_dataset[static_names.index(field.name), :, :],
+                dtype=np.float32,
+            )
+    static = np.stack(
+        [static_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning],
+        axis=0,
+    )
+    scalar_lookup = {
+        field.name: float(scalar_dataset[scalar_names.index(field.name)]) for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
+    }
+    scalar_lookup["T_amb"] = float(scalar_dataset[scalar_names.index("T_amb")])
+    raw_handoff = schedule_dataset.attrs.get("boundary_handoff")
+    if isinstance(raw_handoff, bytes):
+        raw_handoff = raw_handoff.decode("utf-8")
+    if not isinstance(raw_handoff, str):
+        message = f"Transient source lacks boundary-handoff metadata: {path}."
+        raise TransientDataContractError(message)
+    try:
+        boundary_handoff = json.loads(raw_handoff)
+    except json.JSONDecodeError as error:
+        message = f"Transient source boundary-handoff metadata is invalid: {path}."
+        raise TransientDataContractError(message) from error
+    startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
+    if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
+        message = f"Transient source startup-handoff metadata is invalid: {path}."
+        raise TransientDataContractError(message)
+    startup_time = startup.get("duration_h")
+    if isinstance(startup_time, bool) or not isinstance(startup_time, (int, float)) or not math.isfinite(float(startup_time)):
+        message = f"Transient source startup duration is invalid: {path}."
+        raise TransientDataContractError(message)
+    startup_time_value = float(startup_time)
+    boundary_rows: list[list[float]] = []
+    for sample in samples:
+        schedule_n = int(sample["schedule_index_n"])
+        schedule_n_plus_1 = int(sample["schedule_index_n_plus_1"])
+        raw_support_index = sample["schedule_support_index"]
+        schedule_time_n = float(schedule_dataset[schedule_n, schedule_names.index("t")])
+        schedule_time_n_plus_1 = float(schedule_dataset[schedule_n_plus_1, schedule_names.index("t")])
+        support_required = bool(startup["enabled"] and schedule_time_n < startup_time_value < schedule_time_n_plus_1)
+        if support_required != (raw_support_index is not None):
+            message = f"Transient index startup support disagrees with source handoff: {path}."
+            raise TransientDataContractError(message)
+        support_index = schedule_n if raw_support_index is None else int(raw_support_index)
+        if raw_support_index is not None and not math.isclose(
+            float(schedule_dataset[support_index, schedule_names.index("t")]),
+            startup_time_value,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            message = f"Transient index startup support points to the wrong source row: {path}."
+            raise TransientDataContractError(message)
+        support_time_offset = (
+            0.0
+            if raw_support_index is None
+            else float(schedule_dataset[support_index, schedule_names.index("t")]) - float(schedule_dataset[schedule_n, schedule_names.index("t")])
+        )
+        boundary_values = {
+            "T_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("T_in_bc")]),
+            "T_in_bc_t_n_plus_1": float(schedule_dataset[schedule_n_plus_1, schedule_names.index("T_in_bc")]),
+            "omega_in_bc_t_n": float(schedule_dataset[schedule_n, schedule_names.index("omega_in_bc")]),
+            "omega_in_bc_t_n_plus_1": float(
+                schedule_dataset[
+                    schedule_n_plus_1,
+                    schedule_names.index("omega_in_bc"),
+                ]
+            ),
+            "T_amb": scalar_lookup["T_amb"],
+            "startup_support_time_offset": support_time_offset,
+            "T_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("T_in_bc")]),
+            "omega_in_bc_startup_support": float(schedule_dataset[support_index, schedule_names.index("omega_in_bc")]),
+            "startup_support_present": float(raw_support_index is not None),
+        }
+        boundary_rows.append([boundary_values[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning])
+    boundary = np.asarray(boundary_rows, dtype=np.float32)
+    scalars = np.asarray(
+        [scalar_lookup[field.name] for field in transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning],
+        dtype=np.float32,
+    )
+    exact_stop_time: float | None = None
+    exact_stop_state: np.ndarray | None = None
+    if case.get("irregular_stop_time") is not None:
+        exact_time_dataset = require_hdf5_dataset(handle, "exact_stop/time")
+        exact_fields_dataset = require_hdf5_dataset(handle, "exact_stop/fields")
+        exact_time_values = np.asarray(exact_time_dataset, dtype=np.float64)
+        exact_names = decode_json_string_list(
+            exact_fields_dataset.attrs["field_names"],
+            label="exact_stop.field_names",
+        )
+        if exact_time_values.shape != (1,) or exact_names != transient_names:
+            message = f"Transient exact-stop diagnostic shape or field order is invalid: {path}."
+            raise TransientDataContractError(message)
+        exact_stop_time = float(exact_time_values[0])
+        if not math.isclose(
+            exact_stop_time,
+            float(case["irregular_stop_time"]),
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            message = f"Transient exact-stop diagnostic disagrees with its index: {path}."
+            raise TransientDataContractError(message)
+        exact_stop_state = np.asarray(
+            exact_fields_dataset[dynamic_indices, :, :],
+            dtype=np.float32,
+        )
+    arrays = (states, static, boundary, scalars)
+    if any(not np.isfinite(array).all() for array in arrays) or (exact_stop_state is not None and not np.isfinite(exact_stop_state).all()):
+        message = f"Transient materialized Training fields contain non-finite values: {path}."
+        raise TransientDataContractError(message)
+    return TransientCaseArrays(
+        states=np.ascontiguousarray(states),
+        static=np.ascontiguousarray(static),
+        boundary=np.ascontiguousarray(boundary),
+        scalars=np.ascontiguousarray(scalars),
+        time=np.ascontiguousarray(time_values),
+        exact_stop_time=exact_stop_time,
+        exact_stop_state=(None if exact_stop_state is None else np.ascontiguousarray(exact_stop_state)),
+    )
 
 
 def _scientific_config(

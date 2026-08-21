@@ -539,28 +539,35 @@ class TerminalCaseEvidence:
             "case_hdf5_sha256": self.case_hdf5_sha256,
         }
 
-    def artifact(self, stage: str, relative_path: str) -> ArtifactEvidence:
-        """Return one admitted artifact by publication stage and relative path."""
+    def artifact_evidence(
+        self,
+        stage: str,
+        relative_path: str,
+    ) -> ArtifactEvidence:
+        """Return identity-bound artifact evidence with cheap size admission."""
         if stage == "raw":
             artifacts = self.raw_artifacts
         elif stage == "processed":
             artifacts = self.processed_artifacts
         else:
-            msg = f"Unsupported terminal publication stage: {stage!r}."
-            raise ValueError(msg)
+            message = f"Unsupported terminal publication stage: {stage!r}."
+            raise ValueError(message)
         matches = tuple(item for item in artifacts if item.relative_path == relative_path)
         if len(matches) != 1:
-            msg = f"Terminal case {self.case_id!r} has no unique {stage} artifact {relative_path!r}."
-            raise ValueError(msg)
+            message = f"Terminal case {self.case_id!r} has no unique {stage} artifact {relative_path!r}."
+            raise ValueError(message)
         artifact = matches[0]
-        if (
-            not artifact.path.is_file()
-            or artifact.path.is_symlink()
-            or artifact.path.stat().st_size != artifact.size_bytes
-            or common.serialization.file_sha256(artifact.path) != artifact.sha256
-        ):
-            msg = f"Admitted terminal artifact changed after admission: {artifact.path}"
-            raise RuntimeError(msg)
+        if not artifact.path.is_file() or artifact.path.is_symlink() or artifact.path.stat().st_size != artifact.size_bytes:
+            message = f"Admitted terminal artifact is missing, unsafe, or changed size: {artifact.path}"
+            raise RuntimeError(message)
+        return artifact
+
+    def artifact(self, stage: str, relative_path: str) -> ArtifactEvidence:
+        """Fully rehash and return one admitted artifact."""
+        artifact = self.artifact_evidence(stage, relative_path)
+        if common.serialization.file_sha256(artifact.path) != artifact.sha256:
+            message = f"Admitted terminal artifact changed after admission: {artifact.path}"
+            raise RuntimeError(message)
         return artifact
 
 
@@ -1984,8 +1991,13 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     )
 
 
-def _artifact_map(directory: Path) -> dict[str, dict[str, Any]]:
-    """Return exact-byte identities for all staged payload artifacts."""
+def _artifact_map(
+    directory: Path,
+    *,
+    expected_sha256: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return exact-byte identities and verify declared copied artifacts once."""
+    expected = {} if expected_sha256 is None else dict(expected_sha256)
     artifacts: dict[str, dict[str, Any]] = {}
     for path in sorted(directory.rglob("*")):
         if path.is_symlink():
@@ -1993,10 +2005,20 @@ def _artifact_map(directory: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(msg)
         if not path.is_file() or path.name in {"provenance.json", "_SUCCESS"}:
             continue
-        artifacts[path.relative_to(directory).as_posix()] = {
-            "sha256": common.serialization.file_sha256(path),
+        relative = path.relative_to(directory).as_posix()
+        digest = common.serialization.file_sha256(path)
+        expected_digest = expected.get(relative)
+        if expected_digest is not None and digest != expected_digest:
+            msg = f"Copied artifact digest changed during publication: {path}"
+            raise RuntimeError(msg)
+        artifacts[relative] = {
+            "sha256": digest,
             "size_bytes": path.stat().st_size,
         }
+    missing = set(expected) - set(artifacts)
+    if missing:
+        msg = f"Expected copied artifacts are missing during publication: {sorted(missing)}"
+        raise FileNotFoundError(msg)
     return artifacts
 
 
@@ -2007,9 +2029,13 @@ def _complete_stage(
     case_payload: dict[str, Any],
     input_generation_id: str,
     stage: str,
+    expected_artifact_sha256: Mapping[str, str] | None = None,
 ) -> None:
     """Write digest-bound publication provenance and final success evidence."""
-    artifacts = _artifact_map(directory)
+    artifacts = _artifact_map(
+        directory,
+        expected_sha256=expected_artifact_sha256,
+    )
     provenance = {
         "schema_kind": "simulation_case_publication",
         "schema_version": PUBLICATION_SCHEMA_VERSION,
@@ -2045,33 +2071,73 @@ def _complete_stage(
     common.serialization.atomic_write_json(directory / "_SUCCESS", success)
 
 
+def _stable_timing_byte_accounting(
+    timing: Mapping[str, Any],
+    *,
+    fixed_payload_bytes: int,
+) -> dict[str, Any]:
+    """Resolve timing.json's self-referential size without filesystem churn."""
+    resolved = dict(timing)
+    for _ in range(8):
+        serialized = json.dumps(
+            resolved,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        persistent_bytes = fixed_payload_bytes + len(f"{serialized}\n".encode())
+        if resolved["persistent_case_bytes"] == persistent_bytes and resolved["bytes_hashed_during_publication"] == persistent_bytes:
+            return resolved
+        resolved["persistent_case_bytes"] = persistent_bytes
+        resolved["bytes_hashed_during_publication"] = persistent_bytes
+    message = "Case timing byte accounting did not reach a deterministic fixed point."
+    raise RuntimeError(message)
+
+
 def _stage_processed_case(config: config_contract.GenerationConfig, result: ExecutionResult, destination: Path) -> None:
     """Stage one retention-exact canonical post-COMSOL payload with I/O evidence."""
     publication_start = time.monotonic()
     destination.mkdir(parents=True)
     copied_bytes = 0
+    fixed_payload_bytes = 0
     retained_export_bytes = 0
+    expected_artifact_sha256: dict[str, str] = {}
     if config.execution_values["retention_policy"] == "full":
         export_root = destination / "comsol_exports"
         for export in result.exports:
             target = export_root / export.relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(export.source_path, target)
-            copied_bytes += export.size_bytes
-            retained_export_bytes += export.size_bytes
-            if common.serialization.file_sha256(target) != export.sha256:
-                msg = f"COMSOL export digest changed during publication: {target}"
+            observed_size = target.stat().st_size
+            if observed_size != export.size_bytes:
+                msg = f"COMSOL export size changed during publication: {target}"
                 raise RuntimeError(msg)
+            copied_bytes += export.size_bytes
+            fixed_payload_bytes += observed_size
+            retained_export_bytes += export.size_bytes
+            relative = target.relative_to(destination).as_posix()
+            if relative in expected_artifact_sha256:
+                msg = f"COMSOL export destination is duplicated during publication: {relative}"
+                raise RuntimeError(msg)
+            expected_artifact_sha256[relative] = export.sha256
+    timing_path = destination / "timing.json"
     copied_sources = (
         (result.canonical_case.path, destination / "case.h5"),
         (result.solver_log, destination / "solver.log"),
-        (result.prepared.runtime_directory / "timing.json", destination / "timing.json"),
+        (result.prepared.runtime_directory / "timing.json", timing_path),
         (result.execution_provenance, destination / "execution_provenance.json"),
         (result.processing_provenance, destination / "processing_provenance.json"),
     )
     for source, target in copied_sources:
+        source_bytes = source.stat().st_size
         shutil.copy2(source, target)
-        copied_bytes += source.stat().st_size
+        observed_size = target.stat().st_size
+        if observed_size != source_bytes:
+            message = f"Copied case artifact size changed during publication: {target}"
+            raise RuntimeError(message)
+        copied_bytes += source_bytes
+        if target != timing_path:
+            fixed_payload_bytes += observed_size
     status = _load_json_object(
         result.canonical_case.status_path,
         label="converted case status",
@@ -2082,26 +2148,30 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         raise ValueError(message)
     stages["publication"] = "succeeded"
     status_path = common.serialization.atomic_write_json(destination / "status.json", status)
+    fixed_payload_bytes += status_path.stat().st_size
     retained_model_bytes = 0
     if config.execution_values["retention_policy"] == "full":
         if result.solved_model is None:
             message = "Full retention completed without an admitted solved model."
             raise FileNotFoundError(message)
         retained_model_bytes = result.solved_model.stat().st_size
-        shutil.copy2(
-            result.solved_model,
-            destination / comsol_service.RETAINED_MODEL_FILENAME,
-        )
+        retained_model_path = destination / comsol_service.RETAINED_MODEL_FILENAME
+        shutil.copy2(result.solved_model, retained_model_path)
+        observed_size = retained_model_path.stat().st_size
+        if observed_size != retained_model_bytes:
+            message = f"Solved model size changed during publication: {retained_model_path}"
+            raise RuntimeError(message)
         copied_bytes += retained_model_bytes
+        fixed_payload_bytes += observed_size
     validation_start = time.monotonic()
     storage_service.validate_case_hdf5(
         destination / "case.h5",
         expected_profile=config.profile.id,
     )
     post_validation_seconds = time.monotonic() - validation_start
-    timing = dict(result.timing)
-    timing.update(
+    timing = _stable_timing_byte_accounting(
         {
+            **result.timing,
             "publication_seconds": time.monotonic() - publication_start,
             "post_publication_validation_seconds": post_validation_seconds,
             "persistent_case_bytes": 0,
@@ -2111,19 +2181,12 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
             "bytes_hashed_during_publication": 0,
             "bytes_hashed_during_post_publication_validation": 0,
             "bytes_copied_during_publication": copied_bytes,
-        }
+        },
+        fixed_payload_bytes=fixed_payload_bytes,
     )
-    timing_path = destination / "timing.json"
-    for _ in range(8):
-        common.serialization.atomic_write_json(timing_path, timing)
-        persistent_bytes = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file() and not path.is_symlink())
-        hashed_bytes = persistent_bytes + retained_export_bytes
-        if timing["persistent_case_bytes"] == persistent_bytes and timing["bytes_hashed_during_publication"] == hashed_bytes:
-            break
-        timing["persistent_case_bytes"] = persistent_bytes
-        timing["bytes_hashed_during_publication"] = hashed_bytes
-    else:
-        message = f"Case timing byte accounting did not stabilize: {timing_path}"
+    common.serialization.atomic_write_json(timing_path, timing)
+    if fixed_payload_bytes + timing_path.stat().st_size != timing["persistent_case_bytes"]:
+        message = f"Case timing byte accounting changed during publication: {timing_path}"
         raise RuntimeError(message)
     _complete_stage(
         destination,
@@ -2131,6 +2194,7 @@ def _stage_processed_case(config: config_contract.GenerationConfig, result: Exec
         case_payload=result.prepared.bundle.case_payload,
         input_generation_id=result.prepared.input_generation_id,
         stage="processed",
+        expected_artifact_sha256=expected_artifact_sha256,
     )
     if not status_path.is_file():
         message = f"Case status disappeared during staging: {status_path}"
@@ -2491,8 +2555,70 @@ def _hdf5_evidence(identity: Mapping[str, Any]) -> HDF5IdentityEvidence:
     )
 
 
-def _admit_raw_publication_directory(directory: Path) -> _PublicationEvidence:
-    """Admit one exact canonical raw case solely through its input manifest."""
+def _raw_publication_from_reference(
+    reference: admission_service.InputCaseReference,
+) -> _PublicationEvidence:
+    """Build raw publication evidence from one batch-admitted case reference."""
+    directory = reference.case_directory.resolve()
+    case_path = directory / "case.json"
+    if (
+        not case_path.is_file()
+        or case_path.is_symlink()
+        or case_path.stat().st_size != reference.case_json_size_bytes
+        or common.serialization.file_sha256(case_path) != reference.case_json_sha256
+    ):
+        message = f"Batch-admitted raw case definition is missing, unsafe, or changed: {case_path}"
+        raise RuntimeError(message)
+    case_payload = reference.case_payload()
+    case_service.validate_case_payload_schema(case_payload)
+    expected = {
+        "case_id": reference.case_id,
+        "case_index": reference.case_index,
+        "case_input_id": reference.case_input_id,
+        "simulation_case_id": reference.simulation_case_id,
+        "batch_id": reference.batch_id,
+        "batch_identity": reference.batch_identity,
+        "simulation_profile": reference.profile_id,
+        "material_family": reference.material_family,
+        "sampling_regime": reference.sampling_regime,
+    }
+    if any(case_payload.get(key) != value for key, value in expected.items()):
+        message = f"Batch-admitted raw reference disagrees with canonical case evidence: {directory}"
+        raise RuntimeError(message)
+    raw_artifacts = [
+        ArtifactEvidence(
+            relative_path="case.json",
+            path=case_path.resolve(),
+            sha256=reference.case_json_sha256,
+            size_bytes=reference.case_json_size_bytes,
+        )
+    ]
+    for filename, identity in sorted(case_payload["input_files"].items()):
+        input_path = reference.input_directory / filename
+        raw_artifacts.append(
+            ArtifactEvidence(
+                relative_path=f"inputs/{filename}",
+                path=input_path.resolve(),
+                sha256=str(identity["sha256"]),
+                size_bytes=int(identity["size_bytes"]),
+            )
+        )
+    return _PublicationEvidence(
+        directory,
+        "raw",
+        case_payload,
+        {},
+        tuple(raw_artifacts),
+        None,
+    )
+
+
+def _admit_raw_publication_directory(
+    directory: Path,
+    *,
+    validation_depth: ValidationDepth,
+) -> _PublicationEvidence:
+    """Admit one raw case through its authoritative immutable batch evidence."""
     if directory.parent.parent.name != "input_generations":
         message = f"Canonical raw case is not scoped by input-generation identity: {directory}"
         raise RuntimeError(message)
@@ -2510,40 +2636,13 @@ def _admit_raw_publication_directory(directory: Path) -> _PublicationEvidence:
         metadata_directory,
         raw_directory=directory.parent,
         expected_input_generation_id=input_generation_id,
+        validation_depth=("evidence" if validation_depth == "routine" else "full"),
     )
     matches = tuple(reference for reference in source.cases if reference.case_id == directory.name)
     if len(matches) != 1:
         message = f"Input manifest does not declare exactly one raw case {directory.name!r}."
         raise RuntimeError(message)
-    reference = matches[0]
-    case_payload = _load_json_object(reference.case_directory / "case.json", label="canonical raw case definition")
-    case_service.validate_case_payload_schema(case_payload)
-    raw_artifacts = [
-        ArtifactEvidence(
-            relative_path="case.json",
-            path=(reference.case_directory / "case.json").resolve(),
-            sha256=_safe_file_sha256(reference.case_directory / "case.json", label="canonical raw case definition"),
-            size_bytes=(reference.case_directory / "case.json").stat().st_size,
-        )
-    ]
-    for filename, identity in sorted(case_payload["input_files"].items()):
-        input_path = reference.input_directory / filename
-        raw_artifacts.append(
-            ArtifactEvidence(
-                relative_path=f"inputs/{filename}",
-                path=input_path.resolve(),
-                sha256=str(identity["sha256"]),
-                size_bytes=int(identity["size_bytes"]),
-            )
-        )
-    return _PublicationEvidence(
-        directory.resolve(),
-        "raw",
-        case_payload,
-        {},
-        tuple(raw_artifacts),
-        None,
-    )
+    return _raw_publication_from_reference(matches[0])
 
 
 def _require_processed_publication_layout(
@@ -2577,6 +2676,9 @@ def _require_processed_publication_layout(
 def _admit_processed_raw_publication(
     directory: Path,
     provenance: Mapping[str, Any],
+    *,
+    raw_evidence: _PublicationEvidence | None,
+    validation_depth: ValidationDepth,
 ) -> tuple[str, _PublicationEvidence]:
     """Resolve and admit the exact raw input named by processed evidence."""
     if (
@@ -2591,7 +2693,15 @@ def _admit_processed_raw_publication(
         label="input_generation_id",
     )
     raw_case = directory.parents[2] / "raw" / directory.parent.name / "input_generations" / input_generation_id / directory.name
-    return input_generation_id, _admit_raw_publication_directory(raw_case)
+    if raw_evidence is not None:
+        if raw_evidence.stage != "raw" or raw_evidence.directory != raw_case.resolve():
+            message = f"Processed publication raw evidence is bound to another case: {directory}"
+            raise RuntimeError(message)
+        return input_generation_id, raw_evidence
+    return input_generation_id, _admit_raw_publication_directory(
+        raw_case,
+        validation_depth=validation_depth,
+    )
 
 
 def _require_validation_depth(value: ValidationDepth) -> ValidationDepth:
@@ -2602,11 +2712,28 @@ def _require_validation_depth(value: ValidationDepth) -> ValidationDepth:
     return value
 
 
+def _admit_raw_publication(
+    directory: Path,
+    *,
+    validation_depth: ValidationDepth,
+    prior_evidence: _PublicationEvidence | None,
+) -> _PublicationEvidence:
+    """Dispatch raw admission while rejecting an ambiguous prior binding."""
+    if prior_evidence is not None:
+        message = "Raw publication admission cannot receive prior raw evidence."
+        raise TypeError(message)
+    return _admit_raw_publication_directory(
+        directory,
+        validation_depth=validation_depth,
+    )
+
+
 def _admit_publication_directory(
     directory: Path,
     *,
     stage: str,
     validation_depth: ValidationDepth = "full",
+    raw_evidence: _PublicationEvidence | None = None,
 ) -> _PublicationEvidence:
     """Admit one publication at an explicit integrity-validation depth."""
     validation_depth = _require_validation_depth(validation_depth)
@@ -2617,16 +2744,22 @@ def _admit_publication_directory(
         msg = f"Case publication directory is missing or unsafe: {directory}"
         raise FileNotFoundError(msg)
     if stage == "raw":
-        return _admit_raw_publication_directory(directory)
+        return _admit_raw_publication(
+            directory,
+            validation_depth=validation_depth,
+            prior_evidence=raw_evidence,
+        )
     success_path = directory / "_SUCCESS"
     provenance_path = directory / "provenance.json"
     success = _load_json_object(success_path, label=f"{stage} case success marker")
     provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
-    input_generation_id, raw_evidence = _admit_processed_raw_publication(
+    input_generation_id, admitted_raw = _admit_processed_raw_publication(
         directory,
         provenance,
+        raw_evidence=raw_evidence,
+        validation_depth=validation_depth,
     )
-    case_payload = raw_evidence.case_payload
+    case_payload = admitted_raw.case_payload
     try:
         case_service.validate_case_payload_schema(case_payload)
     except (KeyError, TypeError, ValueError) as error:
@@ -2900,12 +3033,15 @@ def validate_completed_case(
     *,
     storage_root: Path | str | None = None,
     validation_depth: ValidationDepth = "full",
+    input_reference: admission_service.InputCaseReference | None = None,
 ) -> dict[str, Any]:
     """Validate one completed case at an explicit integrity depth."""
+    raw_evidence = None if input_reference is None else _raw_publication_from_reference(input_reference)
     processed = _admit_publication_directory(
         processed_case_directory(config, case_index, storage_root=storage_root),
         stage="processed",
         validation_depth=validation_depth,
+        raw_evidence=raw_evidence,
     )
     _require_publication_matches_config(
         processed,
@@ -2931,7 +3067,12 @@ def _retained_export_hdf5_repair_evidence(
     provenance_path = processed / "provenance.json"
     success = _load_json_object(success_path, label="completed case success marker")
     provenance = _load_json_object(provenance_path, label="completed case publication provenance")
-    input_generation_id, raw_evidence = _admit_processed_raw_publication(processed, provenance)
+    input_generation_id, raw_evidence = _admit_processed_raw_publication(
+        processed,
+        provenance,
+        raw_evidence=None,
+        validation_depth="full",
+    )
     case_payload = raw_evidence.case_payload
     _require_case_payload_matches_config(
         case_payload,
@@ -3319,22 +3460,38 @@ def completed_case_is_valid(
     case_index: int,
     *,
     storage_root: Path | str | None = None,
+    input_reference: admission_service.InputCaseReference | None = None,
 ) -> bool:
     """Return false only when processed completion is absent; corruption fails closed."""
     raw = raw_case_directory(config, case_index, storage_root=storage_root)
     processed = processed_case_directory(config, case_index, storage_root=storage_root)
     if not (processed / "_SUCCESS").exists():
         if raw.exists():
-            _require_publication_matches_config(_admit_publication_directory(raw, stage="raw"), config=config, case_index=case_index)
+            reference = input_reference or input_service.admit_configured_input_case(
+                config,
+                case_index,
+                storage_root=storage_root,
+            )
+            _require_publication_matches_config(
+                _raw_publication_from_reference(reference),
+                config=config,
+                case_index=case_index,
+            )
         return False
     if not raw.exists():
         message = f"Processed completion exists without canonical raw inputs: {processed}"
         raise RuntimeError(message)
+    reference = input_reference or input_service.admit_configured_input_case(
+        config,
+        case_index,
+        storage_root=storage_root,
+    )
     validate_completed_case(
         config,
         case_index,
         storage_root=storage_root,
         validation_depth="routine",
+        input_reference=reference,
     )
     return True
 
@@ -4256,12 +4413,18 @@ def finalize_batch(
     records: list[dict[str, Any]] = []
     git_commits: set[str] = set()
     input_generation_ids: set[str] = set()
+    input_references = input_service.admit_configured_input_references(
+        config,
+        storage_root=storage_root,
+        validation_depth="evidence",
+    )
     for case_index in config.case_indices:
         provenance = validate_completed_case(
             config,
             case_index,
             storage_root=storage_root,
             validation_depth="routine",
+            input_reference=input_references[case_index],
         )
         git_commits.add(source_service.validate_git_commit(provenance.get("git_commit")))
         input_generation_ids.add(
@@ -4336,7 +4499,11 @@ def finalize_batch(
             raise RuntimeError(msg)
     else:
         common.serialization.atomic_write_json(success_path, success)
-    validate_terminal_batch(config, storage_root=storage_root)
+    validate_terminal_batch(
+        config,
+        storage_root=storage_root,
+        input_references=input_references,
+    )
     return manifest_path
 
 
@@ -4445,11 +4612,69 @@ def _require_case_matches_terminal(
         raise RuntimeError(msg)
 
 
+def _admit_terminal_case_publications(
+    reference: admission_service.InputCaseReference,
+    *,
+    processed_directory: Path,
+    validation_depth: ValidationDepth,
+) -> tuple[_PublicationEvidence, _PublicationEvidence]:
+    """Reuse one admitted raw case while validating its processed publication."""
+    raw = _raw_publication_from_reference(reference)
+    processed = _admit_publication_directory(
+        processed_directory,
+        stage="processed",
+        validation_depth=validation_depth,
+        raw_evidence=raw,
+    )
+    return raw, processed
+
+
+def _terminal_input_references(
+    *,
+    storage_root: Path | str | None,
+    batch_storage_name: str,
+    input_generation_id: str,
+    raw_root: Path,
+    case_ids: tuple[str, ...],
+    validation_depth: ValidationDepth,
+    manifest_path: Path,
+    input_references: Mapping[int, admission_service.InputCaseReference] | None,
+) -> dict[str, admission_service.InputCaseReference]:
+    """Admit or reuse one exact batch input-reference index."""
+    if input_references is None:
+        metadata_directory = (
+            common.paths.get_generation_meta_root(storage_root=storage_root) / batch_storage_name / "input_generations" / input_generation_id
+        )
+        source = admission_service.admit_input_batch_source(
+            metadata_directory,
+            raw_directory=raw_root,
+            expected_input_generation_id=input_generation_id,
+            validation_depth=("evidence" if validation_depth == "routine" else "full"),
+        )
+        candidates = source.cases
+    else:
+        candidates = tuple(input_references.values())
+    references = {reference.case_id: reference for reference in candidates}
+    expected_root = raw_root.resolve()
+    invalid = any(
+        reference.source_kind != "input_generated"
+        or reference.source_id != input_generation_id
+        or reference.batch_storage_name != batch_storage_name
+        or reference.case_directory.parent.resolve() != expected_root
+        for reference in references.values()
+    )
+    if invalid or set(references) != set(case_ids) or len(references) != len(candidates):
+        message = f"Terminal batch input evidence does not cover exact membership: {manifest_path}"
+        raise RuntimeError(message)
+    return references
+
+
 def admit_terminal_batch(
     batch_storage_name: str,
     *,
     storage_root: Path | str | None = None,
     validation_depth: ValidationDepth = "full",
+    input_references: Mapping[int, admission_service.InputCaseReference] | None = None,
 ) -> TerminalBatchEvidence:
     """
     Admit one terminal batch without requiring its authored configuration.
@@ -4462,6 +4687,8 @@ def admit_terminal_batch(
         Storage root containing the Generation publication.
     validation_depth : {"routine", "full", "deep"}, optional
         Integrity depth; full and deep rehash every retained artifact.
+    input_references : Mapping[int, InputCaseReference] | None, optional
+        Exact operation-local raw-input evidence already admitted by the caller.
 
     Returns
     -------
@@ -4631,8 +4858,23 @@ def admit_terminal_batch(
         case_ids,
         storage_root=storage_root,
     )
+    references = _terminal_input_references(
+        storage_root=storage_root,
+        batch_storage_name=safe_storage_name,
+        input_generation_id=input_generation_id,
+        raw_root=raw_root,
+        case_ids=case_ids,
+        validation_depth=validation_depth,
+        manifest_path=manifest_path,
+        input_references=input_references,
+    )
     admitted_cases: list[TerminalCaseEvidence] = []
-    for expected_index, expected_case_id, raw_record in zip(indices, case_ids, records, strict=True):
+    for expected_index, expected_case_id, raw_record in zip(
+        indices,
+        case_ids,
+        records,
+        strict=True,
+    ):
         if (
             not isinstance(raw_record, dict)
             or set(raw_record) != _CASE_RECORD_KEYS
@@ -4651,14 +4893,9 @@ def admit_terminal_batch(
             "case_hdf5_sha256",
         ):
             _require_sha256(record.get(key), label=f"{expected_case_id}.{key}")
-        raw = _admit_publication_directory(
-            raw_root / expected_case_id,
-            stage="raw",
-            validation_depth=validation_depth,
-        )
-        processed = _admit_publication_directory(
-            processed_root / expected_case_id,
-            stage="processed",
+        raw, processed = _admit_terminal_case_publications(
+            references[expected_case_id],
+            processed_directory=processed_root / expected_case_id,
             validation_depth=validation_depth,
         )
         if raw.case_payload != processed.case_payload:
@@ -4750,12 +4987,14 @@ def validate_terminal_batch(
     *,
     storage_root: Path | str | None = None,
     validation_depth: ValidationDepth = "full",
+    input_references: Mapping[int, admission_service.InputCaseReference] | None = None,
 ) -> dict[str, Any]:
     """Admit a terminal batch and require exact authored-config agreement."""
     evidence = admit_terminal_batch(
         config.batch_storage_name,
         storage_root=storage_root,
         validation_depth=validation_depth,
+        input_references=input_references,
     )
     expected = {
         "simulation_profile": config.profile.id,

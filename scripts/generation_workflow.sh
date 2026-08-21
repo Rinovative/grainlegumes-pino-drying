@@ -34,6 +34,7 @@ ALL_WORKFLOW_ACTIVE=false
 ALL_STAGE="not_started"
 RUN_ID=""
 CPU_BYTES_RETAINED=0
+CPU_BYTES_RETAINED_EXACT=false
 CPU_BYTES_RECLAIMED=0
 CPU_CLEANUP_RECEIPT_SHA=""
 PILOT_MODE=false
@@ -59,6 +60,10 @@ CONSOLE_HEARTBEAT_SECONDS="${GENERATION_CONSOLE_HEARTBEAT_SECONDS:-120}"
 COMPOSITE_CHILD_MODE=false
 CAMPAIGN_PARTIAL=false
 PAIRED_SMOKE_RECEIPT=""
+LOCAL_STORAGE_ROOT=""
+LOCAL_PYTHON_READY=false
+CONFIGURED_UNIFORM_CASE_COUNT=""
+CONFIGURED_TOTAL_CASE_COUNT=""
 
 usage() {
   cat >&2 <<EOF
@@ -910,12 +915,19 @@ print("\t".join(("workflow", *(str(item) for item in fields))))')" ||
 
 resolve_configured_resources() {
   resolve_local_python
+  local validation_mode="${1:-inspect}"
+  local -a validation_arguments=(validate-config "${CAMPAIGN_CONFIG_PATH}")
+  case "${validation_mode}" in
+    executable) ;;
+    inspect) validation_arguments+=(--allow-incomplete) ;;
+    *) fail 2 "Unsupported campaign configuration resolution mode: ${validation_mode}" ;;
+  esac
   local record kind configured_cores_per_case configured_wall_time
   local configured_cores_per_node configured_max_admission_cases configured_poll_interval
   local configured_max_running configured_cpu_host configured_scheduler
   local configured_partition configured_python_module configured_comsol_module
   local configured_python_executable configured_comsol_executable extra
-  record="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
+  record="$(local_cli "${validation_arguments[@]}" |
     local_python -c 'import json, sys
 value = json.load(sys.stdin)
 resources = value["execution_resources"]
@@ -924,6 +936,8 @@ submission = resources["submission"]
 site = resources["site"]
 wall = cluster.get("wall_time")
 max_running = submission.get("max_running_cases")
+counts = tuple(value["counts"].values())
+uniform_count = counts[0] if counts and len(set(counts)) == 1 else "-"
 fields = (
     value["campaign_purpose"], cluster["cores_per_case"],
     "-" if wall is None else wall, cluster["cores_per_node"],
@@ -932,6 +946,7 @@ fields = (
     site["cpu_host"], site["scheduler"], site["partition"],
     site["python_module"], site["comsol_module"],
     site["python_executable"], site["comsol_executable"],
+    uniform_count, sum(counts),
 )
 if any("\t" in str(item) or "\n" in str(item) or "\r" in str(item) for item in fields):
     raise SystemExit("execution configuration contains unsafe shell transport text")
@@ -942,13 +957,15 @@ print("\t".join(("execution", *(str(item) for item in fields))))')" ||
     configured_poll_interval configured_max_running configured_cpu_host \
     configured_scheduler configured_partition configured_python_module \
     configured_comsol_module configured_python_executable \
-    configured_comsol_executable extra <<< "${record}"
+    configured_comsol_executable CONFIGURED_UNIFORM_CASE_COUNT \
+    CONFIGURED_TOTAL_CASE_COUNT extra <<< "${record}"
   [[ "${kind}" == execution && -z "${extra:-}" ]] ||
     fail 1 "Malformed configured execution record."
   validate_positive "configured cores_per_case" "${configured_cores_per_case}"
   validate_positive "configured cores_per_node" "${configured_cores_per_node}"
   validate_positive "configured max_admission_cases" "${configured_max_admission_cases}"
   validate_positive "configured poll_interval_seconds" "${configured_poll_interval}"
+  validate_nonnegative "configured total case count" "${CONFIGURED_TOTAL_CASE_COUNT}"
   [[ "${configured_max_running}" == - ]] ||
     validate_positive "configured max_running_cases" "${configured_max_running}"
   [[ "${configured_wall_time}" != - ]] || configured_wall_time=""
@@ -986,22 +1003,13 @@ resolve_campaign() {
 }
 
 resolve_pilot_contract() {
-  resolve_local_python
-  local record kind purpose configured_count configured_total extra
-  record="$(local_cli validate-config "${CAMPAIGN_CONFIG_PATH}" --allow-incomplete |
-    local_python -c 'import json, sys
-value = json.load(sys.stdin)
-counts = tuple(value["counts"].values())
-if not counts or len(set(counts)) != 1:
-    raise SystemExit("pilot campaign must have one uniform cases-per-material count")
-print("\t".join(("pilot", str(value["campaign_purpose"]), str(counts[0]), str(sum(counts)))))')" ||
-    fail 2 "Could not resolve the dedicated pilot-check campaign contract."
-  IFS=$'\t' read -r kind purpose configured_count configured_total extra <<< "${record}"
-  [[ "${kind}" == pilot && "${purpose}" == pilot_check && -z "${extra:-}" ]] ||
-    fail 2 "pilot-check requires a dedicated campaign with campaign_purpose: pilot_check."
-  validate_positive "configured pilot cases per material" "${configured_count}"
-  validate_positive "configured pilot total" "${configured_total}"
-  (( configured_total % configured_count == 0 )) ||
+  [[ "${CAMPAIGN_PURPOSE}" == pilot_check \
+    && "${CONFIGURED_UNIFORM_CASE_COUNT}" != - \
+    && -n "${CONFIGURED_UNIFORM_CASE_COUNT}" ]] ||
+    fail 2 "pilot-check requires a dedicated campaign with uniform cases per material."
+  validate_positive "configured pilot cases per material" "${CONFIGURED_UNIFORM_CASE_COUNT}"
+  validate_positive "configured pilot total" "${CONFIGURED_TOTAL_CASE_COUNT}"
+  (( CONFIGURED_TOTAL_CASE_COUNT % CONFIGURED_UNIFORM_CASE_COUNT == 0 )) ||
     fail 2 "Pilot total must be divisible by its uniform cases-per-material count."
   PILOT_MODE=true
 }
@@ -1146,9 +1154,10 @@ if [[ "${repository_ready}" == true && "${venv_ready}" == true ]]; then
       "${python_module}" >&2
     exit 1
   fi
-  "${venv}/bin/python" -m src.generation.cli.cli_generation \
-    assert-shared-setup-idle --storage-root "${storage}" ||
-    setup_fail "active dependent scheduler jobs block shared setup"
+  if ! "${venv}/bin/python" -m src.generation.cli.cli_generation \
+    assert-shared-setup-idle --storage-root "${storage}"; then
+    exit 1
+  fi
 else
   fresh_installation=true
   shopt -s nullglob dotglob
@@ -1215,6 +1224,9 @@ cd "${repository}"
 command=("${venv}/bin/python" -m src.generation.cli.cli_generation
   "${operation}" "${campaign}"
   --git-commit "${commit}" --storage-root "${storage}")
+if [[ "${operation}" == submit-campaign ]]; then
+  command+=(--inputs-prepared)
+fi
 "${command[@]}"
 REMOTE
 }
@@ -1427,15 +1439,18 @@ remote_transfer_plan() {
 }
 
 resolve_local_storage() {
+  [[ -z "${LOCAL_STORAGE_ROOT}" ]] || return 0
   require_command realpath
   LOCAL_STORAGE_ROOT="$(realpath -m -- "${HOST_STORAGE_ROOT}")"
   validate_path "local storage" "${LOCAL_STORAGE_ROOT}"
 }
 
 resolve_local_python() {
+  [[ "${LOCAL_PYTHON_READY}" != true ]] || return 0
   [[ -x "${DOCKER_PYTHON}" ]] || fail 1 "Canonical Docker Python runner is not executable: ${DOCKER_PYTHON}"
   local_python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation' ||
     fail 1 "Canonical Docker Python environment lacks required dependencies."
+  LOCAL_PYTHON_READY=true
 }
 
 local_python() {
@@ -1651,7 +1666,7 @@ read_remote_campaign_monitor() {
 
 remote_source_status_tsv() {
   remote_cli_retryable "campaign source-status read" campaign-source-status \
-    "${RUN_ID}" --query-scheduler --format tsv \
+    "${RUN_ID}" --query-scheduler --include-sizes --format tsv \
     --storage-root "${REMOTE_STORAGE_ROOT}"
 }
 
@@ -1666,8 +1681,68 @@ read_remote_source_status() {
   REMOTE_RUN_STATE="${campaign_state}"
   REMOTE_SOURCE_STATE="${source_state}"
   CPU_BYTES_RETAINED="${bytes}"
+  CPU_BYTES_RETAINED_EXACT=true
   REMOTE_CLEANUP_ELIGIBILITY="${eligibility}"
   REMOTE_SOURCE_ACTIVE="${active}"
+}
+
+remote_workflow_monitor() {
+  remote_cli_retryable "campaign resume and status snapshot" resume-campaign \
+    "${RUN_ID}" --format workflow-monitor --max-active-cases 8 \
+    --storage-root "${REMOTE_STORAGE_ROOT}"
+}
+
+read_remote_workflow_monitor() {
+  local output campaign_header source_header tab
+  local kind state state_signature progress_signature extra
+  local source_kind status_run campaign_state source_state bytes eligibility active source_extra
+  local -a monitor_lines=()
+  output="$(remote_workflow_monitor)" ||
+    fail_preserving_interrupt "$?" 1 "Could not resume and reconstruct campaign status."
+  mapfile -t monitor_lines <<< "${output}"
+  (( ${#monitor_lines[@]} >= 3 )) || fail 1 "Malformed combined campaign monitor output."
+  campaign_header="${monitor_lines[0]}"
+  source_header="${monitor_lines[1]}"
+  REMOTE_CAMPAIGN_SUMMARY="$(printf "%s\n" "${monitor_lines[@]:2}")"
+  tab="$(printf "\t")"
+  IFS="${tab}" read -r kind state state_signature progress_signature extra <<< "${campaign_header}"
+  [[ "${kind}" == campaign-monitor && "${state_signature}" =~ ^[0-9a-f]{64}$ \
+    && "${progress_signature}" =~ ^[0-9a-f]{64}$ && -z "${extra:-}" ]] ||
+    fail 1 "Malformed combined campaign monitor header."
+  IFS="${tab}" read -r source_kind status_run campaign_state source_state bytes \
+    eligibility active source_extra <<< "${source_header}"
+  [[ "${source_kind}" == source-monitor && "${status_run}" == "${RUN_ID}" \
+    && "${campaign_state}" == "${state}" && -z "${source_extra:-}" ]] ||
+    fail 1 "Malformed combined CPU source status."
+  if [[ "${bytes}" != unavailable ]]; then
+    validate_nonnegative "CPU retained bytes" "${bytes}"
+    CPU_BYTES_RETAINED_EXACT=true
+  else
+    CPU_BYTES_RETAINED_EXACT=false
+  fi
+  REMOTE_CAMPAIGN_STATE="${state}"
+  REMOTE_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
+  REMOTE_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
+  REMOTE_RUN_STATE="${campaign_state}"
+  REMOTE_SOURCE_STATE="${source_state}"
+  CPU_BYTES_RETAINED="${bytes}"
+  REMOTE_CLEANUP_ELIGIBILITY="${eligibility}"
+  REMOTE_SOURCE_ACTIVE="${active}"
+}
+
+refresh_failure_cpu_bytes() {
+  [[ "${CPU_BYTES_RETAINED_EXACT}" == true ]] && return 0
+  [[ "${RUN_KIND:-}" == campaign && -n "${RUN_ID:-}" \
+    && -n "${REMOTE_STORAGE_ROOT:-}" ]] || return 1
+  local line kind status_run campaign_state source_state bytes eligibility active extra
+  line="$(remote_cli campaign-source-status "${RUN_ID}" --include-sizes --format tsv \
+    --storage-root "${REMOTE_STORAGE_ROOT}" 2>/dev/null)" || return 1
+  IFS=$'\t' read -r kind status_run campaign_state source_state bytes \
+    eligibility active extra <<< "${line}"
+  [[ "${kind}" == source-status && "${status_run}" == "${RUN_ID}" \
+    && "${bytes}" =~ ^[0-9]+$ && -z "${extra:-}" ]] || return 1
+  CPU_BYTES_RETAINED="${bytes}"
+  CPU_BYTES_RETAINED_EXACT=true
 }
 
 deferred_campaign_report() {
@@ -1726,6 +1801,7 @@ read_cleanup_authorization() {
   validate_nonnegative "authorized source file count" "${AUTH_SOURCE_FILE_COUNT}"
   validate_nonnegative "authorized source bytes" "${AUTH_SOURCE_BYTES}"
   CPU_BYTES_RETAINED="${AUTH_SOURCE_BYTES}"
+  CPU_BYTES_RETAINED_EXACT=true
 }
 
 remote_cleanup_arguments() {
@@ -1769,6 +1845,7 @@ confirm_cpu_cleanup() {
       --authorization-sha256 "${AUTHORIZATION_SHA}" \
       --cleanup-receipt-sha256 "${receipt_sha}" --reclaimed-bytes "${reclaimed}"
   CPU_BYTES_RETAINED=0
+  CPU_BYTES_RETAINED_EXACT=true
   CPU_BYTES_RECLAIMED="${reclaimed}"
   CPU_CLEANUP_RECEIPT_SHA="${receipt_sha}"
 }
@@ -1791,8 +1868,14 @@ storage_status_report() {
   resolve_local_python
   resolve_remote_layout
   resolve_local_storage
-  local -a local_arguments=(storage-status --role gpu --storage-root "${LOCAL_STORAGE_ROOT}")
-  local -a remote_arguments=(storage-status --role cpu --query-scheduler --storage-root "${REMOTE_STORAGE_ROOT}")
+  local -a local_arguments=(
+    storage-status --role gpu --metadata-only --omit-run-status
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+  )
+  local -a remote_arguments=(
+    storage-status --role cpu --metadata-only --omit-run-status
+    --storage-root "${REMOTE_STORAGE_ROOT}"
+  )
   if [[ -n "${RUN_ID}" ]]; then
     local_arguments+=(--campaign-run-id "${RUN_ID}")
     remote_arguments+=(--campaign-run-id "${RUN_ID}")
@@ -1800,7 +1883,8 @@ storage_status_report() {
   if [[ -n "${RUN_ID}" ]]; then
     printf 'Campaign status:\n'
     remote_cli_retryable "campaign status read" campaign-status \
-      "${RUN_ID}" --format summary --storage-root "${REMOTE_STORAGE_ROOT}"
+      "${RUN_ID}" --format workflow-monitor --max-active-cases 8 \
+      --storage-root "${REMOTE_STORAGE_ROOT}"
   fi
   printf 'GPU storage status:\n'
   local_cli "${local_arguments[@]}"
@@ -1834,8 +1918,11 @@ workflow_failure_report() {
   continuation="${continuation% }"
   WORKFLOW_FAILURE_EVIDENCE=""
   if [[ "${RUN_KIND:-}" == campaign && -n "${RUN_ID:-}" ]]; then
+    [[ "${CPU_BYTES_RETAINED_EXACT}" == true ]] || refresh_failure_cpu_bytes || true
     local record kind canonical visible extra
-    if [[ -n "${LOCAL_STORAGE_ROOT:-}" ]] &&
+    if [[ -n "${LOCAL_STORAGE_ROOT:-}" \
+      && "${CPU_BYTES_RETAINED_EXACT}" == true \
+      && "${CPU_BYTES_RETAINED}" =~ ^[0-9]+$ ]] &&
       record="$(local_cli record-workflow-failure "${RUN_ID}" \
         --storage-root "${LOCAL_STORAGE_ROOT}" --stage "${ALL_STAGE}" \
         --continuation-command "${continuation}" --cpu-bytes-retained "${CPU_BYTES_RETAINED}" \
@@ -2245,10 +2332,7 @@ monitor_generation_units() {
   while true; do
     case "$monitor_kind" in
       campaign)
-        remote_cli_retryable "campaign resume reconciliation" \
-          resume-campaign "$RUN_ID" --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
-        read_remote_campaign_monitor
-        read_remote_source_status
+        read_remote_workflow_monitor
         local campaign_detail
         campaign_detail="$REMOTE_CAMPAIGN_SUMMARY"$'\n'"Source storage: state=$REMOTE_SOURCE_STATE retained_bytes=$CPU_BYTES_RETAINED"
         generation_console_progress units 5 9 "Work units" RUNNING           "$REMOTE_CAMPAIGN_STATE_SIGNATURE|$REMOTE_SOURCE_STATE|$REMOTE_SOURCE_ACTIVE"           "$campaign_detail"           "$REMOTE_CAMPAIGN_PROGRESS_SIGNATURE|$CPU_BYTES_RETAINED"
@@ -2334,10 +2418,8 @@ resolve_leaf_plan() {
       RUN_ID="$EXPECTED_RUN_ID"
       PILOT_MODE=false
       resolve_campaign "$RUN_LEAF_CONFIG"
-      resolve_configured_resources
+      resolve_configured_resources executable
       validate_resources
-      local_cli validate-config "$CAMPAIGN_CONFIG_PATH" >/dev/null ||
-        fail 2 "Campaign local prerequisites are incomplete."
       if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
         resolve_pilot_contract
       fi
@@ -2420,7 +2502,6 @@ print(json.load(sys.stdin)["benchmark_run_id"])')" ||
 submit_leaf_units() {
   case "$RUN_KIND" in
     campaign)
-      remote_plan_submit plan-campaign >/dev/null
       launch_campaign >/dev/null
       LEAF_PLAN_DETAIL="campaign_run_id=$RUN_ID purpose=$CAMPAIGN_PURPOSE"
       ;;
@@ -2527,15 +2608,19 @@ build_leaf_packages_and_finalizers() {
       if [[ "$CAMPAIGN_PURPOSE" == pilot_check ]]; then
         prepare_pilot_check_receipt
       fi
-      local dataset_output dataset_record dataset_status dataset_reason extra
+      local dataset_output dataset_record dataset_status dataset_reason declared_package_count extra
       dataset_output="$(build_datasets)"
       dataset_record="$(printf '%s' "$dataset_output" | local_python -c 'import json, sys
 value = json.load(sys.stdin)
 reason = str(value.get("reason", "-")).replace("\t", " ").replace("\r", " ").replace("\n", " ")
-print("\t".join((str(value["status"]), reason)))')" ||
+count = value.get("declared_package_count")
+if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+    raise SystemExit("Dataset package stage has no valid declared_package_count")
+print("\t".join((str(value["status"]), reason, str(count))))')" ||
         fail 1 "Could not decode Dataset package stage."
-      IFS=$'\t' read -r dataset_status dataset_reason extra <<< "$dataset_record"
-      [[ -z "${extra:-}" ]] || fail 1 "Malformed Dataset package stage."
+      IFS=$'\t' read -r dataset_status dataset_reason declared_package_count extra <<< "$dataset_record"
+      [[ -z "${extra:-}" && "${declared_package_count}" =~ ^[0-9]+$ ]] ||
+        fail 1 "Malformed Dataset package stage."
       if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
         [[ "$dataset_status" == incomplete ]] ||
           fail 1 "Partial Dataset package stage returned unsupported status: $dataset_status"
@@ -2543,7 +2628,11 @@ print("\t".join((str(value["status"]), reason)))')" ||
       else
         [[ "$dataset_status" == complete ]] ||
           fail 1 "Dataset package stage returned unsupported status: $dataset_status"
-        LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID declared packages and finalizers validated"
+        if [[ "${declared_package_count}" == 0 ]]; then
+          LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID no Dataset packages declared; package finalizer gates validated"
+        else
+          LEAF_PACKAGE_DETAIL="campaign_run_id=$RUN_ID declared packages and finalizers validated"
+        fi
       fi
       ;;
     benchmark)
@@ -2888,9 +2977,8 @@ preflight_generation_plan() {
     campaign)
       RUN_LEAF_CONFIG="$RUN_PLAN_CONFIG"
       resolve_campaign "$RUN_LEAF_CONFIG"
-      resolve_configured_resources
+      resolve_configured_resources executable
       validate_resources
-      local_cli validate-config "$CAMPAIGN_CONFIG_PATH" >/dev/null
       ;;
     benchmark)
       RUN_LEAF_CONFIG="$RUN_PLAN_CONFIG"
@@ -2899,9 +2987,8 @@ preflight_generation_plan() {
     workflow)
       RUN_LEAF_CONFIG="${RUN_CHILD_CONFIGS[0]}"
       resolve_campaign "$RUN_LEAF_CONFIG"
-      resolve_configured_resources
+      resolve_configured_resources executable
       validate_resources
-      local_cli validate-config "$CAMPAIGN_CONFIG_PATH" >/dev/null
       ;;
     *) fail 2 "Unsupported common preflight run kind: $RUN_KIND" ;;
   esac

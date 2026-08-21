@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 _MONITOR_RECORD_KIND = "campaign-monitor"
+_SOURCE_MONITOR_RECORD_KIND = "source-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
 _MAX_ACTIONABLE_DETAILS = 20
@@ -59,6 +60,13 @@ _FAILED_CASE_STATES = frozenset(
         "conversion_failed",
         "publication_failed",
         "case_reconciliation_failed",
+    }
+)
+_PRE_SOLVER_RUNTIME_PHASES = frozenset(
+    {
+        "preparing",
+        "acquiring_comsol_license",
+        "starting_solver",
     }
 )
 
@@ -176,7 +184,7 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
         return "running"
     if state == "license_blocked":
         return "license_blocked"
-    if state in {"scheduler_pending", "pending"}:
+    if state in {"scheduler_pending", "pending", "scheduler_unknown"}:
         return "scheduler_pending"
     if state == "admission_waiting":
         # A reservation has entered admission; the Admission line retains its
@@ -185,6 +193,15 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
     if state == "never_started":
         return "not_admitted"
     return "failed"
+
+
+def _active_case_sort_key(case: Mapping[str, Any]) -> tuple[int, str, str]:
+    """Group useful execution before pre-solver waiting with stable identity."""
+    runtime = _runtime_view(case)
+    phase = runtime.get("phase")
+    waiting = runtime.get("availability") != "available" or phase is None or phase in _PRE_SOLVER_RUNTIME_PHASES
+    batch_identity = str(case.get("batch_id") or case.get("batch_name") or "")
+    return int(waiting), batch_identity, str(case.get("case_id") or "")
 
 
 def _case_heading(case: Mapping[str, Any], *, include_runtime: bool = True) -> str:
@@ -277,9 +294,11 @@ def _scheduler_pending_lines(case: Mapping[str, Any]) -> list[str]:
     """Return one compact scheduler-pending work-unit block."""
     lines = [_case_heading(case, include_runtime=False)]
     details = []
+    classified_state = case.get("classified_state", case.get("state"))
+    reason = "scheduler_visibility_unknown" if classified_state == "scheduler_unknown" else case.get("scheduler_state") or case.get("reason")
     for name, value in (
         ("queue_age", case.get("queue_age")),
-        ("reason", case.get("scheduler_state") or case.get("reason")),
+        ("reason", reason),
         ("cores", case.get("requested_cores")),
     ):
         rendered = _bounded_text(value, maximum=_MAX_REASON_CHARACTERS)
@@ -631,16 +650,22 @@ def format_campaign_status_summary(
             "not_admitted",
         )
     ) or any(case.get("replay_eligible") is True for case in buckets["failed"])
-    if buckets["failed"] and runnable_work_remains:
-        lines.append(
-            f"Failures: {len(buckets['failed'])} terminal, continuing remaining "
-            "work  admission_blocked="
-            f"{str(status.get('admission_blocked') is True).lower()}"
+    if status.get("admission_blocked") is True:
+        block_reason = _bounded_text(
+            status.get("admission_block_reason"),
+            maximum=_MAX_REASON_CHARACTERS,
         )
+        block_parts = ["state=blocked"]
+        if block_reason is not None:
+            block_parts.append(f"reason={block_reason}")
+        lines.append(f"  {'  '.join(block_parts)}")
+    if buckets["failed"] and runnable_work_remains:
+        lines.append(f"Failures: {len(buckets['failed'])} terminal, continuing remaining work")
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
-    _actionable_section(lines, "Running cases", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
-    _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
+    active_cases = sorted(buckets["running"], key=_active_case_sort_key)
+    _actionable_section(lines, "Active cases", active_cases, maximum=max_active_cases, renderer=_active_case_lines)
     _actionable_section(lines, "License-blocked cases", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
+    _actionable_section(lines, "Scheduler-pending cases", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
     recent_failed, older_failed = _recent_and_older_failed_cases(buckets["failed"])
     _actionable_section(
         lines,
@@ -768,6 +793,32 @@ def format_campaign_monitor(
     )
     summary = format_campaign_status_summary(status, max_active_cases=max_active_cases)
     return f"{header}\n{summary}"
+
+
+def format_workflow_monitor(
+    status: Mapping[str, Any],
+    source_status: Mapping[str, Any],
+    *,
+    max_active_cases: int,
+) -> str:
+    """Format one campaign header, one source header, and one bounded summary."""
+    campaign_record = format_campaign_monitor(
+        status,
+        max_active_cases=max_active_cases,
+    )
+    campaign_header, summary = campaign_record.split("\n", 1)
+    source_header = "\t".join(
+        (
+            _SOURCE_MONITOR_RECORD_KIND,
+            str(source_status["campaign_run_id"]),
+            str(source_status["campaign_state"]),
+            str(source_status["source_state"]),
+            ("unavailable" if source_status.get("reclaimable_bytes") is None else str(source_status["reclaimable_bytes"])),
+            str(source_status["cleanup_eligibility"]),
+            str(source_status["active_slurm"]),
+        )
+    )
+    return f"{campaign_header}\n{source_header}\n{summary}"
 
 
 def format_benchmark_status_summary(

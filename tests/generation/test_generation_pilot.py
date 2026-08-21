@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from queue import Queue
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -523,6 +525,52 @@ def test_gpu_accounting_uses_only_validated_destination_and_pilot_metadata(
     summary.write_bytes(b"pilot-meta")
 
 
+def test_pilot_metadata_reader_admits_owned_atomic_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclude one active atomic publication without admitting foreign metadata."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "pilot_concurrent_metadata"
+    directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    directory.mkdir(parents=True)
+    receipt_path = directory / pilot_service.PILOT_RECEIPT_FILENAME
+    staged: Queue[Path] = Queue()
+    releases: Queue[None] = Queue()
+    original_fsync = common.serialization._fsync_file  # noqa: SLF001 -- deterministic publication gate
+
+    def gated_fsync(temporary_path: Path) -> None:
+        original_fsync(temporary_path)
+        staged.put(temporary_path)
+        releases.get(timeout=10.0)
+
+    monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            common.serialization.atomic_write_json,
+            receipt_path,
+            {"publication": "active"},
+        )
+        try:
+            temporary_path = staged.get(timeout=10.0)
+            assert temporary_path.is_file()
+            assert common.serialization.atomic_write_temporary_destination(temporary_path) == receipt_path
+            assert (
+                pilot_service._pilot_check_metadata_files(  # noqa: SLF001 -- strict metadata owner
+                    run_id, storage=storage
+                )
+                == []
+            )
+        finally:
+            releases.put(None)
+        assert future.result(timeout=10.0) == receipt_path
+
+    assert pilot_service._pilot_check_metadata_files(  # noqa: SLF001 -- strict metadata owner
+        run_id, storage=storage
+    ) == [receipt_path]
+
+
 def test_staging_cleanup_accounting_exclusion_requires_bound_receipt(
     tmp_path: Path,
 ) -> None:
@@ -943,6 +991,11 @@ def test_new_commit_pilot_reuses_all_valid_cases_without_scientific_submission(
         lambda *_args, **_kwargs: prepared.append(True),
     )
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
+    monkeypatch.setattr(
+        generation.campaign,
+        "_campaign_input_references",
+        lambda *_args, **_kwargs: {batch.batch_name: {index: object() for index in batch.case_indices} for batch in campaign.batches},
+    )
     monkeypatch.setattr(
         generation.campaign,
         "_scheduler_evidence",
