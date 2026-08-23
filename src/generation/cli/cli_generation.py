@@ -562,12 +562,20 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     run_case.add_argument("--scheduler-kind", choices=("local", "slurm"), default="local")
     _add_storage_arguments(run_case, include_work=True)
 
-    timing_probe = subparsers.add_parser("timing-probe", help="run one isolated diagnostic transient timing probe")
+    timing_probe = subparsers.add_parser(
+        "timing-probe",
+        help="run one ordinary transient campaign case with isolated diagnostic timing evidence",
+    )
     timing_probe.add_argument("config", type=Path)
     _add_storage_arguments(timing_probe, include_work=True)
 
     validate_timing_probe = subparsers.add_parser("validate-timing-probe", help="validate one immutable diagnostic timing-probe bundle")
     validate_timing_probe.add_argument("bundle", type=Path)
+
+    publish_timing_probe = subparsers.add_parser("publish-transferred-timing-probe", help="publish one verified transferred timing-probe bundle")
+    publish_timing_probe.add_argument("probe_id")
+    publish_timing_probe.add_argument("--staging-root", type=Path, required=True)
+    publish_timing_probe.add_argument("--storage-root", type=Path, required=True)
 
     validate_case = subparsers.add_parser("validate-case", help="validate one completed case")
     validate_case.add_argument("config", type=Path)
@@ -2410,22 +2418,23 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         result = timing_probe_service.validate_probe_bundle(args.bundle)
         print("PROBE_BUNDLE_VALID=" + str(result["probe_bundle"]))
         return 0
+    if args.command == "publish-transferred-timing-probe":
+        result = timing_probe_service.publish_transferred_probe_bundle(
+            args.probe_id, staging_root=args.staging_root, destination_root=args.storage_root
+        )
+        print("PROBE_BUNDLE=" + str(result["probe_bundle"]), flush=True)
+        return 0
     if args.command == "timing-probe":
 
         def announce_probe(payload: Mapping[str, str]) -> None:
             """Print the durable session identity before waiting for COMSOL."""
             print("PROBE_ID=" + payload["probe_id"], flush=True)
-            print("PROBE_ACTIVE=" + payload["probe_active"], flush=True)
-            print("PROBE_WORK=" + payload["probe_work"], flush=True)
 
-        result = timing_probe_service.run_timing_probe(
-            args.config,
-            storage_root=args.storage_root,
-            work_root=args.work_root,
-            announce=announce_probe,
-        )
-        print("PROBE_BUNDLE=" + str(result["probe_bundle"]), flush=True)
-        return 0 if result["exit_code"] == 0 else int(result["exit_code"])
+        result = timing_probe_service.run_timing_probe(args.config, storage_root=args.storage_root, work_root=args.work_root, announce=announce_probe)
+        print("PROBE_CASE_STATE=" + str(result["probe_case_state"]), flush=True)
+        print("PROBE_CASE_EXIT_CODE=" + str(result["probe_case_exit_code"]), flush=True)
+        print("PROBE_CPU_BUNDLE=" + str(result["probe_cpu_bundle"]), flush=True)
+        return 0 if result["probe_case_state"] == "successful" else int(result["probe_case_exit_code"])
     if args.command == "run-campaign-case":
         outcome = campaign_runtime.run_campaign_case_job(
             args.campaign_run_id,
@@ -2656,7 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
     previous_term: Any = None
-    if args.command in {"run-campaign-case", "run-core-benchmark-case"}:
+    if args.command in {"run-campaign-case", "run-core-benchmark-case", "timing-probe"}:
         previous_term = signal.getsignal(signal.SIGTERM)
         signal.signal(
             signal.SIGTERM,

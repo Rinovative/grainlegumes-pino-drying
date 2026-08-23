@@ -380,14 +380,22 @@ mutating or regenerating cases.
 
 ## Bounded COMSOL phase-timing diagnostic
 
-The opt-in `timing-probe CONFIG` path runs exactly one configured transient
-Technical Smoke case in one Slurm allocation. It records an immutable diagnostic
-bundle but does not publish Generation cases, Dataset packages, PT shards,
-readiness evidence, replacement work, or cleanup decisions. COMSOL runs only
-inside the allocation, never on the login shell. Foreground, background, resume,
-Candidate A/B/C timing semantics, validation, and the complete removal inventory
-are documented in the
-[COMSOL phase timing probe guide](comsol_phase_timing_probe.md).
+The temporary `timing-probe CONFIG` path accepts the ordinary transient
+Technical Smoke campaign and selects exactly one configured case. Canonical
+input generation, normal scratch preparation, the standard Slurm/COMSOL runtime,
+export collection, normal publication, failure-attempt or temporary-license
+wait recording, and scratch cleanup remain authoritative. The probe adds diagnostic observation only; its isolated
+normal case is removed after compact evidence is retained, so it publishes no
+production Generation case or Dataset package.
+
+The workflow automatically transfers the exact immutable diagnostic bundle from
+CPU storage to local experiment storage, including for a retained nonzero case
+result, and rejects extra or corrupt content. COMSOL runs only inside the
+allocation. Candidate A/B/C semantics, foreground and background commands,
+validation, truthful limitations, and the complete removal inventory are in the
+[COMSOL phase timing probe guide](comsol_phase_timing_probe.md). Direct CLI
+or Python API execution outside an exact configured Slurm allocation is rejected
+before the probe can inspect or launch COMSOL.
 
 ## Identity and provenance policy
 

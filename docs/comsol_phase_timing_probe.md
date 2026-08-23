@@ -1,172 +1,199 @@
 # COMSOL phase timing probe
 
-This temporary, opt-in diagnostic exists only to collect evidence about whether
-COMSOL's retained text can support phase-specific solver timing. It runs exactly
-one configured `technical_runtime_smoke` transient case:
-`transient_drying__lentil__natural`, case 1. It does not publish Generation
-cases, Dataset packages, PT shards, readiness evidence, replacement work, or
-cleanup decisions. Cases generated before final timing integration may not have
-recoverable phase logs.
+This temporary diagnostic runs exactly one transient case from an ordinary
+`technical_runtime_smoke` campaign. Its purpose is to retain evidence about
+whether COMSOL text can support phase-specific timing. It does not establish a
+production timing method or a performance claim.
 
-No real COMSOL execution was performed while implementing or testing this probe.
-The synthetic parser and lifecycle tests therefore do not validate real COMSOL
-log grammar or support a performance claim.
+No real COMSOL execution was performed while implementing or testing this
+repair. Focused tests use a fake executable and therefore cannot validate real
+COMSOL log grammar, phase boundaries, or timing values. The earlier failed probe
+left no usable timing evidence.
 
-The shell admits the repository-local probe and campaign configurations. The
-referenced campaign remains authoritative for the transient template, scientific
-case construction, Slurm partition, site capacity, wall time, modules, and
-virtual environment. The probe independently owns `cores_per_case`; this
-configuration requests 4 cores while the referenced campaign requests 8. The
-shell validates the probe count against the configured 32-core node, passes the
-same 4 cores to `srun --cpus-per-task`, and the probe passes 4 to COMSOL with
-`-np`. COMSOL never runs on the login shell.
+## Execution contract
 
-The 4-core result is only log-format and timing-source evidence. It is not a
-performance benchmark and is not directly comparable to later 8-core production
-timing.
+Use the maintained transient Technical Smoke campaign directly:
 
-Run it through that configured CPU-host allocation:
+```bash
+./scripts/generation_workflow.sh timing-probe configs/generation/campaigns/transient_drying/technical_smoke.yaml
+```
 
-    ./scripts/generation_workflow.sh timing-probe configs/generation/diagnostics/comsol_phase_timing_probe.yaml
+Foreground execution is the default. Managed background execution changes only
+controller ownership:
 
-Run the same isolated diagnostic in the managed background session:
+```bash
+./scripts/generation_workflow.sh timing-probe configs/generation/campaigns/transient_drying/technical_smoke.yaml --background
+```
 
-    ./scripts/generation_workflow.sh timing-probe configs/generation/diagnostics/comsol_phase_timing_probe.yaml --background
+The campaign remains authoritative for the case, template, scientific inputs,
+COMSOL executable, Slurm scheduler and partition, scheduler options, wall time,
+modules, and `cores_per_case`. The shell requests one node, one task, and the
+configured cores with `srun`; the normal Generation command passes the same
+count to COMSOL with `-np`. The public probe runner also requires a numeric
+`SLURM_JOB_ID` and an exact `SLURM_CPUS_PER_TASK`, so direct CLI or Python API
+use outside an admitted allocation fails before input generation or COMSOL
+inspection. COMSOL never runs on the login shell.
 
-The background launcher prints `workflow_session_id=<id>`. Inspect its controller
-output with the emitted value:
+The probe has no alternate case builder or subprocess runner. It performs this
+single path:
 
-    ./scripts/generation_workflow.sh background-status <workflow_session_id>
+1. `generation_cases_input.generate_input_cases(..., case_count=1)` publishes
+   exactly one canonical input case in probe-isolated storage.
+2. `generation_runtime_batch.run_case` invokes ordinary workspace preparation.
+   That preparation admits the canonical case and copies every declared input
+   file, including `fields.csv`, into the COMSOL working-directory root.
+3. The ordinary runtime owns command construction, licensing, process control,
+   stdout and stderr, export collection, conversion, publication or failure
+   attempt recording, and marked scratch cleanup.
+4. An optional diagnostic observer adds one runtime-owned
+   `-batchlog PATH -batchlogout` pair to that normal command and copies complete
+   bounded logs before normal scratch cleanup.
+5. The probe records compact normal publication, failure-attempt, or
+   temporary-license wait evidence. Exactly one authoritative normal outcome is
+   required before immutable bundle publication. The probe then validates the
+   bundle and removes its isolated canonical and processed case storage. It
+   never builds a Dataset package or leaves a normal case in production
+   Generation storage.
 
-The child announces `PROBE_ID`, `PROBE_ACTIVE`, and `PROBE_WORK` before
-COMSOL starts. While the process is active, follow the runtime-owned batch log
-using that exact announced work path:
+The previous implementation bypassed step 2. It generated a case bundle under
+an `inputs/` subdirectory and launched COMSOL directly from another directory,
+so the model could not resolve `fields.csv` at its normal working-directory
+location. The repair removes that parallel path instead of adding an ad-hoc file
+copy.
 
-    tail -f PROBE_WORK/runtime/comsol_batch.log
+A caller-supplied work root remains caller-owned. The normal runner removes only
+its marked case workspace; the probe does not delete the work root or unrelated
+content.
 
-The live work tree is not the final bundle. On completion, the command prints
-`PROBE_BUNDLE`, atomically publishes the immutable bundle at
-`STORAGE_ROOT/03_experiments/comsol_phase_timing_probe/PROBE_ID`, validates it,
-and removes only its validated active/work owner. With container-visible storage
-at `/workspace/storage`, the expected path is:
+## Result and transfer
 
-    /workspace/storage/03_experiments/comsol_phase_timing_probe/PROBE_ID/
+The remote command announces `PROBE_ID` before case execution. Once a normal
+case reaches a retained success, failure-attempt, or temporary-license deferral
+result, it prints:
 
-Use the exact printed path when configured storage is elsewhere. Revalidate and
-inspect a retained bundle with:
+```text
+PROBE_CASE_STATE=successful|failed
+PROBE_CASE_EXIT_CODE=0|nonzero
+PROBE_CPU_BUNDLE=REMOTE_STORAGE/03_experiments/comsol_phase_timing_probe/PROBE_ID
+```
 
-    python -m src.generation.cli.cli_generation validate-timing-probe "$PROBE_BUNDLE"
-    python -m json.tool "$PROBE_BUNDLE/method_verdicts.json"
-    python -m json.tool "$PROBE_BUNDLE/batch_log_candidates.json"
-    python -m json.tool "$PROBE_BUNDLE/stdout_candidates.json"
-    less "$PROBE_BUNDLE/comsol_batch.log"
-    less "$PROBE_BUNDLE/stdout.log"
-    less "$PROBE_BUNDLE/stderr.log"
+The host workflow validates those fields, transfers only the exact diagnostic
+bundle into an existing marked transfer staging directory, validates every file
+and digest, and atomically publishes it at:
 
-`method_verdicts.json` summarizes the diagnostic candidates. The candidate JSON
-files retain every possible timing line with its source, location, exact text,
-context, detected phase, parsed value, unit, and ambiguity classification. The
-three complete logs remain the authoritative evidence; do not rely only on a
-summary excerpt.
+```text
+LOCAL_STORAGE/03_experiments/comsol_phase_timing_probe/PROBE_ID
+```
 
-Resume is fail-closed. The active run key binds the exact probe and campaign
-configuration, campaign digest, source commit, scheduler kind, and requested
-work root. Before starting or adopting the child, the controller reconstructs
-the exact case payload, generated input inventory, copied model digest, scalar
-handoff, COMSOL command, attempt identity, child control, and control digest.
-The child independently rechecks its admitted paths, identities, input/model
-inventory, run key, and control digest. Mutation preserves the active evidence
-and prevents a second launch.
+It then prints `PROBE_BUNDLE` with that local path and removes the marked
+transfer staging. Identical repeated publication is reused; a corrupt existing
+bundle, an identity mismatch, an unexpected file, or an HDF5 payload fails
+closed. The compact CPU bundle is retained. A normal-case failure is transferred
+before the workflow returns the nonzero case exit code. If bundle validation or
+transfer fails, active or staging evidence is retained for diagnosis.
 
-Candidate A retains and parses COMSOL `Solution time` text lines. It records
-every candidate, context, unit, duplicate, and ambiguity status; it confirms a
-phase only when one finite, nonnegative, top-level, unambiguous candidate is
-found in stationary-then-transient order. Its sum remains diagnostic until real
-COMSOL evidence proves the grammar. Candidate B is deliberately unavailable
-(`not_implementable_from_current_source_boundary`): both solve boundaries are
-inside the MPH model, so no in-process or shell split timing is invented.
-Candidate C records observed wall markers with polling and buffering caveats; it
-is diagnostic only and can never establish solver time. No production timing
-method is selected by this probe, even if one diagnostic candidate is reported
-as confirmed.
+Validate and inspect the printed local bundle with:
 
-The intended final production semantics, if a later investigation proves exact
-boundaries, are:
+```bash
+python -m src.generation.cli.cli_generation validate-timing-probe "$PROBE_BUNDLE"
+python -m json.tool "$PROBE_BUNDLE/manifest.json"
+python -m json.tool "$PROBE_BUNDLE/method_verdicts.json"
+python -m json.tool "$PROBE_BUNDLE/batch_log_candidates.json"
+less "$PROBE_BUNDLE/comsol_batch.log"
+less "$PROBE_BUNDLE/stdout.log"
+less "$PROBE_BUNDLE/stderr.log"
+```
 
-    comsol_stationary_airflow_seconds
-    comsol_transient_drying_seconds
-    comsol_scientific_solver_seconds =
-        comsol_stationary_airflow_seconds
-        + comsol_transient_drying_seconds
+The immutable inventory is exactly:
 
-Keep `comsol_process_seconds` separate. Never derive scientific solver time
-from process time minus estimated overhead, Slurm elapsed time, simulated
-physical time, file timestamps, observed-wall marker intervals, or missing
-values filled with zero.
+```text
+README.md
+batch_log_candidates.json
+comsol_batch.log
+environment.json
+exact_command.json
+manifest.json
+method_verdicts.json
+observed_wall_timing.json
+parser_summary.json
+phase_events.jsonl
+sha256sums.txt
+stderr.log
+stdout.log
+stdout_candidates.json
+```
 
-To hand evidence to a later fresh Codex session, make the complete
-`PROBE_BUNDLE` directory available without editing it, identify the exact
-source commit and probe command, and ask that session to run the validator before
-reading `manifest.json`, `method_verdicts.json`, the candidate records, and
-the retained logs. The later session must consume and validate the real bundle,
-treat Candidate C as diagnostic, and avoid promoting any field until the real
-log proves the exact semantics above. After that investigation preserves any
-needed evidence, that session must remove this temporary probe using the inventory
-below.
+`manifest.json` binds the source commit and campaign hash, batch and case
+identities, input-generation identity, canonical and scratch input hashes,
+template, configured resources, COMSOL version query, exact command, normal
+publication, failure-attempt, or temporary-license wait evidence, process
+result, host, and bundle file hashes.
+No `case.h5`, solved model, export, Dataset package, PT shard, readiness evidence,
+or production timing field belongs in the bundle.
+
+## Timing interpretation
+
+Candidate A retains possible `Solution time`, `Elapsed time`, and
+`Computation time` lines with exact source, byte offset, line number, context,
+phase association, parsed unit, duplicate classification, and ambiguity
+reasons. Synthetic tests prove only parser behavior. Even a single ordered
+candidate for both phases is labelled candidate evidence; it is never reported
+as validated real COMSOL grammar or selected automatically.
+
+Candidate B remains
+`not_implementable_from_current_source_boundary`. The exact top-level stationary
+and transient solve calls are inside the binary MPH execution boundary. The
+probe does not introduce a second COMSOL process, edit the model, or invent
+shell markers as substitutes for those boundaries.
+
+Candidate C records host-observed intervals between retained markers. Polling,
+COMSOL buffering, process buffering, filesystem visibility, parser latency, and
+non-solver work may all affect those intervals. Candidate C is diagnostic only.
+
+Accordingly, every bundle records:
+
+```text
+recommendation = unresolved_pending_real_probe_review
+real_comsol_grammar_validated = false
+production_timing_fields_updated = false
+```
+
+If later real evidence proves exact semantics, the intended distinct fields are
+`comsol_stationary_airflow_seconds`,
+`comsol_transient_drying_seconds`, and their sum
+`comsol_scientific_solver_seconds`. Keep `comsol_process_seconds` separate.
+Never infer scientific solver time from Slurm elapsed time, simulated physical
+time, file timestamps, process time minus estimated overhead, observed marker
+intervals, or missing values filled with zero.
 
 ## Exact future removal inventory
 
-Remove all of the following together after retaining any diagnostic evidence
-that is still needed:
+After any needed real diagnostic evidence is retained, remove the temporary
+surface together:
 
-- Delete
-  `configs/generation/diagnostics/comsol_phase_timing_probe.yaml`,
-  `src/generation/generation_timing_probe.py`,
-  `tests/generation/test_generation_timing_probe.py`, and this document.
-  Deleting the module removes all of its constants, regular expressions,
-  `ProbeObservationState`, parsing/observation helpers, session/child helpers,
-  `parse_solution_times`, `summarize_solution_times`,
-  `observe_appended_bytes`, `run_timing_probe`, `validate_probe_bundle`,
-  `_execute_child`, and `_module_main`; no symbol from that module is
-  permanent.
-- In `src/generation/cli/cli_generation.py`, remove the
-  `timing_probe_service` import, the `timing_probe` and
-  `validate_timing_probe` parsers, both dispatch branches, their nested
-  `announce_probe`, and the emitted `PROBE_ID`, `PROBE_ACTIVE`,
-  `PROBE_WORK`, `PROBE_BUNDLE`, and `PROBE_BUNDLE_VALID` fields.
-- In `scripts/generation_workflow.sh`, remove the `timing-probe CONFIG`
-  usage/dispatch path, `TIMING_PROBE_CONFIG_PATH`,
-  `TIMING_PROBE_RELATIVE_PATH`, `resolve_timing_probe_contract`,
-  `run_timing_probe_remote`, and both `timing-probe` background allow-list
-  branches. Remove `timing-probe` from
-  `src/generation/generation_background.py::_SUPPORTED_SUBCOMMANDS`.
-- In
-  `src/generation/runtime/generation_runtime_comsol.py::build_comsol_command`,
-  remove the probe-only `diagnostic_batchlog` parameter, its conflict
-  validation, and its `-batchlog ... -batchlogout` arguments. Preserve the
-  ordinary production command behavior.
-- Remove the “Bounded COMSOL phase-timing diagnostic” subsection and link from
-  `docs/simulation_generation.md`.
-- Retire every probe-only version-1 schema:
-  `generation_timing_probe` (configuration),
-  `comsol_phase_timing_probe_session` (active session),
-  `comsol_phase_timing_probe_child` (child control), and
-  `comsol_phase_timing_probe` (immutable bundle), plus the module-owned
-  version-1 status, child-start/exit, observer/event, candidate, observed-wall,
-  parser-summary, method-verdict, environment, command, file-evidence, and
-  checksum payloads.
-- After evidence retention is decided, remove only probe-owned stored data under
-  `STORAGE_ROOT/03_experiments/comsol_phase_timing_probe` and any external
-  `WORK_ROOT/comsol_phase_timing_probe` owner. Active-session files include
-  `session.json`, `status.json`, `child_control.json`,
-  `controller_child.json`, `child_started.json`, `child_exit.json`,
-  `observer.json`, the isolated case/model/input tree, and runtime logs.
-  Immutable bundle inventory is exactly `manifest.json`,
-  `method_verdicts.json`, `exact_command.json`, `environment.json`,
-  `comsol_batch.log`, `stdout.log`, `stderr.log`,
-  `phase_events.jsonl`, `batch_log_candidates.json`,
-  `stdout_candidates.json`, `observed_wall_timing.json`,
-  `parser_summary.json`, `sha256sums.txt`, and `README.md`.
+- Delete `src/generation/generation_timing_probe.py`,
+  `tests/generation/test_generation_timing_probe.py`, and this guide. There is no
+  probe-specific production YAML to remove.
+- Remove `timing_probe_service`, the `timing-probe`,
+  `validate-timing-probe`, and `publish-transferred-timing-probe` CLI parsers and
+  dispatch branches from `src/generation/cli/cli_generation.py`.
+- Remove `diagnostic_observer` from
+  `generation_runtime_batch.execute_prepared_case` and `run_case`. Remove
+  `diagnostic_batchlog` and its conflict checks and flags from
+  `generation_runtime_comsol.build_comsol_command`. Preserve the normal command
+  and case lifecycle.
+- Remove the optional batch-log behavior used by the fake COMSOL fixture and
+  the probe tests from `tests/generation/conftest.py`.
+- Remove `TIMING_PROBE_SCHEDULER_OPTIONS`,
+  `resolve_timing_probe_contract`, `run_timing_probe_remote`, the
+  `timing-probe CONFIG` usage and dispatch, and its background allow-list entries
+  from the Generation shell/background services.
+- Remove the timing-probe subsection from `docs/simulation_generation.md`.
+- Retire the `comsol_phase_timing_probe` bundle and its module-owned observer,
+  candidate, observed-wall, parser, verdict, environment, command, manifest,
+  file-evidence, and checksum payloads.
+- After evidence-retention decisions, remove only probe-owned stored bundles
+  under `03_experiments/comsol_phase_timing_probe`. Do not reinterpret or remove
+  an existing bundle merely because code is deleted.
 
-Do not remove or reinterpret existing probe bundles merely by deleting code, and
-do not create or update `_codex_handoff`.
+Do not create or update `_codex_handoff` for this diagnostic.

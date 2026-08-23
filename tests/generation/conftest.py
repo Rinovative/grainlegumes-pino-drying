@@ -471,6 +471,24 @@ if sys.argv[1:] == ["-version"]:
     print("COMSOL Multiphysics 6.4.0.293")
     raise SystemExit(0)
 
+arguments = sys.argv[1:]
+probe_batch_log = None
+if "-batchlog" in arguments or "-batchlogout" in arguments:
+    if arguments.count("-batchlog") != 1 or arguments.count("-batchlogout") != 1:
+        raise RuntimeError("fake COMSOL requires one complete diagnostic batch-log flag pair")
+    probe_batch_log = pathlib.Path(arguments[arguments.index("-batchlog") + 1])
+
+
+def write_probe_batch_log(content):
+    if probe_batch_log is None:
+        return
+    probe_batch_log.parent.mkdir(parents=True, exist_ok=True)
+    with probe_batch_log.open("a", encoding="utf-8") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 mode = os.environ.get("FAKE_COMSOL_MODE", "success")
 if mode == "license_capacity_twice_then_success":
     counter_path = pathlib.Path("runtime/fake_license_checkout_count")
@@ -517,7 +535,6 @@ try:
         time.sleep(2.0)
     else:
         time.sleep(float(os.environ.get("FAKE_COMSOL_DELAY", "0")))
-        arguments = sys.argv[1:]
         if arguments.count("-job") != 1 or arguments[arguments.index("-job") + 1] != "b1":
             raise RuntimeError("fake COMSOL requires the canonical b1 job configuration")
         if arguments.count("-inputfile") != 1 or arguments[arguments.index("-inputfile") + 1] != "model.mph":
@@ -529,6 +546,13 @@ try:
         case = json.loads(pathlib.Path("case.json").read_text(encoding="utf-8"))
         transient_profile = case["simulation_profile"] == "transient_drying"
         scalars = runtime_scalar_values(arguments, case) if transient_profile else {}
+        if transient_profile:
+            write_probe_batch_log(
+                "Stationary Solver 1\n"
+                "Solution time: 1.25 s\n"
+                "Time-Dependent Solver 1 in Transient Drying\n"
+                "Elapsed time: 2.5 s\n"
+            )
         solved_model_mode = os.environ.get("FAKE_COMSOL_SOLVED_MODEL_MODE", "canonical")
         if retained:
             requested_output = arguments[arguments.index("-outputfile") + 1]

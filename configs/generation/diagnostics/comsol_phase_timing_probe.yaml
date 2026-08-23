@@ -1,6 +1,0 @@
-schema_kind: generation_timing_probe
-schema_version: 1
-campaign_config: ../campaigns/transient_drying/technical_smoke.yaml
-batch_name: transient_drying__lentil__natural
-case_index: 1
-cores_per_case: 4
