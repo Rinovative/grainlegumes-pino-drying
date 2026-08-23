@@ -26,6 +26,7 @@ import pandas as pd
 from matplotlib.transforms import Bbox
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.ui import tables
 
 from . import generation_input_plot_layout as layout
@@ -104,14 +105,16 @@ def _draw_distribution(
         second.fields[quantity],
     )
     bins = tuple(float(value) for value in np.linspace(lower, upper, 31))
-    axis.hist(
+    histograms.plot_histogram(
+        axis,
         first.fields[quantity].ravel(),
         bins=bins,
         alpha=0.44,
         color=layout.DATASET_A_COLOR,
         label=_case_plot_label(first, "A"),
     )
-    axis.hist(
+    histograms.plot_histogram(
+        axis,
         second.fields[quantity].ravel(),
         bins=bins,
         alpha=0.44,

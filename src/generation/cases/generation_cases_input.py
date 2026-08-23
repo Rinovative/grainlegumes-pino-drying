@@ -447,20 +447,23 @@ def admit_configured_input_case(
     case_index: int,
     *,
     storage_root: Path | str | None = None,
+    git_commit: str | None = None,
 ) -> admission_service.InputCaseReference:
     """Fully admit one configured raw case without rebuilding its batch."""
-    config.case_id(case_index)
-    base, _resolved, metadata, raw = _configured_input_locations(
-        config,
-        storage_root=storage_root,
-    )
-    return admission_service.admit_input_case_evidence(
-        metadata,
-        case_index,
-        raw_directory=raw,
-        expected_input_generation_id=str(base["input_generation_id"]),
-        validation_depth="full",
-    )
+    commit_context = nullcontext() if git_commit is None else _generation_git_commit(source_service.validate_git_commit(git_commit))
+    with commit_context:
+        config.case_id(case_index)
+        base, _resolved, metadata, raw = _configured_input_locations(
+            config,
+            storage_root=storage_root,
+        )
+        return admission_service.admit_input_case_evidence(
+            metadata,
+            case_index,
+            raw_directory=raw,
+            expected_input_generation_id=str(base["input_generation_id"]),
+            validation_depth="full",
+        )
 
 
 def admit_configured_input_references(

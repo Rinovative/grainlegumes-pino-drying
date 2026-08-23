@@ -31,7 +31,7 @@ import numpy as np
 from src.analysis.presentation.analysis_field_labels import field_label
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from matplotlib.axes import Axes
 
@@ -222,68 +222,116 @@ def _build_checkbox_group(
     options: list[str],
     defaults: list[str],
     description: str | None = None,
-    n_cols: int = 2,
+    minimum_column_width: str = "150px",
+    tooltips: Mapping[str, str] | None = None,
+    natural_width: bool = False,
+    one_per_row: bool = False,
+    fixed_columns: int | None = None,
+    fixed_item_width: str | None = None,
 ) -> _CheckboxGroupVBox:
-    """
-    Create internal generic checkbox group builder.
-
-    Parameters
-    ----------
-    options : list[str]
-        Available checkbox options.
-    defaults : list[str]
-        Options enabled by default.
-    description : str | None, optional
-        Optional group label shown above the checkboxes.
-    n_cols : int, optional
-        Number of columns for checkbox layout (default: 2).
-
-    Returns
-    -------
-    widgets.VBox
-        VBox containing the checkbox group.
-
-    Notes
-    -----
-    The returned VBox exposes a public `boxes` attribute
-    mapping option -> Checkbox widget.
-
-    """
+    """Create one compact responsive checkbox group with stable option order."""
+    tooltip_map = {} if tooltips is None else dict(tooltips)
+    unknown_tooltips = set(tooltip_map).difference(options)
+    if unknown_tooltips:
+        message = f"Checkbox tooltips contain unknown options: {sorted(unknown_tooltips)}."
+        raise ValueError(message)
+    if (fixed_columns is None) != (fixed_item_width is None):
+        message = "Fixed checkbox columns require one shared item width."
+        raise ValueError(message)
+    if fixed_columns is not None and fixed_columns < 1:
+        message = "Fixed checkbox column count must be positive."
+        raise ValueError(message)
+    if fixed_columns is not None and (natural_width or one_per_row):
+        message = "Fixed checkbox columns cannot use another flow layout."
+        raise ValueError(message)
+    if fixed_columns is not None:
+        item_layout = widgets.Layout(
+            margin="0",
+            width=fixed_item_width,
+            min_width=fixed_item_width,
+            max_width=fixed_item_width,
+            flex="0 0 auto",
+        )
+    elif one_per_row:
+        item_layout = widgets.Layout(
+            margin="0",
+            width="100%",
+            max_width="100%",
+            flex="0 0 auto",
+        )
+    elif natural_width:
+        item_layout = widgets.Layout(
+            margin="0",
+            width="auto",
+            max_width="32%",
+            flex="0 1 auto",
+        )
+    else:
+        item_layout = widgets.Layout(
+            margin="0",
+            width="auto",
+        )
     boxes = {
-        opt: widgets.Checkbox(
-            value=opt in defaults,
-            description=opt,
+        option: widgets.Checkbox(
+            value=option in defaults,
+            description=option,
+            tooltip=tooltip_map.get(option, ""),
             indent=False,
-            layout=widgets.Layout(
-                margin="0px",
-                width="auto",
-            ),
+            layout=item_layout,
             style={"description_width": "auto"},
         )
-        for opt in options
+        for option in options
     }
-
-    # -------------------------------------------------
-    # Layout: grid (e.g. p u / v |u|)
-    # -------------------------------------------------
-    grid = widgets.GridBox(
-        children=list(boxes.values()),
-        layout=widgets.Layout(
-            grid_template_columns=" ".join(["auto"] * n_cols),
-            grid_gap="0px 15px",
-        ),
-    )
-
+    if fixed_columns is not None:
+        option_container = widgets.GridBox(
+            children=tuple(boxes.values()),
+            layout=widgets.Layout(
+                align_items="flex-start",
+                grid_template_columns=f"repeat({fixed_columns}, {fixed_item_width})",
+                grid_gap="1px 2px",
+                width="max-content",
+            ),
+        )
+    elif one_per_row:
+        option_container = widgets.VBox(
+            children=tuple(boxes.values()),
+            layout=widgets.Layout(
+                align_items="flex-start",
+                grid_gap="2px",
+                width="100%",
+            ),
+        )
+    elif natural_width:
+        option_container = widgets.Box(
+            children=tuple(boxes.values()),
+            layout=widgets.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                justify_content="flex-start",
+                align_items="flex-start",
+                grid_gap="4px 6px",
+                width="100%",
+            ),
+        )
+    else:
+        option_container = widgets.GridBox(
+            children=tuple(boxes.values()),
+            layout=widgets.Layout(
+                width="100%",
+                grid_template_columns=f"repeat(auto-fit, minmax({minimum_column_width}, 1fr))",
+                grid_gap="2px 10px",
+            ),
+        )
     children: list[widgets.Widget] = []
     if description is not None:
         children.append(widgets.Label(description))
-
-    children.append(grid)
-
+    children.append(option_container)
     box = _CheckboxGroupVBox(
         children,
         layout=widgets.Layout(
-            margin="0px 0px 0px 25px",
+            width="max-content" if fixed_columns is not None else "100%",
+            margin="0",
+            align_items="flex-start",
         ),
     )
     box.boxes = boxes
@@ -520,6 +568,37 @@ def ui_radio_pred_scale_mode() -> widgets.RadioButtons:
     )
 
 
+def ui_checkbox_map_scale_lock(*, value: bool = False) -> widgets.Checkbox:
+    """Build the compact boolean map-normalization lock used by EDA."""
+    if not isinstance(value, bool):
+        message = "Map color-scale lock state must be boolean."
+        raise TypeError(message)
+    return widgets.Checkbox(
+        value=value,
+        description="Lock color scale",
+        indent=False,
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="auto"),
+    )
+
+
+def ui_toggle_map_scale_mode(
+    *,
+    value: str = "shared",
+) -> widgets.ToggleButtons:
+    """Build the shared compact map color-scale selector."""
+    if value not in {"shared", "individual"}:
+        message = "Map scale mode must be 'shared' or 'individual'."
+        raise ValueError(message)
+    return widgets.ToggleButtons(
+        options=(("Shared", "shared"), ("Individual", "individual")),
+        value=value,
+        description="Color scale:",
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="auto"),
+    )
+
+
 def ui_radio_kappa_scale() -> widgets.RadioButtons:
     """
     Radio button selector for permeability scaling.
@@ -554,19 +633,40 @@ def ui_checkbox_channels(
     *,
     channels: Sequence[str] | None = None,
     default_on: Sequence[str] | None = None,
+    labels: Mapping[str, str] | None = None,
+    natural_width: bool = False,
+    one_per_row: bool = False,
+    fixed_columns: int | None = None,
 ) -> _CheckboxGroupVBox:
-    """Build the compact multi-channel checkbox grid."""
+    """Build one compact channel checkbox group in caller-selected flow."""
     resolved = list(channels or ("p", "u", "v", "|u|"))
     defaults = list(resolved if default_on is None else default_on)
     if not resolved or not set(defaults).issubset(resolved):
         msg = "Channel checkbox defaults must be drawn from a non-empty option list."
         raise ValueError(msg)
+    visible_labels = {} if labels is None else dict(labels)
+    if not set(visible_labels).issubset(resolved):
+        msg = "Channel display labels must be keyed by available channels."
+        raise ValueError(msg)
+    if any(not isinstance(label, str) or not label or "\n" in label for label in visible_labels.values()):
+        msg = "Channel display labels must be non-empty single-line text."
+        raise ValueError(msg)
+    resolved_labels = {channel: visible_labels.get(channel, field_label(channel)) for channel in resolved}
+    fixed_item_width = None
+    if fixed_columns is not None:
+        widest_label = max(len(label) for label in resolved_labels.values())
+        fixed_item_width = f"{widest_label + 4}ch"
     group = _build_checkbox_group(
         options=resolved,
         defaults=defaults,
+        minimum_column_width="110px",
+        natural_width=natural_width,
+        one_per_row=one_per_row,
+        fixed_columns=fixed_columns,
+        fixed_item_width=fixed_item_width,
     )
     for channel, checkbox in group.boxes.items():
-        checkbox.description = field_label(channel)
+        checkbox.description = resolved_labels[channel]
     return group
 
 
@@ -574,6 +674,8 @@ def ui_checkbox_datasets(
     *,
     dataset_names: list[str],
     default_on: list[str] | None = None,
+    tooltips: Mapping[str, str] | None = None,
+    natural_width: bool = False,
 ) -> widgets.VBox:
     """
     Checkbox selector for datasets.
@@ -584,6 +686,10 @@ def ui_checkbox_datasets(
         Available dataset names.
     default_on : list[str] | None, optional
         Datasets enabled by default. Defaults to all datasets.
+    tooltips : Mapping[str, str] | None, optional
+        Canonical identity details keyed by visible dataset label.
+    natural_width : bool, optional
+        Use the left-aligned responsive wrapping selector layout.
 
     Returns
     -------
@@ -596,11 +702,14 @@ def ui_checkbox_datasets(
     mapping dataset name -> Checkbox widget.
 
     """
-    default_on = default_on or dataset_names
+    default_on = dataset_names if default_on is None else default_on
 
     return _build_checkbox_group(
         options=dataset_names,
         defaults=default_on,
+        minimum_column_width="190px",
+        tooltips=tooltips,
+        natural_width=natural_width,
     )
 
 

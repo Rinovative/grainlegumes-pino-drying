@@ -81,6 +81,19 @@ class TransientCaseArrays:
     exact_stop_state: np.ndarray | None
 
 
+@dataclass(frozen=True, slots=True)
+class TransientCaseLayout:
+    """Describe one validated canonical case timeline and learned transitions."""
+
+    time: np.ndarray
+    tolerance: float
+    configured_horizon: float
+    regular_state_count: int
+    transition_stride: int
+    exact_stop_time: float | None
+    samples: tuple[dict[str, Any], ...]
+
+
 def decode_json_string_list(value: Any, *, label: str) -> list[str]:
     """Decode one HDF5 JSON string-list attribute."""
     if isinstance(value, bytes):
@@ -551,6 +564,145 @@ def _validate_source_metadata(source: TransientSourceCase, handle: h5py.File) ->
     return profile
 
 
+def resolve_transient_case_layout(
+    handle: h5py.File,
+    path: Path,
+    *,
+    sample_id_prefix: str,
+) -> TransientCaseLayout:
+    """Validate one canonical timeline and derive its learned transitions."""
+    if not sample_id_prefix:
+        message = "Transient sample_id_prefix must be non-empty."
+        raise ValueError(message)
+    time_dataset = require_hdf5_dataset(handle, "time")
+    time = np.asarray(time_dataset, dtype=np.float64)
+    tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
+    time_unit = _text_attribute(time_dataset.attrs.get("unit"), label="time.unit")
+    if not math.isfinite(tolerance) or tolerance <= 0.0 or time_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
+        message = f"Transient time tolerance or unit is invalid: {path}."
+        raise TransientDataContractError(message)
+    configured_horizon = configured_regular_horizon(
+        handle,
+        time,
+        path=path,
+        tolerance=tolerance,
+    )
+    regular_count, transition_stride = _regular_time_contract(
+        time,
+        path=path,
+        tolerance=tolerance,
+    )
+    exact_stop_dataset = handle.get("exact_stop/time")
+    exact_stop = None
+    if exact_stop_dataset is not None:
+        if not isinstance(exact_stop_dataset, h5py.Dataset):
+            message = f"Transient exact-stop time must be a dataset: {path}."
+            raise TransientDataContractError(message)
+        exact_values = np.asarray(exact_stop_dataset, dtype=np.float64)
+        exact_unit = _text_attribute(
+            exact_stop_dataset.attrs.get("unit"),
+            label="exact_stop.time.unit",
+        )
+        if exact_values.shape != (1,) or exact_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
+            message = f"Transient exact-stop time must contain one value in the canonical unit: {path}."
+            raise TransientDataContractError(message)
+        exact_stop = float(exact_values[0])
+        if not math.isfinite(exact_stop) or exact_stop <= float(time[-1]) + tolerance or exact_stop > configured_horizon + tolerance:
+            message = f"Transient exact-stop time must follow the regular prefix within the configured horizon: {path}."
+            raise TransientDataContractError(message)
+    transient_dataset = require_hdf5_dataset(handle, "transient/fields")
+    static_dataset = require_hdf5_dataset(handle, "static/fields")
+    schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
+    scalar_dataset = require_hdf5_dataset(handle, "scalar/values")
+    transient_names = decode_json_string_list(
+        transient_dataset.attrs["field_names"],
+        label="transient.field_names",
+    )
+    static_names = decode_json_string_list(
+        static_dataset.attrs["field_names"],
+        label="static.field_names",
+    )
+    schedule_names = decode_json_string_list(
+        schedule_dataset.attrs["field_names"],
+        label="schedule.field_names",
+    )
+    scalar_names = decode_json_string_list(
+        scalar_dataset.attrs["field_names"],
+        label="scalar.field_names",
+    )
+    if transient_names != list(_SOURCE_TRANSIENT_FIELDS):
+        message = f"Transient fields are not canonical: {path}."
+        raise TransientDataContractError(message)
+    required_static = {field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning}.difference({"x", "y"})
+    if not required_static.issubset(static_names):
+        message = f"Transient static conditioning is incomplete: {path}."
+        raise TransientDataContractError(message)
+    if schedule_names != list(_SOURCE_SCHEDULE_FIELDS) or scalar_names != list(_SOURCE_SCALAR_FIELDS):
+        message = f"Transient boundary or scalar conditioning is not canonical: {path}."
+        raise TransientDataContractError(message)
+    schedule_time = np.asarray(
+        schedule_dataset[:, schedule_names.index("t")],
+        dtype=np.float64,
+    )
+    boundary_handoff = json.loads(
+        _text_attribute(
+            schedule_dataset.attrs.get("boundary_handoff"),
+            label="schedule.boundary_handoff",
+        )
+    )
+    startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
+    if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
+        message = f"Transient schedule lacks startup-handoff provenance: {path}."
+        raise TransientDataContractError(message)
+    startup_duration = startup.get("duration_h")
+    if isinstance(startup_duration, bool) or not isinstance(startup_duration, (int, float)) or not math.isfinite(float(startup_duration)):
+        message = f"Transient schedule startup duration is invalid: {path}."
+        raise TransientDataContractError(message)
+    startup_time = float(startup_duration)
+    samples: list[dict[str, Any]] = []
+    for time_index in range(
+        0,
+        max(regular_count - transition_stride, 0),
+        transition_stride,
+    ):
+        t_n = float(time[time_index])
+        t_np1 = float(time[time_index + transition_stride])
+        current = np.flatnonzero(np.isclose(schedule_time, t_n, rtol=0.0, atol=tolerance))
+        following = np.flatnonzero(np.isclose(schedule_time, t_np1, rtol=0.0, atol=tolerance))
+        if current.size != 1 or following.size != 1:
+            message = f"Schedule lacks exact endpoints for transition {t_n} -> {t_np1} h: {path}."
+            raise TransientDataContractError(message)
+        support_index: int | None = None
+        if startup["enabled"] and t_n + tolerance < startup_time < t_np1 - tolerance:
+            support = np.flatnonzero(np.isclose(schedule_time, startup_time, rtol=0.0, atol=tolerance))
+            if support.size != 1:
+                message = f"Schedule lacks its startup support for transition {t_n} -> {t_np1} h: {path}."
+                raise TransientDataContractError(message)
+            support_index = int(support[0])
+        samples.append(
+            {
+                "sample_id": f"{sample_id_prefix}__step_{time_index:04d}",
+                "time_index_n": time_index,
+                "time_index_n_plus_1": time_index + transition_stride,
+                "schedule_index_n": int(current[0]),
+                "schedule_index_n_plus_1": int(following[0]),
+                "schedule_support_index": support_index,
+            }
+        )
+    if not samples:
+        message = f"Transient source has no complete one-hour transition: {path}."
+        raise TransientDataContractError(message)
+    return TransientCaseLayout(
+        time=np.ascontiguousarray(time),
+        tolerance=tolerance,
+        configured_horizon=configured_horizon,
+        regular_state_count=regular_count,
+        transition_stride=transition_stride,
+        exact_stop_time=exact_stop,
+        samples=tuple(samples),
+    )
+
+
 def _case_record(
     source: TransientSourceCase,
     *,
@@ -571,103 +723,18 @@ def _case_record(
         raise TransientDataContractError(message)
     with h5py.File(path, "r") as handle:
         profile = _validate_source_metadata(source, handle)
-        time_dataset = require_hdf5_dataset(handle, "time")
-        time = np.asarray(time_dataset, dtype=np.float64)
-        tolerance = float(time_dataset.attrs.get("classification_atol", math.nan))
-        time_unit = _text_attribute(time_dataset.attrs.get("unit"), label="time.unit")
-        if not math.isfinite(tolerance) or tolerance <= 0.0 or time_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
-            message = f"Transient time tolerance or unit is invalid: {path}."
-            raise TransientDataContractError(message)
-        configured_horizon = configured_regular_horizon(
+        layout = resolve_transient_case_layout(
             handle,
-            time,
-            path=path,
-            tolerance=tolerance,
+            path,
+            sample_id_prefix=source.package_case_id,
         )
-        regular_count, transition_stride = _regular_time_contract(
-            time,
-            path=path,
-            tolerance=tolerance,
-        )
-        exact_stop_dataset = handle.get("exact_stop/time")
-        exact_stop = None
-        if exact_stop_dataset is not None:
-            if not isinstance(exact_stop_dataset, h5py.Dataset):
-                message = f"Transient exact-stop time must be a dataset: {path}."
-                raise TransientDataContractError(message)
-            exact_values = np.asarray(exact_stop_dataset, dtype=np.float64)
-            exact_unit = _text_attribute(exact_stop_dataset.attrs.get("unit"), label="exact_stop.time.unit")
-            if exact_values.shape != (1,) or exact_unit != transient_contract.TRANSIENT_STEP_CONTRACT.time_unit:
-                message = f"Transient exact-stop time must contain one value in the canonical unit: {path}."
-                raise TransientDataContractError(message)
-            exact_stop = float(exact_values[0])
-            if not math.isfinite(exact_stop) or exact_stop <= float(time[-1]) + tolerance or exact_stop > configured_horizon + tolerance:
-                message = f"Transient exact-stop time must follow the regular prefix within the configured horizon: {path}."
-                raise TransientDataContractError(message)
-        transient_dataset = require_hdf5_dataset(handle, "transient/fields")
-        static_dataset = require_hdf5_dataset(handle, "static/fields")
-        schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
-        scalar_dataset = require_hdf5_dataset(handle, "scalar/values")
-        transient_names = decode_json_string_list(transient_dataset.attrs["field_names"], label="transient.field_names")
-        static_names = decode_json_string_list(static_dataset.attrs["field_names"], label="static.field_names")
-        schedule_names = decode_json_string_list(schedule_dataset.attrs["field_names"], label="schedule.field_names")
-        scalar_names = decode_json_string_list(scalar_dataset.attrs["field_names"], label="scalar.field_names")
-        if transient_names != list(_SOURCE_TRANSIENT_FIELDS):
-            message = f"Transient fields are not canonical: {path}."
-            raise TransientDataContractError(message)
-        required_static = {field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning}.difference({"x", "y"})
-        if not required_static.issubset(static_names):
-            message = f"Transient static conditioning is incomplete: {path}."
-            raise TransientDataContractError(message)
-        if schedule_names != list(_SOURCE_SCHEDULE_FIELDS) or scalar_names != list(_SOURCE_SCALAR_FIELDS):
-            message = f"Transient boundary or scalar conditioning is not canonical: {path}."
-            raise TransientDataContractError(message)
-        schedule_time = np.asarray(schedule_dataset[:, schedule_names.index("t")], dtype=np.float64)
-        boundary_handoff = json.loads(
-            _text_attribute(
-                schedule_dataset.attrs.get("boundary_handoff"),
-                label="schedule.boundary_handoff",
-            )
-        )
-        startup = boundary_handoff.get("startup_ramp") if isinstance(boundary_handoff, dict) else None
-        if not isinstance(startup, dict) or not isinstance(startup.get("enabled"), bool):
-            message = f"Transient schedule lacks startup-handoff provenance: {path}."
-            raise TransientDataContractError(message)
-        startup_duration = startup.get("duration_h")
-        if isinstance(startup_duration, bool) or not isinstance(startup_duration, (int, float)) or not math.isfinite(float(startup_duration)):
-            message = f"Transient schedule startup duration is invalid: {path}."
-            raise TransientDataContractError(message)
-        startup_time = float(startup_duration)
-        samples: list[dict[str, Any]] = []
-        for time_index in range(0, max(regular_count - transition_stride, 0), transition_stride):
-            t_n = float(time[time_index])
-            t_np1 = float(time[time_index + transition_stride])
-            current = np.flatnonzero(np.isclose(schedule_time, t_n, rtol=0.0, atol=tolerance))
-            following = np.flatnonzero(np.isclose(schedule_time, t_np1, rtol=0.0, atol=tolerance))
-            if current.size != 1 or following.size != 1:
-                message = f"Schedule lacks exact endpoints for transition {t_n} -> {t_np1} h: {path}."
-                raise TransientDataContractError(message)
-            support_index: int | None = None
-            if startup["enabled"] and t_n + tolerance < startup_time < t_np1 - tolerance:
-                support = np.flatnonzero(np.isclose(schedule_time, startup_time, rtol=0.0, atol=tolerance))
-                if support.size != 1:
-                    message = f"Schedule lacks its startup support for transition {t_n} -> {t_np1} h: {path}."
-                    raise TransientDataContractError(message)
-                support_index = int(support[0])
-            samples.append(
-                {
-                    "sample_id": f"{source.package_case_id}__step_{time_index:04d}",
-                    "time_index_n": time_index,
-                    "time_index_n_plus_1": time_index + transition_stride,
-                    "schedule_index_n": int(current[0]),
-                    "schedule_index_n_plus_1": int(following[0]),
-                    "schedule_support_index": support_index,
-                }
-            )
-    if not samples:
-        message = f"Transient source has no complete one-hour transition: {path}."
-        raise TransientDataContractError(message)
-    status = _status_evidence(path, time, exact_stop, tolerance=tolerance)
+    status = _status_evidence(
+        path,
+        layout.time,
+        layout.exact_stop_time,
+        tolerance=layout.tolerance,
+    )
+    samples = [dict(sample) for sample in layout.samples]
     record = {
         "package_case_id": source.package_case_id,
         "source_relative_path": _safe_relative_source(path, source_root),
@@ -683,13 +750,13 @@ def _case_record(
         "ood_group": source.ood_group,
         "ood_parameters": list(source.ood_parameters),
         "ood_evidence": deepcopy(source.ood_evidence),
-        "sequence_length": regular_count,
-        "stored_state_count": int(time.size + (exact_stop is not None)),
+        "sequence_length": layout.regular_state_count,
+        "stored_state_count": int(layout.time.size + (layout.exact_stop_time is not None)),
         "transition_count": len(samples),
         "t_stop_exact": status["t_stop_exact"],
-        "irregular_stop_time": exact_stop,
+        "irregular_stop_time": layout.exact_stop_time,
     }
-    return record, samples, configured_horizon
+    return record, samples, layout.configured_horizon
 
 
 def _index_digest_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

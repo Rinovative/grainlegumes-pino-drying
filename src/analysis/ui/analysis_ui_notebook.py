@@ -28,10 +28,51 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import pandas as pd
 from IPython.display import clear_output, display
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
 COMPACT_VIEW_SELECTOR_WIDTH_PX = 230
 STANDARD_VIEW_SELECTOR_WIDTH_PX = 360
+
+
+class _DropdownSectionVBox(widgets.VBox):
+    """Expose lifecycle deactivation for the currently rendered dropdown view."""
+
+    def __init__(
+        self,
+        children: Sequence[widgets.Widget],
+        *,
+        activate: Callable[[], None],
+        deactivate: Callable[[], None],
+    ) -> None:
+        """Retain normal section construction beside lifecycle callbacks."""
+        super().__init__(children=tuple(children))
+        self._activate_callback = activate
+        self._deactivate_callback = deactivate
+
+    def activate(self) -> None:
+        """Reactivate the currently rendered view after it becomes visible."""
+        self._activate_callback()
+
+    def deactivate(self) -> None:
+        """Deactivate the currently rendered view before it is hidden."""
+        self._deactivate_callback()
+
+
+def _activate_result(result: Any) -> None:
+    """Invoke one explicit activation hook when the result provides it."""
+    primary = result[0] if isinstance(result, tuple) and result else result
+    activate = getattr(primary, "activate", None)
+    if callable(activate):
+        activate()
+
+
+def _deactivate_result(result: Any) -> None:
+    """Invoke one explicit deactivation hook when the result provides it."""
+    primary = result[0] if isinstance(result, tuple) and result else result
+    deactivate = getattr(primary, "deactivate", None)
+    if callable(deactivate):
+        deactivate()
 
 
 def _sanitize_name(name: str) -> str:
@@ -125,6 +166,15 @@ def make_dropdown_section(
     )
     output = widgets.Output()
     last_idx: dict[str, int | None] = {"idx": None}
+    active_result: dict[str, Any] = {"value": None}
+
+    def activate_current() -> None:
+        """Refresh the cached current view against shared state when visible."""
+        _activate_result(active_result["value"])
+
+    def deactivate_current() -> None:
+        """Stop active view resources without discarding cached widget state."""
+        _deactivate_result(active_result["value"])
 
     def on_plot_change(change: dict) -> None:
         """
@@ -137,9 +187,11 @@ def make_dropdown_section(
         idx = change["new"]
         if last_idx["idx"] == idx:
             return
+        deactivate_current()
         if idx == -1:
             if export_state is not None:
                 export_state["fig"] = None
+                export_state["figures"] = ()
                 export_state["plot_name"] = None
                 export_state["title"] = None
             with output:
@@ -148,7 +200,6 @@ def make_dropdown_section(
             return
 
         title, plot_func, plot_name = plots[idx]
-
         with output:
             output.clear_output(wait=True)
 
@@ -157,6 +208,7 @@ def make_dropdown_section(
                 if isinstance(previous, Figure):
                     plt.close(previous)
                 export_state["fig"] = None
+                export_state["figures"] = ()
                 export_state["plot_name"] = plot_name
                 export_state["title"] = title
 
@@ -166,6 +218,7 @@ def make_dropdown_section(
                 export_plot_name=plot_name,
                 export_title=title,
             )
+            active_result["value"] = result
             if isinstance(result, tuple):
                 result = result[0]
 
@@ -189,7 +242,11 @@ def make_dropdown_section(
 
     dropdown.observe(on_plot_change, names="value")
 
-    return widgets.VBox([dropdown, output])
+    return _DropdownSectionVBox(
+        (dropdown, output),
+        activate=activate_current,
+        deactivate=deactivate_current,
+    )
 
 
 def make_toggle_shortcut(
@@ -257,155 +314,256 @@ def make_toggle_shortcut(
     return toggle
 
 
-def make_lazy_panel_with_tabs(
+class LazyTabbedPanelOutput(widgets.Output):
+    """Expose controlled replacement of one lazy tab collection."""
+
+    def __init__(self) -> None:
+        """Initialize before the panel factory binds its replacement callback."""
+        super().__init__()
+        self._replace_tabs_callback: (
+            Callable[
+                [Sequence[widgets.Widget], Sequence[str]],
+                None,
+            ]
+            | None
+        ) = None
+        self.tabs: widgets.Tab | None = None
+
+    def bind_tab_replacement(
+        self,
+        callback: Callable[[Sequence[widgets.Widget], Sequence[str]], None],
+    ) -> None:
+        """Bind the sole panel-owned section replacement callback."""
+        if self._replace_tabs_callback is not None:
+            message = "Lazy panel tab replacement is already initialized."
+            raise RuntimeError(message)
+        self._replace_tabs_callback = callback
+
+    def replace_tabs(
+        self,
+        sections: Sequence[widgets.Widget],
+        tab_titles: Sequence[str],
+    ) -> None:
+        """Replace visible sections without rebuilding the panel."""
+        if self._replace_tabs_callback is None:
+            message = "Lazy panel tab replacement is not initialized."
+            raise RuntimeError(message)
+        self._replace_tabs_callback(sections, tab_titles)
+
+
+def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
     sections: Sequence[widgets.Widget],
     tab_titles: Sequence[str] | None = None,
     open_btn_text: str = "Open section",
     close_btn_text: str = "Close",
     *,
+    panel_controls: Sequence[widgets.Widget] = (),
     export_state: dict | None = None,
     export_dir: str = "exports",
     export_btn_text: str = "Export PDF",
-) -> widgets.Output:
-    """
-    Build a collapsible tab panel with optional current-figure PDF export.
+) -> LazyTabbedPanelOutput:
+    """Build one collapsible, replaceable lazy tab panel with PDF export."""
+    current_sections = list(sections)
+    titles = list(tab_titles) if tab_titles is not None else [f"Tab {index + 1}" for index in range(len(current_sections))]
+    if not current_sections or len(titles) != len(current_sections):
+        message = "Lazy panels require matching non-empty sections and tab titles."
+        raise ValueError(message)
 
-    Parameters
-    ----------
-    sections : Sequence[ipywidgets.Widget]
-        Already constructed tab contents. Scientific views inside them may remain
-        lazy according to their own dropdown/viewer contract.
-    tab_titles : Sequence[str] | None, optional
-        Tab labels, or generated ``Tab N`` names when omitted.
-    open_btn_text, close_btn_text : str, optional
-        Labels for panel visibility controls.
-    export_state : dict | None, optional
-        Shared mutable mapping expected to contain ``fig`` and optional
-        ``plot_name`` for the current Matplotlib export target.
-    export_dir : str, optional
-        Directory created on export. An empty string resolves to the process
-        working directory.
-    export_btn_text : str, optional
-        PDF-export button label.
+    main_out = LazyTabbedPanelOutput()
+    open_btn = widgets.Button(
+        description=open_btn_text,
+        button_style="primary",
+        layout=widgets.Layout(width="auto"),
+    )
+    close_btn = widgets.Button(
+        description=close_btn_text,
+        button_style="danger",
+        layout=widgets.Layout(width="145px"),
+    )
+    tabs = widgets.Tab(children=tuple(current_sections))
+    main_out.tabs = tabs
 
-    Returns
-    -------
-    ipywidgets.Output
-        Output initially displaying only the open button.
+    def set_titles(values: Sequence[str]) -> None:
+        """Install one exact title for each current section."""
+        if len(values) != len(tabs.children):
+            message = "Tab titles must match the current section count."
+            raise ValueError(message)
+        for index, value in enumerate(values):
+            tabs.set_title(index, value)
 
-    Notes
-    -----
-    Opening/closing replaces notebook output but preserves tab/widget state.
-    Export is user-triggered, creates the directory, and writes a UTC-timestamped
-    PDF from the current figure. Missing state is reported without writing.
-
-    """
-    main_out = widgets.Output()
-    open_btn = widgets.Button(description=open_btn_text, button_style="primary", layout=widgets.Layout(width="auto"))
-    close_btn = widgets.Button(description=close_btn_text, button_style="danger", layout=widgets.Layout(width="145px"))
-
-    tabs = widgets.Tab(children=sections)
-    if tab_titles is not None:
-        for i, title in enumerate(tab_titles):
-            tabs.set_title(i, title)
-    else:
-        for i in range(len(sections)):
-            tabs.set_title(i, f"Tab {i + 1}")
-
-    status_out = widgets.Output()
-
+    set_titles(titles)
+    status_out = widgets.Output(
+        layout=widgets.Layout(
+            display="none",
+            flex="0 0 auto",
+        )
+    )
     export_btn = widgets.Button(
         description=export_btn_text,
         button_style="success",
         layout=widgets.Layout(width="145px"),
     )
 
-    def do_export(_: None = None) -> None:
-        """
-        Write the current export figure to a UTC-timestamped PDF on button click.
-
-        Directory creation and file publication occur only when shared state holds
-        a figure. Otherwise the callback reports status without filesystem writes.
-        """
+    def do_export(_: object = None) -> None:
+        """Write the current single- or multi-page figure bundle to PDF."""
+        status_out.layout.display = "block"
         with status_out:
             status_out.clear_output(wait=True)
-
             if export_state is None:
                 print("[Export] Export is unavailable for this panel.")
                 return
-
-            fig = export_state.get("fig", None)
-            if fig is None:
+            primary = export_state.get("fig")
+            bundled = export_state.get("figures")
+            figures = tuple(figure for figure in bundled if isinstance(figure, Figure)) if isinstance(bundled, (list, tuple)) else ()
+            if not figures and isinstance(primary, Figure):
+                figures = (primary,)
+            if not figures:
                 print("[Export] No figure is selected. Render a plot first.")
                 return
-
             out_dir = Path(export_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-
             stem = export_state.get("plot_name") or "plot"
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"{stem}_{ts}.pdf"
-
-            fig.savefig(out_path, bbox_inches="tight")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            out_path = out_dir / f"{stem}_{timestamp}.pdf"
+            if len(figures) == 1:
+                figures[0].savefig(out_path, bbox_inches="tight")
+            else:
+                with PdfPages(out_path) as pdf:
+                    for figure in figures:
+                        pdf.savefig(figure, bbox_inches="tight")
             print(f"[Export] Saved: {out_path}")
 
     export_btn.on_click(do_export)
+    header = widgets.HBox((close_btn, export_btn))
+    controls_box = widgets.VBox(tuple(panel_controls))
+    panel_children: list[widgets.Widget] = [header]
+    if panel_controls:
+        panel_children.append(controls_box)
+    panel_children.extend((status_out, tabs))
+    panel = widgets.VBox(tuple(panel_children))
+    initialized_sections: set[int] = set()
+    section_export_states: dict[int, dict[str, Any]] = {}
+    expanded = {"value": False}
 
-    header = widgets.HBox([close_btn, export_btn])
-    panel = widgets.VBox([header, status_out, tabs])
+    def current_section(index: int | None) -> widgets.Widget | None:
+        """Resolve one current section index without stale-list assumptions."""
+        if index is None or not 0 <= index < len(current_sections):
+            return None
+        return current_sections[index]
 
-    initialized_tabs: set[int] = set()
-    tab_export_states = [{"fig": None, "plot_name": None, "title": None} for _ in sections]
-
-    def _snapshot_tab(index: int | None) -> None:
-        """Preserve the current view's export target before it is hidden."""
-        if export_state is None or index is None or not 0 <= index < len(tab_export_states):
+    def snapshot_section(index: int | None) -> None:
+        """Preserve one section's current export target before hiding it."""
+        section = current_section(index)
+        if export_state is None or section is None:
             return
-        tab_export_states[index] = {
+        section_export_states[id(section)] = {
             "fig": export_state.get("fig"),
+            "figures": export_state.get("figures", ()),
             "plot_name": export_state.get("plot_name"),
             "title": export_state.get("title"),
         }
 
+    def deactivate_section(index: int | None) -> None:
+        """Deactivate one visible section before tab replacement."""
+        section = current_section(index)
+        deactivate = None if section is None else getattr(section, "deactivate", None)
+        if callable(deactivate):
+            deactivate()
+
     def activate_selected_view(_: object = None) -> None:
-        """Render a tab's first view once, or restore its preserved export target."""
+        """Initialize or reactivate the currently selected lazy section."""
         selected_index = tabs.selected_index
-        if selected_index is None:
+        section = current_section(selected_index)
+        if section is None:
             return
-        section_children = getattr(sections[selected_index], "children", ())
+        section_children = getattr(section, "children", ())
         if not section_children or not isinstance(section_children[0], widgets.Dropdown):
             return
+        section_id = id(section)
         dropdown = section_children[0]
-        if selected_index not in initialized_tabs:
+        if section_id not in initialized_sections:
             if dropdown.index is None and dropdown.options:
                 dropdown.index = 0
-            initialized_tabs.add(selected_index)
-            _snapshot_tab(selected_index)
+            initialized_sections.add(section_id)
+            snapshot_section(selected_index)
             return
         if export_state is not None:
-            export_state.update(tab_export_states[selected_index])
+            export_state.update(
+                section_export_states.get(
+                    section_id,
+                    {
+                        "fig": None,
+                        "figures": (),
+                        "plot_name": None,
+                        "title": None,
+                    },
+                )
+            )
+        activate = getattr(section, "activate", None)
+        if callable(activate):
+            activate()
+        snapshot_section(selected_index)
 
-    def show_panel(_: None = None) -> None:
-        """Display the expanded panel with the active tab already rendered."""
-        _snapshot_tab(tabs.selected_index)
+    def show_panel(_: object = None) -> None:
+        """Display the expanded panel and activate its selected view."""
+        expanded["value"] = True
+        snapshot_section(tabs.selected_index)
         activate_selected_view()
         with main_out:
             clear_output()
             display(panel)
 
-    def show_open(_: None = None) -> None:
-        """Display the collapsed open button without discarding tab state."""
-        _snapshot_tab(tabs.selected_index)
+    def show_open(_: object = None) -> None:
+        """Display only the established collapsed open button."""
+        expanded["value"] = False
+        snapshot_section(tabs.selected_index)
+        deactivate_section(tabs.selected_index)
         with main_out:
             clear_output()
             display(open_btn)
 
     def on_tab_change(change: dict[str, object]) -> None:
-        """Snapshot the hidden tab and immediately initialize or restore the new tab."""
+        """Deactivate the hidden section and activate the newly selected one."""
         old_index = change.get("old")
-        _snapshot_tab(old_index if isinstance(old_index, int) else None)
-        activate_selected_view()
+        previous = old_index if isinstance(old_index, int) else None
+        snapshot_section(previous)
+        deactivate_section(previous)
+        if expanded["value"]:
+            activate_selected_view()
 
+    def replace_tabs(
+        replacement_sections: Sequence[widgets.Widget],
+        replacement_titles: Sequence[str],
+    ) -> None:
+        """Swap visible sections while preserving cached view state."""
+        resolved_sections = list(replacement_sections)
+        resolved_titles = list(replacement_titles)
+        if not resolved_sections or len(resolved_sections) != len(resolved_titles):
+            message = "Replacement tabs require matching non-empty sections and titles."
+            raise ValueError(message)
+        snapshot_section(tabs.selected_index)
+        deactivate_section(tabs.selected_index)
+        tabs.unobserve(on_tab_change, names="selected_index")
+        try:
+            current_sections[:] = resolved_sections
+            tabs.children = tuple(resolved_sections)
+            set_titles(resolved_titles)
+            tabs.selected_index = 0
+        finally:
+            tabs.observe(on_tab_change, names="selected_index")
+        if export_state is not None:
+            export_state.update(
+                {
+                    "fig": None,
+                    "figures": (),
+                    "plot_name": None,
+                    "title": None,
+                }
+            )
+        if expanded["value"]:
+            activate_selected_view()
+
+    main_out.bind_tab_replacement(replace_tabs)
     tabs.observe(on_tab_change, names="selected_index")
     open_btn.on_click(show_panel)
     close_btn.on_click(show_open)

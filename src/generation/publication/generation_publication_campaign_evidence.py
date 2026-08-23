@@ -512,10 +512,15 @@ def _validate_admission_reservations_for_campaign(
 
 def current_campaign_from_manifest(
     manifest: Mapping[str, Any],
+    *,
+    require_executable: bool = True,
 ) -> config_service.CampaignConfig:
-    """Resolve the current package requests over one unchanged simulation plan."""
+    """Resolve current package requests over one unchanged simulation plan."""
     config_path = resolve_campaign_config_path(manifest["campaign_config"])
-    campaign = config_service.load_campaign_config(config_path)
+    campaign = config_service.load_campaign_config(
+        config_path,
+        require_executable=require_executable,
+    )
     campaign = campaign.select_batches(tuple(manifest["selected_batch_names"]))
     if (
         campaign.campaign_id != manifest["campaign_id"]
@@ -531,9 +536,14 @@ def current_campaign_from_manifest(
 
 def campaign_from_manifest(
     manifest: Mapping[str, Any],
+    *,
+    require_executable: bool = True,
 ) -> config_service.CampaignConfig:
-    """Resolve the launch-time package snapshot for ordinary run continuation."""
-    campaign = current_campaign_from_manifest(manifest)
+    """Resolve the launch-time package snapshot for run continuation or inspection."""
+    campaign = current_campaign_from_manifest(
+        manifest,
+        require_executable=require_executable,
+    )
     snapshot = manifest.get("dataset_packages")
     if not isinstance(snapshot, list) or not all(isinstance(package, dict) for package in snapshot):
         message = "Campaign-run Dataset package snapshot is malformed."

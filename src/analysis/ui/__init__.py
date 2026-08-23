@@ -4,7 +4,9 @@ Reusable notebook controls, viewers, and panel composition.
 Provides:
 - components: shared widget controls and display components
 - notebook: notebook-panel construction utilities
+- plot_layout: shared physical-map and colorbar presentation
 - tables: styled analysis-table presentation
+- time: exact stored-time navigation and lifecycle controls
 - viewers: interactive field and case viewers
 """
 
@@ -16,16 +18,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import analysis_ui_components as components
     from . import analysis_ui_notebook as notebook
+    from . import analysis_ui_plot_layout as plot_layout
     from . import analysis_ui_tables as tables
+    from . import analysis_ui_time as time
     from . import analysis_ui_viewers as viewers
 
 _MODULES = {
     "components": "analysis_ui_components",
     "notebook": "analysis_ui_notebook",
+    "plot_layout": "analysis_ui_plot_layout",
     "tables": "analysis_ui_tables",
+    "time": "analysis_ui_time",
     "viewers": "analysis_ui_viewers",
 }
-__all__ = ["components", "notebook", "tables", "viewers"]
+__all__ = ["components", "notebook", "plot_layout", "tables", "time", "viewers"]
 
 
 def __getattr__(name: str) -> object:

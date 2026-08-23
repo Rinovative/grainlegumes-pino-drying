@@ -8,10 +8,11 @@ independent run bundles under `03_experiments/transient_drying`, and remains
 usable when the original CPU Generation workspace has been deleted.
 
 This workflow owns Training, Optuna, checkpoint/resume, W&B telemetry, matched
-compute, and inference loading. Transient EDA, Evaluation, and post-training
-artifact generation are not implemented yet. The training CLI reports that
-limitation after a successful transient run instead of invoking the steady-flow
-artifact builder.
+compute, and inference loading. Completed-output transient EDA is implemented
+against admitted Generation evidence and validated Dataset runtime items.
+Transient Evaluation and post-training Evaluation artifact generation are not
+implemented yet. The training CLI still reports that limitation after a
+successful transient run instead of invoking the steady-flow artifact builder.
 
 ## Maintained experiment plans
 
@@ -233,6 +234,64 @@ central metrics, budget evidence, throughput, and memory are mapped into
 telemetry. Local configs, summaries, histories, checkpoints, handoffs, and study
 storage remain authoritative; W&B is an observer, not the persistence owner.
 
+## Completed-output EDA
+
+`notebooks/eda.ipynb` is the maintained generated-output entry point. One
+workspace exposes `steady_flow` and `transient_drying` through the same
+capability-adaptive panel with no task selector. Discovery includes compatible
+terminal batches and independently valid completed cases from partial, failed,
+or active campaigns. The notebook remains bounded by `MAX_CASES`, performs no
+Training or inference, and stores no generated output.
+
+The completed-output loader preserves strict terminal-batch admission. For
+non-terminal campaigns it uses Generation-owned full case validation, including
+source and output hashes, before exposing:
+
+- all four absolute physical states in canonical order: `T`, `phi`, `w_surf`,
+  and `w_int`;
+- retained Training static fields and clearly classified archive-only fields;
+- complete inlet schedules plus both endpoints and optional startup support for
+  every learned interval;
+- realized completed-case material-conditioning parameters;
+- regular physical state times and a separately labelled diagnostic exact-stop
+  state;
+- canonical target attainment, right censoring, physical drying duration,
+  reached-only time to target, and signed final gap
+  `f_wet_dm_final - f_wet_dm_max`, where positive means still too wet;
+- COMSOL process and available operational timing as metadata, kept separate
+  from physical duration and scientific Dataset identity.
+
+Spatial state views offer only exact available physical times and never select a
+nearest output. Dynamic channel selectors default to all compatible states in
+canonical order, with separate axes and units. Full trajectories use physical
+time on the horizontal axis and static views have no time control. The target
+summary states that reached and unreached percentages use valid completed cases
+as their denominator; unreached cases receive no fabricated target time.
+
+Canonical Generation HDF5 is the completed-case scientific and completion
+authority. The semantic runtime-item adapter produces the same state, static,
+boundary, scalar, and time views from canonical HDF5 and validated PT shards.
+Missing PT shards never hide valid HDF5 science, and PT-backed semantic EDA does
+not reopen a deleted source HDF5. Full Generation schedules, global series,
+target status, and runtime remain explicitly unavailable when a runtime item did
+not persist them.
+
+The reusable API is under `src.analysis.eda.transient`; the notebook delegates
+field discovery, exact-time selection, trajectory reductions, schedule and
+parameter tables, target diagnostics, and runtime tables to that owner. The
+Generation timing loader owns `timing.json` and `status.json` admission. EDA does
+not parse those files, solver logs, scheduler text, or `sacct` output.
+
+### Prioritized future plot recommendations
+
+| Priority | Scientific question | Required fields | Required reduction | Current availability | Owner | Reason not implemented |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | How does target-attainment probability evolve under right censoring? | Canonical target state, physical duration, reached-only target time, material metadata | Kaplan-Meier or another explicitly selected censoring-aware estimator with uncertainty | Case evidence is available; estimator policy is not selected | Completed-output EDA | The mandatory diagnostic reports truthful counts and reached-only quantiles; choosing a survival estimator and confidence method requires a separate scientific decision. |
+| 2 | Which spatial modes dominate each transient state over physical time? | One dynamic state at a time, coordinates, exact state times, valid masks | Per-channel time-aligned POD/SVD with an explicit weighting and centering contract | State evidence is available from HDF5/PT | Completed-output EDA | Cross-channel raw-unit decomposition would be invalid, and a maintained weighting/centering choice has not been established. |
+| 3 | How do schedule changes precede moisture and thermal response? | Complete `T_in_bc`/`omega_in_bc` schedules, state/global trajectories, startup support | Physically aligned lag or impulse-response summary with censoring disclosure | Complete evidence is available only in canonical completed-case HDF5 | Completed-output EDA | A defensible lag window and causal interpretation are not yet defined; a generic correlation plot would overstate the evidence. |
+| 4 | Which Generation phase drives computational cost? | Stationary-airflow, transient-drying, scientific-solver, queue, licence, and end-to-end timing | Per-component distributions and correlations against case metadata | Component fields are explicitly unavailable in current persisted timing | Generation for persistence; EDA for later presentation | EDA must not infer component timing from logs or scheduler text. |
+
+
 ## Inference
 
 A completed transient run can be reconstructed without reopening its Dataset:
@@ -258,7 +317,7 @@ claiming a speedup.
 
 ## Current limitations
 
-- Transient EDA and Evaluation are intentionally not implemented in this change.
+- Transient Evaluation and post-training Evaluation artifacts are not yet implemented.
 - The steady-flow artifact builder does not consume transient runs.
 - Production scientific hyperparameters and Dataset names remain mutable config
   choices; inspect the resolved run config rather than treating this guide as a

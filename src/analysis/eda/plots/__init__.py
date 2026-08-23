@@ -4,6 +4,7 @@ Scientific plots for exploratory generated-data analysis.
 Provides:
 - case_statistics: case-level parameter and field-statistic plots
 - spectral: isotropic, directional, and evolution spectrum plots
+- transient: physical-time, schedule, and consolidated completion diagnostics
 """
 
 from __future__ import annotations
@@ -14,12 +15,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import eda_plot_case_statistics as case_statistics
     from . import eda_plot_spectral_analysis as spectral
+    from . import eda_plot_transient as transient
 
 _MODULES = {
     "case_statistics": "eda_plot_case_statistics",
     "spectral": "eda_plot_spectral_analysis",
+    "transient": "eda_plot_transient",
 }
-__all__ = ["case_statistics", "spectral"]
+__all__ = ["case_statistics", "spectral", "transient"]
 
 
 def __getattr__(name: str) -> object:

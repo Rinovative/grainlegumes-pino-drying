@@ -84,6 +84,7 @@ def render_figure(
         if isinstance(previous, Figure):
             plt.close(previous)
         export_state["fig"] = None
+        export_state["figures"] = ()
         export_state["plot_name"] = export_plot_name
         export_state["title"] = export_title
 
@@ -102,6 +103,7 @@ def render_figure(
         if fig is not None:
             if export_state is not None:
                 export_state["fig"] = fig
+                export_state["figures"] = (fig,)
 
             display(fig)
             plt.close(fig)

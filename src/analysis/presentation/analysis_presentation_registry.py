@@ -1,7 +1,7 @@
 """
 analysis_presentation_registry.py
 
-Declare user-facing EDA section and plot presentation order.
+Declare capability-aware user-facing EDA section and plot presentation order.
 
 Responsibilities:
   - Keep section keys, tab names, plot keys, and display names reviewable together
@@ -40,6 +40,8 @@ class PlotPresentation:
         Stable callable-registry identifier. Numbering never participates.
     name : str
         Human-readable name before hierarchical numbering is derived.
+    required_capabilities : frozenset[str], optional
+        Scientific capabilities a selected dataset must provide for visibility.
 
     Notes
     -----
@@ -49,6 +51,7 @@ class PlotPresentation:
 
     key: str
     name: str
+    required_capabilities: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -81,21 +84,93 @@ EDA_SECTIONS = (
         key="metadata_fields",
         name="Metadata & field statistics",
         plots=(
-            PlotPresentation("metadata_statistics", "Metadata statistics"),
-            PlotPresentation("parameter_distributions", "Parameter distributions"),
-            PlotPresentation("field_value_distributions", "Field value distributions"),
+            PlotPresentation(
+                "metadata_statistics",
+                "Generated case parameters",
+                frozenset({"generated_output"}),
+            ),
+            PlotPresentation(
+                "parameter_distributions",
+                "Scalar material conditioning",
+                frozenset({"generated_output"}),
+            ),
+            PlotPresentation(
+                "field_value_distributions",
+                "Field value distributions",
+                frozenset({"spatial_fields"}),
+            ),
+            PlotPresentation(
+                "spatial_field_maps",
+                "Retained spatial fields",
+                frozenset({"spatial_fields"}),
+            ),
         ),
     ),
     SectionPresentation(
         key="spectral_analysis",
         name="Spectral analysis",
         plots=(
-            PlotPresentation("isotropic_spectra", "Isotropic spectra and cumulative energy"),
-            PlotPresentation("directional_spectra", "Flow and cross-stream directional spectra"),
-            PlotPresentation("spectral_evolution", "Cross-stream spectral evolution along flow direction"),
+            PlotPresentation(
+                "isotropic_spectra",
+                "Isotropic spectra and cumulative energy",
+                frozenset({"spectral"}),
+            ),
+            PlotPresentation(
+                "directional_spectra",
+                "Flow and cross-stream directional spectra",
+                frozenset({"spectral"}),
+            ),
+            PlotPresentation(
+                "spectral_evolution",
+                "Cross-stream spectral evolution along flow direction",
+                frozenset({"spectral"}),
+            ),
+        ),
+    ),
+    SectionPresentation(
+        key="transient_process_evidence",
+        name="Transient states & schedules",
+        plots=(
+            PlotPresentation(
+                "transient_state_snapshots",
+                "Exact physical-time state snapshots",
+                frozenset({"transient_state", "physical_time"}),
+            ),
+            PlotPresentation(
+                "transient_state_trajectories",
+                "Reference physical trajectories",
+                frozenset({"transient_state", "physical_time"}),
+            ),
+            PlotPresentation(
+                "transient_completion_target",
+                "Completion and target attainment",
+                frozenset({"completion", "physical_time"}),
+            ),
         ),
     ),
 )
+
+
+def eda_sections_for_capabilities(
+    capabilities: Sequence[str],
+) -> tuple[SectionPresentation, ...]:
+    """Return the one EDA registry filtered by selected-dataset capabilities."""
+    available = frozenset(capabilities)
+    if any(not isinstance(capability, str) or not capability for capability in available):
+        message = "EDA capabilities must be non-empty text."
+        raise ValueError(message)
+    sections = tuple(
+        SectionPresentation(
+            key=section.key,
+            name=section.name,
+            plots=tuple(plot for plot in section.plots if plot.required_capabilities.issubset(available)),
+        )
+        for section in EDA_SECTIONS
+    )
+    visible = tuple(section for section in sections if section.plots)
+    if visible:
+        validate_registry(visible)
+    return visible
 
 
 def section_display_label(section_index: int, name: str) -> str:
@@ -201,6 +276,9 @@ def validate_registry(sections: Sequence[SectionPresentation]) -> None:
                 raise TypeError(message)
             if not plot.key or not plot.name.strip():
                 message = "Every presentation plot requires a non-empty key and name."
+                raise ValueError(message)
+            if any(not isinstance(capability, str) or not capability for capability in plot.required_capabilities):
+                message = "Plot capability requirements must be non-empty text."
                 raise ValueError(message)
             if plot.key in plot_keys:
                 message = f"Duplicate presentation plot key: {plot.key!r}."

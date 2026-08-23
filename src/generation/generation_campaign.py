@@ -4213,13 +4213,14 @@ def campaign_transfer_plan(
     }
 
 
-def _validate_partial_campaign_evidence(
+def _validate_partial_campaign_evidence_structure(
     run_id: str,
     evidence: Mapping[str, Any],
     *,
     storage_root: Path,
+    require_executable: bool = True,
 ) -> dict[str, Any]:
-    """Bind partial status evidence to the exact launch and configured cases."""
+    """Validate partial campaign identity and membership without opening case publications."""
     required = {
         "schema_kind",
         "schema_version",
@@ -4234,39 +4235,26 @@ def _validate_partial_campaign_evidence(
         "transfer_plan",
     }
     manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
-    campaign = campaign_evidence.campaign_from_manifest(manifest)
+    campaign = (
+        campaign_evidence.campaign_from_manifest(manifest)
+        if require_executable
+        else campaign_evidence.campaign_from_manifest(manifest, require_executable=False)
+    )
     plan = evidence.get("transfer_plan")
     successful = evidence.get("successful_cases")
     failed = evidence.get("failed_cases")
-    case_keys = {
-        "batch_name",
-        "batch_id",
-        "case_id",
-        "case_index",
-        "state",
-        "classified_state",
-    }
+    case_keys = {"batch_name", "batch_id", "case_id", "case_index", "state", "classified_state"}
     expected_cases = {
         (batch.batch_name, batch.batch_id, batch.case_id(case_index), case_index) for batch in campaign.batches for case_index in batch.case_indices
     }
     records = [*successful, *failed] if isinstance(successful, list) and isinstance(failed, list) else []
     observed_cases = {
-        (
-            record.get("batch_name"),
-            record.get("batch_id"),
-            record.get("case_id"),
-            record.get("case_index"),
-        )
+        (record.get("batch_name"), record.get("batch_id"), record.get("case_id"), record.get("case_index"))
         for record in records
         if isinstance(record, dict)
     }
     expected_batches = [
-        {
-            "batch_name": batch.batch_name,
-            "batch_id": batch.batch_id,
-            "case_count": len(batch.case_indices),
-        }
-        for batch in campaign.batches
+        {"batch_name": batch.batch_name, "batch_id": batch.batch_id, "case_count": len(batch.case_indices)} for batch in campaign.batches
     ]
     plan_batches = plan.get("batches") if isinstance(plan, dict) else None
     if (
@@ -4281,15 +4269,7 @@ def _validate_partial_campaign_evidence(
         or not isinstance(evidence.get("recorded_at"), str)
         or not evidence["recorded_at"]
         or not isinstance(plan, dict)
-        or set(plan)
-        != {
-            "campaign_run_id",
-            "campaign_name",
-            "git_commit",
-            "campaign_config",
-            "campaign_directory",
-            "batches",
-        }
+        or set(plan) != {"campaign_run_id", "campaign_name", "git_commit", "campaign_config", "campaign_directory", "batches"}
         or plan.get("campaign_run_id") != run_id
         or plan.get("campaign_name") != campaign.campaign_name
         or plan.get("git_commit") != manifest["git_commit"]
@@ -4299,24 +4279,11 @@ def _validate_partial_campaign_evidence(
         or len(plan_batches) != len(expected_batches)
         or any(
             not isinstance(batch, dict)
-            or set(batch)
-            != {
-                "batch_name",
-                "batch_id",
-                "case_count",
-                "meta_directory",
-                "raw_directory",
-                "processed_directory",
-                "attempt_directories",
-            }
+            or set(batch) != {"batch_name", "batch_id", "case_count", "meta_directory", "raw_directory", "processed_directory", "attempt_directories"}
             for batch in plan_batches
         )
         or [
-            {
-                "batch_name": batch.get("batch_name"),
-                "batch_id": batch.get("batch_id"),
-                "case_count": batch.get("case_count"),
-            }
+            {"batch_name": batch.get("batch_name"), "batch_id": batch.get("batch_id"), "case_count": batch.get("case_count")}
             for batch in plan_batches
             if isinstance(batch, dict)
         ]
@@ -4333,17 +4300,54 @@ def _validate_partial_campaign_evidence(
     ):
         message = "Partial campaign evidence conflicts with the launch campaign."
         raise ValueError(message)
+    return dict(evidence)
+
+
+def _validate_partial_campaign_evidence(
+    run_id: str,
+    evidence: Mapping[str, Any],
+    *,
+    storage_root: Path,
+) -> dict[str, Any]:
+    """Bind partial status evidence to exact launch membership and successful case publications."""
+    validated = _validate_partial_campaign_evidence_structure(run_id, evidence, storage_root=storage_root)
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
+    campaign = campaign_evidence.campaign_from_manifest(manifest)
     batches_by_name = {batch.batch_name: batch for batch in campaign.batches}
-    for record in successful:
+    for record in validated["successful_cases"]:
         batch = batches_by_name[str(record["batch_name"])]
-        if not batch_runtime.completed_case_is_valid(
-            batch,
-            int(record["case_index"]),
-            storage_root=storage_root,
-        ):
+        if not batch_runtime.completed_case_is_valid(batch, int(record["case_index"]), storage_root=storage_root):
             message = f"Successful case publication is invalid: {record['case_id']!r}."
             raise RuntimeError(message)
-    return dict(evidence)
+    return validated
+
+
+def read_partial_campaign_diagnostic_evidence(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Read structural partial campaign evidence for read-only diagnostic case admission.
+
+    This validates the partial evidence schema, campaign identity, membership, and
+    classification records, but intentionally does not validate declared-success
+    case publications. Diagnostic callers must admit those cases individually.
+    """
+    storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
+    path = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / _PARTIAL_CAMPAIGN_FILENAME
+    if not path.exists():
+        return None
+    if not path.is_file() or path.is_symlink():
+        message = f"Partial campaign evidence is missing or unsafe: {path}"
+        raise FileNotFoundError(message)
+    evidence = campaign_evidence.load_json_object(path, label="partial campaign evidence")
+    return _validate_partial_campaign_evidence_structure(
+        run_id,
+        evidence,
+        storage_root=storage,
+        require_executable=False,
+    )
 
 
 def partial_campaign_transfer_plan(

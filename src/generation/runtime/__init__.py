@@ -9,6 +9,7 @@ Provides:
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
 - progress: non-authoritative case runtime progress parsing and persistence
+- timing: admitted completed-case runtime and physical-duration timing evidence
 - stop: controlled COMSOL status-file stop and force escalation
 - workspace: bounded scratch and publication staging
 - PUBLICATION_SCHEMA_VERSION: canonical case-publication schema version
@@ -45,6 +46,7 @@ Provides:
 - record_case_failure: durable failed-case evidence publication
 - case_failure_is_recorded: failed-case evidence admission
 - validate_completed_case: completed-case publication validation
+- admit_completed_case: case-local completed-publication admission
 - completed_case_is_valid: completed-case validity inspection
 - publish_completed_case: atomic completed-case publication
 - run_case: one-case execution and terminal publication
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_preparation as preparation
     from . import generation_runtime_progress as progress
     from . import generation_runtime_stop as stop
+    from . import generation_runtime_timing as timing
     from . import generation_runtime_workspace as workspace
     from .generation_runtime_batch import (
         CASE_FAILURE_SCHEMA_KIND,
@@ -82,6 +85,7 @@ if TYPE_CHECKING:
         HDF5IdentityEvidence,
         TerminalBatchEvidence,
         TerminalCaseEvidence,
+        admit_completed_case,
         admit_terminal_batch,
         batch_meta_directory,
         case_failure_is_recorded,
@@ -121,6 +125,7 @@ _MODULES = {
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
     "progress": "generation_runtime_progress",
+    "timing": "generation_runtime_timing",
     "stop": "generation_runtime_stop",
     "workspace": "generation_runtime_workspace",
 }
@@ -139,6 +144,7 @@ _BATCH_EXPORTS = frozenset(
         "HDF5IdentityEvidence",
         "TerminalBatchEvidence",
         "TerminalCaseEvidence",
+        "admit_completed_case",
         "admit_terminal_batch",
         "batch_meta_directory",
         "case_failure_is_recorded",
@@ -188,6 +194,7 @@ __all__ = [
     "PreparedCase",
     "TerminalBatchEvidence",
     "TerminalCaseEvidence",
+    "admit_completed_case",
     "admit_terminal_batch",
     "batch",
     "batch_meta_directory",
@@ -220,6 +227,7 @@ __all__ = [
     "runtime_cancellation_requested",
     "runtime_force_cancellation_requested",
     "stop",
+    "timing",
     "validate_completed_case",
     "validate_terminal_batch",
     "workspace",

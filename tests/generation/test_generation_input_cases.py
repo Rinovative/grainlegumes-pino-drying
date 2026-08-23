@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -274,6 +275,30 @@ def test_commit_bound_input_generations_never_alias_one_batch_locator(
         first.input_generation_id,
         second.input_generation_id,
     }
+
+
+def test_configured_input_case_binds_a_persisted_commit_without_runtime_environment(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit persisted raw input identity without requiring launcher environment."""
+    service = generation.cases.input_generation
+    config = _load_config(generation_config_factory, "transient_drying")
+    storage = tmp_path / "storage"
+    with service._generation_git_commit(_FAKE_GIT_COMMIT):
+        generated = service.generate_input_cases(config, 1, storage_root=storage)
+    monkeypatch.delenv("GENERATION_GIT_COMMIT", raising=False)
+
+    admitted = service.admit_configured_input_case(
+        config,
+        1,
+        storage_root=storage,
+        git_commit=_FAKE_GIT_COMMIT,
+    )
+
+    assert admitted.source_id == generated.input_generation_id
+    assert "GENERATION_GIT_COMMIT" not in os.environ
 
 
 def test_bounded_requests_merge_membership_and_reuse_exact_cases(

@@ -21,8 +21,9 @@ provides reference solutions, and validated outputs are published as immutable
 Dataset packages. The established steady workflow trains and evaluates FNO,
 U-NO, PI-FNO, and PI-U-NO models. The transient workflow now trains FNO, U-NO,
 and official RNO models through an automatic teacher-forced Stage A followed by
-autonomous Stage B. Transient EDA and Evaluation remain future work; see the
-[transient training guide](docs/transient_training.md).
+autonomous Stage B. Completed-output transient EDA is available through the
+maintained generated-output notebook; transient Evaluation remains future work.
+See the [transient training guide](docs/transient_training.md).
 
 Generation, Dataset publication, preprocessing, training, resume, and evaluation
 are identity-bound and fail closed. Current values, campaign inventories, seeds,
@@ -130,8 +131,12 @@ python -m src.experiments.cli.cli_build_artifacts --task steady_flow
 
 For transient drying, one normal architecture config automatically persists its
 Stage A0 best-model handoff and then starts a separately named Stage B run. The
-CLI prints both run directories. Transient post-training artifacts are not yet
-implemented; details and resume rules are in the
+CLI prints both run directories. `notebooks/eda.ipynb` exposes admitted
+`steady_flow` and `transient_drying` datasets in one capability-adaptive panel
+with no task selector. Discovery preserves strict terminal batches while admitting
+independently valid completed cases from partial or failed campaigns.
+Transient Evaluation and its post-training artifacts are not yet implemented;
+details and resume rules are in the
 [transient training guide](docs/transient_training.md).
 
 From the host, `scripts/docker_job.sh` supplies the corresponding GPU-queue

@@ -3051,6 +3051,106 @@ def validate_completed_case(
     return dict(processed.provenance)
 
 
+def admit_completed_case(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None = None,
+    validation_depth: ValidationDepth = "full",
+    input_reference: admission_service.InputCaseReference | None = None,
+    git_commit: str | None = None,
+) -> TerminalCaseEvidence:
+    """
+    Admit one independently published completed case without a terminal batch manifest.
+
+    Parameters
+    ----------
+    config : GenerationConfig
+        Exact resolved batch configuration that owns the case.
+    case_index : int
+        Configured case index to admit.
+    storage_root : Path | str | None, optional
+        Storage root containing the raw and processed case publications.
+    validation_depth : {"routine", "full", "deep"}, optional
+        Integrity depth used for raw and processed publication admission.
+    input_reference : InputCaseReference | None, optional
+        Exact raw-input evidence already admitted by the caller.
+    git_commit : str | None, optional
+        Persisted source commit used to bind configured raw-input identity when
+        the caller has not already admitted an input reference.
+
+    Returns
+    -------
+    TerminalCaseEvidence
+        Immutable case-local publication, artifact, HDF5, and metadata evidence.
+
+    Raises
+    ------
+    FileNotFoundError
+        If required raw or processed case evidence is absent or unsafe.
+    ValueError
+        If the configured case index or persisted evidence is malformed.
+    RuntimeError
+        If raw, processed, configuration, or HDF5 identities disagree.
+
+    Notes
+    -----
+    This admits one terminal case publication only. It does not create or imply
+    terminal batch membership, a batch manifest, or Dataset publication eligibility.
+
+    """
+    validation_depth = _require_validation_depth(validation_depth)
+    config.case_id(case_index)
+    if input_reference is None:
+        input_reference = input_service.admit_configured_input_case(
+            config,
+            case_index,
+            storage_root=storage_root,
+            git_commit=git_commit,
+        )
+    raw, processed = _admit_terminal_case_publications(
+        input_reference,
+        processed_directory=processed_case_directory(
+            config,
+            case_index,
+            storage_root=storage_root,
+        ),
+        validation_depth=validation_depth,
+    )
+    _require_publication_matches_config(raw, config=config, case_index=case_index)
+    _require_publication_matches_config(processed, config=config, case_index=case_index)
+    if raw.case_payload != processed.case_payload:
+        message = f"Raw and processed canonical metadata disagree for {config.case_id(case_index)!r}."
+        raise RuntimeError(message)
+    hdf5_artifacts = tuple(item for item in processed.artifacts if item.relative_path == "case.h5")
+    if len(hdf5_artifacts) != 1 or processed.hdf5_identity is None:
+        message = f"Completed case lacks one admitted canonical HDF5: {config.case_id(case_index)!r}."
+        raise RuntimeError(message)
+    return TerminalCaseEvidence(
+        case_index=case_index,
+        case_id=config.case_id(case_index),
+        material_family=config.material_family,
+        case_input_id=str(raw.case_payload["case_input_id"]),
+        simulation_case_id=str(raw.case_payload["simulation_case_id"]),
+        success_sha256=_safe_file_sha256(
+            processed.directory / "_SUCCESS",
+            label=f"{config.case_id(case_index)} success marker",
+        ),
+        provenance_sha256=_safe_file_sha256(
+            processed.directory / "provenance.json",
+            label=f"{config.case_id(case_index)} publication provenance",
+        ),
+        case_hdf5_sha256=hdf5_artifacts[0].sha256,
+        raw_directory=raw.directory,
+        processed_directory=processed.directory,
+        hdf5_path=(processed.directory / "case.h5").resolve(),
+        raw_artifacts=raw.artifacts,
+        processed_artifacts=processed.artifacts,
+        hdf5_identity=processed.hdf5_identity,
+        _case_metadata_json=_canonical_json_text(raw.case_payload),
+    )
+
+
 def _retained_export_hdf5_repair_evidence(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -3461,6 +3561,7 @@ def completed_case_is_valid(
     *,
     storage_root: Path | str | None = None,
     input_reference: admission_service.InputCaseReference | None = None,
+    git_commit: str | None = None,
 ) -> bool:
     """Return false only when processed completion is absent; corruption fails closed."""
     raw = raw_case_directory(config, case_index, storage_root=storage_root)
@@ -3471,6 +3572,7 @@ def completed_case_is_valid(
                 config,
                 case_index,
                 storage_root=storage_root,
+                git_commit=git_commit,
             )
             _require_publication_matches_config(
                 _raw_publication_from_reference(reference),
@@ -3485,6 +3587,7 @@ def completed_case_is_valid(
         config,
         case_index,
         storage_root=storage_root,
+        git_commit=git_commit,
     )
     validate_completed_case(
         config,
