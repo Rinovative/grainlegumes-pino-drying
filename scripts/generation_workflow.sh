@@ -1034,8 +1034,6 @@ resolve_campaign() {
 }
 
 resolve_completion_parent_local() {
-  [[ -n "${REPLACEMENT_POOL_SIZE}" ]] ||
-    fail 2 "Completion parent resolution requires replacement_pool_size."
   resolve_local_storage
   resolve_local_python
   local requested_parent="${1:-${PARENT_RUN_ID}}"
@@ -1058,10 +1056,10 @@ def clean(item):
     return text
 print("\t".join(clean(value.get(key)) for key in (
     "status", "parent_run_id", "completion_id", "parent_partial_path",
-    "parent_partial_sha256", "completion_status",
+    "parent_partial_sha256", "completion_status", "replacement_pool_size",
 )))')" || fail 1 "Could not decode completion-parent resolution."
   IFS=$'\t' read -r COMPLETION_PARENT_STATUS COMPLETION_PARENT_RUN_ID \
-    COMPLETION_ID partial_path partial_sha completion_status extra <<< "${record}"
+    COMPLETION_ID partial_path partial_sha completion_status persisted_pool extra <<< "${record}"
   [[ -z "${extra:-}" ]] || fail 1 "Malformed completion-parent result."
   case "${COMPLETION_PARENT_STATUS}" in
     fresh)
@@ -1094,6 +1092,12 @@ print("\t".join(clean(value.get(key)) for key in (
         && ! -L "${COMPLETION_PARENT_PARTIAL_PATH}" ]] ||
         fail 1 "Compatible parent partial evidence escaped canonical local storage."
       COMPLETION_PARENT_PARTIAL_SHA256="${partial_sha}"
+      if [[ -z "${REPLACEMENT_POOL_SIZE}" && "${completion_status}" != - ]]; then
+        [[ "${persisted_pool}" != - ]] ||
+          fail 1 "Persisted completion status lacks its replacement pool high-water."
+        validate_positive "persisted replacement pool high-water" "${persisted_pool}"
+        REPLACEMENT_POOL_SIZE="${persisted_pool}"
+      fi
       ;;
     *) fail 1 "Unsupported completion-parent status: ${COMPLETION_PARENT_STATUS}" ;;
   esac
@@ -2030,7 +2034,7 @@ workflow_failure_report() {
     --remote-root "${REMOTE_ROOT:-configured}"
     --git-commit "${REQUESTED_COMMIT:-unknown}"
   )
-  if [[ -n "${REPLACEMENT_POOL_SIZE:-}" ]]; then
+  if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
     continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
     [[ -z "${COMPLETION_PARENT_RUN_ID:-}" ]] ||
       continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
@@ -2925,15 +2929,20 @@ execution = value["execution"]
 max_running = execution["max_running_cases"]
 if max_running is None:
     max_running = "unlimited"
+print("Completion reconciliation ........ OK")
 print("Completion mode: resume partial campaign")
 print("Parent campaign: {}".format(value["parent_run_id"]))
 print("Parent state: {}".format(value["parent_state"]))
 print("Completion ID: {}".format(value["completion_id"]))
-print("\nExisting successful inventory:")
+print("\n{} successful inventory:".format("Final" if value["status"] == "complete" else "Existing"))
 rows("inventory")
+remaining = sum(value["success_deficits"].values())
 print("\nRemaining deficits:")
 rows("deficit")
-print("  {:18} {}".format("Total", sum(value["success_deficits"].values())))
+print("  {:18} {}".format("Total", remaining))
+print("\nRemaining successful deficit: {}".format(remaining))
+print("New COMSOL work required: {}".format(value.get("new_comsol_work_required", remaining)))
+print("Composite source: state={}".format(value.get("composite_source_state", "pending")))
 print("\nReplacement pool:")
 print("  high water         {}".format(value["pool_high_water"]))
 print("  already consumed   {}".format(value["pool_consumed"]))
@@ -2955,12 +2964,17 @@ print("\nNext:\n  {}".format(value["next_operation"]))' ||
 
 initialize_remote_completion() {
   local output record status observed_id extra
-  output="$(remote_cli initialize-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
-    --parent-run-id "${COMPLETION_PARENT_RUN_ID}" \
-    --parent-partial "${COMPLETION_REMOTE_PARENT_PARTIAL}" \
-    --parent-partial-sha256 "${COMPLETION_PARENT_PARTIAL_SHA256}" \
-    --replacement-pool-size "${REPLACEMENT_POOL_SIZE}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+  local -a arguments=(
+    initialize-campaign-completion "${CAMPAIGN_RELATIVE_PATH}"
+    --parent-run-id "${COMPLETION_PARENT_RUN_ID}"
+    --parent-partial "${COMPLETION_REMOTE_PARENT_PARTIAL}"
+    --parent-partial-sha256 "${COMPLETION_PARENT_PARTIAL_SHA256}"
+    --storage-root "${REMOTE_STORAGE_ROOT}"
+  )
+  if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
+    arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
+  fi
+  output="$(remote_cli "${arguments[@]}")" ||
     fail 1 "Could not initialize or extend the remote campaign completion owner."
   COMPLETION_INITIAL_STATUS_JSON="${output}"
   record="$(printf '%s' "${output}" | local_python -c 'import json, sys
@@ -3068,13 +3082,12 @@ print("\t".join((
         (( required_total > 0 )) ||
           fail 1 "Pool exhaustion lacks an uncovered replacement deficit."
         local next_pool=$((pool_size + required_total))
-        printf 'COMPLETION POOL EXHAUSTED: completion_id=%s uncovered=%s pool_remaining=0.\n' \
-          "${COMPLETION_ID}" "${required_total}" >&2
-        printf 'Continue with a larger cumulative pool:\n' >&2
-        print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run \
-          "${RUN_CONFIG_ARGUMENT}" --replacement-pool-size "${next_pool}" \
-          --parent-run-id "${COMPLETION_PARENT_RUN_ID}" --cpu-host "${CPU_HOST}" \
-          --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}" >&2
+        printf 'COMPLETION POOL EXHAUSTED: completion_id=%s\n' "${COMPLETION_ID}" >&2
+        printf 'remaining successful deficit = %s\n' "${required_total}" >&2
+        printf 'persisted replacement pool high-water = %s\n' "${pool_size}" >&2
+        printf 'unused authorized capacity = 0\n\nNext:\n' >&2
+        print_command ./scripts/generation_workflow.sh run \
+          "${RUN_CONFIG_ARGUMENT}" --replacement-pool-size "${next_pool}" >&2
         RUN_ID="${previous_run_id}"
         return 3
         ;;
@@ -3215,9 +3228,12 @@ collect_completion_replacements() {
 
 finalize_completion_composite() {
   local parent_run="${COMPLETION_PARENT_RUN_ID}" cleanup_json replacement_run
+  printf 'Composite source:\n  state=building_or_reusing expected_completion=%s\n' "${COMPLETION_ID}"
   local_cli build-campaign-completion-composite "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Could not construct exact parent-success plus replacement-success membership."
+  printf 'Dataset packages:\n  source=composite completion\n'
+  printf 'PT shards:\n  source=final Dataset identity\n'
   local_cli build-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Could not build completion Dataset packages, PT shards, smoke, and readiness evidence."
@@ -3603,6 +3619,11 @@ execute_generation_run() {
   generation_console_stage 1 9 "Run plan" OK     "kind=$RUN_KIND identity=$RUN_PLAN_ID config=$RUN_CONFIG_RELATIVE"
   case "$RUN_KIND" in
     campaign)
+      if [[ -z "${REPLACEMENT_POOL_SIZE}" ]]; then
+        RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
+        resolve_campaign "${RUN_LEAF_CONFIG}"
+        resolve_completion_parent_local
+      fi
       if [[ -n "${REPLACEMENT_POOL_SIZE}" ]]; then
         run_campaign_with_completion
       else
@@ -3677,6 +3698,9 @@ print("\t".join((str(value["status"]), str(identifier))))')" ||
   [[ -z "${extra:-}" ]] || fail 1 "Malformed read-only completion status."
   if [[ "${resolution_status}" == compatible_partial ]]; then
     validate_completion_id "${completion_id}"
+    printf 'GPU completion and finalization status:\n'
+    local_cli campaign-completion-status "${completion_id}" --if-present \
+      --config "${CAMPAIGN_CONFIG_PATH}" --storage-root "${LOCAL_STORAGE_ROOT}"
     resolve_remote_layout
     printf 'CPU completion execution status:\n'
     remote_cli_retryable "completion execution status read" \

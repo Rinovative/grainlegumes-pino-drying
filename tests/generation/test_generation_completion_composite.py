@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from src import common
+from src import common, datasets
 from src.datasets.packages import dataset_packages_transient_shards as transient_shards
+from src.generation import generation_campaign_completion as completion_service
 from src.generation import generation_workflow as workflow
 from src.generation.publication import generation_publication_completion_composite as composite
 
@@ -73,7 +75,10 @@ def _source(case: _Case, *, kind: str, terminal: _Terminal | None = None) -> com
     )
 
 
-def test_composite_receipt_binds_exact_success_membership_and_excludes_parent_transfer(tmp_path: Path) -> None:
+def test_composite_receipt_binds_exact_success_membership_and_excludes_parent_transfer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     original = _case(tmp_path, "original", 1)
     replacement = _case(tmp_path, "replacement", 1)
     terminal = _Terminal("replacement-batch", "c" * 64, (replacement,))
@@ -95,6 +100,69 @@ def test_composite_receipt_binds_exact_success_membership_and_excludes_parent_tr
     transfer = composite.replacement_transfer_plan(receipt)
     assert [item["case_id"] for item in transfer] == ["replacement"]
     assert transfer[0]["terminal_batch_storage_name"] == "replacement-storage"
+
+    reused = composite.build_composite_receipt(
+        completion_id="completion__test",
+        completion_state=state,
+        completion_state_sha256=state_digest,
+        parent_run_id="run",
+        parent_partial_sha256="d" * 64,
+        targets={"batch-a": 2},
+        original_cases=(_source(original, kind="parent_partial"),),
+        replacement_cases=(_source(replacement, kind="replacement", terminal=terminal),),
+        storage_root=tmp_path,
+    )
+    assert reused == receipt
+    receipt_path = composite.completion_directory("completion__test", storage_root=tmp_path) / composite.RECEIPT_FILENAME
+    receipt_path.write_text('{"completion_id":"completion__test"}\n', encoding="utf-8")
+    rebuilt = composite.build_composite_receipt(
+        completion_id="completion__test",
+        completion_state=state,
+        completion_state_sha256=state_digest,
+        parent_run_id="run",
+        parent_partial_sha256="d" * 64,
+        targets={"batch-a": 2},
+        original_cases=(_source(original, kind="parent_partial"),),
+        replacement_cases=(_source(replacement, kind="replacement", terminal=terminal),),
+        storage_root=tmp_path,
+    )
+    assert rebuilt == receipt
+
+    conflict = {**receipt, "completion_id": "completion__different"}
+    common.serialization.atomic_write_json(receipt_path, conflict)
+    before = receipt_path.read_bytes()
+    with pytest.raises(FileExistsError, match="conflicts"):
+        composite.build_composite_receipt(
+            completion_id="completion__test",
+            completion_state=state,
+            completion_state_sha256=state_digest,
+            parent_run_id="run",
+            parent_partial_sha256="d" * 64,
+            targets={"batch-a": 2},
+            original_cases=(_source(original, kind="parent_partial"),),
+            replacement_cases=(_source(replacement, kind="replacement", terminal=terminal),),
+            storage_root=tmp_path,
+        )
+    assert receipt_path.read_bytes() == before
+
+    def reject_active_writer(*_args: object, **_kwargs: object) -> object:
+        message = "synthetic active composite writer"
+        raise common.locking.FileLockUnavailableError(message)
+
+    monkeypatch.setattr(common.locking, "exclusive_file_lock", reject_active_writer)
+    with pytest.raises(common.locking.FileLockUnavailableError, match="active composite writer"):
+        composite.build_composite_receipt(
+            completion_id="completion__test",
+            completion_state=state,
+            completion_state_sha256=state_digest,
+            parent_run_id="run",
+            parent_partial_sha256="d" * 64,
+            targets={"batch-a": 2},
+            original_cases=(_source(original, kind="parent_partial"),),
+            replacement_cases=(_source(replacement, kind="replacement", terminal=terminal),),
+            storage_root=tmp_path,
+        )
+    assert receipt_path.read_bytes() == before
 
 
 def test_composite_receipt_rejects_duplicate_physical_identity(tmp_path: Path) -> None:
@@ -137,7 +205,7 @@ def test_composite_lifecycle_revalidates_hdf5_pt_smoke_before_cleanup(
         "dataset_name": "transient",
         "dataset_view": "transient_drying",
         "evaluation_regime": "id",
-        "training_payload": {"required": True},
+        "training_payload": {"required": True, "target_shard_bytes": 1024},
     }
     record = {
         "dataset_name": "transient",
@@ -193,6 +261,8 @@ def test_composite_lifecycle_revalidates_hdf5_pt_smoke_before_cleanup(
         },
         "created_at": "2026-01-01T00:00:00+00:00",
     }
+    lifecycle_path = workflow.composite_lifecycle_receipt_path(completion_id, storage_root=tmp_path)
+    common.serialization.atomic_write_json(lifecycle_path, lifecycle)
 
     monkeypatch.setattr(workflow.workspace_service, "resolve_storage_root", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(workflow.campaign_runtime, "validate_partially_transferred_campaign", lambda *_args, **_kwargs: {})
@@ -205,15 +275,15 @@ def test_composite_lifecycle_revalidates_hdf5_pt_smoke_before_cleanup(
         lambda *_args, **_kwargs: SimpleNamespace(dataset_packages=(plan,)),
     )
     monkeypatch.setattr(workflow, "_validate_package_record", lambda value, **_kwargs: value)
-    monkeypatch.setattr(
-        workflow,
-        "_load_json",
-        lambda _path, *, label: (
-            lifecycle
-            if label == "composite completion lifecycle receipt"
-            else {"source_case_identities": [{"completion_receipt_sha256": identity["completion_receipt_sha256"]}]}
-        ),
-    )
+
+    def load_json(path: Path, *, label: str) -> dict[str, object]:
+        if label == "composite completion lifecycle receipt":
+            value = json.loads(path.read_text(encoding="utf-8"))
+            assert isinstance(value, dict)
+            return value
+        return {"source_case_identities": [{"completion_receipt_sha256": identity["completion_receipt_sha256"]}]}
+
+    monkeypatch.setattr(workflow, "_load_json", load_json)
     monkeypatch.setattr(
         transient_shards,
         "load_transient_shard_receipt",
@@ -228,9 +298,73 @@ def test_composite_lifecycle_revalidates_hdf5_pt_smoke_before_cleanup(
     )
     assert validated["replacement_cleanup"]["eligible"] is True
     lifecycle["shards"][0]["hdf5_pt_smoke"] = {"tampered": True}
+    common.serialization.atomic_write_json(lifecycle_path, lifecycle)
     with pytest.raises(RuntimeError, match="semantic smoke"):
         workflow.validate_composite_completion_lifecycle(
             parent_run_id,
             completion_id,
             storage_root=tmp_path,
         )
+    classified = completion_service._completion_lifecycle_artifact_status(
+        completion_id,
+        {
+            "parent_run_id": parent_run_id,
+            "parent_partial_sha256": composite_receipt["parent_partial_sha256"],
+        },
+        storage_root=tmp_path,
+        composite_state="complete",
+        composite=composite_receipt,
+    )
+    assert classified[3] == "not_ready"
+    assert classified[4:] == (1, 0)
+
+    package_builds: list[dict[str, object]] = []
+
+    def build_packages(*_args: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+        package_builds.append(dict(kwargs))
+        return ({"status": "reused"},)
+
+    shard_builds: list[dict[str, object]] = []
+
+    def build_shards(*_args: object, **kwargs: object) -> dict[str, object]:
+        shard_builds.append(dict(kwargs))
+        return {"receipt_path": shard_path}
+
+    monkeypatch.setattr(datasets.packages, "build_campaign_packages", build_packages)
+    monkeypatch.setattr(workflow, "_package_record", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(transient_shards, "build_transient_shards", build_shards)
+    monkeypatch.setattr(
+        workflow,
+        "_package_runtime_evidence",
+        lambda *_args, **_kwargs: ({}, {}, {"one_step_transition": {"status": "loaded"}}),
+    )
+
+    recovered = workflow.build_composite_completion_lifecycle(
+        parent_run_id,
+        completion_id,
+        storage_root=tmp_path,
+    )
+    assert recovered["readiness"] == "ready"
+    assert len(package_builds) == 1
+    assert len(shard_builds) == 1
+    assert shard_builds[0]["rebuild_invalid"] is True
+
+    reused = workflow.build_composite_completion_lifecycle(
+        parent_run_id,
+        completion_id,
+        storage_root=tmp_path,
+    )
+    assert reused == recovered
+    assert len(package_builds) == 1
+    assert len(shard_builds) == 1
+
+    conflicting = {**recovered, "completion_id": "completion__different"}
+    common.serialization.atomic_write_json(lifecycle_path, conflicting)
+    before_conflict = lifecycle_path.read_bytes()
+    with pytest.raises(FileExistsError, match="different immutable completion provenance"):
+        workflow.build_composite_completion_lifecycle(
+            parent_run_id,
+            completion_id,
+            storage_root=tmp_path,
+        )
+    assert lifecycle_path.read_bytes() == before_conflict

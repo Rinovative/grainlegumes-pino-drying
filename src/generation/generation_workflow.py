@@ -3932,11 +3932,30 @@ def build_composite_completion_lifecycle(
     lock_path = receipt_path.with_suffix(".lock")
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         if receipt_path.exists():
-            return validate_composite_completion_lifecycle(
-                parent_run_id,
-                completion_id,
-                storage_root=storage,
-            )
+            if not receipt_path.is_file() or receipt_path.is_symlink():
+                message = "Existing composite lifecycle destination is unsafe or conflicts with its owner."
+                raise FileExistsError(message)
+            try:
+                return validate_composite_completion_lifecycle(
+                    parent_run_id,
+                    completion_id,
+                    storage_root=storage,
+                )
+            except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+                try:
+                    raw_lifecycle = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    raw_lifecycle = None
+                conflicting_identity = isinstance(raw_lifecycle, dict) and (
+                    raw_lifecycle.get("completion_id") not in {None, completion_id}
+                    or raw_lifecycle.get("parent_run_id") not in {None, parent_run_id}
+                    or raw_lifecycle.get("parent_partial_sha256") not in {None, composite["parent_partial_sha256"]}
+                    or raw_lifecycle.get("composite_receipt_sha256") not in {None, identity["completion_receipt_sha256"]}
+                    or raw_lifecycle.get("combined_inventory_sha256") not in {None, composite["combined_inventory_sha256"]}
+                )
+                if conflicting_identity:
+                    message = "Existing composite lifecycle receipt claims different immutable completion provenance."
+                    raise FileExistsError(message) from error
         results = package_service.build_campaign_packages(
             campaign,
             storage_root=storage,
@@ -3959,6 +3978,7 @@ def build_composite_completion_lifecycle(
                 storage_root=storage,
                 publication_identity=identity,
                 target_shard_bytes=int(policy["target_shard_bytes"]),
+                rebuild_invalid=True,
             )
             shard_receipt = transient_shards.load_transient_shard_receipt(
                 dataset_id,

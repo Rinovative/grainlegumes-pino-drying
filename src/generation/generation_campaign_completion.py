@@ -385,12 +385,12 @@ def create_completion(
     parent_partial_evidence: Mapping[str, Any],
     parent_partial_sha256: str,
     targets: Sequence[CompletionTarget],
-    replacement_pool_size: int,
+    replacement_pool_size: int | None,
     maximum_failed_cases: int = 0,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Create or resume one completion owner under its exclusive state lock."""
-    pool = _positive_int(replacement_pool_size, label="replacement_pool_size")
+    pool = None if replacement_pool_size is None else _positive_int(replacement_pool_size, label="replacement_pool_size")
     maximum_failures = _nonnegative_int(maximum_failed_cases, label="maximum_failed_cases")
     identifier = completion_id(parent_run_id=parent_run_id, parent_partial_sha256=parent_partial_sha256)
     path = _state_path(identifier, storage_root=storage_root)
@@ -412,9 +412,11 @@ def create_completion(
             }
             if {key: state[key] for key in expected} != expected:
                 raise ValueError("Persisted completion identity collides with different immutable parent evidence or targets.")
-            if extend_pool(state, replacement_pool_size=pool, storage_root=storage_root):
+            if pool is not None and extend_pool(state, replacement_pool_size=pool, storage_root=storage_root):
                 return state
             return state
+        if pool is None:
+            raise RuntimeError("No persisted completion owner exists; creating replacement candidates requires --replacement-pool-size.")
         state = {
             "schema_version": _SCHEMA_VERSION,
             "owner": _OWNER,
@@ -1348,10 +1350,10 @@ def create_completion_from_partial(
     parent_run_id: str,
     parent_partial_evidence: Mapping[str, Any],
     parent_partial_sha256: str,
-    replacement_pool_size: int,
+    replacement_pool_size: int | None,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Create or resume completion from a validated parent partial snapshot."""
+    """Create, extend, or resume completion from a validated parent partial snapshot."""
     parent_partial_counts(
         parent_campaign,
         parent_partial_evidence,
@@ -1943,10 +1945,10 @@ def create_completion_from_partial_path(
     parent_run_id: str,
     parent_partial_path: Path | str,
     parent_partial_sha256: str,
-    replacement_pool_size: int,
+    replacement_pool_size: int | None,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Create or resume completion from one exact safe partial-evidence file."""
+    """Create, extend, or resume completion from one exact safe partial-evidence file."""
     path = Path(parent_partial_path).expanduser()
     if not path.is_file() or path.is_symlink():
         raise FileNotFoundError(f"Parent partial evidence is missing or unsafe: {path}.")
@@ -2028,6 +2030,100 @@ def _bounded_active_campaign_status(
     }
 
 
+def _completion_composite_artifact_status(
+    completion_id_value: str,
+    state: Mapping[str, Any],
+    *,
+    storage_root: Path,
+) -> tuple[str, dict[str, Any] | None, int, int]:
+    """Classify the completion composite without mutating persisted evidence."""
+    from .publication import generation_publication_completion_composite as composite_service
+
+    composite_path = completion_directory(completion_id_value, storage_root=storage_root) / composite_service.RECEIPT_FILENAME
+    if not composite_path.exists():
+        return "absent", None, 0, 0
+    if not composite_path.is_file() or composite_path.is_symlink():
+        return "conflicting", None, 0, 1
+    try:
+        composite = composite_service.load_composite_receipt(
+            completion_id_value,
+            storage_root=storage_root,
+        )
+    except (OSError, TypeError, ValueError):
+        try:
+            raw_composite = json.loads(composite_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw_composite = None
+        conflicting = isinstance(raw_composite, dict) and (
+            raw_composite.get("completion_id") not in {None, completion_id_value}
+            or raw_composite.get("parent_run_id") not in {None, state["parent_run_id"]}
+        )
+        return ("conflicting", None, 0, 1) if conflicting else ("recoverable", None, 1, 0)
+    matching = (
+        composite.get("completion_id") == completion_id_value
+        and composite.get("parent_run_id") == state["parent_run_id"]
+        and composite.get("parent_partial_sha256") == state["parent_partial_sha256"]
+    )
+    return ("complete", composite, 0, 0) if matching else ("conflicting", None, 0, 1)
+
+
+def _completion_lifecycle_artifact_status(
+    completion_id_value: str,
+    state: Mapping[str, Any],
+    *,
+    storage_root: Path,
+    composite_state: str,
+    composite: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any], str, int, int]:
+    """Classify completion packages, shards, and readiness without mutation."""
+    lifecycle_path = completion_directory(completion_id_value, storage_root=storage_root) / "completion_lifecycle.json"
+    absent = {"status": "absent", "count": 0}
+    if not lifecycle_path.exists():
+        return None, absent, absent.copy(), "absent", 0, 0
+    if not lifecycle_path.is_file() or lifecycle_path.is_symlink():
+        conflicting = {"status": "conflicting", "count": 0}
+        return None, conflicting, conflicting.copy(), "conflicting", 0, 1
+    try:
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        lifecycle = None
+    packages = lifecycle.get("packages") if isinstance(lifecycle, dict) else None
+    shards = lifecycle.get("shards") if isinstance(lifecycle, dict) else None
+    identity_conflict = isinstance(lifecycle, dict) and (
+        lifecycle.get("completion_id") not in {None, completion_id_value}
+        or lifecycle.get("parent_run_id") not in {None, state["parent_run_id"]}
+        or lifecycle.get("parent_partial_sha256") not in {None, state["parent_partial_sha256"]}
+        or (composite is not None and lifecycle.get("combined_inventory_sha256") not in {None, composite["combined_inventory_sha256"]})
+    )
+    if identity_conflict:
+        conflicting = {"status": "conflicting", "count": 0}
+        return lifecycle, conflicting, conflicting.copy(), "conflicting", 0, 1
+    lifecycle_ready = (
+        isinstance(lifecycle, dict) and composite_state == "complete" and lifecycle.get("status") == "ready" and lifecycle.get("readiness") == "ready"
+    )
+    if lifecycle_ready and isinstance(packages, list) and isinstance(shards, list):
+        from . import generation_workflow as workflow_service
+
+        try:
+            admitted_lifecycle = workflow_service.validate_composite_completion_lifecycle(
+                str(state["parent_run_id"]),
+                completion_id_value,
+                storage_root=storage_root,
+            )
+        except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            pass
+        else:
+            admitted_packages = admitted_lifecycle.get("packages")
+            admitted_shards = admitted_lifecycle.get("shards")
+            if isinstance(admitted_packages, list) and isinstance(admitted_shards, list):
+                package_state = {"status": "ready", "count": len(admitted_packages)}
+                shard_state = {"status": "ready", "count": len(admitted_shards)}
+                return admitted_lifecycle, package_state, shard_state, "ready", 0, 0
+    package_state = {"status": "recoverable", "count": len(packages) if isinstance(packages, list) else 0}
+    shard_state = {"status": "recoverable", "count": len(shards) if isinstance(shards, list) else 0}
+    return lifecycle, package_state, shard_state, "not_ready", 1, 0
+
+
 def completion_status_for_id(
     completion_id_value: str,
     *,
@@ -2037,7 +2133,6 @@ def completion_status_for_id(
 ) -> dict[str, Any]:
     """Report completion execution, publication, packages, shards, and readiness."""
     from .publication import generation_publication_campaign_evidence as campaign_evidence
-    from .publication import generation_publication_completion_composite as composite_service
 
     if not isinstance(if_present, bool):
         raise TypeError("if_present must be boolean.")
@@ -2095,38 +2190,27 @@ def completion_status_for_id(
         if not isinstance(record, dict) or str(record.get("batch_id")) not in original_failures:
             raise ValueError("Completion parent failure membership is malformed.")
         original_failures[str(record["batch_id"])] += 1
-    directory = completion_directory(completion_id_value, storage_root=storage)
-    composite_path = directory / composite_service.RECEIPT_FILENAME
-    lifecycle_path = directory / "completion_lifecycle.json"
-    composite_state = "absent"
-    package_state: dict[str, Any] = {"status": "absent", "count": 0}
-    shard_state: dict[str, Any] = {"status": "absent", "count": 0}
-    training_readiness = "absent"
-    if composite_path.exists():
-        if not composite_path.is_file() or composite_path.is_symlink():
-            raise RuntimeError("Completion composite receipt is unsafe.")
-        composite_service.load_composite_receipt(completion_id_value, storage_root=storage)
-        composite_state = "complete"
-    if lifecycle_path.exists():
-        if not lifecycle_path.is_file() or lifecycle_path.is_symlink():
-            raise RuntimeError("Completion lifecycle receipt is unsafe.")
-        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
-        if not isinstance(lifecycle, dict):
-            raise TypeError("Completion lifecycle receipt must contain one object.")
-        packages = lifecycle.get("packages")
-        shards = lifecycle.get("shards")
-        if (
-            lifecycle.get("completion_id") != completion_id_value
-            or lifecycle.get("parent_run_id") != state["parent_run_id"]
-            or lifecycle.get("status") != "ready"
-            or lifecycle.get("readiness") != "ready"
-            or not isinstance(packages, list)
-            or not isinstance(shards, list)
-        ):
-            raise RuntimeError("Completion lifecycle receipt is not ready or conflicts with its owner.")
-        package_state = {"status": "ready", "count": len(packages)}
-        shard_state = {"status": "ready", "count": len(shards)}
-        training_readiness = "ready"
+    composite_state, composite, composite_recoverable, composite_conflicts = _completion_composite_artifact_status(
+        identifier,
+        state,
+        storage_root=storage,
+    )
+    (
+        lifecycle,
+        package_state,
+        shard_state,
+        training_readiness,
+        lifecycle_recoverable,
+        lifecycle_conflicts,
+    ) = _completion_lifecycle_artifact_status(
+        identifier,
+        state,
+        storage_root=storage,
+        composite_state=composite_state,
+        composite=composite,
+    )
+    recoverable_artifacts = composite_recoverable + lifecycle_recoverable
+    conflicting_artifacts = composite_conflicts + lifecycle_conflicts
     report.update(
         {
             "parent_campaign": state["parent_run_id"],
@@ -2140,6 +2224,33 @@ def completion_status_for_id(
             "package_state": package_state,
             "shard_state": shard_state,
             "training_readiness": training_readiness,
+            "readiness_state": training_readiness,
+            "composite_expected_id": completion_id_value,
+            "dataset_expected_ids": (
+                [str(item.get("dataset_id")) for item in lifecycle.get("packages", []) if isinstance(item, dict)]
+                if isinstance(lifecycle, dict)
+                else []
+            ),
+            "shard_expected_ids": (
+                [str(item.get("derived_payload_id")) for item in lifecycle.get("shards", []) if isinstance(item, dict)]
+                if isinstance(lifecycle, dict)
+                else []
+            ),
+            "recoverable_stale_artifacts": recoverable_artifacts,
+            "conflicting_artifacts": conflicting_artifacts,
+            "normal_run_next_operation": (
+                "resolve conflicting finalization artifact identity"
+                if conflicting_artifacts
+                else (
+                    "collect successful replacement publications and build or recover the completion composite"
+                    if report["status"] == "complete" and composite_state != "complete"
+                    else (
+                        "build or recover Dataset packages, PT shards, smoke, and readiness"
+                        if report["status"] == "complete" and training_readiness != "ready"
+                        else report["next_operation"]
+                    )
+                )
+            ),
         }
     )
     return report
@@ -2463,14 +2574,13 @@ def completion_status(
         "new_replacements_required": schedulable,
         "batch_accounting": batch_accounting,
         "next_operation": next_operation,
+        "normal_run_next_operation": next_operation,
+        "new_comsol_work_required": 0 if status == "complete" else sum(deficits.values()),
+        "normal_run_requires_replacement_pool": required_pool_extension > 0,
         "next_command": (
             None
-            if status in {"complete", "failure_circuit_open"}
-            else (
-                f"run <CONFIG> --replacement-pool-size {pool + required_pool_extension}"
-                if required_pool_extension
-                else f"run <CONFIG> --replacement-pool-size {pool}"
-            )
+            if status == "failure_circuit_open"
+            else (f"run <CONFIG> --replacement-pool-size {pool + required_pool_extension}" if required_pool_extension else "run <CONFIG>")
         ),
     }
 

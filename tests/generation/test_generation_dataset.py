@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,142 @@ from src import common, datasets, domain, generation
 from src.datasets.packages import dataset_packages_builder as package_builder
 
 pytestmark = pytest.mark.integration
+
+
+def test_package_publication_recovers_owned_partial_and_corrupt_state_without_overwriting_conflicts(
+    tmp_path: Path,
+) -> None:
+    """Recover an expected package atomically while preserving conflicting identity bytes."""
+    publish_package = package_builder._publish  # noqa: SLF001 -- lowest publication contract owner
+    schema_identity = package_builder._schema_identity("steady_flow")  # noqa: SLF001 -- test-owned provenance
+    provenance = dict.fromkeys(package_builder.package_manifest.PACKAGE_PROVENANCE_KEYS)
+    provenance.update(
+        {
+            "schema_kind": package_builder.DATASET_PACKAGE_SCHEMA_KIND,
+            "schema_version": package_builder.DATASET_PACKAGE_SCHEMA_VERSION,
+            "dataset_name": "synthetic-package",
+            "dataset_view": "steady_flow",
+            "builder_identity": package_builder.identity.dataset_conversion_contract_identity("steady_flow"),
+            "schema_identity": schema_identity,
+            "source_case_identities": [
+                {
+                    "package_case_id": "case-1",
+                    "batch_id": "batch-1",
+                    "source_case_id": "case-1",
+                    "case_input_id": "input-1",
+                    "simulation_case_id": "simulation-1",
+                    "case_hdf5_sha256": "a" * 64,
+                    "material_family": "lentil",
+                    "material_role": "seen",
+                    "evaluation_regime": "id",
+                    "natural_support_state": "in_support",
+                    "simulation_profile": "steady_flow",
+                    "membership": "train",
+                    "ood_group": None,
+                    "ood_parameters": [],
+                    "task_relevant_ood_parameters": [],
+                }
+            ],
+        }
+    )
+    dataset_id, dataset_digest = package_builder.identity.package_identity_from_provenance(provenance)
+    payload_filename = f"{dataset_id}.pt"
+    prefix = {
+        **provenance,
+        "dataset_id": dataset_id,
+        "dataset_digest": dataset_digest,
+        "payload_filename": payload_filename,
+        "source_case_count": 1,
+    }
+    payload_bytes = b"synthetic immutable payload"
+    build_count = 0
+
+    def build_payload(path: Path) -> dict[str, int]:
+        nonlocal build_count
+        build_count += 1
+        path.write_bytes(payload_bytes)
+        return {"sample_count": 1, "transition_count": 0}
+
+    first = publish_package(
+        dataset_id=dataset_id,
+        payload_filename=payload_filename,
+        manifest_prefix=prefix,
+        build_payload=build_payload,
+        storage_root=tmp_path,
+    )
+    assert first[2] is False
+    assert build_count == 1
+    reused = publish_package(
+        dataset_id=dataset_id,
+        payload_filename=payload_filename,
+        manifest_prefix=prefix,
+        build_payload=build_payload,
+        storage_root=tmp_path,
+    )
+    assert reused[2] is True
+    assert build_count == 1
+
+    metadata_dir = Path(first[1]).parent
+    shutil.rmtree(metadata_dir)
+    recovered_partial = publish_package(
+        dataset_id=dataset_id,
+        payload_filename=payload_filename,
+        manifest_prefix=prefix,
+        build_payload=build_payload,
+        storage_root=tmp_path,
+    )
+    assert recovered_partial[2] is False
+    assert build_count == 2
+    assert package_builder.package_manifest.load_package_manifest(dataset_id, storage_root=tmp_path)["dataset_id"] == dataset_id
+
+    payload_path = Path(recovered_partial[0])
+    payload_path.write_bytes(b"corrupt same-identity payload")
+    recovered_corrupt = publish_package(
+        dataset_id=dataset_id,
+        payload_filename=payload_filename,
+        manifest_prefix=prefix,
+        build_payload=build_payload,
+        storage_root=tmp_path,
+    )
+    assert recovered_corrupt[2] is False
+    assert build_count == 3
+    assert payload_path.read_bytes() == payload_bytes
+
+    state_root = common.paths.get_dataset_state_root(storage_root=tmp_path)
+    orphan_staging = state_root / f".{dataset_id}.interrupted.tmp"
+    orphan_staging.mkdir()
+    payload_path.write_bytes(b"corrupt before interrupted replacement")
+    interrupted_backup = state_root / f".{dataset_id}.interrupted.payload.backup"
+    payload_path.parent.replace(interrupted_backup)
+    recovered_interrupted = publish_package(
+        dataset_id=dataset_id,
+        payload_filename=payload_filename,
+        manifest_prefix=prefix,
+        build_payload=build_payload,
+        storage_root=tmp_path,
+    )
+    assert recovered_interrupted[2] is False
+    assert build_count == 4
+    assert Path(recovered_interrupted[0]).read_bytes() == payload_bytes
+    assert not interrupted_backup.exists()
+    assert not orphan_staging.exists()
+    assert not tuple(state_root.glob(f".{dataset_id}.*.backup"))
+    assert not tuple(state_root.glob(f".{dataset_id}.*.tmp"))
+
+    conflicting_prefix = {**prefix, "dataset_name": "different-valid-owner"}
+    before_payload = payload_path.read_bytes()
+    before_manifest = Path(recovered_corrupt[1]).read_bytes()
+    with pytest.raises(FileExistsError, match="conflicts"):
+        publish_package(
+            dataset_id=dataset_id,
+            payload_filename=payload_filename,
+            manifest_prefix=conflicting_prefix,
+            build_payload=build_payload,
+            storage_root=tmp_path,
+        )
+    assert payload_path.read_bytes() == before_payload
+    assert Path(recovered_corrupt[1]).read_bytes() == before_manifest
+    assert build_count == 4
 
 
 def _dataset(handle: h5py.File, name: str) -> h5py.Dataset:

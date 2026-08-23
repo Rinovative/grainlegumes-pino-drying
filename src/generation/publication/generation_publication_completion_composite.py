@@ -183,13 +183,31 @@ def build_composite_receipt(
     }
     path = _receipt_path(completion_id, storage_root=storage)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        existing = load_composite_receipt(completion_id, storage_root=storage)
-        if existing != receipt:
-            raise FileExistsError("Existing composite receipt conflicts with newly admitted completion evidence.")
-        return existing
-    common.serialization.atomic_write_json(path, receipt)
-    return receipt
+    lock_path = path.with_suffix(".lock")
+    with common.locking.exclusive_file_lock(lock_path, blocking=False):
+        if path.exists():
+            if not path.is_file() or path.is_symlink():
+                message = "Existing composite destination is unsafe or conflicts with its file owner."
+                raise FileExistsError(message)
+            try:
+                existing = load_composite_receipt(completion_id, storage_root=storage)
+            except (OSError, TypeError, ValueError) as error:
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    raw = None
+                if isinstance(raw, dict) and (
+                    raw.get("completion_id") not in {None, completion_id} or raw.get("parent_run_id") not in {None, parent_run_id}
+                ):
+                    message = "Existing composite receipt claims a different completion or parent identity."
+                    raise FileExistsError(message) from error
+            else:
+                if existing != receipt:
+                    message = "Existing composite receipt conflicts with newly admitted completion evidence."
+                    raise FileExistsError(message)
+                return existing
+        common.serialization.atomic_write_json(path, receipt)
+        return load_composite_receipt(completion_id, storage_root=storage)
 
 
 def load_composite_receipt(completion_id: str, *, storage_root: Path | str | None = None) -> dict[str, Any]:

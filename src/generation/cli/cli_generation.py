@@ -821,7 +821,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     initialize_completion.add_argument("--parent-run-id", required=True)
     initialize_completion.add_argument("--parent-partial", type=Path, required=True)
     initialize_completion.add_argument("--parent-partial-sha256", required=True)
-    initialize_completion.add_argument("--replacement-pool-size", type=int, required=True)
+    initialize_completion.add_argument("--replacement-pool-size", type=int)
     _add_storage_arguments(initialize_completion)
 
     advance_completion = subparsers.add_parser(

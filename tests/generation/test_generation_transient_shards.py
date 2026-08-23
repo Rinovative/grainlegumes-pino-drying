@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import h5py
+import pytest
 import torch
 import yaml
 
@@ -255,8 +257,26 @@ def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(
     assert reused["receipt"] == receipt
     assert context_depths == ["evidence"]
 
+    conflict = {**_publication_identity(), "campaign_terminal_sha256": "9" * 64}
+    receipt_path = Path(reused["receipt_path"])
+    before_conflict = {path.name: path.read_bytes() for path in receipt_path.parent.iterdir() if path.is_file()}
+    with pytest.raises(FileExistsError, match="publication identity conflicts"):
+        shard_service.build_transient_shards(
+            dataset_id,
+            storage_root=tmp_path,
+            publication_identity=conflict,
+            target_shard_bytes=1_000_000,
+            rebuild_invalid=True,
+        )
+    assert {path.name: path.read_bytes() for path in receipt_path.parent.iterdir() if path.is_file()} == before_conflict
+
     index_path.touch()
     context_depths.clear()
+    state_root = common.paths.get_dataset_state_root(storage_root=tmp_path)
+    orphan_staging = state_root / f".{dataset_id}.transient-pt.interrupted.tmp"
+    orphan_staging.mkdir()
+    orphan_backup = state_root / f".{dataset_id}.transient-pt.invalid-interrupted.backup"
+    receipt_path.parent.replace(orphan_backup)
     rebound = shard_service.build_transient_shards(
         dataset_id,
         storage_root=tmp_path,
@@ -264,8 +284,10 @@ def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(
         target_shard_bytes=1_000_000,
         rebuild_invalid=True,
     )
-    assert rebound["status"] == "rebuilt"
-    assert context_depths == ["evidence", "full"]
+    assert rebound["status"] == "complete"
+    assert context_depths == ["full"]
+    assert not orphan_staging.exists()
+    assert not orphan_backup.exists()
     receipt = rebound["receipt"]
 
     shard_path = Path(rebound["receipt_path"]).parent / str(receipt["shards"][0]["filename"])
@@ -334,6 +356,21 @@ def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(
             assert source_free[0]["metadata"]["dataset_id"] == dataset_id
         finally:
             source_free.close()
+
+    raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert isinstance(raw_receipt, dict)
+    raw_receipt["publication_identity"] = conflict
+    common.serialization.atomic_write_json(receipt_path, raw_receipt)
+    corrupt_conflict = receipt_path.read_bytes()
+    with pytest.raises(FileExistsError, match="different immutable owner"):
+        shard_service.build_transient_shards(
+            dataset_id,
+            storage_root=tmp_path,
+            publication_identity=_publication_identity(),
+            target_shard_bytes=1_000_000,
+            rebuild_invalid=True,
+        )
+    assert receipt_path.read_bytes() == corrupt_conflict
 
 
 def test_transient_shards_keep_oversized_cases_whole_and_evict_cache(

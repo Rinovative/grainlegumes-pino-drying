@@ -159,9 +159,33 @@ def test_completion_status_if_present_is_read_only_and_rejects_unsafe_state(tmp_
 
 
 def test_completion_pool_is_monotonic_and_parent_bound(tmp_path: Path) -> None:
-    state = _state(tmp_path, pool=2)
-    resumed = _state(tmp_path, pool=2)
-    assert resumed == state
+    initial_pool = 2
+    state = _state(tmp_path, pool=initial_pool)
+    wave = completion.allocate_next_wave(
+        state,
+        original_successes={"batch-a": 1},
+        failed_case_ids={"batch-a": ("case_0002",)},
+        sampling_seed=17,
+        unit_points={
+            ("batch-a", 1): {"thermal": [0.1]},
+            ("batch-a", 2): {"thermal": [0.2]},
+        },
+        storage_root=tmp_path,
+    )
+    assert wave is not None
+    persisted = json.loads(json.dumps(state))
+    resumed = completion.create_completion(
+        parent_run_id="parent__abc",
+        parent_partial_evidence={"successful": {"batch-a": ["case_0001"]}},
+        parent_partial_sha256="a" * 64,
+        targets=(completion.CompletionTarget("batch-a", 3),),
+        replacement_pool_size=None,
+        maximum_failed_cases=1,
+        storage_root=tmp_path,
+    )
+    assert resumed == persisted
+    assert resumed["pool_high_water"] == initial_pool
+    assert [candidate["candidate_id"] for candidate in resumed["candidates"]] == list(wave.candidate_ids)
     assert completion.extend_pool(resumed, replacement_pool_size=4)
     with pytest.raises(ValueError, match="high-water"):
         completion.ensure_pool_capacity(resumed, replacement_pool_size=1)
@@ -172,6 +196,16 @@ def test_completion_pool_is_monotonic_and_parent_bound(tmp_path: Path) -> None:
             parent_partial_sha256="a" * 64,
             targets=(completion.CompletionTarget("batch-a", 3),),
             replacement_pool_size=4,
+            storage_root=tmp_path,
+        )
+
+    with pytest.raises(RuntimeError, match="requires --replacement-pool-size"):
+        completion.create_completion(
+            parent_run_id="parent__missing",
+            parent_partial_evidence={"successful": {}},
+            parent_partial_sha256="b" * 64,
+            targets=(completion.CompletionTarget("batch-a", 1),),
+            replacement_pool_size=None,
             storage_root=tmp_path,
         )
 
@@ -597,6 +631,10 @@ def test_all_failed_parent_can_be_completed_entirely_by_replacements(
     assert startup["package_state"] == {"status": "absent", "count": 0}
     assert startup["shard_state"] == {"status": "absent", "count": 0}
     assert startup["training_readiness"] == "absent"
+    assert startup["recoverable_stale_artifacts"] == 0
+    assert startup["conflicting_artifacts"] == 0
+    assert startup["normal_run_requires_replacement_pool"] is False
+    assert startup["next_command"] == "run <CONFIG>"
     original_successes, failures = completion.parent_partial_counts(
         parent,
         partial,
@@ -627,7 +665,34 @@ def test_all_failed_parent_can_be_completed_entirely_by_replacements(
     }
     for candidate_id in wave.candidate_ids:
         _reconcile_terminal(state, candidate_id, "successful", storage_root=tmp_path)
-    assert completion.completion_status_for_id(state["completion_id"], storage_root=tmp_path)["status"] == "complete"
+    complete = completion.completion_status_for_id(state["completion_id"], storage_root=tmp_path)
+    assert complete["status"] == "complete"
+    assert complete["new_comsol_work_required"] == 0
+    assert complete["normal_run_requires_replacement_pool"] is False
+    assert complete["next_command"] == "run <CONFIG>"
+    assert complete["normal_run_next_operation"] == ("collect successful replacement publications and build or recover the completion composite")
+
+    composite_path = completion.completion_directory(state["completion_id"], storage_root=tmp_path) / "completion_composite.json"
+    composite_path.write_text('{"completion_id":', encoding="utf-8")
+    recoverable = completion.completion_status_for_id(state["completion_id"], storage_root=tmp_path)
+    assert recoverable["composite_source_state"] == "recoverable"
+    assert recoverable["recoverable_stale_artifacts"] == 1
+    assert recoverable["conflicting_artifacts"] == 0
+
+    common.serialization.atomic_write_json(
+        composite_path,
+        {
+            "schema_kind": "generation_completion_composite",
+            "schema_version": 1,
+            "completion_id": "completion__different",
+            "parent_run_id": state["parent_run_id"],
+        },
+    )
+    conflicting = completion.completion_status_for_id(state["completion_id"], storage_root=tmp_path)
+    assert conflicting["composite_source_state"] == "conflicting"
+    assert conflicting["recoverable_stale_artifacts"] == 0
+    assert conflicting["conflicting_artifacts"] == 1
+    assert conflicting["normal_run_next_operation"] == "resolve conflicting finalization artifact identity"
 
 
 def test_supplemental_materialization_has_new_science_and_portable_identity(

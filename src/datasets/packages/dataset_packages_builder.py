@@ -2,14 +2,17 @@
 dataset_packages_builder.py
 
 Build immutable dual-view Dataset packages from terminal simulation evidence.
+
 Responsibilities:
   - Assemble content-bound steady payloads and transient indexes
   - Compute package identities and publish exact payloads atomically
-  - Reuse only existing packages whose manifests and payload hashes agree
+  - Reuse valid packages and recover incomplete same-identity publications
+
 Design principles:
   - Package identity is independent of operational source locations
   - One combined parameter-OOD package owns compact group and parameter indexes
-  - Publication fails closed on partial or conflicting existing state
+  - Valid conflicting identities fail closed without replacement
+
 This module does NOT:
   - Provide the supported Dataset package CLI
   - Inspect or smoke-load published runtime Dataset objects
@@ -21,6 +24,7 @@ import copy
 import json
 import shutil
 import tempfile
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -357,6 +361,132 @@ def _transient_sources(prepared: planning.PreparedPackage) -> tuple[trajectory.T
     return tuple(sources)
 
 
+def _remove_stale_publication_attempts(state_root: Path, dataset_id: str) -> None:
+    """Remove only inactive attempt paths for one locked Dataset identity."""
+    if not state_root.exists():
+        return
+    prefix = f".{dataset_id}."
+    suffixes = (".tmp", ".payload.backup", ".metadata.backup")
+    for path in state_root.iterdir():
+        if not path.name.startswith(prefix) or not path.name.endswith(suffixes):
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+
+def _admit_existing_package(
+    *,
+    dataset_id: str,
+    destination_dir: Path,
+    metadata_dir: Path,
+    destination: Path,
+    manifest_path: Path,
+    requested_prefix: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return an exact existing package or classify it as recoverable."""
+    for directory, label in (
+        (destination_dir, "payload"),
+        (metadata_dir, "metadata"),
+    ):
+        if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+            message = f"Existing Dataset package {label} destination is unsafe: {directory}."
+            raise FileExistsError(message)
+    for artifact, label in (
+        (destination, "payload"),
+        (manifest_path, "manifest"),
+    ):
+        if artifact.exists() and (artifact.is_symlink() or not artifact.is_file()):
+            message = f"Existing Dataset package {label} is unsafe: {artifact}."
+            raise FileExistsError(message)
+    if not manifest_path.is_file():
+        return None
+    try:
+        candidate_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(candidate_manifest, dict):
+        return None
+    conflicting = any(key in candidate_manifest and candidate_manifest[key] != value for key, value in requested_prefix.items())
+    if conflicting:
+        message = f"Existing package content conflicts with {dataset_id!r}."
+        raise FileExistsError(message)
+    if not destination.is_file():
+        return None
+    try:
+        return package_manifest.validate_manifest_content(
+            candidate_manifest,
+            dataset_id=dataset_id,
+            payload_path=destination,
+        )
+    except (FileNotFoundError, TypeError, ValueError):
+        return None
+
+
+def _require_matching_published_manifest(
+    dataset_id: str,
+    published_manifest: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Load the published manifest and require the staged content identity."""
+    admitted_manifest = package_manifest.load_package_manifest_evidence(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    if admitted_manifest != published_manifest:
+        message = f"Published package manifest changed during admission: {dataset_id!r}."
+        raise RuntimeError(message)
+    return admitted_manifest
+
+
+def _replace_package_publication(
+    *,
+    dataset_id: str,
+    destination_dir: Path,
+    metadata_dir: Path,
+    staged_payload_dir: Path,
+    staged_metadata_dir: Path,
+    payload_backup: Path,
+    metadata_backup: Path,
+    published_manifest: Mapping[str, Any],
+    storage_root: Path | str | None,
+) -> dict[str, Any]:
+    """Replace recoverable same-identity state with rollback on interruption."""
+    published_payload = False
+    published_metadata = False
+    try:
+        if destination_dir.exists():
+            destination_dir.replace(payload_backup)
+        if metadata_dir.exists():
+            metadata_dir.replace(metadata_backup)
+        staged_payload_dir.replace(destination_dir)
+        published_payload = True
+        staged_metadata_dir.replace(metadata_dir)
+        published_metadata = True
+        admitted_manifest = _require_matching_published_manifest(
+            dataset_id,
+            published_manifest,
+            storage_root=storage_root,
+        )
+    except BaseException:
+        if published_metadata and metadata_dir.exists():
+            shutil.rmtree(metadata_dir)
+        if published_payload and destination_dir.exists():
+            shutil.rmtree(destination_dir)
+        if metadata_backup.exists() and not metadata_dir.exists():
+            metadata_backup.replace(metadata_dir)
+        if payload_backup.exists() and not destination_dir.exists():
+            payload_backup.replace(destination_dir)
+        raise
+    if metadata_backup.exists():
+        shutil.rmtree(metadata_backup)
+    if payload_backup.exists():
+        shutil.rmtree(payload_backup)
+    return admitted_manifest
+
+
 def _publish(
     *,
     dataset_id: str,
@@ -365,7 +495,7 @@ def _publish(
     build_payload: Callable[[Path], Mapping[str, int]],
     storage_root: Path | str | None,
 ) -> tuple[Path, Path, bool, dict[str, Any]]:
-    """Atomically publish or integrity-reuse one locked immutable package."""
+    """Atomically publish, integrity-reuse, or recover one locked immutable package."""
     payload_root = common.paths.get_dataset_packages_root(storage_root=storage_root)
     metadata_root = common.paths.get_dataset_metadata_root(storage_root=storage_root)
     destination_dir = payload_root / dataset_id
@@ -374,40 +504,29 @@ def _publish(
     manifest_path = metadata_dir / "dataset_manifest.json"
     lock_path = common.paths.resolve_dataset_build_lock_path(dataset_id, storage_root=storage_root)
     requested_prefix = dict(manifest_prefix)
-    published_manifest: dict[str, Any]
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        if destination.is_file() and manifest_path.is_file():
-            try:
-                raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                message = f"Existing package manifest is unreadable: {manifest_path}."
-                raise ValueError(message) from error
-            if not isinstance(raw_manifest, dict):
-                message = f"Existing package manifest is malformed: {manifest_path}."
-                raise TypeError(message)
-            if any(raw_manifest.get(key) != value for key, value in requested_prefix.items()):
-                message = f"Existing package content conflicts with {dataset_id!r}."
-                raise FileExistsError(message)
-            try:
-                existing_manifest = package_manifest.validate_manifest_content(
-                    raw_manifest,
-                    dataset_id=dataset_id,
-                    payload_path=destination,
-                )
-            except (FileNotFoundError, TypeError, ValueError) as error:
-                message = f"Existing package content conflicts with {dataset_id!r}."
-                raise FileExistsError(message) from error
-            return destination, manifest_path, True, existing_manifest
-        if destination_dir.exists() or metadata_dir.exists():
-            message = f"Partial or conflicting dataset package already exists: {dataset_id!r}."
-            raise FileExistsError(message)
+        existing_manifest = _admit_existing_package(
+            dataset_id=dataset_id,
+            destination_dir=destination_dir,
+            metadata_dir=metadata_dir,
+            destination=destination,
+            manifest_path=manifest_path,
+            requested_prefix=requested_prefix,
+        )
         state_root = common.paths.get_dataset_state_root(storage_root=storage_root)
+        if existing_manifest is not None:
+            _remove_stale_publication_attempts(state_root, dataset_id)
+            return destination, manifest_path, True, existing_manifest
+
         state_root.mkdir(parents=True, exist_ok=True)
+        attempt = uuid.uuid4().hex
         staging = Path(tempfile.mkdtemp(prefix=f".{dataset_id}.", suffix=".tmp", dir=state_root))
         staged_payload_dir = staging / "payload"
         staged_metadata_dir = staging / "metadata"
         staged_payload_dir.mkdir()
         staged_metadata_dir.mkdir()
+        payload_backup = state_root / f".{dataset_id}.{attempt}.payload.backup"
+        metadata_backup = state_root / f".{dataset_id}.{attempt}.metadata.backup"
         try:
             staged_payload = staged_payload_dir / payload_filename
             payload_metadata = dict(build_payload(staged_payload))
@@ -431,18 +550,21 @@ def _publish(
             )
             destination_dir.parent.mkdir(parents=True, exist_ok=True)
             metadata_dir.parent.mkdir(parents=True, exist_ok=True)
-            staged_payload_dir.replace(destination_dir)
-            staged_metadata_dir.replace(metadata_dir)
+            admitted_manifest = _replace_package_publication(
+                dataset_id=dataset_id,
+                destination_dir=destination_dir,
+                metadata_dir=metadata_dir,
+                staged_payload_dir=staged_payload_dir,
+                staged_metadata_dir=staged_metadata_dir,
+                payload_backup=payload_backup,
+                metadata_backup=metadata_backup,
+                published_manifest=published_manifest,
+                storage_root=storage_root,
+            )
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-    admitted_manifest = package_manifest.load_package_manifest_evidence(
-        dataset_id,
-        storage_root=storage_root,
-    )
-    if admitted_manifest != published_manifest:
-        message = f"Published package manifest changed during admission: {dataset_id!r}."
-        raise RuntimeError(message)
-    return destination, manifest_path, False, admitted_manifest
+        _remove_stale_publication_attempts(state_root, dataset_id)
+        return destination, manifest_path, False, admitted_manifest
 
 
 def _publish_prepared(

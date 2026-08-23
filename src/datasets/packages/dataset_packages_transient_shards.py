@@ -1011,6 +1011,39 @@ def load_transient_shard_payload(
     )
 
 
+def _raw_shard_destination_conflicts(
+    destination: Path,
+    *,
+    dataset_id: str,
+    publication_identity: Mapping[str, str],
+    target_shard_bytes: int,
+) -> bool:
+    """Return whether invalid shard evidence claims another immutable owner."""
+    receipt_path = destination / TRANSIENT_PT_RECEIPT_FILENAME
+    if receipt_path.is_symlink() or (receipt_path.exists() and not receipt_path.is_file()):
+        return True
+    if not receipt_path.is_file():
+        return False
+    try:
+        raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw_receipt, dict):
+        return False
+    if raw_receipt.get("dataset_id") not in {None, dataset_id}:
+        return True
+    if raw_receipt.get("target_shard_bytes") not in {None, target_shard_bytes}:
+        return True
+    raw_publication = raw_receipt.get("publication_identity")
+    if not isinstance(raw_publication, dict):
+        return False
+    observed_keys = set(raw_publication)
+    expected_keys = set(publication_identity)
+    if observed_keys in _PUBLICATION_IDENTITY_KEY_SETS and observed_keys != expected_keys:
+        return True
+    return any(key in raw_publication and raw_publication[key] != value for key, value in publication_identity.items())
+
+
 def _admit_existing_shard_destination(
     dataset_id: str,
     *,
@@ -1041,10 +1074,18 @@ def _admit_existing_shard_destination(
             manifest_sha256=manifest_sha256,
             canonical_payload_size_bytes=canonical_payload_size_bytes,
             canonical_payload_stat_identity=canonical_payload_stat_identity,
-            publication_identity=publication_identity,
+            publication_identity=None,
             validation_depth=validation_depth,
         )
-    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError):
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+        if _raw_shard_destination_conflicts(
+            destination,
+            dataset_id=dataset_id,
+            publication_identity=publication_identity,
+            target_shard_bytes=target_shard_bytes,
+        ):
+            message = f"Invalid transient PT shard evidence claims a different immutable owner for {dataset_id!r}."
+            raise FileExistsError(message) from error
         if not rebuild_invalid:
             raise
         _emit(
@@ -1057,31 +1098,39 @@ def _admit_existing_shard_destination(
             eta="unavailable",
         )
         return None, True
-    if receipt["target_shard_bytes"] == target_shard_bytes:
-        _emit(
-            progress,
-            operation="shard_reuse",
-            cases_packed=receipt["case_count"],
-            cases_total=receipt["case_count"],
-            shards_completed=receipt["shard_count"],
-            shards_total=receipt["shard_count"],
-            bytes_written=0,
-            eta="unavailable",
-        )
-        return receipt, False
-    if not rebuild_invalid:
-        message = f"Existing transient PT shard packing policy conflicts for {dataset_id!r}."
+    if receipt["publication_identity"] != dict(publication_identity):
+        message = f"Existing transient PT shard publication identity conflicts for {dataset_id!r}."
+        raise FileExistsError(message)
+    if receipt["target_shard_bytes"] != target_shard_bytes:
+        message = f"Existing transient PT shard packing identity conflicts for {dataset_id!r}."
         raise FileExistsError(message)
     _emit(
         progress,
-        operation="shard_rebuild",
-        cases_packed=0,
-        cases_total=case_count,
-        shards_completed=0,
+        operation="shard_reuse",
+        cases_packed=receipt["case_count"],
+        cases_total=receipt["case_count"],
+        shards_completed=receipt["shard_count"],
+        shards_total=receipt["shard_count"],
         bytes_written=0,
         eta="unavailable",
     )
-    return None, True
+    return receipt, False
+
+
+def _remove_stale_shard_attempts(state_root: Path, dataset_id: str) -> None:
+    """Remove only inactive shard staging and backup paths for one locked Dataset."""
+    if not state_root.exists():
+        return
+    prefix = f".{dataset_id}.transient-pt."
+    for path in state_root.iterdir():
+        staging = path.name.startswith(prefix) and path.name.endswith(".tmp")
+        backup = path.name.startswith(f"{prefix}invalid-") and path.name.endswith(".backup")
+        if not staging and not backup:
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
 
 
 def build_transient_shards(
@@ -1122,6 +1171,7 @@ def build_transient_shards(
         storage_root=storage,
     )
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
+        state_root = common.paths.get_dataset_state_root(storage_root=storage)
         existing, replace_invalid = _admit_existing_shard_destination(
             dataset_id,
             destination=destination,
@@ -1138,6 +1188,7 @@ def build_transient_shards(
             progress=progress,
         )
         if existing is not None:
+            _remove_stale_shard_attempts(state_root, dataset_id)
             return {
                 "status": "reused",
                 "receipt_path": destination / TRANSIENT_PT_RECEIPT_FILENAME,
@@ -1153,7 +1204,6 @@ def build_transient_shards(
                 storage,
                 manifest,
             )
-        state_root = common.paths.get_dataset_state_root(storage_root=storage)
         state_root.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(
@@ -1271,6 +1321,7 @@ def build_transient_shards(
             publication_identity=stable_publication,
             validation_depth="evidence",
         )
+        _remove_stale_shard_attempts(state_root, dataset_id)
     return {
         "status": "rebuilt" if replace_invalid else "complete",
         "receipt_path": destination / TRANSIENT_PT_RECEIPT_FILENAME,

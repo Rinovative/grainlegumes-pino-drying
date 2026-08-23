@@ -1524,6 +1524,7 @@ def _seed_completion_transfer(
             "parent_partial_path": f"/workspace/storage/{partial_relative}",
             "parent_partial_sha256": partial_sha256,
             "completion_status": "active",
+            "replacement_pool_size": int(environment["FAKE_COMPLETION_POOL_SIZE"]),
             "target_counts": {_BATCH_NAME: 1},
             "current_successes": {_BATCH_NAME: 0},
             "success_deficits": {_BATCH_NAME: 1},
@@ -3505,6 +3506,86 @@ def test_completion_failure_circuit_stops_without_pool_extension_guidance(
     assert " initialize-campaign-completion " in log_text
     assert (" advance-campaign-completion " in log_text) is (status_variable == "FAKE_COMPLETION_ADVANCE_STATUS")
     assert " campaign-completion-transfer-plan " not in log_text
+    assert " build-campaign-completion-composite " not in log_text
+
+
+def test_config_only_run_finalizes_persisted_complete_campaign_without_new_science(
+    tmp_path: Path,
+) -> None:
+    """Finalize an already satisfied persisted completion through ordinary run CONFIG."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    parent = json.loads(environment["FAKE_COMPLETION_PARENT_JSON"])
+    parent["completion_status"] = "complete"
+    parent["current_successes"] = {_BATCH_NAME: 1}
+    parent["success_deficits"] = {_BATCH_NAME: 0}
+    environment["FAKE_COMPLETION_PARENT_JSON"] = json.dumps(parent, sort_keys=True)
+    environment["FAKE_COMPLETION_INITIALIZE_STATUS"] = "complete"
+    environment["FAKE_COMPLETION_ADVANCE_STATUS"] = "complete"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "state=complete_composite" in result.stdout
+    log_text = log.read_text(encoding="utf-8")
+    assert " initialize-campaign-completion " in log_text
+    assert " advance-campaign-completion " in log_text
+    assert " submit-campaign " not in log_text
+    assert " materialize-campaign-inputs " not in log_text
+    initialize = next(line for line in log_text.splitlines() if " initialize-campaign-completion " in line)
+    assert " --replacement-pool-size " not in initialize
+    assert "<build-campaign-completion-composite>" in log_text
+    assert "<build-campaign-completion-lifecycle>" in log_text
+    assert "<validate-campaign-completion-lifecycle>" in log_text
+
+
+def test_config_only_run_resumes_already_authorized_completion_capacity(tmp_path: Path) -> None:
+    """Resume persisted replacement work without restating its pool high-water."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    environment["FAKE_COMPLETION_ADVANCE_STATES"] = "active,complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    initialize = next(line for line in log_text.splitlines() if " initialize-campaign-completion " in line)
+    assert " --replacement-pool-size " not in initialize
+    assert sum(" advance-campaign-completion " in line for line in log_text.splitlines()) == 2
+    assert _REPLACEMENT_RUN_ID in log_text
+
+
+def test_config_only_run_requests_larger_pool_only_after_persisted_exhaustion(tmp_path: Path) -> None:
+    """Stop without inventing candidates when persisted replacement capacity is exhausted."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    environment["FAKE_COMPLETION_INITIALIZE_STATUS"] = "pool_exhausted"
+    environment["FAKE_COMPLETION_ADVANCE_STATUS"] = "pool_exhausted"
+
+    result = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 3
+    assert "remaining successful deficit = 1" in result.stderr
+    assert "persisted replacement pool high-water = 4" in result.stderr
+    assert "unused authorized capacity = 0" in result.stderr
+    assert "./scripts/generation_workflow.sh run" in result.stderr
+    assert "--replacement-pool-size 5" in result.stderr
+    assert "--parent-run-id" not in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert " submit-campaign " not in log_text
     assert " build-campaign-completion-composite " not in log_text
 
 
