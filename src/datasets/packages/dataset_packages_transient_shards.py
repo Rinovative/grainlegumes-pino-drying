@@ -51,13 +51,24 @@ _MINIMUM_STATE_COUNT: Final = 2
 _TRANSIENT_TENSOR_RANK: Final = 4
 _STATIC_TENSOR_RANK: Final = 3
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
-_PUBLICATION_IDENTITY_KEYS: Final = {
+_TERMINAL_PUBLICATION_IDENTITY_KEYS: Final = {
     "campaign_run_id",
     "campaign_id",
     "git_commit",
     "campaign_terminal_sha256",
     "transfer_inventory_sha256",
 }
+_COMPOSITE_PUBLICATION_IDENTITY_KEYS: Final = {
+    "completion_id",
+    "parent_run_id",
+    "parent_partial_sha256",
+    "completion_receipt_sha256",
+    "combined_inventory_sha256",
+}
+_PUBLICATION_IDENTITY_KEY_SETS: Final = (
+    _TERMINAL_PUBLICATION_IDENTITY_KEYS,
+    _COMPOSITE_PUBLICATION_IDENTITY_KEYS,
+)
 ProgressCallback = Callable[[Mapping[str, Any]], None]
 ValidationDepth = Literal["evidence", "full"]
 
@@ -92,16 +103,16 @@ def transient_shard_receipt_path(
 
 def _validate_publication_identity(value: Any) -> dict[str, str]:
     """Validate stable canonical GPU publication binding fields."""
-    if not isinstance(value, dict) or set(value) != _PUBLICATION_IDENTITY_KEYS:
-        message = "Transient shard GPU publication identity keys are invalid."
+    if not isinstance(value, dict) or set(value) not in _PUBLICATION_IDENTITY_KEY_SETS:
+        message = "Transient shard publication identity keys are invalid."
         raise TransientShardContractError(message)
     result: dict[str, str] = {}
-    for key in sorted(_PUBLICATION_IDENTITY_KEYS):
+    for key in sorted(value):
         item = value[key]
         if not isinstance(item, str) or not item:
             message = f"Transient shard GPU publication identity {key!r} is invalid."
             raise TransientShardContractError(message)
-        if key.endswith("_sha256") and _SHA256_PATTERN.fullmatch(item) is None:
+        if (key.endswith("_sha256") or key == "combined_inventory_sha256") and _SHA256_PATTERN.fullmatch(item) is None:
             message = f"Transient shard GPU publication digest {key!r} is invalid."
             raise TransientShardContractError(message)
         result[key] = item

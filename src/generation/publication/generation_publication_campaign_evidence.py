@@ -69,6 +69,7 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "state",
     }
 )
+_RUN_MANIFEST_OPTIONAL_KEYS: Final = frozenset({"synthetic_completion"})
 POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
     {
         "all_workflow.json",
@@ -165,13 +166,18 @@ def _validate_campaign_run_header(
 ) -> list[str]:
     """Validate top-level campaign, source, and scheduler identity."""
     if (
-        set(manifest) != _RUN_MANIFEST_KEYS
+        not set(manifest) >= _RUN_MANIFEST_KEYS
+        or bool(set(manifest).difference(_RUN_MANIFEST_KEYS | _RUN_MANIFEST_OPTIONAL_KEYS))
         or manifest.get("schema_kind") != "generation_campaign_run"
         or manifest.get("schema_version") != _RUN_MANIFEST_SCHEMA_VERSION
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
         raise ValueError(message)
+    if "synthetic_completion" in manifest:
+        from src.generation import generation_campaign_completion as completion_service  # noqa: PLC0415 -- break the completion/evidence import cycle
+
+        completion_service.validate_synthetic_manifest_extension(manifest["synthetic_completion"])
     source_service.validate_git_commit(manifest.get("git_commit"))
     for key in ("campaign_digest", "execution_config_digest"):
         value = manifest.get(key)
@@ -516,6 +522,15 @@ def current_campaign_from_manifest(
     require_executable: bool = True,
 ) -> config_service.CampaignConfig:
     """Resolve current package requests over one unchanged simulation plan."""
+    if "synthetic_completion" in manifest:
+        from src.generation import generation_campaign_completion as completion_service  # noqa: PLC0415 -- break the completion/evidence import cycle
+
+        campaign = completion_service.campaign_from_synthetic_manifest(
+            manifest,
+            require_executable=require_executable,
+        )
+        _validate_admission_reservations_for_campaign(manifest, campaign)
+        return campaign
     config_path = resolve_campaign_config_path(manifest["campaign_config"])
     campaign = config_service.load_campaign_config(
         config_path,

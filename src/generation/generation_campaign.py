@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 from src import common
 
+from . import generation_campaign_completion as completion_service
 from .cases import generation_cases_admission as admission_service
 from .cases import generation_cases_config as config_service
 from .cases import generation_cases_input as input_service
@@ -339,7 +340,7 @@ def _new_campaign_manifest(
     """Return durable feeder state before the first one-case submission."""
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
     scheduler_prefix = f"{_profile_job_code(campaign)}-campaign-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
-    return {
+    manifest = {
         "schema_kind": "generation_campaign_run",
         "schema_version": 1,
         "campaign_run_id": run_id,
@@ -390,6 +391,10 @@ def _new_campaign_manifest(
         "dataset_packages": list(campaign.dataset_packages),
         "state": "ready",
     }
+    supplemental = completion_service.synthetic_manifest_extension(campaign)
+    if supplemental is not None:
+        manifest["synthetic_completion"] = supplemental
+    return manifest
 
 
 def plan_campaign(
@@ -4289,7 +4294,6 @@ def _validate_partial_campaign_evidence_structure(
         ]
         != expected_batches
         or not isinstance(successful, list)
-        or not successful
         or not isinstance(failed, list)
         or not failed
         or any(not isinstance(record, dict) or set(record) != case_keys for record in records)
@@ -4382,8 +4386,8 @@ def partial_campaign_transfer_plan(
     status = campaign_status(run_id, storage_root=storage, query_scheduler=True)
     successful = [case for case in status["cases"] if case["state"] == "successful"]
     failed = [case for case in status["cases"] if case["state"] == "failed"]
-    if status["campaign_state"] != "completed_with_failures" or not successful or not failed:
-        message = "Partial publication requires successful cases and genuine terminal case failures."
+    if status["campaign_state"] != "completed_with_failures" or not failed:
+        message = "Partial publication requires genuine terminal case failures and exact original membership."
         raise RuntimeError(message)
     batches_by_name = {batch.batch_name: batch for batch in campaign.batches}
     for case in successful:
@@ -5240,7 +5244,6 @@ def validate_partially_transferred_campaign(
         or receipt.get("successful_cases") != successful
         or receipt.get("failed_cases") != failed
         or not isinstance(successful, list)
-        or not successful
         or not isinstance(failed, list)
         or not failed
         or receipt.get("source_removed") is not False

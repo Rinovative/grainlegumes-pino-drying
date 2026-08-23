@@ -25,6 +25,7 @@ CAMPAIGN_PURPOSE=""
 SCHEDULER_KIND=""
 PARTITION=""
 CORES_PER_NODE=""
+TIMING_PROBE_CORES_PER_CASE=""
 PYTHON_MODULE=""
 COMSOL_MODULE=""
 PYTHON_EXECUTABLE=""
@@ -64,13 +65,24 @@ LOCAL_STORAGE_ROOT=""
 LOCAL_PYTHON_READY=false
 CONFIGURED_UNIFORM_CASE_COUNT=""
 CONFIGURED_TOTAL_CASE_COUNT=""
+REPLACEMENT_POOL_SIZE=""
+PARENT_RUN_ID=""
+COMPLETION_PARENT_STATUS=""
+COMPLETION_PARENT_RUN_ID=""
+COMPLETION_ID=""
+COMPLETION_PARENT_PARTIAL_PATH=""
+COMPLETION_PARENT_PARTIAL_SHA256=""
+COMPLETION_PARENT_JSON=""
+COMPLETION_TRANSFER_JSON=""
+COMPLETION_REPLACEMENT_RUN_IDS=()
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  $0 run CONFIG [--background] [--keep-cpu-source|--defer-collection] [remote options]
-  $0 run CONFIG --dry-run
-  $0 run CONFIG --preflight-only [remote options]
+  $0 run CONFIG [--replacement-pool-size N [--parent-run-id RUN_ID]] [--background] [--keep-cpu-source] [remote options]
+  $0 run CONFIG --dry-run [--replacement-pool-size N [--parent-run-id RUN_ID]]
+  $0 run CONFIG --preflight-only [--replacement-pool-size N [--parent-run-id RUN_ID]] [remote options]
+  $0 timing-probe CONFIG [--background] [remote options]
   $0 setup-cpu [--execute] [remote options]
   $0 status CONFIG_OR_RUN_ID [remote options]
   $0 cancel RUN_ID [--force] [remote options]
@@ -84,6 +96,9 @@ Remote options:
   --git-commit COMMIT   exact lowercase 40-character commit
 
 Every maintained Generation workflow starts and resumes with run CONFIG.
+--replacement-pool-size N enables cumulative deterministic completion of a partial
+campaign; increasing N extends the stable candidate prefix. --parent-run-id is an
+expert disambiguation override and is valid only with the replacement pool.
 Foreground execution is the default. --background changes only controller ownership.
 --defer-collection leaves the validated CPU source as the exclusive copy; rerun the
 same CONFIG without it to collect and finish. --keep-cpu-source collects and retains
@@ -384,6 +399,11 @@ validate_commit() {
 
 validate_run_id() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+__[0-9a-f]{16}$ ]] || fail 2 "Malformed campaign-run ID: $1"
+}
+
+validate_completion_id() {
+  [[ "$1" =~ ^completion__[0-9a-f]{24}$ ]] ||
+    fail 2 "Malformed campaign-completion ID: $1"
 }
 
 validate_benchmark_run_id() {
@@ -698,8 +718,8 @@ launch_background_workflow() {
     fail 2 "A background workflow child cannot create another tmux session."
   require_command tmux "background workflow execution"
   local subcommand="${ORIGINAL_ARGUMENTS[0]}" background_count=0 argument
-  [[ "${subcommand}" == run ]] ||
-    fail 2 "--background is supported only by run CONFIG."
+  [[ "${subcommand}" == run || "${subcommand}" == timing-probe ]] ||
+    fail 2 "--background is supported only by run CONFIG or timing-probe CONFIG."
   local -a child_arguments=()
   local has_commit=false has_cpu_host=false has_remote_root=false
   for argument in "${ORIGINAL_ARGUMENTS[@]}"; do
@@ -721,7 +741,7 @@ launch_background_workflow() {
   if [[ "${has_commit}" != true ]]; then
     child_arguments+=(--git-commit "${REQUESTED_COMMIT}")
   fi
-  if [[ "${subcommand}" == run ]]; then
+  if [[ "${subcommand}" == run || "${subcommand}" == timing-probe ]]; then
     CPU_HOST="${GENERATION_CPU_HOST:-}"
     REMOTE_ROOT=""
     local index
@@ -1006,10 +1026,157 @@ ensure_execution_bootstrap() {
 }
 
 
+resolve_timing_probe_contract() {
+  admit_repository_file "$1" "timing-probe config"
+  TIMING_PROBE_CONFIG_PATH="${ADMITTED_HOST_PATH}"
+  TIMING_PROBE_RELATIVE_PATH="${ADMITTED_REPOSITORY_PATH}"
+  local record campaign_path probe_cores
+  local -a fields=()
+  record="$(local_python -c '
+import sys
+
+from src.generation import generation_timing_probe as probe
+
+_, value = probe._probe_config(sys.argv[1])
+fields = (str(value["campaign_config"]), str(value["cores_per_case"]))
+if any(any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in field) for field in fields):
+    raise SystemExit("timing-probe configuration contains unsafe shell transport text")
+print(*fields, sep="\n")
+' "${TIMING_PROBE_CONFIG_PATH}")" || fail 2 "Could not resolve the timing-probe configuration."
+  mapfile -t fields <<< "${record}"
+  (( ${#fields[@]} == 2 )) || fail 2 "Malformed timing-probe configuration record."
+  campaign_path="$(container_path_to_host "${fields[0]}")"
+  probe_cores="${fields[1]}"
+  [[ -n "${campaign_path}" && -n "${probe_cores}" ]] || fail 2 "Malformed timing-probe configuration record."
+  admit_repository_file "${campaign_path}" "timing-probe campaign config"
+  CAMPAIGN_CONFIG_PATH="${ADMITTED_HOST_PATH}"
+  CAMPAIGN_RELATIVE_PATH="${ADMITTED_REPOSITORY_PATH}"
+  resolve_configured_resources executable
+  validate_resources
+  validate_positive "timing-probe cores_per_case" "${probe_cores}"
+  (( probe_cores <= CORES_PER_NODE )) ||
+    fail 2 "timing-probe cores_per_case exceeds configured site cores_per_node."
+  TIMING_PROBE_CORES_PER_CASE="${probe_cores}"
+}
+
+run_timing_probe_remote() {
+  local remote_probe
+  remote_probe="$(remote_repository_path "${TIMING_PROBE_RELATIVE_PATH}")"
+  verify_remote_setup
+  remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${remote_probe}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" "${PARTITION}" "${TIMING_PROBE_CORES_PER_CASE}" "${WALL_TIME}" <<'REMOTE'
+set -euo pipefail
+repository="$1"; storage="$2"; venv="$3"; commit="$4"; probe="$5"
+python_module="$6"; comsol_module="$7"; comsol_executable="$8"; partition="$9"; cores="${10}"; wall_time="${11}"
+module load "${python_module}"
+module load "${comsol_module}"
+command -v "${comsol_executable}" >/dev/null 2>&1 || { printf 'COMSOL executable is unavailable in allocation environment.\\n' >&2; exit 1; }
+export GENERATION_CPU_VENV="${venv}"
+export STORAGE_ROOT="${storage}"
+export GENERATION_GIT_COMMIT="${commit}"
+cd "${repository}"
+command=(srun --nodes=1 --ntasks=1 --cpus-per-task="${cores}" --partition="${partition}")
+[[ -z "${wall_time}" ]] || command+=(--time="${wall_time}")
+command+=("${venv}/bin/python" -m src.generation.cli.cli_generation timing-probe "${probe}" --storage-root "${storage}")
+"${command[@]}"
+REMOTE
+}
+
 resolve_campaign() {
   admit_repository_file "$1" "campaign config"
   CAMPAIGN_CONFIG_PATH="${ADMITTED_HOST_PATH}"
   CAMPAIGN_RELATIVE_PATH="${ADMITTED_REPOSITORY_PATH}"
+}
+
+resolve_completion_parent_local() {
+  [[ -n "${REPLACEMENT_POOL_SIZE}" ]] ||
+    fail 2 "Completion parent resolution requires replacement_pool_size."
+  resolve_local_storage
+  resolve_local_python
+  local requested_parent="${1:-${PARENT_RUN_ID}}"
+  local -a arguments=(
+    find-completion-parent "${CAMPAIGN_CONFIG_PATH}"
+    --storage-root "${LOCAL_STORAGE_ROOT}"
+  )
+  [[ -z "${requested_parent}" ]] || arguments+=(--parent-run-id "${requested_parent}")
+  COMPLETION_PARENT_JSON="$(local_cli "${arguments[@]}")" ||
+    fail 1 "Could not resolve one structurally compatible completion parent."
+  local record partial_path partial_sha completion_status extra
+  record="$(printf '%s' "${COMPLETION_PARENT_JSON}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+def clean(item):
+    if item is None:
+        return "-"
+    text = str(item)
+    if any(character in text for character in "\t\r\n"):
+        raise SystemExit("completion parent result contains unsafe shell transport text")
+    return text
+print("\t".join(clean(value.get(key)) for key in (
+    "status", "parent_run_id", "completion_id", "parent_partial_path",
+    "parent_partial_sha256", "completion_status",
+)))')" || fail 1 "Could not decode completion-parent resolution."
+  IFS=$'\t' read -r COMPLETION_PARENT_STATUS COMPLETION_PARENT_RUN_ID \
+    COMPLETION_ID partial_path partial_sha completion_status extra <<< "${record}"
+  [[ -z "${extra:-}" ]] || fail 1 "Malformed completion-parent result."
+  case "${COMPLETION_PARENT_STATUS}" in
+    fresh)
+      [[ "${COMPLETION_PARENT_RUN_ID}" == - && "${COMPLETION_ID}" == - \
+        && "${partial_path}" == - && "${partial_sha}" == - ]] ||
+        fail 1 "Fresh completion-parent result contains contradictory identity."
+      COMPLETION_PARENT_RUN_ID=""
+      COMPLETION_ID=""
+      COMPLETION_PARENT_PARTIAL_PATH=""
+      COMPLETION_PARENT_PARTIAL_SHA256=""
+      ;;
+    compatible_active|compatible_complete)
+      validate_run_id "${COMPLETION_PARENT_RUN_ID}"
+      [[ "${partial_path}" == - && "${partial_sha}" == - ]] ||
+        fail 1 "Non-partial completion parent returned partial evidence."
+      [[ "${COMPLETION_ID}" == - ]] || validate_completion_id "${COMPLETION_ID}"
+      [[ "${COMPLETION_ID}" != - ]] || COMPLETION_ID=""
+      COMPLETION_PARENT_PARTIAL_PATH=""
+      COMPLETION_PARENT_PARTIAL_SHA256=""
+      ;;
+    compatible_partial)
+      validate_run_id "${COMPLETION_PARENT_RUN_ID}"
+      validate_completion_id "${COMPLETION_ID}"
+      validate_digest "${partial_sha}"
+      COMPLETION_PARENT_PARTIAL_PATH="$(container_path_to_host "${partial_path}")"
+      COMPLETION_PARENT_PARTIAL_PATH="$(realpath -e -- "${COMPLETION_PARENT_PARTIAL_PATH}")" ||
+        fail 1 "Could not resolve compatible parent partial evidence on the host."
+      [[ "${COMPLETION_PARENT_PARTIAL_PATH}" == "${LOCAL_STORAGE_ROOT}/"* \
+        && -f "${COMPLETION_PARENT_PARTIAL_PATH}" \
+        && ! -L "${COMPLETION_PARENT_PARTIAL_PATH}" ]] ||
+        fail 1 "Compatible parent partial evidence escaped canonical local storage."
+      COMPLETION_PARENT_PARTIAL_SHA256="${partial_sha}"
+      ;;
+    *) fail 1 "Unsupported completion-parent status: ${COMPLETION_PARENT_STATUS}" ;;
+  esac
+}
+
+attach_completion_plan_metadata() {
+  RUN_PLAN_JSON="$(local_python -c 'import json, sys
+plan = json.loads(sys.argv[1])
+resolution = json.loads(sys.argv[2])
+pool = int(sys.argv[3])
+override = None if sys.argv[4] == "-" else sys.argv[4]
+plan["replacement_completion"] = {
+    "enabled": True,
+    "replacement_pool_size": pool,
+    "requested_high_water_mark": pool,
+    "parent_run_id_override": override,
+    "compatible_parent_candidates": resolution["compatible_parent_candidates"],
+    "selected_parent": resolution["selected_parent"],
+    "target_counts": resolution["target_counts"],
+    "current_successes": resolution["current_successes"],
+    "deficits": resolution["success_deficits"],
+    "expected_completion_id": resolution["expected_completion_id"],
+    "package_declarations": resolution["package_declarations"],
+    "pt_shard_requirements": resolution["pt_shard_requirements"],
+    "parent_resolution": resolution,
+}
+print(json.dumps(plan, sort_keys=True))' \
+    "${RUN_PLAN_JSON}" "${COMPLETION_PARENT_JSON}" "${REPLACEMENT_POOL_SIZE}" \
+    "${PARENT_RUN_ID:--}")" || fail 1 "Could not bind replacement metadata to the dry-run plan."
 }
 
 resolve_pilot_contract() {
@@ -2748,6 +2915,320 @@ print_validated_leaf_result() {
   esac
 }
 
+sync_completion_parent_evidence() {
+  validate_completion_id "${COMPLETION_ID}"
+  validate_run_id "${COMPLETION_PARENT_RUN_ID}"
+  validate_digest "${COMPLETION_PARENT_PARTIAL_SHA256}"
+  [[ -f "${COMPLETION_PARENT_PARTIAL_PATH}" && ! -L "${COMPLETION_PARENT_PARTIAL_PATH}" ]] ||
+    fail 1 "Completion parent partial evidence is missing or unsafe."
+  require_command rsync "completion parent-evidence transfer"
+  local relative="01_generation/meta/completion-inputs/${COMPLETION_ID}/campaign_partial.json"
+  validate_transfer_path "${relative}"
+  COMPLETION_REMOTE_PARENT_PARTIAL="${REMOTE_STORAGE_ROOT}/${relative}"
+  remote_bash "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}" "${relative}" <<'REMOTE'
+set -euo pipefail
+storage="$1"; relative="$2"; destination="${storage}/${relative}"; directory="${destination%/*}"
+[[ "${storage}" == /* && "${storage}" != / && "${relative}" != /* && "${relative}" != *..* ]] || exit 2
+mkdir -p -- "${directory}"
+[[ -d "${directory}" && ! -L "${directory}" ]] || exit 1
+REMOTE
+  local incoming="${COMPLETION_REMOTE_PARENT_PARTIAL}.incoming.${COMPLETION_PARENT_PARTIAL_SHA256}"
+  rsync -a --protect-args "${COMPLETION_PARENT_PARTIAL_PATH}" "${CPU_HOST}:${incoming}" ||
+    fail 1 "Could not transfer compact parent partial evidence to the CPU completion owner."
+  remote_bash "${CPU_HOST}" "${COMPLETION_REMOTE_PARENT_PARTIAL}" "${incoming}" \
+    "${COMPLETION_PARENT_PARTIAL_SHA256}" <<'REMOTE'
+set -euo pipefail
+destination="$1"; incoming="$2"; expected="$3"
+[[ -f "${incoming}" && ! -L "${incoming}" ]] || exit 1
+observed="$(sha256sum -- "${incoming}")"; observed="${observed%% *}"
+[[ "${observed}" == "${expected}" ]] || exit 1
+if [[ -e "${destination}" ]]; then
+  [[ -f "${destination}" && ! -L "${destination}" ]] || exit 1
+  cmp -s -- "${incoming}" "${destination}" || exit 1
+  rm -- "${incoming}"
+else
+  mv -- "${incoming}" "${destination}"
+fi
+observed="$(sha256sum -- "${destination}")"; observed="${observed%% *}"
+[[ "${observed}" == "${expected}" ]]
+REMOTE
+}
+
+initialize_remote_completion() {
+  local output record status observed_id extra
+  output="$(remote_cli initialize-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
+    --parent-run-id "${COMPLETION_PARENT_RUN_ID}" \
+    --parent-partial "${COMPLETION_REMOTE_PARENT_PARTIAL}" \
+    --parent-partial-sha256 "${COMPLETION_PARENT_PARTIAL_SHA256}" \
+    --replacement-pool-size "${REPLACEMENT_POOL_SIZE}" \
+    --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+    fail 1 "Could not initialize or extend the remote campaign completion owner."
+  record="$(printf '%s' "${output}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
+    fail 1 "Could not decode remote completion initialization."
+  IFS=$'\t' read -r status observed_id extra <<< "${record}"
+  [[ -z "${extra:-}" ]] || fail 1 "Malformed remote completion initialization result."
+  validate_completion_id "${observed_id}"
+  [[ "${observed_id}" == "${COMPLETION_ID}" ]] ||
+    fail 1 "Remote completion identity differs from the compatible parent resolution."
+  case "${status}" in
+    active|complete|pool_exhausted) ;;
+    failure_circuit_open)
+      printf 'COMPLETION FAILURE CIRCUIT OPEN: completion_id=%s; configured replacement failure allowance is exhausted. Evidence is retained and no new candidates will be admitted.\n' \
+        "${COMPLETION_ID}" >&2
+      return 4
+      ;;
+    *) fail 1 "Remote completion initialization returned unsupported status: ${status}" ;;
+  esac
+}
+
+advance_remote_completion() {
+  validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
+  while true; do
+    local output record status observed_id pool_size extra
+    output="$(remote_cli advance-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
+      "${COMPLETION_ID}" --git-commit "${REQUESTED_COMMIT}" \
+      --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+      fail_preserving_interrupt "$?" 1 "Could not advance replacement campaign completion."
+    record="$(printf '%s' "${output}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+print("\t".join((
+    str(value["status"]), str(value["completion_id"]),
+    str(value["replacement_pool_size"]),
+)))')" || fail 1 "Could not decode replacement completion status."
+    IFS=$'\t' read -r status observed_id pool_size extra <<< "${record}"
+    [[ -z "${extra:-}" ]] || fail 1 "Malformed replacement completion status."
+    validate_completion_id "${observed_id}"
+    [[ "${observed_id}" == "${COMPLETION_ID}" ]] ||
+      fail 1 "Replacement completion status changed owner identity."
+    validate_positive "replacement completion pool high-water" "${pool_size}"
+    case "${status}" in
+      complete)
+        printf 'COMPLETION READY: completion_id=%s parent_run_id=%s pool_high_water=%s\n' \
+          "${COMPLETION_ID}" "${COMPLETION_PARENT_RUN_ID}" "${pool_size}"
+        return 0
+        ;;
+      active)
+        printf 'COMPLETION ACTIVE: completion_id=%s pool_high_water=%s\n' \
+          "${COMPLETION_ID}" "${pool_size}"
+        sleep "${STATUS_POLL_SECONDS}" || true
+        ;;
+      failure_circuit_open)
+        printf 'COMPLETION FAILURE CIRCUIT OPEN: completion_id=%s; configured replacement failure allowance is exhausted. Evidence is retained and no new candidates will be admitted.\n' \
+          "${COMPLETION_ID}" >&2
+        return 4
+        ;;
+      pool_exhausted)
+        local next_pool=$((pool_size + 1))
+        printf 'COMPLETION POOL EXHAUSTED: completion_id=%s remaining successful-case deficit.\n' \
+          "${COMPLETION_ID}" >&2
+        printf 'Continue with a larger cumulative pool:\n' >&2
+        print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run \
+          "${RUN_CONFIG_ARGUMENT}" --replacement-pool-size "${next_pool}" \
+          --parent-run-id "${COMPLETION_PARENT_RUN_ID}" --cpu-host "${CPU_HOST}" \
+          --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}" >&2
+        return 3
+        ;;
+      *) fail 1 "Replacement completion entered unsupported state: ${status}" ;;
+    esac
+  done
+}
+
+sync_completion_state_and_plan() {
+  COMPLETION_TRANSFER_JSON="$(remote_cli campaign-completion-transfer-plan \
+    "${COMPLETION_ID}" --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+    fail 1 "Could not resolve successful replacement transfer membership."
+  local records kind field2 field3 field4 field5 field6 extra
+  records="$(printf '%s' "${COMPLETION_TRANSFER_JSON}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+def clean(item):
+    text = str(item)
+    if any(character in text for character in "\t\r\n"):
+        raise SystemExit("completion transfer plan contains unsafe shell transport text")
+    return text
+print("\t".join((
+    "completion", clean(value["completion_id"]), clean(value["parent_run_id"]),
+    clean(value["parent_partial_sha256"]), clean(value["completion_state_path"]),
+    clean(value["completion_state_sha256"]),
+)))
+for item in value["replacement_campaigns"]:
+    print("\t".join((
+        "replacement", clean(item["candidate_id"]), clean(item["target_batch_id"]),
+        clean(item["campaign_run_id"]), clean(item["terminal_batch_id"]),
+    )))')" || fail 1 "Could not decode completion transfer plan."
+  COMPLETION_REPLACEMENT_RUN_IDS=()
+  COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS=()
+  local state_path="" state_sha=""
+  while IFS=$'\t' read -r kind field2 field3 field4 field5 field6 extra; do
+    [[ -z "${extra:-}" ]] || fail 1 "Malformed completion transfer-plan row."
+    case "${kind}" in
+      completion)
+        [[ "${field2}" == "${COMPLETION_ID}" \
+          && "${field3}" == "${COMPLETION_PARENT_RUN_ID}" \
+          && "${field4}" == "${COMPLETION_PARENT_PARTIAL_SHA256}" ]] ||
+          fail 1 "Completion transfer plan changed immutable parent identity."
+        state_path="${field5}"
+        state_sha="${field6}"
+        validate_digest "${state_sha}"
+        ;;
+      replacement)
+        [[ "${field2}" =~ ^replacement__[0-9a-f]{24}$ ]] ||
+          fail 1 "Malformed replacement candidate identity."
+        validate_run_id "${field4}"
+        validate_batch_name "${field3}"
+        validate_batch_name "${field5}"
+        COMPLETION_REPLACEMENT_RUN_IDS+=("${field4}")
+        COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS+=("${field5}")
+        ;;
+      *) fail 1 "Unknown completion transfer-plan row." ;;
+    esac
+  done <<< "${records}"
+  (( ${#COMPLETION_REPLACEMENT_RUN_IDS[@]} > 0 )) ||
+    fail 1 "Complete campaign completion has no successful replacement transfer members."
+  local expected_state="${REMOTE_STORAGE_ROOT}/01_generation/meta/completions/${COMPLETION_ID}/completion.json"
+  [[ "${state_path}" == "${expected_state}" ]] ||
+    fail 1 "Completion state path differs from its dedicated owner."
+  local relative="${state_path#"${REMOTE_STORAGE_ROOT}/"}"
+  validate_transfer_path "${relative}"
+  require_command rsync "completion-state transfer"
+  require_command sha256sum "completion-state verification"
+  local destination="${LOCAL_STORAGE_ROOT}/${relative}"
+  local directory="${destination%/*}"
+  mkdir -p -- "${directory}"
+  [[ -d "${directory}" && ! -L "${directory}" ]] ||
+    fail 1 "Local completion owner directory is unsafe."
+  local incoming="${destination}.incoming.${state_sha}"
+  rsync -a --protect-args "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${relative}" "${incoming}" ||
+    fail 1 "Could not transfer compact completion state to host storage."
+  local observed
+  observed="$(sha256sum -- "${incoming}")"
+  observed="${observed%% *}"
+  [[ "${observed}" == "${state_sha}" ]] ||
+    fail 1 "Transferred completion state failed exact digest validation."
+  if [[ -e "${destination}" ]]; then
+    [[ -f "${destination}" && ! -L "${destination}" ]] ||
+      fail 1 "Existing local completion state is unsafe."
+    cmp -s -- "${incoming}" "${destination}" ||
+      fail 1 "Existing local completion state conflicts with CPU completion evidence."
+    rm -- "${incoming}"
+  else
+    mv -- "${incoming}" "${destination}"
+  fi
+  local_cli campaign-completion-status "${COMPLETION_ID}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Transferred host completion state did not validate."
+}
+
+collect_completion_replacements() {
+  local parent_run="${COMPLETION_PARENT_RUN_ID}" replacement_run previous_keep
+  for replacement_run in "${COMPLETION_REPLACEMENT_RUN_IDS[@]}"; do
+    RUN_ID="${replacement_run}"
+    CAMPAIGN_PARTIAL=false
+    PILOT_MODE=false
+    generation_console_stage 6 9 "Host publication" RUNNING \
+      "successful replacement run=${RUN_ID}"
+    collect_campaign >/dev/null
+    generation_console_stage 7 9 "Packages/finalizer" RUNNING \
+      "replacement run=${RUN_ID} empty launch package gate"
+    build_datasets >/dev/null
+    previous_keep="${KEEP_CPU_SOURCE}"
+    KEEP_CPU_SOURCE=true
+    prepare_all_receipt >/dev/null
+    KEEP_CPU_SOURCE="${previous_keep}"
+    local_cli validate-all-workflow "${RUN_ID}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+      fail 1 "Successful replacement workflow gates did not validate before composite publication."
+  done
+  RUN_ID="${parent_run}"
+}
+
+finalize_completion_composite() {
+  local parent_run="${COMPLETION_PARENT_RUN_ID}" cleanup_json replacement_run
+  local_cli build-campaign-completion-composite "${COMPLETION_ID}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Could not construct exact parent-success plus replacement-success membership."
+  local_cli build-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Could not build completion Dataset packages, PT shards, smoke, and readiness evidence."
+  local_cli validate-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Completion lifecycle failed its pre-cleanup validation."
+  cleanup_json="$(local_cli campaign-completion-cleanup-plan "${parent_run}" \
+    "${COMPLETION_ID}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
+    fail 1 "Could not admit successful replacement-only cleanup eligibility."
+  local_python -c 'import json, sys
+transfer = json.loads(sys.argv[1])
+cleanup = json.loads(sys.argv[2])
+expected = sorted(item["terminal_batch_id"] for item in transfer["replacement_campaigns"])
+observed = sorted(item["terminal_batch_id"] for item in cleanup["sources"])
+if not cleanup.get("eligible") or observed != expected:
+    raise SystemExit("completion cleanup plan differs from successful replacement transfer membership")' \
+    "${COMPLETION_TRANSFER_JSON}" "${cleanup_json}" ||
+    fail 1 "Completion cleanup plan includes missing, failed, or non-replacement sources."
+  if [[ "${KEEP_CPU_SOURCE}" != true ]]; then
+    for replacement_run in "${COMPLETION_REPLACEMENT_RUN_IDS[@]}"; do
+      RUN_ID="${replacement_run}"
+      confirm_cpu_cleanup >/dev/null
+      local_cli validate-all-workflow "${RUN_ID}" \
+        --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+        fail 1 "Replacement workflow changed after authorized CPU cleanup."
+    done
+  fi
+  local_cli validate-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Completion lifecycle changed after replacement-only retention."
+  RUN_ID="${parent_run}"
+  CAMPAIGN_PARTIAL=false
+  LEAF_RESULT=OK
+  LEAF_STATE=complete
+  REMOTE_CAMPAIGN_STATE=complete_composite
+}
+
+run_campaign_with_completion() {
+  [[ "${RUN_KIND}" == campaign && -n "${REPLACEMENT_POOL_SIZE}" ]] ||
+    fail 2 "Internal completion workflow requires one campaign and cumulative pool."
+  local parent_run=""
+  case "${COMPLETION_PARENT_STATUS}" in
+    compatible_partial)
+      parent_run="${COMPLETION_PARENT_RUN_ID}"
+      ;;
+    compatible_active)
+      [[ "${COMPLETION_PARENT_RUN_ID}" == "${RUN_PLAN_ID}" ]] ||
+        fail 1 "Compatible active parent belongs to a different source commit; wait for transfer or use its exact commit."
+      run_leaf_plan campaign "${RUN_PLAN_CONFIG}" "${RUN_PLAN_ID}" \
+        "${RUN_PLAN_PURPOSE}" "${RUN_PLAN_PROFILE}"
+      ;;
+    fresh|compatible_complete)
+      run_leaf_plan campaign "${RUN_PLAN_CONFIG}" "${RUN_PLAN_ID}" \
+        "${RUN_PLAN_PURPOSE}" "${RUN_PLAN_PROFILE}"
+      ;;
+    *) fail 1 "Unsupported completion parent state before execution: ${COMPLETION_PARENT_STATUS}" ;;
+  esac
+  if [[ -z "${parent_run}" ]]; then
+    if [[ "${LEAF_RESULT}" != PARTIAL ]]; then
+      return 0
+    fi
+    parent_run="${RUN_ID}"
+    resolve_completion_parent_local "${parent_run}"
+    [[ "${COMPLETION_PARENT_STATUS}" == compatible_partial \
+      && "${COMPLETION_PARENT_RUN_ID}" == "${parent_run}" ]] ||
+      fail 1 "Newly partial campaign did not resolve to its exact transferred parent evidence."
+  fi
+  RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
+  resolve_campaign "${RUN_LEAF_CONFIG}"
+  resolve_configured_resources executable
+  validate_resources
+  resolve_remote_layout
+  verify_remote_setup >/dev/null
+  sync_completion_parent_evidence
+  initialize_remote_completion
+  advance_remote_completion || return $?
+  sync_completion_state_and_plan
+  collect_completion_replacements
+  finalize_completion_composite
+}
+
 run_leaf_plan() {
   RUN_KIND="$1"
   RUN_LEAF_CONFIG="$2"
@@ -3016,8 +3497,12 @@ execute_generation_run() {
   generation_console_stage 1 9 "Run plan" OK     "kind=$RUN_KIND identity=$RUN_PLAN_ID config=$RUN_CONFIG_RELATIVE"
   case "$RUN_KIND" in
     campaign)
-      run_leaf_plan campaign "$RUN_PLAN_CONFIG" "$RUN_PLAN_ID" \
-        "$RUN_PLAN_PURPOSE" "$RUN_PLAN_PROFILE"
+      if [[ -n "${REPLACEMENT_POOL_SIZE}" ]]; then
+        run_campaign_with_completion
+      else
+        run_leaf_plan campaign "$RUN_PLAN_CONFIG" "$RUN_PLAN_ID" \
+          "$RUN_PLAN_PURPOSE" "$RUN_PLAN_PROFILE"
+      fi
       case "$LEAF_STATE" in
         complete)
           generation_console_final             "run_identity=$RUN_PLAN_ID campaign_run_id=$RUN_ID state=${REMOTE_CAMPAIGN_STATE:-complete} result=$LEAF_RESULT"
@@ -3069,6 +3554,31 @@ benchmark_status_report() {
   fi
 }
 
+completion_status_report_for_config() {
+  resolve_local_storage
+  resolve_local_python
+  local report record resolution_status completion_id extra
+  report="$(local_cli find-completion-parent "${CAMPAIGN_CONFIG_PATH}" \
+    --storage-root "${LOCAL_STORAGE_ROOT}" --allow-untransferred)" ||
+    fail 1 "Could not resolve read-only completion status for the campaign config."
+  printf 'Completion status:\n%s\n' "${report}"
+  record="$(printf '%s' "${report}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+identifier = value.get("completion_id") or value.get("expected_completion_id") or "-"
+print("\t".join((str(value["status"]), str(identifier))))')" ||
+    fail 1 "Could not decode read-only completion status."
+  IFS=$'\t' read -r resolution_status completion_id extra <<< "${record}"
+  [[ -z "${extra:-}" ]] || fail 1 "Malformed read-only completion status."
+  if [[ "${resolution_status}" == compatible_partial ]]; then
+    validate_completion_id "${completion_id}"
+    resolve_remote_layout
+    printf 'CPU completion execution status:\n'
+    remote_cli_retryable "completion execution status read" \
+      campaign-completion-status "${completion_id}" --if-present \
+      --storage-root "${REMOTE_STORAGE_ROOT}"
+  fi
+}
+
 status_generation_target() {
   local target="$1"
   local target_is_config=false
@@ -3089,6 +3599,7 @@ status_generation_target() {
         RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
         resolve_campaign "${RUN_LEAF_CONFIG}"
         resolve_configured_resources
+        completion_status_report_for_config
         storage_status_report
         ;;
       benchmark)
@@ -3116,6 +3627,7 @@ status_generation_target() {
           resolve_configured_resources
           printf 'Child %s/%s: %s\n' \
             "$((index + 1))" "${RUN_CHILD_COUNT}" "${RUN_ID}"
+          completion_status_report_for_config
           storage_status_report
         done
         if local_cli validate-real-smoke \
@@ -3225,6 +3737,10 @@ FORCE_CANCEL=false
 DRY_RUN=false
 PREFLIGHT_ONLY=false
 ALLOW_INCOMPLETE_PLAN=false
+REPLACEMENT_POOL_SIZE=""
+PARENT_RUN_ID=""
+REPLACEMENT_POOL_OPTION_COUNT=0
+PARENT_RUN_OPTION_COUNT=0
 POSITIONAL=()
 
 while (( $# > 0 )); do
@@ -3244,6 +3760,22 @@ while (( $# > 0 )); do
       REQUESTED_COMMIT="$2"
       shift 2
       ;;
+    --replacement-pool-size)
+      (( REPLACEMENT_POOL_OPTION_COUNT == 0 )) ||
+        fail 2 "Specify --replacement-pool-size at most once."
+      (( $# >= 2 )) || fail 2 "--replacement-pool-size requires a value."
+      REPLACEMENT_POOL_OPTION_COUNT=1
+      REPLACEMENT_POOL_SIZE="$2"
+      shift 2
+      ;;
+    --parent-run-id)
+      (( PARENT_RUN_OPTION_COUNT == 0 )) ||
+        fail 2 "Specify --parent-run-id at most once."
+      (( $# >= 2 )) || fail 2 "--parent-run-id requires a value."
+      PARENT_RUN_OPTION_COUNT=1
+      PARENT_RUN_ID="$2"
+      shift 2
+      ;;
     --execute) EXECUTE_SETUP=true; shift ;;
     --confirm) CONFIRM_CLEANUP=true; shift ;;
     --force) FORCE_CANCEL=true; shift ;;
@@ -3258,6 +3790,14 @@ while (( $# > 0 )); do
 done
 
 [[ -z "${REQUESTED_COMMIT}" ]] || validate_commit "${REQUESTED_COMMIT}"
+[[ -z "${REPLACEMENT_POOL_SIZE}" ]] || validate_positive "replacement_pool_size" "${REPLACEMENT_POOL_SIZE}"
+[[ -z "${PARENT_RUN_ID}" ]] || validate_run_id "${PARENT_RUN_ID}"
+if [[ -n "${PARENT_RUN_ID}" && -z "${REPLACEMENT_POOL_SIZE}" ]]; then
+  fail 2 "--parent-run-id requires --replacement-pool-size."
+fi
+if [[ -n "${REPLACEMENT_POOL_SIZE}" && "${SUBCOMMAND}" != run ]]; then
+  fail 2 "Replacement completion options are supported only by run CONFIG."
+fi
 if [[ "${DEFER_COLLECTION}" == true && "${KEEP_CPU_SOURCE}" == true ]]; then
   fail 2 "--defer-collection cannot be combined with --keep-cpu-source."
 fi
@@ -3271,15 +3811,33 @@ resolve_local_commit
 handoff_to_pinned_workflow
 
 case "${SUBCOMMAND}" in
+  timing-probe)
+    (( ${#POSITIONAL[@]} == 1 )) || fail 2 "timing-probe requires exactly one probe config."
+    [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false && "${FORCE_CANCEL}" == false && "${KEEP_CPU_SOURCE}" == false && "${DEFER_COLLECTION}" == false && "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false && -z "${REPLACEMENT_POOL_SIZE}" && -z "${PARENT_RUN_ID}" ]] || fail 2 "timing-probe received an unsupported option."
+    resolve_timing_probe_contract "${POSITIONAL[0]}"
+    resolve_remote_layout
+    run_timing_probe_remote
+    ;;
   run)
     (( ${#POSITIONAL[@]} == 1 )) ||
       fail 2 "run requires exactly one Generation config."
     [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false \
       && "${FORCE_CANCEL}" == false ]] ||
       fail 2 "run received an administrative-only option."
+    if [[ -n "${REPLACEMENT_POOL_SIZE}" && "${DEFER_COLLECTION}" == true ]]; then
+      fail 2 "--replacement-pool-size cannot be combined with --defer-collection; composite finalization requires host collection."
+    fi
     RUN_CONFIG_ARGUMENT="${POSITIONAL[0]}"
     [[ "${DRY_RUN}" != true ]] || ALLOW_INCOMPLETE_PLAN=true
     resolve_generation_run_plan
+    if [[ -n "${REPLACEMENT_POOL_SIZE}" ]]; then
+      [[ "${RUN_KIND}" == campaign ]] ||
+        fail 2 "--replacement-pool-size is supported only for one campaign run plan."
+      RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
+      resolve_campaign "${RUN_LEAF_CONFIG}"
+      resolve_completion_parent_local
+      attach_completion_plan_metadata
+    fi
     if [[ "${DRY_RUN}" == true ]]; then
       printf '%s\n' "${RUN_PLAN_JSON}"
       exit 0

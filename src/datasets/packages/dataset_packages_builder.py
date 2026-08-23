@@ -113,7 +113,17 @@ def _package_provenance(
     template_digests = sorted({str(record["template"]["sha256"]) for record in prepared.batch_records})
     airflow = sorted({str(record["airflow_source"]) for record in prepared.batch_records})
     operation_digests = sorted({str(record["operation_config_digest"]) for record in prepared.batch_records})
-    git_commits = sorted({str(record["git_commit"]) for record in prepared.batch_records})
+    git_commits: set[str] = set()
+    for record in prepared.batch_records:
+        record_commits = record.get("git_commits")
+        if isinstance(record_commits, list):
+            git_commits.update(str(value) for value in record_commits)
+        else:
+            git_commits.add(str(record["git_commit"]))
+    git_commits.update(
+        str(candidate["source_git_commit"]) for candidate in prepared.candidates if isinstance(candidate.get("source_git_commit"), str)
+    )
+    sorted_git_commits = sorted(git_commits)
     case_membership = {str(candidate["package_case_id"]): str(candidate["dataset_membership"]) for candidate in prepared.candidates}
     material_by_batch_name = {batch.batch_name: batch.material_family for batch in campaign.batches}
     material_counts: dict[str, int] = defaultdict(int)
@@ -135,7 +145,7 @@ def _package_provenance(
         "source_batches": prepared.batch_records,
         "source_batch_ids": [record["batch_id"] for record in prepared.batch_records],
         "source_template_digests": template_digests,
-        "source_git_commits": git_commits,
+        "source_git_commits": sorted_git_commits,
         "source_case_identities": [
             {
                 "package_case_id": candidate["package_case_id"],
@@ -155,6 +165,17 @@ def _package_provenance(
                 "ood_parameters": candidate.get("ood_evidence", {}).get("selected_units", []),
                 "task_relevant_ood_parameters": candidate.get("task_relevant_ood_parameters", []),
                 "ood_evidence": copy.deepcopy(candidate.get("ood_evidence", {})),
+                **(
+                    {
+                        "composite_source_kind": candidate["composite_source_kind"],
+                        "source_run_id": candidate["source_run_id"],
+                        "source_git_commit": candidate["source_git_commit"],
+                        "source_campaign_manifest_sha256": candidate["source_campaign_manifest_sha256"],
+                        "completion_receipt_sha256": candidate["completion_receipt_sha256"],
+                    }
+                    if candidate.get("completion_receipt_sha256") is not None
+                    else {}
+                ),
             }
             for candidate in prepared.candidates
         ],
@@ -529,6 +550,7 @@ def build_dataset_package(
     evaluation_regime: str,
     *,
     storage_root: Path | str | None = None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one declared package with its required ID leakage companion."""
     requested_plan = planning.package_plan(campaign, dataset_view, evaluation_regime)
@@ -539,6 +561,7 @@ def build_dataset_package(
         campaign,
         storage_root=storage_root,
         selected_plans=selected_plans,
+        composite_receipt=composite_receipt,
     )
     matches = [
         package for package in prepared if package.plan["dataset_view"] == dataset_view and package.plan["evaluation_regime"] == evaluation_regime
@@ -553,7 +576,8 @@ def build_campaign_packages(
     campaign: generation.cases.config.CampaignConfig,
     *,
     storage_root: Path | str | None = None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Build every declared package after one shared membership/leakage preflight."""
-    prepared = planning.prepare_campaign_packages(campaign, storage_root=storage_root)
+    prepared = planning.prepare_campaign_packages(campaign, storage_root=storage_root, composite_receipt=composite_receipt)
     return tuple(_publish_prepared(campaign, package, storage_root=storage_root) for package in prepared)

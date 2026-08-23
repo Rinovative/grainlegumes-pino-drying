@@ -220,6 +220,85 @@ remain immediately fatal.
 Final campaign failure is reported only after permitted runnable work finishes,
 the configured circuit opens, or a global integrity failure occurs.
 
+### Deterministic replacement completion
+
+A terminal partial campaign can be completed through the normal workflow without
+editing its manifest, hiding its failures, or rerunning its successful cases:
+
+```bash
+./scripts/generation_workflow.sh run CONFIG \
+  --replacement-pool-size N --cpu-host "$CPU_HOST"
+```
+
+`N` is the cumulative maximum number of supplemental candidates owned by that
+completion, not an additional count for each invocation. Increasing `N` extends
+the same deterministic candidate prefix; decreasing it below the persisted high
+water fails. Replacement candidates use independently derived sampling and seed
+provenance and cannot collide with original scientific case identities.
+Candidates are admitted only while an exact configured batch-success deficit
+remains, so a large pool cannot make the completed Dataset exceed its targets.
+
+The workflow discovers a structurally compatible parent from validated host
+publication. It does not select by filename, path, or newest timestamp. If more
+than one parent is compatible, resolve the ambiguity explicitly:
+
+```bash
+./scripts/generation_workflow.sh run CONFIG \
+  --replacement-pool-size N --parent-run-id PARENT_RUN_ID \
+  --cpu-host "$CPU_HOST"
+```
+
+`--parent-run-id` is an expert override and is invalid without a replacement
+pool. A historical parent may have no CPU source remaining: its immutable host
+`campaign_partial.json` is sufficient. The controller transfers only that
+compact evidence back to the CPU owner, launches ordinary one-case replacement
+campaigns under the requested commit, and never reconstructs or mutates the
+original failed run.
+
+A replacement success counts only after normal terminal validation. Failed,
+active, or merely reserved candidates never satisfy a deficit and are never
+included in the transfer plan. Once every deficit is covered, the host builds
+one immutable composite from the parent successes plus the exact successful
+replacement cases, then builds and validates its Dataset packages, transient PT
+shards, loader smoke, readiness evidence, and finalization records. Default
+cleanup is authorized only after those gates pass and is restricted to the
+successful replacement CPU sources; the historical parent and unsuccessful
+replacement evidence are not cleanup members. `--keep-cpu-source` retains the
+successful replacement sources as additional copies.
+
+For example, the maintained family-generalization completion command is:
+
+```bash
+./scripts/generation_workflow.sh run \
+  configs/generation/campaigns/transient_drying/family_generalization.yaml \
+  --replacement-pool-size 12 --background
+```
+
+The CPU host resolves through the normal configured workflow. Configured counts
+remain target successful counts; original and replacement failures remain
+failures. The supplemental design is separate from the original LHS, and no
+final package is built while a deficit remains. Existing validated GPU cases
+are reused even when their CPU source has been deleted.
+
+If the cumulative prefix is exhausted first, the command exits without
+publishing a composite and prints a continuation using a larger pool. Repeating
+the same or larger pool resumes the persisted completion owner. Completion mode
+requires automatic host collection, so it cannot be combined with
+`--defer-collection`. `--preflight-only` checks execution prerequisites.
+`--background` preserves the same pool and parent arguments. The independent
+timing probe is never a completion prerequisite.
+
+`--dry-run` mutates nothing and reports replacement enablement, requested
+high-water mark, compatible and selected parents, target counts, current
+successes, deficits, expected completion identity, package declarations, and PT
+shard requirements. Normal `status CONFIG_OR_RUN_ID` also emits a read-only
+completion report containing parent/completion state, candidate and attempt
+accounting, active work, pool remaining, the completion-local failure circuit,
+and publication/package/shard/readiness state. Replacement campaigns are
+admitted sequentially so the configured local failure threshold is checked
+before every next candidate; an open circuit preserves all evidence and stops
+new admission.
+
 ## Terminal timestamps and status
 
 Scientific success is owned by validated scientific and publication evidence,
@@ -298,6 +377,17 @@ batch, range, commit, and storage root:
 
 Input EDA discovers only admitted canonical manifests and reads them without
 mutating or regenerating cases.
+
+## Bounded COMSOL phase-timing diagnostic
+
+The opt-in `timing-probe CONFIG` path runs exactly one configured transient
+Technical Smoke case in one Slurm allocation. It records an immutable diagnostic
+bundle but does not publish Generation cases, Dataset packages, PT shards,
+readiness evidence, replacement work, or cleanup decisions. COMSOL runs only
+inside the allocation, never on the login shell. Foreground, background, resume,
+Candidate A/B/C timing semantics, validation, and the complete removal inventory
+are documented in the
+[COMSOL phase timing probe guide](comsol_phase_timing_probe.md).
 
 ## Identity and provenance policy
 

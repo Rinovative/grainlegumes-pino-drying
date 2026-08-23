@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -37,6 +39,14 @@ _BENCHMARK_INVENTORY_SHA = "8" * 64
 _BENCHMARK_FILE_COUNT = 1
 _BENCHMARK_SIZE_BYTES = 3
 _AUTHORIZED_BYTES = 24
+_COMPLETION_ID = "completion__" + "c" * 24
+_REPLACEMENT_RUN_ID = "steady_flow_completion_replacement__" + "d" * 16
+_FAILED_REPLACEMENT_RUN_ID = "steady_flow_failed_replacement__" + "e" * 16
+_REPLACEMENT_CANDIDATE_ID = "replacement__" + "f" * 24
+_COMPLETION_TERMINAL_BATCH_ID = generation.cases.config.build_batch_id(
+    _BATCH_NAME,
+    "9" * 64,
+)
 
 
 def _executable(path: Path, content: str) -> Path:
@@ -414,6 +424,16 @@ elif [[ " $* " == *' core-benchmark-summary '* ]]; then
   printf '%s\n' '# Synthetic remote core benchmark summary'
 elif [[ " $* " == *' validate-real-smoke '* ]]; then
   printf '%s\n' '{"status":"valid"}'
+elif [[ " $* " == *' initialize-campaign-completion '* ]]; then
+  printf '{"status":"%s","completion_id":"%s","replacement_pool_size":%s}\n' \
+    "${FAKE_COMPLETION_INITIALIZE_STATUS:-active}" "${FAKE_COMPLETION_ID}" "${FAKE_COMPLETION_POOL_SIZE}"
+elif [[ " $* " == *' advance-campaign-completion '* ]]; then
+  printf '{"status":"%s","completion_id":"%s","replacement_pool_size":%s}\n' \
+    "${FAKE_COMPLETION_ADVANCE_STATUS:-complete}" "${FAKE_COMPLETION_ID}" "${FAKE_COMPLETION_POOL_SIZE}"
+elif [[ " $* " == *' campaign-completion-status '* ]]; then
+  printf '%s\n' "${FAKE_COMPLETION_STATUS_JSON}"
+elif [[ " $* " == *' campaign-completion-transfer-plan '* ]]; then
+  printf '%s\n' "${FAKE_COMPLETION_TRANSFER_JSON}"
 elif [[ " $* " == *' campaign-transfer-authority '* ]]; then
   [[ "${FAKE_COMPATIBLE_SMOKE_STATUS:-missing}" == compatible_repairable ]] || exit 4
   printf '{"schema_kind":"generation_campaign_transfer_authority","schema_version":1,'
@@ -594,13 +614,35 @@ for argument in "$@"; do printf '<%s>\n' "${argument}" >> "${FAKE_COMMAND_LOG}";
 source_argument="${@: -2:1}"
 destination="${@: -1}"
 if [[ "${destination}" == *:* ]]; then
+  remote_path="${destination#*:}"
+  if [[ "${remote_path}" == "${FAKE_REMOTE_STORAGE_ROOT}/"* ]]; then
+    relative="${remote_path#"${FAKE_REMOTE_STORAGE_ROOT}/"}"
+  elif [[ "${remote_path}" == *'/storage/'* ]]; then
+    relative="${remote_path#*/storage/}"
+  else
+    exit 0
+  fi
+  target="${FAKE_REMOTE_MIRROR}/${relative}"
+  mkdir -p "$(dirname "${target}")"
+  cp -a -- "${source_argument}" "${target}"
   exit 0
 fi
 remote_path="${source_argument#*:}"
-relative="${remote_path#*/./}"
+if [[ "${remote_path}" == *'/./'* ]]; then
+  relative="${remote_path#*/./}"
+elif [[ "${remote_path}" == "${FAKE_REMOTE_STORAGE_ROOT}/"* ]]; then
+  relative="${remote_path#"${FAKE_REMOTE_STORAGE_ROOT}/"}"
+else
+  exit 94
+fi
 source="${FAKE_REMOTE_MIRROR}/${relative}"
-mkdir -p "${destination}/$(dirname "${relative}")"
-cp -a -- "${source}" "${destination}/${relative}"
+if [[ -f "${source}" ]]; then
+  mkdir -p "$(dirname "${destination}")"
+  cp -a -- "${source}" "${destination}"
+else
+  mkdir -p "${destination}/$(dirname "${relative}")"
+  cp -a -- "${source}" "${destination}/${relative}"
+fi
 """.replace("$", "$"),
     )
     local_python = _executable(
@@ -666,6 +708,31 @@ if [[ " $* " == *' resolve-generation-run '* ]]; then
       printf '%s\n' '{"run_kind":"campaign","identity":"steady_flow_steady_flow_id_dataset_v1__0123456789abcdef","config_path":"configs/generation/campaigns/steady_flow/id_dataset.yaml","children":[],"units":[{"metadata":{"campaign_purpose":"steady_flow_id_dataset","simulation_profile":"steady_flow"}}]}'
       ;;
   esac
+  exit 0
+fi
+if [[ " $* " == *' find-completion-parent '* ]]; then
+  printf '%s\n' "${FAKE_COMPLETION_PARENT_JSON}"
+  exit 0
+fi
+if [[ " $* " == *' campaign-completion-status '* ]]; then
+  printf '{"status":"complete","completion_id":"%s","replacement_pool_size":%s}\n' \
+    "${FAKE_COMPLETION_ID}" "${FAKE_COMPLETION_POOL_SIZE}"
+  exit 0
+fi
+if [[ " $* " == *' build-campaign-completion-composite '* ]]; then
+  printf '%s\n' '{"status":"complete","case_count":1}'
+  exit 0
+fi
+if [[ " $* " == *' build-campaign-completion-lifecycle '* ]]; then
+  printf '%s\n' '{"status":"complete","workflow_result":"success"}'
+  exit 0
+fi
+if [[ " $* " == *' validate-campaign-completion-lifecycle '* ]]; then
+  printf '%s\n' '{"status":"valid","workflow_result":"success"}'
+  exit 0
+fi
+if [[ " $* " == *' campaign-completion-cleanup-plan '* ]]; then
+  printf '%s\n' "${FAKE_COMPLETION_CLEANUP_JSON}"
   exit 0
 fi
 if [[ " $* " == *' find-compatible-technical-smoke-run '* ]]; then
@@ -785,6 +852,9 @@ fi
 if [[ " $* " == *' list-background-sessions '* ]]; then
   printf '%s\n' '{"sessions":[]}'
   exit 0
+fi
+if [[ " $* " == *' -c '* && (   " $* " == *'completion parent result contains unsafe shell transport text'*   || " $* " == *'plan["replacement_completion"]'*   || " $* " == *'str(value["replacement_pool_size"])'*   || " $* " == *'str(value["status"]), str(value["completion_id"])'*   || " $* " == *'identifier = value.get("completion_id")'*   || " $* " == *'completion transfer plan contains unsafe shell transport text'*   || " $* " == *'completion cleanup plan differs from successful replacement transfer membership'* ) ]]; then
+  exec "${FAKE_REAL_PYTHON}" "$@"
 fi
 if [[ " $* " == *' -c '* ]]; then
   payload="$(cat)"
@@ -920,7 +990,7 @@ elif [[ " $* " == *' repair-transferred-campaign '* ]]; then
   : > "${FAKE_GPU_PUBLISHED_FILE}"
   printf '%s\n' '{"source_removed":false,"status":"transfer_complete"}'
 elif [[ " $* " == *' create-transfer-staging '* ]]; then
-  staging="${storage}/.incoming/${FAKE_RUN_ID}.synthetic"
+  staging="${storage}/.incoming/${FAKE_TRANSFER_RUN_ID}.synthetic"
   mkdir -p "${staging}"
   printf '%s\n' "${staging}"
 elif [[ " $* " == *' publish-transferred-core-benchmark '* ]]; then
@@ -1040,11 +1110,14 @@ fi
             "FAKE_DOCKER_CONTINUE_FILE": "",
             "FAKE_REALPATH": shutil.which("realpath", path=os.defpath) or "/usr/bin/realpath",
             "FAKE_REAL_DATE": shutil.which("date", path=os.defpath) or "/usr/bin/date",
+            "FAKE_REAL_PYTHON": sys.executable,
             "FAKE_REAL_SLEEP": shutil.which("sleep", path=os.defpath) or "/usr/bin/sleep",
             "GENERATION_REPOSITORY_URL": "git@github.com:Rinovative/grainlegumes-pino-drying.git",
             "FAKE_PROJECT_ROOT": str(project),
             "FAKE_REMOTE_MIRROR": str(mirror),
+            "FAKE_REMOTE_STORAGE_ROOT": "/remote/generation root/storage",
             "FAKE_RUN_ID": _RUN_ID,
+            "FAKE_TRANSFER_RUN_ID": _RUN_ID,
             "FAKE_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
             "FAKE_BENCHMARK_STATE": "complete",
             "FAKE_BENCHMARK_RELATIVE": (f"01_generation/meta/performance_benchmarks/core_scaling/{_BENCHMARK_RUN_ID}"),
@@ -1053,6 +1126,39 @@ fi
             "FAKE_BENCHMARK_SIZE_BYTES": str(_BENCHMARK_SIZE_BYTES),
             "FAKE_SMOKE_SHA": _SMOKE_SHA,
             "FAKE_TRANSFER_PLAN": "",
+            "FAKE_COMPLETION_ID": _COMPLETION_ID,
+            "FAKE_COMPLETION_POOL_SIZE": "4",
+            "FAKE_COMPLETION_INITIALIZE_STATUS": "active",
+            "FAKE_COMPLETION_ADVANCE_STATUS": "complete",
+            "FAKE_COMPLETION_STATUS_JSON": json.dumps(
+                {
+                    "status": "active",
+                    "completion_id": _COMPLETION_ID,
+                    "replacement_pool_size": 4,
+                    "attempted_candidates": 1,
+                    "failure_circuit": {"counted_failures": 0, "open": False},
+                }
+            ),
+            "FAKE_COMPLETION_PARENT_JSON": json.dumps(
+                {
+                    "status": "fresh",
+                    "compatible_parent_candidates": [],
+                    "selected_parent": None,
+                    "parent_run_id": None,
+                    "completion_id": None,
+                    "expected_completion_id": None,
+                    "parent_partial_path": None,
+                    "parent_partial_sha256": None,
+                    "completion_status": None,
+                    "target_counts": {"batch-a": 1},
+                    "current_successes": {"batch-a": 0},
+                    "success_deficits": {"batch-a": 1},
+                    "package_declarations": [],
+                    "pt_shard_requirements": [],
+                }
+            ),
+            "FAKE_COMPLETION_TRANSFER_JSON": "{}",
+            "FAKE_COMPLETION_CLEANUP_JSON": json.dumps({"eligible": True, "sources": []}),
             "FAKE_CAMPAIGN_STATE": "successful",
             "FAKE_COMPATIBLE_CAMPAIGN_PACKAGE_STATE": "missing",
             "FAKE_CAMPAIGN_STATUS_FAIL": "false",
@@ -1245,9 +1351,14 @@ def _benchmark_suite(workflow: Path) -> Path:
     return workflow.parent.parent / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
 
 
-def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]:
+def _seed_transfer(
+    mirror: Path,
+    environment: dict[str, str],
+    *,
+    run_id: str = _RUN_ID,
+) -> tuple[str, ...]:
     """Create one complete fake terminal transfer tree and TSV plan."""
-    campaign_directory = f"01_generation/meta/campaigns/{_RUN_ID}"
+    campaign_directory = f"01_generation/meta/campaigns/{run_id}"
     batch_id = generation.cases.config.build_batch_id(
         _BATCH_NAME,
         "fedcba9876543210" + "0" * 48,
@@ -1255,7 +1366,7 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
     meta_directory = f"01_generation/meta/batches/{batch_id}"
     raw_directory = f"01_generation/raw/{batch_id}"
     processed_directory = f"01_generation/processed/{batch_id}"
-    attempt_directory = f"01_generation/attempts/{batch_id}/case_00001/{_RUN_ID}"
+    attempt_directory = f"01_generation/attempts/{batch_id}/case_00001/{run_id}"
     source_directories = (
         meta_directory,
         raw_directory,
@@ -1265,7 +1376,7 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
     for relative in (campaign_directory, *source_directories):
         (mirror / relative).mkdir(parents=True)
     (mirror / campaign_directory / "campaign_terminal.json").write_text(
-        json.dumps({"campaign_run_id": _RUN_ID}) + "\n",
+        json.dumps({"campaign_run_id": run_id}) + "\n",
         encoding="utf-8",
     )
     (mirror / meta_directory / "batch_manifest.json").write_text("{}\n", encoding="utf-8")
@@ -1275,6 +1386,7 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
         "{}\n",
         encoding="utf-8",
     )
+    environment["FAKE_TRANSFER_RUN_ID"] = run_id
     environment["FAKE_TRANSFER_PLAN"] = (
         f"campaign\tsteady_flow_steady_flow_id_dataset_v1\t{_COMMIT}\t{campaign_directory}"
         "\tconfigs/generation/campaigns/steady_flow/id_dataset.yaml\n"
@@ -1286,6 +1398,88 @@ def _seed_transfer(mirror: Path, environment: dict[str, str]) -> tuple[str, ...]
         encoding="utf-8",
     )
     return source_directories
+
+
+def _seed_completion_transfer(
+    storage: Path,
+    mirror: Path,
+    environment: dict[str, str],
+) -> tuple[tuple[str, ...], Path, str]:
+    """Create a historical partial parent and one successful replacement source."""
+    source_directories = _seed_transfer(
+        mirror,
+        environment,
+        run_id=_REPLACEMENT_RUN_ID,
+    )
+    partial_relative = f"01_generation/meta/campaigns/{_RUN_ID}/campaign_partial.json"
+    partial_path = storage / partial_relative
+    partial_path.parent.mkdir(parents=True)
+    partial_bytes = (json.dumps({"campaign_run_id": _RUN_ID}, sort_keys=True) + "\n").encode()
+    partial_path.write_bytes(partial_bytes)
+    partial_sha256 = hashlib.sha256(partial_bytes).hexdigest()
+
+    completion_relative = f"01_generation/meta/completions/{_COMPLETION_ID}/completion.json"
+    completion_bytes = (
+        json.dumps(
+            {
+                "completion_id": _COMPLETION_ID,
+                "parent_run_id": _RUN_ID,
+                "status": "complete",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    completion_path = mirror / completion_relative
+    completion_path.parent.mkdir(parents=True)
+    completion_path.write_bytes(completion_bytes)
+    completion_sha256 = hashlib.sha256(completion_bytes).hexdigest()
+
+    environment["FAKE_COMPLETION_PARENT_JSON"] = json.dumps(
+        {
+            "status": "compatible_partial",
+            "compatible_parent_candidates": [_RUN_ID],
+            "selected_parent": {"campaign_run_id": _RUN_ID, "state": "completed_with_failures"},
+            "parent_run_id": _RUN_ID,
+            "completion_id": _COMPLETION_ID,
+            "expected_completion_id": _COMPLETION_ID,
+            "parent_partial_path": f"/workspace/storage/{partial_relative}",
+            "parent_partial_sha256": partial_sha256,
+            "completion_status": "active",
+            "target_counts": {_BATCH_NAME: 1},
+            "current_successes": {_BATCH_NAME: 0},
+            "success_deficits": {_BATCH_NAME: 1},
+            "package_declarations": [],
+            "pt_shard_requirements": [],
+        },
+        sort_keys=True,
+    )
+    environment["FAKE_COMPLETION_TRANSFER_JSON"] = json.dumps(
+        {
+            "completion_id": _COMPLETION_ID,
+            "parent_run_id": _RUN_ID,
+            "parent_partial_sha256": partial_sha256,
+            "completion_state_path": (f"/remote/generation root/storage/{completion_relative}"),
+            "completion_state_sha256": completion_sha256,
+            "replacement_campaigns": [
+                {
+                    "candidate_id": _REPLACEMENT_CANDIDATE_ID,
+                    "target_batch_id": _BATCH_NAME,
+                    "campaign_run_id": _REPLACEMENT_RUN_ID,
+                    "terminal_batch_id": _COMPLETION_TERMINAL_BATCH_ID,
+                }
+            ],
+        },
+        sort_keys=True,
+    )
+    environment["FAKE_COMPLETION_CLEANUP_JSON"] = json.dumps(
+        {
+            "eligible": True,
+            "sources": [{"terminal_batch_id": _COMPLETION_TERMINAL_BATCH_ID}],
+        },
+        sort_keys=True,
+    )
+    return source_directories, partial_path, completion_relative
 
 
 def test_campaign_source_status_cli_emits_positional_tsv(
@@ -2760,6 +2954,163 @@ def test_unified_run_modes_and_option_validation(tmp_path: Path) -> None:
     assert rejected.returncode == 2
 
 
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["run", "CAMPAIGN", "--replacement-pool-size", "0"],
+            "replacement_pool_size must be an integer >= 1",
+        ),
+        (
+            [
+                "run",
+                "CAMPAIGN",
+                "--replacement-pool-size",
+                "2",
+                "--replacement-pool-size",
+                "3",
+            ],
+            "Specify --replacement-pool-size at most once",
+        ),
+        (
+            ["run", "CAMPAIGN", "--parent-run-id", _RUN_ID],
+            "--parent-run-id requires --replacement-pool-size",
+        ),
+        (
+            [
+                "run",
+                "CAMPAIGN",
+                "--replacement-pool-size",
+                "2",
+                "--parent-run-id",
+                "unsafe/run",
+            ],
+            "Malformed campaign-run ID",
+        ),
+        (
+            [
+                "run",
+                "CAMPAIGN",
+                "--replacement-pool-size",
+                "2",
+                "--defer-collection",
+            ],
+            "cannot be combined with --defer-collection",
+        ),
+    ],
+)
+def test_replacement_options_fail_before_remote_mutation(
+    tmp_path: Path,
+    arguments: list[str],
+    message: str,
+) -> None:
+    """Reject ambiguous or non-cumulative replacement invocations before SSH."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+    resolved_arguments = [str(_campaign(workflow)) if argument == "CAMPAIGN" else argument for argument in arguments]
+
+    result = _run(workflow, resolved_arguments, environment)
+
+    assert result.returncode == 2
+    assert message in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert "ssh-start" not in log_text
+    assert "initialize-campaign-completion" not in log_text
+
+
+def test_replacement_resolution_is_read_only_for_dry_run_and_preflight(
+    tmp_path: Path,
+) -> None:
+    """Expose exact completion discovery without creating campaigns or state."""
+    workflow, log, environment, storage, _mirror = _harness(tmp_path)
+    arguments = [
+        "run",
+        str(_campaign(workflow)),
+        "--replacement-pool-size",
+        "4",
+        *_remote_options(),
+    ]
+
+    dry_run = _run(workflow, [*arguments, "--dry-run"], environment)
+
+    assert dry_run.returncode == 0, dry_run.stderr
+    record = json.loads(dry_run.stdout.splitlines()[-1])
+    completion = record["replacement_completion"]
+    assert completion["enabled"] is True
+    assert completion["replacement_pool_size"] == completion["requested_high_water_mark"] == 4
+    assert completion["parent_run_id_override"] is None
+    assert completion["compatible_parent_candidates"] == []
+    assert completion["selected_parent"] is None
+    assert completion["target_counts"] == {"batch-a": 1}
+    assert completion["current_successes"] == {"batch-a": 0}
+    assert completion["deficits"] == {"batch-a": 1}
+    assert completion["expected_completion_id"] is None
+    assert completion["package_declarations"] == []
+    assert completion["pt_shard_requirements"] == []
+    assert completion["parent_resolution"]["status"] == "fresh"
+    dry_log = log.read_text(encoding="utf-8")
+    assert "<find-completion-parent>" in dry_log
+    assert "ssh-start" not in dry_log
+    assert "rsync-start" not in dry_log
+    assert not (storage / "01_generation/meta/completions").exists()
+
+    log.write_text("", encoding="utf-8")
+    preflight = _run(workflow, [*arguments, "--preflight-only"], environment)
+
+    assert preflight.returncode == 0, preflight.stderr
+    assert "PREFLIGHT COMPLETE" in preflight.stdout
+    preflight_log = log.read_text(encoding="utf-8")
+    assert "<find-completion-parent>" in preflight_log
+    assert " initialize-campaign-completion " not in preflight_log
+    assert " advance-campaign-completion " not in preflight_log
+    assert "rsync-start" not in preflight_log
+    assert not (storage / "01_generation/meta/completions").exists()
+
+
+def test_status_by_config_reports_read_only_completion_plan(tmp_path: Path) -> None:
+    """Expose completion targets and deficits through normal config status."""
+    workflow, log, environment, _storage, _mirror = _harness(tmp_path)
+
+    result = _run(
+        workflow,
+        ["status", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Completion status:" in result.stdout
+    completion_line = next(line for line in result.stdout.splitlines() if line.startswith("{"))
+    completion = json.loads(completion_line)
+    assert completion["target_counts"] == {"batch-a": 1}
+    assert completion["current_successes"] == {"batch-a": 0}
+    assert completion["success_deficits"] == {"batch-a": 1}
+    assert "<find-completion-parent>" in log.read_text(encoding="utf-8")
+
+
+def test_status_by_config_reports_active_remote_completion_accounting(tmp_path: Path) -> None:
+    """Read active candidate and circuit state from the CPU completion owner."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+
+    result = _run(
+        workflow,
+        ["status", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "CPU completion execution status:" in result.stdout
+    reports = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    remote = next(report for report in reports if report.get("status") == "active")
+    assert remote["completion_id"] == _COMPLETION_ID
+    assert remote["attempted_candidates"] == 1
+    assert remote["failure_circuit"] == {"counted_failures": 0, "open": False}
+    log_text = log.read_text(encoding="utf-8")
+    assert " campaign-completion-status " in log_text
+    assert " --if-present " in log_text
+    assert " initialize-campaign-completion " not in log_text
+    assert " advance-campaign-completion " not in log_text
+
+
 def test_removed_specialized_starts_fail_before_remote_mutation(
     tmp_path: Path,
 ) -> None:
@@ -3033,6 +3384,103 @@ def test_automatic_collection_is_non_destructive_and_failure_retains_staging(tmp
     failed_text = failed_log.read_text(encoding="utf-8")
     assert "<publish-transferred-campaign>" in failed_text
     assert any((failed_storage / ".incoming").glob("*"))
+
+
+@pytest.mark.parametrize(
+    "status_variable",
+    ["FAKE_COMPLETION_INITIALIZE_STATUS", "FAKE_COMPLETION_ADVANCE_STATUS"],
+)
+def test_completion_failure_circuit_stops_without_pool_extension_guidance(
+    status_variable: str,
+    tmp_path: Path,
+) -> None:
+    """Stop explicitly at the configured local failure circuit and retain evidence."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    environment[status_variable] = "failure_circuit_open"
+
+    result = _run(
+        workflow,
+        [
+            "run",
+            str(_campaign(workflow)),
+            "--replacement-pool-size",
+            "4",
+            "--parent-run-id",
+            _RUN_ID,
+            *_remote_options(),
+        ],
+        environment,
+    )
+
+    assert result.returncode == 4
+    assert f"COMPLETION FAILURE CIRCUIT OPEN: completion_id={_COMPLETION_ID}" in result.stderr
+    assert "Continue with a larger cumulative pool" not in result.stderr
+    log_text = log.read_text(encoding="utf-8")
+    assert " initialize-campaign-completion " in log_text
+    assert (" advance-campaign-completion " in log_text) is (status_variable == "FAKE_COMPLETION_ADVANCE_STATUS")
+    assert " campaign-completion-transfer-plan " not in log_text
+    assert " build-campaign-completion-composite " not in log_text
+
+
+def test_historical_partial_completion_publishes_successes_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Complete from transferred parent evidence without restoring its CPU source."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    source_directories, partial_path, completion_relative = _seed_completion_transfer(
+        storage,
+        mirror,
+        environment,
+    )
+    original_partial = partial_path.read_bytes()
+    parent_cpu_directory = mirror / f"01_generation/meta/campaigns/{_RUN_ID}"
+    assert not parent_cpu_directory.exists()
+
+    result = _run(
+        workflow,
+        [
+            "run",
+            str(_campaign(workflow)),
+            "--replacement-pool-size",
+            "4",
+            "--parent-run-id",
+            _RUN_ID,
+            *_remote_options(),
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("DONE:") == 1
+    assert "state=complete_composite" in result.stdout
+    assert f"COMPLETION READY: completion_id={_COMPLETION_ID}" in result.stdout
+    assert partial_path.read_bytes() == original_partial
+    assert not parent_cpu_directory.exists()
+    assert (storage / completion_relative).read_bytes() == (mirror / completion_relative).read_bytes()
+    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
+    assert (mirror / source_directories[3]).is_dir()
+
+    log_text = log.read_text(encoding="utf-8")
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    assert not any(" submit-campaign " in line for line in remote_commands)
+    assert any(" initialize-campaign-completion " in line for line in remote_commands)
+    assert any(" advance-campaign-completion " in line for line in remote_commands)
+    cleanup_commands = [line for line in remote_commands if " cleanup-campaign-source " in line]
+    assert len(cleanup_commands) == 1
+    assert _REPLACEMENT_RUN_ID in cleanup_commands[0]
+    assert _RUN_ID not in cleanup_commands[0]
+    assert _FAILED_REPLACEMENT_RUN_ID not in log_text
+
+    positions = [
+        log_text.index("<build-campaign-completion-composite>"),
+        log_text.index("<build-campaign-completion-lifecycle>"),
+        log_text.index("<validate-campaign-completion-lifecycle>"),
+        log_text.index("<campaign-completion-cleanup-plan>"),
+        log_text.index(" cleanup-campaign-source "),
+        log_text.rindex("<validate-campaign-completion-lifecycle>"),
+    ]
+    assert positions == sorted(positions)
 
 
 def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(tmp_path: Path) -> None:

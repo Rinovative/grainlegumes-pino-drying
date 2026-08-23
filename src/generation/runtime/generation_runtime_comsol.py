@@ -90,6 +90,7 @@ def build_comsol_command(
     cores_per_case: int,
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
     scheduler_kind: str = "local",
+    diagnostic_batchlog: str | None = None,
 ) -> list[str]:
     """Build the canonical Generation COMSOL batch argument vector."""
     if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
@@ -98,6 +99,16 @@ def build_comsol_command(
     if scheduler_kind not in {"local", "slurm"}:
         message = f"Unsupported scheduler kind for case execution: {scheduler_kind!r}."
         raise ValueError(message)
+    extra_arguments = config.execution_values["runtime"]["extra_arguments"]
+    if diagnostic_batchlog is not None:
+        if not diagnostic_batchlog or "\x00" in diagnostic_batchlog:
+            message = "diagnostic_batchlog must be one safe non-empty path."
+            raise ValueError(message)
+        for value in extra_arguments:
+            normalized = str(value).strip().casefold()
+            if normalized in {"-batchlog", "-batchlogout"} or normalized.startswith(("-batchlog=", "-batchlogout=")):
+                message = "Probe-owned COMSOL batch logging conflicts with configured extra arguments."
+                raise ValueError(message)
     return [
         resolve_comsol_executable(config),
         "batch",
@@ -109,5 +120,6 @@ def build_comsol_command(
         *_comsol_parameter_arguments(config, scalar_handoff),
         "-np",
         str(cores_per_case),
-        *config.execution_values["runtime"]["extra_arguments"],
+        *([] if diagnostic_batchlog is None else ["-batchlog", diagnostic_batchlog, "-batchlogout"]),
+        *extra_arguments,
     ]

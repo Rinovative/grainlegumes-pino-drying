@@ -31,10 +31,12 @@ from src import common
 from src.generation import generation_background as background_service
 from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_runtime
+from src.generation import generation_campaign_completion as completion_service
 from src.generation import generation_campaign_status as campaign_status_service
 from src.generation import generation_readiness as readiness_service
 from src.generation import generation_run as run_service
 from src.generation import generation_smoke as smoke_service
+from src.generation import generation_timing_probe as timing_probe_service
 from src.generation import generation_workflow as workflow_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
@@ -560,6 +562,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     run_case.add_argument("--scheduler-kind", choices=("local", "slurm"), default="local")
     _add_storage_arguments(run_case, include_work=True)
 
+    timing_probe = subparsers.add_parser("timing-probe", help="run one isolated diagnostic transient timing probe")
+    timing_probe.add_argument("config", type=Path)
+    _add_storage_arguments(timing_probe, include_work=True)
+
+    validate_timing_probe = subparsers.add_parser("validate-timing-probe", help="validate one immutable diagnostic timing-probe bundle")
+    validate_timing_probe.add_argument("bundle", type=Path)
+
     validate_case = subparsers.add_parser("validate-case", help="validate one completed case")
     validate_case.add_argument("config", type=Path)
     _add_batch_selection(validate_case, required=True)
@@ -802,6 +811,85 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     compatible_campaign.add_argument("config", type=Path)
     compatible_campaign.add_argument("--storage-root", type=Path, required=True)
+
+    completion_parent = subparsers.add_parser(
+        "find-completion-parent",
+        help="resolve zero or one structurally compatible campaign completion parent",
+    )
+    completion_parent.add_argument("config", type=Path)
+    completion_parent.add_argument("--parent-run-id")
+    completion_parent.add_argument("--allow-untransferred", action="store_true")
+    _add_storage_arguments(completion_parent)
+
+    initialize_completion = subparsers.add_parser(
+        "initialize-campaign-completion",
+        help="create or extend one bounded replacement completion owner",
+    )
+    initialize_completion.add_argument("config", type=Path)
+    initialize_completion.add_argument("--parent-run-id", required=True)
+    initialize_completion.add_argument("--parent-partial", type=Path, required=True)
+    initialize_completion.add_argument("--parent-partial-sha256", required=True)
+    initialize_completion.add_argument("--replacement-pool-size", type=int, required=True)
+    _add_storage_arguments(initialize_completion)
+
+    advance_completion = subparsers.add_parser(
+        "advance-campaign-completion",
+        help="reconcile and advance one serialized replacement campaign wave",
+    )
+    advance_completion.add_argument("config", type=Path)
+    advance_completion.add_argument("completion_id")
+    advance_completion.add_argument("--git-commit", required=True)
+    _add_storage_arguments(advance_completion)
+
+    completion_status = subparsers.add_parser(
+        "campaign-completion-status",
+        help="report exact replacement successes, failures, reservations, and deficits",
+    )
+    completion_status.add_argument("completion_id")
+    completion_status.add_argument(
+        "--if-present",
+        action="store_true",
+        help="report an absent state without creating or mutating a completion owner",
+    )
+    _add_storage_arguments(completion_status)
+
+    completion_transfer = subparsers.add_parser(
+        "campaign-completion-transfer-plan",
+        help="report the completed state and successful replacement runs to transfer",
+    )
+    completion_transfer.add_argument("completion_id")
+    _add_storage_arguments(completion_transfer)
+
+    completion_composite = subparsers.add_parser(
+        "build-campaign-completion-composite",
+        help="admit transferred parent and replacement successes into one exact composite",
+    )
+    completion_composite.add_argument("completion_id")
+    _add_storage_arguments(completion_composite)
+
+    completion_lifecycle = subparsers.add_parser(
+        "build-campaign-completion-lifecycle",
+        help="build composite Dataset packages, PT shards, smoke, readiness, and cleanup plan",
+    )
+    completion_lifecycle.add_argument("parent_run_id")
+    completion_lifecycle.add_argument("completion_id")
+    _add_storage_arguments(completion_lifecycle)
+
+    validate_completion_lifecycle = subparsers.add_parser(
+        "validate-campaign-completion-lifecycle",
+        help="revalidate one completion-owned Dataset and cleanup gate",
+    )
+    validate_completion_lifecycle.add_argument("parent_run_id")
+    validate_completion_lifecycle.add_argument("completion_id")
+    _add_storage_arguments(validate_completion_lifecycle)
+
+    completion_cleanup = subparsers.add_parser(
+        "campaign-completion-cleanup-plan",
+        help="report successful replacement-only cleanup eligibility",
+    )
+    completion_cleanup.add_argument("parent_run_id")
+    completion_cleanup.add_argument("completion_id")
+    _add_storage_arguments(completion_cleanup)
 
     build_datasets = subparsers.add_parser(
         "build-campaign-datasets",
@@ -2018,6 +2106,92 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         else:
             print(pilot_service.terminal_summary(receipt))
         return 0
+    if args.command == "find-completion-parent":
+        campaign = config_service.load_campaign_config(args.config)
+        report = completion_service.find_compatible_completion_parent(
+            campaign,
+            parent_run_id=args.parent_run_id,
+            storage_root=args.storage_root,
+            require_transferred=not args.allow_untransferred,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
+    if args.command == "initialize-campaign-completion":
+        campaign = config_service.load_campaign_config(args.config)
+        state = completion_service.create_completion_from_partial_path(
+            parent_campaign=campaign,
+            parent_run_id=args.parent_run_id,
+            parent_partial_path=args.parent_partial,
+            parent_partial_sha256=args.parent_partial_sha256,
+            replacement_pool_size=args.replacement_pool_size,
+            storage_root=args.storage_root,
+        )
+        report = completion_service.completion_status_for_id(
+            state["completion_id"],
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
+    if args.command == "advance-campaign-completion":
+        campaign = config_service.load_campaign_config(args.config)
+        state = completion_service.load_completion(
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        report = completion_service.advance_completion_campaigns(
+            state,
+            parent_campaign=campaign,
+            git_commit=args.git_commit,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
+    if args.command == "campaign-completion-status":
+        report = completion_service.completion_status_for_id(
+            args.completion_id,
+            storage_root=args.storage_root,
+            if_present=args.if_present,
+        )
+        print(json.dumps(report, sort_keys=True))
+        return 0
+    if args.command == "campaign-completion-transfer-plan":
+        plan = completion_service.completion_transfer_plan(
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+    if args.command == "build-campaign-completion-composite":
+        receipt = completion_service.build_completion_composite(
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "build-campaign-completion-lifecycle":
+        receipt = workflow_service.build_composite_completion_lifecycle(
+            args.parent_run_id,
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "validate-campaign-completion-lifecycle":
+        receipt = workflow_service.validate_composite_completion_lifecycle(
+            args.parent_run_id,
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    if args.command == "campaign-completion-cleanup-plan":
+        plan = workflow_service.composite_replacement_cleanup_plan(
+            args.parent_run_id,
+            args.completion_id,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(plan, sort_keys=True))
+        return 0
     if args.command == "find-compatible-campaign-source":
         report = workflow_service.find_compatible_completed_campaign_source(
             args.config,
@@ -2232,6 +2406,26 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         else:
             print(canonical_path)
         return 0
+    if args.command == "validate-timing-probe":
+        result = timing_probe_service.validate_probe_bundle(args.bundle)
+        print("PROBE_BUNDLE_VALID=" + str(result["probe_bundle"]))
+        return 0
+    if args.command == "timing-probe":
+
+        def announce_probe(payload: Mapping[str, str]) -> None:
+            """Print the durable session identity before waiting for COMSOL."""
+            print("PROBE_ID=" + payload["probe_id"], flush=True)
+            print("PROBE_ACTIVE=" + payload["probe_active"], flush=True)
+            print("PROBE_WORK=" + payload["probe_work"], flush=True)
+
+        result = timing_probe_service.run_timing_probe(
+            args.config,
+            storage_root=args.storage_root,
+            work_root=args.work_root,
+            announce=announce_probe,
+        )
+        print("PROBE_BUNDLE=" + str(result["probe_bundle"]), flush=True)
+        return 0 if result["exit_code"] == 0 else int(result["exit_code"])
     if args.command == "run-campaign-case":
         outcome = campaign_runtime.run_campaign_case_job(
             args.campaign_run_id,

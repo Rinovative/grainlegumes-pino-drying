@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from src import generation
 
     from .contracts import dataset_contracts_identity as identity
@@ -65,6 +67,7 @@ def build_dataset_package(
     evaluation_regime: str,
     *,
     storage_root: Path | str | None = None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one declared package with its required ID leakage companion."""
     from .packages import dataset_packages_builder as builder  # noqa: PLC0415
@@ -74,6 +77,7 @@ def build_dataset_package(
         dataset_view,
         evaluation_regime,
         storage_root=storage_root,
+        composite_receipt=composite_receipt,
     )
 
 
@@ -81,11 +85,12 @@ def build_campaign_packages(
     campaign: generation.cases.config.CampaignConfig,
     *,
     storage_root: Path | str | None = None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Build every declared package after one shared membership preflight."""
     from .packages import dataset_packages_builder as builder  # noqa: PLC0415
 
-    return builder.build_campaign_packages(campaign, storage_root=storage_root)
+    return builder.build_campaign_packages(campaign, storage_root=storage_root, composite_receipt=composite_receipt)
 
 
 def load_package_manifest(

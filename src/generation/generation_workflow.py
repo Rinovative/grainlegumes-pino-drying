@@ -3863,3 +3863,286 @@ def validate_partial_completion_receipt(
         message = f"Partial completion receipt is invalid: {receipt_path}"
         raise ValueError(message)
     return receipt
+
+
+COMPOSITE_LIFECYCLE_FILENAME: Final = "completion_lifecycle.json"
+COMPOSITE_LIFECYCLE_SCHEMA_KIND: Final = "generation_completion_composite_lifecycle"
+
+
+def composite_lifecycle_receipt_path(
+    completion_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Return the completion-owned lifecycle receipt path."""
+    from .publication import generation_publication_completion_composite as composite_service  # noqa: PLC0415
+
+    return (
+        composite_service.completion_directory(
+            completion_id,
+            storage_root=storage_root,
+        )
+        / COMPOSITE_LIFECYCLE_FILENAME
+    )
+
+
+def _composite_publication_identity(receipt: Mapping[str, Any]) -> dict[str, str]:
+    """Return the distinct PT-shard identity for one admitted composite completion."""
+    required = {
+        "completion_id",
+        "parent_run_id",
+        "parent_partial_sha256",
+        "combined_inventory_sha256",
+    }
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required):
+        message = "Composite receipt lacks immutable publication identity fields."
+        raise ValueError(message)
+    return {
+        "completion_id": str(receipt["completion_id"]),
+        "parent_run_id": str(receipt["parent_run_id"]),
+        "parent_partial_sha256": str(receipt["parent_partial_sha256"]),
+        "completion_receipt_sha256": common.serialization.canonical_json_sha256(dict(receipt)),
+        "combined_inventory_sha256": str(receipt["combined_inventory_sha256"]),
+    }
+
+
+def build_composite_completion_lifecycle(
+    parent_run_id: str,
+    completion_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Build completion-owned packages, PT shards, and smoke evidence without terminalizing the parent."""
+    from src.datasets import packages as package_service  # noqa: PLC0415
+    from src.datasets.packages import dataset_packages_transient_shards as transient_shards  # noqa: PLC0415
+
+    from .publication import generation_publication_completion_composite as composite_service  # noqa: PLC0415
+
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    parent_run_id = common.paths.validate_logical_name(parent_run_id, label="parent_run_id")
+    campaign_runtime.validate_partially_transferred_campaign(parent_run_id, storage_root=storage)
+    composite = composite_service.load_composite_receipt(completion_id, storage_root=storage)
+    partial_path = campaign_evidence.campaign_run_directory(parent_run_id, storage_root=storage) / "campaign_partial.json"
+    if composite["parent_run_id"] != parent_run_id or composite["parent_partial_sha256"] != common.serialization.file_sha256(partial_path):
+        message = "Composite receipt does not bind the admitted parent partial evidence."
+        raise ValueError(message)
+    campaign = campaign_evidence.campaign_for_run(parent_run_id, storage_root=storage)
+    receipt_path = composite_lifecycle_receipt_path(completion_id, storage_root=storage)
+    identity = _composite_publication_identity(composite)
+    lock_path = receipt_path.with_suffix(".lock")
+    with common.locking.exclusive_file_lock(lock_path, blocking=False):
+        if receipt_path.exists():
+            return validate_composite_completion_lifecycle(
+                parent_run_id,
+                completion_id,
+                storage_root=storage,
+            )
+        results = package_service.build_campaign_packages(
+            campaign,
+            storage_root=storage,
+            composite_receipt=composite,
+        )
+        records = tuple(_package_record(result, storage_root=storage) for result in results)
+        shards: list[dict[str, Any]] = []
+        records_by_key = {_package_key(record): record for record in records}
+        for plan in campaign.dataset_packages:
+            policy = plan.get("training_payload")
+            if plan["dataset_view"] != "transient_drying" or policy is None:
+                continue
+            record = records_by_key.get(_package_key(plan))
+            if record is None:
+                message = "Composite package result is missing one declared transient plan."
+                raise RuntimeError(message)
+            dataset_id = str(record["dataset_id"])
+            result = transient_shards.build_transient_shards(
+                dataset_id,
+                storage_root=storage,
+                publication_identity=identity,
+                target_shard_bytes=int(policy["target_shard_bytes"]),
+            )
+            shard_receipt = transient_shards.load_transient_shard_receipt(
+                dataset_id,
+                storage_root=storage,
+                publication_identity=identity,
+                validation_depth="evidence",
+            )
+            shard_path = Path(result["receipt_path"])
+            hdf5_pt_smoke = _smoke_transient_shard_backend(
+                record,
+                storage_root=storage,
+                compare_canonical=True,
+            )
+            shards.append(
+                {
+                    "dataset_id": dataset_id,
+                    "required": bool(policy["required"]),
+                    "receipt_relative_path": shard_path.relative_to(storage).as_posix(),
+                    "receipt_sha256": common.serialization.file_sha256(shard_path),
+                    "derived_payload_id": shard_receipt["derived_payload_id"],
+                    "loader_smoke": _package_runtime_evidence(dataset_id, storage_root=storage)[2],
+                    "hdf5_pt_smoke": hdf5_pt_smoke,
+                }
+            )
+        lifecycle = {
+            "schema_kind": COMPOSITE_LIFECYCLE_SCHEMA_KIND,
+            "schema_version": WORKFLOW_SCHEMA_VERSION,
+            "status": "ready",
+            "completion_id": completion_id,
+            "parent_run_id": parent_run_id,
+            "parent_partial_sha256": composite["parent_partial_sha256"],
+            "composite_receipt_sha256": identity["completion_receipt_sha256"],
+            "combined_inventory_sha256": composite["combined_inventory_sha256"],
+            "packages": list(records),
+            "shards": shards,
+            "readiness": "ready",
+            "replacement_cleanup": {
+                "eligible": True,
+                "replacement_transfer_inventory_sha256": composite["replacement_transfer_inventory_sha256"],
+                "sources": list(composite_service.replacement_transfer_plan(composite)),
+            },
+            "created_at": _utc_now(),
+        }
+        common.serialization.atomic_write_json(receipt_path, lifecycle)
+    return validate_composite_completion_lifecycle(parent_run_id, completion_id, storage_root=storage)
+
+
+def validate_composite_completion_lifecycle(
+    parent_run_id: str,
+    completion_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate a completion-owned package, shard, smoke, readiness, and cleanup-plan receipt."""
+    from src.datasets.packages import dataset_packages_transient_shards as transient_shards  # noqa: PLC0415
+
+    from .publication import generation_publication_completion_composite as composite_service  # noqa: PLC0415
+
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    parent_run_id = common.paths.validate_logical_name(parent_run_id, label="parent_run_id")
+    campaign_runtime.validate_partially_transferred_campaign(parent_run_id, storage_root=storage)
+    composite = composite_service.load_composite_receipt(completion_id, storage_root=storage)
+    identity = _composite_publication_identity(composite)
+    receipt = _load_json(
+        composite_lifecycle_receipt_path(completion_id, storage_root=storage),
+        label="composite completion lifecycle receipt",
+    )
+    required = {
+        "schema_kind",
+        "schema_version",
+        "status",
+        "completion_id",
+        "parent_run_id",
+        "parent_partial_sha256",
+        "composite_receipt_sha256",
+        "combined_inventory_sha256",
+        "packages",
+        "shards",
+        "readiness",
+        "replacement_cleanup",
+        "created_at",
+    }
+    receipt_is_ready = (
+        set(receipt) == required
+        and receipt.get("schema_kind") == COMPOSITE_LIFECYCLE_SCHEMA_KIND
+        and receipt.get("schema_version") == WORKFLOW_SCHEMA_VERSION
+        and receipt.get("status") == "ready"
+        and receipt.get("readiness") == "ready"
+    )
+    if not receipt_is_ready:
+        message = "Composite lifecycle receipt schema or readiness is invalid."
+        raise ValueError(message)
+    partial_path = campaign_evidence.campaign_run_directory(parent_run_id, storage_root=storage) / "campaign_partial.json"
+    if (
+        receipt.get("completion_id") != completion_id
+        or receipt.get("parent_run_id") != parent_run_id
+        or receipt.get("parent_partial_sha256") != common.serialization.file_sha256(partial_path)
+        or receipt.get("parent_partial_sha256") != composite["parent_partial_sha256"]
+        or receipt.get("composite_receipt_sha256") != identity["completion_receipt_sha256"]
+        or receipt.get("combined_inventory_sha256") != composite["combined_inventory_sha256"]
+    ):
+        message = "Composite lifecycle receipt no longer binds parent or composite evidence."
+        raise ValueError(message)
+    campaign = campaign_evidence.campaign_for_run(parent_run_id, storage_root=storage)
+    plans = {_package_key(plan): plan for plan in campaign.dataset_packages}
+    records = receipt.get("packages")
+    if not isinstance(records, list) or {_package_key(record) for record in records if isinstance(record, dict)} != set(plans):
+        message = "Composite lifecycle package membership is invalid."
+        raise ValueError(message)
+    for record in records:
+        admitted = _validate_package_record(record, storage_root=storage, expected_plan=plans[_package_key(record)], campaign=campaign)
+        manifest = _load_json(
+            storage / admitted["manifest_relative_path"],
+            label="composite Dataset package manifest",
+        )
+        source_cases = manifest.get("source_case_identities") if isinstance(manifest, dict) else None
+        source_binding_valid = isinstance(source_cases, list) and all(
+            isinstance(case, dict) and case.get("completion_receipt_sha256") == identity["completion_receipt_sha256"] for case in source_cases
+        )
+        if not source_binding_valid:
+            message = "Composite package manifest is not bound to every source receipt identity."
+            raise ValueError(message)
+    shards = receipt.get("shards")
+    if not isinstance(shards, list):
+        message = "Composite lifecycle shard records are invalid."
+        raise TypeError(message)
+    expected_shards = {
+        str(record["dataset_id"])
+        for record in records
+        if plans[_package_key(record)].get("training_payload") is not None and plans[_package_key(record)]["dataset_view"] == "transient_drying"
+    }
+    if {str(item.get("dataset_id")) for item in shards if isinstance(item, dict)} != expected_shards:
+        message = "Composite lifecycle shard membership is incomplete."
+        raise ValueError(message)
+    records_by_dataset_id = {str(record["dataset_id"]): record for record in records}
+    for shard in shards:
+        if not isinstance(shard, dict):
+            message = "Composite lifecycle shard record must be an object."
+            raise TypeError(message)
+        path = storage / str(shard.get("receipt_relative_path"))
+        admitted = transient_shards.load_transient_shard_receipt(
+            str(shard.get("dataset_id")),
+            storage_root=storage,
+            publication_identity=identity,
+            validation_depth="evidence",
+        )
+        dataset_id = str(shard.get("dataset_id"))
+        record = records_by_dataset_id.get(dataset_id)
+        if record is None:
+            message = "Composite lifecycle shard lacks its exact Dataset package record."
+            raise RuntimeError(message)
+        observed_smoke = _smoke_transient_shard_backend(
+            record,
+            storage_root=storage,
+            compare_canonical=True,
+        )
+        shard_matches = (
+            path.is_file()
+            and common.serialization.file_sha256(path) == shard.get("receipt_sha256")
+            and admitted["derived_payload_id"] == shard.get("derived_payload_id")
+            and shard.get("hdf5_pt_smoke") == observed_smoke
+        )
+        if not shard_matches:
+            message = "Composite lifecycle shard receipt or HDF5/PT semantic smoke changed after admission."
+            raise RuntimeError(message)
+    expected_cleanup = list(composite_service.replacement_transfer_plan(composite))
+    cleanup = receipt.get("replacement_cleanup")
+    expected_cleanup_plan = {
+        "eligible": True,
+        "replacement_transfer_inventory_sha256": composite["replacement_transfer_inventory_sha256"],
+        "sources": expected_cleanup,
+    }
+    if not isinstance(cleanup, dict) or cleanup != expected_cleanup_plan:
+        message = "Composite lifecycle replacement-only cleanup plan is invalid."
+        raise ValueError(message)
+    return receipt
+
+
+def composite_replacement_cleanup_plan(
+    parent_run_id: str,
+    completion_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return replacement-only source eligibility after all completion lifecycle gates pass."""
+    receipt = validate_composite_completion_lifecycle(parent_run_id, completion_id, storage_root=storage_root)
+    return dict(receipt["replacement_cleanup"])

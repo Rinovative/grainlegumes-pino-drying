@@ -249,16 +249,27 @@ def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str
         "ood_parameters",
         "task_relevant_ood_parameters",
     )
+    composite_keys = ("composite_source_kind", "completion_receipt_sha256")
     projected_cases: list[dict[str, Any]] = []
+    composite_bound = any(
+        isinstance(source_case, Mapping) and source_case.get("completion_receipt_sha256") is not None for source_case in source_cases
+    )
     for index, source_case in enumerate(source_cases):
         if not isinstance(source_case, Mapping):
             message = f"Dataset package source_case_identities[{index}] must be a mapping."
             raise TypeError(message)
-        missing = [key for key in case_keys if key not in source_case]
+        required_keys = case_keys + composite_keys if composite_bound else case_keys
+        missing = [key for key in required_keys if key not in source_case]
         if missing:
             message = f"Dataset package source_case_identities[{index}] is missing semantic fields {missing}."
             raise ValueError(message)
-        projected_cases.append({key: copy.deepcopy(source_case[key]) for key in case_keys})
+        projected = {key: copy.deepcopy(source_case[key]) for key in case_keys}
+        if composite_bound:
+            if any(source_case[key] is None for key in composite_keys):
+                message = "Composite Dataset package sources must all bind the same completion receipt."
+                raise ValueError(message)
+            projected.update({key: copy.deepcopy(source_case[key]) for key in composite_keys})
+        projected_cases.append(projected)
     package_keys = (
         "schema_kind",
         "schema_version",

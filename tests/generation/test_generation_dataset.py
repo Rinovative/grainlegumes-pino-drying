@@ -237,6 +237,15 @@ def test_transient_case_publishes_distinct_dual_view_dataset_ids(
     steady_manifest = datasets.packages.load_package_manifest(steady["dataset_id"], storage_root=storage)
     transient_source = transient_manifest["source_case_identities"][0]
     steady_source = steady_manifest["source_case_identities"][0]
+    composite_keys = {
+        "composite_source_kind",
+        "source_run_id",
+        "source_git_commit",
+        "source_campaign_manifest_sha256",
+        "completion_receipt_sha256",
+    }
+    assert composite_keys.isdisjoint(transient_source)
+    assert composite_keys.isdisjoint(steady_source)
     assert transient_source["source_relative_path"] == steady_source["source_relative_path"]
     assert transient_source["case_hdf5_sha256"] == steady_source["case_hdf5_sha256"]
     assert storage / transient_source["source_relative_path"] == outcome.processed_directory / "case.h5"

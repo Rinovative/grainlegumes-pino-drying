@@ -42,7 +42,7 @@ _SESSION_ID_PATTERN: Final = re.compile(r"gw-[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+-[0-9a
 _SAFE_SUBCOMMAND_PATTERN: Final = re.compile(r"[a-z][a-z0-9-]*")
 _RUN_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]+__[0-9a-f]{16}")
 _BENCHMARK_RUN_ID_PATTERN: Final = re.compile(r"core_scaling_transient__[0-9a-f]{16}")
-_SUPPORTED_SUBCOMMANDS: Final = frozenset({"run"})
+_SUPPORTED_SUBCOMMANDS: Final = frozenset({"run", "timing-probe"})
 _SESSION_KEYS: Final = frozenset(
     {
         "schema_kind",

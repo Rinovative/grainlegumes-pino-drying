@@ -977,6 +977,95 @@ def _sample_nominal_case(config: _SamplingConfig, case_index: int) -> CaseSample
     )
 
 
+def _supplemental_design(config: _SamplingConfig) -> dict[str, Any] | None:
+    """Validate one persisted prefix-stable replacement design, when present."""
+    value = config.scientific_values.get("supplemental_design")
+    if value is None:
+        return None
+    required = {
+        "schema_kind",
+        "schema_version",
+        "completion_id",
+        "parent_run_id",
+        "parent_partial_sha256",
+        "parent_campaign_digest",
+        "parent_batch_id",
+        "parent_scientific_config_digest",
+        "parent_failed_case_id",
+        "candidate_id",
+        "science_id",
+        "candidate_ordinal",
+        "batch_ordinal",
+        "sampling_algorithm",
+        "sampling_seed",
+        "block_seeds",
+        "unit_point",
+        "unit_point_sha256",
+        "physical_values",
+        "physical_values_sha256",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_kind") != "generation_supplemental_design"
+        or value.get("schema_version") != 1
+        or value.get("sampling_algorithm") != "sobol"
+    ):
+        message = "Supplemental replacement design has an unsupported schema."
+        raise ValueError(message)
+    ordinal = value["candidate_ordinal"]
+    batch_ordinal = value["batch_ordinal"]
+    seed = value["sampling_seed"]
+    if (
+        isinstance(ordinal, bool)
+        or not isinstance(ordinal, int)
+        or ordinal < 1
+        or isinstance(batch_ordinal, bool)
+        or not isinstance(batch_ordinal, int)
+        or batch_ordinal < 1
+        or isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or seed < 0
+    ):
+        message = "Supplemental replacement ordinal and sampling seed are invalid."
+        raise ValueError(message)
+    plans = config.scientific_values["sampling"]["blocks"]
+    points = value["unit_point"]
+    block_seeds = value["block_seeds"]
+    if not isinstance(points, dict) or set(points) != set(plans) or not isinstance(block_seeds, dict) or set(block_seeds) != set(plans):
+        message = "Supplemental replacement blocks disagree with the authoritative sampling plan."
+        raise ValueError(message)
+    for block, plan in plans.items():
+        point = points[block]
+        block_seed = block_seeds[block]
+        if (
+            not isinstance(point, list)
+            or len(point) != int(plan["effective_dimension"])
+            or any(
+                isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or not 0.0 <= float(item) <= 1.0
+                for item in point
+            )
+            or isinstance(block_seed, bool)
+            or not isinstance(block_seed, int)
+            or block_seed < 0
+        ):
+            message = f"Supplemental replacement point for block {block!r} is invalid."
+            raise ValueError(message)
+    if common.serialization.canonical_json_sha256({"unit_point": points}) != value["unit_point_sha256"]:
+        message = "Supplemental replacement unit-point digest changed."
+        raise RuntimeError(message)
+    physical = value["physical_values"]
+    if physical is not None and (
+        not isinstance(physical, dict) or common.serialization.canonical_json_sha256({"physical_values": physical}) != value["physical_values_sha256"]
+    ):
+        message = "Supplemental replacement physical-value evidence changed."
+        raise RuntimeError(message)
+    if physical is None and value["physical_values_sha256"] is not None:
+        message = "Unresolved supplemental physical values cannot declare a digest."
+        raise ValueError(message)
+    return copy.deepcopy(value)
+
+
 def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
     """Resolve one deterministic case from profile-active block designs."""
     config.case_id(case_index)
@@ -1009,21 +1098,27 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
         case_index=case_index,
     )
     position = config.case_indices.index(case_index)
+    supplemental = _supplemental_design(config)
     block_provenance: dict[str, dict[str, Any]] = {}
     ood_details: dict[str, dict[str, Any]] = {}
     family_bounds = family_contract.get("initial_moisture_bounds", {})
     initial_moisture_field_constraint = family_contract.get("initial_moisture_field_constraint", {})
     for block, plan in config.scientific_values["sampling"]["blocks"].items():
-        row_index = int(plan["permutation"][position])
-        design = unit_design(
-            config.scientific_values["sampling"]["method"],
-            count=len(config.case_indices),
-            dimensions=int(plan["effective_dimension"]),
-            seed=int(plan["design_seed"]),
-        )
-        if _array_sha256(design) != plan["design_sha256"]:
-            message = f"Sampling design digest changed for block {block!r}."
-            raise RuntimeError(message)
+        if supplemental is None:
+            row_index = int(plan["permutation"][position])
+            design = unit_design(
+                config.scientific_values["sampling"]["method"],
+                count=len(config.case_indices),
+                dimensions=int(plan["effective_dimension"]),
+                seed=int(plan["design_seed"]),
+            )
+            if _array_sha256(design) != plan["design_sha256"]:
+                message = f"Sampling design digest changed for block {block!r}."
+                raise RuntimeError(message)
+            row = design[row_index]
+        else:
+            row_index = int(supplemental["candidate_ordinal"]) - 1
+            row = np.asarray(supplemental["unit_point"][block], dtype=float)
         parameters = tuple(str(name) for name in plan["parameters"])
         numerical_block_parameters = {name for name in parameters if registry_service.effective_dimension(registry[name]) > 0}
         overlap = set(values).intersection(numerical_block_parameters)
@@ -1033,7 +1128,7 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
         block_values, block_ood_details = _block_values(
             registry,
             block,
-            design[row_index],
+            row,
             parameters=parameters,
             selected_ood=selected,
             seed_base=config.seed_base,
@@ -1044,15 +1139,28 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
         )
         values.update(block_values)
         ood_details.update(block_ood_details)
-        block_provenance[block] = {
-            "seed_origin": plan["seed_origin"],
-            "design_seed": plan["design_seed"],
-            "design_sha256": plan["design_sha256"],
-            "permutation_seed": plan["permutation_seed"],
-            "permutation_sha256": plan["permutation_sha256"],
-            "case_position": position,
-            "block_row_index": row_index,
-        }
+        if supplemental is None:
+            block_provenance[block] = {
+                "seed_origin": plan["seed_origin"],
+                "design_seed": plan["design_seed"],
+                "design_sha256": plan["design_sha256"],
+                "permutation_seed": plan["permutation_seed"],
+                "permutation_sha256": plan["permutation_sha256"],
+                "case_position": position,
+                "block_row_index": row_index,
+            }
+        else:
+            block_provenance[block] = {
+                "sampling_kind": "supplemental_replacement_sobol",
+                "candidate_id": supplemental["candidate_id"],
+                "candidate_ordinal": supplemental["candidate_ordinal"],
+                "sampling_seed": supplemental["sampling_seed"],
+                "block_seed": supplemental["block_seeds"][block],
+                "unit_point": list(supplemental["unit_point"][block]),
+                "unit_point_sha256": supplemental["unit_point_sha256"],
+                "case_position": position,
+                "block_row_index": row_index,
+            }
     coupled_ood_details = _apply_coupled_ood_records(
         family_contract,
         selected_ood=selected,
@@ -1078,6 +1186,11 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
             values,
             active_ood_unit=next(iter(selected), None),
         )
+    if supplemental is not None and supplemental["physical_values"] is not None:
+        observed_digest = common.serialization.canonical_json_sha256({"physical_values": values})
+        if observed_digest != supplemental["physical_values_sha256"] or values != supplemental["physical_values"]:
+            message = "Supplemental replacement physical values no longer match their persisted unit point."
+            raise RuntimeError(message)
     selected_units = sorted(selected)
     if selected_units:
         if len(selected_units) != 1:

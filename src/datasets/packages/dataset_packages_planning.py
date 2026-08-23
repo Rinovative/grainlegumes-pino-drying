@@ -1,3 +1,4 @@
+# ruff: noqa: TRY003, EM101, EM102, TRY004
 """
 dataset_packages_planning.py
 
@@ -92,8 +93,16 @@ def _load_candidates(
     plan: Mapping[str, Any],
     *,
     storage_root: Path | str | None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Admit terminal batches and enumerate deterministic source candidates."""
+    """Admit terminal batches or one validated composite source inventory."""
+    if composite_receipt is not None:
+        return _load_composite_candidates(
+            campaign,
+            plan,
+            storage_root=storage_root,
+            composite_receipt=composite_receipt,
+        )
     storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
     batch_records: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -168,6 +177,217 @@ def _load_candidates(
                     "simulation_case_id": case.simulation_case_id,
                     "case_hdf5_relative": case.hdf5_path.relative_to(storage).as_posix(),
                     "case_hdf5_sha256": case.case_hdf5_sha256,
+                }
+            )
+    return batch_records, candidates
+
+
+@dataclass(frozen=True, slots=True)
+class _CompositeBatchEvidence:
+    """Present independently admitted cases through the existing batch consumer contract."""
+
+    simulation_profile: str
+    available_learning_views: tuple[str, ...]
+    airflow_source: str
+    batch_id: str
+    sampling_regime: str
+    template_sha256: str
+    git_commit: str
+    git_commits: tuple[str, ...]
+    cases: tuple[Any, ...]
+
+    def case(self, case_id: str) -> Any:
+        """Return one exact case from the immutable composite membership."""
+        matches = tuple(case for case in self.cases if case.case_id == case_id)
+        if len(matches) != 1:
+            raise ValueError(f"Composite batch {self.batch_id!r} has no unique case {case_id!r}.")
+        return matches[0]
+
+
+def _composite_member_case(
+    member: Mapping[str, Any],
+    batch: generation.cases.config.GenerationConfig,
+    *,
+    storage_root: Path,
+) -> Any:
+    """Re-admit one case from its declared partial or terminal composite source."""
+    source_kind = member.get("source_kind")
+    source_run_id = common.paths.validate_logical_name(member.get("source_run_id"), label="source_run_id")
+    source_manifest_path = generation.publication.campaign_evidence.campaign_run_manifest_path(
+        source_run_id,
+        storage_root=storage_root,
+    )
+    source_manifest = generation.publication.campaign_evidence.load_campaign_run(
+        source_run_id,
+        storage_root=storage_root,
+    )
+    if source_manifest.get("git_commit") != member.get("source_git_commit") or common.serialization.file_sha256(source_manifest_path) != member.get(
+        "source_campaign_manifest_sha256"
+    ):
+        raise RuntimeError("Composite source campaign manifest conflicts with the immutable receipt.")
+    case_index = member.get("case_index")
+    if isinstance(case_index, bool) or not isinstance(case_index, int):
+        raise ValueError("Composite case membership has an invalid case index.")
+    if source_kind == "parent_partial":
+        case = generation.runtime.admit_completed_case(
+            batch,
+            case_index,
+            storage_root=storage_root,
+            validation_depth="routine",
+        )
+    elif source_kind == "replacement":
+        storage_name = member.get("terminal_batch_storage_name")
+        manifest_sha256 = member.get("terminal_manifest_sha256")
+        if not isinstance(storage_name, str) or not storage_name or not isinstance(manifest_sha256, str):
+            raise ValueError("Replacement composite membership lacks terminal batch storage evidence.")
+        terminal = generation.runtime.admit_terminal_batch(
+            storage_name,
+            storage_root=storage_root,
+            validation_depth="routine",
+        )
+        if terminal.manifest_sha256 != manifest_sha256 or terminal.batch_id != member.get("terminal_batch_id"):
+            raise RuntimeError("Replacement terminal batch evidence conflicts with the composite receipt.")
+        case = terminal.case(str(member.get("case_id")))
+    else:
+        raise ValueError("Composite membership has an unsupported source kind.")
+    expected = {
+        "case_id": case.case_id,
+        "case_input_id": case.case_input_id,
+        "simulation_case_id": case.simulation_case_id,
+        "success_sha256": case.success_sha256,
+        "provenance_sha256": case.provenance_sha256,
+        "case_hdf5_sha256": case.case_hdf5_sha256,
+    }
+    observed = {key: member.get(key) for key in expected}
+    case_commit = terminal.git_commit if source_kind == "replacement" else case.hdf5_identity.git_commit
+    if observed != expected or case_commit != member.get("source_git_commit"):
+        raise RuntimeError(f"Composite receipt conflicts with re-admitted case evidence: {case.case_id!r}.")
+    return case
+
+
+def _load_composite_candidates(
+    campaign: generation.cases.config.CampaignConfig,
+    plan: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None,
+    composite_receipt: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Enumerate a complete parent-plus-replacement receipt through normal package selection."""
+    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+    receipt = generation.publication.completion_composite.load_composite_receipt(
+        str(composite_receipt.get("completion_id", "")), storage_root=storage
+    )
+    if receipt != dict(composite_receipt):
+        raise RuntimeError("Composite receipt changed after caller admission.")
+    expected_batches = _source_batches(campaign, plan)
+    expected_ids = {batch.batch_id for batch in expected_batches}
+    members = receipt.get("source_membership")
+    if not isinstance(members, list):
+        raise ValueError("Composite receipt source membership is malformed.")
+    selected = [member for member in members if isinstance(member, dict) and member.get("batch_id") in expected_ids]
+    if len(selected) != sum(int(receipt["targets"].get(batch.batch_id, 0)) for batch in expected_batches):
+        raise ValueError("Composite receipt does not provide exact package-target membership.")
+    batch_records: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for batch in expected_batches:
+        batch_members = [member for member in selected if member["batch_id"] == batch.batch_id]
+        if not batch_members:
+            raise ValueError(f"Composite receipt has no source cases for batch {batch.batch_id!r}.")
+        cases = tuple(_composite_member_case(member, batch, storage_root=storage) for member in batch_members)
+        first = cases[0].hdf5_identity
+        shared_identity = (
+            first.simulation_profile,
+            first.template_sha256,
+            first.export_contract_sha256,
+            first.available_learning_views,
+            first.airflow_source,
+            first.retention_policy,
+        )
+        if any(
+            (
+                case.hdf5_identity.simulation_profile,
+                case.hdf5_identity.template_sha256,
+                case.hdf5_identity.export_contract_sha256,
+                case.hdf5_identity.available_learning_views,
+                case.hdf5_identity.airflow_source,
+                case.hdf5_identity.retention_policy,
+            )
+            != shared_identity
+            for case in cases
+        ):
+            raise RuntimeError(f"Composite cases have incompatible HDF5 identities for batch {batch.batch_id!r}.")
+        member_commits = tuple(sorted({str(member["source_git_commit"]) for member in batch_members}))
+        evidence = _CompositeBatchEvidence(
+            simulation_profile=first.simulation_profile,
+            available_learning_views=first.available_learning_views,
+            airflow_source=first.airflow_source,
+            batch_id=batch.batch_id,
+            sampling_regime=batch.sampling_regime,
+            template_sha256=first.template_sha256,
+            git_commit=member_commits[0] if len(member_commits) == 1 else "",
+            git_commits=member_commits,
+            cases=cases,
+        )
+        batch_records.append(
+            {
+                "batch_name": batch.batch_name,
+                "batch_id": batch.batch_id,
+                "batch_identity": batch.batch_identity,
+                "manifest_sha256": common.serialization.canonical_json_sha256(list(batch_members)),
+                "simulation_profile": evidence.simulation_profile,
+                "template": {"relative_path": first.template_relative_path, "sha256": evidence.template_sha256},
+                "scientific_config_digest": first.scientific_config_digest,
+                "git_commits": list(evidence.git_commits),
+                "material_config_digest": batch.scientific_values["material_config_digest"],
+                "material_role": batch.material_role,
+                "evaluation_regime": batch.evaluation_regime,
+                "natural_support_state": batch.scientific_values["natural_support_state"],
+                "operation_config_digest": batch.scientific_values["operation_config_digest"],
+                "airflow_source": evidence.airflow_source,
+                "available_learning_views": list(evidence.available_learning_views),
+                "export_contract_sha256": first.export_contract_sha256,
+                "steady_flow_conditioning": copy.deepcopy(batch.scientific_values["steady_flow_conditioning"]),
+            }
+        )
+        for member, case in zip(batch_members, cases, strict=True):
+            payload = case.metadata_payload()
+            observed_ownership = (
+                payload.get("material_family"),
+                payload.get("material_role"),
+                payload.get("evaluation_regime"),
+                payload.get("sampling_regime"),
+            )
+            expected_ownership = (
+                batch.material_family,
+                batch.material_role,
+                plan["evaluation_regime"],
+                batch.sampling_regime,
+            )
+            if observed_ownership != expected_ownership:
+                raise ValueError(f"Composite case {case.case_id!r} disagrees with its parent package ownership.")
+            candidates.append(
+                {
+                    "batch": batch,
+                    "terminal_evidence": evidence,
+                    "case_evidence": case,
+                    "manifest": evidence,
+                    "record": case.record_payload(),
+                    "case_payload": payload,
+                    "batch_id": batch.batch_id,
+                    "batch_name": batch.batch_name,
+                    "case_id": case.case_id,
+                    "package_case_id": _global_case_id(batch.batch_name, case.case_id),
+                    "material_family": case.material_family,
+                    "simulation_profile": evidence.simulation_profile,
+                    "case_input_id": case.case_input_id,
+                    "simulation_case_id": case.simulation_case_id,
+                    "case_hdf5_relative": case.hdf5_path.relative_to(storage).as_posix(),
+                    "case_hdf5_sha256": case.case_hdf5_sha256,
+                    "composite_source_kind": member["source_kind"],
+                    "source_run_id": member["source_run_id"],
+                    "source_git_commit": member["source_git_commit"],
+                    "source_campaign_manifest_sha256": member["source_campaign_manifest_sha256"],
+                    "completion_receipt_sha256": common.serialization.canonical_json_sha256(receipt),
                 }
             )
     return batch_records, candidates
@@ -500,6 +720,7 @@ def prepare_campaign_packages(
     *,
     storage_root: Path | str | None,
     selected_plans: Sequence[Mapping[str, Any]] | None = None,
+    composite_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[PreparedPackage, ...]:
     """Admit selected packages together so membership and leakage are global."""
     plans = [copy.deepcopy(dict(plan)) for plan in (campaign.dataset_packages if selected_plans is None else selected_plans)]
@@ -507,7 +728,7 @@ def prepare_campaign_packages(
     for plan in plans:
         regime = str(plan["evaluation_regime"])
         if regime not in source_by_regime:
-            source_by_regime[regime] = _load_candidates(campaign, plan, storage_root=storage_root)
+            source_by_regime[regime] = _load_candidates(campaign, plan, storage_root=storage_root, composite_receipt=composite_receipt)
     id_plans = [plan for plan in plans if plan["evaluation_regime"] == "id"]
     shared_membership: dict[str, str] = {}
     technical_smoke = campaign.campaign_purpose == "technical_runtime_smoke"

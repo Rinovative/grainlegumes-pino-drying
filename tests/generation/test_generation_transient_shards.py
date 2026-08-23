@@ -96,6 +96,19 @@ def _publication_identity() -> dict[str, str]:
     }
 
 
+def test_transient_shards_accept_distinct_composite_publication_identity() -> None:
+    """Keep replacement-completion shard provenance separate from terminal campaigns."""
+    identity = {
+        "completion_id": "completion__synthetic",
+        "parent_run_id": "synthetic_run",
+        "parent_partial_sha256": "1" * 64,
+        "completion_receipt_sha256": "2" * 64,
+        "combined_inventory_sha256": "3" * 64,
+    }
+    admitted = datasets.packages.transient_shards._validate_publication_identity(identity)
+    assert admitted == identity
+
+
 def _assert_item_equal(left: Any, right: Any) -> None:
     """Require exact equality through one nested TransientItem tree."""
     assert type(left) is type(right)
