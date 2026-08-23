@@ -826,7 +826,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     advance_completion = subparsers.add_parser(
         "advance-campaign-completion",
-        help="reconcile and advance one serialized replacement campaign wave",
+        help="reconcile and advance exact replacement rounds through normal campaigns",
     )
     advance_completion.add_argument("config", type=Path)
     advance_completion.add_argument("completion_id")
@@ -843,6 +843,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         action="store_true",
         help="report an absent state without creating or mutating a completion owner",
     )
+    completion_status.add_argument("--config", type=Path, help="include named targets and resolved normal execution settings")
     _add_storage_arguments(completion_status)
 
     completion_transfer = subparsers.add_parser(
@@ -2121,6 +2122,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         report = completion_service.completion_status_for_id(
             state["completion_id"],
             storage_root=args.storage_root,
+            parent_campaign=campaign,
         )
         print(json.dumps(report, sort_keys=True))
         return 0
@@ -2139,10 +2141,12 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(report, sort_keys=True))
         return 0
     if args.command == "campaign-completion-status":
+        campaign = None if args.config is None else config_service.load_campaign_config(args.config)
         report = completion_service.completion_status_for_id(
             args.completion_id,
             storage_root=args.storage_root,
             if_present=args.if_present,
+            parent_campaign=campaign,
         )
         print(json.dumps(report, sort_keys=True))
         return 0

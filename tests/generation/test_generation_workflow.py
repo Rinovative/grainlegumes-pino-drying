@@ -342,6 +342,74 @@ next_campaign_state() {
   fi
   printf '%s\n' "${state}"
 }
+next_completion_advance_state() {
+  local state="${FAKE_COMPLETION_ADVANCE_STATUS:-complete}" index=0
+  if [[ -n "${FAKE_COMPLETION_ADVANCE_STATES:-}" ]]; then
+    IFS=',' read -r -a states <<< "${FAKE_COMPLETION_ADVANCE_STATES}"
+    [[ ! -f "${FAKE_COMPLETION_ADVANCE_STATE_INDEX_FILE}" ]] ||
+      read -r index < "${FAKE_COMPLETION_ADVANCE_STATE_INDEX_FILE}"
+    (( ${#states[@]} > 0 )) || exit 95
+    if (( index >= ${#states[@]} )); then
+      index=$(( ${#states[@]} - 1 ))
+    fi
+    state="${states[index]}"
+    printf '%s\n' "$(( index + 1 ))" > "${FAKE_COMPLETION_ADVANCE_STATE_INDEX_FILE}"
+  fi
+  printf '%s\n' "${state}"
+}
+completion_report() {
+  local phase="$1" status="$2"
+  "${FAKE_REAL_PYTHON}" -c 'import json, os, sys
+phase, status = sys.argv[1:]
+pool = int(os.environ["FAKE_COMPLETION_POOL_SIZE"])
+batch = os.environ["FAKE_BATCH_NAME"]
+replacement_run = os.environ["FAKE_REPLACEMENT_RUN_ID"]
+is_active_round = phase == "advance" and status == "active"
+is_complete = status == "complete"
+allocated = 0 if phase == "initialize" else 1
+reserved = 1 if is_active_round else 0
+new_required = 1 if phase == "initialize" or status == "pool_exhausted" else 0
+current = 1 if is_complete else 0
+report = {
+    "status": status,
+    "completion_id": os.environ["FAKE_COMPLETION_ID"],
+    "parent_run_id": os.environ["FAKE_RUN_ID"],
+    "parent_state": "completed_with_failures",
+    "replacement_pool_size": pool,
+    "pool_high_water": pool,
+    "pool_consumed": allocated,
+    "pool_remaining": max(pool - allocated, 0),
+    "pool_insufficient": status == "pool_exhausted",
+    "allocated_candidates": allocated,
+    "reserved_candidates": reserved,
+    "attempted_candidates": allocated,
+    "failure_circuit": {"counted_failures": 0, "open": status == "failure_circuit_open"},
+    "success_deficits": {batch: 0 if is_complete else 1},
+    "new_replacements_required": {batch: new_required},
+    "active_run_ids": [replacement_run] if is_active_round else [],
+    "active_round_run_ids": [replacement_run] if is_active_round else [],
+    "next_operation": "monitor the active normal replacement campaign" if is_active_round else "no replacement work remains",
+    "target_batches": [{
+        "batch_id": batch,
+        "batch_name": batch,
+        "material_family": "synthetic_material",
+        "target_successes": 1,
+        "current_successes": current,
+        "uncovered_deficit": 0 if is_complete else 1,
+        "reserved_candidates": reserved,
+        "new_replacements_required": new_required,
+    }],
+    "execution": {
+        "max_admission_cases": 2,
+        "max_running_cases": None,
+        "cores_per_case": 16,
+        "partition": "standard",
+        "wall_time": "01:05:00",
+        "poll_interval_seconds": 1,
+    },
+}
+print(json.dumps(report, sort_keys=True))' "${phase}" "${status}"
+}
 if [[ "${FAKE_SETUP_IDLE_REJECT:-false}" == true \
   && -f "${FAKE_SETUP_INSTALLED_FILE}" \
   && "${payload}" == *'assert-shared-setup-idle'* ]]; then
@@ -362,6 +430,10 @@ if [[ "${FAKE_LOGIN_PREFLIGHT_STDOUT:-false}" == true \
   printf '%s\n' \
     'Preflight domain=CPU login check=command:git status=pass detail=resolved' \
     'Generation-venv-runtime status=pass'
+fi
+reported_campaign_run_id="${FAKE_RUN_ID}"
+if [[ " $* " == *" ${FAKE_REPLACEMENT_RUN_ID} "* ]]; then
+  reported_campaign_run_id="${FAKE_REPLACEMENT_RUN_ID}"
 fi
 if [[ " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* \
   || " $* " == *' feed-campaign '* ]]; then
@@ -425,11 +497,9 @@ elif [[ " $* " == *' core-benchmark-summary '* ]]; then
 elif [[ " $* " == *' validate-real-smoke '* ]]; then
   printf '%s\n' '{"status":"valid"}'
 elif [[ " $* " == *' initialize-campaign-completion '* ]]; then
-  printf '{"status":"%s","completion_id":"%s","replacement_pool_size":%s}\n' \
-    "${FAKE_COMPLETION_INITIALIZE_STATUS:-active}" "${FAKE_COMPLETION_ID}" "${FAKE_COMPLETION_POOL_SIZE}"
+  completion_report initialize "${FAKE_COMPLETION_INITIALIZE_STATUS:-active}"
 elif [[ " $* " == *' advance-campaign-completion '* ]]; then
-  printf '{"status":"%s","completion_id":"%s","replacement_pool_size":%s}\n' \
-    "${FAKE_COMPLETION_ADVANCE_STATUS:-complete}" "${FAKE_COMPLETION_ID}" "${FAKE_COMPLETION_POOL_SIZE}"
+  completion_report advance "$(next_completion_advance_state)"
 elif [[ " $* " == *' campaign-completion-status '* ]]; then
   printf '%s\n' "${FAKE_COMPLETION_STATUS_JSON}"
 elif [[ " $* " == *' campaign-completion-transfer-plan '* ]]; then
@@ -444,10 +514,11 @@ elif [[ " $* " == *' campaign-transfer-plan '* ]]; then
   printf '%b' "${FAKE_TRANSFER_PLAN}"
 elif [[ " $* " == *' campaign-source-status '* ]]; then
   if [[ -f "${FAKE_REMOTE_CLEANED_FILE}" ]]; then
-    printf 'source-status\t%s\tcomplete\tcleaned\t0\talready_complete\tFalse\n' "${FAKE_RUN_ID}"
+    printf 'source-status\t%s\tcomplete\tcleaned\t0\talready_complete\tFalse\n' \
+      "${reported_campaign_run_id}"
   else
     printf 'source-status\t%s\trunning\t%s\t%s\tineligible\tFalse\n' \
-      "${FAKE_RUN_ID}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
+      "${reported_campaign_run_id}" "${FAKE_SOURCE_STATE}" "${FAKE_AUTHORIZED_BYTES}"
   fi
 elif [[ ( " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* ) \
   && "${FAKE_CAMPAIGN_STATUS_FAIL:-false}" == true ]]; then
@@ -480,7 +551,8 @@ elif [[ " $* " == *' campaign-status '* && " $* " == *' --format monitor '* ]]; 
     progress_value="${values[value_index]}"
   fi
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
-  printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
+  printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' \
+    "${reported_campaign_run_id}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
   printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
   printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
   printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
@@ -515,9 +587,9 @@ elif [[ ( " $* " == *' campaign-status '* || " $* " == *' resume-campaign '* ) \
   fi
   printf 'campaign-monitor\t%s\t%s\t%s\n' "${state}" "${state_signature}" "${progress_signature}"
   printf 'source-monitor\t%s\t%s\t%s\tunavailable\tineligible\tFalse\n' \
-    "${FAKE_RUN_ID}" "${state}" "${FAKE_SOURCE_STATE}"
+    "${reported_campaign_run_id}" "${state}" "${FAKE_SOURCE_STATE}"
   printf 'Campaign: %s\nState: %s\nExecution: commit=%s  config_digest=%s\n' \
-    "${FAKE_RUN_ID}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
+    "${reported_campaign_run_id}" "${state}" "${FAKE_GIT_COMMIT}" "${FAKE_INVENTORY_SHA}"
   printf 'Resources: cores_per_case=16  max_admission_cases=2  max_running_cases=null\n'
   printf 'Cases: 0/1 completed, 1 active, 0 pending, 0 failed\n\n'
   printf 'Active cases:\ncase_0001  job=591776  node=node-a  elapsed=00:01:00\n'
@@ -853,7 +925,7 @@ if [[ " $* " == *' list-background-sessions '* ]]; then
   printf '%s\n' '{"sessions":[]}'
   exit 0
 fi
-if [[ " $* " == *' -c '* && (   " $* " == *'completion parent result contains unsafe shell transport text'*   || " $* " == *'plan["replacement_completion"]'*   || " $* " == *'str(value["replacement_pool_size"])'*   || " $* " == *'str(value["status"]), str(value["completion_id"])'*   || " $* " == *'identifier = value.get("completion_id")'*   || " $* " == *'completion transfer plan contains unsafe shell transport text'*   || " $* " == *'completion cleanup plan differs from successful replacement transfer membership'* ) ]]; then
+if [[ " $* " == *' -c '* && (   " $* " == *'completion parent result contains unsafe shell transport text'*   || " $* " == *'plan["replacement_completion"]'*   || " $* " == *'str(value["replacement_pool_size"])'*   || " $* " == *'str(value["status"]), str(value["completion_id"])'*   || " $* " == *'value["target_batches"]'*   || " $* " == *'identifier = value.get("completion_id")'*   || " $* " == *'completion transfer plan contains unsafe shell transport text'*   || " $* " == *'completion cleanup plan differs from successful replacement transfer membership'* ) ]]; then
   exec "${FAKE_REAL_PYTHON}" "$@"
 fi
 if [[ " $* " == *' -c '* ]]; then
@@ -1117,6 +1189,8 @@ fi
             "FAKE_REMOTE_MIRROR": str(mirror),
             "FAKE_REMOTE_STORAGE_ROOT": "/remote/generation root/storage",
             "FAKE_RUN_ID": _RUN_ID,
+            "FAKE_REPLACEMENT_RUN_ID": _REPLACEMENT_RUN_ID,
+            "FAKE_BATCH_NAME": _BATCH_NAME,
             "FAKE_TRANSFER_RUN_ID": _RUN_ID,
             "FAKE_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
             "FAKE_BENCHMARK_STATE": "complete",
@@ -1130,6 +1204,8 @@ fi
             "FAKE_COMPLETION_POOL_SIZE": "4",
             "FAKE_COMPLETION_INITIALIZE_STATUS": "active",
             "FAKE_COMPLETION_ADVANCE_STATUS": "complete",
+            "FAKE_COMPLETION_ADVANCE_STATES": "",
+            "FAKE_COMPLETION_ADVANCE_STATE_INDEX_FILE": str(state_root / "completion-advance-state-index"),
             "FAKE_COMPLETION_STATUS_JSON": json.dumps(
                 {
                     "status": "active",
@@ -1404,6 +1480,8 @@ def _seed_completion_transfer(
     storage: Path,
     mirror: Path,
     environment: dict[str, str],
+    *,
+    replacement_partial: bool = False,
 ) -> tuple[tuple[str, ...], Path, str]:
     """Create a historical partial parent and one successful replacement source."""
     source_directories = _seed_transfer(
@@ -1461,6 +1539,13 @@ def _seed_completion_transfer(
             "parent_partial_sha256": partial_sha256,
             "completion_state_path": (f"/remote/generation root/storage/{completion_relative}"),
             "completion_state_sha256": completion_sha256,
+            "replacement_runs": [
+                {
+                    "campaign_run_id": _REPLACEMENT_RUN_ID,
+                    "partial": replacement_partial,
+                    "campaign_state": "completed_with_failures" if replacement_partial else "complete",
+                }
+            ],
             "replacement_campaigns": [
                 {
                     "candidate_id": _REPLACEMENT_CANDIDATE_ID,
@@ -3434,6 +3519,8 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
         environment,
     )
     original_partial = partial_path.read_bytes()
+    environment["FAKE_COMPLETION_ADVANCE_STATES"] = "active,complete"
+    environment["FAKE_CAMPAIGN_STATES"] = "successful"
     parent_cpu_directory = mirror / f"01_generation/meta/campaigns/{_RUN_ID}"
     assert not parent_cpu_directory.exists()
 
@@ -3455,6 +3542,11 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
     assert result.stdout.count("DONE:") == 1
     assert "state=complete_composite" in result.stdout
     assert f"COMPLETION READY: completion_id={_COMPLETION_ID}" in result.stdout
+    assert "Existing successful inventory:" in result.stdout
+    assert "Replacement plan:" in result.stdout
+    assert "max admission cases = 2" in result.stdout
+    assert "Cases: 0/1 completed, 1 active, 0 pending, 0 failed" in result.stdout
+    assert "COMPLETION ACTIVE" not in result.stdout
     assert partial_path.read_bytes() == original_partial
     assert not parent_cpu_directory.exists()
     assert (storage / completion_relative).read_bytes() == (mirror / completion_relative).read_bytes()
@@ -3465,7 +3557,10 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
     remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
     assert not any(" submit-campaign " in line for line in remote_commands)
     assert any(" initialize-campaign-completion " in line for line in remote_commands)
-    assert any(" advance-campaign-completion " in line for line in remote_commands)
+    assert sum(" advance-campaign-completion " in line for line in remote_commands) == 2
+    replacement_resume = [line for line in remote_commands if " resume-campaign " in line]
+    assert len(replacement_resume) == 1
+    assert _REPLACEMENT_RUN_ID in replacement_resume[0]
     cleanup_commands = [line for line in remote_commands if " cleanup-campaign-source " in line]
     assert len(cleanup_commands) == 1
     assert _REPLACEMENT_RUN_ID in cleanup_commands[0]
@@ -3481,6 +3576,40 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
         log_text.rindex("<validate-campaign-completion-lifecycle>"),
     ]
     assert positions == sorted(positions)
+
+
+def test_mixed_replacement_round_retains_failed_cpu_evidence(tmp_path: Path) -> None:
+    """Collect successful members but retain a shared run that also contains failures."""
+    workflow, log, environment, storage, mirror = _harness(tmp_path)
+    source_directories, _partial_path, _completion_relative = _seed_completion_transfer(
+        storage,
+        mirror,
+        environment,
+        replacement_partial=True,
+    )
+
+    result = _run(
+        workflow,
+        [
+            "run",
+            str(_campaign(workflow)),
+            "--replacement-pool-size",
+            "4",
+            "--parent-run-id",
+            _RUN_ID,
+            *_remote_options(),
+        ],
+        environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all((mirror / relative).exists() for relative in source_directories)
+    log_text = log.read_text(encoding="utf-8")
+    remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
+    assert not any(" cleanup-campaign-source " in line for line in remote_commands)
+    validation_arguments = f"<validate-all-workflow>\n<{_REPLACEMENT_RUN_ID}>\n<--partial>"
+    assert log_text.count(validation_arguments) >= 2
+    assert "contains failed evidence and remains on CPU storage" in result.stdout
 
 
 def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(tmp_path: Path) -> None:

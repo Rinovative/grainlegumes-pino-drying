@@ -6,8 +6,8 @@ Persist deterministic supplemental replacement planning for partial campaigns.
 
 Responsibilities:
   - Bind completion state to immutable parent evidence and a stable identity
-  - Allocate and materialize bounded prefix-stable supplemental candidates
-  - Advance one-case replacement campaigns through the normal campaign feeder
+  - Allocate exact per-batch rounds of prefix-stable supplemental candidates
+  - Advance replacement rounds through the normal multi-case campaign feeder
   - Construct exact composite membership from independently admitted successes
 
 Design principles:
@@ -39,6 +39,8 @@ from .contracts import generation_contracts_source as source_service
 
 _SCHEMA_VERSION = 1
 _OWNER = "generation_campaign_completion.v1"
+_LEGACY_SYNTHETIC_SOURCE_KIND = "generation_supplemental_campaign_source"
+_ROUND_SYNTHETIC_SOURCE_KIND = "generation_supplemental_round_source"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _RESERVING_STATES = frozenset({"planned", "active", "retry", "replay"})
 
@@ -66,7 +68,7 @@ class ReplacementCandidate:
 
 @dataclass(frozen=True, slots=True)
 class ReplacementWave:
-    """One ordinary one-case synthetic campaign allocation."""
+    """One exact replacement-round allocation in deterministic candidate order."""
 
     wave_ordinal: int
     candidate_ids: tuple[str, ...]
@@ -295,14 +297,15 @@ def _validate_completion_state(  # noqa: C901, PLR0912, PLR0915 -- centralized d
             _positive_int(materialization.get("case_index"), label="replacement case_index")
             source_service.validate_git_commit(materialization.get("git_commit"))
             extension = validate_synthetic_manifest_extension(materialization.get("extension"))
-            design = extension.get("design")
+            design, binding = _synthetic_candidate_binding(extension, candidate_id)
+            case_index = int(materialization["case_index"])
             if (
                 materialization.get("simulation_science_id") != science_id
-                or not isinstance(design, dict)
                 or design.get("completion_id") != identifier
                 or design.get("candidate_id") != candidate_id
-                or extension.get("synthetic_batch_id") != materialization.get("batch_id")
-                or extension.get("synthetic_case_index") != materialization.get("case_index")
+                or binding["batch_id"] != materialization.get("batch_id")
+                or binding["case_index"] != case_index
+                or materialization.get("case_id") != f"case_{case_index:04d}"
             ):
                 raise ValueError("Completion candidate materialization identity is invalid.")
         terminal_evidence = candidate.get("terminal_evidence")
@@ -636,8 +639,8 @@ def allocate_next_wave(
     unit_points: Mapping[tuple[str, int], Mapping[str, Sequence[float]]],
     storage_root: Path | str | None = None,
 ) -> ReplacementWave | None:
-    """Allocate at most current uncovered deficits when no prior wave remains active."""
-    if any(wave["state"] != "terminal" for wave in state["waves"]) or state["failure_circuit"]["open"]:
+    """Allocate exactly the currently schedulable deficits within remaining pool capacity."""
+    if state["failure_circuit"]["open"]:
         return None
     existing_ids = [str(item["candidate_id"]) for item in state["candidates"]]
     if len(existing_ids) != len(set(existing_ids)):
@@ -653,7 +656,7 @@ def allocate_next_wave(
         failures = tuple(failed_case_ids.get(batch_id, ()))
         if not failures:
             continue
-        for _local_index in range(min(deficits[batch_id], remaining_pool, 1)):
+        for _local_index in range(min(deficits[batch_id], remaining_pool)):
             ordinal += 1
             batch_ordinal = 1 + sum(item.get("batch_id") == batch_id for item in [*state["candidates"], *selected])
             candidate_seed = sampling_seed[batch_id] if isinstance(sampling_seed, Mapping) else sampling_seed
@@ -671,7 +674,7 @@ def allocate_next_wave(
             remaining_pool -= 1
             if remaining_pool == 0:
                 break
-        if selected:
+        if remaining_pool == 0:
             break
     if not selected:
         return None
@@ -771,20 +774,23 @@ def _supplemental_batch(
     case_index: int,
     assignment: Mapping[str, Any],
     scientific: Mapping[str, Any],
+    batch_name: str | None = None,
 ) -> config_service.GenerationConfig:
     """Build one immutable one-case batch from resolved supplemental science."""
     values = copy.deepcopy(dict(scientific))
     scientific_digest = config_service.compute_scientific_config_digest(values)
     case_input_digest = config_service.compute_case_input_config_digest(values)
+    resolved_batch_name = parent.batch_name if batch_name is None else common.paths.validate_logical_name(batch_name, label="batch_name")
     return replace(
         parent,
+        batch_name=resolved_batch_name,
         scientific_values=values,
         case_indices=(case_index,),
         assignments={case_index: copy.deepcopy(dict(assignment))},
         scientific_config_digest=scientific_digest,
         case_input_config_digest=case_input_digest,
         batch_identity=scientific_digest,
-        batch_id=config_service.build_batch_id(parent.batch_name, scientific_digest),
+        batch_id=config_service.build_batch_id(resolved_batch_name, scientific_digest),
         batch_storage_name=config_service.build_batch_storage_name(
             parent.profile.id,
             parent.material_family,
@@ -882,31 +888,144 @@ def materialize_candidate_campaign(
     )
 
 
+def materialize_replacement_round_campaign(
+    *,
+    state_identity: Mapping[str, Any],
+    parent_campaign: config_service.CampaignConfig,
+    candidates: Sequence[Mapping[str, Any]],
+) -> config_service.CampaignConfig:
+    """Materialize one exact candidate set as one ordinary multi-case campaign."""
+    ordered = tuple(candidates)
+    if not ordered:
+        raise ValueError("Replacement round requires at least one candidate.")
+    candidate_ids = [str(candidate.get("candidate_id", "")) for candidate in ordered]
+    if any(not candidate_id for candidate_id in candidate_ids) or len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("Replacement round candidate identities must be non-empty and unique.")
+    ordinals = [_positive_int(candidate.get("ordinal"), label="candidate ordinal") for candidate in ordered]
+    if ordinals != sorted(ordinals):
+        raise ValueError("Replacement round candidates must preserve deterministic ordinal order.")
+    round_digest = _canonical(
+        {
+            "schema_kind": "generation_supplemental_round",
+            "schema_version": 1,
+            "completion_id": state_identity["completion_id"],
+            "parent_run_id": state_identity["parent_run_id"],
+            "parent_partial_sha256": state_identity["parent_partial_sha256"],
+            "parent_campaign_digest": parent_campaign.campaign_digest,
+            "candidate_ids": candidate_ids,
+        }
+    )
+    campaign_name = f"replacement_round_{round_digest[:24]}"
+    campaign_id = f"{campaign_name}_v1"
+    batches: list[config_service.GenerationConfig] = []
+    for candidate in ordered:
+        legacy = materialize_candidate_campaign(
+            state_identity=state_identity,
+            parent_campaign=parent_campaign,
+            candidate=candidate,
+        )
+        legacy_batch = legacy.batches[0]
+        case_index = legacy_batch.case_indices[0]
+        scientific = copy.deepcopy(legacy_batch.scientific_values)
+        scientific["campaign_id"] = campaign_id
+        batch_name = f"{legacy_batch.batch_name}__replacement_{int(candidate['ordinal']):04d}"
+        batch = _supplemental_batch(
+            legacy_batch,
+            case_index=case_index,
+            assignment=legacy_batch.case_assignment(case_index),
+            scientific=scientific,
+            batch_name=batch_name,
+        )
+        verified = sampling_service.sample_case(batch, case_index)
+        design = batch.scientific_values.get("supplemental_design")
+        if not isinstance(design, dict) or verified.values != design.get("physical_values"):
+            raise RuntimeError("Supplemental physical values changed during replacement-round materialization.")
+        batches.append(batch)
+    campaign_digest = _canonical(
+        {
+            "schema_kind": "resolved_generation_supplemental_round_campaign",
+            "schema_version": 1,
+            "completion_id": state_identity["completion_id"],
+            "parent_run_id": state_identity["parent_run_id"],
+            "parent_partial_sha256": state_identity["parent_partial_sha256"],
+            "parent_campaign_digest": parent_campaign.campaign_digest,
+            "candidate_ids": candidate_ids,
+            "batches": [
+                {
+                    "batch_name": batch.batch_name,
+                    "batch_id": batch.batch_id,
+                    "case_index": batch.case_indices[0],
+                }
+                for batch in batches
+            ],
+        }
+    )
+    return replace(
+        parent_campaign,
+        campaign_name=campaign_name,
+        campaign_digest=campaign_digest,
+        package_request_digest=common.serialization.canonical_json_sha256([]),
+        campaign_id=campaign_id,
+        evaluation_regimes=tuple(dict.fromkeys(batch.evaluation_regime for batch in batches)),
+        total_case_count=len(batches),
+        batches=tuple(batches),
+        dataset_packages=(),
+    )
+
+
 def synthetic_manifest_extension(campaign: config_service.CampaignConfig) -> dict[str, Any] | None:
-    """Return the typed manifest extension for one supplemental campaign."""
-    if len(campaign.batches) != 1:
+    """Return portable reconstruction evidence for a legacy candidate or shared round."""
+    designs: list[dict[str, Any]] = []
+    for batch in campaign.batches:
+        design = batch.scientific_values.get("supplemental_design")
+        if design is None:
+            if designs:
+                raise ValueError("Supplemental campaign cannot mix replacement and ordinary batches.")
+            return None
+        if not isinstance(design, dict):
+            raise TypeError("Supplemental campaign design must be one mapping.")
+        designs.append(copy.deepcopy(design))
+    if not designs:
         return None
-    batch = campaign.batches[0]
-    design = batch.scientific_values.get("supplemental_design")
-    if design is None:
-        return None
-    if not isinstance(design, dict):
-        raise TypeError("Supplemental campaign design must be one mapping.")
-    payload = {
-        "schema_kind": "generation_supplemental_campaign_source",
-        "schema_version": 1,
-        "design": copy.deepcopy(design),
-        "synthetic_campaign_id": campaign.campaign_id,
-        "synthetic_campaign_digest": campaign.campaign_digest,
-        "synthetic_batch_id": batch.batch_id,
-        "synthetic_case_index": batch.case_indices[0],
-    }
+    candidate_id = str(designs[0].get("candidate_id", ""))
+    legacy_name = f"replacement_{candidate_id.removeprefix('replacement__')}"
+    if len(campaign.batches) == 1 and campaign.campaign_name == legacy_name:
+        batch = campaign.batches[0]
+        payload = {
+            "schema_kind": _LEGACY_SYNTHETIC_SOURCE_KIND,
+            "schema_version": 1,
+            "design": designs[0],
+            "synthetic_campaign_id": campaign.campaign_id,
+            "synthetic_campaign_digest": campaign.campaign_digest,
+            "synthetic_batch_id": batch.batch_id,
+            "synthetic_case_index": batch.case_indices[0],
+        }
+    else:
+        payload = {
+            "schema_kind": _ROUND_SYNTHETIC_SOURCE_KIND,
+            "schema_version": 1,
+            "designs": designs,
+            "synthetic_campaign_id": campaign.campaign_id,
+            "synthetic_campaign_digest": campaign.campaign_digest,
+            "synthetic_batches": [
+                {
+                    "candidate_id": design["candidate_id"],
+                    "batch_name": batch.batch_name,
+                    "batch_id": batch.batch_id,
+                    "case_index": batch.case_indices[0],
+                }
+                for batch, design in zip(campaign.batches, designs, strict=True)
+            ],
+        }
     return {**payload, "payload_sha256": _canonical(payload)}
 
 
 def validate_synthetic_manifest_extension(value: object) -> dict[str, Any]:
     """Validate one exact portable supplemental campaign reconstruction record."""
-    required = {
+    if not isinstance(value, dict):
+        raise TypeError("Supplemental campaign manifest extension must be one mapping.")
+    kind = value.get("schema_kind")
+    legacy_required = {
         "schema_kind",
         "schema_version",
         "design",
@@ -916,38 +1035,92 @@ def validate_synthetic_manifest_extension(value: object) -> dict[str, Any]:
         "synthetic_case_index",
         "payload_sha256",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    round_required = {
+        "schema_kind",
+        "schema_version",
+        "designs",
+        "synthetic_campaign_id",
+        "synthetic_campaign_digest",
+        "synthetic_batches",
+        "payload_sha256",
+    }
+    required = legacy_required if kind == _LEGACY_SYNTHETIC_SOURCE_KIND else round_required if kind == _ROUND_SYNTHETIC_SOURCE_KIND else set()
+    if not required or set(value) != required:
         raise ValueError("Supplemental campaign manifest extension has an unsupported shape.")
     payload = {key: copy.deepcopy(value[key]) for key in required - {"payload_sha256"}}
     if (
-        value.get("schema_kind") != "generation_supplemental_campaign_source"
-        or value.get("schema_version") != 1
+        value.get("schema_version") != 1
         or _SHA256.fullmatch(str(value.get("synthetic_campaign_digest", ""))) is None
         or _SHA256.fullmatch(str(value.get("payload_sha256", ""))) is None
         or _canonical(payload) != value["payload_sha256"]
     ):
         raise ValueError("Supplemental campaign manifest extension identity is invalid.")
+    common.paths.validate_logical_name(value.get("synthetic_campaign_id"), label="synthetic_campaign_id")
+    if kind == _LEGACY_SYNTHETIC_SOURCE_KIND:
+        if not isinstance(value.get("design"), dict):
+            raise TypeError("Supplemental campaign design must be one mapping.")
+        common.paths.validate_logical_name(value.get("synthetic_batch_id"), label="synthetic_batch_id")
+        _positive_int(value.get("synthetic_case_index"), label="synthetic_case_index")
+        return copy.deepcopy(value)
+    designs = value.get("designs")
+    batches = value.get("synthetic_batches")
+    if not isinstance(designs, list) or not designs or not all(isinstance(design, dict) for design in designs):
+        raise TypeError("Supplemental round designs must be one non-empty list of mappings.")
+    if not isinstance(batches, list) or len(batches) != len(designs):
+        raise ValueError("Supplemental round batch evidence must match candidate design membership.")
+    candidate_ids: list[str] = []
+    batch_names: list[str] = []
+    batch_ids: list[str] = []
+    for design, batch in zip(designs, batches, strict=True):
+        if not isinstance(batch, dict) or set(batch) != {"candidate_id", "batch_name", "batch_id", "case_index"}:
+            raise ValueError("Supplemental round batch evidence has an unsupported shape.")
+        candidate_id = common.paths.validate_logical_name(batch.get("candidate_id"), label="candidate_id")
+        batch_name = common.paths.validate_logical_name(batch.get("batch_name"), label="batch_name")
+        batch_id = common.paths.validate_logical_name(batch.get("batch_id"), label="batch_id")
+        _positive_int(batch.get("case_index"), label="synthetic_case_index")
+        if design.get("candidate_id") != candidate_id:
+            raise ValueError("Supplemental round design and batch candidate identities differ.")
+        candidate_ids.append(candidate_id)
+        batch_names.append(batch_name)
+        batch_ids.append(batch_id)
+    if len(candidate_ids) != len(set(candidate_ids)) or len(batch_names) != len(set(batch_names)) or len(batch_ids) != len(set(batch_ids)):
+        raise FileExistsError("Supplemental round contains duplicate candidate or batch identities.")
     return copy.deepcopy(value)
 
 
-def campaign_from_synthetic_manifest(
-    manifest: Mapping[str, Any],
-    *,
-    require_executable: bool = True,
-) -> config_service.CampaignConfig:
-    """Reconstruct and verify one supplemental campaign from portable evidence."""
-    extension = validate_synthetic_manifest_extension(manifest.get("synthetic_completion"))
-    design = extension["design"]
-    if not isinstance(design, dict):
-        raise TypeError("Supplemental campaign design is malformed.")
-    relative = Path(str(manifest.get("campaign_config", "")))
-    if relative.is_absolute() or ".." in relative.parts or relative.parts[:3] != ("configs", "generation", "campaigns"):
-        raise ValueError("Supplemental parent campaign path is unsafe.")
-    source = (common.paths.get_project_root().resolve() / relative).resolve()
-    parent = config_service.load_campaign_config(source, require_executable=require_executable)
-    if parent.campaign_digest != design.get("parent_campaign_digest"):
-        raise RuntimeError("Supplemental parent campaign identity changed after launch.")
-    candidate = {
+def _synthetic_candidate_binding(
+    extension: Mapping[str, Any],
+    candidate_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one candidate design and synthetic batch binding from portable evidence."""
+    admitted = validate_synthetic_manifest_extension(extension)
+    if admitted["schema_kind"] == _LEGACY_SYNTHETIC_SOURCE_KIND:
+        design = admitted["design"]
+        if design.get("candidate_id") != candidate_id:
+            raise ValueError("Legacy supplemental extension does not own the requested candidate.")
+        return design, {
+            "batch_name": None,
+            "batch_id": admitted["synthetic_batch_id"],
+            "case_index": admitted["synthetic_case_index"],
+        }
+    matches = [
+        (design, batch)
+        for design, batch in zip(admitted["designs"], admitted["synthetic_batches"], strict=True)
+        if design.get("candidate_id") == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("Supplemental round candidate binding is missing or ambiguous.")
+    design, batch = matches[0]
+    return design, {
+        "batch_name": batch["batch_name"],
+        "batch_id": batch["batch_id"],
+        "case_index": batch["case_index"],
+    }
+
+
+def _candidate_from_supplemental_design(design: Mapping[str, Any]) -> dict[str, Any]:
+    """Reconstruct one immutable candidate input from a persisted supplemental design."""
+    return {
         "batch_id": design["parent_batch_id"],
         "candidate_id": design["candidate_id"],
         "parent_failed_case_id": design["parent_failed_case_id"],
@@ -962,36 +1135,48 @@ def campaign_from_synthetic_manifest(
         },
         "science_id": design["science_id"],
     }
-    state_identity = {
-        "completion_id": design["completion_id"],
-        "parent_run_id": design["parent_run_id"],
-        "parent_partial_sha256": design["parent_partial_sha256"],
-    }
-    campaign = materialize_candidate_campaign(
-        state_identity=state_identity,
-        parent_campaign=parent,
-        candidate=candidate,
+
+
+def campaign_from_synthetic_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    require_executable: bool = True,
+) -> config_service.CampaignConfig:
+    """Reconstruct and verify one supplemental campaign from portable evidence."""
+    extension = validate_synthetic_manifest_extension(manifest.get("synthetic_completion"))
+    designs = [extension["design"]] if extension["schema_kind"] == _LEGACY_SYNTHETIC_SOURCE_KIND else extension["designs"]
+    relative = Path(str(manifest.get("campaign_config", "")))
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:3] != ("configs", "generation", "campaigns"):
+        raise ValueError("Supplemental parent campaign path is unsafe.")
+    source = (common.paths.get_project_root().resolve() / relative).resolve()
+    parent = config_service.load_campaign_config(source, require_executable=require_executable)
+    if any(parent.campaign_digest != design.get("parent_campaign_digest") for design in designs):
+        raise RuntimeError("Supplemental parent campaign identity changed after launch.")
+    identity_fields = ("completion_id", "parent_run_id", "parent_partial_sha256")
+    state_identity = {field: designs[0][field] for field in identity_fields}
+    if any(any(design.get(field) != state_identity[field] for field in identity_fields) for design in designs):
+        raise RuntimeError("Supplemental round designs disagree on completion identity.")
+    candidates = tuple(_candidate_from_supplemental_design(design) for design in designs)
+    campaign = (
+        materialize_candidate_campaign(
+            state_identity=state_identity,
+            parent_campaign=parent,
+            candidate=candidates[0],
+        )
+        if extension["schema_kind"] == _LEGACY_SYNTHETIC_SOURCE_KIND
+        else materialize_replacement_round_campaign(
+            state_identity=state_identity,
+            parent_campaign=parent,
+            candidates=candidates,
+        )
     )
-    batch = campaign.batches[0]
-    expected = {
-        "campaign_id": extension["synthetic_campaign_id"],
-        "campaign_digest": extension["synthetic_campaign_digest"],
-        "batch_id": extension["synthetic_batch_id"],
-        "case_index": extension["synthetic_case_index"],
-    }
-    observed = {
-        "campaign_id": campaign.campaign_id,
-        "campaign_digest": campaign.campaign_digest,
-        "batch_id": batch.batch_id,
-        "case_index": batch.case_indices[0],
-    }
-    if observed != expected:
+    if synthetic_manifest_extension(campaign) != extension:
         raise RuntimeError("Supplemental campaign reconstruction changed its persisted identity.")
     if (
         campaign.campaign_id != manifest.get("campaign_id")
         or campaign.campaign_digest != manifest.get("campaign_digest")
         or common.serialization.canonical_json_sha256(campaign.execution_values) != manifest.get("execution_config_digest")
-        or [batch.batch_name] != manifest.get("selected_batch_names")
+        or [batch.batch_name for batch in campaign.batches] != manifest.get("selected_batch_names")
         or manifest.get("dataset_packages") != []
     ):
         raise RuntimeError("Supplemental campaign conflicts with its campaign-run manifest.")
@@ -1036,6 +1221,68 @@ def record_candidate_materialization(
     if previous is None:
         candidate["materialization"] = materialization
         save_completion(state, storage_root=storage_root)
+    return campaign
+
+
+def record_replacement_round_materialization(
+    state: dict[str, Any],
+    *,
+    candidate_ids: Sequence[str],
+    parent_campaign: config_service.CampaignConfig,
+    git_commit: str,
+    storage_root: Path | str | None = None,
+) -> config_service.CampaignConfig:
+    """Persist every candidate-to-case binding for one shared campaign atomically."""
+    from . import generation_campaign as campaign_service
+
+    selected_ids = tuple(candidate_ids)
+    if not selected_ids or len(selected_ids) != len(set(selected_ids)):
+        raise ValueError("Replacement round materialization requires unique candidate identities.")
+    matching_waves = [wave for wave in state["waves"] if tuple(wave["candidate_ids"]) == selected_ids]
+    if len(matching_waves) != 1:
+        raise ValueError("Replacement round materialization must match one exact persisted wave.")
+    candidates = tuple(_candidate_record(state, candidate_id) for candidate_id in selected_ids)
+    campaign = materialize_replacement_round_campaign(
+        state_identity=state,
+        parent_campaign=parent_campaign,
+        candidates=candidates,
+    )
+    extension = synthetic_manifest_extension(campaign)
+    if not isinstance(extension, dict) or extension.get("schema_kind") != _ROUND_SYNTHETIC_SOURCE_KIND:
+        raise RuntimeError("Replacement round did not produce shared portable reconstruction evidence.")
+    commit = source_service.validate_git_commit(git_commit)
+    run_id = campaign_service.campaign_run_id(campaign, git_commit=commit)
+    materializations: list[dict[str, Any]] = []
+    for candidate, batch in zip(candidates, campaign.batches, strict=True):
+        case_index = batch.case_indices[0]
+        materializations.append(
+            {
+                "campaign_run_id": run_id,
+                "extension": copy.deepcopy(extension),
+                "batch_id": batch.batch_id,
+                "case_id": batch.case_id(case_index),
+                "case_index": case_index,
+                "simulation_science_id": candidate["science_id"],
+                "git_commit": commit,
+            }
+        )
+    previous = [candidate.get("materialization") for candidate in candidates]
+    if any(item is not None for item in previous):
+        if previous != materializations:
+            raise FileExistsError("Persisted replacement round conflicts with deterministic reconstruction.")
+        return campaign
+    selected_identity = {id(candidate) for candidate in candidates}
+    other = [
+        item["materialization"] for item in state["candidates"] if id(item) not in selected_identity and isinstance(item.get("materialization"), dict)
+    ]
+    new_batch_ids = {str(item["batch_id"]) for item in materializations}
+    if any(str(item.get("batch_id")) in new_batch_ids for item in other):
+        raise FileExistsError("Replacement round materialization collided on batch_id.")
+    if any(item.get("campaign_run_id") == run_id for item in other):
+        raise FileExistsError("Replacement round materialization collided on campaign_run_id.")
+    for candidate, materialization in zip(candidates, materializations, strict=True):
+        candidate["materialization"] = materialization
+    save_completion(state, storage_root=storage_root)
     return campaign
 
 
@@ -1476,6 +1723,7 @@ def completion_transfer_plan(
     if status["status"] != "complete":
         raise RuntimeError("Replacement transfer is forbidden until completion reaches exact successful targets.")
     replacements: list[dict[str, Any]] = []
+    runs: dict[str, dict[str, Any]] = {}
     for candidate in state["candidates"]:
         if candidate["state"] != "successful":
             continue
@@ -1485,14 +1733,47 @@ def completion_transfer_plan(
         terminal_evidence = candidate.get("terminal_evidence")
         if not isinstance(terminal_evidence, dict):
             raise TypeError("Successful replacement lacks terminal execution evidence.")
+        run_id = str(materialization["campaign_run_id"])
         replacements.append(
             {
                 "candidate_id": candidate["candidate_id"],
                 "target_batch_id": candidate["batch_id"],
-                "campaign_run_id": materialization["campaign_run_id"],
+                "campaign_run_id": run_id,
                 "git_commit": materialization["git_commit"],
                 "campaign_run_manifest_sha256": terminal_evidence["campaign_run_manifest_sha256"],
                 "terminal_batch_id": materialization["batch_id"],
+            }
+        )
+        record = runs.setdefault(
+            run_id,
+            {
+                "campaign_run_id": run_id,
+                "git_commit": materialization["git_commit"],
+                "campaign_run_manifest_sha256": terminal_evidence["campaign_run_manifest_sha256"],
+                "terminal_batch_ids": [],
+            },
+        )
+        if (
+            record["git_commit"] != materialization["git_commit"]
+            or record["campaign_run_manifest_sha256"] != terminal_evidence["campaign_run_manifest_sha256"]
+        ):
+            raise RuntimeError("Candidates sharing one replacement run disagree on terminal provenance.")
+        record["terminal_batch_ids"].append(materialization["batch_id"])
+    replacement_runs: list[dict[str, Any]] = []
+    for run_id, record in runs.items():
+        run_candidates = [
+            candidate
+            for candidate in state["candidates"]
+            if isinstance(candidate.get("materialization"), dict) and candidate["materialization"].get("campaign_run_id") == run_id
+        ]
+        if not run_candidates or any(candidate.get("state") not in {"successful", "failed"} for candidate in run_candidates):
+            raise RuntimeError("Successful replacement belongs to a nonterminal campaign run.")
+        campaign_state = "completed_with_failures" if any(candidate["state"] == "failed" for candidate in run_candidates) else "complete"
+        replacement_runs.append(
+            {
+                **record,
+                "campaign_state": campaign_state,
+                "partial": campaign_state != "complete",
             }
         )
     path = _state_path(completion_id_value, storage_root=storage)
@@ -1505,6 +1786,7 @@ def completion_transfer_plan(
         "completion_state_path": str(path),
         "completion_state_sha256": common.serialization.file_sha256(path),
         "replacement_campaigns": replacements,
+        "replacement_runs": replacement_runs,
     }
 
 
@@ -1583,9 +1865,14 @@ def build_completion_composite(
         if not isinstance(terminal_evidence, dict):
             raise TypeError("Successful replacement lacks terminal execution evidence.")
         run_id = str(materialization["campaign_run_id"])
-        campaign_service.validate_transferred_campaign(run_id, storage_root=storage)
         manifest_path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage)
         manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
+        if manifest.get("state") == "complete":
+            campaign_service.validate_transferred_campaign(run_id, storage_root=storage)
+        elif manifest.get("state") == "completed_with_failures":
+            campaign_service.validate_partially_transferred_campaign(run_id, storage_root=storage)
+        else:
+            raise RuntimeError("Transferred replacement campaign is not terminal.")
         if (
             manifest.get("git_commit") != materialization["git_commit"]
             or terminal_evidence["git_commit"] != materialization["git_commit"]
@@ -1594,20 +1881,23 @@ def build_completion_composite(
             raise RuntimeError("Transferred replacement campaign manifest differs from persisted execution provenance.")
         campaign = campaign_evidence.campaign_from_manifest(manifest)
         extension = validate_synthetic_manifest_extension(manifest.get("synthetic_completion"))
-        design = extension["design"]
+        if extension != materialization["extension"]:
+            raise RuntimeError("Transferred replacement campaign changed its portable completion evidence.")
+        design, binding = _synthetic_candidate_binding(extension, str(candidate["candidate_id"]))
         if (
-            not isinstance(design, dict)
-            or design.get("completion_id") != completion_id_value
+            design.get("completion_id") != completion_id_value
             or design.get("parent_run_id") != parent_run_id
             or design.get("parent_partial_sha256") != state["parent_partial_sha256"]
             or design.get("candidate_id") != candidate["candidate_id"]
             or design.get("parent_batch_id") != candidate["batch_id"]
-            or len(campaign.batches) != 1
+            or binding["batch_id"] != materialization["batch_id"]
+            or binding["case_index"] != materialization["case_index"]
         ):
             raise RuntimeError("Transferred replacement campaign conflicts with completion identity.")
-        synthetic_batch = campaign.batches[0]
-        if synthetic_batch.batch_id != materialization["batch_id"]:
+        matching_batches = [batch for batch in campaign.batches if batch.batch_id == materialization["batch_id"]]
+        if len(matching_batches) != 1:
             raise RuntimeError("Transferred replacement batch differs from persisted materialization.")
+        synthetic_batch = matching_batches[0]
         terminal = batch_runtime.admit_terminal_batch(
             synthetic_batch.batch_storage_name,
             storage_root=storage,
@@ -1681,13 +1971,72 @@ def create_completion_from_partial_path(
     )
 
 
+def completion_execution_projection(campaign: config_service.CampaignConfig) -> dict[str, Any]:
+    """Return the normal configured admission, resource, retry, and polling contract."""
+    submission = campaign.execution_values["submission"]
+    cluster = campaign.execution_values["cluster"]
+    runtime = campaign.execution_values["runtime"]
+    return {
+        "max_admission_cases": int(submission["max_admission_cases"]),
+        "max_running_cases": submission["max_running_cases"],
+        "poll_interval_seconds": int(submission["poll_interval_seconds"]),
+        "cores_per_case": int(cluster["cores_per_case"]),
+        "cores_per_node": int(cluster["cores_per_node"]),
+        "partition": cluster["partition"],
+        "wall_time": cluster["wall_time"],
+        "maximum_failed_cases": int(runtime["maximum_failed_cases"]),
+        "temporary_license_retry": copy.deepcopy(runtime["temporary_license_retry"]),
+    }
+
+
+def _bounded_active_campaign_status(
+    run_id: str,
+    *,
+    storage_root: Path,
+) -> dict[str, Any]:
+    """Return normal campaign status without raw scheduler command output."""
+    from . import generation_campaign as campaign_service
+
+    status = campaign_service.campaign_status(run_id, storage_root=storage_root)
+    cases = status.get("cases")
+    if not isinstance(cases, list):
+        raise TypeError("Active replacement campaign status lacks normal case views.")
+    case_fields = (
+        "batch_name",
+        "batch_id",
+        "case_index",
+        "case_id",
+        "state",
+        "classified_state",
+        "reason",
+        "latest_job_id",
+        "latest_job_state",
+        "latest_node",
+        "elapsed_seconds",
+        "runtime_progress",
+        "license_retry_eligible",
+        "next_license_retry_at",
+    )
+    return {
+        "campaign_run_id": run_id,
+        "campaign_state": status["campaign_state"],
+        "submission_config": copy.deepcopy(status["submission_config"]),
+        "work_unit_counts": copy.deepcopy(status["work_unit_counts"]),
+        "admission": copy.deepcopy(status["admission"]),
+        "slurm_job_ids": list(status["slurm_job_ids"]),
+        "cases": [{field: copy.deepcopy(case[field]) for field in case_fields if field in case} for case in cases if isinstance(case, dict)],
+    }
+
+
 def completion_status_for_id(
     completion_id_value: str,
     *,
     storage_root: Path | str | None = None,
     if_present: bool = False,
+    parent_campaign: config_service.CampaignConfig | None = None,
 ) -> dict[str, Any]:
     """Report completion execution, publication, packages, shards, and readiness."""
+    from .publication import generation_publication_campaign_evidence as campaign_evidence
     from .publication import generation_publication_completion_composite as composite_service
 
     if not isinstance(if_present, bool):
@@ -1709,6 +2058,34 @@ def completion_status_for_id(
         state,
         original_successes=_embedded_original_successes(state),
     )
+    target_accounting = {str(item["batch_id"]): item for item in report["batch_accounting"]}
+    if parent_campaign is not None:
+        campaign_batches = {batch.batch_id: batch for batch in parent_campaign.batches}
+        if set(campaign_batches) != set(target_accounting):
+            raise RuntimeError("Completion status campaign targets differ from persisted completion ownership.")
+        target_batches = [
+            {
+                **copy.deepcopy(target_accounting[str(target["batch_id"])]),
+                "batch_name": campaign_batches[str(target["batch_id"])].batch_name,
+                "material_family": campaign_batches[str(target["batch_id"])].material_family,
+                "material_role": campaign_batches[str(target["batch_id"])].material_role,
+                "evaluation_regime": campaign_batches[str(target["batch_id"])].evaluation_regime,
+                "sampling_regime": campaign_batches[str(target["batch_id"])].sampling_regime,
+            }
+            for target in state["targets"]
+        ]
+        execution = completion_execution_projection(parent_campaign)
+    else:
+        target_batches = [copy.deepcopy(target_accounting[str(target["batch_id"])]) for target in state["targets"]]
+        execution = None
+    active_campaigns: list[dict[str, Any]] = []
+    for run_id in report["active_run_ids"]:
+        manifest_path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage)
+        active_campaigns.append(
+            _bounded_active_campaign_status(run_id, storage_root=storage)
+            if manifest_path.is_file() and not manifest_path.is_symlink()
+            else {"campaign_run_id": run_id, "campaign_state": "materialized", "cases": []}
+        )
     evidence = state["parent_partial_evidence"]
     failed = evidence.get("failed_cases") if isinstance(evidence, dict) else None
     if not isinstance(failed, list):
@@ -1755,6 +2132,10 @@ def completion_status_for_id(
             "parent_campaign": state["parent_run_id"],
             "parent_state": evidence.get("campaign_state") if isinstance(evidence, dict) else None,
             "original_failures": original_failures,
+            "target_batches": target_batches,
+            "execution": execution,
+            "active_campaigns": active_campaigns,
+            "normal_case_status": active_campaigns,
             "composite_source_state": composite_state,
             "package_state": package_state,
             "shard_state": shard_state,
@@ -1797,37 +2178,57 @@ def _candidate_points(
     return seeds, points
 
 
-def _candidate_state_from_campaign(manifest: Mapping[str, Any]) -> str:
-    """Project one ordinary synthetic campaign state into completion accounting."""
-    state = manifest.get("state")
-    if state == "complete":
+def _candidate_state_from_case_status(case: Mapping[str, Any]) -> str:
+    """Project one normal campaign case view into reserving or terminal completion state."""
+    state = str(case.get("state", ""))
+    classified = str(case.get("classified_state", state))
+    if state == "successful":
         return "successful"
-    if state in {"completed_with_failures", "failure_threshold_reached"}:
-        return "failed"
-    if state == "license_blocked":
+    if state == "license_blocked" or case.get("temporary_license_retry") is not None:
         return "retry"
-    if state in {
-        "ready",
-        "submitting",
-        "active",
-        "submission_failed",
-        "submission_unknown",
-        "scheduler_unknown",
-        "cancel_requested",
-        "force_cancel_requested",
-    }:
+    if case.get("replay_eligible", case.get("postprocessing_replay_available")) is True:
+        return "replay"
+    if classified in {"cancelled", "interrupted"}:
         return "active"
-    raise ValueError(f"Synthetic replacement campaign has an unsupported state: {state!r}.")
+    if state in {"running", "scheduler_pending"}:
+        return "active"
+    if state in {"admission_waiting", "never_started"}:
+        return "planned"
+    if state == "failed":
+        return "failed"
+    raise ValueError(f"Synthetic replacement case has an unsupported state: {state!r} ({classified!r}).")
+
+
+def _candidate_case_status(
+    status: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact normal campaign case view bound to one candidate."""
+    materialization = candidate.get("materialization")
+    cases = status.get("cases")
+    if not isinstance(materialization, dict) or not isinstance(cases, list):
+        raise TypeError("Replacement campaign status lacks candidate materialization or case views.")
+    matches = [
+        case
+        for case in cases
+        if isinstance(case, dict)
+        and case.get("batch_id") == materialization["batch_id"]
+        and case.get("case_index") == materialization["case_index"]
+        and case.get("case_id") == materialization["case_id"]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("Replacement campaign status does not contain one exact candidate case.")
+    return copy.deepcopy(matches[0])
 
 
 def _candidate_terminal_evidence(
     run_id: str,
     *,
     candidate_state: str,
+    case_status: Mapping[str, Any],
     storage_root: Path | str | None,
 ) -> dict[str, Any]:
-    """Bind one terminal synthetic result to its exact manifest and local failure class."""
-    from . import generation_campaign as campaign_service
+    """Bind one terminal synthetic case result to its exact shared campaign manifest."""
     from .publication import generation_publication_campaign_evidence as campaign_evidence
 
     if candidate_state not in {"successful", "failed"}:
@@ -1837,22 +2238,18 @@ def _candidate_terminal_evidence(
     path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage_root)
     if not path.is_file() or path.is_symlink():
         raise FileNotFoundError(f"Replacement campaign-run manifest is missing or unsafe: {path}.")
-    failure_counts = {"solver_failed": 0, "technical_runtime_timed_out": 0}
-    if candidate_state == "failed":
-        status = campaign_service.campaign_status(run_id, storage_root=storage_root, query_scheduler=True)
-        observed = status.get("failure_counts")
-        if status.get("campaign_run_id") != run_id or not isinstance(observed, Mapping):
-            raise RuntimeError("Failed replacement lacks authoritative campaign failure accounting.")
-        failure_counts = {
-            "solver_failed": _nonnegative_int(observed.get("solver_failed"), label="replacement solver_failed"),
-            "technical_runtime_timed_out": _nonnegative_int(
-                observed.get("technical_runtime_timed_out"),
-                label="replacement technical_runtime_timed_out",
-            ),
-        }
+    classified = str(case_status.get("classified_state", case_status.get("state", "")))
+    temporary_license_retry = case_status.get("temporary_license_retry")
+    failure_counts = {
+        "solver_failed": int(
+            candidate_state == "failed"
+            and classified == "failed"
+            and case_status.get("failure_stage") == "solver"
+            and temporary_license_retry is None
+        ),
+        "technical_runtime_timed_out": int(candidate_state == "failed" and classified == "timed_out" and temporary_license_retry is None),
+    }
     contribution = sum(failure_counts.values())
-    if contribution > 1:
-        raise RuntimeError("One-case replacement produced impossible failure-circuit accounting.")
     return {
         "campaign_run_manifest_sha256": common.serialization.file_sha256(path),
         "git_commit": commit,
@@ -1861,61 +2258,269 @@ def _candidate_terminal_evidence(
     }
 
 
+def _materialized_campaign_groups(state: Mapping[str, Any]) -> tuple[tuple[str, tuple[dict[str, Any], ...]], ...]:
+    """Group materialized candidates by shared normal campaign in prefix order."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for candidate in state["candidates"]:
+        materialization = candidate.get("materialization")
+        if isinstance(materialization, dict):
+            groups.setdefault(str(materialization["campaign_run_id"]), []).append(candidate)
+    return tuple((run_id, tuple(candidates)) for run_id, candidates in groups.items())
+
+
+def _reconstruct_materialized_campaign(
+    state: Mapping[str, Any],
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    parent_campaign: config_service.CampaignConfig,
+) -> config_service.CampaignConfig:
+    """Rebuild one legacy or shared-round campaign from completion-owned bindings."""
+    from . import generation_campaign as campaign_service
+
+    selected = tuple(candidates)
+    if not selected:
+        raise ValueError("Materialized replacement campaign has no candidate membership.")
+    materializations = [candidate.get("materialization") for candidate in selected]
+    if not all(isinstance(item, dict) for item in materializations):
+        raise TypeError("Materialized replacement campaign has incomplete candidate bindings.")
+    admitted = [item for item in materializations if isinstance(item, dict)]
+    extension = validate_synthetic_manifest_extension(admitted[0]["extension"])
+    if any(item["extension"] != extension for item in admitted):
+        raise RuntimeError("Candidates sharing one replacement campaign disagree on portable evidence.")
+    if extension["schema_kind"] == _LEGACY_SYNTHETIC_SOURCE_KIND:
+        if len(selected) != 1:
+            raise RuntimeError("Legacy supplemental campaign cannot own multiple candidates.")
+        campaign = materialize_candidate_campaign(
+            state_identity=state,
+            parent_campaign=parent_campaign,
+            candidate=selected[0],
+        )
+    else:
+        extension_ids = [str(design["candidate_id"]) for design in extension["designs"]]
+        by_id = {str(candidate["candidate_id"]): candidate for candidate in selected}
+        if set(extension_ids) != set(by_id):
+            raise RuntimeError("Replacement round extension and completion membership differ.")
+        campaign = materialize_replacement_round_campaign(
+            state_identity=state,
+            parent_campaign=parent_campaign,
+            candidates=tuple(by_id[candidate_id] for candidate_id in extension_ids),
+        )
+    commits = {str(item["git_commit"]) for item in admitted}
+    run_ids = {str(item["campaign_run_id"]) for item in admitted}
+    if len(commits) != 1 or len(run_ids) != 1:
+        raise RuntimeError("Replacement campaign candidates disagree on execution identity.")
+    expected_run_id = campaign_service.campaign_run_id(campaign, git_commit=next(iter(commits)))
+    if run_ids != {expected_run_id} or synthetic_manifest_extension(campaign) != extension:
+        raise RuntimeError("Replacement campaign reconstruction changed persisted execution identity.")
+    return campaign
+
+
+def _campaign_candidate_transitions(
+    run_id: str,
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    manifest: Mapping[str, Any],
+    status: Mapping[str, Any],
+    storage_root: Path | str | None,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Derive candidate transitions from one normal campaign monitor snapshot."""
+    if status.get("campaign_run_id") != run_id:
+        raise RuntimeError("Normal campaign status changed replacement run identity.")
+    projected: dict[str, tuple[str, dict[str, Any]]] = {}
+    for candidate in candidates:
+        case = _candidate_case_status(status, candidate)
+        projected[str(candidate["candidate_id"])] = (_candidate_state_from_case_status(case), case)
+    campaign_state = str(manifest.get("state", ""))
+    all_terminal = all(state in {"successful", "failed"} for state, _case in projected.values())
+    stable_terminal = campaign_state == "complete" or (campaign_state == "completed_with_failures" and all_terminal)
+    if campaign_state == "complete" and any(state != "successful" for state, _case in projected.values()):
+        raise RuntimeError("Complete replacement campaign contains a non-successful case.")
+    threshold_terminal = campaign_state == "failure_threshold_reached"
+    transitions: dict[str, str] = {}
+    evidence: dict[str, dict[str, Any]] = {}
+    for candidate_id, (candidate_state, case) in projected.items():
+        if candidate_state in {"successful", "failed"} and (stable_terminal or threshold_terminal):
+            transitions[candidate_id] = candidate_state
+            evidence[candidate_id] = _candidate_terminal_evidence(
+                run_id,
+                candidate_state=candidate_state,
+                case_status=case,
+                storage_root=storage_root,
+            )
+        elif candidate_state in {"successful", "failed"}:
+            transitions[candidate_id] = "active"
+        else:
+            transitions[candidate_id] = candidate_state
+    return transitions, evidence
+
+
 def completion_status(
     state: Mapping[str, Any],
     *,
     original_successes: Mapping[str, int],
 ) -> dict[str, Any]:
-    """Return one bounded completion status without treating reservations as success."""
+    """Return exact per-batch deficits, reservations, pool use, and active runs."""
     deficits = uncovered_deficits(state, original_successes=original_successes)
-    reserving = sum(item.get("state") in _RESERVING_STATES for item in state["candidates"])
-    successes = sum(item.get("state") == "successful" for item in state["candidates"])
-    failures = sum(item.get("state") == "failed" for item in state["candidates"])
-    attempted = sum(item.get("state") != "planned" for item in state["candidates"])
-    materialized = sum(isinstance(item.get("materialization"), dict) for item in state["candidates"])
+    schedulable = schedulable_deficits(state, original_successes=original_successes)
+    current_successes = _success_counts(state, original_successes=original_successes)
+    target_ids = [str(target["batch_id"]) for target in state["targets"]]
+    reserving_by_batch = dict.fromkeys(target_ids, 0)
+    replacement_successes_by_batch = dict.fromkeys(target_ids, 0)
+    state_counts: dict[str, int] = dict.fromkeys(("planned", "active", "retry", "replay", "successful", "failed"), 0)
+    active_run_ids: list[str] = []
+    active_round_run_ids: list[str] = []
+    for candidate in state["candidates"]:
+        candidate_state = str(candidate["state"])
+        state_counts[candidate_state] += 1
+        batch_id = str(candidate["batch_id"])
+        if candidate_state in _RESERVING_STATES:
+            reserving_by_batch[batch_id] += 1
+        if candidate_state == "successful":
+            replacement_successes_by_batch[batch_id] += 1
+        materialization = candidate.get("materialization")
+        if candidate_state in _RESERVING_STATES and isinstance(materialization, dict):
+            run_id = str(materialization["campaign_run_id"])
+            if run_id not in active_run_ids:
+                active_run_ids.append(run_id)
+            extension = materialization.get("extension")
+            if isinstance(extension, dict) and extension.get("schema_kind") == _ROUND_SYNTHETIC_SOURCE_KIND and run_id not in active_round_run_ids:
+                active_round_run_ids.append(run_id)
+    reserving = sum(reserving_by_batch.values())
+    successes = int(state_counts["successful"])
+    failures = int(state_counts["failed"])
+    attempted = sum(candidate.get("state") != "planned" for candidate in state["candidates"])
+    materialized = sum(isinstance(candidate.get("materialization"), dict) for candidate in state["candidates"])
     pool = int(state["pool_high_water"])
+    pool_consumed = len(state["candidates"])
+    pool_remaining = pool - pool_consumed
+    required_pool_extension = max(0, sum(schedulable.values()) - pool_remaining)
     circuit_open = bool(state["failure_circuit"]["open"])
     if circuit_open:
         status = "failure_circuit_open"
     elif not any(deficits.values()):
         status = "complete"
-    elif len(state["candidates"]) >= pool and reserving == 0:
+    elif pool_remaining == 0 and reserving == 0:
         status = "pool_exhausted"
     else:
         status = "active"
+    batch_accounting = [
+        {
+            "batch_id": batch_id,
+            "target_successes": int(target["target_successes"]),
+            "original_successes": int(original_successes.get(batch_id, 0)),
+            "successful_replacements": int(replacement_successes_by_batch[batch_id]),
+            "current_successes": int(current_successes.get(batch_id, 0)),
+            "uncovered_deficit": int(deficits[batch_id]),
+            "reserved_active": int(reserving_by_batch[batch_id]),
+            "new_replacements_required": int(schedulable[batch_id]),
+        }
+        for target in state["targets"]
+        for batch_id in (str(target["batch_id"]),)
+    ]
+    if status == "complete":
+        next_operation = "build and validate the immutable completion composite"
+    elif status == "failure_circuit_open":
+        next_operation = "inspect retained replacement failure evidence before any new admission"
+    elif status == "pool_exhausted":
+        next_operation = "increase the cumulative replacement pool high-water"
+    elif active_run_ids:
+        next_operation = "resume and monitor the active normal replacement campaign"
+    elif any(schedulable.values()):
+        next_operation = "materialize the exact newly uncovered per-batch replacement slots"
+    else:
+        next_operation = "reconcile reserving replacement evidence"
     return {
+        "schema_kind": "generation_campaign_completion_status",
+        "schema_version": _SCHEMA_VERSION,
         "completion_id": state["completion_id"],
         "parent_run_id": state["parent_run_id"],
         "status": status,
         "replacement_pool_size": pool,
         "pool_high_water": pool,
-        "allocated_candidates": len(state["candidates"]),
+        "pool_consumed": pool_consumed,
+        "pool_remaining": pool_remaining,
+        "pool_insufficient": required_pool_extension > 0,
+        "allocated_candidates": pool_consumed,
         "materialized_candidates": materialized,
         "attempted_candidates": attempted,
         "attempts": attempted,
-        "running_candidates": sum(item.get("state") == "active" for item in state["candidates"]),
-        "pending_candidates": sum(item.get("state") in {"planned", "retry", "replay"} for item in state["candidates"]),
+        "running_candidates": int(state_counts["active"]),
+        "pending_candidates": int(state_counts["planned"] + state_counts["retry"] + state_counts["replay"]),
         "unattempted_candidates": pool - attempted,
         "remaining_attempt_capacity": pool - attempted,
         "successful_replacements": successes,
         "failed_replacements": failures,
         "reserved_candidates": reserving,
+        "candidate_state_counts": state_counts,
+        "active_run_ids": active_run_ids,
+        "active_round_run_ids": active_round_run_ids,
         "failure_policy": copy.deepcopy(state["failure_policy"]),
         "failure_circuit": copy.deepcopy(state["failure_circuit"]),
-        "original_successes": dict(original_successes),
-        "current_successes": {
-            batch_id: int(target["target_successes"]) - int(deficits[batch_id])
-            for batch_id, target in ((item["batch_id"], item) for item in state["targets"])
-        },
+        "original_successes": {batch_id: int(original_successes.get(batch_id, 0)) for batch_id in target_ids},
+        "current_successes": {batch_id: int(current_successes.get(batch_id, 0)) for batch_id in target_ids},
         "success_deficits": deficits,
+        "reserved_active_by_batch": reserving_by_batch,
+        "new_replacements_required": schedulable,
+        "batch_accounting": batch_accounting,
+        "next_operation": next_operation,
         "next_command": (
             None
             if status in {"complete", "failure_circuit_open"}
             else (
-                f"run <CONFIG> --replacement-pool-size {pool + 1}" if status == "pool_exhausted" else f"run <CONFIG> --replacement-pool-size {pool}"
+                f"run <CONFIG> --replacement-pool-size {pool + required_pool_extension}"
+                if required_pool_extension
+                else f"run <CONFIG> --replacement-pool-size {pool}"
             )
         ),
     }
+
+
+def _advance_materialized_campaign(
+    state: Mapping[str, Any],
+    *,
+    run_id: str,
+    campaign_candidates: Sequence[Mapping[str, Any]],
+    projected_candidates: Sequence[Mapping[str, Any]],
+    parent_campaign: config_service.CampaignConfig,
+    storage_root: Path | str | None,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Submit or resume one normal replacement campaign and project selected cases."""
+    from . import generation_campaign as campaign_service
+    from .publication import generation_publication_campaign_evidence as campaign_evidence
+
+    path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage_root)
+    if path.exists():
+        snapshot = campaign_service.resume_campaign_monitor_snapshot(
+            run_id,
+            storage_root=storage_root,
+        )
+        manifest = snapshot["manifest"]
+        status = snapshot["status"]
+    else:
+        campaign = _reconstruct_materialized_campaign(
+            state,
+            candidates=campaign_candidates,
+            parent_campaign=parent_campaign,
+        )
+        materialization = campaign_candidates[0].get("materialization")
+        if not isinstance(materialization, dict):
+            raise TypeError("Replacement campaign submission lacks materialization evidence.")
+        manifest = campaign_service.submit_campaign(
+            campaign,
+            git_commit=str(materialization["git_commit"]),
+            storage_root=storage_root,
+        )
+        status = campaign_service.campaign_status(
+            run_id,
+            storage_root=storage_root,
+        )
+    return _campaign_candidate_transitions(
+        run_id,
+        projected_candidates,
+        manifest=manifest,
+        status=status,
+        storage_root=storage_root,
+    )
 
 
 def _advance_completion_campaigns_unlocked(
@@ -1925,48 +2530,47 @@ def _advance_completion_campaigns_unlocked(
     git_commit: str,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Advance supplemental candidates exclusively through the normal campaign feeder."""
-    from . import generation_campaign as campaign_service
-    from .publication import generation_publication_campaign_evidence as campaign_evidence
-
+    """Advance exact replacement rounds exclusively through the normal feeder."""
     original_successes, failed_case_ids = parent_partial_counts(
         parent_campaign,
         state["parent_partial_evidence"],
         parent_run_id=state["parent_run_id"],
     )
-    transitions: dict[str, str] = {}
-    transition_evidence: dict[str, dict[str, Any]] = {}
-    for candidate in state["candidates"]:
-        if candidate.get("state") in {"successful", "failed"}:
+    for wave in state["waves"]:
+        if wave["state"] == "terminal":
             continue
-        materialization = candidate.get("materialization")
-        if not isinstance(materialization, dict):
-            continue
-        run_id = str(materialization["campaign_run_id"])
-        path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage_root)
-        if not path.exists():
-            continue
-        campaign = record_candidate_materialization(
-            state,
-            candidate_id=str(candidate["candidate_id"]),
-            parent_campaign=parent_campaign,
-            git_commit=git_commit,
-            storage_root=storage_root,
-        )
-        manifest = campaign_service.feed_campaign(
-            run_id,
-            storage_root=storage_root,
-            resolved_campaign=campaign,
-        )
-        candidate_id = str(candidate["candidate_id"])
-        next_state = _candidate_state_from_campaign(manifest)
-        transitions[candidate_id] = next_state
-        if next_state in {"successful", "failed"}:
-            transition_evidence[candidate_id] = _candidate_terminal_evidence(
-                run_id,
-                candidate_state=next_state,
+        wave_candidates = tuple(_candidate_record(state, str(candidate_id)) for candidate_id in wave["candidate_ids"])
+        materialized = [isinstance(candidate.get("materialization"), dict) for candidate in wave_candidates]
+        if any(materialized) and not all(materialized):
+            raise RuntimeError("Replacement round has partially persisted campaign bindings.")
+        if not any(materialized):
+            record_replacement_round_materialization(
+                state,
+                candidate_ids=tuple(str(candidate_id) for candidate_id in wave["candidate_ids"]),
+                parent_campaign=parent_campaign,
+                git_commit=git_commit,
                 storage_root=storage_root,
             )
+
+    transitions: dict[str, str] = {}
+    transition_evidence: dict[str, dict[str, Any]] = {}
+    for run_id, candidates in _materialized_campaign_groups(state):
+        nonterminal = tuple(candidate for candidate in candidates if candidate.get("state") not in {"successful", "failed"})
+        if not nonterminal:
+            continue
+        group_transitions, group_evidence = _advance_materialized_campaign(
+            state,
+            run_id=run_id,
+            campaign_candidates=candidates,
+            projected_candidates=nonterminal,
+            parent_campaign=parent_campaign,
+            storage_root=storage_root,
+        )
+        overlap = set(transitions).intersection(group_transitions)
+        if overlap:
+            raise RuntimeError(f"Replacement candidate was projected by multiple campaigns: {sorted(overlap)}.")
+        transitions.update(group_transitions)
+        transition_evidence.update(group_evidence)
     if transitions:
         reconcile_wave(
             state,
@@ -1974,51 +2578,44 @@ def _advance_completion_campaigns_unlocked(
             candidate_terminal_evidence=transition_evidence,
             storage_root=storage_root,
         )
-    if not any(wave["state"] != "terminal" for wave in state["waves"]):
-        seeds, points = _candidate_points(state, parent_campaign)
-        allocate_next_wave(
+
+    seeds, points = _candidate_points(state, parent_campaign)
+    wave = allocate_next_wave(
+        state,
+        original_successes=original_successes,
+        failed_case_ids=failed_case_ids,
+        sampling_seed=seeds,
+        unit_points=points,
+        storage_root=storage_root,
+    )
+    if wave is not None:
+        record_replacement_round_materialization(
             state,
-            original_successes=original_successes,
-            failed_case_ids=failed_case_ids,
-            sampling_seed=seeds,
-            unit_points=points,
-            storage_root=storage_root,
-        )
-    active_candidate_ids = {candidate_id for wave in state["waves"] if wave["state"] != "terminal" for candidate_id in wave["candidate_ids"]}
-    launch_transitions: dict[str, str] = {}
-    launch_evidence: dict[str, dict[str, Any]] = {}
-    for candidate_id in sorted(active_candidate_ids):
-        candidate = _candidate_record(state, candidate_id)
-        if candidate.get("state") in {"successful", "failed"}:
-            continue
-        campaign = record_candidate_materialization(
-            state,
-            candidate_id=candidate_id,
+            candidate_ids=wave.candidate_ids,
             parent_campaign=parent_campaign,
             git_commit=git_commit,
             storage_root=storage_root,
         )
-        manifest = campaign_service.submit_campaign(
-            campaign,
-            git_commit=git_commit,
+        candidates = tuple(_candidate_record(state, candidate_id) for candidate_id in wave.candidate_ids)
+        materialization = candidates[0].get("materialization")
+        if not isinstance(materialization, dict):
+            raise RuntimeError("Replacement round materialization was not persisted atomically.")
+        run_id = str(materialization["campaign_run_id"])
+        launch_transitions, launch_evidence = _advance_materialized_campaign(
+            state,
+            run_id=run_id,
+            campaign_candidates=candidates,
+            projected_candidates=candidates,
+            parent_campaign=parent_campaign,
             storage_root=storage_root,
         )
-        next_state = _candidate_state_from_campaign(manifest)
-        launch_transitions[candidate_id] = next_state
-        if next_state in {"successful", "failed"}:
-            run_id = str(candidate["materialization"]["campaign_run_id"])
-            launch_evidence[candidate_id] = _candidate_terminal_evidence(
-                run_id,
-                candidate_state=next_state,
+        if launch_transitions:
+            reconcile_wave(
+                state,
+                candidate_states=launch_transitions,
+                candidate_terminal_evidence=launch_evidence,
                 storage_root=storage_root,
             )
-    if launch_transitions:
-        reconcile_wave(
-            state,
-            candidate_states=launch_transitions,
-            candidate_terminal_evidence=launch_evidence,
-            storage_root=storage_root,
-        )
     return completion_status(state, original_successes=original_successes)
 
 

@@ -187,6 +187,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         max_admission_cases: int = 1,
         poll_interval_seconds: int = 1,
         max_running_cases: int | None = None,
+        cores_per_case: int = 1,
         license_retry_enabled: bool = True,
         license_initial_delay_seconds: float = 2.0,
         license_maximum_delay_seconds: float = 5.0,
@@ -264,7 +265,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         wall_time = f"{wall_seconds // 3600:02d}:{(wall_seconds % 3600) // 60:02d}:{wall_seconds % 60:02d}"
         execution["cluster"].update(
             {
-                "cores_per_case": 1,
+                "cores_per_case": cores_per_case,
                 "wall_time": wall_time,
                 "scheduler_options": [],
             }

@@ -73,7 +73,10 @@ COMPLETION_PARENT_PARTIAL_PATH=""
 COMPLETION_PARENT_PARTIAL_SHA256=""
 COMPLETION_PARENT_JSON=""
 COMPLETION_TRANSFER_JSON=""
+COMPLETION_INITIAL_STATUS_JSON=""
 COMPLETION_REPLACEMENT_RUN_IDS=()
+COMPLETION_REPLACEMENT_RUN_PARTIAL=()
+COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS=()
 
 usage() {
   cat >&2 <<EOF
@@ -2027,6 +2030,11 @@ workflow_failure_report() {
     --remote-root "${REMOTE_ROOT:-configured}"
     --git-commit "${REQUESTED_COMMIT:-unknown}"
   )
+  if [[ -n "${REPLACEMENT_POOL_SIZE:-}" ]]; then
+    continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
+    [[ -z "${COMPLETION_PARENT_RUN_ID:-}" ]] ||
+      continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
+  fi
   local collection_mode
   collection_mode="$(collection_mode_argument)"
   [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
@@ -2897,6 +2905,54 @@ observed="$(sha256sum -- "${destination}")"; observed="${observed%% *}"
 REMOTE
 }
 
+render_completion_plan() {
+  local report="$1"
+  printf '%s' "${report}" | local_python -c 'import json, sys
+value = json.load(sys.stdin)
+def label(item):
+    return str(item.get("material_family") or item["batch_id"]).replace("_", " ").title()
+def rows(field):
+    for item in value["target_batches"]:
+        if field == "inventory":
+            count = item["current_successes"]
+            target = item["target_successes"]
+            print("  {:18} {} / {}".format(label(item), count, target))
+        elif field == "deficit":
+            print("  {:18} {}".format(label(item), item["uncovered_deficit"]))
+        else:
+            print("  {:18} {}".format(label(item), item["new_replacements_required"]))
+execution = value["execution"]
+max_running = execution["max_running_cases"]
+if max_running is None:
+    max_running = "unlimited"
+print("Completion mode: resume partial campaign")
+print("Parent campaign: {}".format(value["parent_run_id"]))
+print("Parent state: {}".format(value["parent_state"]))
+print("Completion ID: {}".format(value["completion_id"]))
+print("\nExisting successful inventory:")
+rows("inventory")
+print("\nRemaining deficits:")
+rows("deficit")
+print("  {:18} {}".format("Total", sum(value["success_deficits"].values())))
+print("\nReplacement pool:")
+print("  high water         {}".format(value["pool_high_water"]))
+print("  already consumed   {}".format(value["pool_consumed"]))
+print("  active/reserving   {}".format(value["reserved_candidates"]))
+print("  reserve remaining  {}".format(value["pool_remaining"]))
+print("\nReplacement plan:\n  newly required:")
+rows("required")
+print("  total newly required = {}".format(sum(value["new_replacements_required"].values())))
+print("\nExecution:")
+print("  max admission cases = {}".format(execution["max_admission_cases"]))
+print("  max running cases   = {}".format(max_running))
+print("  cores per case      = {}".format(execution["cores_per_case"]))
+print("  partition           = {}".format(execution["partition"]))
+print("  wall time           = {}".format(execution["wall_time"]))
+print("  poll interval       = {} s".format(execution["poll_interval_seconds"]))
+print("\nNext:\n  {}".format(value["next_operation"]))' ||
+    fail 1 "Could not render exact completion startup plan."
+}
+
 initialize_remote_completion() {
   local output record status observed_id extra
   output="$(remote_cli initialize-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
@@ -2906,6 +2962,7 @@ initialize_remote_completion() {
     --replacement-pool-size "${REPLACEMENT_POOL_SIZE}" \
     --storage-root "${REMOTE_STORAGE_ROOT}")" ||
     fail 1 "Could not initialize or extend the remote campaign completion owner."
+  COMPLETION_INITIAL_STATUS_JSON="${output}"
   record="$(printf '%s' "${output}" | local_python -c 'import json, sys
 value = json.load(sys.stdin)
 print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
@@ -2928,49 +2985,97 @@ print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
 
 advance_remote_completion() {
   validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
+  local previous_run_id="${RUN_ID}"
   while true; do
-    local output record status observed_id pool_size extra
-    output="$(remote_cli advance-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
+    local output record status observed_id pool_size monitor_run active_count
+    local required_total allocated_candidates reserved_candidates next_operation extra
+    local startup_detail
+    printf -v startup_detail \
+      "completion_id=%s\noperation=%s" \
+      "${COMPLETION_ID}" \
+      "reconciling evidence and preparing exact replacement membership"
+    generation_console_progress completion-startup 3 9 "Canonical inputs" RUNNING \
+      "${COMPLETION_ID}" "${startup_detail}" "${COMPLETION_ID}"
+    output="$(generation_run_with_heartbeat \
+      "completion-advance-${COMPLETION_ID}" 3 9 "Canonical inputs" \
+      "reconciling evidence, allocating exact deficits, and preparing replacement inputs" \
+      "completion_id=${COMPLETION_ID}" \
+      remote_cli advance-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
       "${COMPLETION_ID}" --git-commit "${REQUESTED_COMMIT}" \
       --storage-root "${REMOTE_STORAGE_ROOT}")" ||
       fail_preserving_interrupt "$?" 1 "Could not advance replacement campaign completion."
     record="$(printf '%s' "${output}" | local_python -c 'import json, sys
 value = json.load(sys.stdin)
+active = list(value.get("active_run_ids", []))
+rounds = list(value.get("active_round_run_ids", []))
+monitor = (rounds or active or ["-"])[0]
+next_operation = str(value["next_operation"])
+if any(character in next_operation for character in "\t\r\n"):
+    raise SystemExit("unsafe completion next-operation text")
 print("\t".join((
     str(value["status"]), str(value["completion_id"]),
-    str(value["replacement_pool_size"]),
+    str(value["replacement_pool_size"]), str(monitor), str(len(active)),
+    str(sum(value["new_replacements_required"].values())),
+    str(value["allocated_candidates"]), str(value["reserved_candidates"]),
+    next_operation,
 )))')" || fail 1 "Could not decode replacement completion status."
-    IFS=$'\t' read -r status observed_id pool_size extra <<< "${record}"
+    IFS=$'\t' read -r status observed_id pool_size monitor_run active_count \
+      required_total allocated_candidates reserved_candidates next_operation extra <<< "${record}"
     [[ -z "${extra:-}" ]] || fail 1 "Malformed replacement completion status."
     validate_completion_id "${observed_id}"
     [[ "${observed_id}" == "${COMPLETION_ID}" ]] ||
       fail 1 "Replacement completion status changed owner identity."
     validate_positive "replacement completion pool high-water" "${pool_size}"
+    validate_nonnegative "active replacement campaign count" "${active_count}"
+    validate_nonnegative "newly required replacement count" "${required_total}"
+    validate_nonnegative "allocated replacement count" "${allocated_candidates}"
+    validate_nonnegative "reserved replacement count" "${reserved_candidates}"
     case "${status}" in
       complete)
+        generation_console_stage 4 9 "Work-unit plan" OK \
+          "exact deficits=0 allocated=${allocated_candidates} reserved=0"
         printf 'COMPLETION READY: completion_id=%s parent_run_id=%s pool_high_water=%s\n' \
           "${COMPLETION_ID}" "${COMPLETION_PARENT_RUN_ID}" "${pool_size}"
+        RUN_ID="${previous_run_id}"
         return 0
         ;;
       active)
-        printf 'COMPLETION ACTIVE: completion_id=%s pool_high_water=%s\n' \
-          "${COMPLETION_ID}" "${pool_size}"
+        generation_console_stage 3 9 "Canonical inputs" OK \
+          "replacement inputs admitted through normal campaign preparation"
+        generation_console_stage 4 9 "Work-unit plan" OK \
+          "allocated=${allocated_candidates} active_or_reserved=${reserved_candidates} newly_uncovered=${required_total} active_runs=${active_count}"
+        if [[ "${monitor_run}" != - ]]; then
+          validate_run_id "${monitor_run}"
+          RUN_ID="${monitor_run}"
+          CAMPAIGN_PARTIAL=false
+          monitor_generation_units campaign
+          RUN_ID="${previous_run_id}"
+          continue
+        fi
+        generation_console_progress completion-reconcile 5 9 "Work units" RUNNING \
+          "${allocated_candidates}|${reserved_candidates}|${required_total}" \
+          "operation=${next_operation}" \
+          "${allocated_candidates}|${reserved_candidates}|${required_total}"
         sleep "${STATUS_POLL_SECONDS}" || true
         ;;
       failure_circuit_open)
         printf 'COMPLETION FAILURE CIRCUIT OPEN: completion_id=%s; configured replacement failure allowance is exhausted. Evidence is retained and no new candidates will be admitted.\n' \
           "${COMPLETION_ID}" >&2
+        RUN_ID="${previous_run_id}"
         return 4
         ;;
       pool_exhausted)
-        local next_pool=$((pool_size + 1))
-        printf 'COMPLETION POOL EXHAUSTED: completion_id=%s remaining successful-case deficit.\n' \
-          "${COMPLETION_ID}" >&2
+        (( required_total > 0 )) ||
+          fail 1 "Pool exhaustion lacks an uncovered replacement deficit."
+        local next_pool=$((pool_size + required_total))
+        printf 'COMPLETION POOL EXHAUSTED: completion_id=%s uncovered=%s pool_remaining=0.\n' \
+          "${COMPLETION_ID}" "${required_total}" >&2
         printf 'Continue with a larger cumulative pool:\n' >&2
         print_command "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run \
           "${RUN_CONFIG_ARGUMENT}" --replacement-pool-size "${next_pool}" \
           --parent-run-id "${COMPLETION_PARENT_RUN_ID}" --cpu-host "${CPU_HOST}" \
           --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}" >&2
+        RUN_ID="${previous_run_id}"
         return 3
         ;;
       *) fail 1 "Replacement completion entered unsupported state: ${status}" ;;
@@ -2995,12 +3100,18 @@ print("\t".join((
     clean(value["parent_partial_sha256"]), clean(value["completion_state_path"]),
     clean(value["completion_state_sha256"]),
 )))
+for item in value["replacement_runs"]:
+    print("\t".join((
+        "replacement-run", clean(item["campaign_run_id"]),
+        "true" if item["partial"] else "false", clean(item["campaign_state"]),
+    )))
 for item in value["replacement_campaigns"]:
     print("\t".join((
         "replacement", clean(item["candidate_id"]), clean(item["target_batch_id"]),
         clean(item["campaign_run_id"]), clean(item["terminal_batch_id"]),
     )))')" || fail 1 "Could not decode completion transfer plan."
   COMPLETION_REPLACEMENT_RUN_IDS=()
+  COMPLETION_REPLACEMENT_RUN_PARTIAL=()
   COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS=()
   local state_path="" state_sha=""
   while IFS=$'\t' read -r kind field2 field3 field4 field5 field6 extra; do
@@ -3015,20 +3126,30 @@ for item in value["replacement_campaigns"]:
         state_sha="${field6}"
         validate_digest "${state_sha}"
         ;;
+      replacement-run)
+        validate_run_id "${field2}"
+        [[ "${field3}" == true || "${field3}" == false ]] ||
+          fail 1 "Malformed replacement run collection mode."
+        [[ "${field4}" == complete || "${field4}" == completed_with_failures ]] ||
+          fail 1 "Malformed replacement run terminal state."
+        COMPLETION_REPLACEMENT_RUN_IDS+=("${field2}")
+        COMPLETION_REPLACEMENT_RUN_PARTIAL+=("${field3}")
+        ;;
       replacement)
         [[ "${field2}" =~ ^replacement__[0-9a-f]{24}$ ]] ||
           fail 1 "Malformed replacement candidate identity."
         validate_run_id "${field4}"
         validate_batch_name "${field3}"
         validate_batch_name "${field5}"
-        COMPLETION_REPLACEMENT_RUN_IDS+=("${field4}")
         COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS+=("${field5}")
         ;;
       *) fail 1 "Unknown completion transfer-plan row." ;;
     esac
   done <<< "${records}"
-  (( ${#COMPLETION_REPLACEMENT_RUN_IDS[@]} > 0 )) ||
-    fail 1 "Complete campaign completion has no successful replacement transfer members."
+  (( ${#COMPLETION_REPLACEMENT_RUN_IDS[@]} > 0 \
+    && ${#COMPLETION_REPLACEMENT_RUN_IDS[@]} == ${#COMPLETION_REPLACEMENT_RUN_PARTIAL[@]} \
+    && ${#COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS[@]} > 0 )) ||
+    fail 1 "Complete campaign completion has malformed successful replacement transfer membership."
   local expected_state="${REMOTE_STORAGE_ROOT}/01_generation/meta/completions/${COMPLETION_ID}/completion.json"
   [[ "${state_path}" == "${expected_state}" ]] ||
     fail 1 "Completion state path differs from its dedicated owner."
@@ -3059,30 +3180,36 @@ for item in value["replacement_campaigns"]:
     mv -- "${incoming}" "${destination}"
   fi
   local_cli campaign-completion-status "${COMPLETION_ID}" \
-    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    --config "${CAMPAIGN_CONFIG_PATH}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Transferred host completion state did not validate."
 }
 
 collect_completion_replacements() {
-  local parent_run="${COMPLETION_PARENT_RUN_ID}" replacement_run previous_keep
-  for replacement_run in "${COMPLETION_REPLACEMENT_RUN_IDS[@]}"; do
+  local parent_run="${COMPLETION_PARENT_RUN_ID}" replacement_run previous_keep partial index
+  local -a validation_arguments=()
+  for ((index=0; index<${#COMPLETION_REPLACEMENT_RUN_IDS[@]}; index++)); do
+    replacement_run="${COMPLETION_REPLACEMENT_RUN_IDS[index]}"
+    partial="${COMPLETION_REPLACEMENT_RUN_PARTIAL[index]}"
     RUN_ID="${replacement_run}"
-    CAMPAIGN_PARTIAL=false
+    CAMPAIGN_PARTIAL="${partial}"
     PILOT_MODE=false
     generation_console_stage 6 9 "Host publication" RUNNING \
-      "successful replacement run=${RUN_ID}"
+      "replacement run=${RUN_ID} partial=${CAMPAIGN_PARTIAL}"
     collect_campaign >/dev/null
     generation_console_stage 7 9 "Packages/finalizer" RUNNING \
-      "replacement run=${RUN_ID} empty launch package gate"
+      "replacement run=${RUN_ID} empty launch package gate partial=${CAMPAIGN_PARTIAL}"
     build_datasets >/dev/null
     previous_keep="${KEEP_CPU_SOURCE}"
     KEEP_CPU_SOURCE=true
     prepare_all_receipt >/dev/null
     KEEP_CPU_SOURCE="${previous_keep}"
-    local_cli validate-all-workflow "${RUN_ID}" \
+    validation_arguments=(validate-all-workflow "${RUN_ID}")
+    [[ "${CAMPAIGN_PARTIAL}" != true ]] || validation_arguments+=(--partial)
+    local_cli "${validation_arguments[@]}" \
       --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-      fail 1 "Successful replacement workflow gates did not validate before composite publication."
+      fail 1 "Replacement workflow gates did not validate before composite publication."
   done
+  CAMPAIGN_PARTIAL=false
   RUN_ID="${parent_run}"
 }
 
@@ -3110,8 +3237,20 @@ if not cleanup.get("eligible") or observed != expected:
     "${COMPLETION_TRANSFER_JSON}" "${cleanup_json}" ||
     fail 1 "Completion cleanup plan includes missing, failed, or non-replacement sources."
   if [[ "${KEEP_CPU_SOURCE}" != true ]]; then
-    for replacement_run in "${COMPLETION_REPLACEMENT_RUN_IDS[@]}"; do
+    local index partial
+    for ((index=0; index<${#COMPLETION_REPLACEMENT_RUN_IDS[@]}; index++)); do
+      replacement_run="${COMPLETION_REPLACEMENT_RUN_IDS[index]}"
+      partial="${COMPLETION_REPLACEMENT_RUN_PARTIAL[index]}"
       RUN_ID="${replacement_run}"
+      CAMPAIGN_PARTIAL="${partial}"
+      if [[ "${CAMPAIGN_PARTIAL}" == true ]]; then
+        local_cli validate-all-workflow "${RUN_ID}" --partial \
+          --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+          fail 1 "Mixed-outcome replacement evidence changed before retention."
+        generation_console_stage 8 9 "Retention policy" RETAINED \
+          "replacement run=${RUN_ID} contains failed evidence and remains on CPU storage"
+        continue
+      fi
       confirm_cpu_cleanup >/dev/null
       local_cli validate-all-workflow "${RUN_ID}" \
         --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
@@ -3131,6 +3270,13 @@ if not cleanup.get("eligible") or observed != expected:
 run_campaign_with_completion() {
   [[ "${RUN_KIND}" == campaign && -n "${REPLACEMENT_POOL_SIZE}" ]] ||
     fail 2 "Internal completion workflow requires one campaign and cumulative pool."
+  generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
+    "${RUN_PLAN_ID}|parent-resolution" \
+    "operation=resolving a structurally compatible partial parent" \
+    "${RUN_PLAN_ID}|parent-resolution"
+  RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
+  resolve_campaign "${RUN_LEAF_CONFIG}"
+  resolve_completion_parent_local
   local parent_run=""
   case "${COMPLETION_PARENT_STATUS}" in
     compatible_partial)
@@ -3158,14 +3304,31 @@ run_campaign_with_completion() {
       && "${COMPLETION_PARENT_RUN_ID}" == "${parent_run}" ]] ||
       fail 1 "Newly partial campaign did not resolve to its exact transferred parent evidence."
   fi
-  RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
-  resolve_campaign "${RUN_LEAF_CONFIG}"
+  generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
+    "${COMPLETION_ID}|execution" \
+    "operation=resolving normal campaign admission, resources, retries, and polling" \
+    "${COMPLETION_ID}|execution"
   resolve_configured_resources executable
   validate_resources
   resolve_remote_layout
+  generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
+    "${COMPLETION_ID}|cpu-setup" \
+    "operation=validating the pinned CPU execution environment" \
+    "${COMPLETION_ID}|cpu-setup"
   verify_remote_setup >/dev/null
+  generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
+    "${COMPLETION_ID}|parent" \
+    "operation=validating retained parent successes and persisted completion evidence" \
+    "${COMPLETION_ID}|parent"
   sync_completion_parent_evidence
+  generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
+    "${COMPLETION_ID}|state" \
+    "operation=reconciling existing replacement state and exact per-material reservations" \
+    "${COMPLETION_ID}|state"
   initialize_remote_completion
+  render_completion_plan "${COMPLETION_INITIAL_STATUS_JSON}"
+  generation_console_stage 2 9 "Existing state" OK \
+    "parent_run=${COMPLETION_PARENT_RUN_ID} completion_id=${COMPLETION_ID}"
   advance_remote_completion || return $?
   sync_completion_state_and_plan
   collect_completion_replacements
@@ -3518,7 +3681,7 @@ print("\t".join((str(value["status"]), str(identifier))))')" ||
     printf 'CPU completion execution status:\n'
     remote_cli_retryable "completion execution status read" \
       campaign-completion-status "${completion_id}" --if-present \
-      --storage-root "${REMOTE_STORAGE_ROOT}"
+      --config "${CAMPAIGN_RELATIVE_PATH}" --storage-root "${REMOTE_STORAGE_ROOT}"
   fi
 }
 
@@ -3771,8 +3934,10 @@ case "${SUBCOMMAND}" in
         fail 2 "--replacement-pool-size is supported only for one campaign run plan."
       RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
       resolve_campaign "${RUN_LEAF_CONFIG}"
-      resolve_completion_parent_local
-      attach_completion_plan_metadata
+      if [[ "${DRY_RUN}" == true || "${PREFLIGHT_ONLY}" == true ]]; then
+        resolve_completion_parent_local
+        attach_completion_plan_metadata
+      fi
     fi
     if [[ "${DRY_RUN}" == true ]]; then
       printf '%s\n' "${RUN_PLAN_JSON}"

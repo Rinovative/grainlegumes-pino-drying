@@ -233,10 +233,14 @@ editing its manifest, hiding its failures, or rerunning its successful cases:
 `N` is the cumulative maximum number of supplemental candidates owned by that
 completion, not an additional count for each invocation. Increasing `N` extends
 the same deterministic candidate prefix; decreasing it below the persisted high
-water fails. Replacement candidates use independently derived sampling and seed
-provenance and cannot collide with original scientific case identities.
-Candidates are admitted only while an exact configured batch-success deficit
-remains, so a large pool cannot make the completed Dataset exceed its targets.
+water fails. The pool is capacity, not desired work: the controller materializes
+exactly one candidate for each currently uncovered batch-specific success slot.
+Planned, active, license-retry, and replayable candidates reserve only their own
+batch slots. A terminal failure releases that same batch slot, so the next round
+contains exactly one further candidate for that material. Replacement candidates
+use independently derived sampling and seed provenance and cannot collide with
+original scientific case identities. A large pool therefore cannot make the
+completed Dataset exceed its configured targets.
 
 The workflow discovers a structurally compatible parent from validated host
 publication. It does not select by filename, path, or newest timestamp. If more
@@ -251,9 +255,12 @@ than one parent is compatible, resolve the ambiguity explicitly:
 `--parent-run-id` is an expert override and is invalid without a replacement
 pool. A historical parent may have no CPU source remaining: its immutable host
 `campaign_partial.json` is sufficient. The controller transfers only that
-compact evidence back to the CPU owner, launches ordinary one-case replacement
-campaigns under the requested commit, and never reconstructs or mutates the
-original failed run.
+compact evidence back to the CPU owner and never reconstructs or mutates the
+original failed run. Newly uncovered slots are combined into one ordinary
+multi-case replacement campaign per round. The normal campaign feeder owns input
+preparation, admission, maximum running cases, Slurm resources, temporary-license
+retry, replay, and monitoring. Historical one-case replacement campaigns remain
+valid and are resumed from their existing evidence without resubmission.
 
 A replacement success counts only after normal terminal validation. Failed,
 active, or merely reserved candidates never satisfy a deficit and are never
@@ -261,10 +268,13 @@ included in the transfer plan. Once every deficit is covered, the host builds
 one immutable composite from the parent successes plus the exact successful
 replacement cases, then builds and validates its Dataset packages, transient PT
 shards, loader smoke, readiness evidence, and finalization records. Default
-cleanup is authorized only after those gates pass and is restricted to the
-successful replacement CPU sources; the historical parent and unsuccessful
-replacement evidence are not cleanup members. `--keep-cpu-source` retains the
-successful replacement sources as additional copies.
+cleanup is authorized only after those gates pass and is restricted to
+replacement runs whose evidence can be removed without deleting failures. A
+fully successful round follows normal cleanup. A mixed-success round remains on
+CPU storage in full because cleanup is campaign-scoped and its failed evidence
+must be preserved. The historical parent and unsuccessful replacement evidence
+are never cleanup members. `--keep-cpu-source` retains every replacement source
+as an additional copy.
 
 For example, the maintained family-generalization completion command is:
 
@@ -291,13 +301,15 @@ metadata adds no completion gate.
 `--dry-run` mutates nothing and reports replacement enablement, requested
 high-water mark, compatible and selected parents, target counts, current
 successes, deficits, expected completion identity, package declarations, and PT
-shard requirements. Normal `status CONFIG_OR_RUN_ID` also emits a read-only
-completion report containing parent/completion state, candidate and attempt
-accounting, active work, pool remaining, the completion-local failure circuit,
-and publication/package/shard/readiness state. Replacement campaigns are
-admitted sequentially so the configured local failure threshold is checked
-before every next candidate; an open circuit preserves all evidence and stops
-new admission.
+shard requirements. An executing completion first prints the derived per-batch
+inventory, deficits, reservations, pool accounting, exact new work, and resolved
+normal execution settings. It then uses the ordinary campaign case monitor, so
+submission, pending/running transitions, jobs, nodes, solver progress, retries,
+and terminal cases have the same presentation as any configured campaign.
+Normal `status CONFIG_OR_RUN_ID` emits the same read-only completion projection,
+including active normal case views and publication/package/shard/readiness state.
+The completion-local failure circuit is checked before a new exact round; an
+open circuit preserves all evidence and stops new admission.
 
 ## Terminal timestamps and status
 
