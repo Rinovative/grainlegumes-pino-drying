@@ -472,18 +472,14 @@ if sys.argv[1:] == ["-version"]:
     raise SystemExit(0)
 
 arguments = sys.argv[1:]
-probe_batch_log = None
-if "-batchlog" in arguments or "-batchlogout" in arguments:
-    if arguments.count("-batchlog") != 1 or arguments.count("-batchlogout") != 1:
-        raise RuntimeError("fake COMSOL requires one complete diagnostic batch-log flag pair")
-    probe_batch_log = pathlib.Path(arguments[arguments.index("-batchlog") + 1])
+if arguments.count("-batchlog") != 1 or arguments.count("-batchlogout") != 1:
+    raise RuntimeError("fake COMSOL requires one complete runtime-owned batch-log flag pair")
+batch_log = pathlib.Path(arguments[arguments.index("-batchlog") + 1])
 
 
-def write_probe_batch_log(content):
-    if probe_batch_log is None:
-        return
-    probe_batch_log.parent.mkdir(parents=True, exist_ok=True)
-    with probe_batch_log.open("a", encoding="utf-8") as stream:
+def write_comsol_batch_log(content):
+    batch_log.parent.mkdir(parents=True, exist_ok=True)
+    with batch_log.open("w", encoding="utf-8") as stream:
         stream.write(content)
         stream.flush()
         os.fsync(stream.fileno())
@@ -546,13 +542,34 @@ try:
         case = json.loads(pathlib.Path("case.json").read_text(encoding="utf-8"))
         transient_profile = case["simulation_profile"] == "transient_drying"
         scalars = runtime_scalar_values(arguments, case) if transient_profile else {}
-        if transient_profile:
-            write_probe_batch_log(
-                "Stationary Solver 1\n"
-                "Solution time: 1.25 s\n"
-                "Time-Dependent Solver 1 in Transient Drying\n"
-                "Elapsed time: 2.5 s\n"
-            )
+        stationary_batch_log = (
+            "<---- Dependent Variables 1 in Stationary Airflow/Stationary Airflow Solution\n"
+            "      (sol1) -------------------------------------------------------------------\n"
+            "Solution time: 0.5 s.\n"
+            "----- Dependent Variables 1 in Stationary Airflow/Stationary Airflow Solution\n"
+            "      (sol1) ------------------------------------------------------------------>\n"
+            "<---- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution\n"
+            "      (sol1) -------------------------------------------------------------------\n"
+            "Solution time: 3.5 s.\n"
+            "----- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution\n"
+            "      (sol1) ------------------------------------------------------------------>\n"
+        )
+        transient_batch_log = (
+            "<---- Dependent Variables 1 in Transient Drying/Transient Drying Solution (sol2) -\n"
+            "Values of variables not solved for: Stationary Airflow Solution (sol1).\n"
+            "Solution time: 0.75 s.\n"
+            "----- Dependent Variables 1 in Transient Drying/Transient Drying Solution (sol2) >\n"
+            "<---- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution\n"
+            "      (sol2) -------------------------------------------------------------------\n"
+            "Time-dependent solver (BDF)\n"
+            "Solution time: 7.25 s.\n"
+            "----- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution\n"
+            "      (sol2) ------------------------------------------------------------------>\n"
+        )
+        if mode == "success_missing_transient_timing":
+            write_comsol_batch_log(stationary_batch_log)
+        else:
+            write_comsol_batch_log(stationary_batch_log + (transient_batch_log if transient_profile else ""))
         solved_model_mode = os.environ.get("FAKE_COMSOL_SOLVED_MODEL_MODE", "canonical")
         if retained:
             requested_output = arguments[arguments.index("-outputfile") + 1]

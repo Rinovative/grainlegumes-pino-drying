@@ -328,13 +328,18 @@ def test_resolved_science_and_execution_are_persisted_separately(
         "-pindex=1",
         "-paramfile",
         "-paramfile=parameters.txt",
+        "-batchlog",
+        "-batchlog=other.log",
+        "-batchlogout",
+        "-batchlogout=true",
+        "-BATCHLOG=other.log",
     ],
 )
-def test_extra_arguments_cannot_override_scalar_handoff_flags(
+def test_extra_arguments_cannot_override_runtime_owned_comsol_flags(
     generation_config_factory: Any,
     argument: str,
 ) -> None:
-    """Keep every COMSOL parameter-injection flag runtime-owned."""
+    """Keep every command, parameter, and batch-log flag runtime-owned."""
     config_path, _template = generation_config_factory(extra_arguments=(argument,))
     with pytest.raises(generation.cases.config.GenerationConfigError, match="cannot override"):
         generation.cases.config.load_generation_config(
@@ -386,7 +391,14 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     assert local[parameter_start + 3].split(",") == expected_values
     assert "[1]" not in local[parameter_start + 3]
     assert local[parameter_start + 5] == ",".join(str(index) for index in range(1, 13))
-    assert local[parameter_start + 6 :] == ["-np", "2", "-recover"]
+    assert local[parameter_start + 6 :] == [
+        "-np",
+        "2",
+        "-batchlog",
+        "comsol_batch.log",
+        "-batchlogout",
+        "-recover",
+    ]
 
     slurm = comsol_service.build_comsol_command(
         config,
@@ -440,6 +452,9 @@ def test_comsol_builder_owns_fixed_job_and_controlled_stop_output(
         "solved.mph",
         "-np",
         "16",
+        "-batchlog",
+        "comsol_batch.log",
+        "-batchlogout",
     ]
 
 
@@ -817,6 +832,80 @@ def test_failure_timeout_missing_export_and_case_lock(
 
 
 @pytest.mark.integration
+def test_transient_case_publishes_structural_solver_timing(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+) -> None:
+    """Persist transient scientific timing without retaining its complete batch log."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    storage = tmp_path / "transient timing storage"
+    _prepare_canonical_inputs(config, storage)
+
+    outcome = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=8,
+        storage_root=storage,
+        work_root=tmp_path / "transient timing work",
+    )
+
+    assert outcome.status == "completed"
+    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    assert timing["comsol_stationary_airflow_seconds"] == 3.5
+    assert timing["comsol_transient_drying_seconds"] == 7.25
+    assert timing["comsol_scientific_solver_seconds"] == 10.75
+    assert timing["comsol_solver_timing"]["status"] == "complete"
+    assert timing["comsol_solver_timing"]["source_kind"] == "comsol_batch_log"
+    assert timing["comsol_process_seconds"] == timing["runtime_s"]
+    assert not (outcome.processed_directory / "comsol_batch.log").exists()
+
+
+@pytest.mark.integration
+def test_successful_transient_case_keeps_missing_timing_nonfatal(
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep scientific success when the finalized log lacks a required phase timing."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        executable=fake_comsol,
+    )
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=_natural_batch_name("transient_drying"),
+    )
+    storage = tmp_path / "missing transient timing storage"
+    _prepare_canonical_inputs(config, storage)
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "success_missing_transient_timing")
+
+    outcome = generation.runtime.run_case(
+        config,
+        1,
+        cores_per_case=1,
+        storage_root=storage,
+        work_root=tmp_path / "missing transient timing work",
+    )
+
+    assert outcome.status == "completed"
+    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    assert timing["comsol_stationary_airflow_seconds"] == 3.5
+    assert timing["comsol_transient_drying_seconds"] is None
+    assert timing["comsol_scientific_solver_seconds"] is None
+    assert timing["comsol_solver_timing"]["status"] == "missing"
+    assert generation.runtime.completed_case_is_valid(config, 1, storage_root=storage)
+
+
+@pytest.mark.integration
 def test_compact_case_uses_solved_output_but_omits_model_from_publication(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -878,6 +967,9 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         "16",
     ]
     assert "-nosave" not in arguments
+    assert arguments.count("-batchlog") == 1
+    assert arguments.count("-batchlogout") == 1
+    assert arguments[arguments.index("-batchlog") + 1].endswith("/runtime/comsol_batch.log")
     assert execution["result"]["solved_model"]["canonical_relative_path"] == "solved.mph"
     case_hdf5 = outcome.processed_directory / "case.h5"
     assert case_hdf5.is_file()
@@ -903,6 +995,11 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         assert evidence["row_count"] > 0
         assert evidence["column_count"] > 0
     timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    assert timing["comsol_stationary_airflow_seconds"] == 3.5
+    assert timing["comsol_transient_drying_seconds"] is None
+    assert timing["comsol_scientific_solver_seconds"] == 3.5
+    assert timing["comsol_solver_timing"]["status"] == "complete"
+    assert timing["comsol_process_seconds"] == timing["runtime_s"]
     assert timing["source_export_bytes"] > 0
     assert timing["solved_model_scratch_bytes"] > 0
     assert timing["case_hdf5_bytes"] == case_hdf5.stat().st_size

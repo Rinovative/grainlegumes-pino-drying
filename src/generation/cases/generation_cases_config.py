@@ -104,6 +104,8 @@ _COMSOL_OWNED_ARGUMENTS = (
     "-plist",
     "-pindex",
     "-paramfile",
+    "-batchlog",
+    "-batchlogout",
 )
 _SCHEDULER_OWNED_OPTIONS = (
     "--parsable",
@@ -2019,7 +2021,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     ):
         msg = "execution.runtime.extra_arguments must be an ordered list of safe arguments."
         raise GenerationConfigError(msg)
-    if any(item == owned or item.startswith(f"{owned}=") for item in arguments for owned in _COMSOL_OWNED_ARGUMENTS):
+    if any(item.casefold() == owned or item.casefold().startswith(f"{owned}=") for item in arguments for owned in _COMSOL_OWNED_ARGUMENTS):
         msg = "execution.runtime.extra_arguments cannot override runtime-owned COMSOL arguments."
         raise GenerationConfigError(msg)
     runtime["executable"] = site["comsol_executable"]

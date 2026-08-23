@@ -5,7 +5,7 @@ Own the fixed Generation-side COMSOL process invocation contract.
 Responsibilities:
   - Own canonical COMSOL job and case-local model names
   - Build one safe COMSOL batch argument vector for every execution path
-  - Select exactly one save mode from the resolved retention policy
+  - Select exactly one save mode and one runtime-owned batch log
 Design principles:
   - Template job identity and workspace filenames are internal conventions
   - Core allocation remains explicit in every invocation
@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Final
 
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
+
+from . import generation_runtime_comsol_timing as comsol_timing
 
 if TYPE_CHECKING:
     from src.generation.cases import generation_cases_config as config_contract
@@ -90,7 +92,7 @@ def build_comsol_command(
     cores_per_case: int,
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
     scheduler_kind: str = "local",
-    diagnostic_batchlog: str | None = None,
+    batch_log_path: str = comsol_timing.COMSOL_BATCH_LOG_FILENAME,
 ) -> list[str]:
     """Build the canonical Generation COMSOL batch argument vector."""
     if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
@@ -100,15 +102,17 @@ def build_comsol_command(
         message = f"Unsupported scheduler kind for case execution: {scheduler_kind!r}."
         raise ValueError(message)
     extra_arguments = config.execution_values["runtime"]["extra_arguments"]
-    if diagnostic_batchlog is not None:
-        if not diagnostic_batchlog or "\x00" in diagnostic_batchlog:
-            message = "diagnostic_batchlog must be one safe non-empty path."
+    if not isinstance(batch_log_path, str):
+        message = "batch_log_path must be a string."
+        raise TypeError(message)
+    if not batch_log_path or "\x00" in batch_log_path:
+        message = "batch_log_path must be one safe non-empty path."
+        raise ValueError(message)
+    for value in extra_arguments:
+        normalized = str(value).strip().casefold()
+        if normalized in {"-batchlog", "-batchlogout"} or normalized.startswith(("-batchlog=", "-batchlogout=")):
+            message = "Runtime-owned COMSOL batch logging conflicts with configured extra arguments."
             raise ValueError(message)
-        for value in extra_arguments:
-            normalized = str(value).strip().casefold()
-            if normalized in {"-batchlog", "-batchlogout"} or normalized.startswith(("-batchlog=", "-batchlogout=")):
-                message = "Probe-owned COMSOL batch logging conflicts with configured extra arguments."
-                raise ValueError(message)
     return [
         resolve_comsol_executable(config),
         "batch",
@@ -120,6 +124,8 @@ def build_comsol_command(
         *_comsol_parameter_arguments(config, scalar_handoff),
         "-np",
         str(cores_per_case),
-        *([] if diagnostic_batchlog is None else ["-batchlog", diagnostic_batchlog, "-batchlogout"]),
+        "-batchlog",
+        batch_log_path,
+        "-batchlogout",
         *extra_arguments,
     ]

@@ -6,6 +6,7 @@ Provides:
 - cluster: scheduler planning and submission
 - license: bounded temporary floating-license retry evidence
 - comsol: fixed COMSOL command and workspace-name conventions
+- comsol_timing: structural COMSOL scientific solver timing
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
 - progress: non-authoritative case runtime progress parsing and persistence
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_batch as batch
     from . import generation_runtime_cluster as cluster
     from . import generation_runtime_comsol as comsol
+    from . import generation_runtime_comsol_timing as comsol_timing
     from . import generation_runtime_license as license  # noqa: A004 -- public service name
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
@@ -121,6 +123,7 @@ _MODULES = {
     "batch": "generation_runtime_batch",
     "cluster": "generation_runtime_cluster",
     "comsol": "generation_runtime_comsol",
+    "comsol_timing": "generation_runtime_comsol_timing",
     "license": "generation_runtime_license",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
@@ -205,6 +208,7 @@ __all__ = [
     "collect_exports",
     "completed_case_is_valid",
     "comsol",
+    "comsol_timing",
     "execute_prepared_case",
     "finalize_batch",
     "initialize_batch_metadata",

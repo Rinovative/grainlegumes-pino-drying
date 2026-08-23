@@ -8,7 +8,7 @@ Responsibilities:
   - Read hash-admitted timing and status sidecars from completed-case evidence
   - Bind runtime values to the admitted case and batch identities
   - Preserve physical duration, target attainment, and censoring separately from runtime
-  - Represent unavailable component timing explicitly without inferring it from logs
+  - Expose persisted solver timing and explicit component availability without parsing logs
 
 Design principles:
   - Completed-case evidence remains the sole authority for artifact admission
@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import TYPE_CHECKING, Any, Protocol
 
+from . import generation_runtime_comsol_timing as comsol_timing
+
 if TYPE_CHECKING:
     from .generation_runtime_batch import TerminalCaseEvidence
 
@@ -37,6 +39,9 @@ _STATUS_SCHEMA_KIND = "simulation_case_status"
 _SCHEMA_VERSION = 1
 _UNAVAILABLE_NOT_PERSISTED = "unavailable_not_persisted"
 _UNAVAILABLE_NOT_APPLICABLE = "unavailable_not_applicable"
+_UNAVAILABLE_MISSING = "unavailable_missing"
+_UNAVAILABLE_AMBIGUOUS = "unavailable_ambiguous"
+_AVAILABLE = "available"
 
 
 class _CompletedTimingBatch(Protocol):
@@ -87,11 +92,12 @@ class CaseTimingEvidence:
     export_conversion_seconds: float
     complete_execution_seconds: float
     licence_wait_seconds: float
-    stationary_airflow_solver_seconds: None
-    transient_drying_solver_seconds: None
-    scientific_solver_seconds: None
+    stationary_airflow_solver_seconds: float | None
+    transient_drying_solver_seconds: float | None
+    scientific_solver_seconds: float | None
     queue_wait_seconds: None
     generation_compute_end_to_end_seconds: None
+    comsol_solver_timing: comsol_timing.ComsolSolverTiming | None
     component_timing_availability: tuple[tuple[str, str], ...]
 
     def as_dict(self) -> dict[str, Any]:
@@ -114,11 +120,12 @@ class CaseTimingEvidence:
             "export_conversion_seconds": self.export_conversion_seconds,
             "complete_execution_seconds": self.complete_execution_seconds,
             "licence_wait_seconds": self.licence_wait_seconds,
-            "stationary_airflow_solver_seconds": None,
-            "transient_drying_solver_seconds": None,
-            "scientific_solver_seconds": None,
+            "stationary_airflow_solver_seconds": self.stationary_airflow_solver_seconds,
+            "transient_drying_solver_seconds": self.transient_drying_solver_seconds,
+            "scientific_solver_seconds": self.scientific_solver_seconds,
             "queue_wait_seconds": None,
             "generation_compute_end_to_end_seconds": None,
+            "comsol_solver_timing": None if self.comsol_solver_timing is None else self.comsol_solver_timing.as_dict(),
             "component_timing_availability": dict(self.component_timing_availability),
         }
 
@@ -198,6 +205,17 @@ def _physical_status(
     return duration, duration if target_reached else None, target_reached, not target_reached, final_wet, "available", status_runtime
 
 
+def _phase_availability(status: comsol_timing.PhaseStatus) -> str:
+    """Translate structural phase status to the downstream availability vocabulary."""
+    if status == "complete":
+        return _AVAILABLE
+    if status == "not_applicable":
+        return _UNAVAILABLE_NOT_APPLICABLE
+    if status == "ambiguous":
+        return _UNAVAILABLE_AMBIGUOUS
+    return _UNAVAILABLE_MISSING
+
+
 def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch) -> CaseTimingEvidence:
     """
     Load current validated timing and status evidence for one completed case.
@@ -253,15 +271,39 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         raise ValueError("Case status and timing runtime values disagree.")
     if values["complete_execution_seconds"] < values["comsol_process_seconds"]:
         raise ValueError("Case complete execution time cannot be shorter than COMSOL process time.")
-    components = tuple(
-        (field, _UNAVAILABLE_NOT_PERSISTED)
-        for field in (
-            "stationary_airflow_solver_seconds",
-            "transient_drying_solver_seconds",
-            "scientific_solver_seconds",
-            "queue_wait_seconds",
-            "generation_compute_end_to_end_seconds",
+    solver_timing = comsol_timing.admit_persisted_solver_timing(
+        timing,
+        simulation_profile=batch.simulation_profile,
+    )
+    if solver_timing is None:
+        stationary_seconds = None
+        transient_seconds = None
+        scientific_seconds = None
+        solver_components = (
+            ("stationary_airflow_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
+            ("transient_drying_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
+            ("scientific_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
         )
+    else:
+        stationary_seconds = solver_timing.stationary_airflow.seconds
+        transient_seconds = solver_timing.transient_drying.seconds
+        scientific_seconds = solver_timing.scientific_solver_seconds
+        scientific_availability = (
+            _AVAILABLE
+            if solver_timing.status == "complete"
+            else _UNAVAILABLE_AMBIGUOUS
+            if solver_timing.status == "ambiguous"
+            else _UNAVAILABLE_MISSING
+        )
+        solver_components = (
+            ("stationary_airflow_solver_seconds", _phase_availability(solver_timing.stationary_airflow.status)),
+            ("transient_drying_solver_seconds", _phase_availability(solver_timing.transient_drying.status)),
+            ("scientific_solver_seconds", scientific_availability),
+        )
+    components = (
+        *solver_components,
+        ("queue_wait_seconds", _UNAVAILABLE_NOT_PERSISTED),
+        ("generation_compute_end_to_end_seconds", _UNAVAILABLE_NOT_PERSISTED),
     )
     return CaseTimingEvidence(
         case_id=case.case_id,
@@ -276,11 +318,12 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         target_wet_fraction_limit=target_limit,
         physical_duration_availability=physical_availability,
         target_wet_fraction_limit_availability=target_limit_availability,
-        stationary_airflow_solver_seconds=None,
-        transient_drying_solver_seconds=None,
-        scientific_solver_seconds=None,
+        stationary_airflow_solver_seconds=stationary_seconds,
+        transient_drying_solver_seconds=transient_seconds,
+        scientific_solver_seconds=scientific_seconds,
         queue_wait_seconds=None,
         generation_compute_end_to_end_seconds=None,
+        comsol_solver_timing=solver_timing,
         component_timing_availability=components,
         **values,
     )

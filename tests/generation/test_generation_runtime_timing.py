@@ -1,4 +1,4 @@
-# ruff: noqa: S101, D103, EM101, TRY003, TC003
+# ruff: noqa: S101, D103, EM101, FLY002, PLR2004, TRY003, TC003
 """Verify terminal timing evidence loading without runtime-text parsing."""
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from src.generation.runtime import generation_runtime_comsol_timing as comsol_timing
 from src.generation.runtime import generation_runtime_timing as timing
 
 if TYPE_CHECKING:
@@ -53,7 +54,7 @@ class _Batch:
         return {"scientific_fixed_values": {"f_wet_dm_max": 0.05}}
 
 
-def _write_sidecars(directory: Path) -> None:
+def _write_sidecars(directory: Path, *, include_solver_timing: bool = True) -> None:
     timing_payload = {
         "schema_kind": "simulation_case_timing",
         "schema_version": 1,
@@ -71,6 +72,21 @@ def _write_sidecars(directory: Path) -> None:
         "complete_execution_s": 16.0,
         "license_wait_seconds": 2.0,
     }
+    if include_solver_timing:
+        solver_timing = comsol_timing.parse_comsol_batch_log_text(
+            "\n".join(
+                (
+                    "<---- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) -",
+                    "Solution time: 3 s.",
+                    "----- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) >",
+                    "<---- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) -",
+                    "Solution time: 4 s.",
+                    "----- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) >",
+                )
+            ),
+            simulation_profile="transient_drying",
+        )
+        timing_payload.update(solver_timing.timing_fields())
     status_payload = {
         "schema_kind": "simulation_case_status",
         "schema_version": 1,
@@ -100,7 +116,12 @@ def test_load_case_timing_separates_physical_and_runtime_evidence(tmp_path: Path
     assert (result.physical_duration_hours, result.time_to_target_hours, result.target_reached, result.right_censored) == (96.0, None, False, True)
     assert (result.final_wet_fraction, result.target_wet_fraction_limit) == (0.07, 0.05)
     assert (result.comsol_process_seconds, result.export_conversion_seconds, result.complete_execution_seconds) == (12.0, 3.0, 16.0)
+    assert (result.stationary_airflow_solver_seconds, result.transient_drying_solver_seconds) == (3.0, 4.0)
+    assert result.scientific_solver_seconds == 7.0
+    assert result.comsol_process_seconds != result.scientific_solver_seconds
     payload = result.as_dict()
+    assert payload["comsol_solver_timing"]["status"] == "complete"
+    assert payload["component_timing_availability"]["scientific_solver_seconds"] == "available"
     assert payload["component_timing_availability"]["queue_wait_seconds"] == "unavailable_not_persisted"
     payload["component_timing_availability"]["queue_wait_seconds"] = "changed"
     assert result.as_dict()["component_timing_availability"]["queue_wait_seconds"] == "unavailable_not_persisted"
@@ -146,6 +167,52 @@ def test_load_case_timing_rejects_identity_schema_and_nonfinite_evidence(tmp_pat
     source.write_text(json.dumps(payload), encoding="utf-8")
     case = _Case(tmp_path)
     with pytest.raises((TypeError, ValueError)):
+        timing.load_case_timing(
+            cast("TerminalCaseEvidence", case),
+            batch=cast("TerminalBatchEvidence", _Batch(case)),
+        )
+
+
+def test_load_case_timing_keeps_legacy_solver_components_explicitly_unavailable(tmp_path: Path) -> None:
+    _write_sidecars(tmp_path, include_solver_timing=False)
+    case = _Case(tmp_path)
+
+    result = timing.load_case_timing(
+        cast("TerminalCaseEvidence", case),
+        batch=cast("TerminalBatchEvidence", _Batch(case)),
+    )
+
+    assert result.stationary_airflow_solver_seconds is None
+    assert result.transient_drying_solver_seconds is None
+    assert result.scientific_solver_seconds is None
+    assert result.comsol_solver_timing is None
+    assert result.as_dict()["component_timing_availability"]["scientific_solver_seconds"] == "unavailable_not_persisted"
+
+
+def test_load_case_timing_rejects_solver_sum_inconsistent_with_structural_evidence(tmp_path: Path) -> None:
+    _write_sidecars(tmp_path)
+    source = tmp_path / "timing.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["comsol_scientific_solver_seconds"] = 8.0
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    case = _Case(tmp_path)
+
+    with pytest.raises(ValueError, match="disagree with structural evidence"):
+        timing.load_case_timing(
+            cast("TerminalCaseEvidence", case),
+            batch=cast("TerminalBatchEvidence", _Batch(case)),
+        )
+
+
+def test_load_case_timing_rejects_total_record_count_smaller_than_phase_evidence(tmp_path: Path) -> None:
+    _write_sidecars(tmp_path)
+    source = tmp_path / "timing.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["comsol_solver_timing"]["solution_time_record_count"] = 1
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    case = _Case(tmp_path)
+
+    with pytest.raises(ValueError, match="counts exceed the total record count"):
         timing.load_case_timing(
             cast("TerminalCaseEvidence", case),
             batch=cast("TerminalBatchEvidence", _Batch(case)),

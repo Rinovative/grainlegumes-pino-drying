@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, PLR2004
 """Steady-flow fake-COMSOL, canonical HDF5, and package regression."""
 
 from __future__ import annotations
@@ -217,6 +217,16 @@ def test_transient_case_publishes_distinct_dual_view_dataset_ids(
         work_root=tmp_path / "dual-view-work",
     )
     generation.runtime.finalize_batch(batch, storage_root=storage)
+    admitted = generation.runtime.admit_terminal_batch(batch.batch_storage_name, storage_root=storage)
+    interpreted = datasets.packages.generated_batch.interpret_generated_transient_case(
+        admitted,
+        admitted.case("case_0001"),
+        task=domain.tasks.registry.get_task("transient_drying"),
+    )
+    assert interpreted["runtime"]["stationary_airflow_solver_seconds"] == 3.5
+    assert interpreted["runtime"]["transient_drying_solver_seconds"] == 7.25
+    assert interpreted["runtime"]["scientific_solver_seconds"] == 10.75
+    assert interpreted["runtime"]["comsol_solver_timing"]["status"] == "complete"
 
     transient = datasets.packages.build_dataset_package(
         campaign,

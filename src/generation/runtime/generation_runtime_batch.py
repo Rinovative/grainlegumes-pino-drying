@@ -54,6 +54,7 @@ from src.generation.publication import (
 from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol as comsol_service
+from . import generation_runtime_comsol_timing as comsol_timing
 from . import generation_runtime_license as license_service
 from . import generation_runtime_progress as progress_service
 from . import generation_runtime_stop as stop_service
@@ -61,8 +62,6 @@ from . import generation_runtime_workspace as workspace_service
 from .generation_runtime_preparation import PreparedCase, prepare_case_work_directory
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from src.generation.validation.generation_validation_policy import DiagnosticRecord
 
 PUBLICATION_SCHEMA_VERSION = 1
@@ -1380,30 +1379,19 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     scheduler_kind: str = "local",
     allocated_node: str | None = None,
     progress_reporter: progress_service.RuntimeProgressReporter | None = None,
-    diagnostic_observer: Callable[[str, PreparedCase, Mapping[str, Any]], None] | None = None,
 ) -> ExecutionResult:
     """Run one isolated COMSOL process and create its validated canonical HDF5."""
     scalar_handoff = prepared.bundle.scalar_handoff
     if scalar_handoff is not None:
         scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
-    batch_log = prepared.runtime_directory / "comsol_batch.log" if diagnostic_observer is not None else None
+    batch_log = prepared.runtime_directory / comsol_timing.COMSOL_BATCH_LOG_FILENAME
     command = comsol_service.build_comsol_command(
         config,
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
         scheduler_kind=scheduler_kind,
-        diagnostic_batchlog=(None if batch_log is None else str(batch_log)),
+        batch_log_path=str(batch_log),
     )
-    if diagnostic_observer is not None:
-        diagnostic_observer(
-            "prepared",
-            prepared,
-            {
-                "command": tuple(command),
-                "batch_log_path": (None if batch_log is None else str(batch_log)),
-                "cores_per_case": cores_per_case,
-            },
-        )
     try:
         _require_executable(command, comsol_executable=comsol_service.resolve_comsol_executable(config))
     except FileNotFoundError as error:
@@ -1509,6 +1497,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             stdout_path.open("w", encoding="utf-8", newline="\n") as stdout_stream,
             stderr_path.open("w", encoding="utf-8", newline="\n") as stderr_stream,
         ):
+            batch_log.unlink(missing_ok=True)
             _reset_runtime_progress_stdout(progress_reporter, stdout_path)
             if in_allocation_enabled:
                 _update_license_acquisition_progress(
@@ -1822,6 +1811,16 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             )
         break
     elapsed = time.monotonic() - monotonic_start
+    solver_timing = comsol_timing.parse_comsol_batch_log(
+        batch_log,
+        simulation_profile=config.profile.id,
+    )
+    if solver_timing.status != "complete":
+        detail = "; ".join(solver_timing.diagnostics) or "required top-level solver timing was not found"
+        print(
+            f"Warning: COMSOL solver timing is {solver_timing.status} for {prepared.bundle.case_id}: {detail}",
+            file=sys.stderr,
+        )
     timing = {
         "schema_kind": "simulation_case_timing",
         "schema_version": PUBLICATION_SCHEMA_VERSION,
@@ -1839,6 +1838,8 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         "started_at": started_at,
         "ended_at": _utc_now(),
         "runtime_s": elapsed,
+        "comsol_process_seconds": elapsed,
+        **solver_timing.timing_fields(),
         "requested_cores": cores_per_case,
         "worker_slot": worker_slot,
         "allocated_node": allocated_node,
@@ -4275,7 +4276,6 @@ def run_case(
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
     blocking_lock: bool = True,
-    diagnostic_observer: Callable[[str, PreparedCase, Mapping[str, Any]], None] | None = None,
 ) -> CaseRunOutcome:
     """Run or integrity-skip one case and always close marked scratch."""
     storage = workspace_service.resolve_storage_root(storage_root, create=True)
@@ -4323,7 +4323,6 @@ def run_case(
                 scheduler_kind=scheduler_kind,
                 allocated_node=allocated_node,
                 progress_reporter=progress_reporter,
-                diagnostic_observer=diagnostic_observer,
             )
             failure_stage = "publication"
             _update_runtime_progress(progress_reporter, phase="publishing", force=True)
@@ -4332,17 +4331,9 @@ def run_case(
                 result,
                 storage_root=storage,
             )
-            if diagnostic_observer is not None:
-                diagnostic_observer("finished", prepared, {"exit_code": 0, "error": None})
             _update_runtime_progress(progress_reporter, phase="completed", terminal=True)
         except BaseException as error:
             _update_runtime_progress(progress_reporter, phase="failed", terminal=True)
-            if diagnostic_observer is not None and prepared is not None:
-                diagnostic_observer(
-                    "finished",
-                    prepared,
-                    {"exit_code": getattr(error, "exit_code", None), "error": f"{type(error).__name__}: {error}"},
-                )
             attempt_directory, attempt_root, attempt_run_id = _workspace_from_attempt(prepared, error)
             try:
                 publication_complete = completed_case_is_valid(

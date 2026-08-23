@@ -25,7 +25,6 @@ CAMPAIGN_PURPOSE=""
 SCHEDULER_KIND=""
 PARTITION=""
 CORES_PER_NODE=""
-TIMING_PROBE_SCHEDULER_OPTIONS=()
 PYTHON_MODULE=""
 COMSOL_MODULE=""
 PYTHON_EXECUTABLE=""
@@ -82,7 +81,6 @@ Usage:
   $0 run CONFIG [--replacement-pool-size N [--parent-run-id RUN_ID]] [--background] [--keep-cpu-source] [remote options]
   $0 run CONFIG --dry-run [--replacement-pool-size N [--parent-run-id RUN_ID]]
   $0 run CONFIG --preflight-only [--replacement-pool-size N [--parent-run-id RUN_ID]] [remote options]
-  $0 timing-probe CONFIG [--background] [remote options]
   $0 setup-cpu [--execute] [remote options]
   $0 status CONFIG_OR_RUN_ID [remote options]
   $0 cancel RUN_ID [--force] [remote options]
@@ -718,8 +716,8 @@ launch_background_workflow() {
     fail 2 "A background workflow child cannot create another tmux session."
   require_command tmux "background workflow execution"
   local subcommand="${ORIGINAL_ARGUMENTS[0]}" background_count=0 argument
-  [[ "${subcommand}" == run || "${subcommand}" == timing-probe ]] ||
-    fail 2 "--background is supported only by run CONFIG or timing-probe CONFIG."
+  [[ "${subcommand}" == run ]] ||
+    fail 2 "--background is supported only by run CONFIG."
   local -a child_arguments=()
   local has_commit=false has_cpu_host=false has_remote_root=false
   for argument in "${ORIGINAL_ARGUMENTS[@]}"; do
@@ -741,7 +739,7 @@ launch_background_workflow() {
   if [[ "${has_commit}" != true ]]; then
     child_arguments+=(--git-commit "${REQUESTED_COMMIT}")
   fi
-  if [[ "${subcommand}" == run || "${subcommand}" == timing-probe ]]; then
+  if [[ "${subcommand}" == run ]]; then
     CPU_HOST="${GENERATION_CPU_HOST:-}"
     REMOTE_ROOT=""
     local index
@@ -1025,168 +1023,6 @@ ensure_execution_bootstrap() {
   validate_positive "configured cores_per_node" "${CORES_PER_NODE}"
 }
 
-
-resolve_timing_probe_contract() {
-  admit_repository_file "$1" "timing-probe campaign config"
-  CAMPAIGN_CONFIG_PATH="${ADMITTED_HOST_PATH}"
-  CAMPAIGN_RELATIVE_PATH="${ADMITTED_REPOSITORY_PATH}"
-  local record header option
-  local -a fields=()
-  record="$(local_python -c '
-import sys
-
-from src.generation import generation_timing_probe as probe
-
-plan = probe.resolve_timing_probe_plan(sys.argv[1])
-fields = (
-    plan["campaign_config"],
-    plan["campaign_id"],
-    plan["batch_name"],
-    str(plan["case_index"]),
-    str(plan["case_count"]),
-)
-options = tuple(plan["resources"]["scheduler_options"])
-if any(any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in field) for field in (*fields, *options)):
-    raise SystemExit("timing-probe plan contains unsafe shell transport text")
-print("\t".join(("timing-probe", *fields)))
-print(*options, sep="\n")
-' "${CAMPAIGN_CONFIG_PATH}")" || fail 2 "Could not resolve the ordinary timing-probe campaign."
-  mapfile -t fields <<< "${record}"
-  (( ${#fields[@]} >= 1 )) || fail 2 "Malformed timing-probe plan."
-  header="${fields[0]}"
-  local kind campaign_path campaign_id batch_name case_index case_count extra
-  IFS=$'\t' read -r kind campaign_path campaign_id batch_name case_index case_count extra <<< "${header}"
-  campaign_path="$(container_path_to_host "${campaign_path}")"
-  [[ "${kind}" == timing-probe && "${campaign_path}" == "${CAMPAIGN_CONFIG_PATH}" \
-    && -n "${campaign_id}" && -n "${batch_name}" && "${case_index}" =~ ^[0-9]+$ \
-    && "${case_count}" == 1 && -z "${extra:-}" ]] ||
-    fail 2 "Malformed timing-probe plan."
-  TIMING_PROBE_SCHEDULER_OPTIONS=()
-  for option in "${fields[@]:1}"; do
-    [[ "${option}" == --* && "${option}" != *$'\n'* && "${option}" != *$'\r'* \
-      && "${option}" != *$'\t'* ]] || fail 2 "Unsafe timing-probe scheduler option."
-    TIMING_PROBE_SCHEDULER_OPTIONS+=("${option}")
-  done
-  resolve_configured_resources executable
-  validate_resources
-  [[ "${CAMPAIGN_PURPOSE}" == technical_runtime_smoke ]] ||
-    fail 2 "Timing probe requires an ordinary technical-runtime-smoke campaign."
-}
-
-run_timing_probe_remote() {
-  local remote_campaign remote_output remote_status
-  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
-  verify_remote_setup
-  set +e
-  remote_output="$(remote_bash "${CPU_HOST}" "${REMOTE_REPOSITORY}" \
-    "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${REQUESTED_COMMIT}" \
-    "${remote_campaign}" "${PYTHON_MODULE}" "${COMSOL_MODULE}" \
-    "${COMSOL_EXECUTABLE}" "${PARTITION}" "${CORES_PER_CASE}" \
-    "${WALL_TIME}" "${TIMING_PROBE_SCHEDULER_OPTIONS[@]}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
-python_module="$6"; comsol_module="$7"; comsol_executable="$8"; partition="$9"
-cores="${10}"; wall_time="${11}"
-shift 11
-scheduler_options=("$@")
-module load "${python_module}"
-module load "${comsol_module}"
-command -v "${comsol_executable}" >/dev/null 2>&1 || {
-  printf 'COMSOL executable is unavailable in allocation environment.\n' >&2
-  exit 1
-}
-export GENERATION_CPU_VENV="${venv}"
-export STORAGE_ROOT="${storage}"
-export GENERATION_GIT_COMMIT="${commit}"
-cd "${repository}"
-command=(srun --nodes=1 --ntasks=1 --cpus-per-task="${cores}" --partition="${partition}")
-[[ -z "${wall_time}" ]] || command+=(--time="${wall_time}")
-command+=("${scheduler_options[@]}")
-command+=("${venv}/bin/python" -m src.generation.cli.cli_generation
-  timing-probe "${campaign}" --storage-root "${storage}")
-"${command[@]}"
-REMOTE
-)"
-  remote_status=$?
-  set -e
-  [[ -n "${remote_output}" ]] && printf '%s\n' "${remote_output}"
-
-  resolve_local_storage
-  resolve_local_python
-  local parsed probe_id probe_case_state probe_case_exit_code probe_cpu_bundle
-  local -a probe_fields=()
-  parsed="$(printf '%s\n' "${remote_output}" | local_python -c '
-import sys
-
-keys = ("PROBE_ID", "PROBE_CASE_STATE", "PROBE_CASE_EXIT_CODE", "PROBE_CPU_BUNDLE")
-values = {}
-for raw in sys.stdin:
-    line = raw.rstrip("\n")
-    for key in keys:
-        prefix = key + "="
-        if line.startswith(prefix):
-            if key in values:
-                raise SystemExit(f"duplicate {key} field")
-            values[key] = line[len(prefix):]
-missing = [key for key in keys if key not in values or not values[key]]
-if missing:
-    raise SystemExit("missing timing-probe result fields: " + ", ".join(missing))
-if any(any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value) for value in values.values()):
-    raise SystemExit("timing-probe result contains unsafe transport text")
-print(*(values[key] for key in keys), sep="\n")
-')" || fail_preserving_interrupt "${remote_status}" 1 \
-    "Remote timing probe did not publish complete retained result fields."
-  mapfile -t probe_fields <<< "${parsed}"
-  (( ${#probe_fields[@]} == 4 )) || fail 1 "Malformed timing-probe result fields."
-  probe_id="${probe_fields[0]}"
-  probe_case_state="${probe_fields[1]}"
-  probe_case_exit_code="${probe_fields[2]}"
-  probe_cpu_bundle="${probe_fields[3]}"
-  [[ "${probe_id}" =~ ^probe-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] ||
-    fail 1 "Malformed timing-probe identity."
-  [[ "${probe_case_exit_code}" =~ ^[0-9]+$ && "${probe_case_exit_code}" -le 255 ]] ||
-    fail 1 "Malformed timing-probe exit code."
-  case "${probe_case_state}" in
-    successful)
-      (( probe_case_exit_code == 0 && remote_status == 0 )) ||
-        fail 1 "Successful timing-probe fields disagree with the remote process status."
-      ;;
-    failed)
-      (( probe_case_exit_code > 0 && remote_status == probe_case_exit_code )) ||
-        fail 1 "Failed timing-probe fields disagree with the remote process status."
-      ;;
-    *) fail 1 "Malformed timing-probe case state." ;;
-  esac
-  local expected_cpu_bundle relative staging publication local_bundle
-  expected_cpu_bundle="${REMOTE_STORAGE_ROOT}/03_experiments/comsol_phase_timing_probe/${probe_id}"
-  [[ "${probe_cpu_bundle}" == "${expected_cpu_bundle}" ]] ||
-    fail 1 "Timing-probe CPU bundle escaped its exact experiment owner."
-  relative="${probe_cpu_bundle#"${REMOTE_STORAGE_ROOT}/"}"
-  validate_transfer_path "${relative}"
-  require_command rsync "timing-probe diagnostic transfer"
-  staging="$(local_cli create-transfer-staging "${probe_id}" \
-    --storage-root "${LOCAL_STORAGE_ROOT}")" ||
-    fail 1 "Could not create marked timing-probe transfer staging."
-  staging="$(container_path_to_host "${staging}")"
-  mkdir -m 700 -- "${staging}/${probe_id}" ||
-    fail 1 "Could not create the exact timing-probe staging member."
-  rsync -a --protect-args "${CPU_HOST}:${probe_cpu_bundle}/" "${staging}/${probe_id}/" ||
-    fail 1 "Timing-probe transfer failed; staging retained at ${staging}."
-  publication="$(local_cli publish-transferred-timing-probe "${probe_id}" \
-    --staging-root "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}")" ||
-    fail 1 "Timing-probe GPU publication failed; staging retained at ${staging}."
-  [[ "${publication}" == PROBE_BUNDLE=* && "${publication}" != *$'\n'* ]] ||
-    fail 1 "Malformed timing-probe GPU publication result; staging retained at ${staging}."
-  local_bundle="${publication#PROBE_BUNDLE=}"
-  local_bundle="$(container_path_to_host "${local_bundle}")"
-  [[ "${local_bundle}" == "${LOCAL_STORAGE_ROOT}/03_experiments/comsol_phase_timing_probe/${probe_id}" ]] ||
-    fail 1 "Timing-probe GPU bundle escaped its exact experiment owner."
-  local_cli cleanup-transfer-staging --campaign-run-id "${probe_id}" \
-    --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" --confirm >/dev/null ||
-    fail 1 "Timing-probe publication succeeded, but transfer staging cleanup failed at ${staging}."
-  printf 'PROBE_BUNDLE=%s\n' "${local_bundle}"
-  return "${remote_status}"
-}
 
 resolve_campaign() {
   admit_repository_file "$1" "campaign config"
@@ -3918,13 +3754,6 @@ resolve_local_commit
 handoff_to_pinned_workflow
 
 case "${SUBCOMMAND}" in
-  timing-probe)
-    (( ${#POSITIONAL[@]} == 1 )) || fail 2 "timing-probe requires exactly one probe config."
-    [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false && "${FORCE_CANCEL}" == false && "${KEEP_CPU_SOURCE}" == false && "${DEFER_COLLECTION}" == false && "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false && -z "${REPLACEMENT_POOL_SIZE}" && -z "${PARENT_RUN_ID}" ]] || fail 2 "timing-probe received an unsupported option."
-    resolve_timing_probe_contract "${POSITIONAL[0]}"
-    resolve_remote_layout
-    run_timing_probe_remote
-    ;;
   run)
     (( ${#POSITIONAL[@]} == 1 )) ||
       fail 2 "run requires exactly one Generation config."

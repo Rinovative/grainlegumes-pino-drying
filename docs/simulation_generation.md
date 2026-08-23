@@ -285,8 +285,8 @@ publishing a composite and prints a continuation using a larger pool. Repeating
 the same or larger pool resumes the persisted completion owner. Completion mode
 requires automatic host collection, so it cannot be combined with
 `--defer-collection`. `--preflight-only` checks execution prerequisites.
-`--background` preserves the same pool and parent arguments. The independent
-timing probe is never a completion prerequisite.
+`--background` preserves the same pool and parent arguments. Normal solver-timing
+metadata adds no completion gate.
 
 `--dry-run` mutates nothing and reports replacement enablement, requested
 high-water mark, compatible and selected parents, target counts, current
@@ -378,24 +378,36 @@ batch, range, commit, and storage root:
 Input EDA discovers only admitted canonical manifests and reads them without
 mutating or regenerating cases.
 
-## Bounded COMSOL phase-timing diagnostic
+## COMSOL process and scientific solver timing
 
-The temporary `timing-probe CONFIG` path accepts the ordinary transient
-Technical Smoke campaign and selects exactly one configured case. Canonical
-input generation, normal scratch preparation, the standard Slurm/COMSOL runtime,
-export collection, normal publication, failure-attempt or temporary-license
-wait recording, and scratch cleanup remain authoritative. The probe adds diagnostic observation only; its isolated
-normal case is removed after compact evidence is retained, so it publishes no
-production Generation case or Dataset package.
+Every normal case writes one attempt-local `comsol_batch.log` through COMSOL's
+`-batchlog` and `-batchlogout` flags. After the process exits, Generation parses
+the finalized log once and persists compact evidence in the normal `timing.json`.
+The raw batch log then follows the existing success or failure retention policy.
+Configured extra arguments cannot override the runtime-owned log path.
 
-The workflow automatically transfers the exact immutable diagnostic bundle from
-CPU storage to local experiment storage, including for a retained nonzero case
-result, and rejects extra or corrupt content. COMSOL runs only inside the
-allocation. Candidate A/B/C semantics, foreground and background commands,
-validation, truthful limitations, and the complete removal inventory are in the
-[COMSOL phase timing probe guide](comsol_phase_timing_probe.md). Direct CLI
-or Python API execution outside an exact configured Slurm allocation is rejected
-before the probe can inspect or launch COMSOL.
+`comsol_process_seconds` remains the monotonic elapsed duration of the complete
+COMSOL process, including loading, compilation, solver work, exports, and other
+process overhead. COMSOL-reported scientific timing is separate:
+
+- `comsol_stationary_airflow_seconds` is the `Solution time` directly owned by
+  the matched top-level `Stationary Solver 1` block in the Stationary Airflow
+  solution;
+- `comsol_transient_drying_seconds` is the corresponding value from the matched
+  top-level `Time-Dependent Solver 1` block in the Transient Drying solution;
+- `comsol_scientific_solver_seconds` is their sum for transient cases and equals
+  the stationary value for steady-airflow cases.
+
+The structural parser requires matching COMSOL open and close boundaries.
+Compilation, dependent-variable, and other nested `Solution time` records are
+excluded, and unrelated text containing `Stationary` or `Transient` cannot
+change ownership. Missing or ambiguous timing leaves unavailable fields null and
+records a bounded status and diagnostic without invalidating an otherwise
+successful scientific case. Confirmed stationary evidence may remain available
+when a transient solve fails, but no scientific sum is computed without every
+required phase. The admitted Generation timing adapter exposes the values,
+method, status, block identity, and source-line evidence to Dataset packages and
+downstream benchmarking without requiring raw-log access.
 
 ## Identity and provenance policy
 
