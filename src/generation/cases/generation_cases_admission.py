@@ -647,9 +647,14 @@ def _load_input_batch_envelope(
     *,
     raw_directory: Path | str | None,
     expected_input_generation_id: str | None,
+    require_raw_directory: bool = True,
 ) -> _InputBatchEnvelope:
     """Validate immutable batch identity before bounded case reconstruction."""
-    directory = Path(directory).expanduser().resolve()
+    metadata_candidate = Path(directory).expanduser()
+    if metadata_candidate.is_symlink():
+        message = f"Input-generation metadata directory is an unsafe symbolic link: {metadata_candidate}"
+        raise ValueError(message)
+    directory = metadata_candidate.resolve()
     if not directory.is_dir():
         message = f"Input-generation metadata directory does not exist: {directory}"
         raise ValueError(message)
@@ -742,8 +747,20 @@ def _load_input_batch_envelope(
             str(generation_id),
             storage_root=directory.parents[4],
         )
-    raw = Path(raw_directory).expanduser().resolve()
-    if not raw.is_dir() or raw.is_symlink():
+    raw_candidate = Path(raw_directory).expanduser()
+    if raw_candidate.is_symlink():
+        message = f"Canonical input raw batch is an unsafe symbolic link: {raw_candidate}"
+        raise ValueError(message)
+    raw = raw_candidate.resolve()
+    if not raw.is_dir():
+        if not require_raw_directory:
+            return _InputBatchEnvelope(
+                directory=directory,
+                raw_directory=raw,
+                manifest=manifest,
+                resolved_config=resolved,
+                parameter_metadata=resolved["registry_metadata"],
+            )
         message = f"Canonical input raw batch is missing or unsafe: {raw}"
         raise ValueError(message)
     if raw.name != generation_id or raw.parent.name != "input_generations" or raw.parent.parent.name != batch_storage_name:
@@ -756,6 +773,83 @@ def _load_input_batch_envelope(
         resolved_config=resolved,
         parameter_metadata=resolved["registry_metadata"],
     )
+
+
+def admit_retired_input_case_metadata(
+    directory: Path | str,
+    case_index: int,
+    *,
+    expected_input_generation_id: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Admit durable input metadata for one case after raw cleanup."""
+    if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 1:
+        message = "Retired input metadata requires a positive integer case index."
+        raise ValueError(message)
+    envelope = _load_input_batch_envelope(
+        directory,
+        raw_directory=None,
+        expected_input_generation_id=expected_input_generation_id,
+        require_raw_directory=False,
+    )
+    records = envelope.manifest["cases"]
+    indices = envelope.manifest["case_indices"]
+    expected_digest = frozenset("0123456789abcdef")
+    case_input_ids: set[str] = set()
+    simulation_case_ids: set[str] = set()
+    selected: Mapping[str, Any] | None = None
+    for record, index in zip(records, indices, strict=True):
+        input_files = record.get("input_files") if isinstance(record, Mapping) else None
+        valid_files = (
+            isinstance(input_files, Mapping)
+            and bool(input_files)
+            and all(
+                isinstance(name, str)
+                and name
+                and not Path(name).is_absolute()
+                and ".." not in Path(name).parts
+                and Path(name).as_posix() == name
+                and isinstance(identity, Mapping)
+                and set(identity) == {"sha256", "size_bytes"}
+                and isinstance(identity.get("sha256"), str)
+                and len(identity["sha256"]) == _SHA256_LENGTH
+                and set(identity["sha256"]).issubset(expected_digest)
+                and isinstance(identity.get("size_bytes"), int)
+                and not isinstance(identity.get("size_bytes"), bool)
+                and identity["size_bytes"] >= 0
+                for name, identity in (input_files.items() if isinstance(input_files, Mapping) else ())
+            )
+        )
+        case_input_id = record.get("case_input_id") if isinstance(record, Mapping) else None
+        simulation_case_id = record.get("simulation_case_id") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(record, Mapping)
+            or set(record) != INPUT_CASE_RECORD_KEYS
+            or record.get("case_index") != index
+            or record.get("case_id") != f"case_{index:04d}"
+            or not isinstance(case_input_id, str)
+            or len(case_input_id) != _SHA256_LENGTH
+            or not set(case_input_id).issubset(expected_digest)
+            or not isinstance(simulation_case_id, str)
+            or len(simulation_case_id) != _SHA256_LENGTH
+            or not set(simulation_case_id).issubset(expected_digest)
+            or any(
+                not isinstance(record.get(name), str) or len(record[name]) != _SHA256_LENGTH or not set(record[name]).issubset(expected_digest)
+                for name in ("case_json_sha256", "seed_evidence_sha256")
+            )
+            or not valid_files
+            or case_input_id in case_input_ids
+            or simulation_case_id in simulation_case_ids
+        ):
+            message = "Retired input-generation metadata has malformed, duplicate, or incomplete case evidence."
+            raise ValueError(message)
+        case_input_ids.add(case_input_id)
+        simulation_case_ids.add(simulation_case_id)
+        if index == case_index:
+            selected = record
+    if selected is None:
+        message = f"Input-generation manifest does not declare retired case index {case_index}."
+        raise ValueError(message)
+    return envelope.manifest, envelope.resolved_config, selected
 
 
 def _raise_for_execution_artifact(*roots: Path) -> None:

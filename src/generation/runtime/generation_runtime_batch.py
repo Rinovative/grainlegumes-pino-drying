@@ -18,6 +18,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -501,7 +502,7 @@ class HDF5IdentityEvidence:
 
 @dataclass(frozen=True, slots=True)
 class TerminalCaseEvidence:
-    """Describe one completely admitted raw and processed terminal case."""
+    """Describe one admitted terminal case with optional retained raw evidence."""
 
     case_index: int
     case_id: str
@@ -511,13 +512,14 @@ class TerminalCaseEvidence:
     success_sha256: str
     provenance_sha256: str
     case_hdf5_sha256: str
-    raw_directory: Path
+    raw_directory: Path | None
     processed_directory: Path
     hdf5_path: Path
     raw_artifacts: tuple[ArtifactEvidence, ...]
     processed_artifacts: tuple[ArtifactEvidence, ...]
     hdf5_identity: HDF5IdentityEvidence
     _case_metadata_json: str
+    source_kind: Literal["raw_and_processed", "processed_only"] = "raw_and_processed"
 
     def metadata_payload(self) -> dict[str, Any]:
         """Return an independent mutable copy of canonical case metadata."""
@@ -2461,6 +2463,35 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _load_json_object_at_sha256(
+    path: Path,
+    *,
+    label: str,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Load the exact JSON object bound to one already admitted digest."""
+    if not path.is_file() or path.is_symlink():
+        message = f"Missing required {label}: {path}"
+        raise FileNotFoundError(message)
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        message = f"Could not read {label}: {path}"
+        raise ValueError(message) from error
+    if hashlib.sha256(payload).hexdigest() != _require_sha256(expected_sha256, label=f"{label} sha256"):
+        message = f"{label} changed after admission: {path}"
+        raise RuntimeError(message)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        message = f"Could not decode {label}: {path}"
+        raise ValueError(message) from error
+    if not isinstance(value, dict):
+        message = f"{label} must contain a JSON object: {path}"
+        raise TypeError(message)
+    return value
+
+
 def _canonical_json_text(payload: Mapping[str, Any]) -> str:
     """Return one deterministic compact JSON representation."""
     return json.dumps(dict(payload), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -2744,12 +2775,88 @@ def _admit_raw_publication(
     )
 
 
+def _admit_processed_case_payload(
+    directory: Path,
+    provenance: Mapping[str, Any],
+    *,
+    raw_evidence: _PublicationEvidence | None,
+    validation_depth: ValidationDepth,
+    case_payload_evidence: Mapping[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Admit raw-backed or explicitly reconstructed processed case metadata."""
+    if case_payload_evidence is None:
+        input_generation_id, admitted_raw = _admit_processed_raw_publication(
+            directory,
+            provenance,
+            raw_evidence=raw_evidence,
+            validation_depth=validation_depth,
+        )
+        case_payload = dict(admitted_raw.case_payload)
+    else:
+        if raw_evidence is not None:
+            message = "Processed-only admission cannot also receive raw publication evidence."
+            raise TypeError(message)
+        if (
+            set(provenance) != _CASE_PUBLICATION_KEYS
+            or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
+            or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        ):
+            message = f"Case publication schema is not current: {directory}"
+            raise RuntimeError(message)
+        input_generation_id = common.paths.validate_logical_name(
+            provenance.get("input_generation_id"),
+            label="input_generation_id",
+        )
+        case_payload = dict(case_payload_evidence)
+    try:
+        case_service.validate_case_payload_schema(case_payload)
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"Canonical case provenance does not match the active exact schema: {directory}"
+        raise RuntimeError(message) from error
+    return input_generation_id, case_payload
+
+
+def _require_processed_success_evidence(
+    status: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    *,
+    case_id: str,
+    simulation_case_id: str,
+    directory: Path,
+) -> None:
+    """Require positive scientific and COMSOL success evidence."""
+    stages = status.get("stages")
+    result = execution.get("result")
+    successful_stages = ("solver", "exports", "conversion", "publication")
+    if (
+        status.get("schema_kind") != "simulation_case_status"
+        or status.get("schema_version") != storage_service.STATUS_SCHEMA_VERSION
+        or status.get("case_state") != "successful"
+        or status.get("solver_success") is not True
+        or status.get("contains_nan_or_inf") is not False
+        or status.get("field_shape_valid") is not True
+        or not isinstance(stages, dict)
+        or any(stages.get(name) != "succeeded" for name in successful_stages)
+        or execution.get("schema_kind") != "simulation_execution_provenance"
+        or execution.get("schema_version") != 1
+        or execution.get("case_id") != case_id
+        or execution.get("simulation_case_id") != simulation_case_id
+        or not isinstance(result, dict)
+        or result.get("state") != "succeeded"
+        or result.get("exit_code") != 0
+        or result.get("timed_out") is not False
+    ):
+        message = f"Processed scientific or COMSOL success evidence is invalid in {directory}."
+        raise RuntimeError(message)
+
+
 def _admit_publication_directory(
     directory: Path,
     *,
     stage: str,
     validation_depth: ValidationDepth = "full",
     raw_evidence: _PublicationEvidence | None = None,
+    case_payload_evidence: Mapping[str, Any] | None = None,
 ) -> _PublicationEvidence:
     """Admit one publication at an explicit integrity-validation depth."""
     validation_depth = _require_validation_depth(validation_depth)
@@ -2769,18 +2876,13 @@ def _admit_publication_directory(
     provenance_path = directory / "provenance.json"
     success = _load_json_object(success_path, label=f"{stage} case success marker")
     provenance = _load_json_object(provenance_path, label=f"{stage} case publication provenance")
-    input_generation_id, admitted_raw = _admit_processed_raw_publication(
+    input_generation_id, case_payload = _admit_processed_case_payload(
         directory,
         provenance,
         raw_evidence=raw_evidence,
         validation_depth=validation_depth,
+        case_payload_evidence=case_payload_evidence,
     )
-    case_payload = admitted_raw.case_payload
-    try:
-        case_service.validate_case_payload_schema(case_payload)
-    except (KeyError, TypeError, ValueError) as error:
-        msg = f"Canonical case provenance does not match the active exact schema: {directory}"
-        raise RuntimeError(msg) from error
     if (
         set(success) != _CASE_SUCCESS_KEYS
         or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
@@ -2908,6 +3010,7 @@ def _admit_publication_directory(
         msg = f"Processed publication lacks canonical payload or runtime evidence: {directory}"
         raise RuntimeError(msg)
     timing = _load_json_object(directory / "timing.json", label="case timing")
+    status = _load_json_object(directory / "status.json", label="case status")
     execution = _load_json_object(
         directory / "execution_provenance.json",
         label="case execution provenance",
@@ -2915,6 +3018,13 @@ def _admit_publication_directory(
     processing = _load_json_object(
         directory / "processing_provenance.json",
         label="case processing provenance",
+    )
+    _require_processed_success_evidence(
+        status,
+        execution,
+        case_id=case_id,
+        simulation_case_id=simulation_case_id,
+        directory=directory,
     )
     processing_keys = {
         "schema_kind",
@@ -3051,20 +3161,19 @@ def validate_completed_case(
     validation_depth: ValidationDepth = "full",
     input_reference: admission_service.InputCaseReference | None = None,
 ) -> dict[str, Any]:
-    """Validate one completed case at an explicit integrity depth."""
-    raw_evidence = None if input_reference is None else _raw_publication_from_reference(input_reference)
-    processed = _admit_publication_directory(
-        processed_case_directory(config, case_index, storage_root=storage_root),
-        stage="processed",
+    """Validate one completed case through the authoritative terminal admission."""
+    admitted = admit_completed_case(
+        config,
+        case_index,
+        storage_root=storage_root,
         validation_depth=validation_depth,
-        raw_evidence=raw_evidence,
+        input_reference=input_reference,
     )
-    _require_publication_matches_config(
-        processed,
-        config=config,
-        case_index=case_index,
+    return _load_json_object_at_sha256(
+        admitted.processed_directory / "provenance.json",
+        label="processed case publication provenance",
+        expected_sha256=admitted.provenance_sha256,
     )
-    return dict(processed.provenance)
 
 
 def admit_completed_case(
@@ -3086,14 +3195,13 @@ def admit_completed_case(
     case_index : int
         Configured case index to admit.
     storage_root : Path | str | None, optional
-        Storage root containing the raw and processed case publications.
+        Storage root containing the processed case and any retained raw publication.
     validation_depth : {"routine", "full", "deep"}, optional
         Integrity depth used for raw and processed publication admission.
     input_reference : InputCaseReference | None, optional
         Exact raw-input evidence already admitted by the caller.
     git_commit : str | None, optional
-        Persisted source commit used to bind configured raw-input identity when
-        the caller has not already admitted an input reference.
+        Persisted source commit required to match the processed publication.
 
     Returns
     -------
@@ -3103,7 +3211,7 @@ def admit_completed_case(
     Raises
     ------
     FileNotFoundError
-        If required raw or processed case evidence is absent or unsafe.
+        If required processed or durable identity evidence is absent or unsafe.
     ValueError
         If the configured case index or persisted evidence is malformed.
     RuntimeError
@@ -3117,21 +3225,43 @@ def admit_completed_case(
     """
     validation_depth = _require_validation_depth(validation_depth)
     config.case_id(case_index)
+    processed_directory = processed_case_directory(config, case_index, storage_root=storage_root)
+    provenance = _load_json_object(processed_directory / "provenance.json", label="processed case publication provenance")
+    input_generation_id = common.paths.validate_logical_name(
+        provenance.get("input_generation_id"),
+        label="processed input_generation_id",
+    )
+    persisted_raw = common.paths.resolve_generation_input_generation_raw_directory(
+        config.batch_storage_name,
+        input_generation_id,
+        storage_root=storage_root,
+    ) / config.case_id(case_index)
+    if persisted_raw.is_symlink() or persisted_raw.parent.is_symlink() or (persisted_raw.exists() and not persisted_raw.is_dir()):
+        message = f"Processed publication references unsafe contradictory raw evidence: {persisted_raw}"
+        raise RuntimeError(message)
+    if git_commit is not None and provenance.get("git_commit") != source_service.validate_git_commit(git_commit):
+        message = "Processed publication source commit disagrees with the requested completion source commit."
+        raise RuntimeError(message)
+    if not persisted_raw.is_dir():
+        if input_reference is not None:
+            message = "Processed-only completion reuse cannot receive contradictory raw input evidence."
+            raise RuntimeError(message)
+        return _admit_processed_only_completed_case(config, case_index, storage_root=storage_root)
     if input_reference is None:
-        input_reference = input_service.admit_configured_input_case(
-            config,
-            case_index,
-            storage_root=storage_root,
-            git_commit=git_commit,
+        raw = _admit_raw_publication_directory(
+            persisted_raw,
+            validation_depth=validation_depth,
         )
-    raw, processed = _admit_terminal_case_publications(
-        input_reference,
-        processed_directory=processed_case_directory(
-            config,
-            case_index,
-            storage_root=storage_root,
-        ),
+    else:
+        raw = _raw_publication_from_reference(input_reference)
+        if input_reference.source_id != input_generation_id or raw.directory != persisted_raw.resolve():
+            message = "Provided raw input evidence disagrees with the processed publication input-generation identity."
+            raise RuntimeError(message)
+    processed = _admit_publication_directory(
+        processed_directory,
+        stage="processed",
         validation_depth=validation_depth,
+        raw_evidence=raw,
     )
     _require_publication_matches_config(raw, config=config, case_index=case_index)
     _require_publication_matches_config(processed, config=config, case_index=case_index)
@@ -3571,6 +3701,209 @@ def repair_completed_case_hdf5_from_retained_exports(
         )
 
 
+def _admit_processed_only_completed_case(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    *,
+    storage_root: Path | str | None,
+) -> TerminalCaseEvidence:
+    """Admit one successful processed case after its canonical raw inputs were retired."""
+    directory = processed_case_directory(config, case_index, storage_root=storage_root)
+    provenance = _load_json_object(directory / "provenance.json", label="processed case publication provenance")
+    input_generation_id = common.paths.validate_logical_name(
+        provenance.get("input_generation_id"),
+        label="processed input_generation_id",
+    )
+    metadata_directory = (
+        common.paths.get_generation_meta_root(storage_root=storage_root) / config.batch_storage_name / "input_generations" / input_generation_id
+    )
+    manifest, resolved, record = admission_service.admit_retired_input_case_metadata(
+        metadata_directory,
+        case_index,
+        expected_input_generation_id=input_generation_id,
+    )
+    hdf5 = storage_service.validate_case_hdf5(
+        directory / "case.h5",
+        expected_profile=config.profile.id,
+        include_reuse_evidence=True,
+    )
+    reuse_evidence = hdf5.get("reuse_evidence")
+    if not isinstance(reuse_evidence, Mapping):
+        message = f"Canonical HDF5 lacks validated completion-reuse evidence: {directory}"
+        raise TypeError(message)
+    case_scientific = reuse_evidence.get("case_scientific_provenance")
+    input_files = reuse_evidence.get("input_files")
+    scalar_handoff = reuse_evidence.get("scalar_handoff")
+    template = reuse_evidence.get("template")
+    if (
+        not isinstance(case_scientific, dict)
+        or not isinstance(input_files, dict)
+        or not isinstance(template, dict)
+        or resolved != config.scientific_values
+        or hdf5["scientific_config_digest"] != manifest["scientific_config_digest"]
+        or template
+        != {
+            "sha256": config.template_sha256,
+            "sha256_validation": "pass",
+            "comsol_internal_contract": "runtime_validation_required",
+        }
+        or manifest["template_relative_path"] != config.template_relative_path
+        or manifest["template_sha256"] != config.template_sha256
+        or manifest["git_commit"] != provenance.get("git_commit")
+        or input_files != record["input_files"]
+        or case_scientific.get("case_id") != config.case_id(case_index)
+        or case_scientific.get("case_index") != case_index
+        or case_scientific.get("case_input_id") != record["case_input_id"]
+        or case_scientific.get("simulation_case_id") != record["simulation_case_id"]
+    ):
+        message = f"Processed-only reuse evidence disagrees with input metadata or configured science: {directory}"
+        raise RuntimeError(message)
+    case_input_payload = {
+        "schema_version": case_service.CASE_SCHEMA_VERSION,
+        "case_input_config_digest": manifest["case_input_config_digest"],
+        "material_family": case_scientific["material_family"],
+        "sampling_regime": case_scientific["sampling_regime"],
+        "ood": case_scientific["ood"],
+        "case_index": case_index,
+        "seed_evidence": case_scientific["seed_evidence"],
+        "block_provenance": case_scientific["block_provenance"],
+        "sampled_values": case_scientific["sampled_values"],
+        "coupled_selections": case_scientific["coupled_selections"],
+        "input_files": input_files,
+    }
+    case_input_id = case_service.compute_case_input_id(case_input_payload)
+    simulation_case_id = case_service.compute_simulation_case_id(
+        {
+            "schema_version": case_service.CASE_SCHEMA_VERSION,
+            "case_input_id": case_input_id,
+            "simulation_profile": config.profile.id,
+            "template": {
+                "relative_path": manifest["template_relative_path"],
+                "filename": Path(str(manifest["template_relative_path"])).name,
+                "sha256": manifest["template_sha256"],
+            },
+            "export_contract_sha256": hdf5["export_contract_sha256"],
+            "steady_flow_conditioning_digest": common.serialization.canonical_json_sha256(resolved["steady_flow_conditioning"]),
+        }
+    )
+    if case_input_id != record["case_input_id"] or simulation_case_id != record["simulation_case_id"]:
+        message = f"Processed-only reuse identities cannot be recomputed from durable evidence: {directory}"
+        raise RuntimeError(message)
+    payload = {
+        "schema_kind": case_service.CASE_SCHEMA_KIND,
+        "schema_version": case_service.CASE_SCHEMA_VERSION,
+        "simulation_profile": config.profile.id,
+        "batch_id": manifest["batch_id"],
+        "batch_identity": manifest["batch_identity"],
+        "scientific_config_digest": manifest["scientific_config_digest"],
+        "case_input_config_digest": manifest["case_input_config_digest"],
+        "case_id": config.case_id(case_index),
+        "case_index": case_index,
+        "generator_version": manifest["generator_version"],
+        "git_commit": manifest["git_commit"],
+        "material_family": case_scientific["material_family"],
+        "material_role": case_scientific["material_role"],
+        "evaluation_regime": case_scientific["evaluation_regime"],
+        "sampling_regime": case_scientific["sampling_regime"],
+        "natural_support_state": case_scientific["natural_support_state"],
+        "ood": case_scientific["ood"],
+        "available_learning_views": list(config.profile.available_learning_views),
+        "airflow_source": config.profile.airflow_source,
+        "steady_flow_conditioning": resolved["steady_flow_conditioning"],
+        "steady_flow_conditioning_digest": common.serialization.canonical_json_sha256(resolved["steady_flow_conditioning"]),
+        "stationary_fixed_ownership": resolved["stationary_fixed_ownership"],
+        "stationary_fixed_values": [
+            {
+                "name": name,
+                "value": float(resolved["scientific_fixed_values"][name]),
+                "unit": unit,
+                "owner": "package_fixed",
+                "runtime_source": "canonical_template",
+            }
+            for name, unit in zip(
+                profiles.STATIONARY_FIXED_FIELDS,
+                profiles.STATIONARY_FIXED_UNITS,
+                strict=True,
+            )
+        ],
+        "seed_evidence": case_scientific["seed_evidence"],
+        "block_provenance": case_scientific["block_provenance"],
+        "sampled_values": case_scientific["sampled_values"],
+        "sampled_units": case_scientific["sampled_units"],
+        "coupled_selections": case_scientific["coupled_selections"],
+        "spatial_diagnostics": case_scientific["spatial_diagnostics"],
+        "input_contract": resolved["input_contract"],
+        "template": {
+            "relative_path": manifest["template_relative_path"],
+            "filename": Path(str(manifest["template_relative_path"])).name,
+            "sha256": manifest["template_sha256"],
+        },
+        "export_contract_sha256": hdf5["export_contract_sha256"],
+        "input_files": input_files,
+        "case_input_id": case_input_id,
+        "simulation_case_id": simulation_case_id,
+    }
+    for name in ("schedule_diagnostics", "pilot_check"):
+        if name in case_scientific:
+            payload[name] = case_scientific[name]
+    if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
+        if not isinstance(scalar_handoff, dict) or not isinstance(scalar_handoff.get("entries"), list):
+            message = f"Processed-only transient reuse lacks validated scalar-handoff provenance: {directory}"
+            raise RuntimeError(message)
+        payload["scalar_handoff"] = scalar_handoff
+        payload["scalars"] = scalar_handoff["entries"]
+    elif scalar_handoff is not None:
+        message = f"Processed-only steady-flow reuse contains transient scalar provenance: {directory}"
+        raise RuntimeError(message)
+    try:
+        case_service.validate_case_payload_schema(payload)
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"Processed-only durable evidence cannot reconstruct the canonical case schema: {directory}"
+        raise RuntimeError(message) from error
+    serialized_case = json.dumps(
+        payload,
+        ensure_ascii=True,
+        indent=2,
+        sort_keys=True,
+    )
+    reconstructed_case_sha256 = hashlib.sha256(f"{serialized_case}\n".encode()).hexdigest()
+    if (
+        reconstructed_case_sha256 != record["case_json_sha256"]
+        or common.serialization.canonical_json_sha256(payload["seed_evidence"]) != record["seed_evidence_sha256"]
+    ):
+        message = f"Processed-only durable evidence does not reproduce the immutable case metadata digest: {directory}"
+        raise RuntimeError(message)
+    processed = _admit_publication_directory(
+        directory,
+        stage="processed",
+        validation_depth="full",
+        case_payload_evidence=payload,
+    )
+    _require_publication_matches_config(processed, config=config, case_index=case_index)
+    hdf5_artifacts = tuple(item for item in processed.artifacts if item.relative_path == "case.h5")
+    if len(hdf5_artifacts) != 1 or processed.hdf5_identity is None:
+        message = f"Processed-only completion lacks one admitted canonical HDF5: {config.case_id(case_index)!r}."
+        raise RuntimeError(message)
+    return TerminalCaseEvidence(
+        case_index=case_index,
+        case_id=config.case_id(case_index),
+        material_family=config.material_family,
+        case_input_id=case_input_id,
+        simulation_case_id=simulation_case_id,
+        success_sha256=_safe_file_sha256(directory / "_SUCCESS", label="processed case success marker"),
+        provenance_sha256=_safe_file_sha256(directory / "provenance.json", label="processed case publication provenance"),
+        case_hdf5_sha256=hdf5_artifacts[0].sha256,
+        raw_directory=None,
+        processed_directory=processed.directory,
+        hdf5_path=(processed.directory / "case.h5").resolve(),
+        raw_artifacts=(),
+        processed_artifacts=processed.artifacts,
+        hdf5_identity=processed.hdf5_identity,
+        _case_metadata_json=_canonical_json_text(payload),
+        source_kind="processed_only",
+    )
+
+
 def completed_case_is_valid(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -3580,9 +3913,9 @@ def completed_case_is_valid(
     git_commit: str | None = None,
 ) -> bool:
     """Return false only when processed completion is absent; corruption fails closed."""
-    raw = raw_case_directory(config, case_index, storage_root=storage_root)
     processed = processed_case_directory(config, case_index, storage_root=storage_root)
     if not (processed / "_SUCCESS").exists():
+        raw = raw_case_directory(config, case_index, storage_root=storage_root)
         if raw.exists():
             reference = input_reference or input_service.admit_configured_input_case(
                 config,
@@ -3596,21 +3929,13 @@ def completed_case_is_valid(
                 case_index=case_index,
             )
         return False
-    if not raw.exists():
-        message = f"Processed completion exists without canonical raw inputs: {processed}"
-        raise RuntimeError(message)
-    reference = input_reference or input_service.admit_configured_input_case(
-        config,
-        case_index,
-        storage_root=storage_root,
-        git_commit=git_commit,
-    )
-    validate_completed_case(
+    admit_completed_case(
         config,
         case_index,
         storage_root=storage_root,
         validation_depth="routine",
-        input_reference=reference,
+        input_reference=input_reference,
+        git_commit=git_commit,
     )
     return True
 

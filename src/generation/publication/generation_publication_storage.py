@@ -2250,8 +2250,16 @@ def _validate_hdf5_transient(
     _validate_hdf5_diagnostics(handle, complete_time, scientific)
 
 
-def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> dict[str, Any]:
+def validate_case_hdf5(
+    path: Path,
+    *,
+    expected_profile: str | None = None,
+    include_reuse_evidence: bool = False,
+) -> dict[str, Any]:
     """Validate exact schema-v1 layout, provenance, units, shapes, and identities."""
+    if not isinstance(include_reuse_evidence, bool):
+        message = "include_reuse_evidence must be boolean."
+        raise TypeError(message)
     if not path.is_file() or path.is_symlink():
         msg = f"Canonical case HDF5 is missing or unsafe: {path}"
         raise FileNotFoundError(msg)
@@ -2318,7 +2326,7 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
         if "git_commit" in handle.attrs:
             message = "Canonical HDF5 scientific content must not embed execution Git provenance."
             raise ValueError(message)
-        return {
+        result = {
             "simulation_profile": profile,
             "git_commit": None,
             "template_relative_path": template_relative_path,
@@ -2328,6 +2336,25 @@ def validate_case_hdf5(path: Path, *, expected_profile: str | None = None) -> di
             "retention_policy": retention_policy,
             **identities,
         }
+        if include_reuse_evidence:
+            result["reuse_evidence"] = {
+                "case_scientific_provenance": _hdf5_json_dataset(
+                    handle,
+                    "provenance/case_scientific_provenance_json",
+                ),
+                "input_files": _hdf5_json_dataset(
+                    handle,
+                    "provenance/input_files_json",
+                ),
+                "scalar_handoff": (
+                    _hdf5_json_dataset(handle, "provenance/scalar_handoff_json") if profile == profiles.TRANSIENT_DRYING_PROFILE else None
+                ),
+                "template": _hdf5_json_dataset(
+                    handle,
+                    "provenance/template_json",
+                ),
+            }
+        return result
 
 
 def read_transient_final_bulk_moisture(path: Path) -> float:

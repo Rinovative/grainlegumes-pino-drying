@@ -612,6 +612,57 @@ def test_parent_resolution_is_structural_ambiguous_and_override_bound(
         )
 
 
+def test_parent_resolution_skips_stale_candidates_and_fails_closed_on_claimed_corruption(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore structurally stale runs but reject corruption after a digest match."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm", natural_count=3)
+    parent = generation.cases.config.load_campaign_config(config_path)
+    stale_run_id = "parent__1111111111111111"
+    compatible_run_id = "parent__2222222222222222"
+    for run_id, campaign_digest in (
+        (stale_run_id, "0" * 64),
+        (compatible_run_id, parent.campaign_digest),
+    ):
+        directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
+        directory.mkdir(parents=True)
+        common.serialization.atomic_write_json(
+            directory / "campaign_run.json",
+            {"campaign_digest": campaign_digest},
+        )
+
+    admitted: list[str] = []
+
+    def admit_compatible(run_id: str, **_kwargs: Any) -> tuple[dict[str, Any], Any]:
+        admitted.append(run_id)
+        return {"state": "complete", "git_commit": "d" * 40}, parent
+
+    monkeypatch.setattr(completion, "_compatible_campaign_run", admit_compatible)
+    selected = completion.find_compatible_completion_parent(
+        parent,
+        storage_root=tmp_path,
+        require_transferred=False,
+    )
+    assert selected["status"] == "compatible_complete"
+    assert selected["parent_run_id"] == compatible_run_id
+    assert admitted == [compatible_run_id]
+
+    def reject_corrupt(run_id: str, **_kwargs: Any) -> None:
+        assert run_id == compatible_run_id
+        message = "claimed-compatible campaign evidence is corrupt"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(completion, "_compatible_campaign_run", reject_corrupt)
+    with pytest.raises(RuntimeError, match="claimed-compatible campaign evidence is corrupt"):
+        completion.find_compatible_completion_parent(
+            parent,
+            storage_root=tmp_path,
+            require_transferred=False,
+        )
+
+
 def _completed_replacement_state(
     generation_config_factory: Any,
     tmp_path: Path,
