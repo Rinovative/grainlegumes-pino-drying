@@ -156,6 +156,7 @@ def test_transient_shard_default_is_materialization_owned_and_identity_neutral(
             "dataset_view": "transient_drying",
             "evaluation_regime": "id",
             "source_role": "seen",
+            "dataset_revision": 0,
             "training_payload": {
                 "backend": "pt_shards",
                 "required": True,

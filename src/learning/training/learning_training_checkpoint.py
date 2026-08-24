@@ -86,7 +86,7 @@ _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
 )
 _CONFIG_PROVENANCE_ROOT_KEYS: Final = frozenset({"paths", "tracking"})
 _RUN_SEMANTIC_KEYS: Final = frozenset({"seed", "deterministic"})
-_RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "suffix"})
+_RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "suffix", "revision", "naming_schema_version"})
 _DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "ood_datasets", "train_ratio", "ood_fraction", "batch_size"})
 _DATA_EXECUTION_KEYS: Final = frozenset({"num_workers", "pin_memory", "persistent_workers"})
 _CHECKPOINT_KEYS = frozenset(
@@ -178,10 +178,11 @@ def effective_config_identity_payload(
                     "transient_backend_required",
                     "hdf5_cache_size",
                     "allow_technical_smoke",
+                    "dataset_references",
                 }
             )
             if is_transient
-            else _DATA_EXECUTION_KEYS
+            else _DATA_EXECUTION_KEYS | {"dataset_references"}
         ),
         label="data",
     )

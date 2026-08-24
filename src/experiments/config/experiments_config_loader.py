@@ -96,7 +96,7 @@ _RESOLVED_PATH_KEYS = frozenset(
     }
 )
 _SECTION_KEYS = {
-    "run": frozenset({"seed", "deterministic", "device", "suffix", "name"}),
+    "run": frozenset({"seed", "revision", "deterministic", "device", "suffix", "name", "naming_schema_version"}),
     "data": frozenset(
         {
             "train_dataset",
@@ -112,6 +112,7 @@ _SECTION_KEYS = {
             "transient_backend_required",
             "hdf5_cache_size",
             "allow_technical_smoke",
+            "dataset_references",
         }
     ),
     "model": frozenset({"kind", "params"}),
@@ -177,8 +178,13 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         _reject_unknown(section_mapping, allowed, path=section)
 
     raw_run = _as_mapping(user_config.get("run"), path="run")
-    if raw_run.get("name") is not None:
-        msg = "run.name is derived and must not be supplied by an executable request."
+    derived_run_keys = sorted({"name", "naming_schema_version"}.intersection(raw_run))
+    if derived_run_keys:
+        msg = f"Derived run key(s) must not be supplied by an executable request: {derived_run_keys}."
+        raise ConfigError(msg)
+    raw_data = _as_mapping(user_config.get("data"), path="data")
+    if "dataset_references" in raw_data:
+        msg = "data.dataset_references is resolved metadata and must not be authored."
         raise ConfigError(msg)
 
     model = _as_mapping(user_config.get("model"), path="model")
@@ -745,6 +751,185 @@ def _ood_datasets(data: Mapping[str, Any], *, path: str, allow_empty: bool = Fal
     return dataset_ids
 
 
+def _validate_reference_record(value: object, *, path: str) -> dict[str, Any]:
+    """Validate one pinned immutable Dataset-reference record with path context."""
+    try:
+        return datasets.packages.references.validate_dataset_reference_record(value)
+    except (TypeError, ValueError) as error:
+        message = f"{path}: {error}"
+        raise ConfigError(message) from error
+
+
+def _resolve_dataset_selector(
+    value: object,
+    *,
+    task: str,
+    path: str,
+    pinned: object,
+    storage_root: Path | str | None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Resolve one authored exact ID or explicit logical Dataset reference once."""
+    if isinstance(value, str):
+        if pinned is not None:
+            message = f"{path} is an exact Dataset ID but its pinned reference evidence is non-null."
+            raise ConfigError(message)
+        try:
+            return common.paths.validate_logical_name(value, label=path), None
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+    if not isinstance(value, Mapping):
+        message = f"{path} must be an exact Dataset ID or a mapping with explicit name and revision."
+        raise ConfigError(message)
+    try:
+        reference = datasets.packages.references.DatasetRef.from_mapping(value)
+    except (TypeError, ValueError) as error:
+        message = f"{path} must be an exact Dataset ID or a mapping with explicit name and revision: {error}"
+        raise ConfigError(message) from error
+    if pinned is None:
+        try:
+            record = datasets.packages.references.resolve_dataset_reference_record(
+                task,
+                reference.name,
+                reference.revision,
+                storage_root=storage_root,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            message = f"{path}: unable to resolve Dataset reference {reference.name!r} revision {reference.revision}: {error}"
+            raise ConfigError(message) from error
+    else:
+        record = _validate_reference_record(pinned, path=f"{path}.pinned_reference")
+    if record["task"] != task or record["name"] != reference.name or record["revision"] != reference.revision:
+        message = f"{path} does not match its pinned task, name, and revision evidence."
+        raise ConfigError(message)
+    return record["dataset_id"], record
+
+
+def _resolve_dataset_selections(
+    config: dict[str, Any],
+    *,
+    authored_data: Mapping[str, Any],
+    task: str,
+    storage_root: Path | str | None,
+    pinned_dataset_references: Mapping[str, Any] | None,
+) -> None:
+    """Resolve authored Dataset selections and persist their complete bounded evidence."""
+    data = _as_mapping(config["data"], path="data")
+    raw_ood = authored_data.get("ood_datasets")
+    if not isinstance(raw_ood, list):
+        message = "data.ood_datasets must be a list of exact Dataset IDs or logical references."
+        raise ConfigError(message)
+    if pinned_dataset_references is None:
+        pinned_train = None
+        pinned_ood: list[object] = [None] * len(raw_ood)
+    else:
+        pinned_mapping = _as_mapping(pinned_dataset_references, path="data.dataset_references")
+        if set(pinned_mapping) != {"train", "ood"}:
+            message = "data.dataset_references must contain exactly train and ood evidence."
+            raise ConfigError(message)
+        pinned_train = pinned_mapping["train"]
+        raw_pinned_ood = pinned_mapping["ood"]
+        if not isinstance(raw_pinned_ood, list) or len(raw_pinned_ood) != len(raw_ood):
+            message = "data.dataset_references.ood must align exactly with data.ood_datasets."
+            raise ConfigError(message)
+        pinned_ood = list(raw_pinned_ood)
+    train_id, train_record = _resolve_dataset_selector(
+        authored_data["train_dataset"],
+        task=task,
+        path="data.train_dataset",
+        pinned=pinned_train,
+        storage_root=storage_root,
+    )
+    ood_ids: list[str] = []
+    ood_records: list[dict[str, Any] | None] = []
+    for index, selector in enumerate(raw_ood):
+        dataset_id, record = _resolve_dataset_selector(
+            selector,
+            task=task,
+            path=f"data.ood_datasets[{index}]",
+            pinned=pinned_ood[index],
+            storage_root=storage_root,
+        )
+        ood_ids.append(dataset_id)
+        ood_records.append(record)
+    data["train_dataset"] = train_id
+    data["ood_datasets"] = ood_ids
+    data["dataset_references"] = {"train": train_record, "ood": ood_records}
+    config["data"] = data
+
+
+def _validate_dataset_reference_evidence(config: dict[str, Any]) -> None:
+    """Validate persisted reference evidence without consulting mutable external state."""
+    data = _as_mapping(config["data"], path="data")
+    raw = data.get("dataset_references")
+    if raw is None:
+        return
+    evidence = _as_mapping(raw, path="data.dataset_references")
+    if set(evidence) != {"train", "ood"}:
+        message = "data.dataset_references must contain exactly train and ood evidence."
+        raise ConfigError(message)
+    ood_ids = data.get("ood_datasets")
+    raw_ood = evidence["ood"]
+    if not isinstance(ood_ids, list) or not isinstance(raw_ood, list) or len(raw_ood) != len(ood_ids):
+        message = "data.dataset_references.ood must align exactly with data.ood_datasets."
+        raise ConfigError(message)
+
+    def validate_binding(record: object, *, dataset_id: object, path: str) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        validated = _validate_reference_record(record, path=path)
+        if validated["task"] != config.get("task") or validated["dataset_id"] != dataset_id:
+            message = f"{path} does not bind the configured task and exact Dataset ID."
+            raise ConfigError(message)
+        return validated
+
+    validated_train = validate_binding(
+        evidence["train"],
+        dataset_id=data.get("train_dataset"),
+        path="data.dataset_references.train",
+    )
+    validated_ood = [
+        validate_binding(record, dataset_id=ood_ids[index], path=f"data.dataset_references.ood[{index}]") for index, record in enumerate(raw_ood)
+    ]
+    data["dataset_references"] = {"train": validated_train, "ood": validated_ood}
+    config["data"] = data
+
+
+def audit_resolved_dataset_references(
+    config: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None = None,
+) -> tuple[str, ...]:
+    """Audit present logical references against pinned evidence while allowing removal."""
+    candidate = copy.deepcopy(dict(config))
+    _validate_dataset_reference_evidence(candidate)
+    evidence = candidate["data"].get("dataset_references")
+    if not isinstance(evidence, Mapping):
+        return ()
+    records = [evidence["train"], *evidence["ood"]]
+    missing: list[str] = []
+    for record in records:
+        if record is None:
+            continue
+        label = f"{record['task']}/{record['name']}/r{record['revision']}"
+        try:
+            current = datasets.packages.references.resolve_dataset_reference_record(
+                record["task"],
+                record["name"],
+                record["revision"],
+                storage_root=storage_root,
+            )
+        except FileNotFoundError:
+            missing.append(label)
+            continue
+        except (OSError, TypeError, ValueError) as error:
+            message = f"Pinned Dataset reference audit failed for {label}: {error}"
+            raise ConfigError(message) from error
+        if current != record:
+            message = f"Pinned Dataset reference audit detected identity drift for {label}."
+            raise ConfigError(message)
+    return tuple(missing)
+
+
 def _model_variant(config: Mapping[str, Any]) -> str:
     """Return the exact human-facing network/loss variant."""
     model = _as_mapping(config.get("model"), path="model")
@@ -1097,10 +1282,44 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
                 "tags",
                 "monitor",
                 "upload",
+                "metric_schema_version",
             }
         ),
         path="tracking.wandb",
     )
+    metric_schema_version = wandb.get(
+        "metric_schema_version",
+        config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
+    )
+    if (
+        isinstance(metric_schema_version, bool)
+        or not isinstance(metric_schema_version, int)
+        or metric_schema_version
+        not in {
+            config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
+            config_defaults.WANDB_METRIC_SCHEMA_VERSION,
+        }
+    ):
+        msg = "tracking.wandb.metric_schema_version is unsupported."
+        raise ConfigError(msg)
+    if not require_derived:
+        naming_schema_version = _as_mapping(config.get("run"), path="run").get(
+            "naming_schema_version",
+            _LEGACY_RUN_NAMING_SCHEMA_VERSION,
+        )
+        metric_schema_version = (
+            config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION
+            if naming_schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION
+            else config_defaults.WANDB_METRIC_SCHEMA_VERSION
+        )
+    persist_metric_schema = (
+        "metric_schema_version" in wandb or _as_mapping(config.get("run"), path="run").get("naming_schema_version") == RUN_NAMING_SCHEMA_VERSION
+    )
+    if persist_metric_schema:
+        wandb["metric_schema_version"] = metric_schema_version
+    else:
+        wandb.pop("metric_schema_version", None)
+
     mode = wandb.get("mode")
     if mode not in {"online", "offline", "disabled"}:
         msg = "tracking.wandb.mode must be 'online', 'offline', or 'disabled'."
@@ -1135,6 +1354,27 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
     wandb["upload"] = upload
     tracking["wandb"] = wandb
     config["tracking"] = tracking
+
+
+def _validate_current_run_identity_schema(run: Mapping[str, Any], data: Mapping[str, Any]) -> None:
+    """Validate the persisted run-naming schema and its required identity evidence."""
+    naming_schema_version = run.get(
+        "naming_schema_version",
+        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
+    )
+    if (
+        isinstance(naming_schema_version, bool)
+        or not isinstance(naming_schema_version, int)
+        or naming_schema_version not in {_LEGACY_RUN_NAMING_SCHEMA_VERSION, RUN_NAMING_SCHEMA_VERSION}
+    ):
+        msg = "run.naming_schema_version is unsupported."
+        raise ConfigError(msg)
+    if naming_schema_version == RUN_NAMING_SCHEMA_VERSION and "revision" not in run:
+        msg = "Current resolved runs must persist run.revision explicitly."
+        raise ConfigError(msg)
+    if naming_schema_version == RUN_NAMING_SCHEMA_VERSION and "dataset_references" not in data:
+        msg = "Current resolved runs must persist data.dataset_references evidence."
+        raise ConfigError(msg)
 
 
 def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracking: bool) -> None:
@@ -1179,6 +1419,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         msg = "training.ood_evaluation_interval must be positive."
         raise ConfigError(msg)
     data = _as_mapping(config["data"], path="data")
+    _validate_dataset_reference_evidence(config)
+    data = _as_mapping(config["data"], path="data")
     batch_size = data.get("batch_size")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         msg = "data.batch_size must be a positive integer."
@@ -1204,6 +1446,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     _validate_tracking(config, require_derived=require_derived_tracking)
 
     run = _as_mapping(config["run"], path="run")
+    _nonnegative_integer(run.get("revision", 0), path="run.revision")
+    _validate_current_run_identity_schema(run, data)
     try:
         run["device"] = learning.device_policy.validate_device_policy(
             run.get("device"),
@@ -1222,29 +1466,111 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     _validate_run_context(config)
 
 
-def generate_run_name(config: dict[str, Any]) -> str:
-    """
-    Generate a descriptive run name from semantic model and loss settings.
+RUN_NAMING_SCHEMA_VERSION = 2
+_LEGACY_RUN_NAMING_SCHEMA_VERSION = 1
+_EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
 
-    Parameters
-    ----------
-    config : dict[str, Any]
-        Resolved experiment configuration.
 
-    Returns
-    -------
-    str
-        Deterministic architecture/science/seed name with an optional final
-        experiment suffix.
+def _nonnegative_integer(value: object, *, path: str) -> int:
+    """Return one exact non-negative integer or raise a config error."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"{path} must be an integer >= 0, got {value!r}."
+        raise ConfigError(msg)
+    return value
 
-    Raises
-    ------
-    ConfigError
-        If required semantic model or scientific settings are invalid.
 
-    """
-    run = _as_mapping(config["run"], path="run")
-    data = _as_mapping(config["data"], path="data")
+def _dataset_display_name(config: Mapping[str, Any]) -> str:
+    """Return the concise Train Dataset reference label without exact digests."""
+    data = _as_mapping(config.get("data"), path="data")
+    references = data.get("dataset_references")
+    if isinstance(references, Mapping):
+        train_reference = references.get("train")
+        if isinstance(train_reference, Mapping):
+            try:
+                name = common.paths.validate_logical_name(
+                    train_reference.get("name"),
+                    label="data.dataset_references.train.name",
+                )
+            except ValueError as error:
+                raise ConfigError(str(error)) from error
+            revision = _nonnegative_integer(
+                train_reference.get("revision"),
+                path="data.dataset_references.train.revision",
+            )
+            return name if revision == 0 else f"{name}_d{revision}"
+
+    try:
+        dataset_id = common.paths.validate_logical_name(
+            data.get("train_dataset"),
+            label="data.train_dataset",
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    parts = dataset_id.split("__")
+    if parts and parts[0] == config.get("task"):
+        parts.pop(0)
+    if len(parts) > 1 and _EXACT_DATASET_DIGEST_TOKEN.fullmatch(parts[-1]) is not None:
+        parts.pop()
+    display_name = "_".join(parts)
+    try:
+        return common.paths.validate_logical_name(
+            display_name,
+            label="Train Dataset display name",
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+
+
+def _stage_display_token(config: Mapping[str, Any]) -> str | None:
+    """Return the concise child-stage token when the resolved run is staged."""
+    training = config.get("training")
+    if not isinstance(training, Mapping):
+        return None
+    stage = training.get("stage")
+    comparison_arm = training.get("comparison_arm")
+    if stage == "a":
+        return "a0" if comparison_arm == "a0" else "a"
+    if stage == "b":
+        return "b"
+    return None
+
+
+def generate_parent_experiment_label(config: Mapping[str, Any]) -> str:
+    """Generate the canonical concise parent label for a new experiment."""
+    run = _as_mapping(config.get("run"), path="run")
+    data = _as_mapping(config.get("data"), path="data")
+    model_key = resolved_model_variant(config)
+    scientific_variant = resolved_scientific_variant(config)
+    _validate_run_context(
+        config,
+        model_key=model_key,
+        scientific_variant=scientific_variant,
+    )
+    seed = _nonnegative_integer(run.get("seed"), path="run.seed")
+    revision = _nonnegative_integer(run.get("revision", 0), path="run.revision")
+    parts = [model_key]
+    if scientific_variant is not None:
+        parts.append(scientific_variant)
+    spatial_stride = data.get("spatial_stride", 1)
+    if config.get("task") == "transient_drying" and spatial_stride != 1:
+        parts.append(f"stride{spatial_stride}")
+    parts.extend((_dataset_display_name(config), f"s{seed}"))
+    suffix = run.get("suffix")
+    if suffix:
+        parts.append(str(suffix))
+    if revision > 0:
+        parts.append(f"r{revision}")
+    label = "_".join(parts)
+    try:
+        return common.paths.validate_logical_name(label, label="human experiment label")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+
+
+def _generate_legacy_run_name(config: Mapping[str, Any]) -> str:
+    """Regenerate the exact pre-reference run name for legacy saved configs."""
+    run = _as_mapping(config.get("run"), path="run")
+    data = _as_mapping(config.get("data"), path="data")
     model_key = resolved_model_variant(config)
     scientific_variant = resolved_scientific_variant(config)
     _validate_run_context(
@@ -1259,11 +1585,7 @@ def generate_run_name(config: dict[str, Any]) -> str:
         )
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    seed = run.get("seed")
-    if type(seed) is not int or seed < 0:
-        msg = f"run.seed must be a non-negative integer for run identity, got {seed!r}."
-        raise ConfigError(msg)
-
+    seed = _nonnegative_integer(run.get("seed"), path="run.seed")
     parts = [model_key]
     if scientific_variant is not None:
         parts.append(scientific_variant)
@@ -1274,6 +1596,23 @@ def generate_run_name(config: dict[str, Any]) -> str:
     if run.get("suffix"):
         parts.append(str(run["suffix"]))
     return "__".join(parts)
+
+
+def generate_run_name(config: Mapping[str, Any]) -> str:
+    """Generate the schema-appropriate persisted run leaf and display name."""
+    run = _as_mapping(config.get("run"), path="run")
+    schema_version = run.get(
+        "naming_schema_version",
+        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
+    )
+    if schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION:
+        return _generate_legacy_run_name(config)
+    if schema_version != RUN_NAMING_SCHEMA_VERSION:
+        msg = f"run.naming_schema_version is unsupported: {schema_version!r}."
+        raise ConfigError(msg)
+    parent = generate_parent_experiment_label(config)
+    stage = _stage_display_token(config)
+    return parent if stage is None else f"{parent}_{stage}"
 
 
 _TRANSIENT_STATE_CHANNELS = 4
@@ -1413,7 +1752,8 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         "hdf5_cache_size",
         "allow_technical_smoke",
     }
-    if set(data) != required_data:
+    allowed_data_keys = (required_data, required_data | {"dataset_references"})
+    if set(data) not in allowed_data_keys:
         _raise_config_error("Transient data keys do not match the loader contract.")
     if (
         data["transient_backend_preference"] not in {"pt_shards", "canonical_hdf5"}
@@ -1551,7 +1891,13 @@ def _reject_transient_roots_for_steady(config: Mapping[str, Any]) -> None:
         _raise_config_error(f"Steady-flow config does not admit transient root key(s): {unexpected}.")
 
 
-def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
+def resolve_config(
+    user_config: dict[str, Any],
+    *,
+    storage_root: Path | str | None = None,
+    naming_schema_version: int = RUN_NAMING_SCHEMA_VERSION,
+    pinned_dataset_references: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Strictly resolve one semantic experiment configuration.
 
@@ -1559,6 +1905,12 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     ----------
     user_config : dict[str, Any]
         Raw semantic experiment mapping.
+    storage_root : Path or str or None, optional
+        Explicit Dataset-reference and resolved-path root for controlled callers.
+    naming_schema_version : int, optional
+        Derived run-label schema selected by fresh or legacy lifecycle owners.
+    pinned_dataset_references : Mapping[str, Any] or None, optional
+        Saved immutable reference evidence used instead of current external aliases.
 
     Returns
     -------
@@ -1571,6 +1923,11 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
         If the schema, identifiers, fields, or settings violate the contract.
     ValueError
         If a referenced semantic identifier is not registered.
+
+    Notes
+    -----
+    Logical Dataset references are resolved once here and persisted as exact IDs
+    plus immutable bounded evidence. Exact Dataset IDs remain accepted.
 
     """
     if not isinstance(user_config, Mapping):
@@ -1589,11 +1946,28 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     authored_data = _as_mapping(user_config.get("data"), path="data")
     missing_dataset_ids = [key for key in ("train_dataset", "ood_datasets") if key not in authored_data]
     if missing_dataset_ids:
-        msg = f"Experiment data must explicitly select exact Dataset IDs; missing={missing_dataset_ids}."
+        msg = f"Experiment data must explicitly select Dataset identities; missing={missing_dataset_ids}."
+        raise ConfigError(msg)
+    if (
+        isinstance(naming_schema_version, bool)
+        or not isinstance(naming_schema_version, int)
+        or naming_schema_version not in {_LEGACY_RUN_NAMING_SCHEMA_VERSION, RUN_NAMING_SCHEMA_VERSION}
+    ):
+        msg = f"Unsupported requested run naming schema version: {naming_schema_version!r}."
         raise ConfigError(msg)
 
     effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
     effective["task"] = task_id
+    run = _as_mapping(effective["run"], path="run")
+    run["naming_schema_version"] = naming_schema_version
+    effective["run"] = run
+    _resolve_dataset_selections(
+        effective,
+        authored_data=authored_data,
+        task=task_id,
+        storage_root=storage_root,
+        pinned_dataset_references=pinned_dataset_references,
+    )
     is_transient = task_id == "transient_drying"
     if is_transient:
         _validate_transient_extensions(effective, authored=user_config)
@@ -1657,10 +2031,10 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     effective["task_contract"] = task.resolved_contract()
     effective["paths"] = {
         "project_root": str(common.paths.get_project_root()),
-        "storage_root": str(common.paths.get_storage_root()),
-        "dataset_metadata_root": str(common.paths.get_dataset_metadata_root()),
-        "dataset_root": str(common.paths.get_dataset_packages_root()),
-        "output_root": str(common.paths.get_experiments_root()),
+        "storage_root": str(common.paths.get_storage_root(storage_root=storage_root)),
+        "dataset_metadata_root": str(common.paths.get_dataset_metadata_root(storage_root=storage_root)),
+        "dataset_root": str(common.paths.get_dataset_packages_root(storage_root=storage_root)),
+        "output_root": str(common.paths.get_experiments_root(storage_root=storage_root)),
     }
     run = _as_mapping(effective["run"], path="run")
     run["name"] = generate_run_name(effective)
@@ -1669,6 +2043,11 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     except ValueError as error:
         raise ConfigError(str(error)) from error
     effective["run"] = run
+    if naming_schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION:
+        effective["run"].pop("revision", None)
+        effective["run"].pop("naming_schema_version", None)
+        effective["data"].pop("dataset_references", None)
+        effective["tracking"]["wandb"].pop("metric_schema_version", None)
     return effective
 
 

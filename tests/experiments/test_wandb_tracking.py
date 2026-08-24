@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,15 @@ import torch
 from support import configs
 
 from src import datasets, experiments
+from src.experiments.config import experiments_config_transient_plan as transient_plan
 
 tracking = experiments.tracking
+
+_CURATED_CUDA_METRIC_COUNT = 25
+_CURATED_CUDA_LOG_ENTRY_COUNT = 26
+_CURRENT_METRIC_SCHEMA_VERSION = 2
+_GIB_BYTES = 1024**3
+_PROJECTED_GIB = 2.0
 
 
 class _FakeArtifact:
@@ -126,6 +134,60 @@ def _resolved_config(
         settings["study"] = study
     raw["training"]["epochs"] = epochs
     return experiments.config.loader.resolve_config(raw)
+
+
+def _current_transient_config(*, mode: str = "online") -> dict[str, Any]:
+    """Return one current transient child with exact and logical Dataset identity."""
+    train_id = "transient_drying__synthetic_family__id__0123456789abcdef"
+    ood_id = "transient_drying__synthetic_family__near_family_ood__fedcba9876543210"
+    raw = configs.transient_two_stage_config(revision=1)
+    raw["data"]["train_dataset"] = train_id
+    raw["data"]["ood_datasets"] = [ood_id]
+    raw["tracking"]["wandb"]["mode"] = mode
+    plan = transient_plan.resolve_transient_training_plan(raw)
+    config = copy.deepcopy(dict(plan.stage_a))
+    config["run"]["device"] = "cuda"
+    config["data"]["dataset_references"] = {
+        "train": {
+            "task": "transient_drying",
+            "name": "synthetic_family_id",
+            "revision": 1,
+            "dataset_id": train_id,
+        },
+        "ood": [
+            {
+                "task": "transient_drying",
+                "name": "synthetic_family_ood",
+                "revision": 0,
+                "dataset_id": ood_id,
+            }
+        ],
+    }
+    config["run"]["name"] = experiments.config.loader.generate_run_name(config)
+    return config
+
+
+def _transient_split_evidence() -> dict[str, Any]:
+    """Return compact transient split evidence for semantic W&B projection."""
+    return {
+        "schema_kind": "transient_drying_training_split",
+        "schema_version": 1,
+        "tensorizer": {"input_profile": "complete", "temporal_conditioning": "none"},
+        "sampling": {"window": 2},
+        "ood_fraction": 0.2,
+        "split_seed": 7,
+        "dataset_identity": {
+            "train": {"dataset_id": "train", "index_digest": "b" * 64},
+            "ood": [{"dataset_id": "ood", "index_digest": "c" * 64}],
+        },
+        "roles": {
+            "train": {"case_ids": ["a"]},
+            "scaling_train_one_step": {"case_ids": ["a"]},
+            "evaluation": {"case_ids": ["b"]},
+            "id_test": {"case_ids": ["c"]},
+            "ood": {"parts": [{"case_ids": ["d"]}]},
+        },
+    }
 
 
 def _patch_wandb(monkeypatch: pytest.MonkeyPatch, fake: _FakeWandb) -> None:
@@ -382,9 +444,14 @@ def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys()
         transient_scaling={"semantic_digest": "1" * 64, "scale_mode": "delta_rms"},
         transient_handoff={"source_run_name": "a0", "compatibility_digest": "2" * 64},
     )
+    assert payload["run"]["revision"] == config["run"]["revision"]
+    assert payload["data"]["configured_identity"]["train_dataset"] == config["data"]["train_dataset"]
     assert payload["data"]["split"]["roles"]["evaluation"]["case_ids"] == ["b"]
     assert payload["data"]["normalization"]["semantic_digest"] == "1" * 64
     assert payload["provenance"]["runtime_backend"] == {"train": "pt_shards"}
+    assert payload["provenance"]["checkpoint_config_digest"] == "f" * 64
+    assert payload["provenance"]["resolved_config_sha256"] != payload["provenance"]["checkpoint_config_digest"]
+    assert payload["provenance"]["schema_versions"]["wandb_metrics"] == _CURRENT_METRIC_SCHEMA_VERSION
     definitions = tracking.automatic_history_metric_definitions(
         config["evaluation"]["metrics"],
         objective_id="normalized_drying_group_macro_rmse",
@@ -393,12 +460,66 @@ def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys()
         physics_monitor_enabled=False,
         cuda_enabled=False,
         task_id="transient_drying",
+        metric_schema_version=1,
     )
     destinations = {definition.wandb_key for definition in definitions}
     assert "Transient/Loss/train_data_w_int" in destinations
     assert "Transient/ID/normalized_drying_group_macro_rmse" in destinations
     assert "Transient/ID/Guardrail/one_step/physical_mae_T" in destinations
     assert len(destinations) == len(definitions)
+
+
+def test_current_transient_session_projects_curated_history_and_parent_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Project only current curated metrics while retaining opaque SDK run identity."""
+    config = _current_transient_config()
+    semantic = tracking.build_semantic_config(
+        config,
+        split_indices=_transient_split_evidence(),
+        split_indices_sha256="d" * 64,
+        normalizer_sha256="e" * 64,
+        checkpoint_identity={"effective_config_digest": "f" * 64},
+        model=torch.nn.Linear(2, 3),
+        device_metadata={"resolved_device": "cuda:0", "pytorch_version": torch.__version__},
+        duration_contract=experiments.run.RUN_DURATION_CONTRACT,
+        runtime_provenance={"train": "pt_shards"},
+        transient_scaling={"semantic_digest": "1" * 64, "scale_mode": "state_std"},
+    )
+    fake = _FakeWandb()
+    _patch_wandb(monkeypatch, fake)
+
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic)
+
+    initialization = fake.initializations[0]
+    configured_identity = initialization["config"]["data"]["configured_identity"]
+    definitions = session.history_metric_definitions
+    destinations = {definition.wandb_key for definition in definitions}
+    assert len(definitions) == _CURATED_CUDA_METRIC_COUNT
+    assert all(not destination.startswith("Transient/") for destination in destinations)
+    assert initialization["project"] == "grainlegumes-pino-drying-transient"
+    assert initialization["group"] == experiments.config.loader.generate_parent_experiment_label(config)
+    assert initialization["job_type"] == "stage_a0"
+    assert initialization["id"] == session.run_id
+    assert initialization["id"] != initialization["name"]
+    assert initialization["resume"] == "never"
+    assert config["data"]["train_dataset"] not in initialization["group"]
+    assert "0123456789abcdef" not in initialization["group"]
+    assert configured_identity["train_dataset"] == config["data"]["train_dataset"]
+    assert configured_identity["ood_datasets"] == config["data"]["ood_datasets"]
+    assert configured_identity["dataset_references"] == config["data"]["dataset_references"]
+    assert configured_identity["dataset_references"]["train"]["revision"] == 1
+    assert initialization["config"]["run"]["revision"] == 1
+    metrics = {definition.source_key: 1.0 for definition in definitions}
+    metrics["system/cuda_peak_memory_allocated_bytes"] = _PROJECTED_GIB * _GIB_BYTES
+
+    session.log_epoch(1, metrics)
+
+    payload, step = fake.runs[0].logs[-1]
+    assert step == 1
+    assert len(payload) == _CURATED_CUDA_LOG_ENTRY_COUNT
+    assert payload["Performance/cuda_peak_memory_gib"] == _PROJECTED_GIB
 
 
 def test_model_parameter_counts_ignore_device_and_dtype() -> None:

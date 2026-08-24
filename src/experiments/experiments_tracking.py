@@ -32,8 +32,6 @@ import importlib.metadata
 import os
 import platform
 import re
-import shutil
-import subprocess
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
@@ -42,7 +40,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from src import common, datasets
+from src import datasets
+
+from . import experiments_run_identity as run_identity
+from . import experiments_wandb_schema as wandb_schema
+from .config import experiments_config_defaults as config_defaults
 
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
@@ -65,6 +67,10 @@ _MAX_SAFE_ERROR_LENGTH = 600
 AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Overview",
     "Accuracy",
+    "Loss",
+    "Optimization",
+    "Curriculum",
+    "Performance",
     "Physics",
     "Diagnostics",
     "Optuna",
@@ -107,6 +113,7 @@ class HistoryMetricDefinition:
     owner: str
     computation_cost: str
     scientific_question: str
+    multiplier: float = 1.0
 
 
 def _definition(
@@ -116,6 +123,7 @@ def _definition(
     owner: str,
     computation_cost: str,
     scientific_question: str,
+    multiplier: float = 1.0,
 ) -> HistoryMetricDefinition:
     """Build one compact immutable history definition."""
     return HistoryMetricDefinition(
@@ -124,10 +132,11 @@ def _definition(
         owner=owner,
         computation_cost=computation_cost,
         scientific_question=scientific_question,
+        multiplier=multiplier,
     )
 
 
-def _transient_history_metric_definitions(
+def _legacy_transient_history_metric_definitions(
     evaluation_metrics: Sequence[Mapping[str, Any]],
     *,
     objective_id: str,
@@ -254,6 +263,31 @@ def _transient_history_metric_definitions(
     return tuple(definitions)
 
 
+def _curated_transient_history_metric_definitions(
+    *,
+    objective_id: str,
+    state_aux_enabled: bool,
+    cuda_enabled: bool,
+) -> tuple[HistoryMetricDefinition, ...]:
+    """Project only the current curated transient completed-epoch history."""
+    owner = "src.learning.training.learning_training_loop.train_loop"
+    return tuple(
+        _definition(
+            projection.source_key,
+            projection.wandb_key,
+            owner=owner,
+            computation_cost="existing authoritative value with optional unit projection",
+            scientific_question="What does this curated transient history series report?",
+            multiplier=projection.multiplier,
+        )
+        for projection in wandb_schema.curated_transient_metric_projections(
+            objective_id=objective_id,
+            state_aux_enabled=state_aux_enabled,
+            cuda_enabled=cuda_enabled,
+        )
+    )
+
+
 def automatic_history_metric_definitions(
     evaluation_metrics: Sequence[Mapping[str, Any]],
     *,
@@ -264,6 +298,8 @@ def automatic_history_metric_definitions(
     cuda_enabled: bool,
     optuna_trial: bool = False,
     task_id: str | None = None,
+    metric_schema_version: int = config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
+    state_aux_enabled: bool = False,
 ) -> tuple[HistoryMetricDefinition, ...]:
     """
     Return the ordered automatic-personal-workspace history contract.
@@ -275,11 +311,21 @@ def automatic_history_metric_definitions(
     personal workspace will preserve registration order in its UI.
     """
     if task_id == "transient_drying":
-        transient_definitions = _transient_history_metric_definitions(
-            evaluation_metrics,
-            objective_id=objective_id,
-            cuda_enabled=cuda_enabled,
-        )
+        if metric_schema_version == config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION:
+            transient_definitions = _legacy_transient_history_metric_definitions(
+                evaluation_metrics,
+                objective_id=objective_id,
+                cuda_enabled=cuda_enabled,
+            )
+        elif metric_schema_version == config_defaults.WANDB_METRIC_SCHEMA_VERSION:
+            transient_definitions = _curated_transient_history_metric_definitions(
+                objective_id=objective_id,
+                state_aux_enabled=state_aux_enabled,
+                cuda_enabled=cuda_enabled,
+            )
+        else:
+            message = f"Unsupported transient W&B metric schema: {metric_schema_version!r}."
+            raise ValueError(message)
         if optuna_trial:
             transient_definitions = (
                 *transient_definitions,
@@ -618,44 +664,11 @@ def _sanitize_semantic_value(value: Any, *, key: str = "") -> Any:
 
 
 def _git_metadata() -> dict[str, Any]:
-    """
-    Return read-only commit and dirty-state facts without repository identity.
-
-    Fixed local Git commands run with a short timeout. Missing Git, command
-    errors, or timeouts return unknown values. No remote URL, branch, author,
-    path, or environment state is collected.
-    """
-    project_root = common.paths.get_project_root()
-    git_path = shutil.which("git")
-    if git_path is None:
-        return {"commit": None, "dirty": None}
-    try:
-        revision = subprocess.run(  # noqa: S603 -- absolute git resolved from trusted PATH
-            [git_path, "rev-parse", "HEAD"],
-            cwd=project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        status = subprocess.run(  # noqa: S603 -- fixed read-only git arguments
-            [git_path, "status", "--porcelain", "--untracked-files=normal"],
-            cwd=project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {"commit": None, "dirty": None}
-    commit = revision.stdout.strip() if revision.returncode == 0 else None
-    return {
-        "commit": commit or None,
-        "dirty": None if status.returncode != 0 else bool(status.stdout),
-    }
+    """Return the shared bounded read-only repository provenance."""
+    return run_identity.source_repository_evidence()
 
 
-TRACKING_INTEGRATION_VERSION = 1
+TRACKING_INTEGRATION_VERSION = 2
 
 
 def model_parameter_counts(model: Any) -> dict[str, int]:
@@ -698,6 +711,9 @@ def _build_transient_semantic_config(
 ) -> dict[str, Any]:
     """Build bounded transient-drying provenance without steady split assumptions."""
     task_contract = cast("Mapping[str, Any]", config["task_contract"])
+    data_config = cast("Mapping[str, Any]", config["data"])
+    run_config = cast("Mapping[str, Any]", config["run"])
+    wandb_config = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
     roles = cast("Mapping[str, Any]", split_indices["roles"])
     datasets_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", split_indices["dataset_identity"])))
     split_payload = {
@@ -717,7 +733,27 @@ def _build_transient_semantic_config(
     model_payload["parameter_counts"] = model_parameter_counts(model)
     payload: dict[str, Any] = {
         "task": {"id": config["task"], "contract_digest": task_contract.get("digest"), "contract": copy.deepcopy(dict(task_contract))},
-        "data": {"datasets": datasets_payload, "split": split_payload, "normalization": scaling_payload},
+        "run": {
+            "name": run_config["name"],
+            "seed": run_config["seed"],
+            "revision": run_config.get("revision", 0),
+            "naming_schema_version": run_config.get("naming_schema_version", 1),
+            "stage": cast("Mapping[str, Any]", config["training"]).get("stage"),
+        },
+        "data": {
+            "datasets": datasets_payload,
+            "configured_identity": {
+                "train_dataset": data_config["train_dataset"],
+                "ood_datasets": copy.deepcopy(data_config["ood_datasets"]),
+                "dataset_references": copy.deepcopy(data_config.get("dataset_references")),
+            },
+            "loader": {
+                key: copy.deepcopy(data_config.get(key))
+                for key in ("batch_size", "num_workers", "pin_memory", "persistent_workers", "spatial_stride")
+            },
+            "split": split_payload,
+            "normalization": scaling_payload,
+        },
         "tensorizer": copy.deepcopy(split_indices["tensorizer"]),
         "model": model_payload,
         "loss": copy.deepcopy(config["loss"]),
@@ -729,10 +765,16 @@ def _build_transient_semantic_config(
         "teacher_handoff": copy.deepcopy(dict(transient_handoff)) if transient_handoff is not None else None,
         "provenance": {
             "repository": _git_metadata(),
-            "config_digest": checkpoint_identity.get("effective_config_digest"),
+            "resolved_config_sha256": run_identity.resolved_config_digest(config),
+            "checkpoint_config_digest": checkpoint_identity.get("effective_config_digest"),
             "task_contract_digest": task_contract.get("digest"),
             "runtime_backend": copy.deepcopy(dict(runtime_provenance or {})),
-            "schema_versions": {"run": 1, "checkpoint": 1, "tracking_integration": TRACKING_INTEGRATION_VERSION},
+            "schema_versions": {
+                "run": run_config.get("naming_schema_version", 1),
+                "checkpoint": 1,
+                "tracking_integration": TRACKING_INTEGRATION_VERSION,
+                "wandb_metrics": wandb_config.get("metric_schema_version", 1),
+            },
         },
         "runtime": {
             "device": copy.deepcopy(dict(device_metadata)),
@@ -1044,6 +1086,11 @@ class WandbSession:
         """Return the unique admitted local-to-W&B history mapping."""
         return {definition.source_key: definition.wandb_key for definition in self.history_metric_definitions}
 
+    @property
+    def history_definition_by_source(self) -> dict[str, HistoryMetricDefinition]:
+        """Return complete source projections including presentation-only unit scaling."""
+        return {definition.source_key: definition for definition in self.history_metric_definitions}
+
     def _persist(self, updates: Mapping[str, Any]) -> None:
         """Persist bounded observer state through the authoritative local writer."""
         if self.state_updater is not None:
@@ -1080,11 +1127,11 @@ class WandbSession:
             raise TrackingError(msg)
 
         payload: dict[str, float | int] = {"epoch": epoch}
-        destination_by_source = self.history_destination_by_source
+        definition_by_source = self.history_definition_by_source
         for key, value in metrics.items():
-            destination = destination_by_source.get(key)
-            if destination is not None:
-                payload[destination] = float(value)
+            definition = definition_by_source.get(key)
+            if definition is not None:
+                payload[definition.wandb_key] = float(value) * definition.multiplier
 
         if self._run_operation(
             "history",
@@ -1428,7 +1475,15 @@ def initialize_wandb(
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
     mode = str(settings["mode"])
     workflow = str(settings["workflow"])
+    metric_schema_version = int(settings.get("metric_schema_version", config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION))
     group = str(settings["study"]) if workflow == "optuna_trial" else None
+    job_type = workflow
+    if task_id == "transient_drying" and workflow == "train":
+        group, job_type = wandb_schema.transient_run_organization(
+            config,
+            workflow=workflow,
+            metric_schema_version=metric_schema_version,
+        )
     runtime_tags = _runtime_wandb_tags(settings, semantic_config)
 
     if mode == "disabled":
@@ -1467,7 +1522,8 @@ def initialize_wandb(
         "entity": settings["entity"],
         "tags": runtime_tags,
         "group": group,
-        "job_type": workflow,
+        "job_type": job_type,
+        "metric_schema_version": metric_schema_version,
         "session_started_at": _utc_now(),
         "session_kind": "resume" if resume else "fresh",
         "status": "offline" if mode == "offline" else "active",
@@ -1511,6 +1567,8 @@ def initialize_wandb(
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
+        metric_schema_version=metric_schema_version,
+        state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
     )
 
     sdk_run: _WandbRun | None = None
@@ -1522,7 +1580,7 @@ def initialize_wandb(
                 entity=cast("str | None", settings["entity"]),
                 tags=None if resume and mode == "online" else runtime_tags,
                 group=group,
-                job_type=workflow,
+                job_type=job_type,
                 mode=mode,
                 name=run_name,
                 id=run_id,

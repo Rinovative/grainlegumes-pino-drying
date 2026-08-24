@@ -2566,7 +2566,7 @@ def test_validate_config_exposes_resolved_campaign_ownership(
     assert output["campaign_purpose"] == campaign.campaign_purpose
     assert output["case_counts"]["derived_total"] == campaign.total_case_count
     assert output["seed_plan"]["campaign_seed"] == campaign.batches[0].scientific_values["campaign_seed"]
-    assert output["dataset_package_requests"] == [{"evaluation_regime": "id", "source_role": "seen"}]
+    assert output["dataset_package_requests"] == [{"evaluation_regime": "id", "source_role": "seen", "dataset_revision": 0}]
     assert len(output["dataset_package_inventory"]) == len(campaign.dataset_packages)
 
 

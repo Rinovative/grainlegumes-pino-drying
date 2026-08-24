@@ -147,6 +147,64 @@ def inspect_dataset_package(
     return package_validation.inspect_dataset_package(dataset_id, storage_root=storage_root)
 
 
+def publish_dataset_reference(
+    task: str,
+    name: str,
+    revision: int,
+    dataset_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Publish one task-local immutable reference to a fully admitted package."""
+    from .packages import dataset_packages_references as references  # noqa: PLC0415
+
+    return references.publish_dataset_reference(task, name, revision, dataset_id, storage_root=storage_root)
+
+
+def resolve_dataset_reference(
+    task: str,
+    name: str,
+    revision: int,
+    *,
+    storage_root: Path | str | None = None,
+    validate_payload_hash: bool = False,
+) -> dict[str, Any]:
+    """Resolve one immutable logical Dataset reference to exact package evidence."""
+    from .packages import dataset_packages_references as references  # noqa: PLC0415
+
+    return references.resolve_dataset_reference(
+        task,
+        name,
+        revision,
+        storage_root=storage_root,
+        validate_payload_hash=validate_payload_hash,
+    )
+
+
+def list_dataset_references(
+    task: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """List task-local immutable Dataset references in deterministic order."""
+    from .packages import dataset_packages_references as references  # noqa: PLC0415
+
+    return references.list_dataset_references(task, storage_root=storage_root)
+
+
+def inspect_dataset_reference(
+    task: str,
+    name: str,
+    revision: int,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Inspect one logical Dataset reference without expanded provenance."""
+    from .packages import dataset_packages_references as references  # noqa: PLC0415
+
+    return references.inspect_dataset_reference(task, name, revision, storage_root=storage_root)
+
+
 def smoke_dataset_package(
     dataset_id: str,
     *,
@@ -197,6 +255,22 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--persistent-workers", action="store_true")
     smoke.add_argument("--prefetch-factor", type=int)
     smoke.add_argument("--hdf5-cache-size", type=int, default=1)
+
+    references = commands.add_parser("refs", help="list immutable logical Dataset references")
+    references.add_argument("--task", required=True)
+    references.add_argument("--storage-root", type=Path)
+
+    resolve = commands.add_parser("resolve", help="resolve one immutable logical Dataset reference")
+    resolve.add_argument("--task", required=True)
+    resolve.add_argument("--name", required=True)
+    resolve.add_argument("--revision", type=int, required=True)
+    resolve.add_argument("--storage-root", type=Path)
+
+    inspect_ref = commands.add_parser("inspect-ref", help="inspect one immutable logical Dataset reference")
+    inspect_ref.add_argument("--task", required=True)
+    inspect_ref.add_argument("--name", required=True)
+    inspect_ref.add_argument("--revision", type=int, required=True)
+    inspect_ref.add_argument("--storage-root", type=Path)
     return parser
 
 
@@ -226,6 +300,15 @@ def main() -> int:
             persistent_workers=arguments.persistent_workers,
             prefetch_factor=arguments.prefetch_factor,
             hdf5_cache_size=arguments.hdf5_cache_size,
+        )
+    elif arguments.command == "refs":
+        result = {"task": arguments.task, "references": list_dataset_references(arguments.task, storage_root=arguments.storage_root)}
+    elif arguments.command in {"resolve", "inspect-ref"}:
+        result = inspect_dataset_reference(
+            arguments.task,
+            arguments.name,
+            arguments.revision,
+            storage_root=arguments.storage_root,
         )
     else:
         message = f"Unsupported dataset package command: {arguments.command!r}."

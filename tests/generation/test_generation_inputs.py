@@ -174,6 +174,7 @@ def test_package_only_cross_profile_request_preserves_simulation_identity(
             "dataset_view": "transient_drying",
             "evaluation_regime": "id",
             "source_role": "seen",
+            "dataset_revision": 0,
         }
     ]
     config_path.write_text(
@@ -187,6 +188,7 @@ def test_package_only_cross_profile_request_preserves_simulation_identity(
             "dataset_view": "steady_flow",
             "evaluation_regime": "id",
             "source_role": "seen",
+            "dataset_revision": 0,
         }
     )
     config_path.write_text(
@@ -199,6 +201,29 @@ def test_package_only_cross_profile_request_preserves_simulation_identity(
     assert extended.package_request_digest != base.package_request_digest
     assert [batch.batch_id for batch in extended.batches] == [batch.batch_id for batch in base.batches]
     assert {package["dataset_view"] for package in extended.dataset_packages} == {"steady_flow", "transient_drying"}
+
+
+def test_dataset_revision_changes_request_identity_not_simulation_identity(
+    generation_config_factory: Any,
+) -> None:
+    """Version the logical publication request without changing simulated data."""
+    config_path, _template = generation_config_factory(
+        simulation_profile="transient_drying",
+        campaign_purpose="family_generalization",
+        natural_count=3,
+    )
+    base = generation.cases.config.load_campaign_config(config_path)
+    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    authored["dataset_packages"][0]["dataset_revision"] = 1
+    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
+    revised = generation.cases.config.load_campaign_config(config_path)
+
+    assert revised.campaign_digest == base.campaign_digest
+    assert revised.package_request_digest != base.package_request_digest
+    assert [batch.batch_id for batch in revised.batches] == [batch.batch_id for batch in base.batches]
+    assert generation.cases.config.dataset_package_scientific_plan(
+        revised.dataset_packages[0]
+    ) == generation.cases.config.dataset_package_scientific_plan(base.dataset_packages[0])
 
 
 def test_active_campaign_keeps_its_launch_package_snapshot(
@@ -217,6 +242,7 @@ def test_active_campaign_keeps_its_launch_package_snapshot(
             "dataset_view": "transient_drying",
             "evaluation_regime": "id",
             "source_role": "seen",
+            "dataset_revision": 0,
         }
     ]
     config_path.write_text(
@@ -238,6 +264,7 @@ def test_active_campaign_keeps_its_launch_package_snapshot(
             "dataset_view": "steady_flow",
             "evaluation_regime": "id",
             "source_role": "seen",
+            "dataset_revision": 0,
         }
     )
     config_path.write_text(

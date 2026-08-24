@@ -27,6 +27,7 @@ def _plan(view: str) -> dict[str, Any]:
         "dataset_view": view,
         "evaluation_regime": "id",
         "source_role": "seen",
+        "dataset_revision": 0,
     }
 
 

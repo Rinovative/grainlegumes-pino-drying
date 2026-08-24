@@ -44,7 +44,7 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
     authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     authored["campaign_purpose"] = "technical_runtime_smoke"
     authored["sampling"]["counts"] = {"natural": {"lentil": 2}}
-    authored["dataset_packages"] = [{"evaluation_regime": "id", "source_role": "seen"}]
+    authored["dataset_packages"] = [{"evaluation_regime": "id", "source_role": "seen", "dataset_revision": 0}]
     config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
 
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -118,6 +118,18 @@ def test_technical_fake_runtime_reaches_packages_and_worker_modes(
     assert tuple(result["dataset_view"] for result in results) == expected_views
     for result in results:
         manifest = datasets.packages.load_package_manifest(result["dataset_id"], storage_root=storage)
+        reference = result["dataset_reference"]
+        assert reference["status"] == "published"
+        assert reference["task"] == result["dataset_view"]
+        assert reference["revision"] == 0
+        assert reference["dataset_id"] == result["dataset_id"]
+        resolved_reference = datasets.packages.resolve_dataset_reference(
+            reference["task"],
+            reference["name"],
+            reference["revision"],
+            storage_root=storage,
+        )
+        assert resolved_reference["dataset_id"] == result["dataset_id"]
         assert manifest["campaign_purpose"] == "technical_runtime_smoke"
         assert manifest["evaluation_regime"] == "id"
         assert manifest["training_eligible"] is False

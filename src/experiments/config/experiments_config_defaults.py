@@ -9,7 +9,7 @@ Responsibilities:
   - Return serializable defaults for strict experiment resolution
 
 Design principles:
-  - Exact training and evaluation Dataset IDs are explicit experiment inputs
+  - Dataset selections are explicit exact IDs or immutable logical references
   - Task-fixed scientific semantics come exclusively from the registered TaskSpec
   - Runtime defaults remain independent of concrete task field names
   - Semantic identifiers are distinct from Python implementation class names
@@ -28,6 +28,7 @@ from src import domain
 
 RUN_DEFAULTS: dict[str, Any] = {
     "seed": 9,
+    "revision": 0,
     "deterministic": True,
     "device": "auto",
     "suffix": None,
@@ -90,6 +91,8 @@ WANDB_TASK_PROJECTS = {
     "transient_drying": "grainlegumes-pino-drying-transient",
 }
 WANDB_MAX_TAGS = 2
+WANDB_LEGACY_METRIC_SCHEMA_VERSION = 1
+WANDB_METRIC_SCHEMA_VERSION = 2
 WANDB_WORKFLOWS = (
     "train",
     "optuna_trial",

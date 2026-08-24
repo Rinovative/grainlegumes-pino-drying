@@ -50,6 +50,7 @@ from src.learning.transient import learning_transient_scaling as transient_scali
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 
 from . import experiments_console as console
+from . import experiments_run_identity as run_identity
 from . import experiments_tracking as tracking
 from .config import experiments_config_loader as config_loader
 from .config import experiments_config_transient_plan as transient_plan
@@ -118,7 +119,7 @@ class ExistingRunAdmissionError(FileExistsError):
 
     def __init__(self, report: Mapping[str, Any]) -> None:
         """Initialize the rejection with an isolated diagnostic report."""
-        super().__init__("Run admission rejected: existing run requires explicit resume.")
+        super().__init__(str(report.get("reason", "Run admission rejected: existing run requires explicit resume.")))
         self.report = copy.deepcopy(dict(report))
 
 
@@ -857,6 +858,8 @@ def inspect_existing_run_admission(
     status = "unavailable"
     completed_epoch: int | None = None
     issues: list[str] = []
+    requested_config_digest = run_identity.resolved_config_digest(requested_config)
+    existing_config_digest: str | None = None
 
     try:
         summary = read_run_summary(path)
@@ -885,6 +888,7 @@ def inspect_existing_run_admission(
             saved_config = config_loader.validate_resolved_config(
                 config_loader.load_yaml(config_file),
             )
+            existing_config_digest = run_identity.resolved_config_digest(saved_config)
             validate_resume_config(requested_config, saved_config)
         except (OSError, KeyError, TypeError, ValueError) as error:
             issues.append(str(error))
@@ -928,6 +932,9 @@ def inspect_existing_run_admission(
         "active_lock": lock_state,
         "resume_compatibility": compatibility,
         "reason": reason,
+        "existing_config_digest": existing_config_digest,
+        "requested_config_digest": requested_config_digest,
+        "run_revision": requested_config.get("run", {}).get("revision", 0),
     }
 
 
@@ -937,14 +944,26 @@ def reject_existing_fresh_run(
     *,
     config_path: Path | str,
 ) -> ExistingRunAdmissionError:
-    """Create the dedicated fresh-run rejection with no runtime allocation."""
-    return ExistingRunAdmissionError(
-        inspect_existing_run_admission(
-            run_dir,
-            requested_config,
-            config_path=config_path,
-        )
+    """Create the dedicated fresh-run rejection with exact identity diagnostics."""
+    report = inspect_existing_run_admission(
+        run_dir,
+        requested_config,
+        config_path=config_path,
     )
+    existing_digest = report.get("existing_config_digest")
+    requested_digest = report["requested_config_digest"]
+    if existing_digest == requested_digest:
+        report["reason"] = (
+            f"Matching run already exists; use explicit resume: ./scripts/docker_job.sh train {report['config_path']} --resume {report['run_dir']}"
+        )
+    elif existing_digest is not None:
+        report["reason"] = (
+            "Run revision conflict: "
+            f"experiment={report['requested_run_name']!r}, revision={report['run_revision']}, "
+            f"existing config digest={existing_digest}, requested config digest={requested_digest}. "
+            "Resume the matching run or set a new explicit run.revision."
+        )
+    return ExistingRunAdmissionError(report)
 
 
 def _validate_resume_output_root(
@@ -2290,12 +2309,18 @@ def _run_resolved_experiment(
         if fresh_destination is None:
             msg = "Fresh-run destination was not resolved before runtime admission."
             raise AssertionError(msg)
+        summary_identity = {"run_identity": run_identity.run_identity_evidence(requested, config_path=config_path)}
         with run_writer_lease(fresh_destination):
-            run_dir = _prepare_fresh_run_locked(requested, run_dir=fresh_destination)
+            run_dir = _prepare_fresh_run_locked(
+                requested,
+                run_dir=fresh_destination,
+                summary_extra=summary_identity,
+            )
             result = _execute_prepared_run_locked(
                 requested,
                 run_dir=run_dir,
                 persisted_config=requested,
+                summary_extra=summary_identity,
                 device_resolution=device_resolution,
             )
         return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution, "task": str(requested["task"])}
@@ -2314,8 +2339,13 @@ def _run_resolved_experiment(
         if summary.get("status") not in {"running", "interrupted", "completed"}:
             msg = f"Run status {summary.get('status')!r} is not resumable: {run_dir}"
             raise RunLifecycleError(msg)
-        saved_config = config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir))
+        saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
         target_epochs = validate_resume_config(requested, saved_config)
+        saved_storage_root = saved_config.get("paths", {}).get("storage_root")
+        missing_dataset_references = config_loader.audit_resolved_dataset_references(
+            saved_config,
+            storage_root=saved_storage_root,
+        )
         _validate_resume_output_root(run_dir, saved_config, output_root)
         runtime_config = copy.deepcopy(saved_config)
         runtime_config["training"]["epochs"] = target_epochs
@@ -2377,9 +2407,40 @@ def _run_resolved_experiment(
             saved_split_indices=split_indices,
             restored_data_processor=data_processor,
             resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+            summary_extra={"dataset_reference_audit": {"missing": list(missing_dataset_references)}},
             device_resolution=device_resolution,
         )
-        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution, "task": str(requested["task"])}
+        return {
+            "run_dir": run_dir,
+            "result": result,
+            "device_resolution": device_resolution,
+            "task": str(requested["task"]),
+            "missing_dataset_references": missing_dataset_references,
+        }
+
+
+def _resume_resolution_context(
+    resume: Path | str | None,
+) -> tuple[int, Mapping[str, Any] | None]:
+    """Return saved naming and Dataset-reference evidence before request resolution."""
+    if resume is None:
+        return config_loader.RUN_NAMING_SCHEMA_VERSION, None
+    run_dir = Path(resume).expanduser().resolve(strict=False)
+    config_path = common.paths.resolve_run_config_path(run_dir)
+    if not config_path.is_file():
+        return config_loader.RUN_NAMING_SCHEMA_VERSION, None
+    saved = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
+    run = saved.get("run")
+    data = saved.get("data")
+    if not isinstance(run, Mapping) or not isinstance(data, Mapping):
+        message = "Saved resume config lacks run or data identity."
+        raise config_loader.ConfigError(message)
+    schema = run.get("naming_schema_version", 1)
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        message = "Saved resume config has an invalid naming schema version."
+        raise config_loader.ConfigError(message)
+    references = data.get("dataset_references")
+    return schema, copy.deepcopy(references) if isinstance(references, Mapping) else None
 
 
 def _apply_device_override(raw: dict[str, Any], device: str | None) -> None:
@@ -2442,7 +2503,12 @@ def _run_transient_two_stage_plan(
     output_root: Path | str | None,
 ) -> dict[str, Any]:
     """Execute or explicitly resume the two independently persisted transient stages."""
-    plan = transient_plan.resolve_transient_training_plan(raw)
+    naming_schema_version, pinned_references = _resume_resolution_context(resume)
+    plan = transient_plan.resolve_transient_training_plan(
+        raw,
+        naming_schema_version=naming_schema_version,
+        pinned_dataset_references=pinned_references,
+    )
     config_loader.validate_task_directory_identity(
         config_path,
         raw_task=raw.get("task"),
@@ -2455,25 +2521,50 @@ def _run_transient_two_stage_plan(
     validate_deterministic_model_device_policy(a_config, device_resolution)
     a_dir = _stage_destination(a_config)
     b_dir = _stage_destination(b_config)
+    experiment_record: dict[str, Any] | None = None
+    experiment_record_path: Path | None = None
+    if naming_schema_version == config_loader.RUN_NAMING_SCHEMA_VERSION:
+        experiment_record = run_identity.build_transient_experiment_record(
+            a_config,
+            b_config,
+            config_path=config_path,
+        )
 
     if resume is not None:
+        if experiment_record is not None:
+            try:
+                experiment_record_path = run_identity.validate_persisted_transient_experiment_record(
+                    experiment_record,
+                    output_root=a_config["paths"]["output_root"],
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                message = "Persisted transient parent identity does not match the explicit resume request."
+                raise RunLifecycleError(message) from error
         resume_dir = Path(resume).expanduser().resolve()
         if resume_dir == a_dir:
             if b_dir.exists():
                 raise reject_existing_fresh_run(b_dir, b_config, config_path=config_path)
-            a_outcome = _run_resolved_experiment(
-                a_config,
-                config_path=config_path,
-                resume=resume_dir,
-                output_root=output_root,
-                device_resolution=device_resolution,
-            )
-            _validate_reusable_stage_a(
-                a_outcome["run_dir"],
-                requested_a=a_config,
-                requested_b=b_config,
-                device_resolution=device_resolution,
-            )
+            try:
+                _validate_reusable_stage_a(
+                    a_dir,
+                    requested_a=a_config,
+                    requested_b=b_config,
+                    device_resolution=device_resolution,
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError, RunLifecycleError):
+                a_outcome = _run_resolved_experiment(
+                    a_config,
+                    config_path=config_path,
+                    resume=resume_dir,
+                    output_root=output_root,
+                    device_resolution=device_resolution,
+                )
+                _validate_reusable_stage_a(
+                    a_outcome["run_dir"],
+                    requested_a=a_config,
+                    requested_b=b_config,
+                    device_resolution=device_resolution,
+                )
             b_outcome = _run_resolved_experiment(
                 b_config,
                 config_path=config_path,
@@ -2497,7 +2588,24 @@ def _run_transient_two_stage_plan(
         else:
             message = f"--resume must name the derived Stage A or Stage B run leaf: {resume_dir}"
             raise ValueError(message)
-        return {**b_outcome, "stage_runs": {"a": a_dir, "b": b_dir}}
+        return {
+            **b_outcome,
+            "stage_runs": {"a": a_dir, "b": b_dir},
+            "experiment_record": experiment_record_path,
+        }
+
+    if naming_schema_version == config_loader.RUN_NAMING_SCHEMA_VERSION:
+        if b_dir.exists():
+            raise reject_existing_fresh_run(b_dir, b_config, config_path=config_path)
+        if a_dir.exists():
+            raise reject_existing_fresh_run(a_dir, a_config, config_path=config_path)
+        if experiment_record is None:
+            message = "Current transient plans require a parent experiment record."
+            raise AssertionError(message)
+        experiment_record_path = run_identity.admit_fresh_transient_experiment_record(
+            experiment_record,
+            output_root=a_config["paths"]["output_root"],
+        )
 
     if b_dir.exists():
         raise reject_existing_fresh_run(b_dir, b_config, config_path=config_path)
@@ -2530,7 +2638,11 @@ def _run_transient_two_stage_plan(
         output_root=output_root,
         device_resolution=device_resolution,
     )
-    return {**b_outcome, "stage_runs": {"a": a_dir, "b": b_dir}}
+    return {
+        **b_outcome,
+        "stage_runs": {"a": a_dir, "b": b_dir},
+        "experiment_record": experiment_record_path,
+    }
 
 
 def run_experiment(
@@ -2562,6 +2674,11 @@ def run_experiment(
     """
     raw_requested = config_loader.load_yaml(config_path)
     _apply_device_override(raw_requested, device)
+    if resume is not None:
+        resume_dir = Path(resume).expanduser().resolve(strict=False)
+        if common.locking.file_lock_is_active(_run_writer_lock_path(resume_dir)):
+            message = f"Run has an active writer lease and cannot be resumed concurrently: {resume_dir}"
+            raise RunLifecycleError(message)
     if transient_plan.is_transient_two_stage_config(raw_requested):
         return _run_transient_two_stage_plan(
             raw_requested,
@@ -2569,7 +2686,12 @@ def run_experiment(
             resume=resume,
             output_root=output_root,
         )
-    requested = config_loader.resolve_config(raw_requested)
+    naming_schema_version, pinned_references = _resume_resolution_context(resume)
+    requested = config_loader.resolve_config(
+        raw_requested,
+        naming_schema_version=naming_schema_version,
+        pinned_dataset_references=pinned_references,
+    )
     config_loader.validate_task_directory_identity(
         config_path,
         raw_task=raw_requested.get("task"),

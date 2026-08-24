@@ -34,6 +34,7 @@ def test_matching_workflow_is_admitted(
 
     assert result.family == expected_family
     assert result.task == "steady_flow"
+    assert result.run_label
 
 
 @pytest.mark.parametrize(

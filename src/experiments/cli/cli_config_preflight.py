@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         print(str(error), file=sys.stderr)
         return 2
-    values = (result.family, result.task, result.canonical_path)
+    values = (result.family, result.task, result.canonical_path, result.run_label)
     if any("\t" in value or "\n" in value for value in values):
         print("Configuration preflight fields contain unsupported control characters.", file=sys.stderr)
         return 2

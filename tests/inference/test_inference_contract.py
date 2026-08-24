@@ -116,9 +116,14 @@ def test_resume_requires_last_checkpoint_even_when_other_files_exist(
     (run_dir / "last_checkpoint.pt").unlink()
     monkeypatch.setattr(experiments.run.config_loader, "load_yaml", lambda _path: {})
     monkeypatch.setattr(
+        experiments.run,
+        "_resume_resolution_context",
+        lambda _resume: (experiments.config.loader.RUN_NAMING_SCHEMA_VERSION, None),
+    )
+    monkeypatch.setattr(
         experiments.run.config_loader,
         "resolve_config",
-        lambda _raw: {
+        lambda _raw, **_kwargs: {
             "run": {"device": "cpu"},
             "training": {"mixed_precision": False},
         },

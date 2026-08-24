@@ -179,6 +179,11 @@ def get_dataset_packages_root(
     return get_datasets_root(storage_root=storage_root) / "packages"
 
 
+def get_dataset_references_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return the immutable logical Dataset-reference metadata root."""
+    return get_datasets_root(storage_root=storage_root) / "refs"
+
+
 def get_dataset_state_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the hidden root for dataset-publication coordination state."""
     return get_datasets_root(storage_root=storage_root) / ".state"
@@ -192,6 +197,11 @@ def get_experiment_state_root(*, storage_root: Path | str | None = None) -> Path
 def get_dataset_build_locks_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the persistent OS-lock-anchor root for dataset publication."""
     return get_dataset_state_root(storage_root=storage_root) / "dataset-builds" / "locks"
+
+
+def get_dataset_reference_locks_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return persistent advisory-lock anchors for Dataset-reference publication."""
+    return get_dataset_state_root(storage_root=storage_root) / "dataset-references" / "locks"
 
 
 def get_dataset_build_transactions_root(*, storage_root: Path | str | None = None) -> Path:
@@ -438,6 +448,39 @@ def resolve_dataset_build_transaction_path(
     """Resolve one dataset builder's durable recovery marker."""
     dataset_id = validate_logical_name(dataset_id, label="dataset_id")
     return get_dataset_build_transactions_root(storage_root=storage_root) / f"dataset-{dataset_id}.json"
+
+
+def resolve_dataset_reference_path(
+    task: str,
+    name: str,
+    revision: int,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one task-local immutable Dataset-reference record path."""
+    task = validate_logical_name(task, label="task")
+    name = validate_logical_name(name, label="dataset reference name")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        msg = f"dataset reference revision must be a non-negative integer, got {revision!r}."
+        raise ValueError(msg)
+    return get_dataset_references_root(storage_root=storage_root) / task / name / f"r{revision}.json"
+
+
+def resolve_dataset_reference_lock_path(
+    task: str,
+    name: str,
+    revision: int,
+    *,
+    storage_root: Path | str | None = None,
+) -> Path:
+    """Resolve one advisory lock for a task-local Dataset-reference revision."""
+    task = validate_logical_name(task, label="task")
+    name = validate_logical_name(name, label="dataset reference name")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        msg = f"dataset reference revision must be a non-negative integer, got {revision!r}."
+        raise ValueError(msg)
+    digest = hashlib.sha256(f"{task}\0{name}\0{revision}".encode()).hexdigest()
+    return get_dataset_reference_locks_root(storage_root=storage_root) / f"reference-{digest}.lock"
 
 
 def resolve_run_lock_path(

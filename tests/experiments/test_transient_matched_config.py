@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+from support import configs
 
 from src import experiments
 from src.experiments.cli import cli_transient_matched_config as matched
@@ -14,22 +14,25 @@ from src.experiments.config import experiments_config_loader as loader
 from src.experiments.config import experiments_config_transient_plan as transient_plan
 from src.learning.transient.learning_transient_curriculum import RolloutCurriculum
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 _ROLLOUT_HORIZON = 32
 _B_STEPS = 7
 
 
 def _plan(model_kind: str = "fno") -> transient_plan.TransientTrainingPlan:
-    """Return one resolved maintained transient two-stage plan."""
-    names = {
-        "fno": "fno_m128x160_h64_l3__lentil_chickpea__s9.yaml",
-        "rno": "rno_m24x24_h16_l3__lentil_chickpea__s9.yaml",
-    }
-    return transient_plan.load_and_resolve_transient_training_plan(Path("configs/learning/transient_drying/experiments") / names[model_kind])
+    """Return one resolved test-owned transient two-stage plan."""
+    return transient_plan.resolve_transient_training_plan(
+        configs.transient_two_stage_config(model_kind=model_kind),
+    )
 
 
 def _a0_config() -> dict[str, Any]:
     """Return one isolated resolved transient A0 configuration."""
-    return dict(_plan().stage_a)
+    raw = configs.transient_two_stage_config()
+    raw["training"]["stage_schedule"]["total_epochs"] = 6
+    return dict(transient_plan.resolve_transient_training_plan(raw).stage_a)
 
 
 def test_b_and_a_plus_configs_follow_completed_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,7 +96,7 @@ def test_a_plus_rejects_caller_budget_that_disagrees_with_completed_b(tmp_path: 
     b["training"]["curriculum"] = {
         "lengths": [2, 4, 8, 16, 32],
         "milestone_fractions": list(RolloutCurriculum.DEFAULT_MILESTONE_FRACTIONS),
-        "seed": 9,
+        "seed": a0["run"]["seed"],
     }
     source = {"config": a0, "summary": {"resolved_device": "cpu"}}
     completed_b = {"config": b, "summary": {"resolved_device": "cpu", "terminal_controller": {"successful_optimizer_steps": 3}}}

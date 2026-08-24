@@ -6,6 +6,7 @@ Provides:
 - generated_batch: generated-simulation batch admission
 - manifest: package-manifest publication and admission
 - planning: deterministic source and membership planning
+- references: immutable task-local Dataset-reference publication and resolution
 - trajectory: transient source admission and compact trajectory indexes
 - transient_shards: Dataset-bound derived PT shard publication and admission
 - DATASET_PACKAGE_SCHEMA_KIND: canonical package-manifest schema kind
@@ -15,7 +16,12 @@ Provides:
 - build_campaign_packages: build every declared campaign package
 - load_package_manifest: load one canonical package manifest
 - load_dataset_package_manifest: bind a manifest to a steady payload identity
+- load_package_manifest_evidence: admit manifest metadata without payload rehashing
 - inspect_dataset_package: inspect one package and runtime sample
+- publish_dataset_reference: publish one immutable task-local package binding
+- resolve_dataset_reference: resolve one immutable task-local package binding
+- list_dataset_references: list immutable task-local package bindings
+- inspect_dataset_reference: inspect one bounded resolved package binding
 - smoke_dataset_package: run one bounded package loader smoke
 - storage_schema_version: return the canonical source-storage schema version
 """
@@ -30,9 +36,13 @@ if TYPE_CHECKING:
         build_campaign_packages,
         build_dataset_package,
         inspect_dataset_package,
+        inspect_dataset_reference,
+        list_dataset_references,
         load_dataset_package_manifest,
         load_package_manifest,
         load_package_manifest_evidence,
+        publish_dataset_reference,
+        resolve_dataset_reference,
         smoke_dataset_package,
         storage_schema_version,
     )
@@ -41,6 +51,7 @@ if TYPE_CHECKING:
     from . import dataset_packages_generated_batch as generated_batch
     from . import dataset_packages_manifest as manifest
     from . import dataset_packages_planning as planning
+    from . import dataset_packages_references as references
     from . import dataset_packages_trajectory as trajectory
     from . import dataset_packages_transient_shards as transient_shards
     from .dataset_packages_manifest import (
@@ -53,6 +64,7 @@ _MODULES = {
     "generated_batch": "dataset_packages_generated_batch",
     "manifest": "dataset_packages_manifest",
     "planning": "dataset_packages_planning",
+    "references": "dataset_packages_references",
     "trajectory": "dataset_packages_trajectory",
     "transient_shards": "dataset_packages_transient_shards",
 }
@@ -67,6 +79,10 @@ _FACADE_EXPORTS = frozenset(
         "load_package_manifest_evidence",
         "smoke_dataset_package",
         "storage_schema_version",
+        "publish_dataset_reference",
+        "resolve_dataset_reference",
+        "list_dataset_references",
+        "inspect_dataset_reference",
     }
 )
 _MANIFEST_EXPORTS = frozenset(
@@ -84,11 +100,16 @@ __all__ = [
     "builder",
     "generated_batch",
     "inspect_dataset_package",
+    "inspect_dataset_reference",
+    "list_dataset_references",
     "load_dataset_package_manifest",
     "load_package_manifest",
     "load_package_manifest_evidence",
     "manifest",
     "planning",
+    "publish_dataset_reference",
+    "references",
+    "resolve_dataset_reference",
     "smoke_dataset_package",
     "storage_schema_version",
     "trajectory",

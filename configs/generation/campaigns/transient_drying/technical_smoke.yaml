@@ -22,6 +22,7 @@ sampling:
       lentil: 2
 dataset_packages:
 - evaluation_regime: id
+  dataset_revision: 0
   source_role: seen
   training_payload:
     backend: pt_shards

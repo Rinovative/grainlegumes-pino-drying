@@ -34,20 +34,24 @@ membership:
     id_test: 5
 dataset_packages:
 - dataset_view: transient_drying
+  dataset_revision: 0
   evaluation_regime: id
   source_role: seen
   training_payload:
     backend: pt_shards
     required: true
 - dataset_view: transient_drying
+  dataset_revision: 0
   evaluation_regime: near_family_ood
   source_role: near_family_ood
   training_payload:
     backend: pt_shards
     required: true
 - dataset_view: steady_flow
+  dataset_revision: 0
   evaluation_regime: id
   source_role: seen
 - dataset_view: steady_flow
+  dataset_revision: 0
   evaluation_regime: near_family_ood
   source_role: near_family_ood

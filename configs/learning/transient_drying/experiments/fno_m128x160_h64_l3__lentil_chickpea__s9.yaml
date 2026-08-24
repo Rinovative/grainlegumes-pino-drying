@@ -1,13 +1,17 @@
 task: transient_drying
 run:
+  revision: 0
   seed: 9
   deterministic: true
   device: cuda
   suffix: null
 data:
-  train_dataset: transient_drying__lentil+chickpea__id
+  train_dataset:
+    name: lentil+chickpea_id
+    revision: 0
   ood_datasets:
-  - transient_drying__kidney_bean__near_family_ood
+  - name: kidney_bean_near_family_ood
+    revision: 0
   batch_size: 2
   transient_backend_preference: pt_shards
   transient_backend_required: true

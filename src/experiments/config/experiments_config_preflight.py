@@ -23,6 +23,7 @@ class ConfigPreflight:
     task: str
     model_kind: str
     physics_enabled: bool
+    run_label: str
     source_path: Path
     canonical_path: str
 
@@ -97,14 +98,17 @@ def inspect_config(path: Path | str) -> ConfigPreflight:
         raise loader.ConfigError(msg)
     task = resolved.get("task")
     model_kind = model.get("kind")
-    if not isinstance(task, str) or not isinstance(model_kind, str):
-        msg = "Resolved executable config must contain string task and model.kind values."
+    run = resolved.get("run")
+    run_label = run.get("name") if isinstance(run, dict) else None
+    if not isinstance(task, str) or not isinstance(model_kind, str) or not isinstance(run_label, str):
+        msg = "Resolved executable config must contain string task, model.kind, and run.name values."
         raise loader.ConfigError(msg)
     return ConfigPreflight(
         family=family,
         task=task,
         model_kind=model_kind,
         physics_enabled=physics["enabled"],
+        run_label=run_label,
         source_path=source.resolve(),
         canonical_path=_canonical_config_path(source),
     )

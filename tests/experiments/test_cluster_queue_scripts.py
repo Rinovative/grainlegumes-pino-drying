@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -536,6 +537,11 @@ def _assert_submission(
     assert len(queued) == 4
     token = queued[3]
     assert not token.startswith("/")
+    _scope, queue_label = token.split("/", maxsplit=1)
+    if workflow == "train":
+        assert queue_label.startswith("train-")
+        assert "steady_flow" not in queue_label
+        assert not re.search(r"[0-9a-f]{16,}", queue_label)
     assert len(" ".join(queued[2:])) < 120
     assert str(harness.repository) not in " ".join(queued)
     assert harness.environment["STORAGE_ROOT"] not in " ".join(queued)
@@ -720,7 +726,7 @@ def test_optuna_submission_uses_explicit_gpu_and_forwards_arguments(
     """Forward a valid Optuna request to the explicitly selected device."""
     harness = _harness(
         tmp_path,
-        preflight_summary=f"optuna\tsteady_flow\t{_OPTUNA_CONFIG_RELATIVE}",
+        preflight_summary=f"optuna\tsteady_flow\t{_OPTUNA_CONFIG_RELATIVE}\toptuna-study",
     )
     arguments = [
         _OPTUNA_CONFIG_RELATIVE,
@@ -812,7 +818,7 @@ def test_host_paths_are_translated_to_container_domains(tmp_path: Path) -> None:
     """Translate repository configs and host storage paths to container paths."""
     harness = _harness(
         tmp_path,
-        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}",
+        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}\tcanonical-run",
     )
     resume = Path(harness.environment["STORAGE_ROOT"]) / "03_experiments/steady_flow/runs/synthetic run"
     resume.mkdir(parents=True)
@@ -854,7 +860,7 @@ def test_scheduler_submission_failure_is_propagated(tmp_path: Path) -> None:
     """Return the scheduler failure without claiming successful admission."""
     harness = _harness(
         tmp_path,
-        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}",
+        preflight_summary=f"experiment\tsteady_flow\t{_DIRECT_CONFIG_RELATIVE}\tcanonical-run",
     )
     harness.environment["QUEUE_SUBMISSION_EXIT"] = "37"
     harness.environment["QUEUE_PARTIAL_OUTPUT"] = "synthetic scheduler diagnostic\n"

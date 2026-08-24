@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
+from support import configs
 from torch.optim.adamw import AdamW
 
 from src import common, datasets, domain, experiments, generation, learning
@@ -25,6 +25,9 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 from src.learning.transient.learning_transient_curriculum import RolloutCurriculum, RolloutCurriculumState
 from tests.generation.test_generation_transient import _small_scientific_contract, _source, _write_transient_case
 from tests.generation.test_generation_transient_shards import _assert_item_equal
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 pytestmark = pytest.mark.integration
 _CUDA_REQUIRED = pytest.mark.skipif(
@@ -291,7 +294,7 @@ def _authored_fno_plan(
     destination: Path,
 ) -> Path:
     """Write one compact test-owned authored FNO A0-to-B plan."""
-    raw = experiments.config.loader.load_yaml("configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml")
+    raw = configs.transient_two_stage_config(model_kind="fno", seed=9)
     raw["run"].update({"device": "cuda", "deterministic": False, "suffix": "technical"})
     raw["data"].update(
         {
@@ -357,8 +360,8 @@ def test_transient_a0_and_b_lifecycle_smoke(transient_smoke_package: dict[str, A
     resolution = outcome["device_resolution"]
 
     assert outcome["run_dir"] == b_dir
-    assert "stage_a0" in a0_dir.name
-    assert "stage_b" in b_dir.name
+    assert a0_dir.name.endswith("_a0")
+    assert b_dir.name.endswith("_b")
     assert a0["best_checkpoint"]["schema_version"] == 1
     assert (a0_dir / "history.json").is_file()
     manifest = handoff.validate_stage_a_handoff(
@@ -392,12 +395,10 @@ def _resolved_direct_model_config(
     ood_dataset: str,
     model_kind: str,
 ) -> dict[str, Any]:
-    """Derive and shrink a maintained architecture-specific A0 child for one update."""
-    names = {
-        "uno": "uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__lentil_chickpea__s9.yaml",
-        "rno": "rno_m24x24_h16_l3__lentil_chickpea__s9.yaml",
-    }
-    plan = transient_plan.load_and_resolve_transient_training_plan(Path("configs/learning/transient_drying/experiments") / names[model_kind])
+    """Derive and shrink a test-owned architecture-specific A0 child for one update."""
+    plan = transient_plan.resolve_transient_training_plan(
+        configs.transient_two_stage_config(model_kind=model_kind, seed=9),
+    )
     resolved = copy.deepcopy(dict(plan.stage_a))
     resolved["run"].update({"device": "cuda", "deterministic": False, "suffix": "technical"})
     resolved["data"].update(

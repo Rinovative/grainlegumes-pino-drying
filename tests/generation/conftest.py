@@ -334,7 +334,7 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
                 "counts": {"natural": {_TEST_MATERIAL_FAMILY: natural_count}},
             },
             "dataset_packages": [
-                {"evaluation_regime": "id", "source_role": "seen"},
+                {"evaluation_regime": "id", "source_role": "seen", "dataset_revision": 0},
             ],
         }
         if campaign_purpose == "technical_runtime_smoke":

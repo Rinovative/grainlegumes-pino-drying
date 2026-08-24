@@ -1638,6 +1638,7 @@ def dataset_package_scientific_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     """Return package membership semantics without derived Training storage policy."""
     plan = copy.deepcopy(dict(value))
     plan.pop("training_payload", None)
+    plan.pop("dataset_revision", None)
     return plan
 
 
@@ -1666,12 +1667,17 @@ def _validate_dataset_packages(
         package = _mapping(raw, label=label)
         _exact_keys(
             package,
-            required={"evaluation_regime", "source_role"},
+            required={"evaluation_regime", "source_role", "dataset_revision"},
             optional={"dataset_view", "training_payload"},
             label=label,
         )
         regime = package["evaluation_regime"]
         source_role = package["source_role"]
+        package["dataset_revision"] = _integer(
+            package["dataset_revision"],
+            label=f"{label}.dataset_revision",
+            minimum=0,
+        )
         dataset_view = package.get("dataset_view")
         training_payload = package.get("training_payload")
         if training_payload is not None:

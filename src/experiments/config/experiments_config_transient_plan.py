@@ -101,16 +101,6 @@ def _validate_exact_keys(value: Mapping[str, Any], expected: frozenset[str], *, 
         raise loader.ConfigError(message)
 
 
-def _stage_suffix(context: object, *, stage_token: str) -> str:
-    """Append one required derived stage token to optional authored context."""
-    if context is None:
-        return stage_token
-    if not isinstance(context, str) or not context:
-        message = "run.suffix must be null or a non-empty string in an authored transient plan."
-        raise loader.ConfigError(message)
-    return f"{context}_{stage_token}"
-
-
 def _null_matched_compute() -> dict[str, None]:
     """Return the exact no-budget resolved A0 matched-compute mapping."""
     return dict.fromkeys(sorted(_MATCHED_KEYS))
@@ -128,6 +118,7 @@ def _derive_child(
     stage_config: Mapping[str, Any],
     stage_schedule: Mapping[str, Any],
     source_run_name: str | None,
+    naming_schema_version: int,
 ) -> dict[str, Any]:
     """Build one ordinary raw child config from the authored shared plan mapping."""
     child = copy.deepcopy(dict(raw))
@@ -135,7 +126,9 @@ def _derive_child(
     temporal["sampling"] = copy.deepcopy(stage_config["sampling"])
     child["temporal"] = temporal
     run = _mapping(child.get("run"), path="run")
-    run["suffix"] = _stage_suffix(run.get("suffix"), stage_token="stage_a0" if stage == "a" else "stage_b")
+    if naming_schema_version == 1:
+        stage_suffix = "stage_a0" if stage == "a" else "stage_b"
+        run["suffix"] = stage_suffix if run.get("suffix") is None else f"{run['suffix']}_{stage_suffix}"
     child["run"] = run
     training: dict[str, Any] = {
         "epochs": stage_schedule["stage_a_epochs"] if stage == "a" else stage_schedule["stage_b_epochs"],
@@ -155,7 +148,13 @@ def _derive_child(
     return child
 
 
-def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTrainingPlan:
+def resolve_transient_training_plan(
+    raw: Mapping[str, Any],
+    *,
+    storage_root: Path | str | None = None,
+    naming_schema_version: int = loader.RUN_NAMING_SCHEMA_VERSION,
+    pinned_dataset_references: Mapping[str, Any] | None = None,
+) -> TransientTrainingPlan:
     """
     Resolve one authored transient two-stage plan into canonical A0 and B configs.
 
@@ -163,6 +162,12 @@ def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTraining
     ----------
     raw : Mapping[str, Any]
         Authored transient plan with shared semantic sections and exact stage maps.
+    storage_root : Path or str or None, optional
+        Explicit root for controlled logical Dataset-reference resolution.
+    naming_schema_version : int, optional
+        Current concise or legacy saved-run naming schema.
+    pinned_dataset_references : Mapping[str, Any] or None, optional
+        Saved reference evidence reused without chasing current aliases.
 
     Returns
     -------
@@ -198,8 +203,14 @@ def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTraining
         stage_config=stage_a,
         stage_schedule=stage_schedule,
         source_run_name=None,
+        naming_schema_version=naming_schema_version,
     )
-    resolved_a = loader.resolve_config(a_raw)
+    resolved_a = loader.resolve_config(
+        a_raw,
+        storage_root=storage_root,
+        naming_schema_version=naming_schema_version,
+        pinned_dataset_references=pinned_dataset_references,
+    )
     resolved_a = loader.validate_resolved_config(resolved_a)
     b_raw = _derive_child(
         authored,
@@ -207,8 +218,14 @@ def resolve_transient_training_plan(raw: Mapping[str, Any]) -> TransientTraining
         stage_config=stage_b,
         stage_schedule=stage_schedule,
         source_run_name=resolved_a["run"]["name"],
+        naming_schema_version=naming_schema_version,
     )
-    resolved_b = loader.resolve_config(b_raw)
+    resolved_b = loader.resolve_config(
+        b_raw,
+        storage_root=storage_root,
+        naming_schema_version=naming_schema_version,
+        pinned_dataset_references=pinned_dataset_references,
+    )
     resolved_b = loader.validate_resolved_config(resolved_b)
     handoff = resolved_b["training"]["teacher_handoff"]
     if handoff != {"source_run_name": resolved_a["run"]["name"]}:

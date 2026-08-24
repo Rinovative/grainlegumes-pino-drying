@@ -1134,18 +1134,23 @@ def _campaign_seed_plan(campaign: config_service.CampaignConfig) -> dict[str, An
     }
 
 
-def _dataset_package_requests(campaign: config_service.CampaignConfig) -> list[dict[str, str]]:
-    """Return unique authored package intents represented by resolved packages."""
-    requests: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+def _dataset_package_requests(campaign: config_service.CampaignConfig) -> list[dict[str, str | int]]:
+    """Return unique revision-bearing package intents represented by resolved packages."""
+    requests: list[dict[str, str | int]] = []
+    seen: set[tuple[str, str, int]] = set()
     for package in campaign.dataset_packages:
-        key = (str(package["evaluation_regime"]), str(package["source_role"]))
+        key = (
+            str(package["evaluation_regime"]),
+            str(package["source_role"]),
+            int(package["dataset_revision"]),
+        )
         if key not in seen:
             seen.add(key)
             requests.append(
                 {
                     "evaluation_regime": key[0],
                     "source_role": key[1],
+                    "dataset_revision": key[2],
                 }
             )
     return requests

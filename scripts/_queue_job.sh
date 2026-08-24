@@ -11,7 +11,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 
-if [[ ! "${QUEUE_TOKEN}" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,63})/([A-Za-z0-9][A-Za-z0-9._-]{0,95})$ ]]; then
+if [[ ! "${QUEUE_TOKEN}" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,63})/([A-Za-z0-9][A-Za-z0-9._+-]{0,95})$ ]]; then
   echo "Queue descriptor token is invalid." >&2
   exit 2
 fi

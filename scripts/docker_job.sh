@@ -419,6 +419,7 @@ fi
 RESOLVED_TASK="not supplied"
 LOG_SCOPE=""
 CANONICAL_CONFIG_PATH="not applicable"
+PREFLIGHT_RUN_LABEL="not applicable"
 case "${JOB_TYPE}" in
   train|optuna)
     if (( ${#SEMANTIC_ARGS[@]} == 0 )); then
@@ -444,8 +445,8 @@ case "${JOB_TYPE}" in
       fi
       exit "${PREFLIGHT_STATUS}"
     fi
-    IFS=$'\t' read -r SUPPLIED_CONFIG_FAMILY RESOLVED_TASK CANONICAL_CONFIG_PATH PREFLIGHT_EXTRA <<< "${PREFLIGHT_OUTPUT}"
-    if [[ -z "${SUPPLIED_CONFIG_FAMILY}" || -z "${RESOLVED_TASK}" || -z "${CANONICAL_CONFIG_PATH}" || -n "${PREFLIGHT_EXTRA:-}" ]]; then
+    IFS=$'\t' read -r SUPPLIED_CONFIG_FAMILY RESOLVED_TASK CANONICAL_CONFIG_PATH PREFLIGHT_RUN_LABEL PREFLIGHT_EXTRA <<< "${PREFLIGHT_OUTPUT}"
+    if [[ -z "${SUPPLIED_CONFIG_FAMILY}" || -z "${RESOLVED_TASK}" || -z "${CANONICAL_CONFIG_PATH}" || -z "${PREFLIGHT_RUN_LABEL}" || -n "${PREFLIGHT_EXTRA:-}" ]]; then
       fail 1 "Configuration preflight returned a malformed container summary."
     fi
     LOG_SCOPE="${RESOLVED_TASK}"
@@ -629,8 +630,12 @@ if [[ "${JOB_TYPE}" == "train" || "${JOB_TYPE}" == "optuna" ]]; then
 else
   QUEUE_VARIANT="artifacts"
 fi
-QUEUE_LABEL="vp2-${JOB_TYPE}-${RESOLVED_TASK}-${QUEUE_VARIANT}${QUEUE_SEED}-${LOG_SUFFIX}"
-if [[ ! "${QUEUE_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]; then
+if [[ "${JOB_TYPE}" == "train" ]]; then
+  QUEUE_LABEL="train-${PREFLIGHT_RUN_LABEL}-${LOG_SUFFIX}"
+else
+  QUEUE_LABEL="vp2-${JOB_TYPE}-${RESOLVED_TASK}-${QUEUE_VARIANT}${QUEUE_SEED}-${LOG_SUFFIX}"
+fi
+if [[ ! "${QUEUE_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,95}$ ]]; then
   rm -f -- "${LOG_PATH}"
   fail 1 "Unable to derive a safe concise queue label."
 fi

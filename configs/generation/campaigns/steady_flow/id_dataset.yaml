@@ -31,4 +31,5 @@ membership:
     id_test: 35
 dataset_packages:
 - evaluation_regime: id
+  dataset_revision: 0
   source_role: seen

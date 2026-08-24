@@ -39,6 +39,7 @@ from src.datasets.contracts import dataset_contracts_views as views
 from . import dataset_packages_generated_batch as generated
 from . import dataset_packages_manifest as package_manifest
 from . import dataset_packages_planning as planning
+from . import dataset_packages_references as references
 from . import dataset_packages_trajectory as trajectory
 
 if TYPE_CHECKING:
@@ -567,6 +568,16 @@ def _publish(
         return destination, manifest_path, False, admitted_manifest
 
 
+def _logical_reference_name(dataset_name: str, dataset_view: str) -> str:
+    """Derive one concise task-local logical name from the canonical package name."""
+    prefix = f"{dataset_view}__"
+    if not dataset_name.startswith(prefix):
+        message = f"Dataset package name {dataset_name!r} is not owned by view {dataset_view!r}."
+        raise ValueError(message)
+    logical_name = dataset_name[len(prefix) :].replace("__", "_")
+    return references.DatasetRef(logical_name, 0).name
+
+
 def _publish_prepared(
     campaign: generation.cases.config.CampaignConfig,
     prepared: planning.PreparedPackage,
@@ -642,6 +653,20 @@ def _publish_prepared(
         build_payload=build_payload,
         storage_root=storage_root,
     )
+    admitted_manifest = package_manifest.load_package_manifest(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    if admitted_manifest != manifest:
+        message = f"Fully admitted package manifest changed after publication: {dataset_id!r}."
+        raise RuntimeError(message)
+    dataset_reference = references.publish_dataset_reference(
+        dataset_view,
+        _logical_reference_name(str(prepared.plan["dataset_name"]), dataset_view),
+        int(prepared.plan["dataset_revision"]),
+        dataset_id,
+        storage_root=storage_root,
+    )
     if reused and dataset_view == "transient_drying":
         existing_index = trajectory.load_transient_index(destination)
         if (
@@ -659,6 +684,7 @@ def _publish_prepared(
         "evaluation_regime": prepared.plan["evaluation_regime"],
         "payload_path": destination,
         "manifest_path": manifest_path,
+        "dataset_reference": dataset_reference,
         "sample_count": int(manifest["sample_count"]),
         "source_case_count": len(prepared.candidates),
         "transition_count": int(manifest["transition_count"]),

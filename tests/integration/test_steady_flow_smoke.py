@@ -1058,8 +1058,10 @@ def test_interrupted_direct_run_resumes_from_renamed_directory(
     raw = copy.deepcopy(saved)
     raw.pop("task_contract")
     raw.pop("paths")
+    raw["data"].pop("dataset_references")
     raw["run"].pop("name")
-    for key in ("project", "entity", "tags"):
+    raw["run"].pop("naming_schema_version")
+    for key in ("project", "entity", "tags", "metric_schema_version"):
         raw["tracking"]["wandb"].pop(key)
     raw["model"]["params"].pop("in_channels")
     raw["model"]["params"].pop("out_channels")
