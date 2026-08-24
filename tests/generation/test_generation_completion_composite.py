@@ -12,12 +12,14 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from src import common, datasets
+from src.datasets.packages import dataset_packages_planning as package_planning
 from src.datasets.packages import dataset_packages_transient_shards as transient_shards
 from src.generation import generation_campaign_completion as completion_service
 from src.generation import generation_workflow as workflow
 from src.generation.publication import generation_publication_completion_composite as composite
 
 if TYPE_CHECKING:
+    from src.generation.cases.generation_cases_config import GenerationConfig
     from src.generation.runtime.generation_runtime_batch import TerminalBatchEvidence, TerminalCaseEvidence
 
 
@@ -368,3 +370,127 @@ def test_composite_lifecycle_revalidates_hdf5_pt_smoke_before_cleanup(
             storage_root=tmp_path,
         )
     assert lifecycle_path.read_bytes() == before_conflict
+
+
+def test_composite_parent_routine_admission_uses_receipt_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_commit = "d" * 40
+    manifest_path = tmp_path / "campaign_run.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    admitted = SimpleNamespace(
+        case_id="case_0028",
+        case_input_id="input-case-0028",
+        simulation_case_id="simulation-case-0028",
+        success_sha256="a" * 64,
+        provenance_sha256="b" * 64,
+        case_hdf5_sha256="c" * 64,
+        hdf5_identity=SimpleNamespace(git_commit=None),
+    )
+    admission: dict[str, object] = {}
+
+    def admit_completed_case(*_args: object, **kwargs: object) -> SimpleNamespace:
+        admission.update(kwargs)
+        return admitted
+
+    monkeypatch.setattr(
+        package_planning.generation.publication.campaign_evidence,
+        "campaign_run_manifest_path",
+        lambda *_args, **_kwargs: manifest_path,
+    )
+    monkeypatch.setattr(
+        package_planning.generation.publication.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {"git_commit": source_commit},
+    )
+    monkeypatch.setattr(package_planning.generation.runtime, "admit_completed_case", admit_completed_case)
+    member = {
+        "source_kind": "parent_partial",
+        "source_run_id": "parent-run",
+        "source_git_commit": source_commit,
+        "source_campaign_manifest_sha256": common.serialization.file_sha256(manifest_path),
+        "case_index": 28,
+        "case_id": admitted.case_id,
+        "case_input_id": admitted.case_input_id,
+        "simulation_case_id": admitted.simulation_case_id,
+        "success_sha256": admitted.success_sha256,
+        "provenance_sha256": admitted.provenance_sha256,
+        "case_hdf5_sha256": admitted.case_hdf5_sha256,
+    }
+
+    case = package_planning._composite_member_case(
+        member,
+        cast("GenerationConfig", SimpleNamespace()),
+        storage_root=tmp_path,
+    )
+
+    assert case is admitted
+    assert admission == {
+        "storage_root": tmp_path,
+        "validation_depth": "routine",
+        "git_commit": source_commit,
+    }
+
+
+def test_shared_id_membership_uses_nested_material_counts() -> None:
+    roles = ("train", "validation", "id_test")
+    plan = {
+        "materials": ["lentil", "chickpea"],
+        "membership": {
+            "seed": 1967,
+            "per_seen_material": {"train": 2, "validation": 1, "id_test": 1},
+        },
+    }
+    candidates = [{"material_family": material, "case_input_id": f"{material}-input-{index}"} for material in plan["materials"] for index in range(4)]
+
+    assignments = package_planning._shared_id_membership(plan, candidates)
+
+    assert len(assignments) == len(candidates)
+    for material in plan["materials"]:
+        memberships = [assignments[f"{material}-input-{index}"] for index in range(4)]
+        assert {role: memberships.count(role) for role in roles} == plan["membership"]["per_seen_material"]
+
+    with pytest.raises(ValueError, match="nested membership contract"):
+        package_planning._shared_id_membership(
+            {
+                "materials": plan["materials"],
+                "membership_seed": 1967,
+                "membership_counts_per_material": plan["membership"]["per_seen_material"],
+            },
+            candidates,
+        )
+
+
+def test_composite_template_path_uses_immutable_case_metadata() -> None:
+    template_sha256 = "a" * 64
+    relative_path = "simulation/transient_drying/transient_drying_template.mph"
+
+    def admitted_case(case_id: str, path: str, *, metadata_sha256: str = template_sha256) -> SimpleNamespace:
+        return SimpleNamespace(
+            case_id=case_id,
+            hdf5_identity=SimpleNamespace(
+                template_relative_path=None,
+                template_sha256=template_sha256,
+            ),
+            metadata_payload=lambda: {
+                "template": {
+                    "relative_path": path,
+                    "sha256": metadata_sha256,
+                }
+            },
+        )
+
+    cases = (
+        admitted_case("case_0000", relative_path),
+        admitted_case("case_0001", relative_path),
+    )
+
+    assert package_planning._composite_template_relative_path(cases) == relative_path
+
+    with pytest.raises(RuntimeError, match="incompatible template paths"):
+        package_planning._composite_template_relative_path((*cases, admitted_case("case_0002", "simulation/other_template.mph")))
+    with pytest.raises(RuntimeError, match="template SHA-256"):
+        package_planning._composite_template_relative_path((admitted_case("case_0003", relative_path, metadata_sha256="b" * 64),))
+    with pytest.raises(ValueError, match="template path"):
+        package_planning._composite_template_relative_path((admitted_case("case_0004", ""),))

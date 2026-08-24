@@ -211,3 +211,121 @@ def test_standalone_split_admission_recomputes_membership_digests() -> None:
             ood_fraction=1.0,
             split_seed=9,
         )
+
+
+def test_ood_package_regime_uses_immutable_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    regimes = {
+        "parameter": "parameter_ood",
+        "near": "near_family_ood",
+        "far": "far_family_ood",
+        "extreme": "extreme_family_ood",
+        "id": "id",
+    }
+    calls: list[tuple[str, str | None]] = []
+
+    def load_manifest(dataset_id: str, *, storage_root: str | None) -> dict[str, str]:
+        calls.append((dataset_id, storage_root))
+        return {
+            "dataset_view": "transient_drying",
+            "evaluation_regime": regimes[dataset_id],
+        }
+
+    monkeypatch.setattr(training.package_manifest, "load_package_manifest", load_manifest)
+
+    for dataset_id, regime in tuple(regimes.items())[:-1]:
+        assert training._ood_package_regime(dataset_id, storage_root="/storage") == regime
+    with pytest.raises(ValueError, match="resolves to an ID package"):
+        training._ood_package_regime("id", storage_root="/storage")
+
+    assert calls == [(dataset_id, "/storage") for dataset_id in regimes]
+
+
+def test_ood_package_regime_rejects_non_transient_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        training.package_manifest,
+        "load_package_manifest",
+        lambda *_args, **_kwargs: {
+            "dataset_view": "steady_flow",
+            "evaluation_regime": "near_family_ood",
+        },
+    )
+
+    with pytest.raises(ValueError, match="incompatible view"):
+        training._ood_package_regime("steady-ood", storage_root=None)
+
+
+def test_training_loader_dispatches_ordered_manifest_ood_regimes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ood_regimes = {
+        "ood_parameter": "parameter_ood",
+        "ood_near": "near_family_ood",
+        "ood_far": "far_family_ood",
+        "ood_extreme": "extreme_family_ood",
+    }
+    sampling = TransientSamplingSpec(mode="one_step_transition")
+
+    def runtime_dataset(dataset_id: str) -> transient.TransientPhysicalDataset:
+        dataset = object.__new__(transient.TransientPhysicalDataset)
+        dataset.sample_indices = (0,)
+        dataset.sampling = sampling
+        dataset._item_references = (transient._ItemReference(case_index=0, sample_positions=(0,)),)
+        dataset.storage_backend = "pt_shards"
+        dataset.payload = {
+            "dataset_id": dataset_id,
+            "contract_digest": "a" * 64,
+            "index_digest": dataset_id.ljust(64, "0"),
+            "configured_regular_horizon": {"value": 32.0, "unit": "h"},
+            "cases": [{"package_case_id": f"{dataset_id}_case"}],
+            "samples": [
+                {
+                    "case_index": 0,
+                    "sample_id": f"{dataset_id}_case__step_0000",
+                }
+            ],
+        }
+        return dataset
+
+    datasets = {dataset_id: runtime_dataset(dataset_id) for dataset_id in ("train_id", *ood_regimes)}
+    requests: list[tuple[str, str]] = []
+
+    def create_dataset(
+        request: training.factory.DatasetRequest,
+        **_kwargs: object,
+    ) -> transient.TransientPhysicalDataset:
+        dataset_id = request.dataset_id
+        requests.append((dataset_id, request.evaluation_regime))
+        return datasets[dataset_id]
+
+    monkeypatch.setattr(
+        training.package_manifest,
+        "load_package_manifest",
+        lambda dataset_id, **_kwargs: {
+            "dataset_view": "transient_drying",
+            "evaluation_regime": ood_regimes[dataset_id],
+        },
+    )
+    monkeypatch.setattr(training.factory, "create_dataset", create_dataset)
+    monkeypatch.setattr(training, "_select_cases", lambda dataset, _case_ids: dataset)
+    monkeypatch.setattr(training.scaling, "fit_transient_scaling", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(training, "_loader", lambda dataset, *_args, **_kwargs: dataset)
+
+    loaders = training.create_transient_training_loaders(
+        train_dataset_id="train_id",
+        ood_dataset_ids=tuple(ood_regimes),
+        tensorizer=TransientTensorizerSpec(
+            input_profile="canonical_physics_complete_v1",
+            temporal_conditioning=TemporalConditioningSpec("none"),
+        ),
+        train_sampling=sampling,
+        loader_settings=training.factory.LoaderSettings(batch_size=1),
+    )
+
+    ood_requests = [request for request in requests if request[0] in ood_regimes]
+    assert ood_requests == list(ood_regimes.items())
+    assert [identity["dataset_id"] for identity in loaders.dataset_identity["ood"]] == list(ood_regimes)
+    assert [part["case_ids"] for part in loaders.split["roles"]["ood"]["parts"]] == [[f"{dataset_id}_case"] for dataset_id in ood_regimes]

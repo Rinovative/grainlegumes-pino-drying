@@ -234,6 +234,7 @@ def _composite_member_case(
             case_index,
             storage_root=storage_root,
             validation_depth="routine",
+            git_commit=source_manifest["git_commit"],
         )
     elif source_kind == "replacement":
         storage_name = member.get("terminal_batch_storage_name")
@@ -259,10 +260,32 @@ def _composite_member_case(
         "case_hdf5_sha256": case.case_hdf5_sha256,
     }
     observed = {key: member.get(key) for key in expected}
-    case_commit = terminal.git_commit if source_kind == "replacement" else case.hdf5_identity.git_commit
+    case_commit = terminal.git_commit if source_kind == "replacement" else source_manifest["git_commit"]
     if observed != expected or case_commit != member.get("source_git_commit"):
         raise RuntimeError(f"Composite receipt conflicts with re-admitted case evidence: {case.case_id!r}.")
     return case
+
+
+def _composite_template_relative_path(cases: Sequence[Any]) -> str:
+    """Return the one immutable template path shared by admitted composite cases."""
+    relative_paths: set[str] = set()
+    for case in cases:
+        template = case.metadata_payload().get("template")
+        if not isinstance(template, dict):
+            message = f"Composite case {case.case_id!r} lacks immutable template metadata."
+            raise ValueError(message)
+        relative_path = template.get("relative_path")
+        if not isinstance(relative_path, str) or not relative_path:
+            message = f"Composite case {case.case_id!r} has an invalid immutable template path."
+            raise ValueError(message)
+        if template.get("sha256") != case.hdf5_identity.template_sha256:
+            message = f"Composite case {case.case_id!r} has conflicting template SHA-256 evidence."
+            raise RuntimeError(message)
+        relative_paths.add(relative_path)
+    if len(relative_paths) != 1:
+        message = f"Composite batch cases have incompatible template paths: {sorted(relative_paths)}."
+        raise RuntimeError(message)
+    return next(iter(relative_paths))
 
 
 def _load_composite_candidates(
@@ -294,6 +317,7 @@ def _load_composite_candidates(
         if not batch_members:
             raise ValueError(f"Composite receipt has no source cases for batch {batch.batch_id!r}.")
         cases = tuple(_composite_member_case(member, batch, storage_root=storage) for member in batch_members)
+        template_relative_path = _composite_template_relative_path(cases)
         first = cases[0].hdf5_identity
         shared_identity = (
             first.simulation_profile,
@@ -335,7 +359,7 @@ def _load_composite_candidates(
                 "batch_identity": batch.batch_identity,
                 "manifest_sha256": common.serialization.canonical_json_sha256(list(batch_members)),
                 "simulation_profile": evidence.simulation_profile,
-                "template": {"relative_path": first.template_relative_path, "sha256": evidence.template_sha256},
+                "template": {"relative_path": template_relative_path, "sha256": evidence.template_sha256},
                 "scientific_config_digest": first.scientific_config_digest,
                 "git_commits": list(evidence.git_commits),
                 "material_config_digest": batch.scientific_values["material_config_digest"],
@@ -466,9 +490,18 @@ def _shared_id_membership(
     candidates: Sequence[Mapping[str, Any]],
 ) -> dict[str, str]:
     """Assign deterministic material-stratified membership to physical case IDs."""
-    seed = plan["membership_seed"]
-    counts = plan["membership_counts_per_material"]
-    if not isinstance(seed, int) or any(not isinstance(counts.get(role), int) for role in _ID_MEMBERSHIP_ROLES):
+    membership = plan.get("membership")
+    if not isinstance(membership, dict):
+        message = "ID package membership must use the resolved nested membership contract."
+        raise ValueError(message)
+    seed = membership.get("seed")
+    counts = membership.get("per_seen_material")
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not isinstance(counts, dict)
+        or any(isinstance(counts.get(role), bool) or not isinstance(counts.get(role), int) for role in _ID_MEMBERSHIP_ROLES)
+    ):
         message = "ID package membership seed and per-material counts must be resolved."
         raise ValueError(message)
     assignments: dict[str, str] = {}

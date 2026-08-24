@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -22,8 +22,13 @@ from src.learning.transient.learning_transient_tensorizer import (
     TransientTensorizer,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 _EXPECTED_UNIQUE_STATES = 3
 _EXPECTED_TRANSITIONS = 2
+_STREAMING_TRANSITIONS = 20
+_STREAMING_STATES = _STREAMING_TRANSITIONS + 1
 
 
 def _digest(label: str) -> str:
@@ -214,6 +219,198 @@ def test_scaling_deduplicates_states_and_ignores_external_eval_values() -> None:
     assert first.unique_train_state_count == _EXPECTED_UNIQUE_STATES
     assert first.transition_count == _EXPECTED_TRANSITIONS
     assert first.digest == second.digest
+
+
+def test_scaling_admits_exact_float32_delta_when_addition_does_not_round_trip() -> None:
+    """Prefer direct endpoints while validating the exact stored delta."""
+    first = _item(0)
+    second = _item(1)
+    first_state = torch.full_like(first["state"], 0.3)
+    second_state = torch.full_like(second["state"], 0.1)
+    terminal_state = torch.full_like(second["state"], 0.4)
+    first["state"] = first_state
+    first["target"] = second_state - first_state
+    second["state"] = second_state
+    second["target"] = terminal_state - second_state
+    assert not torch.equal(first_state + first["target"], second_state)
+
+    artifact = fit_transient_scaling(
+        [first, second],
+        tensorizer=_spec(),
+        dataset_identity={"dataset_id": "synthetic"},
+        train_membership_digest=_digest("round-trip"),
+        horizon=10.0,
+    )
+
+    terminal_reconstructed = second_state + second["target"]
+    expected_matrix = torch.stack((first_state, second_state, terminal_reconstructed)).permute(1, 0, 2, 3).reshape(4, -1)
+    expected_std = expected_matrix.to(dtype=torch.float64).std(dim=1, unbiased=False).to(dtype=torch.float32)
+    assert torch.equal(artifact.state_std, expected_std)
+    assert artifact.unique_train_state_count == _EXPECTED_UNIQUE_STATES
+
+
+def test_scaling_rejects_noncanonical_case_time_order() -> None:
+    """Require the immutable package index's grouped consecutive order."""
+    first = _item(0)
+    second = _item(1)
+    with pytest.raises(ValueError, match="canonical zero-time"):
+        fit_transient_scaling(
+            [second, first],
+            tensorizer=_spec(),
+            dataset_identity={"dataset_id": "synthetic"},
+            train_membership_digest=_digest("reversed-order"),
+            horizon=10.0,
+        )
+
+
+def test_scaling_streams_one_shot_items_against_float64_population_reference() -> None:
+    """Match stable analytical moments without materializing production tensors."""
+    items = []
+    for index in range(_STREAMING_TRANSITIONS):
+        item = _item(
+            index,
+            regular_omega=(0.1 + index * 0.01, 0.2 + index * 0.02),
+        )
+        item["static"] = item["static"] + index * 0.5
+        item["scalars"] = item["scalars"] + index * 0.25
+        items.append(item)
+
+    artifact = fit_transient_scaling(
+        (item for item in items),
+        tensorizer=_spec(),
+        dataset_identity={"dataset_id": "synthetic"},
+        train_membership_digest=_digest("streaming-reference"),
+        horizon=25.0,
+    )
+
+    def population(values: tuple[torch.Tensor, ...], channels: int) -> tuple[torch.Tensor, torch.Tensor]:
+        matrix = torch.stack(values).permute(1, 0, 2, 3).reshape(channels, -1).to(dtype=torch.float64)
+        return matrix.mean(dim=1).to(dtype=torch.float32), matrix.std(dim=1, unbiased=False).to(dtype=torch.float32)
+
+    state_values = [item["state"] for item in items]
+    state_values.append(items[-1]["state"] + items[-1]["target"])
+    state_mean, state_std = population(tuple(state_values), 4)
+    static_mean, static_std = population(tuple(item["static"] for item in items), 7)
+    scalar_matrix = torch.stack(tuple(item["scalars"] for item in items)).transpose(0, 1).to(dtype=torch.float64)
+    omega_matrix = torch.cat(tuple(item["boundary"][2:4] for item in items)).reshape(1, -1).to(dtype=torch.float64)
+
+    def assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+        torch.testing.assert_close(actual, expected, rtol=1.0e-6, atol=1.0e-7)
+
+    assert_close(artifact.state_mean, state_mean)
+    assert_close(artifact.state_std, state_std)
+    assert_close(artifact.delta_rms, torch.ones(4))
+    assert_close(artifact.static_mean, static_mean)
+    assert_close(artifact.static_std, static_std.clamp_min(artifact.numerical_floor))
+    assert_close(
+        artifact.scalar_mean,
+        scalar_matrix.mean(dim=1).to(dtype=torch.float32),
+    )
+    assert_close(
+        artifact.scalar_std,
+        scalar_matrix.std(dim=1, unbiased=False).to(dtype=torch.float32).clamp_min(artifact.numerical_floor),
+    )
+    assert_close(
+        artifact.omega_boundary_mean,
+        omega_matrix.mean().to(dtype=torch.float32),
+    )
+    assert_close(
+        artifact.omega_boundary_std,
+        omega_matrix.std(unbiased=False).to(dtype=torch.float32).clamp_min(artifact.numerical_floor),
+    )
+    assert artifact.unique_train_state_count == _STREAMING_STATES
+    assert artifact.unique_transition_count == artifact.transition_count == _STREAMING_TRANSITIONS
+
+
+def test_scaling_isolates_reused_one_shot_buffers() -> None:
+    """Snapshot yielded tensors before a one-shot iterator reuses its buffers."""
+    state_buffer = torch.empty_like(_item()["state"])
+    target_buffer = torch.empty_like(_item()["target"])
+
+    def reused_items() -> Iterator[dict[str, Any]]:
+        first = _item(0)
+        state_buffer.zero_()
+        target_buffer.fill_(1.0)
+        first["state"] = state_buffer
+        first["target"] = target_buffer
+        yield first
+
+        second = _item(1)
+        state_buffer.fill_(1.0)
+        target_buffer.fill_(2.0)
+        second["state"] = state_buffer
+        second["target"] = target_buffer
+        yield second
+
+    artifact = fit_transient_scaling(
+        reused_items(),
+        tensorizer=_spec(),
+        dataset_identity={"dataset_id": "synthetic"},
+        train_membership_digest=_digest("reused-buffers"),
+        horizon=10.0,
+    )
+
+    torch.testing.assert_close(
+        artifact.state_mean,
+        torch.full((4,), 4.0 / 3.0),
+    )
+    torch.testing.assert_close(
+        artifact.delta_rms,
+        torch.sqrt(torch.tensor(2.5)).repeat(4),
+    )
+    assert artifact.unique_train_state_count == _EXPECTED_UNIQUE_STATES
+    assert artifact.unique_transition_count == artifact.transition_count == _EXPECTED_TRANSITIONS
+
+
+def test_scaling_rejects_direct_state_that_disagrees_with_exact_delta() -> None:
+    """Keep direct endpoint admission bound to the stored float32 delta."""
+    first = _item(0)
+    second = _item(1)
+    first["state"].fill_(0.3)
+    second["state"].fill_(0.1)
+    first["target"] = second["state"] - first["state"]
+    second["state"].fill_(0.2)
+
+    with pytest.raises(ValueError, match="exact transition target"):
+        fit_transient_scaling(
+            [first, second],
+            tensorizer=_spec(),
+            dataset_identity={"dataset_id": "synthetic"},
+            train_membership_digest=_digest("conflicting-direct-endpoint"),
+            horizon=10.0,
+        )
+
+
+def test_scaling_keeps_direct_and_transition_duplicates_exact() -> None:
+    """Reject duplicate direct states and targets even when additions coincide."""
+    original = _item(0)
+    changed_state = copy.deepcopy(original)
+    changed_state["state"][0, 0, 0] += 1.0
+    with pytest.raises(ValueError, match="direct transient state"):
+        fit_transient_scaling(
+            [original, changed_state],
+            tensorizer=_spec(),
+            dataset_identity={"dataset_id": "synthetic"},
+            train_membership_digest=_digest("conflicting-direct-duplicate"),
+            horizon=10.0,
+        )
+
+    changed_target = copy.deepcopy(original)
+    changed_target["target"].zero_()
+    changed_target["target"][0, 0, 1] = torch.nextafter(
+        torch.tensor(0.0),
+        torch.tensor(float("inf")),
+    )
+    original["target"].zero_()
+    assert torch.equal(original["state"] + original["target"], original["state"] + changed_target["target"])
+    with pytest.raises(ValueError, match="transition evidence"):
+        fit_transient_scaling(
+            [original, changed_target],
+            tensorizer=_spec(),
+            dataset_identity={"dataset_id": "synthetic"},
+            train_membership_digest=_digest("conflicting-transition-duplicate"),
+            horizon=10.0,
+        )
 
 
 def test_scaling_persists_raw_zero_statistics_and_selects_delta_rms() -> None:

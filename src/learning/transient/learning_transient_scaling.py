@@ -118,16 +118,221 @@ def _finite_float_tensor(value: Any, *, label: str) -> torch.Tensor:
     return value.detach().clone().contiguous()
 
 
-def _population_statistics(
-    values: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return unmodified population mean and standard deviation statistics."""
-    return values.mean(dim=1), values.std(dim=1, unbiased=False)
+class _StreamingChannelMoments:
+    """Accumulate stable population moments without retaining source tensors."""
+
+    def __init__(self, channels: int) -> None:
+        """Initialize empty float64 channel moments."""
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            message = "Streaming moment channels must be a positive integer."
+            raise ValueError(message)
+        self._channels = channels
+        self._count = 0
+        self._mean = torch.zeros(channels, dtype=torch.float64)
+        self._m2 = torch.zeros(channels, dtype=torch.float64)
+
+    def update(self, value: torch.Tensor) -> None:
+        """Merge one finite CPU tensor whose leading axis is channel."""
+        if value.ndim < 1 or value.shape[0] != self._channels:
+            message = f"Streaming moments require a leading channel axis of length {self._channels}."
+            raise ValueError(message)
+        flattened = value.reshape(self._channels, -1).to(dtype=torch.float64)
+        chunk_count = int(flattened.shape[1])
+        chunk_variance, chunk_mean = torch.var_mean(flattened, dim=1, correction=0)
+        chunk_m2 = chunk_variance * chunk_count
+        total_count = self._count + chunk_count
+        if self._count == 0:
+            self._mean = chunk_mean
+            self._m2 = chunk_m2
+        else:
+            delta = chunk_mean - self._mean
+            self._mean = self._mean + delta * (chunk_count / total_count)
+            self._m2 = self._m2 + chunk_m2 + delta.square() * (self._count * chunk_count / total_count)
+        self._count = total_count
+
+    def population_statistics(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return float32 population mean and standard deviation vectors."""
+        if self._count < 1:
+            message = "Streaming population statistics require at least one value."
+            raise ValueError(message)
+        variance = (self._m2 / self._count).clamp_min(0.0)
+        return self._mean.to(dtype=torch.float32), torch.sqrt(variance).to(dtype=torch.float32)
 
 
-def _population_rms(values: torch.Tensor) -> torch.Tensor:
-    """Return the unmodified zero-preserving per-channel population RMS."""
-    return torch.sqrt(torch.mean(values.square(), dim=1))
+class _StreamingChannelRMS:
+    """Accumulate a zero-preserving channel RMS without retaining tensors."""
+
+    def __init__(self, channels: int) -> None:
+        """Initialize empty float64 squared-value sums."""
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            message = "Streaming RMS channels must be a positive integer."
+            raise ValueError(message)
+        self._channels = channels
+        self._count = 0
+        self._square_sum = torch.zeros(channels, dtype=torch.float64)
+
+    def update(self, value: torch.Tensor) -> None:
+        """Merge one finite CPU tensor whose leading axis is channel."""
+        if value.ndim < 1 or value.shape[0] != self._channels:
+            message = f"Streaming RMS requires a leading channel axis of length {self._channels}."
+            raise ValueError(message)
+        flattened = value.reshape(self._channels, -1).to(dtype=torch.float64)
+        self._square_sum = self._square_sum + flattened.square().sum(dim=1)
+        self._count += int(flattened.shape[1])
+
+    def population_rms(self) -> torch.Tensor:
+        """Return one unmodified float32 population RMS vector."""
+        if self._count < 1:
+            message = "Streaming population RMS requires at least one value."
+            raise ValueError(message)
+        return torch.sqrt(self._square_sum / self._count).to(dtype=torch.float32)
+
+
+class _OrderedStateEvidence:
+    """Validate canonical state chains while accumulating bounded moments."""
+
+    def __init__(self) -> None:
+        """Initialize empty ordered Train-state evidence."""
+        self._state_moments = _StreamingChannelMoments(_STATE_CHANNELS)
+        self._delta_rms = _StreamingChannelRMS(_STATE_CHANNELS)
+        self._seen_simulations: set[str] = set()
+        self._active_simulation: str | None = None
+        self._previous_state: torch.Tensor | None = None
+        self._previous_target: torch.Tensor | None = None
+        self._previous_index_n: int | None = None
+        self._previous_index_next: int | None = None
+        self._previous_t_next: float | None = None
+        self._transition_count = 0
+        self._unique_transition_count = 0
+        self._unique_state_count = 0
+
+    @property
+    def transition_count(self) -> int:
+        """Return the raw admitted item count."""
+        return self._transition_count
+
+    @property
+    def unique_transition_count(self) -> int:
+        """Return the exact unique transition count."""
+        return self._unique_transition_count
+
+    @property
+    def unique_state_count(self) -> int:
+        """Return the exact unique absolute-state count."""
+        return self._unique_state_count
+
+    def _finish_active_simulation(self) -> None:
+        """Admit one reconstructed terminal state and release its tensors."""
+        if self._previous_state is None or self._previous_target is None:
+            return
+        self._state_moments.update(self._previous_state + self._previous_target)
+        self._unique_state_count += 1
+        self._previous_state = None
+        self._previous_target = None
+
+    def _begin_simulation(self, simulation: str, *, index_n: int, t_n: float) -> None:
+        """Finish the prior case and admit one canonical zero-time case start."""
+        if simulation in self._seen_simulations:
+            message = "Transient scaling items must retain canonical grouped case order."
+            raise ValueError(message)
+        self._finish_active_simulation()
+        if index_n != 0 or not math.isclose(t_n, 0.0, rel_tol=0.0, abs_tol=1.0e-6):
+            message = "Each transient scaling case must begin at its canonical zero-time transition."
+            raise ValueError(message)
+        self._seen_simulations.add(simulation)
+        self._active_simulation = simulation
+        self._previous_index_n = None
+        self._previous_index_next = None
+        self._previous_t_next = None
+
+    def _admit_duplicate(self, state: torch.Tensor, target: torch.Tensor) -> None:
+        """Require one adjacent duplicate to repeat exact direct/target evidence."""
+        if self._previous_state is None or self._previous_target is None:
+            message = "Transient scaling duplicate transition evidence is incomplete."
+            raise RuntimeError(message)
+        if not torch.equal(self._previous_state, state):
+            message = "Duplicate direct transient state evidence disagrees exactly."
+            raise ValueError(message)
+        if not torch.equal(self._previous_target, target):
+            message = "Duplicate transient transition evidence disagrees exactly."
+            raise ValueError(message)
+
+    def _admit_unique(
+        self,
+        state: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        index_n: int,
+        index_next: int,
+        t_n: float,
+        t_next: float,
+    ) -> None:
+        """Validate and accumulate one new consecutive transition."""
+        if self._previous_index_next is not None:
+            if (
+                self._previous_t_next is None
+                or index_n != self._previous_index_next
+                or not math.isclose(
+                    t_n,
+                    self._previous_t_next,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-6,
+                )
+            ):
+                message = "Transient scaling items must retain canonical consecutive case/time order."
+                raise ValueError(message)
+            if self._previous_state is None or self._previous_target is None:
+                message = "Transient scaling transition chain evidence is incomplete."
+                raise RuntimeError(message)
+            if not torch.equal(state - self._previous_state, self._previous_target):
+                message = "Direct transient state evidence disagrees with its exact transition target."
+                raise ValueError(message)
+        self._state_moments.update(state)
+        self._delta_rms.update(target)
+        self._unique_state_count += 1
+        self._unique_transition_count += 1
+        self._previous_state = state
+        self._previous_target = target
+        self._previous_index_n = index_n
+        self._previous_index_next = index_next
+        self._previous_t_next = t_next
+
+    def admit(
+        self,
+        state: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        simulation: str,
+        index_n: int,
+        index_next: int,
+        t_n: float,
+        t_next: float,
+    ) -> None:
+        """Admit one ordered raw transition and retain at most one endpoint pair."""
+        if simulation != self._active_simulation:
+            self._begin_simulation(simulation, index_n=index_n, t_n=t_n)
+        duplicate = self._previous_index_n == index_n and self._previous_index_next == index_next
+        if duplicate:
+            self._admit_duplicate(state, target)
+        else:
+            self._admit_unique(
+                state,
+                target,
+                index_n=index_n,
+                index_next=index_next,
+                t_n=t_n,
+                t_next=t_next,
+            )
+        self._transition_count += 1
+
+    def finish(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Finalize the terminal state and return state statistics plus delta RMS."""
+        if self._transition_count < 1:
+            message = "Transient scaling fit requires at least one Train item."
+            raise ValueError(message)
+        self._finish_active_simulation()
+        state_mean, state_std = self._state_moments.population_statistics()
+        return state_mean, state_std, self._delta_rms.population_rms()
 
 
 def _operational_scale(values: torch.Tensor, *, floor: float) -> torch.Tensor:
@@ -619,10 +824,16 @@ def _raw_fit_tensor(
     item: Mapping[str, Any],
     name: str,
 ) -> torch.Tensor:
-    """Return one detached finite float32 CPU tensor from a Train item."""
+    """Return one detached finite contiguous float32 CPU Train tensor."""
     value = item.get(name)
-    tensor = _finite_float_tensor(value, label=name)
-    return tensor.to(device="cpu", dtype=torch.float32)
+    if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.is_complex():
+        message = f"{name} must be one real floating-point tensor."
+        raise TypeError(message)
+    tensor = value.detach().to(device="cpu", dtype=torch.float32).contiguous().clone()
+    if not bool(torch.isfinite(tensor).all().item()):
+        message = f"{name} must contain only finite values."
+        raise ValueError(message)
+    return tensor
 
 
 def _scalar_time(
@@ -719,23 +930,22 @@ def fit_transient_scaling(
     scale_mode: TransientScaleMode = "state_std",
 ) -> TransientScalingArtifact:
     """
-    Fit task-specific statistics from raw one-step Train items only.
+    Fit task-specific statistics from canonical one-step Train items only.
 
-    Absolute states are deduplicated by simulation and time index. Repeated
-    evidence for one state must agree exactly. Validation/OOD data are not an
-    argument and therefore cannot influence fitted statistics.
+    Items must retain the package index's grouped, consecutive case/time order.
+    Each direct endpoint is validated online through the exact float32
+    subtraction contract, and only one reconstructed terminal state is admitted
+    per case. Stable float64 channel moments avoid retaining source tensors;
+    Validation/OOD data cannot influence fitted statistics.
     """
     resolved_horizon = _positive_horizon(horizon)
     if scale_mode not in {"state_std", "delta_rms"}:
         message = "scale_mode must be 'state_std' or 'delta_rms'."
         raise ValueError(message)
-    states: dict[tuple[str, int], torch.Tensor] = {}
-    deltas: list[torch.Tensor] = []
-    statics: list[torch.Tensor] = []
-    scalars: list[torch.Tensor] = []
-    omega_values: list[torch.Tensor] = []
-    transitions: dict[tuple[str, int, int], torch.Tensor] = {}
-    transition_count = 0
+    state_evidence = _OrderedStateEvidence()
+    static_moments = _StreamingChannelMoments(_STATIC_CHANNELS)
+    scalar_moments = _StreamingChannelMoments(_SCALAR_CHANNELS)
+    omega_moments = _StreamingChannelMoments(1)
     spatial_shape: tuple[int, int] | None = None
 
     for item in items:
@@ -776,50 +986,30 @@ def fit_transient_scaling(
             message = "Train time evidence lies outside the configured horizon."
             raise ValueError(message)
 
-        current_key = (simulation, index_n)
-        next_key = (simulation, index_next)
-        for key, state_value in (
-            (current_key, state),
-            (next_key, state + target),
-        ):
-            prior = states.get(key)
-            if prior is not None and not torch.equal(prior, state_value):
-                message = "Duplicate transient state evidence disagrees exactly."
-                raise ValueError(message)
-            states[key] = state_value
-
-        transition_key = (simulation, index_n, index_next)
-        prior_transition = transitions.get(transition_key)
-        if prior_transition is not None and not torch.equal(prior_transition, target):
-            message = "Duplicate transient transition evidence disagrees exactly."
-            raise ValueError(message)
-        if prior_transition is None:
-            transitions[transition_key] = target
-            deltas.append(target)
-        statics.append(static)
-        scalars.append(scalar_values)
-        omega_values.append(boundary[2:4])
+        state_evidence.admit(
+            state,
+            target,
+            simulation=simulation,
+            index_n=index_n,
+            index_next=index_next,
+            t_n=t_n,
+            t_next=t_next,
+        )
+        static_moments.update(static)
+        scalar_moments.update(scalar_values)
+        omega_moments.update(boundary[2:4].reshape(1, -1))
         if float(boundary[8].item()) == 1.0:
-            omega_values.append(boundary[7:8])
-        transition_count += 1
+            omega_moments.update(boundary[7:8].reshape(1, -1))
 
-    if transition_count == 0 or spatial_shape is None:
+    if spatial_shape is None:
         message = "Transient scaling fit requires at least one Train item."
         raise ValueError(message)
-
-    state_matrix = torch.stack(tuple(states.values())).permute(1, 0, 2, 3).reshape(_STATE_CHANNELS, -1)
-    delta_matrix = torch.stack(deltas).permute(1, 0, 2, 3).reshape(_STATE_CHANNELS, -1)
-    static_matrix = torch.stack(statics).permute(1, 0, 2, 3).reshape(_STATIC_CHANNELS, -1)
-    scalar_matrix = torch.stack(scalars).transpose(0, 1)
-    omega_matrix = torch.cat(omega_values).reshape(1, -1)
-
-    state_mean, state_std = _population_statistics(state_matrix)
-    delta_rms = _population_rms(delta_matrix)
+    state_mean, state_std, delta_rms = state_evidence.finish()
     selected_increment_statistic = state_std if scale_mode == "state_std" else delta_rms
     increment_scale = _operational_scale(selected_increment_statistic, floor=SCALE_FLOOR)
-    static_mean, static_std = _population_statistics(static_matrix)
-    scalar_mean, scalar_std = _population_statistics(scalar_matrix)
-    omega_mean, omega_std = _population_statistics(omega_matrix)
+    static_mean, static_std = static_moments.population_statistics()
+    scalar_mean, scalar_std = scalar_moments.population_statistics()
+    omega_mean, omega_std = omega_moments.population_statistics()
     static_std = _operational_scale(static_std, floor=SCALE_FLOOR)
     scalar_std = _operational_scale(scalar_std, floor=SCALE_FLOOR)
     omega_std = _operational_scale(omega_std, floor=SCALE_FLOOR)
@@ -834,9 +1024,9 @@ def fit_transient_scaling(
         train_membership_digest=train_membership_digest,
         scale_mode=scale_mode,
         numerical_floor=SCALE_FLOOR,
-        unique_train_state_count=len(states),
-        unique_transition_count=len(transitions),
-        transition_count=transition_count,
+        unique_train_state_count=state_evidence.unique_state_count,
+        unique_transition_count=state_evidence.unique_transition_count,
+        transition_count=state_evidence.transition_count,
         spatial_shape=spatial_shape,
         state_names=tuple(field.name for field in contract.dynamic_state),
         static_names=tuple(field.name for field in contract.static_spatial_conditioning),

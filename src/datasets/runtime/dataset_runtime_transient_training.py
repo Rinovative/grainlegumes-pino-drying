@@ -23,7 +23,7 @@ import json
 import random
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import numpy as np
 import torch
@@ -31,6 +31,8 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from src import domain
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
+from src.datasets.contracts import dataset_contracts_views as views
+from src.datasets.packages import dataset_packages_manifest as package_manifest
 from src.datasets.runtime import dataset_runtime_factory as factory
 from src.datasets.runtime import dataset_runtime_transient as transient
 from src.learning.transient import learning_transient_scaling as scaling
@@ -385,6 +387,26 @@ def _loader(
     )
 
 
+def _ood_package_regime(
+    dataset_id: str,
+    *,
+    storage_root: str | None,
+) -> views.PackageRegime:
+    """Return the immutable non-ID regime owned by one transient package manifest."""
+    manifest = package_manifest.load_package_manifest(
+        dataset_id,
+        storage_root=storage_root,
+    )
+    if manifest["dataset_view"] != "transient_drying":
+        message = f"Transient Training OOD dataset {dataset_id!r} has incompatible view {manifest['dataset_view']!r}."
+        raise ValueError(message)
+    regime = cast("views.PackageRegime", manifest["evaluation_regime"])
+    if regime == "id":
+        message = f"Transient Training OOD dataset {dataset_id!r} resolves to an ID package."
+        raise ValueError(message)
+    return regime
+
+
 def create_transient_training_loaders(
     *,
     train_dataset_id: str,
@@ -432,7 +454,7 @@ def create_transient_training_loaders(
         message = "worker_seed must be an integer."
         raise TypeError(message)
 
-    def request(dataset_id: str, regime: str, membership: str | None = None) -> factory.DatasetRequest:
+    def request(dataset_id: str, regime: views.PackageRegime, membership: str | None = None) -> factory.DatasetRequest:
         return factory.DatasetRequest(
             dataset_id=dataset_id,
             dataset_view="transient_drying",
@@ -445,7 +467,7 @@ def create_transient_training_loaders(
             transient_backend_required=transient_backend_required,
         )
 
-    def dataset_for(dataset_id: str, regime: str, membership: str | None = None) -> transient.TransientPhysicalDataset:
+    def dataset_for(dataset_id: str, regime: views.PackageRegime, membership: str | None = None) -> transient.TransientPhysicalDataset:
         value = factory.create_dataset(request(dataset_id, regime, membership), hdf5_cache_size=loader_settings.hdf5_cache_size)
         if not isinstance(value, transient.TransientPhysicalDataset):
             message = "Transient Dataset factory returned a non-transient Dataset."
@@ -459,7 +481,13 @@ def create_transient_training_loaders(
     if not ood_ids:
         message = "ood_dataset_ids must be non-empty."
         raise ValueError(message)
-    ood_parts = [dataset_for(dataset_id, "parameter_ood") for dataset_id in ood_ids]
+    ood_parts = [
+        dataset_for(
+            dataset_id,
+            _ood_package_regime(dataset_id, storage_root=storage_root),
+        )
+        for dataset_id in ood_ids
+    ]
     selected_ood_parts: list[transient.TransientPhysicalDataset] = []
     for offset, source in enumerate(ood_parts):
         case_ids = tuple(_case_positions(source))
