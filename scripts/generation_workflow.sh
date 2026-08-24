@@ -69,6 +69,7 @@ PARENT_RUN_ID=""
 COMPLETION_PARENT_STATUS=""
 COMPLETION_PARENT_RUN_ID=""
 COMPLETION_ID=""
+COMPLETION_OWNER_PERSISTED=false
 COMPLETION_PARENT_PARTIAL_PATH=""
 COMPLETION_PARENT_PARTIAL_SHA256=""
 COMPLETION_PARENT_JSON=""
@@ -1061,6 +1062,7 @@ print("\t".join(clean(value.get(key)) for key in (
   IFS=$'\t' read -r COMPLETION_PARENT_STATUS COMPLETION_PARENT_RUN_ID \
     COMPLETION_ID partial_path partial_sha completion_status persisted_pool extra <<< "${record}"
   [[ -z "${extra:-}" ]] || fail 1 "Malformed completion-parent result."
+  COMPLETION_OWNER_PERSISTED=false
   case "${COMPLETION_PARENT_STATUS}" in
     fresh)
       [[ "${COMPLETION_PARENT_RUN_ID}" == - && "${COMPLETION_ID}" == - \
@@ -1092,11 +1094,12 @@ print("\t".join(clean(value.get(key)) for key in (
         && ! -L "${COMPLETION_PARENT_PARTIAL_PATH}" ]] ||
         fail 1 "Compatible parent partial evidence escaped canonical local storage."
       COMPLETION_PARENT_PARTIAL_SHA256="${partial_sha}"
-      if [[ -z "${REPLACEMENT_POOL_SIZE}" && "${completion_status}" != - ]]; then
+      if [[ "${completion_status}" != - ]]; then
+        COMPLETION_OWNER_PERSISTED=true
         [[ "${persisted_pool}" != - ]] ||
           fail 1 "Persisted completion status lacks its replacement pool high-water."
         validate_positive "persisted replacement pool high-water" "${persisted_pool}"
-        REPLACEMENT_POOL_SIZE="${persisted_pool}"
+        [[ -n "${REPLACEMENT_POOL_SIZE}" ]] || REPLACEMENT_POOL_SIZE="${persisted_pool}"
       fi
       ;;
     *) fail 1 "Unsupported completion-parent status: ${COMPLETION_PARENT_STATUS}" ;;
@@ -2027,17 +2030,28 @@ workflow_failure_report() {
   local status="$1"
   trap - EXIT
   ALL_WORKFLOW_ACTIVE=false
-  local -a continuation_arguments=(
-    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run
-    "${RUN_CONFIG_ARGUMENT:-CONFIG}"
-    --cpu-host "${CPU_HOST:-configured}"
-    --remote-root "${REMOTE_ROOT:-configured}"
-    --git-commit "${REQUESTED_COMMIT:-unknown}"
-  )
-  if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
-    continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
-    [[ -z "${COMPLETION_PARENT_RUN_ID:-}" ]] ||
-      continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
+  local -a continuation_arguments=()
+  if [[ "${COMPLETION_OWNER_PERSISTED:-false}" == true ]]; then
+    continuation_arguments=(
+      ./scripts/generation_workflow.sh run
+      "${RUN_CONFIG_ARGUMENT:-CONFIG}"
+    )
+    if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
+      continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
+    fi
+  else
+    continuation_arguments=(
+      "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" run
+      "${RUN_CONFIG_ARGUMENT:-CONFIG}"
+      --cpu-host "${CPU_HOST:-configured}"
+      --remote-root "${REMOTE_ROOT:-configured}"
+      --git-commit "${REQUESTED_COMMIT:-unknown}"
+    )
+    if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
+      continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
+      [[ -z "${COMPLETION_PARENT_RUN_ID:-}" ]] ||
+        continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
+    fi
   fi
   local collection_mode
   collection_mode="$(collection_mode_argument)"
@@ -2986,6 +3000,7 @@ print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
   validate_completion_id "${observed_id}"
   [[ "${observed_id}" == "${COMPLETION_ID}" ]] ||
     fail 1 "Remote completion identity differs from the compatible parent resolution."
+  COMPLETION_OWNER_PERSISTED=true
   case "${status}" in
     active|complete|pool_exhausted) ;;
     failure_circuit_open)
@@ -3198,45 +3213,44 @@ for item in value["replacement_campaigns"]:
 }
 
 collect_completion_replacements() {
-  local parent_run="${COMPLETION_PARENT_RUN_ID}" replacement_run previous_keep partial index
-  local -a validation_arguments=()
-  for ((index=0; index<${#COMPLETION_REPLACEMENT_RUN_IDS[@]}; index++)); do
+  local parent_run="${COMPLETION_PARENT_RUN_ID}" replacement_run partial index total successful_total
+  total="${#COMPLETION_REPLACEMENT_RUN_IDS[@]}"
+  successful_total="${#COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS[@]}"
+  for ((index=0; index<total; index++)); do
     replacement_run="${COMPLETION_REPLACEMENT_RUN_IDS[index]}"
     partial="${COMPLETION_REPLACEMENT_RUN_PARTIAL[index]}"
     RUN_ID="${replacement_run}"
     CAMPAIGN_PARTIAL="${partial}"
     PILOT_MODE=false
     generation_console_stage 6 9 "Host publication" RUNNING \
-      "replacement run=${RUN_ID} partial=${CAMPAIGN_PARTIAL}"
+      "collecting successful replacements validated=${index}/${total}
+replacement=${RUN_ID} partial=${CAMPAIGN_PARTIAL} state=collecting"
     collect_campaign >/dev/null
-    generation_console_stage 7 9 "Packages/finalizer" RUNNING \
-      "replacement run=${RUN_ID} empty launch package gate partial=${CAMPAIGN_PARTIAL}"
-    build_datasets >/dev/null
-    previous_keep="${KEEP_CPU_SOURCE}"
-    KEEP_CPU_SOURCE=true
-    prepare_all_receipt >/dev/null
-    KEEP_CPU_SOURCE="${previous_keep}"
-    validation_arguments=(validate-all-workflow "${RUN_ID}")
-    [[ "${CAMPAIGN_PARTIAL}" != true ]] || validation_arguments+=(--partial)
-    local_cli "${validation_arguments[@]}" \
-      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-      fail 1 "Replacement workflow gates did not validate before composite publication."
+    generation_console_stage 6 9 "Host publication" RUNNING \
+      "collecting successful replacements validated=$((index + 1))/${total}
+replacement=${RUN_ID} partial=${CAMPAIGN_PARTIAL} state=complete"
   done
+  generation_console_stage 6 9 "Host publication" OK \
+    "successful replacement publications=${successful_total}/${successful_total} replacement_runs=${total}/${total}"
   CAMPAIGN_PARTIAL=false
   RUN_ID="${parent_run}"
 }
 
 finalize_completion_composite() {
-  local parent_run="${COMPLETION_PARENT_RUN_ID}" cleanup_json replacement_run
+  local parent_run="${COMPLETION_PARENT_RUN_ID}" cleanup_json
   printf 'Composite source:\n  state=building_or_reusing expected_completion=%s\n' "${COMPLETION_ID}"
   local_cli build-campaign-completion-composite "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Could not construct exact parent-success plus replacement-success membership."
+  generation_console_stage 7 9 "Packages/finalizer" RUNNING \
+    "source=completion composite completion_id=${COMPLETION_ID}"
   printf 'Dataset packages:\n  source=composite completion\n'
   printf 'PT shards:\n  source=final Dataset identity\n'
   local_cli build-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Could not build completion Dataset packages, PT shards, smoke, and readiness evidence."
+  generation_console_stage 7 9 "Packages/finalizer" OK \
+    "source=completion composite completion_id=${COMPLETION_ID}"
   local_cli validate-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Completion lifecycle failed its pre-cleanup validation."
@@ -3252,27 +3266,8 @@ if not cleanup.get("eligible") or observed != expected:
     raise SystemExit("completion cleanup plan differs from successful replacement transfer membership")' \
     "${COMPLETION_TRANSFER_JSON}" "${cleanup_json}" ||
     fail 1 "Completion cleanup plan includes missing, failed, or non-replacement sources."
-  if [[ "${KEEP_CPU_SOURCE}" != true ]]; then
-    local index partial
-    for ((index=0; index<${#COMPLETION_REPLACEMENT_RUN_IDS[@]}; index++)); do
-      replacement_run="${COMPLETION_REPLACEMENT_RUN_IDS[index]}"
-      partial="${COMPLETION_REPLACEMENT_RUN_PARTIAL[index]}"
-      RUN_ID="${replacement_run}"
-      CAMPAIGN_PARTIAL="${partial}"
-      if [[ "${CAMPAIGN_PARTIAL}" == true ]]; then
-        local_cli validate-all-workflow "${RUN_ID}" --partial \
-          --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-          fail 1 "Mixed-outcome replacement evidence changed before retention."
-        generation_console_stage 8 9 "Retention policy" RETAINED \
-          "replacement run=${RUN_ID} contains failed evidence and remains on CPU storage"
-        continue
-      fi
-      confirm_cpu_cleanup >/dev/null
-      local_cli validate-all-workflow "${RUN_ID}" \
-        --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-        fail 1 "Replacement workflow changed after authorized CPU cleanup."
-    done
-  fi
+  generation_console_stage 8 9 "Retention policy" RETAINED \
+    "completion-owned replacement sources remain outside standalone workflow finalization"
   local_cli validate-campaign-completion-lifecycle "${parent_run}" "${COMPLETION_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
     fail 1 "Completion lifecycle changed after replacement-only retention."

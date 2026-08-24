@@ -370,6 +370,11 @@ def test_dataset_finalization_lock_uses_generation_local_state(
         lambda *_args, **_kwargs: SimpleNamespace(dataset_packages=()),
     )
     monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {"campaign_run_id": _RUN_ID},
+    )
+    monkeypatch.setattr(
         generation.workflow,
         "validate_dataset_packages_receipt",
         lambda *_args, **_kwargs: {"packages": []},
@@ -379,6 +384,30 @@ def test_dataset_finalization_lock_uses_generation_local_state(
     expected_lock = common.paths.get_generation_state_root(storage_root=storage) / "dataset-package-locks" / f"{_RUN_ID}.lock"
     assert expected_lock.is_file()
     assert not (run_directory / "dataset_packages_complete.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [
+        generation.workflow.build_campaign_datasets,
+        generation.workflow.record_incomplete_campaign_datasets,
+    ],
+)
+def test_completion_owned_replacement_rejects_standalone_dataset_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: object,
+) -> None:
+    """Keep synthetic completion runs owned by the completion composite."""
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(
+        campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {"synthetic_completion": {"owner": "completion"}},
+    )
+
+    with pytest.raises(ValueError, match="completion composite"):
+        entry_point(_RUN_ID, storage_root=storage)  # type: ignore[operator]
 
 
 def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(

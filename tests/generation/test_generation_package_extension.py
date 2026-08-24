@@ -137,6 +137,11 @@ def test_missing_package_extension_is_append_only_and_idempotent(
     )
     monkeypatch.setattr(
         generation.workflow.campaign_evidence,
+        "load_campaign_run",
+        lambda *_args, **_kwargs: {"campaign_run_id": _RUN_ID},
+    )
+    monkeypatch.setattr(
+        generation.workflow.campaign_evidence,
         "campaign_for_run",
         lambda *_args, **_kwargs: launch,
     )

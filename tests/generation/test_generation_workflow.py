@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -497,6 +498,7 @@ elif [[ " $* " == *' core-benchmark-summary '* ]]; then
 elif [[ " $* " == *' validate-real-smoke '* ]]; then
   printf '%s\n' '{"status":"valid"}'
 elif [[ " $* " == *' initialize-campaign-completion '* ]]; then
+  [[ "${FAKE_COMPLETION_INITIALIZE_FAIL:-false}" != true ]] || exit 5
   completion_report initialize "${FAKE_COMPLETION_INITIALIZE_STATUS:-active}"
 elif [[ " $* " == *' advance-campaign-completion '* ]]; then
   completion_report advance "$(next_completion_advance_state)"
@@ -792,6 +794,7 @@ if [[ " $* " == *' campaign-completion-status '* ]]; then
   exit 0
 fi
 if [[ " $* " == *' build-campaign-completion-composite '* ]]; then
+  [[ "${FAKE_COMPLETION_COMPOSITE_FAIL:-false}" != true ]] || exit 5
   printf '%s\n' '{"status":"complete","case_count":1}'
   exit 0
 fi
@@ -1203,9 +1206,11 @@ fi
             "FAKE_COMPLETION_ID": _COMPLETION_ID,
             "FAKE_COMPLETION_POOL_SIZE": "4",
             "FAKE_COMPLETION_INITIALIZE_STATUS": "active",
+            "FAKE_COMPLETION_INITIALIZE_FAIL": "false",
             "FAKE_COMPLETION_ADVANCE_STATUS": "complete",
             "FAKE_COMPLETION_ADVANCE_STATES": "",
             "FAKE_COMPLETION_ADVANCE_STATE_INDEX_FILE": str(state_root / "completion-advance-state-index"),
+            "FAKE_COMPLETION_COMPOSITE_FAIL": "false",
             "FAKE_COMPLETION_STATUS_JSON": json.dumps(
                 {
                     "status": "active",
@@ -3509,8 +3514,11 @@ def test_completion_failure_circuit_stops_without_pool_extension_guidance(
     assert " build-campaign-completion-composite " not in log_text
 
 
+@pytest.mark.parametrize("gpu_already_valid", [False, True])
 def test_config_only_run_finalizes_persisted_complete_campaign_without_new_science(
     tmp_path: Path,
+    *,
+    gpu_already_valid: bool,
 ) -> None:
     """Finalize an already satisfied persisted completion through ordinary run CONFIG."""
     workflow, log, environment, storage, mirror = _harness(tmp_path)
@@ -3522,6 +3530,11 @@ def test_config_only_run_finalizes_persisted_complete_campaign_without_new_scien
     environment["FAKE_COMPLETION_PARENT_JSON"] = json.dumps(parent, sort_keys=True)
     environment["FAKE_COMPLETION_INITIALIZE_STATUS"] = "complete"
     environment["FAKE_COMPLETION_ADVANCE_STATUS"] = "complete"
+    environment["FAKE_GPU_ALWAYS_VALID"] = str(gpu_already_valid).lower()
+    failure_path = storage / "01_generation/meta/campaigns" / _REPLACEMENT_RUN_ID / "workflow_failures/failure-0001.json"
+    failure_path.parent.mkdir(parents=True, exist_ok=True)
+    failure_bytes = b'{"stage":"historic standalone finalizer failure"}\n'
+    failure_path.write_bytes(failure_bytes)
 
     result = _run(
         workflow,
@@ -3538,9 +3551,88 @@ def test_config_only_run_finalizes_persisted_complete_campaign_without_new_scien
     assert " materialize-campaign-inputs " not in log_text
     initialize = next(line for line in log_text.splitlines() if " initialize-campaign-completion " in line)
     assert " --replacement-pool-size " not in initialize
-    assert "<build-campaign-completion-composite>" in log_text
-    assert "<build-campaign-completion-lifecycle>" in log_text
+    assert log_text.count("<build-campaign-completion-composite>") == 2
+    assert log_text.count("<build-campaign-completion-lifecycle>") == 2
     assert "<validate-campaign-completion-lifecycle>" in log_text
+    for forbidden in (
+        "<build-campaign-datasets>",
+        "<prepare-all-workflow>",
+        "<validate-all-workflow>",
+    ):
+        assert forbidden not in log_text
+    if gpu_already_valid:
+        assert "<publish-transferred-campaign>" not in log_text
+    else:
+        assert "<publish-transferred-campaign>" in log_text
+    assert failure_path.read_bytes() == failure_bytes
+    assert "empty launch package gate" not in result.stdout
+    assert "successful replacement publications=1/1" in result.stdout
+    assert "source=completion composite" in result.stdout
+
+
+def test_completion_failure_continuation_uses_canonical_config_resume(tmp_path: Path) -> None:
+    """Render a durable config-only command for completion-owned orchestration failure."""
+    workflow, _log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    parent = json.loads(environment["FAKE_COMPLETION_PARENT_JSON"])
+    parent["completion_status"] = "complete"
+    parent["current_successes"] = {_BATCH_NAME: 1}
+    parent["success_deficits"] = {_BATCH_NAME: 0}
+    environment["FAKE_COMPLETION_PARENT_JSON"] = json.dumps(parent, sort_keys=True)
+    environment["FAKE_COMPLETION_INITIALIZE_STATUS"] = "complete"
+    environment["FAKE_COMPLETION_ADVANCE_STATUS"] = "complete"
+    environment["FAKE_COMPLETION_COMPOSITE_FAIL"] = "true"
+
+    failed = _run(
+        workflow,
+        ["run", str(_campaign(workflow)), *_remote_options()],
+        environment,
+    )
+
+    assert failed.returncode != 0
+    continuation = next(line for line in failed.stderr.splitlines() if "generation_workflow.sh run" in line)
+    assert shlex.split(continuation.strip()) == [
+        "./scripts/generation_workflow.sh",
+        "run",
+        str(_campaign(workflow)),
+    ]
+
+
+def test_preinitialization_completion_failure_preserves_initiation_arguments(tmp_path: Path) -> None:
+    """Retain authorization and execution identity until completion ownership is persisted."""
+    workflow, _log, environment, storage, mirror = _harness(tmp_path)
+    _seed_completion_transfer(storage, mirror, environment)
+    parent = json.loads(environment["FAKE_COMPLETION_PARENT_JSON"])
+    parent["completion_status"] = None
+    parent["replacement_pool_size"] = None
+    environment["FAKE_COMPLETION_PARENT_JSON"] = json.dumps(parent, sort_keys=True)
+    environment["FAKE_COMPLETION_INITIALIZE_FAIL"] = "true"
+
+    failed = _run(
+        workflow,
+        [
+            "run",
+            str(_campaign(workflow)),
+            "--replacement-pool-size",
+            "4",
+            "--parent-run-id",
+            _RUN_ID,
+            *_remote_options(),
+        ],
+        environment,
+    )
+
+    assert failed.returncode != 0
+    continuation = next(line for line in failed.stderr.splitlines() if "generation_workflow.sh run" in line)
+    continuation_arguments = shlex.split(continuation.strip())
+    assert continuation_arguments[:3] == [str(workflow), "run", str(_campaign(workflow))]
+    assert continuation_arguments[3:9] == _remote_options()
+    assert continuation_arguments[9:] == [
+        "--replacement-pool-size",
+        "4",
+        "--parent-run-id",
+        _RUN_ID,
+    ]
 
 
 def test_config_only_run_resumes_already_authorized_completion_capacity(tmp_path: Path) -> None:
@@ -3631,8 +3723,7 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
     assert partial_path.read_bytes() == original_partial
     assert not parent_cpu_directory.exists()
     assert (storage / completion_relative).read_bytes() == (mirror / completion_relative).read_bytes()
-    assert all(not (mirror / relative).exists() for relative in source_directories[:3])
-    assert (mirror / source_directories[3]).is_dir()
+    assert all((mirror / relative).exists() for relative in source_directories)
 
     log_text = log.read_text(encoding="utf-8")
     remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
@@ -3642,10 +3733,10 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
     replacement_resume = [line for line in remote_commands if " resume-campaign " in line]
     assert len(replacement_resume) == 1
     assert _REPLACEMENT_RUN_ID in replacement_resume[0]
-    cleanup_commands = [line for line in remote_commands if " cleanup-campaign-source " in line]
-    assert len(cleanup_commands) == 1
-    assert _REPLACEMENT_RUN_ID in cleanup_commands[0]
-    assert _RUN_ID not in cleanup_commands[0]
+    assert "<build-campaign-datasets>" not in log_text
+    assert "<prepare-all-workflow>" not in log_text
+    assert "<validate-all-workflow>" not in log_text
+    assert not any(" cleanup-campaign-source " in line for line in remote_commands)
     assert _FAILED_REPLACEMENT_RUN_ID not in log_text
 
     positions = [
@@ -3653,7 +3744,6 @@ def test_historical_partial_completion_publishes_successes_before_cleanup(
         log_text.index("<build-campaign-completion-lifecycle>"),
         log_text.index("<validate-campaign-completion-lifecycle>"),
         log_text.index("<campaign-completion-cleanup-plan>"),
-        log_text.index(" cleanup-campaign-source "),
         log_text.rindex("<validate-campaign-completion-lifecycle>"),
     ]
     assert positions == sorted(positions)
@@ -3688,9 +3778,10 @@ def test_mixed_replacement_round_retains_failed_cpu_evidence(tmp_path: Path) -> 
     log_text = log.read_text(encoding="utf-8")
     remote_commands = [line for line in log_text.splitlines() if line.startswith("<bash -l -s --")]
     assert not any(" cleanup-campaign-source " in line for line in remote_commands)
-    validation_arguments = f"<validate-all-workflow>\n<{_REPLACEMENT_RUN_ID}>\n<--partial>"
-    assert log_text.count(validation_arguments) >= 2
-    assert "contains failed evidence and remains on CPU storage" in result.stdout
+    assert "<build-campaign-datasets>" not in log_text
+    assert "<prepare-all-workflow>" not in log_text
+    assert "<validate-all-workflow>" not in log_text
+    assert "completion-owned replacement sources remain outside standalone workflow finalization" in result.stdout
 
 
 def test_all_default_cleanup_orders_every_gate_and_keep_opt_out_retains_source(tmp_path: Path) -> None:
@@ -3789,6 +3880,10 @@ def test_failure_continuation_preserves_collection_mode(
 
     assert failed.returncode != 0
     continuation = next(line for line in failed.stderr.splitlines() if "generation_workflow.sh run" in line)
+    continuation_arguments = shlex.split(continuation.strip())
+    assert continuation_arguments[:3] == [str(workflow), "run", str(_campaign(workflow))]
+    assert continuation_arguments[3:9] == _remote_options()
+    assert "generation-workflow-source." not in continuation
     if collection_mode is None:
         assert "--keep-cpu-source" not in continuation
         assert "--defer-collection" not in continuation

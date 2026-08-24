@@ -913,6 +913,20 @@ def validate_dataset_packages_receipt(
     return receipt
 
 
+def _reject_completion_owned_replacement_dataset_entry(
+    run_id: str,
+    *,
+    storage_root: Path,
+) -> None:
+    """Reject standalone Dataset ownership for completion-owned replacement runs."""
+    manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
+    if "synthetic_completion" in manifest:
+        message = (
+            "Completion-owned replacement runs are execution and publication containers; build Dataset packages only from the completion composite."
+        )
+        raise ValueError(message)
+
+
 def build_campaign_datasets(
     run_id: str,
     *,
@@ -926,6 +940,7 @@ def build_campaign_datasets(
         message = "prepare_training_payloads must be boolean."
         raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    _reject_completion_owned_replacement_dataset_entry(run_id, storage_root=storage)
     transfer = campaign_runtime.admit_transferred_campaign(run_id, storage_root=storage)
     terminal = campaign_runtime.validate_terminal_campaign(
         run_id,
@@ -3661,6 +3676,7 @@ def record_incomplete_campaign_datasets(
 ) -> dict[str, Any]:
     """Record that Dataset membership is incomplete without minting Dataset IDs."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    _reject_completion_owned_replacement_dataset_entry(run_id, storage_root=storage)
     transfer = campaign_runtime.validate_partially_transferred_campaign(
         run_id,
         storage_root=storage,
