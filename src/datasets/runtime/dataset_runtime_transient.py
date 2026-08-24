@@ -5,8 +5,8 @@ Lazily materialize physical-unit transient samples from admitted indexes.
 Responsibilities:
   - Resolve and revalidate immutable source HDF5 and temporal evidence
   - Materialize explicit one-step transitions or deterministic rollout windows
-  - Slice required state, static, boundary, scalar, and regular-time values
-  - Own one process-local read-only handle and bounded LRU-cache implementation
+  - Apply one validated boundary-preserving spatial view to every spatial field
+  - Own process-local read-only handles, shard admissions, and bounded caches
 Design principles:
   - One admitted trajectory index drives every runtime sampling mode
   - Delta targets are derived from canonical absolute endpoint states
@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -37,6 +37,9 @@ from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 from src.datasets.packages import dataset_packages_transient_shards as transient_shards
+
+_SHA256_LENGTH = 64
+_TRANSIENT_FIELD_RANK = 4
 
 
 class TransientTime(TypedDict):
@@ -68,6 +71,9 @@ class TransientMetadata(TypedDict):
     stored_state_count: int
     has_exact_stop_state: bool
     t_stop_exact: float
+    spatial_stride: int
+    canonical_spatial_shape: tuple[int, int]
+    effective_spatial_shape: tuple[int, int]
 
 
 class TransientItem(TypedDict):
@@ -103,6 +109,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         sampling: transient_contract.TransientSamplingSpec,
         source_root: Path | str | None = None,
         hdf5_cache_size: int = 0,
+        spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
         transform: TransientTransform | None = None,
     ) -> None:
@@ -118,8 +125,11 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         self.payload = trajectory.load_transient_index(self.index_path)
         self.sampling = sampling
         self.hdf5_cache_size = hdf5_cache_size
+        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
         self.transform = transform
         self.storage_backend = "canonical_hdf5"
+        self.dataset_manifest_digest: str | None = None
+        self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:
@@ -160,6 +170,29 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
     def configured_regular_horizon(self) -> float:
         """Return the Generation-configured temporal normalization horizon."""
         return float(self.payload["configured_regular_horizon"]["value"])
+
+    def bind_dataset_manifest_digest(self, digest: str) -> None:
+        """Bind the factory-admitted immutable package-manifest digest."""
+        if not isinstance(digest, str) or len(digest) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in digest):
+            message = "dataset manifest digest must be lowercase SHA-256."
+            raise ValueError(message)
+        self.dataset_manifest_digest = digest
+
+    def spatial_view(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Return canonical and effective ``(Y, X)`` shapes without reading fields."""
+        if self._spatial_view is not None:
+            return self._spatial_view
+        reference = self._item_references[0]
+        path = self._validate_runtime_source(reference.case_index)
+        with h5py.File(path, "r") as handle:
+            fields = trajectory.require_hdf5_dataset(handle, "transient/fields")
+            if fields.ndim != _TRANSIENT_FIELD_RANK:
+                message = f"Transient source spatial tensor rank is invalid: {path}."
+                raise trajectory.TransientDataContractError(message)
+            canonical = (int(fields.shape[2]), int(fields.shape[3]))
+        effective = transient_contract.resolve_spatial_view(canonical, self.spatial_stride)
+        self._spatial_view = (canonical, effective)
+        return self._spatial_view
 
     def runtime_item_ids(self) -> tuple[str, ...]:
         """Return stable IDs for the fully expanded runtime sampling items."""
@@ -310,10 +343,26 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         return handle, False
 
     @staticmethod
-    def _finite_tensor(array: Any, *, label: str, path: Path) -> torch.Tensor:
-        """Convert one finite float32 value or array into a contiguous tensor."""
+    def _finite_tensor(
+        array: Any,
+        *,
+        label: str,
+        path: Path,
+        validate_values: bool = True,
+    ) -> torch.Tensor:
+        """Return one contiguous float32 tensor, scanning values when required."""
+        if isinstance(array, torch.Tensor):
+            if (
+                array.device.type != "cpu"
+                or array.dtype != torch.float32
+                or array.is_complex()
+                or (validate_values and not bool(torch.isfinite(array).all()))
+            ):
+                message = f"Transient {label} contains invalid selected tensor values: {path}."
+                raise trajectory.TransientDataContractError(message)
+            return array if array.is_contiguous() else array.contiguous()
         converted = np.asarray(array, dtype=np.float32)
-        if not np.isfinite(converted).all():
+        if validate_values and not np.isfinite(converted).all():
             message = f"Transient {label} contains non-finite selected values: {path}."
             raise trajectory.TransientDataContractError(message)
         return torch.from_numpy(np.ascontiguousarray(converted))
@@ -333,6 +382,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 case,
                 samples,
                 expected_regular_horizon=self.configured_regular_horizon,
+                spatial_stride=self.spatial_stride,
             )
         finally:
             if close_after:
@@ -359,32 +409,61 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         scalar_array: Any,
         time_values: Any,
         source_label: Path,
+        validate_values: bool = True,
     ) -> TransientItem:
         """Build one backend-independent TransientItem from physical arrays."""
         times = np.asarray(time_values, dtype=np.float64)
         dt_values = np.diff(times)
-        states = self._finite_tensor(states_array, label="state sequence", path=source_label)
+        states = self._finite_tensor(
+            states_array,
+            label="state sequence",
+            path=source_label,
+            validate_values=validate_values,
+        )
         target_sequence = states[1:] - states[:-1]
-        boundary = self._finite_tensor(boundary_array, label="boundary conditioning", path=source_label)
-        t_n = self._finite_tensor(times[:-1], label="current time", path=source_label)
-        t_n_plus_1 = self._finite_tensor(times[1:], label="next time", path=source_label)
-        dt = self._finite_tensor(dt_values, label="time increment", path=source_label)
+        boundary = self._finite_tensor(
+            boundary_array,
+            label="boundary conditioning",
+            path=source_label,
+            validate_values=validate_values,
+        )
+        t_n = self._finite_tensor(
+            times[:-1],
+            label="current time",
+            path=source_label,
+            validate_values=validate_values,
+        )
+        t_n_plus_1 = self._finite_tensor(
+            times[1:],
+            label="next time",
+            path=source_label,
+            validate_values=validate_values,
+        )
+        dt = self._finite_tensor(
+            dt_values,
+            label="time increment",
+            path=source_label,
+            validate_values=validate_values,
+        )
         one_step = self.sampling.mode == "one_step_transition"
         first_time_index = int(samples[0]["time_index_n"])
         last_time_index = int(samples[-1]["time_index_n_plus_1"])
         sample_id = str(samples[0]["sample_id"]) if one_step else f"{case['package_case_id']}__window_{first_time_index:04d}_{last_time_index:04d}"
+        canonical_shape, effective_shape = self.spatial_view()
         item: TransientItem = {
             "state": states[0],
             "static": self._finite_tensor(
                 static_array,
                 label="static conditioning",
                 path=source_label,
+                validate_values=validate_values,
             ),
             "boundary": boundary[0] if one_step else boundary,
             "scalars": self._finite_tensor(
                 scalar_array,
                 label="scalar conditioning",
                 path=source_label,
+                validate_values=validate_values,
             ),
             "time": {
                 "t_n": t_n[0] if one_step else t_n,
@@ -411,6 +490,9 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "stored_state_count": int(case["stored_state_count"]),
                 "has_exact_stop_state": case["irregular_stop_time"] is not None,
                 "t_stop_exact": float(case["t_stop_exact"]),
+                "spatial_stride": self.spatial_stride,
+                "canonical_spatial_shape": canonical_shape,
+                "effective_spatial_shape": effective_shape,
             },
         }
         return item if self.transform is None else self.transform(item)
@@ -444,6 +526,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         sampling: transient_contract.TransientSamplingSpec,
         source_root: Path | str | None = None,
         hdf5_cache_size: int = 0,
+        spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
         transform: TransientTransform | None = None,
     ) -> None:
@@ -459,8 +542,11 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self.payload = trajectory.load_transient_index(self.index_path)
         self.sampling = sampling
         self.hdf5_cache_size = hdf5_cache_size
+        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
         self.transform = transform
         self.storage_backend = "pt_shards"
+        self.dataset_manifest_digest: str | None = None
+        self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:
@@ -477,6 +563,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self._item_references = self._build_item_references()
         self._process_id: int | None = None
         self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._validated_shards: set[int] = set()
         self._shard_receipt = transient_shards.load_transient_shard_receipt(
             self.dataset_id,
             storage_root=self.source_root,
@@ -499,15 +586,17 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self._shard_cache.clear()
 
     def close(self) -> None:
-        """Release bounded process-local shard cache resources."""
+        """Release bounded process-local shard cache and admission evidence."""
         self._clear_shard_cache()
+        self._validated_shards.clear()
         self._process_id = None
 
     def _ensure_process(self) -> None:
-        """Discard inherited shard mappings before use in another process."""
+        """Discard inherited shard mappings and admissions in another process."""
         process_id = os.getpid()
         if self._process_id != process_id:
             self._clear_shard_cache()
+            self._validated_shards.clear()
             self._process_id = process_id
 
     def _load_shard(self, shard_index: int) -> dict[str, Any]:
@@ -522,31 +611,73 @@ class TransientPTShardDataset(TransientPhysicalDataset):
             shard_index,
             storage_root=self.source_root,
             receipt=self._shard_receipt,
+            validate_values=shard_index not in self._validated_shards,
         )
-        if self.hdf5_cache_size > 0:
-            self._shard_cache[shard_index] = payload
-            while len(self._shard_cache) > self.hdf5_cache_size:
-                self._shard_cache.popitem(last=False)
+        self._validated_shards.add(shard_index)
+        shard_cache_size = max(1, self.hdf5_cache_size)
+        self._shard_cache[shard_index] = payload
+        while len(self._shard_cache) > shard_cache_size:
+            self._shard_cache.popitem(last=False)
         return payload
 
-    def __getitem__(self, index: int) -> TransientItem:
-        """Materialize one semantic item from exactly one whole-case shard."""
-        reference = self._item_references[index]
+    @property
+    def shard_count(self) -> int:
+        """Return the admitted immutable PT-shard count."""
+        return int(self._shard_receipt["shard_count"])
+
+    def _admit_spatial_view(self, case_payload: Mapping[str, Any]) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Bind one shard case to the configured boundary-preserving view."""
+        states = case_payload.get("states")
+        if not isinstance(states, torch.Tensor) or states.ndim != _TRANSIENT_FIELD_RANK:
+            message = "Transient shard state tensor rank is invalid."
+            raise trajectory.TransientDataContractError(message)
+        canonical = (int(states.shape[2]), int(states.shape[3]))
+        effective = transient_contract.resolve_spatial_view(canonical, self.spatial_stride)
+        observed = (canonical, effective)
+        if self._spatial_view is not None and self._spatial_view != observed:
+            message = "Transient shard cases do not share one canonical spatial view."
+            raise trajectory.TransientDataContractError(message)
+        self._spatial_view = observed
+        return observed
+
+    def spatial_view(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Return canonical and effective ``(Y, X)`` shapes from one shard."""
+        if self._spatial_view is not None:
+            return self._spatial_view
+        reference = self._item_references[0]
+        case = self.payload["cases"][reference.case_index]
+        location = self._shard_receipt["case_locator"][str(case["package_case_id"])]
+        shard = self._load_shard(int(location["shard_index"]))
+        case_payload = shard["cases"][int(location["case_position"])]
+        return self._admit_spatial_view(case_payload)
+
+    def _materialize_shard_reference(
+        self,
+        reference: _ItemReference,
+        shard: Mapping[str, Any],
+        *,
+        spatial_states: torch.Tensor | None = None,
+        spatial_static: torch.Tensor | None = None,
+    ) -> TransientItem:
+        """Materialize one item from an already admitted mmap-backed shard."""
         samples = [self.payload["samples"][position] for position in reference.sample_positions]
         case = self.payload["cases"][reference.case_index]
         case_id = str(case["package_case_id"])
         location = self._shard_receipt["case_locator"][case_id]
         shard_index = int(location["shard_index"])
-        shard = self._load_shard(shard_index)
         case_payload = shard["cases"][int(location["case_position"])]
         if case_payload["case_index"] != reference.case_index or case_payload["case_record"] != case:
             message = f"Transient shard case lookup conflicts for {case_id!r}."
             raise trajectory.TransientDataContractError(message)
+        self._admit_spatial_view(case_payload)
         state_indices = [
             int(samples[0]["time_index_n"]),
             *[int(sample["time_index_n_plus_1"]) for sample in samples],
         ]
         boundary_indices = [self._sample_offsets[position] for position in reference.sample_positions]
+        stride = self.spatial_stride
+        states = case_payload["states"][state_indices, :, ::stride, ::stride] if spatial_states is None else spatial_states[state_indices]
+        static = case_payload["static"][:, ::stride, ::stride] if spatial_static is None else spatial_static
         shard_record = self._shard_receipt["shards"][shard_index]
         source_label = transient_shards.transient_shard_directory(
             self.dataset_id,
@@ -555,19 +686,91 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         return self._materialize_item(
             case=case,
             samples=samples,
-            states_array=case_payload["states"][state_indices],
-            static_array=case_payload["static"],
+            states_array=states,
+            static_array=static,
             boundary_array=case_payload["boundary"][boundary_indices],
             scalar_array=case_payload["scalars"],
             time_values=case_payload["state_time"][state_indices],
             source_label=source_label,
+            validate_values=False,
         )
+
+    def iter_scaling_items(
+        self,
+        *,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> Iterator[TransientItem]:
+        """Yield one-step Train items while retaining only one shard mapping."""
+        if self.sampling.mode != "one_step_transition":
+            message = "Shard-aware scaling iteration requires one-step sampling."
+            raise ValueError(message)
+        shard_sequence: list[int] = []
+        for reference in self._item_references:
+            case = self.payload["cases"][reference.case_index]
+            location = self._shard_receipt["case_locator"][str(case["package_case_id"])]
+            shard_index = int(location["shard_index"])
+            if not shard_sequence or shard_sequence[-1] != shard_index:
+                shard_sequence.append(shard_index)
+        if len(shard_sequence) != len(set(shard_sequence)):
+            message = "Transient scaling membership revisits a prior shard out of canonical order."
+            raise trajectory.TransientDataContractError(message)
+
+        active_shard_index: int | None = None
+        active_shard: Mapping[str, Any] | None = None
+        active_case_index: int | None = None
+        spatial_states: torch.Tensor | None = None
+        spatial_static: torch.Tensor | None = None
+        completed_shards = 0
+        for reference in self._item_references:
+            case = self.payload["cases"][reference.case_index]
+            location = self._shard_receipt["case_locator"][str(case["package_case_id"])]
+            shard_index = int(location["shard_index"])
+            if shard_index != active_shard_index:
+                if active_shard_index is not None:
+                    completed_shards += 1
+                    if progress_callback is not None:
+                        progress_callback(completed_shards, len(shard_sequence))
+                active_shard = self._load_shard(shard_index)
+                active_shard_index = shard_index
+                active_case_index = None
+            if active_shard is None:
+                message = "Transient scaling shard admission did not produce a payload."
+                raise RuntimeError(message)
+            if reference.case_index != active_case_index:
+                case_payload = active_shard["cases"][int(location["case_position"])]
+                if case_payload["case_index"] != reference.case_index or case_payload["case_record"] != case:
+                    message = f"Transient shard case lookup conflicts for {case['package_case_id']!r}."
+                    raise trajectory.TransientDataContractError(message)
+                self._admit_spatial_view(case_payload)
+                stride = self.spatial_stride
+                spatial_states = case_payload["states"][:, :, ::stride, ::stride]
+                spatial_static = case_payload["static"][:, ::stride, ::stride].contiguous()
+                active_case_index = reference.case_index
+            yield self._materialize_shard_reference(
+                reference,
+                active_shard,
+                spatial_states=spatial_states,
+                spatial_static=spatial_static,
+            )
+        if active_shard_index is not None:
+            completed_shards += 1
+            if progress_callback is not None:
+                progress_callback(completed_shards, len(shard_sequence))
+
+    def __getitem__(self, index: int) -> TransientItem:
+        """Materialize one semantic item from exactly one whole-case shard."""
+        reference = self._item_references[index]
+        case = self.payload["cases"][reference.case_index]
+        location = self._shard_receipt["case_locator"][str(case["package_case_id"])]
+        shard = self._load_shard(int(location["shard_index"]))
+        return self._materialize_shard_reference(reference, shard)
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude mmap-backed shard payloads from worker serialization."""
         state = dict(self.__dict__)
         state["_process_id"] = None
         state["_shard_cache"] = OrderedDict()
+        state["_validated_shards"] = set()
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -575,6 +778,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self.__dict__.update(state)
         self._process_id = None
         self._shard_cache = OrderedDict()
+        self._validated_shards = set()
 
     def __del__(self) -> None:
         """Best-effort release of process-local mmap-backed shard payloads."""
@@ -623,6 +827,7 @@ def select_transient_cases(
         sampling=dataset.sampling,
         source_root=dataset.source_root,
         hdf5_cache_size=dataset.hdf5_cache_size,
+        spatial_stride=dataset.spatial_stride,
         sample_indices=positions,
         transform=dataset.transform,
     )
@@ -630,6 +835,9 @@ def select_transient_cases(
         replacement.close()
         message = "Transient runtime reconstruction changed storage backend."
         raise RuntimeError(message)
+    manifest_digest = getattr(dataset, "dataset_manifest_digest", None)
+    if manifest_digest is not None:
+        replacement.bind_dataset_manifest_digest(manifest_digest)
     dataset.close()
     return replacement
 

@@ -30,6 +30,7 @@ import json
 import os
 import random
 import shutil
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -728,6 +729,7 @@ def _validate_saved_data_contract(
                 sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
                 ood_fraction=float(config["data"].get("ood_fraction", 1.0)),
                 split_seed=derive_subseed(int(config["run"]["seed"]), "split"),
+                spatial_stride=int(config["data"].get("spatial_stride", 1)),
             )
         except (KeyError, TypeError, ValueError) as error:
             message = f"Saved transient data contract is invalid: {error}"
@@ -1202,6 +1204,15 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         )
         configure_reproducibility(config, device=device)
         is_transient = config["task"] == "transient_drying"
+        if is_transient:
+            console_reporter.startup(resolved_device=str(device))
+            console_reporter.startup_phase(
+                "data_setup_start",
+                {
+                    "backend_preference": config["data"]["transient_backend_preference"],
+                    "spatial_stride": config["data"]["spatial_stride"],
+                },
+            )
         handoff_manifest: dict[str, Any] | None = None
         handoff_directory: Path | None = None
         handoff_scaling = restored_data_processor
@@ -1236,6 +1247,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             split_indices=saved_split_indices,
             data_processor=handoff_scaling,
             seed_plan=seed_plan,
+            startup_callback=console_reporter.startup_phase if is_transient else None,
         )
         data_processor = dataloaders["data_processor"]
         split_indices = dataloaders["split_indices"]
@@ -1274,12 +1286,25 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             )
 
         seed_process(seed_plan["model_init"], device=device)
+        model_started = time.perf_counter()
         if is_transient:
+            console_reporter.startup_phase(
+                "model_build_start",
+                {"model_kind": config["model"]["kind"]},
+            )
             learning.models.factory.validate_transient_model_spatial_shape(
                 config,
                 data_processor.spatial_shape,
             )
         model = learning.models.factory.build_model(config, device=device)
+        if is_transient:
+            console_reporter.startup_phase(
+                "model_cuda_ready",
+                {
+                    "device": str(device),
+                    "seconds": time.perf_counter() - model_started,
+                },
+            )
         train_loss = learning.losses.factory.build_training_loss(config, device=device)
         set_normalizers = getattr(train_loss, "set_normalizers", None)
         if callable(set_normalizers):
@@ -1412,7 +1437,8 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 tuning_context=(dict(summary_extra) if summary_extra and "study_name" in summary_extra else None),
             )
 
-        console_reporter.startup(resolved_device=str(device))
+        if not is_transient:
+            console_reporter.startup(resolved_device=str(device))
         tracking_initialization_attempted = True
         tracker = tracking.initialize_wandb(
             config,
@@ -1447,6 +1473,11 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 train_loader=dataloaders["train"],
             )
 
+        if is_transient:
+            console_reporter.startup_phase(
+                "training_start",
+                {"batches_per_epoch": len(dataloaders["train"])},
+            )
         result = learning.training.loop.train_loop(
             config=config,
             device=device,
@@ -1547,6 +1578,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 "checkpoint_identity": copy.deepcopy(identity),
                 "transient_scaling": copy.deepcopy(dict(transient_scaling_payload)),
                 "runtime_backend_provenance": copy.deepcopy(dict(dataloaders["runtime_provenance"])),
+                "spatial_view": copy.deepcopy(dict(dataloaders["spatial_view"])),
                 "terminal_controller": {key: controller[key] for key in terminal_controller_keys},
                 "terminal_curriculum": {
                     "active_stage": adapter.curriculum_state.active_stage,

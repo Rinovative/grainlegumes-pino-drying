@@ -204,6 +204,11 @@ def get_run_locks_root(*, storage_root: Path | str | None = None) -> Path:
     return get_experiment_state_root(storage_root=storage_root) / "runs" / "locks"
 
 
+def get_transient_scaler_cache_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return the integrity-bound transient Train-scaler cache root."""
+    return get_experiment_state_root(storage_root=storage_root) / "transient_scalers"
+
+
 def resolve_queue_log_dir(
     scope: str,
     *,

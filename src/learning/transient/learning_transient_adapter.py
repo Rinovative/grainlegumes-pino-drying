@@ -300,7 +300,8 @@ def _clone_controller(controller: MatchedComputeController) -> MatchedComputeCon
 def _move_to_device(value: Any, device: torch.device) -> Any:
     """Recursively move tensor evidence while preserving metadata values."""
     if isinstance(value, torch.Tensor):
-        return value.to(device)
+        non_blocking = device.type == "cuda" and value.device.type == "cpu" and value.is_pinned()
+        return value.to(device, non_blocking=non_blocking)
     if isinstance(value, Mapping):
         return {key: _move_to_device(item, device) for key, item in value.items()}
     if isinstance(value, list):

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from src import learning
 from src.experiments.config import experiments_config_loader as loader
 from src.experiments.config import experiments_config_preflight as preflight
 from src.experiments.config import experiments_config_transient_plan as transient_plan
@@ -19,6 +20,7 @@ _ROUNDING_TOTAL = 7
 _ROUNDED_STAGE_A = 4
 _ROUNDED_STAGE_B = 3
 _FIXED_TOTAL = 200
+_STRIDE_TWO = 2
 _MAINTAINED = (
     ("fno_m128x160_h64_l3__lentil_chickpea__s9.yaml", "fno"),
     ("rno_m24x24_h16_l3__lentil_chickpea__s9.yaml", "rno"),
@@ -114,3 +116,43 @@ def test_fixed_plans_share_one_authored_epoch_schedule(filename: str, model_kind
     assert plan.stage_a["training"]["stage_schedule"] == plan.stage_b["training"]["stage_schedule"]
     assert plan.stage_a["training"]["epochs"] + plan.stage_b["training"]["epochs"] == _FIXED_TOTAL
     assert all(value is None for value in plan.stage_b["training"]["matched_compute"].values())
+
+
+def test_spatial_stride_defaults_to_one_and_changes_run_identity_only_when_explicit() -> None:
+    """Resolve legacy omission at full resolution and distinguish stride-two runs."""
+    stride_one_raw = loader.load_yaml(_FNO)
+    stride_one_raw["data"].pop("spatial_stride", None)
+    stride_one = transient_plan.resolve_transient_training_plan(stride_one_raw)
+
+    stride_two_raw = copy.deepcopy(stride_one_raw)
+    stride_two_raw["data"]["spatial_stride"] = _STRIDE_TWO
+    stride_two = transient_plan.resolve_transient_training_plan(stride_two_raw)
+
+    assert stride_one.stage_a["data"]["spatial_stride"] == 1
+    assert stride_one.stage_b["data"]["spatial_stride"] == 1
+    assert stride_two.stage_a["data"]["spatial_stride"] == _STRIDE_TWO
+    assert "__stride2__" in stride_two.stage_a["run"]["name"]
+    assert stride_one.stage_a["run"]["name"] != stride_two.stage_a["run"]["name"]
+    assert learning.training.checkpoint.config_digest(stride_one.stage_a) != learning.training.checkpoint.config_digest(stride_two.stage_a)
+    assert learning.training.checkpoint.resume_contract_digest(stride_one.stage_a) != learning.training.checkpoint.resume_contract_digest(
+        stride_two.stage_a
+    )
+
+
+@pytest.mark.parametrize("value", [True, 1.5, 0, -1])
+def test_spatial_stride_rejects_non_integer_or_non_positive_values(value: object) -> None:
+    """Reject coercion and boundary-invalid stride values during config resolution."""
+    raw = loader.load_yaml(_FNO)
+    raw["data"]["spatial_stride"] = value
+
+    with pytest.raises((TypeError, ValueError), match="spatial_stride"):
+        transient_plan.resolve_transient_training_plan(raw)
+
+
+def test_transient_persistent_workers_require_worker_processes() -> None:
+    """Fail fast when a transient config enables persistence without workers."""
+    raw = loader.load_yaml(_FNO)
+    raw["data"].update({"num_workers": 0, "persistent_workers": True})
+
+    with pytest.raises(loader.ConfigError, match="persistent_workers"):
+        transient_plan.resolve_transient_training_plan(raw)

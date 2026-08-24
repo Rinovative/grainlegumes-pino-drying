@@ -26,7 +26,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from io import StringIO
 from pathlib import Path
@@ -107,6 +107,7 @@ _SECTION_KEYS = {
             "num_workers",
             "pin_memory",
             "persistent_workers",
+            "spatial_stride",
             "transient_backend_preference",
             "transient_backend_required",
             "hdf5_cache_size",
@@ -949,6 +950,9 @@ def _derived_suffix_components(
         ("seed", f"seed{run.get('seed')}"),
     ]
     components.extend(("architecture parameter", token) for token in model_key.split("_")[1:])
+    spatial_stride = data.get("spatial_stride", 1)
+    if config.get("task") == "transient_drying" and spatial_stride != 1:
+        components.append(("spatial stride", f"stride{spatial_stride}"))
 
     if model.get("kind") == "uno":
         scaling_token = _format_uno_scalings(params)
@@ -1179,6 +1183,16 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         msg = "data.batch_size must be a positive integer."
         raise ConfigError(msg)
+    num_workers = data.get("num_workers")
+    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0:
+        msg = "data.num_workers must be an integer >= 0."
+        raise ConfigError(msg)
+    if type(data.get("pin_memory")) is not bool or type(data.get("persistent_workers")) is not bool:
+        msg = "data.pin_memory and data.persistent_workers must be boolean."
+        raise ConfigError(msg)
+    if config.get("task") == "transient_drying" and num_workers == 0 and data["persistent_workers"]:
+        msg = "Transient data.persistent_workers requires data.num_workers > 0."
+        raise ConfigError(msg)
     try:
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
@@ -1253,6 +1267,9 @@ def generate_run_name(config: dict[str, Any]) -> str:
     parts = [model_key]
     if scientific_variant is not None:
         parts.append(scientific_variant)
+    spatial_stride = data.get("spatial_stride", 1)
+    if config.get("task") == "transient_drying" and spatial_stride != 1:
+        parts.append(f"stride{spatial_stride}")
     parts.extend((train_dataset, f"s{seed}"))
     if run.get("suffix"):
         parts.append(str(run["suffix"]))
@@ -1357,7 +1374,7 @@ def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, A
     return expected
 
 
-def _validate_transient_extensions(  # noqa: C901, PLR0912
+def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
     config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
 ) -> None:
     """Resolve strict transient-only temporal, loader, and curriculum semantics."""
@@ -1390,6 +1407,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         "num_workers",
         "pin_memory",
         "persistent_workers",
+        "spatial_stride",
         "transient_backend_preference",
         "transient_backend_required",
         "hdf5_cache_size",
@@ -1405,6 +1423,11 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         _raise_config_error("Transient backend and technical-smoke settings are invalid.")
     if isinstance(data["hdf5_cache_size"], bool) or not isinstance(data["hdf5_cache_size"], int) or data["hdf5_cache_size"] < 0:
         _raise_config_error("data.hdf5_cache_size must be an integer >= 0.")
+    try:
+        data["spatial_stride"] = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
+    except (TypeError, ValueError) as error:
+        message = f"data.spatial_stride: {error}"
+        raise ConfigError(message) from error
     training = _as_mapping(config["training"], path="training")
     required_training = {
         "epochs",
@@ -1826,6 +1849,7 @@ def create_dataloaders_from_config(
     split_indices: dict[str, Any] | None = None,
     data_processor: Any | None = None,
     seed_plan: Mapping[str, int] | None = None,
+    startup_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """
     Create current dataloaders after validating the resolved task contract.
@@ -1841,6 +1865,8 @@ def create_dataloaders_from_config(
     seed_plan : Mapping[str, int] | None, optional
         Stable labeled ``split``, ``loader``, and ``worker`` seeds. Defaults to
         ``run.seed`` for isolated direct loader callers.
+    startup_callback : Callable or None, optional
+        Presentation-owned receiver for bounded semantic startup events.
 
     Returns
     -------
@@ -1884,6 +1910,7 @@ def create_dataloaders_from_config(
             storage_root=config["paths"]["storage_root"],
             transient_backend_preference=data_cfg["transient_backend_preference"],
             transient_backend_required=data_cfg["transient_backend_required"],
+            spatial_stride=data_cfg["spatial_stride"],
             scale_mode=config["scaling"]["mode"],
             split_seed=seeds.get("split", run_seed),
             loader_seed=seeds.get("loader", run_seed),
@@ -1891,6 +1918,7 @@ def create_dataloaders_from_config(
             saved_split=split_indices,
             restored_scaling_artifact=data_processor,
             allow_technical_smoke=data_cfg["allow_technical_smoke"],
+            startup_callback=startup_callback,
         )
         return {
             "train": loaders.train,
@@ -1900,6 +1928,7 @@ def create_dataloaders_from_config(
             "data_processor": loaders.scaling_artifact,
             "split_indices": loaders.split,
             "dataset_identity": loaders.dataset_identity,
+            "spatial_view": loaders.spatial_view,
             "runtime_provenance": loaders.runtime_provenance,
             "tensorizer": tensorizer,
         }

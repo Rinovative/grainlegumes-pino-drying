@@ -10,6 +10,7 @@ invalid CPU/fallback requests. It deliberately does not run Docker, Slurm,
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -97,6 +98,7 @@ def _harness(
         "docker_job.sh",
         "docker_python.sh",
         "_docker_run.sh",
+        "_queue_job.sh",
         "config_preflight_runtime.py",
     ):
         shutil.copy2(_REPOSITORY_ROOT / "scripts" / name, scripts / name)
@@ -125,12 +127,30 @@ def _harness(
         """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\0' "$@" > "${HOST_PYTHON_CAPTURE}"
-if [[ "${1-}" == "-c" ]]; then
+if [[ "${1-}" == "-c" && "${2-}" == *"sys.version_info"* ]]; then
   printf '%s\\n' "${HOST_PYTHON_STUB_VERSION:-3.9.19}"
   exit "${HOST_PYTHON_VERSION_EXIT_CODE:-0}"
 fi
-echo 'host Python was asked to import project code directly' >&2
-exit 97
+exec "${CONTAINER_PYTHON}" "$@"
+""",
+    )
+    _write_executable(
+        binary_dir / "git",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1-}" == "-C" && "${3-}" == "rev-parse" && "${4-}" == "HEAD" ]]; then
+  printf '%s\n' "${MOCK_GIT_COMMIT:-0000000000000000000000000000000000000001}"
+  exit 0
+fi
+if [[ "${1-}" == "-C" && "${3-}" == "diff" ]]; then
+  printf '%s' "${MOCK_GIT_DIFF-}"
+  exit 0
+fi
+if [[ "${1-}" == "-C" && "${3-}" == "ls-files" ]]; then
+  exit 0
+fi
+echo 'unexpected git arguments' >&2
+exit 64
 """,
     )
     report = gpu_report if gpu_report is not None else ("0, Cluster GPU A, 20, 7000, 24000\n2, Cluster GPU B, 5, 1000, 24000\n")
@@ -394,6 +414,12 @@ def _queue_log_dir(harness: _Harness, scope: str = "steady_flow") -> Path:
     return Path(harness.environment["STORAGE_ROOT"]) / "03_experiments" / scope / "logs" / "queue"
 
 
+def _descriptor_path_from_token(harness: _Harness, token: str) -> Path:
+    """Resolve one validated short queue token inside the test storage root."""
+    scope, label = token.split("/", maxsplit=1)
+    return _queue_log_dir(harness, scope) / f"{label}.queue.json"
+
+
 def _assert_preflight_container(
     harness: _Harness,
     *,
@@ -412,7 +438,6 @@ def _assert_preflight_container(
     assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in arguments
     assert arguments[arguments.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert "STORAGE_ROOT=/workspace/storage" in arguments
-    assert not harness.host_python_capture.exists()
     assert arguments[-4:] == [
         "python",
         "/workspace/repo/scripts/config_preflight_runtime.py",
@@ -434,7 +459,6 @@ def _assert_queue_path_container(harness: _Harness, *, scope: str) -> None:
     assert f"type=bind,source={harness.environment['STORAGE_ROOT']},target=/workspace/storage" in arguments
     assert arguments[arguments.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert "STORAGE_ROOT=/workspace/storage" in arguments
-    assert not harness.host_python_capture.exists()
     assert arguments[-4:] == [
         "python",
         "-m",
@@ -485,7 +509,8 @@ def _assert_wandb_forwarding(
 
     processed_root = Path(harness.environment["STORAGE_ROOT"]) / "03_experiments"
     log_text = "\n".join(path.read_text(encoding="utf-8") for path in processed_root.glob("*/logs/queue/*.log"))
-    visible_text = "\n".join(("\0".join(docker), result.stdout, result.stderr, log_text))
+    descriptor_text = "\n".join(path.read_text(encoding="utf-8") for path in processed_root.glob("*/logs/queue/*.queue.json"))
+    visible_text = "\n".join(("\0".join(docker), result.stdout, result.stderr, log_text, descriptor_text))
     for key in possible_keys:
         if key:
             assert key not in visible_text
@@ -500,28 +525,55 @@ def _assert_submission(
     module: str,
     semantic_arguments: list[str],
 ) -> Path:
-    """Assert the scheduler and maintained CLI receive semantic arguments."""
+    """Assert a concise scheduler command and exact descriptor recovery."""
     assert result.returncode == 0, result.stderr
     queued = _capture_arguments(harness.runtsgpu_capture)
     assert queued[:3] == [
         f"-g{gpu}",
         "--",
-        str(harness.repository / "scripts" / "_docker_run.sh"),
+        "scripts/_queue_job.sh",
     ]
-    assert queued[3:5] == [gpu, workflow]
-    log_path = Path(queued[5])
-    assert log_path.parent == _queue_log_dir(harness)
+    assert len(queued) == 4
+    token = queued[3]
+    assert not token.startswith("/")
+    assert len(" ".join(queued[2:])) < 120
+    assert str(harness.repository) not in " ".join(queued)
+    assert harness.environment["STORAGE_ROOT"] not in " ".join(queued)
+    descriptor_path = _descriptor_path_from_token(harness, token)
+    assert descriptor_path.parent == _queue_log_dir(harness)
+    assert descriptor_path.is_file()
+
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    assert descriptor["schema_version"] == 1
+    assert descriptor["workflow"] == workflow
+    assert descriptor["host_gpu"] == gpu
+    assert descriptor["container_gpu"] == "0"
+    assert descriptor["task_spooler_socket"] == f"/etc/ts/socket_{gpu}"
+    assert descriptor["host_log"].startswith(str(_queue_log_dir(harness)))
+    assert descriptor["project_root"] == str(harness.repository)
+    assert descriptor["storage_root"] == harness.environment["STORAGE_ROOT"]
+    assert len(descriptor["source_commit"]) == 40
+    assert len(descriptor["source_worktree_sha256"]) == 64
     forwarded_arguments = list(semantic_arguments)
     if workflow in {"train", "optuna"} and not forwarded_arguments[0].startswith("/workspace/"):
         forwarded_arguments[0] = f"/workspace/repo/{forwarded_arguments[0]}"
-    assert queued[6:] == forwarded_arguments
-    _assert_queue_path_container(harness, scope="steady_flow")
+    assert descriptor["execution_argv"] == [
+        str(harness.repository / "scripts" / "_docker_run.sh"),
+        gpu,
+        workflow,
+        descriptor["host_log"],
+        *forwarded_arguments,
+    ]
     if workflow in {"train", "optuna"}:
+        assert descriptor["config_sha256"] is not None
         _assert_preflight_container(
             harness,
             workflow=workflow,
             config_path=forwarded_arguments[0],
         )
+    else:
+        assert descriptor["config_sha256"] is None
+    _assert_queue_path_container(harness, scope="steady_flow")
 
     docker = _capture_arguments(harness.docker_capture)
     assert docker[docker.index("--gpus") + 1] == f"device={gpu}"
@@ -539,11 +591,98 @@ def _assert_submission(
     assert "--queue-gpu" not in queued
     assert "--queue-gpu" not in docker
 
+    log_path = Path(descriptor["host_log"])
     assert log_path.is_file()
     log_text = log_path.read_text(encoding="utf-8")
     assert "captured Docker stdout with spaces" in log_text
     assert "captured Docker stderr with spaces" in log_text
     return log_path
+
+
+def test_queue_runner_rejects_unsafe_missing_and_malformed_descriptors(tmp_path: Path) -> None:
+    """Fail closed before Docker when descriptor provenance cannot be validated."""
+    harness = _harness(tmp_path)
+    queue_runner = harness.repository / "scripts" / "_queue_job.sh"
+    malformed = _queue_log_dir(harness) / "malformed.queue.json"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not json\n", encoding="utf-8")
+    malformed.chmod(0o400)
+
+    for token in (
+        "/outside/unsafe",
+        "../escape",
+        "steady_flow/missing",
+        "steady_flow/malformed",
+    ):
+        result = subprocess.run(
+            [str(queue_runner), token],
+            cwd=harness.repository,
+            env=harness.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode != 0
+    assert not harness.docker_capture.exists()
+
+
+def test_queue_runner_rejects_changed_source_checkout(tmp_path: Path) -> None:
+    """Reject a queued job when its commit or dirty worktree changed."""
+    harness = _harness(tmp_path)
+    submitted = _run_job(
+        harness,
+        "--queue-gpu",
+        "auto",
+        "artifacts",
+        "--task",
+        "steady_flow",
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    queued = _capture_arguments(harness.runtsgpu_capture)
+    docker_before = harness.docker_capture.read_bytes()
+
+    for override in (
+        {"MOCK_GIT_COMMIT": "2" * 40},
+        {"MOCK_GIT_DIFF": "changed tracked source\n"},
+    ):
+        environment = {**harness.environment, **override}
+        rerun = subprocess.run(
+            [queued[2], queued[3]],
+            cwd=harness.repository,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert rerun.returncode != 0
+        assert harness.docker_capture.read_bytes() == docker_before
+
+
+def test_queue_runner_propagates_docker_exit_status(tmp_path: Path) -> None:
+    """Preserve the worker Docker status after recovering a valid descriptor."""
+    harness = _harness(tmp_path, docker_exit_code=41)
+    submitted = _run_job(
+        harness,
+        "--queue-gpu",
+        "auto",
+        "artifacts",
+        "--task",
+        "steady_flow",
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    queued = _capture_arguments(harness.runtsgpu_capture)
+    rerun = subprocess.run(
+        [queued[2], queued[3]],
+        cwd=harness.repository,
+        env=harness.environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rerun.returncode == 41
+    descriptor_path = _descriptor_path_from_token(harness, queued[3])
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    assert "Docker exit status: 41" in Path(descriptor["host_log"]).read_text(encoding="utf-8")
 
 
 def test_direct_submission_uses_automatic_gpu_and_forwards_arguments(

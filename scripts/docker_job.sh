@@ -610,17 +610,162 @@ esac
 TASK_SPOOLER_SOCKET="/etc/ts/socket_${GPU_ID}"
 LOG_DIR="$(resolve_host_queue_log_dir "${LOG_SCOPE}")"
 mkdir -p "${LOG_DIR}"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_PATH="$(mktemp --suffix=.log "${LOG_DIR}/${TIMESTAMP}__${JOB_TYPE}__gpu${GPU_ID}__XXXXXX")"
+LOG_SUFFIX="$(basename -- "${LOG_PATH%.log}")"
+LOG_SUFFIX="${LOG_SUFFIX##*__}"
+QUEUE_VARIANT="job"
+QUEUE_SEED=""
+if [[ "${JOB_TYPE}" == "train" || "${JOB_TYPE}" == "optuna" ]]; then
+  QUEUE_CONFIG_STEM="$(basename -- "${CANONICAL_CONFIG_PATH}")"
+  QUEUE_CONFIG_STEM="${QUEUE_CONFIG_STEM%.*}"
+  QUEUE_VARIANT="${QUEUE_CONFIG_STEM%%_*}"
+  if [[ ! "${QUEUE_VARIANT}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$ ]]; then
+    QUEUE_VARIANT="config"
+  fi
+  if [[ "${QUEUE_CONFIG_STEM}" =~ __s([0-9]+)$ ]]; then
+    QUEUE_SEED="-s${BASH_REMATCH[1]}"
+  fi
+else
+  QUEUE_VARIANT="artifacts"
+fi
+QUEUE_LABEL="vp2-${JOB_TYPE}-${RESOLVED_TASK}-${QUEUE_VARIANT}${QUEUE_SEED}-${LOG_SUFFIX}"
+if [[ ! "${QUEUE_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]; then
+  rm -f -- "${LOG_PATH}"
+  fail 1 "Unable to derive a safe concise queue label."
+fi
+QUEUE_TOKEN="${LOG_SCOPE}/${QUEUE_LABEL}"
+DESCRIPTOR_PATH="${LOG_DIR}/${QUEUE_LABEL}.queue.json"
+SOURCE_COMMIT="$(git -C "${PROJECT_DIR}" rev-parse HEAD)"
+if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  fail 1 "Unable to resolve the current source commit for the queue descriptor."
+fi
+CONFIG_DESCRIPTOR_PATH="${CANONICAL_CONFIG_PATH}"
+if [[ "${JOB_TYPE}" == "train" || "${JOB_TYPE}" == "optuna" ]]; then
+  CONFIG_DESCRIPTOR_PATH="${SEMANTIC_ARGS[0]}"
+fi
+
+write_queue_descriptor() {
+  local descriptor_path="$1"
+  local config_path="${HOST_CONFIG_PATH:-}"
+
+  python -c '
+import datetime
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+(
+    descriptor,
+    project_root,
+    storage_root,
+    queue_log_root,
+    workflow,
+    task,
+    canonical_config,
+    config_path,
+    gpu,
+    host_log,
+    source_commit,
+    *semantic_args,
+) = sys.argv[1:]
+def source_worktree_sha256(root: Path) -> str:
+    tracked_diff = subprocess.run(
+        ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    untracked_output = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    digest = hashlib.sha256()
+    digest.update(b"tracked-diff\0")
+    digest.update(len(tracked_diff).to_bytes(8, "big"))
+    digest.update(tracked_diff)
+    for relative_raw in sorted(part for part in untracked_output.split(b"\0") if part):
+        candidate = root / os.fsdecode(relative_raw)
+        digest.update(b"untracked\0")
+        digest.update(len(relative_raw).to_bytes(8, "big"))
+        digest.update(relative_raw)
+        if candidate.is_symlink():
+            target = os.fsencode(os.readlink(candidate))
+            digest.update(b"symlink\0")
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+        elif candidate.is_file():
+            digest.update(b"file\0")
+            digest.update((candidate.stat().st_mode & stat.S_IXUSR).to_bytes(1, "big"))
+            with candidate.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise SystemExit(f"Unable to fingerprint untracked source path: {candidate}")
+    return digest.hexdigest()
+
+
+config_hash = None
+if config_path:
+    config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+payload = {
+    "schema_version": 1,
+    "created_utc": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "workflow": workflow,
+    "task": task,
+    "canonical_config": canonical_config,
+    "config_sha256": config_hash,
+    "host_gpu": gpu,
+    "container_gpu": "0",
+    "task_spooler_socket": f"/etc/ts/socket_{gpu}",
+    "host_log": host_log,
+    "project_root": project_root,
+    "storage_root": storage_root,
+    "queue_log_root": queue_log_root,
+    "source_commit": source_commit,
+    "source_worktree_sha256": source_worktree_sha256(Path(project_root)),
+    "execution_argv": [
+        os.path.join(project_root, "scripts", "_docker_run.sh"),
+        gpu,
+        workflow,
+        host_log,
+        *semantic_args,
+    ],
+}
+descriptor_path = Path(descriptor)
+file_descriptor = os.open(descriptor_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+    stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+' \
+    "${descriptor_path}" \
+    "${PROJECT_DIR}" \
+    "${STORAGE_DIR}" \
+    "${LOG_DIR}" \
+    "${JOB_TYPE}" \
+    "${RESOLVED_TASK}" \
+    "${CONFIG_DESCRIPTOR_PATH}" \
+    "${config_path}" \
+    "${GPU_ID}" \
+    "${LOG_PATH}" \
+    "${SOURCE_COMMIT}" \
+    "${SEMANTIC_ARGS[@]}"
+}
+
+if ! write_queue_descriptor "${DESCRIPTOR_PATH}"; then
+  rm -f -- "${LOG_PATH}" "${DESCRIPTOR_PATH}"
+  fail 1 "Unable to create the queue descriptor."
+fi
+chmod 400 "${DESCRIPTOR_PATH}"
 QUEUE_COMMAND=(
   runTSGPU.py
   "-g${GPU_ID}"
   --
-  "${PROJECT_DIR}/scripts/_docker_run.sh"
-  "${GPU_ID}"
-  "${JOB_TYPE}"
-  "${LOG_PATH}"
-  "${SEMANTIC_ARGS[@]}"
+  scripts/_queue_job.sh
+  "${QUEUE_TOKEN}"
 )
 
 cd "${PROJECT_DIR}"
@@ -684,6 +829,8 @@ printf 'Selected host GPU: %s\n' "${GPU_ID}"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${GPU_ID}"
 printf 'Container CUDA device: 0\n'
 printf 'Task-spooler socket: %s\n' "${TASK_SPOOLER_SOCKET}"
+printf 'Queue label: %s\n' "${QUEUE_LABEL}"
+printf 'Queue descriptor: %s\n' "${DESCRIPTOR_PATH}"
 printf 'Queued command:'
 printf ' %q' "${QUEUE_COMMAND[@]}"
 printf '\n'

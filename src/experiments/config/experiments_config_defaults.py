@@ -144,9 +144,10 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
             "run": RUN_DEFAULTS,
             "data": {
                 "batch_size": 2,
-                "num_workers": 0,
-                "pin_memory": False,
-                "persistent_workers": False,
+                "num_workers": 2,
+                "pin_memory": True,
+                "persistent_workers": True,
+                "spatial_stride": 1,
                 "transient_backend_preference": "pt_shards",
                 "transient_backend_required": False,
                 "hdf5_cache_size": 0,

@@ -13,6 +13,9 @@ import torch
 import yaml
 
 from src import common, datasets, generation
+from src.learning.learning_temporal import TemporalConditioningSpec
+from src.learning.transient import learning_transient_scaling as transient_scaling
+from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 from tests.generation.test_generation_transient import (
     _small_scientific_contract,
     _source,
@@ -27,6 +30,7 @@ def _fixture_context(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build two compact canonical GPU cases and one transient index."""
     scientific = _small_scientific_contract()
+    scientific["grid"].update({"ny": 5, "Ly": 0.4})
     scientific["time"].update(
         {
             "stop": 4.0,
@@ -174,7 +178,7 @@ def test_transient_shard_default_is_materialization_owned_and_identity_neutral(
     assert defaulted.dataset_packages[0]["training_payload"]["target_shard_bytes"] == target_bytes
 
 
-def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(
+def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(  # noqa: PLR0915 -- one compact lifecycle fixture
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -245,6 +249,46 @@ def test_transient_shards_pack_whole_cases_and_match_both_sampling_modes(
         finally:
             canonical.close()
             sharded.close()
+
+    full = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=one_step,
+        source_root=tmp_path,
+        sample_indices=(3,),
+    )
+    canonical_stride_two = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=one_step,
+        source_root=tmp_path,
+        spatial_stride=2,
+        sample_indices=(3,),
+    )
+    sharded_stride_two = datasets.runtime.transient.TransientPTShardDataset(
+        index_path,
+        sampling=one_step,
+        source_root=tmp_path,
+        spatial_stride=2,
+        sample_indices=(3,),
+    )
+    try:
+        full_item = full[0]
+        strided_item = canonical_stride_two[0]
+        _assert_item_equal(strided_item, sharded_stride_two[0])
+        torch.testing.assert_close(strided_item["state"], full_item["state"][:, ::2, ::2], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(strided_item["target"], full_item["target"][:, ::2, ::2], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(strided_item["static"], full_item["static"][:, ::2, ::2], rtol=0.0, atol=0.0)
+        _assert_item_equal(strided_item["boundary"], full_item["boundary"])
+        _assert_item_equal(strided_item["scalars"], full_item["scalars"])
+        _assert_item_equal(strided_item["time"], full_item["time"])
+        assert strided_item["state"].shape[-2:] == (3, 3)
+        assert strided_item["static"][0, 0, 0] == full_item["static"][0, 0, 0]
+        assert strided_item["static"][0, -1, -1] == full_item["static"][0, -1, -1]
+        assert strided_item["static"][1, 0, 0] == full_item["static"][1, 0, 0]
+        assert strided_item["static"][1, -1, -1] == full_item["static"][1, -1, -1]
+    finally:
+        full.close()
+        canonical_stride_two.close()
+        sharded_stride_two.close()
 
     context_depths.clear()
     reused = shard_service.build_transient_shards(
@@ -438,3 +482,55 @@ def test_transient_shards_keep_oversized_cases_whole_and_evict_cache(
         assert tuple(runtime._shard_cache) == (1,)
     finally:
         runtime.close()
+
+    load_calls: list[tuple[int, bool]] = []
+    original_load = shard_service.load_transient_shard_payload
+
+    def tracked_load(
+        _dataset_id: str,
+        shard_index: int,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        load_calls.append((shard_index, bool(kwargs["validate_values"])))
+        return original_load(_dataset_id, shard_index, **kwargs)
+
+    monkeypatch.setattr(shard_service, "load_transient_shard_payload", tracked_load)
+    fast_runtime = datasets.runtime.transient.TransientPTShardDataset(
+        index_path,
+        sampling=datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),
+        source_root=tmp_path,
+        hdf5_cache_size=0,
+    )
+    reference_runtime = datasets.runtime.transient.TransientPTShardDataset(
+        index_path,
+        sampling=datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),
+        source_root=tmp_path,
+        hdf5_cache_size=1,
+    )
+    tensorizer = TransientTensorizerSpec(
+        input_profile="canonical_physics_complete_v1",
+        temporal_conditioning=TemporalConditioningSpec("none"),
+    )
+    progress: list[tuple[int, int]] = []
+    try:
+        optimized = transient_scaling.fit_transient_scaling(
+            fast_runtime.iter_scaling_items(progress_callback=lambda completed, total: progress.append((completed, total))),
+            tensorizer=tensorizer,
+            dataset_identity={"dataset_id": dataset_id},
+            train_membership_digest="6" * 64,
+            horizon=fast_runtime.configured_regular_horizon,
+        )
+        assert load_calls == [(0, True), (1, True)]
+        assert progress == [(1, 2), (2, 2)]
+        load_calls.clear()
+        reference = transient_scaling.fit_transient_scaling(
+            (reference_runtime[position] for position in range(len(reference_runtime))),
+            tensorizer=tensorizer,
+            dataset_identity={"dataset_id": dataset_id},
+            train_membership_digest="6" * 64,
+            horizon=reference_runtime.configured_regular_horizon,
+        )
+        assert optimized.state_dict() == reference.state_dict()
+    finally:
+        fast_runtime.close()
+        reference_runtime.close()

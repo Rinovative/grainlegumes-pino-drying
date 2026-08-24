@@ -477,15 +477,16 @@ def _finite_tensor(
     dtype: torch.dtype,
     shape: tuple[int | None, ...],
     label: str,
+    validate_values: bool = True,
 ) -> torch.Tensor:
-    """Validate one finite CPU tensor with a partly variable exact shape."""
+    """Validate one CPU tensor shape and, on first process access, values."""
     if (
         not isinstance(value, torch.Tensor)
         or value.device.type != "cpu"
         or value.dtype != dtype
         or value.ndim != len(shape)
         or any(expected is not None and value.shape[index] != expected for index, expected in enumerate(shape))
-        or not bool(torch.isfinite(value).all())
+        or (validate_values and not bool(torch.isfinite(value).all()))
     ):
         message = f"Transient shard tensor {label!r} has an invalid dtype, shape, device, or value."
         raise TransientShardContractError(message)
@@ -498,6 +499,7 @@ def _validate_case_payload(
     expected_case_index: int,
     expected_case: Mapping[str, Any],
     expected_samples: Sequence[Mapping[str, Any]],
+    validate_values: bool = True,
 ) -> None:
     """Validate one complete case payload against its scientific index."""
     required = {
@@ -532,30 +534,35 @@ def _validate_case_payload(
         dtype=torch.float32,
         shape=(int(expected_case["sequence_length"]), len(_expected_field_order()["dynamic"]), None, None),
         label="states",
+        validate_values=validate_values,
     )
     _finite_tensor(
         value["static"],
         dtype=torch.float32,
         shape=(len(_expected_field_order()["static"]), states.shape[2], states.shape[3]),
         label="static",
+        validate_values=validate_values,
     )
     _finite_tensor(
         value["boundary"],
         dtype=torch.float32,
         shape=(len(expected_samples), len(_expected_field_order()["boundary"])),
         label="boundary",
+        validate_values=validate_values,
     )
     _finite_tensor(
         value["scalars"],
         dtype=torch.float32,
         shape=(len(_expected_field_order()["scalars"]),),
         label="scalars",
+        validate_values=validate_values,
     )
     time = _finite_tensor(
         value["state_time"],
         dtype=torch.float64,
         shape=(int(expected_case["sequence_length"]),),
         label="state_time",
+        validate_values=validate_values,
     )
     if time.numel() < _MINIMUM_STATE_COUNT or not bool(torch.all(time[1:] > time[:-1])):
         message = f"Transient shard state times are not strictly increasing at case {expected_case_index}."
@@ -580,6 +587,7 @@ def _validate_case_payload(
             dtype=torch.float32,
             shape=(states.shape[1], states.shape[2], states.shape[3]),
             label="exact_stop_state",
+            validate_values=validate_values,
         )
 
 
@@ -628,6 +636,7 @@ def _validate_loaded_shard(
     publication_identity: Mapping[str, str],
     expected_grouped: Sequence[Sequence[Mapping[str, Any]]],
     locator: Mapping[str, Any],
+    validate_values: bool = True,
 ) -> dict[str, Any]:
     """Validate one safely loaded shard against receipt and scientific index."""
     required = {
@@ -686,6 +695,7 @@ def _validate_loaded_shard(
             expected_case_index=case_index,
             expected_case=index["cases"][case_index],
             expected_samples=expected_grouped[case_index],
+            validate_values=validate_values,
         )
         transition_count += int(case_payload["valid_transition_count"])
         tensor_bytes += _tensor_bytes(case_payload)
@@ -948,11 +958,15 @@ def load_transient_shard_payload(
     *,
     storage_root: Path | str | None = None,
     receipt: Mapping[str, Any] | None = None,
+    validate_values: bool = True,
 ) -> dict[str, Any]:
-    """Stat-admit, mmap-load, and validate exactly one requested PT shard."""
+    """Stat-admit and mmap-load one shard, scanning values once per process."""
     if isinstance(shard_index, bool) or not isinstance(shard_index, int) or shard_index < 0:
         message = "shard_index must be a non-negative integer."
         raise ValueError(message)
+    if type(validate_values) is not bool:
+        message = "validate_values must be boolean."
+        raise TypeError(message)
     storage, manifest, index, _manifest_sha256 = _package_context(
         dataset_id,
         storage_root=storage_root,
@@ -1008,6 +1022,7 @@ def load_transient_shard_payload(
         publication_identity=publication_identity,
         expected_grouped=_case_samples(index),
         locator=locator,
+        validate_values=validate_values,
     )
 
 

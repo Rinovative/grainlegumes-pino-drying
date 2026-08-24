@@ -69,6 +69,7 @@ _TRAINING_IDENTITY_CONTRACT: Final = {
     "selection": "resolved_evaluation_objective_and_ordered_split",
 }
 TRAINING_IDENTITY_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(_TRAINING_IDENTITY_CONTRACT)
+_TRANSIENT_SPLIT_SCHEMA_VERSION: Final = 2
 _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
     {
         "task",
@@ -172,6 +173,7 @@ def effective_config_identity_payload(
                     "num_workers",
                     "pin_memory",
                     "persistent_workers",
+                    "spatial_stride",
                     "transient_backend_preference",
                     "transient_backend_required",
                     "hdf5_cache_size",
@@ -183,6 +185,9 @@ def effective_config_identity_payload(
         ),
         label="data",
     )
+    configured_spatial_stride = config["data"].get("spatial_stride", 1) if is_transient else 1
+    if is_transient and configured_spatial_stride != 1:
+        data["spatial_stride"] = configured_spatial_stride
     task_contract = _required_mapping(config["task_contract"], label="config task_contract")
     required_task_contract = {"schema_version", "task", "digest", "data_contract_digest"}
     missing_contract = sorted(required_task_contract.difference(task_contract))
@@ -344,7 +349,7 @@ def build_checkpoint_identity(
     task_digest = _required_sha256(task_digest, label="config task_contract.digest")
     normalizer_digest = _required_sha256(normalizer_sha256, label="normalizer_sha256")
     if task == "transient_drying":
-        required = {
+        base_required = {
             "schema_kind",
             "schema_version",
             "task",
@@ -358,8 +363,27 @@ def build_checkpoint_identity(
             "roles",
             "runtime_provenance",
         }
+        split_version = split_indices.get("schema_version")
+        configured_stride = config["data"].get("spatial_stride", 1)
+        if split_version == 1:
+            required = base_required
+            if configured_stride != 1:
+                message = "Legacy transient checkpoint split evidence is valid only for spatial_stride=1."
+                raise ValueError(message)
+        elif split_version == _TRANSIENT_SPLIT_SCHEMA_VERSION:
+            required = base_required.union({"spatial_view"})
+            spatial_view = _required_mapping(
+                split_indices.get("spatial_view"),
+                label="transient spatial_view",
+            )
+            if spatial_view.get("spatial_stride") != configured_stride:
+                message = "Transient checkpoint split spatial stride does not match the config."
+                raise ValueError(message)
+        else:
+            message = f"Transient checkpoint split schema version {split_version!r} is unsupported."
+            raise ValueError(message)
         if set(split_indices) != required:
-            message = "Transient checkpoint split does not match the current training-split schema."
+            message = "Transient checkpoint split does not match the maintained training-split schema."
             raise ValueError(message)
         if split_indices["task"] != task or split_indices["task_contract_digest"] != task_digest:
             message = "Transient checkpoint split task identity does not match the config contract."

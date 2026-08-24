@@ -5,7 +5,7 @@ Define and serialize the unregistered transient drying sample-data contract.
 Responsibilities:
   - Select Dataset-owned conditioning fields from Generation storage descriptors
   - Declare ordered state, temporal, boundary, scalar, target, and archive fields
-  - Validate explicit one-step and rollout-window sampling specifications
+  - Validate explicit sampling and boundary-preserving spatial-view specifications
   - Serialize and digest the exact persisted transient sample contract
 Design principles:
   - Generation owns canonical HDF5 source names and physical units
@@ -35,6 +35,41 @@ TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "one_step_transition",
     "rollout_window",
 )
+_SPATIAL_AXIS_COUNT: Final = 2
+_MINIMUM_SPATIAL_AXIS_LENGTH: Final = 2
+
+
+def validate_spatial_stride(value: Any) -> int:
+    """Return one exact positive spatial stride without coercion."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        message = "spatial_stride must be an integer."
+        raise TypeError(message)
+    if value < 1:
+        message = "spatial_stride must be >= 1."
+        raise ValueError(message)
+    return value
+
+
+def resolve_spatial_view(
+    canonical_shape: tuple[int, int],
+    spatial_stride: int,
+) -> tuple[int, int]:
+    """Return the boundary-preserving effective ``(Y, X)`` shape."""
+    stride = validate_spatial_stride(spatial_stride)
+    if (
+        not isinstance(canonical_shape, tuple)
+        or len(canonical_shape) != _SPATIAL_AXIS_COUNT
+        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in canonical_shape)
+    ):
+        message = "canonical_shape must contain two integer spatial axes >= 2."
+        raise ValueError(message)
+    if any((axis - 1) % stride != 0 for axis in canonical_shape):
+        message = f"spatial_stride={stride} does not preserve both boundaries of canonical spatial shape {canonical_shape}."
+        raise ValueError(message)
+    return (
+        (canonical_shape[0] - 1) // stride + 1,
+        (canonical_shape[1] - 1) // stride + 1,
+    )
 
 
 @dataclass(frozen=True, slots=True)

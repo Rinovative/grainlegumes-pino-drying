@@ -25,6 +25,20 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|password|secret|token)(\s*[:=]\s*)([^\s,;]+)")
+_STARTUP_PHASE_EVENTS = frozenset(
+    {
+        "data_setup_start",
+        "dataset_resolved",
+        "scaler_cache",
+        "scaler_fit_start",
+        "scaler_fit_progress",
+        "scaler_fit_complete",
+        "dataloader_ready",
+        "model_build_start",
+        "model_cuda_ready",
+        "training_start",
+    }
+)
 
 
 def _redact_secrets(value: object) -> str:
@@ -109,6 +123,18 @@ class ConsoleReporter:
         """Return the objective first, followed by resolved diagnostic metrics."""
         declared = tuple(str(metric["id"]) for metric in self.config["evaluation"]["metrics"])
         return (self.objective_id, *(metric_id for metric_id in declared if metric_id != self.objective_id))
+
+    def startup_phase(self, event: str, fields: Mapping[str, Any] | None = None) -> None:
+        """Emit one maintained bounded startup phase with total elapsed time."""
+        if event not in _STARTUP_PHASE_EVENTS:
+            message = f"Unsupported startup phase event: {event!r}."
+            raise ValueError(message)
+        values = dict(fields or {})
+        _emit(
+            event,
+            elapsed_seconds=time.perf_counter() - self._started,
+            **values,
+        )
 
     def startup(self, *, resolved_device: str) -> None:
         """Emit one resolved-run line and one active-loss-composition line."""

@@ -57,6 +57,7 @@ class DatasetRequest:
     allow_technical_smoke: bool = False
     transient_backend_preference: TransientBackendPreference = "pt_shards"
     transient_backend_required: bool = False
+    spatial_stride: int = 1
 
     def __post_init__(self) -> None:
         """Reject selectors that are ambiguous or invalid for their regime."""
@@ -66,8 +67,9 @@ class DatasetRequest:
             if not isinstance(self.transient_sampling, transient_contract.TransientSamplingSpec):
                 message = "Transient Dataset requests require one explicit transient_sampling specification."
                 raise TypeError(message)
-        elif self.transient_sampling is not None:
-            message = "Steady-flow Dataset requests cannot include transient_sampling."
+            transient_contract.validate_spatial_stride(self.spatial_stride)
+        elif self.transient_sampling is not None or self.spatial_stride != 1:
+            message = "Steady-flow Dataset requests cannot include transient_sampling or a non-unit spatial_stride."
             raise ValueError(message)
         if self.membership is not None and self.membership not in views.ID_MEMBERSHIPS:
             message = f"Unsupported ID membership selector: {self.membership!r}."
@@ -213,6 +215,7 @@ def _create_dataset_from_manifest(
             sampling=sampling,
             source_root=request.storage_root,
             hdf5_cache_size=hdf5_cache_size,
+            spatial_stride=request.spatial_stride,
             transform=transient_transform,
         )
     elif request.transient_backend_preference == "pt_shards" and request.transient_backend_required:
@@ -224,6 +227,7 @@ def _create_dataset_from_manifest(
             sampling=sampling,
             source_root=request.storage_root,
             hdf5_cache_size=hdf5_cache_size,
+            spatial_stride=request.spatial_stride,
             transform=transient_transform,
         )
     if (
@@ -234,7 +238,9 @@ def _create_dataset_from_manifest(
     ):
         message = f"Transient index does not bind its package manifest: {payload_path}."
         raise ValueError(message)
-    return _select_transient(transient_dataset, request)
+    selected = _select_transient(transient_dataset, request)
+    selected.bind_dataset_manifest_digest(str(manifest["dataset_digest"]))
+    return selected
 
 
 def create_dataset(

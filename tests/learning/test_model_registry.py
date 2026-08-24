@@ -171,3 +171,43 @@ def test_transient_uno_schedule_preserves_y_x_axis_order() -> None:
     config["model"]["params"]["modes_x"] = 49
     with pytest.raises(ValueError, match="modes_x"):
         learning.models.factory.validate_transient_model_spatial_shape(config, (32, 48))
+
+
+def test_immediate_uno_stride_two_grid_passes_layerwise_preflight() -> None:
+    """Admit the maintained m64x64 seven-layer UNO schedule on 126x201."""
+    config = {
+        "task": "transient_drying",
+        "model": {
+            "kind": "uno",
+            "params": {
+                "modes_y": 64,
+                "modes_x": 64,
+                "n_layers": 7,
+                "mode_ratio": 0.495,
+                "uno_scalings": [
+                    [1.0, 1.0],
+                    [0.5, 0.5],
+                    [0.5, 0.5],
+                    [1.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 2.0],
+                    [2.0, 2.0],
+                ],
+            },
+        },
+    }
+
+    learning.models.factory.validate_transient_model_spatial_shape(config, (126, 201))
+
+
+def test_fno_stride_two_grid_checks_modes_against_effective_axes() -> None:
+    """Apply FNO spectral admission to the effective, not canonical, grid."""
+    config = {
+        "task": "transient_drying",
+        "model": {"kind": "fno", "params": {"n_modes": [64, 64]}},
+    }
+    learning.models.factory.validate_transient_model_spatial_shape(config, (126, 201))
+
+    config["model"]["params"]["n_modes"] = [127, 64]
+    with pytest.raises(ValueError, match="modes_y"):
+        learning.models.factory.validate_transient_model_spatial_shape(config, (126, 201))

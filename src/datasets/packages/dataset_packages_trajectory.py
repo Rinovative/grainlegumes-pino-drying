@@ -44,6 +44,7 @@ _SOURCE_TRANSIENT_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.
 _SOURCE_SCHEDULE_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.schedule_fields)
 _SOURCE_SCALAR_FIELDS: Final = tuple(field.name for field in _SOURCE_PROFILE.scalar_inputs)
 _MINIMUM_TRANSIENT_STATE_COUNT: Final = 2
+_TRANSIENT_FIELD_RANK: Final = 4
 
 
 class TransientDataContractError(ValueError):
@@ -127,7 +128,7 @@ def require_hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
     return value
 
 
-def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical HDF5 interpretation
+def read_transient_case_arrays(  # noqa: C901, PLR0912, PLR0915 -- centralized canonical HDF5 interpretation
     handle: h5py.File,
     path: Path,
     case: Mapping[str, Any],
@@ -135,8 +136,9 @@ def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical 
     *,
     expected_regular_horizon: float,
     complete_case: bool = False,
+    spatial_stride: int = 1,
 ) -> TransientCaseArrays:
-    """Read and validate one case slice in the canonical Training field order."""
+    """Read and validate one case slice in the configured Training spatial view."""
     if not samples:
         message = f"Transient materialization requires at least one indexed transition: {path}."
         raise TransientDataContractError(message)
@@ -145,6 +147,12 @@ def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical 
     schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
     scalar_dataset = require_hdf5_dataset(handle, "scalar/values")
     time_dataset = require_hdf5_dataset(handle, "time")
+    stride = transient_contract.validate_spatial_stride(spatial_stride)
+    if transient_dataset.ndim != _TRANSIENT_FIELD_RANK:
+        message = f"Transient source spatial tensor rank is invalid: {path}."
+        raise TransientDataContractError(message)
+    canonical_shape = (int(transient_dataset.shape[2]), int(transient_dataset.shape[3]))
+    transient_contract.resolve_spatial_view(canonical_shape, stride)
     transient_names = decode_json_string_list(
         transient_dataset.attrs["field_names"],
         label="transient.field_names",
@@ -219,21 +227,21 @@ def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical 
     states = np.stack(
         [
             np.asarray(
-                transient_dataset[time_index, dynamic_indices, :, :],
+                transient_dataset[time_index, dynamic_indices, ::stride, ::stride],
                 dtype=np.float32,
             )
             for time_index in state_indices
         ],
         axis=0,
     )
-    x_axis = np.asarray(require_hdf5_dataset(handle, "coords/x")[:], dtype=np.float32)
-    y_axis = np.asarray(require_hdf5_dataset(handle, "coords/y")[:], dtype=np.float32)
+    x_axis = np.asarray(require_hdf5_dataset(handle, "coords/x")[::stride], dtype=np.float32)
+    y_axis = np.asarray(require_hdf5_dataset(handle, "coords/y")[::stride], dtype=np.float32)
     x_grid, y_grid = np.meshgrid(x_axis, y_axis)
     static_values: dict[str, np.ndarray] = {"x": x_grid, "y": y_grid}
     for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning:
         if field.name not in static_values:
             static_values[field.name] = np.asarray(
-                static_dataset[static_names.index(field.name), :, :],
+                static_dataset[static_names.index(field.name), ::stride, ::stride],
                 dtype=np.float32,
             )
     static = np.stack(
@@ -334,7 +342,7 @@ def read_transient_case_arrays(  # noqa: C901, PLR0915 -- centralized canonical 
             message = f"Transient exact-stop diagnostic disagrees with its index: {path}."
             raise TransientDataContractError(message)
         exact_stop_state = np.asarray(
-            exact_fields_dataset[dynamic_indices, :, :],
+            exact_fields_dataset[dynamic_indices, ::stride, ::stride],
             dtype=np.float32,
         )
     arrays = (states, static, boundary, scalars)
