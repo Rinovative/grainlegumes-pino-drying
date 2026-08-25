@@ -8,8 +8,17 @@ Provides:
 - panel: interactive evaluation notebook panel
 - presentation: current-native field, grid, and metadata presentation data
 - plots: scientific evaluation visualizations
-- session: bounded evaluation-case and numerical-summary reuse
-- workflow: portable run preparation, reporting, and panel composition
+- run_discovery: read-only persisted-run and artifact discovery
+- selection: synchronized task-aware notebook selection state
+- session: bounded steady evaluation-case and numerical-summary reuse
+- transient_artifact: strict sequence-artifact persistence and admission
+- transient_comparison: matched-compute and Airflow-to-Drying comparison contracts
+- transient_metrics: sequence-aware Drying metrics and diagnostics
+- transient_rollout: teacher-forced, autonomous, and rolling-origin inference
+- transient_session: bounded sequence reductions and tracking summaries
+- transient_timing: admitted runtime components and speedup formulas
+- workflow: task-aware run preparation, reporting, and panel composition
+- workspace: automatic EDA-aligned notebook entry points
 """
 
 from __future__ import annotations
@@ -24,8 +33,17 @@ if TYPE_CHECKING:
     from . import evaluation_panel as panel
     from . import evaluation_plot as plots
     from . import evaluation_presentation as presentation
+    from . import evaluation_run_discovery as run_discovery
+    from . import evaluation_selection as selection
     from . import evaluation_session as session
+    from . import evaluation_transient_artifact as transient_artifact
+    from . import evaluation_transient_comparison as transient_comparison
+    from . import evaluation_transient_metrics as transient_metrics
+    from . import evaluation_transient_rollout as transient_rollout
+    from . import evaluation_transient_session as transient_session
+    from . import evaluation_transient_timing as transient_timing
     from . import evaluation_workflow as workflow
+    from . import evaluation_workspace as workspace
 
 _MODULES = {
     "artifact_loader": "evaluation_artifact_loader",
@@ -34,10 +52,37 @@ _MODULES = {
     "panel": "evaluation_panel",
     "plots": "evaluation_plot",
     "presentation": "evaluation_presentation",
+    "run_discovery": "evaluation_run_discovery",
+    "selection": "evaluation_selection",
     "session": "evaluation_session",
+    "transient_artifact": "evaluation_transient_artifact",
+    "transient_comparison": "evaluation_transient_comparison",
+    "transient_metrics": "evaluation_transient_metrics",
+    "transient_rollout": "evaluation_transient_rollout",
+    "transient_session": "evaluation_transient_session",
+    "transient_timing": "evaluation_transient_timing",
     "workflow": "evaluation_workflow",
+    "workspace": "evaluation_workspace",
 }
-__all__ = ["artifact_loader", "case", "dataframe", "panel", "plots", "presentation", "session", "workflow"]
+__all__ = [
+    "artifact_loader",
+    "case",
+    "dataframe",
+    "panel",
+    "plots",
+    "presentation",
+    "run_discovery",
+    "selection",
+    "session",
+    "transient_artifact",
+    "transient_comparison",
+    "transient_metrics",
+    "transient_rollout",
+    "transient_session",
+    "transient_timing",
+    "workflow",
+    "workspace",
+]
 
 
 def __getattr__(name: str) -> object:

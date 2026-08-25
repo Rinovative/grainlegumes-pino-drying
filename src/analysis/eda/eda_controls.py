@@ -34,11 +34,6 @@ if TYPE_CHECKING:
 
     from . import eda_selection as selection
 
-_CASE_ROW_WIDTH_PX = ui.notebook.COMPACT_VIEW_SELECTOR_WIDTH_PX
-_CASE_STEP_WIDTH_PX = 40
-_CASE_VALUE_WIDTH_PX = _CASE_ROW_WIDTH_PX - 2 * _CASE_STEP_WIDTH_PX
-_CASE_ROW_WIDTH = f"{_CASE_ROW_WIDTH_PX}px"
-
 
 class GeneratedOutputDatasetControl:
     """Bind the sole panel-level dataset selector to global EDA selection state."""
@@ -131,34 +126,10 @@ class GeneratedOutputControls:
         self.case, self.previous_case, self.next_case = ui.components.ui_step_case_index(
             case_numbers=initial_cases,
         )
-        self.case.layout = widgets.Layout(
-            width=f"{_CASE_VALUE_WIDTH_PX}px",
-            min_width=f"{_CASE_VALUE_WIDTH_PX}px",
-            max_width=f"{_CASE_VALUE_WIDTH_PX}px",
-            flex=f"0 0 {_CASE_VALUE_WIDTH_PX}px",
-            margin="0",
-        )
-        self.previous_case.tooltip = "Previous shared case"
-        self.next_case.tooltip = "Next shared case"
-        for button in (self.previous_case, self.next_case):
-            button.layout = widgets.Layout(
-                width=f"{_CASE_STEP_WIDTH_PX}px",
-                min_width=f"{_CASE_STEP_WIDTH_PX}px",
-                max_width=f"{_CASE_STEP_WIDTH_PX}px",
-                flex=f"0 0 {_CASE_STEP_WIDTH_PX}px",
-                margin="0",
-            )
-        self.case_row = widgets.HBox(
-            (self.case, self.previous_case, self.next_case),
-            layout=widgets.Layout(
-                align_items="center",
-                flex_flow="row nowrap",
-                grid_gap="0",
-                width=_CASE_ROW_WIDTH,
-                min_width=_CASE_ROW_WIDTH,
-                max_width=_CASE_ROW_WIDTH,
-                flex=f"0 0 {_CASE_ROW_WIDTH}",
-            ),
+        self.case_row = ui.components.ui_compact_case_row(
+            self.case,
+            self.previous_case,
+            self.next_case,
         )
         self.status = widgets.HTML(
             layout=widgets.Layout(display="none"),

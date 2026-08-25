@@ -9,6 +9,7 @@ Provides:
 - samples_outliers: sample, outlier, and extreme-case plots
 - sensitivity_capacity: capacity and metadata-sensitivity plots
 - spectral_fidelity: prediction-spectrum fidelity plots
+- transient: sequence, process, matched-compute, and timing plots
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from . import evaluation_plot_samples_outliers as samples_outliers
     from . import evaluation_plot_sensitivity_capacity as sensitivity_capacity
     from . import evaluation_plot_spectral_fidelity as spectral_fidelity
+    from . import evaluation_plot_transient as transient
 
 _MODULES = {
     "error_behavior": "evaluation_plot_error_behavior",
@@ -33,6 +35,7 @@ _MODULES = {
     "samples_outliers": "evaluation_plot_samples_outliers",
     "sensitivity_capacity": "evaluation_plot_sensitivity_capacity",
     "spectral_fidelity": "evaluation_plot_spectral_fidelity",
+    "transient": "evaluation_plot_transient",
 }
 __all__ = [
     "error_behavior",
@@ -42,6 +45,7 @@ __all__ = [
     "samples_outliers",
     "sensitivity_capacity",
     "spectral_fidelity",
+    "transient",
 ]
 
 

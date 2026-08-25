@@ -19,7 +19,7 @@ from src.generation import generation_workflow as workflow
 from src.generation.publication import generation_publication_completion_composite as composite
 
 if TYPE_CHECKING:
-    from src.generation.cases.generation_cases_config import GenerationConfig
+    from src.generation.cases.generation_cases_config import CampaignConfig, GenerationConfig
     from src.generation.runtime.generation_runtime_batch import TerminalBatchEvidence, TerminalCaseEvidence
 
 
@@ -431,6 +431,141 @@ def test_composite_parent_routine_admission_uses_receipt_commit(
         "validation_depth": "routine",
         "git_commit": source_commit,
     }
+
+
+def test_composite_candidates_preserve_actual_source_batch_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_commit = "d" * 40
+    replacement_commit = "e" * 40
+    template_sha256 = "a" * 64
+    target_limit = 0.05
+    scientific = {
+        "material_config_digest": "b" * 64,
+        "natural_support_state": "natural",
+        "operation_config_digest": "c" * 64,
+        "scientific_fixed_values": {"f_wet_dm_max": target_limit},
+        "steady_flow_conditioning": {"exhaustive": True},
+    }
+    batch = SimpleNamespace(
+        batch_id="parent-batch",
+        batch_name="transient_drying__lentil__natural",
+        batch_identity="f" * 64,
+        scientific_values=scientific,
+        material_family="lentil",
+        material_role="seen",
+        evaluation_regime="id",
+        sampling_regime="natural",
+    )
+
+    def admitted_case(case_id: str) -> SimpleNamespace:
+        payload = {
+            "material_family": "lentil",
+            "material_role": "seen",
+            "evaluation_regime": "id",
+            "sampling_regime": "natural",
+            "template": {
+                "relative_path": "simulation/transient_drying/transient_drying_template.mph",
+                "sha256": template_sha256,
+            },
+        }
+        return SimpleNamespace(
+            case_id=case_id,
+            case_input_id=f"input-{case_id}",
+            simulation_case_id=f"simulation-{case_id}",
+            material_family="lentil",
+            hdf5_path=tmp_path / "01_generation" / "processed" / case_id / "case.h5",
+            case_hdf5_sha256="1" * 64,
+            hdf5_identity=SimpleNamespace(
+                simulation_profile="transient_drying",
+                template_sha256=template_sha256,
+                export_contract_sha256="2" * 64,
+                available_learning_views=("steady_flow", "transient_drying"),
+                airflow_source="comsol_reference",
+                retention_policy="canonical",
+                scientific_config_digest="3" * 64,
+            ),
+            metadata_payload=lambda: dict(payload),
+            record_payload=lambda: {
+                "case_input_id": f"input-{case_id}",
+                "simulation_case_id": f"simulation-{case_id}",
+            },
+        )
+
+    parent_case = admitted_case("case_0001")
+    replacement_case = admitted_case("case_0002")
+    replacement_terminal = SimpleNamespace(
+        batch_id="replacement-batch",
+        git_commit=replacement_commit,
+        cases=(replacement_case,),
+    )
+    members = [
+        {
+            "batch_id": batch.batch_id,
+            "case_id": parent_case.case_id,
+            "source_kind": "parent_partial",
+            "source_run_id": "parent-run",
+            "source_git_commit": parent_commit,
+            "source_campaign_manifest_sha256": "4" * 64,
+        },
+        {
+            "batch_id": batch.batch_id,
+            "case_id": replacement_case.case_id,
+            "source_kind": "replacement",
+            "source_run_id": "replacement-run",
+            "source_git_commit": replacement_commit,
+            "source_campaign_manifest_sha256": "5" * 64,
+        },
+    ]
+    receipt = {
+        "completion_id": "completion__test",
+        "targets": {batch.batch_id: 2},
+        "source_membership": members,
+    }
+    admitted = {
+        parent_case.case_id: package_planning._CompositeMemberEvidence(
+            case=parent_case,
+            terminal_evidence=None,
+        ),
+        replacement_case.case_id: package_planning._CompositeMemberEvidence(
+            case=replacement_case,
+            terminal_evidence=replacement_terminal,
+        ),
+    }
+    monkeypatch.setattr(package_planning, "_source_batches", lambda *_args, **_kwargs: (batch,))
+    monkeypatch.setattr(
+        package_planning.generation.publication.completion_composite,
+        "load_composite_receipt",
+        lambda *_args, **_kwargs: receipt,
+    )
+    monkeypatch.setattr(
+        package_planning,
+        "_composite_member_evidence",
+        lambda member, *_args, **_kwargs: admitted[member["case_id"]],
+    )
+
+    batch_records, candidates = package_planning._load_composite_candidates(
+        cast("CampaignConfig", SimpleNamespace()),
+        {"evaluation_regime": "id"},
+        storage_root=tmp_path,
+        composite_receipt=receipt,
+    )
+
+    assert batch_records[0]["git_commits"] == [parent_commit, replacement_commit]
+    assert [candidate["batch_id"] for candidate in candidates] == [batch.batch_id, batch.batch_id]
+    parent_source = candidates[0]["terminal_evidence"]
+    assert isinstance(parent_source, package_planning._CompositeBatchEvidence)
+    assert (parent_source.batch_id, parent_source.git_commit, parent_source.cases) == (
+        batch.batch_id,
+        parent_commit,
+        (parent_case,),
+    )
+    assert parent_source.scientific_config_payload() == scientific
+    copied_science = parent_source.scientific_config_payload()
+    copied_science["scientific_fixed_values"]["f_wet_dm_max"] = 0.1
+    assert parent_source.scientific_config_payload()["scientific_fixed_values"]["f_wet_dm_max"] == target_limit
+    assert candidates[1]["terminal_evidence"] is replacement_terminal
 
 
 def test_shared_id_membership_uses_nested_material_counts() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from matplotlib.container import BarContainer
 
 from src.analysis.presentation import histograms
 
@@ -84,7 +85,7 @@ def test_near_constant_unequal_values_use_the_normal_histogram_path() -> None:
         artists = histograms.plot_histogram(axis, values, bins=4)
         assert artists.constant_line is None
         assert artists.constant_value is None
-        assert artists.bars is not None
+        assert isinstance(artists.bars, BarContainer)
         assert len(artists.bars.patches) == 4
     finally:
         plt.close(figure)

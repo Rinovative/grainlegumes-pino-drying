@@ -58,6 +58,7 @@ _FIELD_DISPLAY: Final = {
     "phi": FieldDisplayMetadata("φ", r"$\varphi$", "Relative humidity"),
     "w_surf": FieldDisplayMetadata("w_surf", r"$w_{\mathrm{surf}}$", "Surface moisture"),
     "w_int": FieldDisplayMetadata("w_int", r"$w_{\mathrm{int}}$", "Internal moisture"),
+    "w_gr": FieldDisplayMetadata("w_gr", r"$w_{\mathrm{gr}}$", "Grain moisture"),
     "T_in_bc": FieldDisplayMetadata("T_in,bc", r"$T_{\mathrm{in,bc}}$", "Inlet temperature"),
     "omega_in_bc": FieldDisplayMetadata("ω_in,bc", r"$\omega_{\mathrm{in,bc}}$", "Inlet humidity ratio"),
     "T_amb": FieldDisplayMetadata("T_amb", r"$T_{\mathrm{amb}}$", "Ambient temperature"),
@@ -76,6 +77,12 @@ def field_display_metadata(field: str) -> FieldDisplayMetadata:
         field,
         FieldDisplayMetadata(None, None, field.replace("_", " ")),
     )
+
+
+def has_declared_field_metadata(field: str) -> bool:
+    """Return whether a field has an explicit shared presentation declaration."""
+    field_display_metadata(field)
+    return field in _FIELD_DISPLAY
 
 
 TemperatureQuantityKind = Literal["absolute", "difference"]

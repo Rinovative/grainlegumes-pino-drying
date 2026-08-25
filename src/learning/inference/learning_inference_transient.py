@@ -24,9 +24,9 @@ This module does NOT:
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from torch import nn
@@ -46,8 +46,9 @@ _AIRFLOW_SOURCES = {_COMSOL_REFERENCE_AIRFLOW_SOURCE, "external"}
 _MODEL_KINDS = {"fno", "uno", "rno"}
 _PRECISION = "float32"
 _TIME_ATOL = 1.0e-6
+_PREPARED_REQUEST_TOKEN = object()
 
-# ruff: noqa: EM101, EM102, PLR2004, TRY003
+# ruff: noqa: EM101, EM102, PLR2004, SLF001, TRY003
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,32 @@ class TransientInferenceContext:
     device: torch.device
     model_kind: Literal["fno", "uno", "rno"]
     precision: Literal["float32"]
+
+
+@dataclass(frozen=True, slots=True)
+class TransientPreparedRequest:
+    """Hold one strictly admitted transient request on its inference device."""
+
+    context: TransientInferenceContext
+    state: torch.Tensor
+    static: torch.Tensor
+    boundary: torch.Tensor
+    scalars: torch.Tensor
+    t_n: torch.Tensor
+    t_next: torch.Tensor
+    dt: torch.Tensor
+    _versions: tuple[int, ...] = field(repr=False)
+    _owner_token: object = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Reject construction outside the strict preparation owner."""
+        if self._owner_token is not _PREPARED_REQUEST_TOKEN:
+            raise TypeError("Prepared transient requests must come from strict admission.")
+
+    @property
+    def length(self) -> int:
+        """Return the exact request transition count."""
+        return int(self.boundary.shape[1])
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,69 +345,22 @@ def _owned_runtime_inputs(
     external_airflow: torch.Tensor | None,
     airflow_source: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Copy validated request data to the context device and apply airflow policy."""
-    owned = tuple(value.to(device=context.device, dtype=torch.float32).clone() for value in (state, static, boundary, scalars, t_n, t_next, dt))
-    runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, runtime_t_next, runtime_dt = owned
+    """Place validated request data on the context device and apply airflow policy."""
+    runtime_values = tuple(value.to(device=context.device, dtype=torch.float32) for value in (state, static, boundary, scalars, t_n, t_next, dt))
+    runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, runtime_t_next, runtime_dt = runtime_values
     if airflow_source == "external":
         if external_airflow is None:
             raise RuntimeError("Validated external airflow unexpectedly missing.")
-        runtime_airflow = external_airflow.to(device=context.device, dtype=torch.float32).clone()
+        runtime_airflow = external_airflow.to(
+            device=context.device,
+            dtype=torch.float32,
+        )
+        runtime_static = runtime_static.clone()
         runtime_static[:, 2:5] = runtime_airflow
     return runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, runtime_t_next, runtime_dt
 
 
-def _timed_predict(
-    context: TransientInferenceContext,
-    step_input: torch.Tensor,
-    *,
-    hidden: object | None,
-) -> tuple[torch.Tensor, object | None, float]:
-    """Time only the model invocation supplied to the transient rollout owner."""
-    seconds = 0.0
-
-    def measure(invoke: Callable[[], object]) -> object:
-        """Measure exactly one dispatched model call and no input/output validation."""
-        nonlocal seconds
-        if context.device.type == "cuda":
-            torch.cuda.synchronize(context.device)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record(torch.cuda.current_stream(context.device))
-            result = invoke()
-            end.record(torch.cuda.current_stream(context.device))
-            torch.cuda.synchronize(context.device)
-            seconds = float(start.elapsed_time(end)) / 1000.0
-            return result
-        started = perf_counter()
-        result = invoke()
-        seconds = perf_counter() - started
-        return result
-
-    with torch.no_grad():
-        prediction, next_hidden = rollout.predict_step(
-            context.model,
-            step_input,
-            model_kind=context.model_kind,
-            hidden=hidden,
-            model_call=measure,
-        )
-    if seconds < 0.0:
-        raise RuntimeError("Transient inference measured negative model time.")
-    return prediction, next_hidden, seconds
-
-
-def _timing(*, seconds: float, context: TransientInferenceContext, mode: Literal["one_step", "autonomous_rollout"], calls: int) -> TransientTiming:
-    """Build factual timing metadata without derived performance claims."""
-    return TransientTiming(
-        model_seconds=seconds,
-        device=str(context.device),
-        precision=context.precision,
-        mode=mode,
-        model_calls=calls,
-    )
-
-
-def predict_transient_step(
+def prepare_transient_request(
     context: TransientInferenceContext,
     *,
     state: torch.Tensor,
@@ -392,8 +372,8 @@ def predict_transient_step(
     dt: torch.Tensor,
     airflow_source: str | None = None,
     external_airflow: torch.Tensor | None = None,
-) -> TransientStepResult:
-    """Predict the first physical next state from one validated transient request window."""
+) -> TransientPreparedRequest:
+    """Strictly validate one request once and place its tensors for reuse."""
     if not isinstance(context, TransientInferenceContext):
         raise TypeError("context must be one TransientInferenceContext.")
     resolved_airflow_source = _resolve_airflow_source(airflow_source)
@@ -422,13 +402,288 @@ def predict_transient_step(
         external_airflow=external_airflow,
         airflow_source=resolved_airflow_source,
     )
-    runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, _, _ = values
-    step_input = context.tensorizer.assemble_step(runtime_state, runtime_static, runtime_boundary[:, 0], runtime_scalars, runtime_t_n[:, 0])
+    owned = tuple(value.clone() for value in values)
+    runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, runtime_t_next, runtime_dt = owned
+    return TransientPreparedRequest(
+        context=context,
+        state=runtime_state,
+        static=runtime_static,
+        boundary=runtime_boundary,
+        scalars=runtime_scalars,
+        t_n=runtime_t_n,
+        t_next=runtime_t_next,
+        dt=runtime_dt,
+        _versions=tuple(value._version for value in owned),
+        _owner_token=_PREPARED_REQUEST_TOKEN,
+    )
+
+
+def _prepared_tensors(
+    request: TransientPreparedRequest,
+) -> tuple[torch.Tensor, ...]:
+    """Return prepared tensors in their immutable-evidence order."""
+    return (
+        request.state,
+        request.static,
+        request.boundary,
+        request.scalars,
+        request.t_n,
+        request.t_next,
+        request.dt,
+    )
+
+
+def _require_prepared_request(
+    context: TransientInferenceContext,
+    request: TransientPreparedRequest,
+) -> None:
+    """Require one request created for the exact active inference context."""
+    if not isinstance(request, TransientPreparedRequest) or request.context is not context:
+        raise TypeError("Prepared transient request must belong to the exact inference context.")
+    tensors = _prepared_tensors(request)
+    if any(value.device != context.device or value.dtype != torch.float32 for value in tensors):
+        raise RuntimeError("Prepared transient request placement drifted from its inference context.")
+    if tuple(value._version for value in tensors) != request._versions:
+        raise RuntimeError("Prepared transient request tensors were mutated after strict admission.")
+
+
+def window_transient_prepared_request(
+    request: TransientPreparedRequest,
+    *,
+    origin: int,
+    length: int,
+    state: torch.Tensor | None = None,
+) -> TransientPreparedRequest:
+    """Return one zero-copy case-local window from already-admitted runtime inputs."""
+    if not isinstance(request, TransientPreparedRequest):
+        raise TypeError("request must be one TransientPreparedRequest.")
+    _require_prepared_request(request.context, request)
+    if (
+        isinstance(origin, bool)
+        or not isinstance(origin, int)
+        or isinstance(length, bool)
+        or not isinstance(length, int)
+        or origin < 0
+        or length < 1
+        or origin + length > request.length
+    ):
+        raise ValueError("Prepared transient window must lie inside the admitted request.")
+    selected_state = request.state if state is None else state
+    if origin and state is None:
+        raise ValueError("A nonzero prepared transient origin requires its exact current state.")
+    if (
+        not isinstance(selected_state, torch.Tensor)
+        or selected_state.shape != request.state.shape
+        or selected_state.device != request.context.device
+        or selected_state.dtype != torch.float32
+    ):
+        raise ValueError("Prepared transient window state contradicts runtime shape or placement.")
+    stop = origin + length
+    tensors = (
+        selected_state,
+        request.static,
+        request.boundary[:, origin:stop],
+        request.scalars,
+        request.t_n[:, origin:stop],
+        request.t_next[:, origin:stop],
+        request.dt[:, origin:stop],
+    )
+    return TransientPreparedRequest(
+        context=request.context,
+        state=tensors[0],
+        static=tensors[1],
+        boundary=tensors[2],
+        scalars=tensors[3],
+        t_n=tensors[4],
+        t_next=tensors[5],
+        dt=tensors[6],
+        _versions=tuple(value._version for value in tensors),
+        _owner_token=_PREPARED_REQUEST_TOKEN,
+    )
+
+
+class _ModelCallTimer:
+    """Measure only dispatched model calls and synchronize CUDA once per request."""
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._cpu_seconds = 0.0
+        self._cuda_events: list[tuple[Any, Any]] = []
+
+    def measure(self, invoke: Callable[[], object]) -> object:
+        """Measure one model dispatch without input assembly or state reconstruction."""
+        if self._device.type == "cuda":
+            stream = torch.cuda.current_stream(self._device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(stream)
+            result = invoke()
+            end.record(stream)
+            self._cuda_events.append((start, end))
+            return result
+        started = perf_counter()
+        result = invoke()
+        self._cpu_seconds += perf_counter() - started
+        return result
+
+    def finish(self) -> float:
+        """Return aggregate model-only seconds after one bounded completion wait."""
+        if self._device.type == "cuda":
+            if not self._cuda_events:
+                return 0.0
+            self._cuda_events[-1][1].synchronize()
+            seconds = sum(float(start.elapsed_time(end)) for start, end in self._cuda_events) / 1000.0
+        else:
+            seconds = self._cpu_seconds
+        if seconds < 0.0:
+            raise RuntimeError("Transient inference measured negative model time.")
+        return seconds
+
+
+def _timed_predict(
+    context: TransientInferenceContext,
+    step_input: torch.Tensor,
+    *,
+    hidden: object | None,
+) -> tuple[torch.Tensor, object | None, float]:
+    """Time only the model invocation supplied to the transient rollout owner."""
+    timer = _ModelCallTimer(context.device)
+    with torch.no_grad():
+        prediction, next_hidden = rollout.predict_step(
+            context.model,
+            step_input,
+            model_kind=context.model_kind,
+            hidden=hidden,
+            model_call=timer.measure,
+        )
+    return prediction, next_hidden, timer.finish()
+
+
+def _timing(*, seconds: float, context: TransientInferenceContext, mode: Literal["one_step", "autonomous_rollout"], calls: int) -> TransientTiming:
+    """Build factual timing metadata without derived performance claims."""
+    return TransientTiming(
+        model_seconds=seconds,
+        device=str(context.device),
+        precision=context.precision,
+        mode=mode,
+        model_calls=calls,
+    )
+
+
+def predict_prepared_transient_step(
+    context: TransientInferenceContext,
+    request: TransientPreparedRequest,
+) -> TransientStepResult:
+    """Predict one step from already-admitted runtime tensors."""
+    _require_prepared_request(context, request)
+    step_input = context.tensorizer.assemble_step(
+        request.state,
+        request.static,
+        request.boundary[:, 0],
+        request.scalars,
+        request.t_n[:, 0],
+    )
     scaled_delta, _, seconds = _timed_predict(context, step_input, hidden=None)
-    scaled_delta = scaled_delta.to(device=context.scaling.device, dtype=torch.float32)
-    next_state = context.tensorizer.reconstruct_next_state(runtime_state, scaled_delta)
-    timing = _timing(seconds=seconds, context=context, mode="one_step", calls=1)
-    return TransientStepResult(next_state=next_state, scaled_delta=scaled_delta, timing=timing)
+    scaled_delta = scaled_delta.to(
+        device=context.scaling.device,
+        dtype=torch.float32,
+    )
+    next_state = context.tensorizer.reconstruct_next_state(
+        request.state,
+        scaled_delta,
+    )
+    timing = _timing(
+        seconds=seconds,
+        context=context,
+        mode="one_step",
+        calls=1,
+    )
+    return TransientStepResult(
+        next_state=next_state,
+        scaled_delta=scaled_delta,
+        timing=timing,
+    )
+
+
+def predict_transient_step(
+    context: TransientInferenceContext,
+    *,
+    state: torch.Tensor,
+    static: torch.Tensor,
+    boundary: torch.Tensor,
+    scalars: torch.Tensor,
+    t_n: torch.Tensor,
+    t_next: torch.Tensor,
+    dt: torch.Tensor,
+    airflow_source: str | None = None,
+    external_airflow: torch.Tensor | None = None,
+) -> TransientStepResult:
+    """Strictly prepare a physical request and predict its first next state."""
+    request = prepare_transient_request(
+        context,
+        state=state,
+        static=static,
+        boundary=boundary,
+        scalars=scalars,
+        t_n=t_n,
+        t_next=t_next,
+        dt=dt,
+        airflow_source=airflow_source,
+        external_airflow=external_airflow,
+    )
+    return predict_prepared_transient_step(context, request)
+
+
+def rollout_prepared_transient_autonomous(
+    context: TransientInferenceContext,
+    request: TransientPreparedRequest,
+) -> TransientRolloutResult:
+    """Autonomously reconstruct one already-admitted runtime request window."""
+    _require_prepared_request(context, request)
+    current = request.state
+    batch_size, channels, height, width = current.shape
+    output_shape = (batch_size, request.length, channels, height, width)
+    states = current.new_empty(output_shape)
+    deltas = current.new_empty(output_shape)
+    hidden: object | None = None
+    timer = _ModelCallTimer(context.device)
+    with torch.inference_mode():
+        for index in range(request.length):
+            step_input = context.tensorizer.assemble_step(
+                current,
+                request.static,
+                request.boundary[:, index],
+                request.scalars,
+                request.t_n[:, index],
+            )
+            scaled_delta, hidden = rollout.predict_step(
+                context.model,
+                step_input,
+                model_kind=context.model_kind,
+                hidden=hidden,
+                model_call=timer.measure,
+            )
+            scaled_delta = scaled_delta.to(
+                device=context.scaling.device,
+                dtype=torch.float32,
+            )
+            current = context.tensorizer.reconstruct_next_state(
+                current,
+                scaled_delta,
+            )
+            deltas[:, index].copy_(scaled_delta)
+            states[:, index].copy_(current)
+    seconds = timer.finish()
+    return TransientRolloutResult(
+        states=states,
+        scaled_deltas=deltas,
+        timing=_timing(
+            seconds=seconds,
+            context=context,
+            mode="autonomous_rollout",
+            calls=request.length,
+        ),
+    )
 
 
 def rollout_transient_autonomous(
@@ -444,11 +699,9 @@ def rollout_transient_autonomous(
     airflow_source: str | None = None,
     external_airflow: torch.Tensor | None = None,
 ) -> TransientRolloutResult:
-    """Autonomously reconstruct every next state in one validated request window."""
-    if not isinstance(context, TransientInferenceContext):
-        raise TypeError("context must be one TransientInferenceContext.")
-    resolved_airflow_source = _resolve_airflow_source(airflow_source)
-    _, length, _, _ = _validate_request(
+    """Strictly prepare a physical request and autonomously reconstruct it."""
+    request = prepare_transient_request(
+        context,
         state=state,
         static=static,
         boundary=boundary,
@@ -456,38 +709,7 @@ def rollout_transient_autonomous(
         t_n=t_n,
         t_next=t_next,
         dt=dt,
+        airflow_source=airflow_source,
         external_airflow=external_airflow,
-        airflow_source=resolved_airflow_source,
-        spatial_shape=context.scaling.spatial_shape,
-        horizon=context.scaling.horizon,
     )
-    values = _owned_runtime_inputs(
-        context=context,
-        state=state,
-        static=static,
-        boundary=boundary,
-        scalars=scalars,
-        t_n=t_n,
-        t_next=t_next,
-        dt=dt,
-        external_airflow=external_airflow,
-        airflow_source=resolved_airflow_source,
-    )
-    current, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, _, _ = values
-    hidden: object | None = None
-    deltas: list[torch.Tensor] = []
-    states: list[torch.Tensor] = []
-    seconds = 0.0
-    for index in range(length):
-        step_input = context.tensorizer.assemble_step(current, runtime_static, runtime_boundary[:, index], runtime_scalars, runtime_t_n[:, index])
-        scaled_delta, hidden, elapsed = _timed_predict(context, step_input, hidden=hidden)
-        scaled_delta = scaled_delta.to(device=context.scaling.device, dtype=torch.float32)
-        current = context.tensorizer.reconstruct_next_state(current, scaled_delta)
-        deltas.append(scaled_delta)
-        states.append(current)
-        seconds += elapsed
-    return TransientRolloutResult(
-        states=torch.stack(states, dim=1),
-        scaled_deltas=torch.stack(deltas, dim=1),
-        timing=_timing(seconds=seconds, context=context, mode="autonomous_rollout", calls=length),
-    )
+    return rollout_prepared_transient_autonomous(context, request)

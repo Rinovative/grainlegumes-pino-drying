@@ -35,6 +35,7 @@ from src import common, domain, generation
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
+from src.generation import generation_campaign_completion as campaign_completion
 
 from . import dataset_packages_generated_batch as generated
 from . import dataset_packages_manifest as package_manifest
@@ -219,6 +220,91 @@ def _package_provenance(
         "builder_identity": identity.dataset_conversion_contract_identity(view.id),
         "schema_identity": _schema_identity(view.id),
     }
+
+
+def admit_package_composite_sources(
+    dataset_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> planning.PreparedPackage | None:
+    """Re-admit one published package through its immutable completion composite."""
+    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+    manifest = package_manifest.load_package_manifest(dataset_id, storage_root=storage)
+    source_identities = manifest.get("source_case_identities")
+    if not isinstance(source_identities, list) or not source_identities:
+        message = f"Dataset package {dataset_id!r} has no source-case identities."
+        raise ValueError(message)
+    if not all(isinstance(source, dict) for source in source_identities):
+        message = f"Dataset package {dataset_id!r} has malformed source-case identities."
+        raise TypeError(message)
+    receipt_values = [source.get("completion_receipt_sha256") for source in source_identities]
+    if all(value is None for value in receipt_values):
+        return None
+    if not all(isinstance(value, str) and value for value in receipt_values) or len(set(receipt_values)) != 1:
+        message = f"Dataset package {dataset_id!r} does not bind one completion receipt."
+        raise ValueError(message)
+    parent_run_ids = {str(source["source_run_id"]) for source in source_identities if source.get("composite_source_kind") == "parent_partial"}
+    if len(parent_run_ids) != 1:
+        message = f"Dataset package {dataset_id!r} does not identify one composite parent run."
+        raise ValueError(message)
+    parent_run_id = next(iter(parent_run_ids))
+    partial_path = (
+        generation.publication.campaign_evidence.campaign_run_directory(
+            parent_run_id,
+            storage_root=storage,
+        )
+        / "campaign_partial.json"
+    )
+    parent_partial_sha256 = common.serialization.file_sha256(partial_path)
+    completion_id = campaign_completion.completion_id(
+        parent_run_id=parent_run_id,
+        parent_partial_sha256=parent_partial_sha256,
+    )
+    receipt = generation.publication.completion_composite.load_composite_receipt(
+        completion_id,
+        storage_root=storage,
+    )
+    receipt_sha256 = common.serialization.canonical_json_sha256(receipt)
+    if receipt_sha256 != receipt_values[0]:
+        message = f"Dataset package {dataset_id!r} conflicts with its completion receipt."
+        raise RuntimeError(message)
+    generation.workflow.validate_composite_completion_lifecycle(
+        parent_run_id,
+        completion_id,
+        storage_root=storage,
+    )
+    campaign = generation.publication.campaign_evidence.campaign_for_run(
+        parent_run_id,
+        storage_root=storage,
+    )
+    dataset_view = str(manifest["dataset_view"])
+    evaluation_regime = str(manifest["evaluation_regime"])
+    requested_plan = planning.package_plan(campaign, dataset_view, evaluation_regime)
+    selected_plans = [requested_plan]
+    if evaluation_regime != "id":
+        selected_plans.insert(0, planning.package_plan(campaign, dataset_view, "id"))
+    prepared = planning.prepare_campaign_packages(
+        campaign,
+        storage_root=storage,
+        selected_plans=selected_plans,
+        composite_receipt=receipt,
+    )
+    matches = [
+        package for package in prepared if package.plan["dataset_view"] == dataset_view and package.plan["evaluation_regime"] == evaluation_regime
+    ]
+    if len(matches) != 1:
+        message = f"Composite package admission is ambiguous for {dataset_view!r}/{evaluation_regime!r}."
+        raise RuntimeError(message)
+    admitted = matches[0]
+    provenance = _package_provenance(campaign, admitted)
+    if provenance["source_case_identities"] != source_identities:
+        message = f"Dataset package {dataset_id!r} conflicts with re-admitted composite source evidence."
+        raise RuntimeError(message)
+    admitted_id, admitted_digest = identity.package_identity_from_provenance(provenance)
+    if admitted_id != dataset_id or admitted_digest != manifest.get("dataset_digest"):
+        message = f"Dataset package {dataset_id!r} is not reproduced by its admitted composite evidence."
+        raise RuntimeError(message)
+    return admitted
 
 
 def storage_schema_version() -> int:

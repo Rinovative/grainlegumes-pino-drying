@@ -21,9 +21,10 @@ provides reference solutions, and validated outputs are published as immutable
 Dataset packages. The established steady workflow trains and evaluates FNO,
 U-NO, PI-FNO, and PI-U-NO models. The transient workflow now trains FNO, U-NO,
 and official RNO models through an automatic teacher-forced Stage A followed by
-autonomous Stage B. Completed-output transient EDA is available through the
-maintained generated-output notebook; transient Evaluation remains future work.
-See the [transient training guide](docs/transient_training.md).
+autonomous Stage B. Completed-output transient EDA and sequence-aware
+Evaluation are available through the maintained notebooks and shared artifact
+workflow. See the [Evaluation guide](docs/evaluation.md) and
+[transient training guide](docs/transient_training.md).
 
 Generation, Dataset publication, preprocessing, training, resume, and evaluation
 are identity-bound and fail closed. Current values, campaign inventories, seeds,
@@ -127,6 +128,7 @@ python -m src.experiments.cli.cli_config_preflight train <experiment_config>
 python -m src.experiments.cli.cli_train <experiment_config>
 python -m src.experiments.cli.cli_optuna <optuna_config>
 python -m src.experiments.cli.cli_build_artifacts --task steady_flow
+python -m src.experiments.cli.cli_build_artifacts --task transient_drying
 ```
 
 For transient drying, one normal architecture config automatically persists its
@@ -135,8 +137,13 @@ CLI prints both run directories. `notebooks/eda.ipynb` exposes admitted
 `steady_flow` and `transient_drying` datasets in one capability-adaptive panel
 with no task selector. Discovery preserves strict terminal batches while admitting
 independently valid completed cases from partial or failed campaigns.
-Transient Evaluation and its post-training artifacts are not yet implemented;
-details and resume rules are in the
+Completed transient runs use the same
+task-aware post-training artifact service. `notebooks/eval_single_model.ipynb` and
+`notebooks/eval_comparison_models.ipynb` automatically discover persisted runs,
+load only validated Evaluation artifacts, preserve absent OOD roles as absent,
+and render transient-specific panels and local reports. Artifact commands,
+controls, and loading behavior are in the [Evaluation guide](docs/evaluation.md);
+comparison semantics and resume rules are in the
 [transient training guide](docs/transient_training.md).
 
 From the host, `scripts/docker_job.sh` supplies the corresponding GPU-queue

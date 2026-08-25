@@ -77,6 +77,31 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deliberately regenerate and atomically replace existing selected artifact targets; not required for initial generation.",
     )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--one-case",
+        action="store_true",
+        help="Generate the first saved case only for a disposable transient UI/debug artifact.",
+    )
+    scope.add_argument(
+        "--case-id",
+        dest="case_ids",
+        action="append",
+        default=None,
+        help="Exact saved transient case ID for a disposable scoped artifact. May be repeated.",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("id", "ood"),
+        default=None,
+        help="Selected transient role for bounded generation; requires --one-case or --case-id.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="New noncanonical output directory required for bounded generation.",
+    )
     return parser
 
 
@@ -123,6 +148,28 @@ def main(argv: list[str] | None = None) -> int:
             selected_roots = [runs_root]
         else:
             parser.error("artifact selection unexpectedly lacks a run root")
+        bounded = bool(args.one_case or args.case_ids)
+        if bounded:
+            if args.run_dirs is None or len(args.run_dirs) != 1:
+                parser.error("bounded generation requires exactly one --run-dir")
+            if args.output_root is None:
+                parser.error("bounded generation requires --output-root")
+            if args.rebuild:
+                parser.error("bounded generation never replaces an existing output; omit --rebuild")
+            scoped = analysis.artifacts.service.build_scoped_transient_artifact(
+                run_dir=args.run_dirs[0],
+                dataset_root=dataset_root,
+                output_root=args.output_root,
+                split="id" if args.split is None else args.split,
+                case_ids=args.case_ids,
+                one_case=args.one_case,
+                device_policy=args.device,
+            )
+            print(f"[DONE] Validated scoped transient artifact for {len(scoped.case_ids)} case(s): {scoped.root}")
+            return 0
+        if args.split is not None or args.output_root is not None:
+            parser.error("--split and --output-root require --one-case or --case-id")
+
         result_count = 0
         for selected_root in selected_roots:
             results = analysis.artifacts.service.build_artifacts(

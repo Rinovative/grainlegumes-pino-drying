@@ -275,10 +275,68 @@ def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
         state_updater=update,
     )
     session.log_epoch(1, {"train/loss_total": 2.0})
+    session.log_transient_evaluation_summary(
+        {
+            "evaluation/0/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse": 0.25,
+        }
+    )
     session.finish(status="completed")
     assert not session.enabled
     assert state == {}
     assert list(tmp_path.iterdir()) == []
+
+
+def test_offline_evaluation_summary_is_bounded_flat_and_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror only finite bounded Evaluation scalars into offline run summary state."""
+    monkeypatch.delenv("WANDB_API_KEY")
+    fake = _FakeWandb()
+    _patch_wandb(monkeypatch, fake)
+    state, update = _state_recorder()
+    session = tracking.initialize_wandb(
+        _resolved_config(mode="offline"),
+        run_dir=tmp_path,
+        state_updater=update,
+    )
+    metric_prefix = "evaluation/0/id/autonomous_full/full/cumulative"
+    evidence = {
+        f"{metric_prefix}/normalized_drying_group_macro_rmse": 0.25,
+        f"{metric_prefix}/contributing_case_count": 3,
+        "evaluation/pipeline/0/c_available": 0,
+        "evaluation/identity/checkpoint_sha256": "a" * 64,
+        "evaluation/identity/input_profile": "canonical_physics_complete_v1",
+        "evaluation/identity/backend": "canonical_hdf5",
+    }
+    session.log_transient_evaluation_summary(evidence)
+    assert fake.runs[0].summary == evidence
+    assert state["evaluation_summary_keys"] == sorted(evidence)
+    assert state["evaluation_summary_entry_count"] == len(evidence)
+    with pytest.raises(tracking.TrackingError, match="finite"):
+        session.log_transient_evaluation_summary({f"{metric_prefix}/normalized_drying_group_macro_rmse": float("nan")})
+    with pytest.raises(tracking.TrackingError, match="Unsupported"):
+        session.log_transient_evaluation_summary({"unscoped": 1.0})
+    with pytest.raises(tracking.TrackingError, match="Unsupported"):
+        session.log_transient_evaluation_summary({"evaluation/raw_dataset_value": 1.0})
+    with pytest.raises(tracking.TrackingError, match="Unsupported"):
+        session.log_transient_evaluation_summary({"evaluation/identity/run_name": "arbitrary"})
+    for unauthorized_key in (
+        "evaluation/identity/scaling_semantic_digest",
+        "evaluation/identity/comparison_arm",
+        "evaluation/identity/training_strategy",
+        "evaluation/identity/matched_compute_manifest_sha256",
+    ):
+        with pytest.raises(tracking.TrackingError, match="Unsupported"):
+            session.log_transient_evaluation_summary({unauthorized_key: "a" * 64})
+    with pytest.raises(tracking.TrackingError, match="logical name"):
+        session.log_transient_evaluation_summary({"evaluation/identity/dataset/id/name": '{"raw_dataset_value":1}'})
+    with pytest.raises(tracking.TrackingError, match="finite numeric"):
+        session.log_transient_evaluation_summary({f"{metric_prefix}/normalized_drying_group_macro_rmse": [0.25]})
+    with pytest.raises(tracking.TrackingError, match="bounded mapping"):
+        session.log_transient_evaluation_summary(
+            {f"evaluation/{index}/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse": 0.25 for index in range(513)}
+        )
 
 
 def test_online_authentication_is_checked_before_sdk_import(

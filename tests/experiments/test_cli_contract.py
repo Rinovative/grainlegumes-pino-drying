@@ -125,6 +125,65 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
     assert artifact_cli_call["metadata_root"] == tmp_path / "meta"
 
 
+def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward exact split/cases/device while bypassing full canonical generation."""
+    captured: dict[str, object] = {}
+
+    def capture_scoped(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            root=kwargs["output_root"],
+            case_ids=("case-a", "case-c"),
+        )
+
+    monkeypatch.setattr(
+        analysis.artifacts.service,
+        "build_scoped_transient_artifact",
+        capture_scoped,
+    )
+    monkeypatch.setattr(
+        analysis.artifacts.service,
+        "build_artifacts",
+        lambda **_kwargs: pytest.fail("bounded CLI reached full artifact generation"),
+    )
+    run_dir = tmp_path / "run"
+    output_root = tmp_path / "scoped artifact"
+
+    assert (
+        cli_build_artifacts.main(
+            [
+                "--run-dir",
+                str(run_dir),
+                "--dataset-root",
+                str(tmp_path / "datasets"),
+                "--case-id",
+                "case-a",
+                "--case-id",
+                "case-c",
+                "--split",
+                "ood",
+                "--output-root",
+                str(output_root),
+                "--device",
+                "cuda",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "run_dir": run_dir,
+        "dataset_root": tmp_path / "datasets",
+        "output_root": output_root,
+        "split": "ood",
+        "case_ids": ["case-a", "case-c"],
+        "one_case": False,
+        "device_policy": "cuda",
+    }
+
+
 def test_direct_cli_opt_out_skips_only_post_training_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

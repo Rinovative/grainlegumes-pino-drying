@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import importlib
 import importlib.metadata
+import math
 import os
 import platform
 import re
@@ -37,6 +38,7 @@ from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -64,6 +66,94 @@ POST_ARTIFACT_MEDIA_KEYS = frozenset(
 _POST_ARTIFACT_FILE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".html", ".pdf"})
 _SECRET_KEY_PATTERN = re.compile(r"(?i)(WANDB_API_KEY|api[_-]?key|password|secret|token)(\s*[:=]\s*)([^\s,;]+)")
 _MAX_SAFE_ERROR_LENGTH = 600
+_MAX_EVALUATION_SUMMARY_ENTRIES = 512
+_MAX_EVALUATION_SUMMARY_TEXT = 512
+_TRANSIENT_EVALUATION_HORIZONS = "1|2|4|8|16|32|64|128|full"
+_TRANSIENT_EVALUATION_METRIC_KEY = re.compile(
+    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|ood)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
+)
+_TRANSIENT_EVALUATION_PIPELINE_KEY = re.compile(r"^evaluation/pipeline/(?:0|[1-9][0-9]*)/(?P<metric>[A-Za-z0-9_]+)$")
+_TRANSIENT_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|ood)/name$")
+_TRANSIENT_EVALUATION_SPEEDUP_KEY = re.compile(
+    r"^evaluation/timing/speedup/(?P<name>drying_only_solver_speedup|full_pipeline_solver_speedup|hybrid_component_speedup|comsol_process_speedup|generation_compute_end_to_end_speedup)/(?P<metric>available_count|unavailable_count|ratio_of_sums)$"
+)
+_TRANSIENT_EVALUATION_COMPONENT_KEY = re.compile(
+    r"^evaluation/timing/component/(?P<name>comsol_transient_drying_seconds|drying_no_rollout_model_seconds|dataset_materialization_seconds)/(?P<metric>available_count|median_seconds)$"
+)
+_TRANSIENT_EVALUATION_SUMMARY_METRICS = frozenset(
+    {
+        "normalized_drying_group_macro_rmse",
+        "contributing_record_count",
+        "contributing_case_count",
+        "unavailable_case_count",
+        "elapsed_physical_time_median",
+        "physical_w_gr_rmse",
+        "physical_w_gr_mae",
+        "bulk_dry_basis_rmse",
+        "bulk_wet_basis_rmse",
+        "bulk_moisture_valid_count",
+        "bulk_moisture_unavailable_count",
+        "target_available_count",
+        "predicted_right_censored_count",
+        "target_time_error_count",
+        "target_time_error_mean",
+        "target_time_error_mae",
+        "target_gap_count",
+        "predicted_final_target_gap_mean",
+        "reference_final_target_gap_mean",
+        "target_final_gap_error_mean",
+        "target_final_gap_error_mae",
+        "nonfinite_values",
+        "negative_moisture_values",
+        "abnormal_increment_growth_count",
+        *(f"normalized_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
+        *(f"physical_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
+        *(f"physical_mae_{field}" for field in ("T", "phi", "w_surf", "w_int")),
+    }
+)
+_TRANSIENT_EVALUATION_COUNT_METRICS = frozenset(
+    {
+        "contributing_record_count",
+        "contributing_case_count",
+        "unavailable_case_count",
+        "bulk_moisture_valid_count",
+        "bulk_moisture_unavailable_count",
+        "target_available_count",
+        "predicted_right_censored_count",
+        "target_time_error_count",
+        "target_gap_count",
+        "nonfinite_values",
+        "negative_moisture_values",
+        "abnormal_increment_growth_count",
+    }
+)
+_TRANSIENT_EVALUATION_PIPELINE_METRICS = frozenset(
+    {
+        "drying_surrogate_error",
+        "c_available",
+        "complete_pipeline_error",
+        "airflow_substitution_discrepancy",
+        "signed_airflow_degradation",
+        "airflow_degradation_ratio",
+        "upstream_airflow_error",
+    }
+)
+_TRANSIENT_EVALUATION_HASH_IDENTITIES = frozenset(
+    {
+        "evaluation/identity/checkpoint_sha256",
+        "evaluation/identity/timing_evidence_sha256",
+        "evaluation/identity/dataset_sha256",
+        "evaluation/timing/hardware_identity_sha256",
+    }
+)
+_TRANSIENT_EVALUATION_EXACT_TEXT_IDENTITIES = {
+    "evaluation/identity/input_profile": frozenset({"canonical_physics_complete_v1"}),
+    "evaluation/identity/model_kind": frozenset({"fno", "uno", "rno"}),
+    "evaluation/timing/precision": frozenset({"float32"}),
+}
+_TRANSIENT_EVALUATION_LOGICAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,254}$")
+_TRANSIENT_EVALUATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TRANSIENT_EVALUATION_DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)(?:\|(?:cpu|cuda(?::[0-9]+)?))*$")
 AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Overview",
     "Accuracy",
@@ -75,6 +165,138 @@ AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Diagnostics",
     "Optuna",
 )
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    """Return whether one outbound aggregate is an exact non-negative integer."""
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Return whether one outbound aggregate is a finite real non-boolean."""
+    return not isinstance(value, bool) and isinstance(value, Real) and math.isfinite(float(value))
+
+
+def _validate_transient_metric_entry(key: str, value: Any) -> bool:
+    """Validate one mode/horizon or pipeline aggregate key when recognized."""
+    metric_match = _TRANSIENT_EVALUATION_METRIC_KEY.fullmatch(key)
+    if metric_match is not None:
+        metric = metric_match.group("metric")
+        if metric not in _TRANSIENT_EVALUATION_SUMMARY_METRICS:
+            return False
+        if metric in _TRANSIENT_EVALUATION_COUNT_METRICS:
+            if not _is_nonnegative_int(value):
+                msg = f"Transient Evaluation count {key!r} must be a non-negative integer."
+                raise TrackingError(msg)
+        elif not _is_finite_number(value):
+            msg = f"Transient Evaluation aggregate {key!r} must be finite numeric evidence."
+            raise TrackingError(msg)
+        return True
+
+    pipeline_match = _TRANSIENT_EVALUATION_PIPELINE_KEY.fullmatch(key)
+    if pipeline_match is None:
+        return False
+    metric = pipeline_match.group("metric")
+    if metric not in _TRANSIENT_EVALUATION_PIPELINE_METRICS:
+        return False
+    if metric == "c_available":
+        if not _is_nonnegative_int(value) or int(value) not in {0, 1}:
+            msg = "Transient Evaluation pipeline availability must be exactly 0 or 1."
+            raise TrackingError(msg)
+    elif not _is_finite_number(value):
+        msg = f"Transient Evaluation pipeline aggregate {key!r} must be finite numeric evidence."
+        raise TrackingError(msg)
+    return True
+
+
+def _validate_transient_identity_entry(key: str, value: Any) -> bool:
+    """Validate one exact approved Dataset, model, or Training identity key."""
+    if key in _TRANSIENT_EVALUATION_HASH_IDENTITIES:
+        if not isinstance(value, str) or _TRANSIENT_EVALUATION_SHA256.fullmatch(value) is None:
+            msg = f"Transient Evaluation identity {key!r} must be one SHA-256 digest."
+            raise TrackingError(msg)
+        return True
+    allowed = _TRANSIENT_EVALUATION_EXACT_TEXT_IDENTITIES.get(key)
+    if allowed is not None:
+        if value not in allowed:
+            msg = f"Transient Evaluation identity {key!r} is unsupported."
+            raise TrackingError(msg)
+        return True
+    if key == "evaluation/identity/checkpoint_epoch":
+        if not _is_nonnegative_int(value):
+            msg = "Transient Evaluation checkpoint epoch must be a non-negative integer."
+            raise TrackingError(msg)
+        return True
+    if key == "evaluation/identity/backend":
+        if not isinstance(value, str):
+            msg = "Transient Evaluation backend identity must be bounded text."
+            raise TrackingError(msg)
+        backends = value.split("|")
+        if not backends or len(backends) != len(set(backends)) or not set(backends).issubset({"canonical_hdf5", "pt_shards"}):
+            msg = "Transient Evaluation backend identity is unsupported."
+            raise TrackingError(msg)
+        return True
+    if _TRANSIENT_EVALUATION_DATASET_KEY.fullmatch(key) is not None:
+        if not isinstance(value, str) or _TRANSIENT_EVALUATION_LOGICAL_NAME.fullmatch(value) is None:
+            msg = "Transient Evaluation Dataset identity must be one bounded logical name."
+            raise TrackingError(msg)
+        return True
+    return False
+
+
+def _validate_transient_timing_entry(key: str, value: Any) -> bool:
+    """Validate one approved aggregate timing, device, or speedup entry."""
+    if key == "evaluation/timing/device":
+        if not isinstance(value, str) or _TRANSIENT_EVALUATION_DEVICE.fullmatch(value) is None:
+            msg = "Transient Evaluation device identity is unsupported."
+            raise TrackingError(msg)
+        return True
+    if key == "evaluation/timing/warmup_passes":
+        if not _is_nonnegative_int(value):
+            msg = "Transient Evaluation warm-up count must be a non-negative integer."
+            raise TrackingError(msg)
+        return True
+    if key == "evaluation/timing/component_composed":
+        if not isinstance(value, bool):
+            msg = "Transient Evaluation component-composed identity must be boolean."
+            raise TrackingError(msg)
+        return True
+
+    speedup_match = _TRANSIENT_EVALUATION_SPEEDUP_KEY.fullmatch(key)
+    if speedup_match is not None:
+        metric = speedup_match.group("metric")
+        if metric in {"available_count", "unavailable_count"}:
+            if not _is_nonnegative_int(value):
+                msg = f"Transient Evaluation speedup count {key!r} must be a non-negative integer."
+                raise TrackingError(msg)
+        elif not _is_finite_number(value) or float(value) <= 0.0:
+            msg = f"Transient Evaluation speedup {key!r} must be finite and positive."
+            raise TrackingError(msg)
+        return True
+
+    component_match = _TRANSIENT_EVALUATION_COMPONENT_KEY.fullmatch(key)
+    if component_match is None:
+        return False
+    metric = component_match.group("metric")
+    if metric == "available_count":
+        if not _is_nonnegative_int(value):
+            msg = f"Transient Evaluation timing count {key!r} must be a non-negative integer."
+            raise TrackingError(msg)
+    elif not _is_finite_number(value) or float(value) < 0.0:
+        msg = f"Transient Evaluation timing median {key!r} must be finite and non-negative."
+        raise TrackingError(msg)
+    return True
+
+
+def _validate_transient_evaluation_summary_entry(key: Any, value: Any) -> str:
+    """Admit only the declared aggregate and identity publication vocabulary."""
+    if not isinstance(key, str) or not key:
+        msg = "Transient Evaluation summary keys must be non-empty text."
+        raise TrackingError(msg)
+    if _validate_transient_metric_entry(key, value) or _validate_transient_identity_entry(key, value) or _validate_transient_timing_entry(key, value):
+        return key
+    msg = f"Unsupported transient Evaluation summary key {key!r}."
+    raise TrackingError(msg)
 
 
 def _accuracy_history_metric_ids(
@@ -1139,6 +1361,46 @@ class WandbSession:
         ):
             self._last_logged_epoch = epoch
             self._persist({"last_logged_epoch": epoch})
+
+    def log_transient_evaluation_summary(self, evidence: Mapping[str, Any]) -> None:
+        """Log one schema-restricted transient Evaluation summary."""
+        if self._run is None or self._finished:
+            return
+        if not isinstance(evidence, Mapping) or not evidence or len(evidence) > _MAX_EVALUATION_SUMMARY_ENTRIES:
+            msg = f"W&B Evaluation summary must be one non-empty bounded mapping with at most {_MAX_EVALUATION_SUMMARY_ENTRIES} entries."
+            raise TrackingError(msg)
+        payload: dict[str, bool | float | int | str] = {}
+        for key, value in evidence.items():
+            admitted_key = _validate_transient_evaluation_summary_entry(key, value)
+            if isinstance(value, (bool, int)):
+                payload[admitted_key] = value
+            elif isinstance(value, float):
+                if not math.isfinite(value):
+                    msg = f"W&B Evaluation summary value {admitted_key!r} must be finite."
+                    raise TrackingError(msg)
+                payload[admitted_key] = value
+            elif isinstance(value, str) and value and len(value) <= _MAX_EVALUATION_SUMMARY_TEXT:
+                payload[admitted_key] = value
+            else:
+                msg = f"W&B Evaluation summary value {admitted_key!r} must be a bounded boolean, integer, finite float, or non-empty string."
+                raise TrackingError(msg)
+
+        def update_summary() -> None:
+            """Apply one bounded summary mutation without writing history arrays."""
+            summary = getattr(self._run, "summary", None)
+            update = getattr(summary, "update", None)
+            if not callable(update):
+                msg_0 = "The active W&B run does not expose summary updates."
+                raise TrackingUploadError(msg_0)
+            update(payload)
+
+        if self._run_operation("evaluation_summary", update_summary):
+            self._persist(
+                {
+                    "evaluation_summary_keys": sorted(payload),
+                    "evaluation_summary_entry_count": len(payload),
+                }
+            )
 
     def _validate_run_file(self, kind: str, path: Path) -> None:
         """Admit only one completed artifact-provenance file under this run."""

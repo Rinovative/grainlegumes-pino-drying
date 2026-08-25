@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 
 
 class _Case:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, git_commit: str = "a" * 40) -> None:
         self.case_id = "case_0001"
         self.case_input_id = "b" * 64
         self.simulation_case_id = "c" * 64
-        self.hdf5_identity = SimpleNamespace(simulation_profile="transient_drying", git_commit="a" * 40)
+        self.hdf5_identity = SimpleNamespace(simulation_profile="transient_drying", git_commit=git_commit)
         self.directory = directory
         self.requests: list[tuple[str, str]] = []
 
@@ -37,12 +37,18 @@ class _Case:
 
 
 class _Batch:
-    batch_id = "batch-1"
     simulation_profile = "transient_drying"
-    git_commit = "a" * 40
 
-    def __init__(self, case: _Case) -> None:
+    def __init__(
+        self,
+        case: _Case,
+        *,
+        batch_id: str = "batch-1",
+        git_commit: str = "a" * 40,
+    ) -> None:
         self._case = case
+        self.batch_id = batch_id
+        self.git_commit = git_commit
 
     def case(self, case_id: str) -> _Case:
         if case_id != self._case.case_id:
@@ -54,16 +60,22 @@ class _Batch:
         return {"scientific_fixed_values": {"f_wet_dm_max": 0.05}}
 
 
-def _write_sidecars(directory: Path, *, include_solver_timing: bool = True) -> None:
+def _write_sidecars(
+    directory: Path,
+    *,
+    include_solver_timing: bool = True,
+    batch_id: str = "batch-1",
+    git_commit: str = "a" * 40,
+) -> None:
     timing_payload = {
         "schema_kind": "simulation_case_timing",
         "schema_version": 1,
-        "batch_id": "batch-1",
+        "batch_id": batch_id,
         "case_id": "case_0001",
         "case_input_id": "b" * 64,
         "simulation_case_id": "c" * 64,
         "simulation_profile": "transient_drying",
-        "git_commit": "a" * 40,
+        "git_commit": git_commit,
         "exit_code": 0,
         "timed_out": False,
         "runtime_s": 12.0,
@@ -127,6 +139,23 @@ def test_load_case_timing_separates_physical_and_runtime_evidence(tmp_path: Path
     assert result.as_dict()["component_timing_availability"]["queue_wait_seconds"] == "unavailable_not_persisted"
 
 
+def test_load_case_timing_admits_replacement_with_its_actual_source_batch(tmp_path: Path) -> None:
+    batch_id = "replacement-batch"
+    git_commit = "d" * 40
+    _write_sidecars(tmp_path, batch_id=batch_id, git_commit=git_commit)
+    case = _Case(tmp_path, git_commit=git_commit)
+
+    result = timing.load_case_timing(
+        cast("TerminalCaseEvidence", case),
+        batch=cast(
+            "TerminalBatchEvidence",
+            _Batch(case, batch_id=batch_id, git_commit=git_commit),
+        ),
+    )
+
+    assert (result.batch_id, result.git_commit) == (batch_id, git_commit)
+
+
 def test_load_case_timing_rejects_target_status_inconsistent_with_admitted_limit(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
     source = tmp_path / "status.json"
@@ -149,6 +178,21 @@ def test_load_case_timing_rejects_status_runtime_inconsistent_with_timing(tmp_pa
     source.write_text(json.dumps(payload), encoding="utf-8")
     case = _Case(tmp_path)
     with pytest.raises(ValueError, match="status and timing runtime"):
+        timing.load_case_timing(
+            cast("TerminalCaseEvidence", case),
+            batch=cast("TerminalBatchEvidence", _Batch(case)),
+        )
+
+
+def test_load_case_timing_rejects_timing_owned_by_a_different_source_batch(tmp_path: Path) -> None:
+    _write_sidecars(tmp_path)
+    source = tmp_path / "timing.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["batch_id"] = "replacement-batch"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    case = _Case(tmp_path)
+
+    with pytest.raises(ValueError, match="timing identity"):
         timing.load_case_timing(
             cast("TerminalCaseEvidence", case),
             batch=cast("TerminalBatchEvidence", _Batch(case)),

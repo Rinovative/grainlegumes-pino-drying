@@ -753,6 +753,52 @@ def test_optuna_submission_uses_explicit_gpu_and_forwards_arguments(
     )
 
 
+def test_scoped_artifact_submission_translates_run_and_output_paths(
+    tmp_path: Path,
+) -> None:
+    """Queue one exact scoped run while preserving container storage paths."""
+    harness = _harness(tmp_path)
+    run_dir = Path(harness.environment["STORAGE_ROOT"]) / "03_experiments/transient_drying/runs/completed run"
+    run_dir.mkdir(parents=True)
+    output_root = Path(harness.environment["STORAGE_ROOT"]) / "04_reports/evaluation/debug one case"
+    result = _run_job(
+        harness,
+        "--queue-gpu",
+        "auto",
+        "artifacts",
+        "--run-dir",
+        str(run_dir),
+        "--one-case",
+        "--split",
+        "id",
+        "--output-root",
+        str(output_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    queued = _capture_arguments(harness.runtsgpu_capture)
+    descriptor = json.loads(_descriptor_path_from_token(harness, queued[3]).read_text(encoding="utf-8"))
+    expected = [
+        "--run-dir",
+        "/workspace/storage/03_experiments/transient_drying/runs/completed run",
+        "--one-case",
+        "--split",
+        "id",
+        "--output-root",
+        "/workspace/storage/04_reports/evaluation/debug one case",
+    ]
+    assert descriptor["execution_argv"][-len(expected) :] == expected
+    docker = _capture_arguments(harness.docker_capture)
+    assert docker[-(len(expected) + 5) :] == [
+        "python",
+        "-m",
+        "src.experiments.cli.cli_build_artifacts",
+        *expected,
+        "--device",
+        "cuda",
+    ]
+
+
 def test_malformed_gpu_report_fails_before_submission(tmp_path: Path) -> None:
     """Reject malformed automatic-selection evidence without queuing."""
     harness = _harness(tmp_path, gpu_report="not a gpu record\n")

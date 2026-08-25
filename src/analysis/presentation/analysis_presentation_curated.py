@@ -4,15 +4,15 @@ analysis_presentation_curated.py
 Render the fixed scientific media inventory accepted by optional W&B tracking.
 
 Responsibilities:
-  - Build four figures and one neutral run-summary table from validated frames
+  - Build the fixed steady figure/table bundle from validated aggregate frames
+  - Build the fixed transient sequence, process, comparison, and timing report
   - Save rendered files below an explicit caller-owned output directory
-  - Return an exact five-key bundle without importing or calling W&B
 
 Design principles:
   - Input frames already satisfy current artifact/provenance compatibility
   - Output media remains separate from immutable ID/OOD artifact cache directories
   - Rendering never mutates artifact caches or run state
-  - The inventory is identical to the tracking upload allowlist
+  - Every task returns an exact bounded inventory without importing W&B
 
 This module does NOT:
   - Import, initialize, or call W&B
@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     import pandas as pd
     from matplotlib.figure import Figure
 
+    from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
+
 CURATED_ANALYSIS_KEYS = frozenset(
     {
         "run_summary_table",
@@ -51,6 +53,22 @@ CURATED_ANALYSIS_KEYS = frozenset(
         "spectral_fidelity",
     }
 )
+TRANSIENT_CURATED_ANALYSIS_KEYS = frozenset(
+    {
+        "transient_summary_table",
+        "transient_state_maps",
+        "transient_central_error_time",
+        "transient_horizon_error",
+        "transient_endpoint_cumulative",
+        "transient_target_time",
+        "transient_pipeline_degradation",
+        "transient_timing_distributions",
+        "transient_timing_speedups",
+        "transient_accuracy_inference_time",
+        "transient_accuracy_speedup",
+    }
+)
+_TRANSIENT_OPTIONAL_ANALYSIS_KEYS = frozenset({"transient_training_performance_compute"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +103,25 @@ class CuratedAnalysisBundle:
         names = set(self.media_files).union(self.tables)
         if names != CURATED_ANALYSIS_KEYS or set(self.media_files).intersection(self.tables):
             msg = f"Curated analysis bundle must contain exactly {sorted(CURATED_ANALYSIS_KEYS)}."
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class TransientCuratedAnalysisBundle:
+    """Hold the fixed local transient report inventory outside artifact caches."""
+
+    media_files: Mapping[str, Path]
+    tables: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        """Require the exact sequence-aware report inventory."""
+        names = set(self.media_files).union(self.tables)
+        allowed_inventories = {
+            TRANSIENT_CURATED_ANALYSIS_KEYS,
+            TRANSIENT_CURATED_ANALYSIS_KEYS.union(_TRANSIENT_OPTIONAL_ANALYSIS_KEYS),
+        }
+        if frozenset(names) not in allowed_inventories or set(self.media_files).intersection(self.tables):
+            msg = "Transient curated bundle has an invalid required or matched-compute inventory."
             raise ValueError(msg)
 
 
@@ -193,4 +230,69 @@ def render_curated_analysis(
     return CuratedAnalysisBundle(
         media_files=media_files,
         tables={"run_summary_table": _neutral_table(summary)},
+    )
+
+
+def render_curated_transient_analysis(
+    *,
+    session: TransientEvaluationSession,
+    output_dir: str | Path,
+    training_performance: pd.DataFrame | None = None,
+) -> TransientCuratedAnalysisBundle:
+    """Render one fixed sequence-aware local report without mutating artifacts."""
+    from src.analysis.evaluation.evaluation_plot import evaluation_plot_transient as transient_plot  # noqa: PLC0415
+
+    if not session.frame_names:
+        msg = "Transient curated rendering requires one open Evaluation session."
+        raise ValueError(msg)
+    target = Path(output_dir).resolve()
+    if any(target == root or target.is_relative_to(root) for root in session.artifact_roots):
+        msg = "Transient curated output must be outside every immutable artifact cache."
+        raise ValueError(msg)
+    target.mkdir(parents=True, exist_ok=True)
+    primary_frame = session.frame_names[0]
+    primary_record = session.full_autonomous_records(primary_frame)[0]
+    target_records = session.full_autonomous_records()
+    summary = session.dataset_dataframe()
+    timing_report = session.timing_report(primary_frame)
+    primary_accuracy = session.case_dataframe(modes=("autonomous_full",))
+    primary_accuracy = primary_accuracy.loc[
+        (primary_accuracy["frame"] == primary_frame) & (primary_accuracy["scope"] == "cumulative") & (primary_accuracy["requested_horizon"] == "full")
+    ]
+    media_files = {
+        "transient_state_maps": target / "transient_state_maps.png",
+        "transient_central_error_time": target / "transient_central_error_time.png",
+        "transient_horizon_error": target / "transient_horizon_error.png",
+        "transient_endpoint_cumulative": target / "transient_endpoint_cumulative.png",
+        "transient_target_time": target / "transient_target_time.png",
+        "transient_pipeline_degradation": target / "transient_pipeline_degradation.png",
+        "transient_timing_distributions": target / "transient_timing_distributions.png",
+        "transient_timing_speedups": target / "transient_timing_speedups.png",
+        "transient_accuracy_inference_time": target / "transient_accuracy_inference_time.png",
+        "transient_accuracy_speedup": target / "transient_accuracy_speedup.png",
+    }
+    figures = {
+        "transient_state_maps": transient_plot.plot_state_maps(primary_record),
+        "transient_central_error_time": transient_plot.plot_central_error_vs_time(
+            primary_record,
+            scaling_state=session.scaling_state(primary_frame),
+        ),
+        "transient_horizon_error": transient_plot.plot_horizon_error(summary),
+        "transient_endpoint_cumulative": transient_plot.plot_endpoint_vs_cumulative(summary),
+        "transient_target_time": transient_plot.plot_target_time(target_records),
+        "transient_pipeline_degradation": transient_plot.plot_pipeline_degradation(session.pipeline_degradation()),
+        "transient_timing_distributions": transient_plot.plot_timing_distributions(timing_report),
+        "transient_timing_speedups": transient_plot.plot_timing_speedups(timing_report),
+        "transient_accuracy_inference_time": transient_plot.plot_accuracy_vs_inference_time(primary_accuracy, timing_report),
+        "transient_accuracy_speedup": transient_plot.plot_accuracy_vs_speedup(primary_accuracy, timing_report),
+    }
+    if training_performance is not None:
+        name = "transient_training_performance_compute"
+        media_files[name] = target / f"{name}.png"
+        figures[name] = transient_plot.plot_training_performance_vs_compute(training_performance)
+    for name, figure in figures.items():
+        _save_figure(figure, media_files[name])
+    return TransientCuratedAnalysisBundle(
+        media_files=media_files,
+        tables={"transient_summary_table": _neutral_table(summary)},
     )

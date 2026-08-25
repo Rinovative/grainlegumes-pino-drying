@@ -24,6 +24,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -33,13 +34,15 @@ import pandas as pd
 from src.analysis.presentation.analysis_field_labels import (
     VELOCITY_MAGNITUDE_LABEL,
     VELOCITY_MAGNITUDE_MATHTEXT,
+    display_unit,
+    field_label,
+    has_declared_field_metadata,
 )
 
 from . import evaluation_dataframe as dataframe
+from . import evaluation_transient_artifact as transient_artifact
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-
     from .evaluation_case import EvaluationCase
 
 _FIELD_LABELS: Mapping[str, str] = {
@@ -75,6 +78,35 @@ class ParameterSelection:
 
     included: tuple[str, ...]
     omitted: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class TransientDisplayField:
+    """Describe one stored or explicitly supported derived transient channel."""
+
+    key: str
+    label: str
+    unit: str
+    stored: bool
+    dependencies: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TransientChannelResolution:
+    """Return comparable transient channels and concise omission evidence."""
+
+    fields: tuple[TransientDisplayField, ...]
+    omitted: Mapping[str, str]
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """Return canonical channel keys in visible order."""
+        return tuple(field.key for field in self.fields)
+
+    @property
+    def labels(self) -> Mapping[str, str]:
+        """Return key-to-label widget text with authoritative displayed units."""
+        return {field.key: f"{field.label} [{display_unit(field.unit)}]" for field in self.fields}
 
 
 _PARAMETER_PRESENTATION = (
@@ -361,3 +393,146 @@ def case_number(frame: pd.DataFrame, row_position: int) -> int:
         msg = "case_index must be an integer."
         raise TypeError(msg)
     return int(value)
+
+
+def _transient_field_declarations(
+    frame: pd.DataFrame,
+) -> tuple[tuple[str, ...], Mapping[str, Mapping[str, object]], Mapping[str, object]]:
+    """Read stored channel names and optional metadata from admitted artifact evidence."""
+    provenance = frame.attrs.get("artifact_provenance")
+    evaluation_value = provenance.get("evaluation") if isinstance(provenance, Mapping) else None
+    evaluation = evaluation_value if isinstance(evaluation_value, Mapping) else {}
+    objective_value = evaluation.get("objective")
+    objective = objective_value if isinstance(objective_value, Mapping) else {}
+    declared = frame.attrs.get("output_fields", objective.get("fields"))
+    if declared is None:
+        if frame.attrs.get("artifact_kind") != transient_artifact.TRANSIENT_ARTIFACT_KIND:
+            msg = "Transient channel resolution requires an admitted sequence artifact."
+            raise ValueError(msg)
+        fields = transient_artifact.STATE_ORDER
+    else:
+        if isinstance(declared, (str, bytes)) or not isinstance(declared, Sequence):
+            msg = "Transient artifact output fields must be an ordered sequence."
+            raise TypeError(msg)
+        fields = tuple(declared)
+        if not fields or any(not isinstance(field, str) or not field for field in fields) or len(fields) != len(set(fields)):
+            msg = "Transient artifact output fields must be unique non-empty text."
+            raise ValueError(msg)
+
+    metadata_value = frame.attrs.get("field_metadata", evaluation.get("field_metadata", {}))
+    if not isinstance(metadata_value, Mapping):
+        msg = "Transient field metadata must be a mapping when supplied."
+        raise TypeError(msg)
+    metadata = {key: value for key, value in metadata_value.items() if isinstance(key, str) and isinstance(value, Mapping)}
+
+    units_value = frame.attrs.get("field_units", evaluation.get("field_units", {}))
+    if not isinstance(units_value, Mapping):
+        msg = "Transient field units must be a mapping when supplied."
+        raise TypeError(msg)
+    units = {key: value for key, value in units_value.items() if isinstance(key, str)}
+    return fields, metadata, units
+
+
+def _transient_frame_channels(frame: pd.DataFrame) -> TransientChannelResolution:
+    """Resolve one frame without inventing a label, unit, or derived quantity."""
+    fields, metadata, declared_units = _transient_field_declarations(frame)
+    contract_units = dict(zip(transient_artifact.STATE_ORDER, transient_artifact.STATE_UNITS, strict=True))
+    known_order = tuple(field for field in transient_artifact.STATE_ORDER if field in fields)
+    future_order = tuple(sorted(set(fields).difference(known_order)))
+    resolved: list[TransientDisplayField] = []
+    omitted: dict[str, str] = {}
+    for field in (*known_order, *future_order):
+        field_metadata = metadata.get(field, {})
+        label_value = field_metadata.get("label")
+        label = label_value if isinstance(label_value, str) and label_value else (field_label(field) if has_declared_field_metadata(field) else None)
+        contract_unit = contract_units.get(field)
+        unit: str | None
+        if contract_unit is not None:
+            explicit_units: list[object] = []
+            if "unit" in field_metadata:
+                explicit_units.append(field_metadata["unit"])
+            if field in declared_units:
+                explicit_units.append(declared_units[field])
+            if any(value != contract_unit for value in explicit_units):
+                omitted[field] = f"declared unit conflicts with canonical unit {contract_unit!r}"
+                continue
+            unit = contract_unit
+        else:
+            unit_value = field_metadata.get("unit", declared_units.get(field))
+            unit = unit_value if isinstance(unit_value, str) and unit_value else None
+        if label is None or unit is None:
+            missing = "label and unit" if label is None and unit is None else ("label" if label is None else "unit")
+            omitted[field] = f"missing authoritative {missing} metadata"
+            continue
+        resolved.append(
+            TransientDisplayField(
+                key=field,
+                label=label,
+                unit=unit,
+                stored=True,
+                dependencies=(field,),
+            )
+        )
+
+    provenance = frame.attrs.get("artifact_provenance")
+    evaluation_value = provenance.get("evaluation") if isinstance(provenance, Mapping) else None
+    evaluation = evaluation_value if isinstance(evaluation_value, Mapping) else {}
+    policy_value = evaluation.get("process_diagnostic_policy")
+    policy = policy_value if isinstance(policy_value, Mapping) else {}
+    bulk_value = policy.get("bulk_moisture")
+    bulk = bulk_value if isinstance(bulk_value, Mapping) else {}
+    resolved_keys = {field.key for field in resolved}
+    moisture_units = {field.unit for field in resolved if field.key in {"w_surf", "w_int"}}
+    supports_bulk = (
+        bulk.get("available") is True
+        and {"w_surf", "w_int"}.issubset(resolved_keys)
+        and len(moisture_units) == 1
+        and "f_surf" in transient_artifact.SCALAR_ORDER
+        and has_declared_field_metadata("w_gr")
+    )
+    if supports_bulk:
+        derived = TransientDisplayField(
+            key="w_gr",
+            label=field_label("w_gr"),
+            unit=next(iter(moisture_units)),
+            stored=False,
+            dependencies=("w_surf", "w_int", "f_surf"),
+        )
+        canonical_count = sum(field.key in transient_artifact.STATE_ORDER for field in resolved)
+        resolved.insert(canonical_count, derived)
+    else:
+        omitted["w_gr"] = "bulk-moisture derivation lacks compatible w_surf, w_int, f_surf, unit, or policy evidence"
+    return TransientChannelResolution(tuple(resolved), omitted)
+
+
+def transient_channel_resolution(
+    frames: Sequence[pd.DataFrame],
+) -> TransientChannelResolution:
+    """Return the scientifically compatible channel intersection for frames."""
+    if not frames:
+        msg = "At least one transient evaluation frame is required."
+        raise ValueError(msg)
+    per_frame = tuple(_transient_frame_channels(frame) for frame in frames)
+    first_by_key = {field.key: field for field in per_frame[0].fields}
+    shared_keys = set(first_by_key)
+    for resolution in per_frame[1:]:
+        shared_keys.intersection_update(field.key for field in resolution.fields)
+    admitted: list[TransientDisplayField] = []
+    omitted: dict[str, str] = {}
+    for key, reference in first_by_key.items():
+        if key not in shared_keys:
+            omitted[key] = "not supplied by every compared artifact"
+            continue
+        matches = tuple(field for resolution in per_frame for field in resolution.fields if field.key == key)
+        signatures = {(field.label, field.unit, field.stored, field.dependencies) for field in matches}
+        if len(signatures) != 1:
+            omitted[key] = "compared artifacts declare incompatible channel semantics"
+            continue
+        admitted.append(reference)
+    for resolution in per_frame:
+        for key, reason in resolution.omitted.items():
+            omitted.setdefault(key, reason)
+    if not admitted:
+        msg = "Compared transient artifacts expose no compatible labelled channels with authoritative units."
+        raise ValueError(msg)
+    return TransientChannelResolution(tuple(admitted), omitted)

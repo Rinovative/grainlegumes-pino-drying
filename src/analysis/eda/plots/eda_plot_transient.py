@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
+    from matplotlib.gridspec import GridSpecBase
 
 _SPATIAL_SUPTITLE_Y: Final = 0.985
 _SPATIAL_GRID_TOP: Final = _SPATIAL_SUPTITLE_Y - (_SPATIAL_SUPTITLE_Y - 0.91) / 8.0
@@ -377,6 +378,7 @@ def _spatial_map_figure(
         layout=None,
     )
     scientific_axes: list[Axes] = []
+    map_grid: GridSpecBase
     if include_schedules:
         colors = _dataset_color_map(datasets)
         outer = figure.add_gridspec(
@@ -431,12 +433,12 @@ def _spatial_map_figure(
         )
         main_schedule_axes = tuple(figure.add_subplot(schedule_grid[row, 0]) for row in range(len(schedule_fields)))
         startup_schedule_axes = tuple(figure.add_subplot(schedule_grid[row, 1]) for row in range(len(schedule_fields)))
-        for axis, field in zip(main_schedule_axes, schedule_fields, strict=True):
+        for axis, schedule_field in zip(main_schedule_axes, schedule_fields, strict=True):
             layout.add_channel_row_label(
                 axis,
                 field_labels.field_label_with_unit(
-                    field.name,
-                    field.unit,
+                    schedule_field.name,
+                    schedule_field.unit,
                     mathtext=True,
                 ),
                 figure_x=_TRANSIENT_ROW_LABEL_X,

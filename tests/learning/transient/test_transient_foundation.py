@@ -510,6 +510,22 @@ def test_scaling_serialization_is_strict_and_device_independent() -> None:
         TransientScalingArtifact.from_state_dict(changed_embedding)
 
 
+def test_scaling_rejects_direct_runtime_dtype_mismatch() -> None:
+    """Keep scaler dtype admission strict for callers that bypass preparation."""
+    artifact = _artifact()
+    with pytest.raises(ValueError, match="scaler device/dtype"):
+        artifact.encode_state(torch.zeros((1, 4, 2, 2), dtype=torch.float64))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
+def test_cuda_scaling_rejects_direct_cpu_state() -> None:
+    """Keep scaler device admission strict for an unprepared CPU state."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    artifact = _artifact().to(device)
+    with pytest.raises(ValueError, match="scaler device/dtype"):
+        artifact.encode_state(torch.zeros((1, 4, 2, 2), dtype=torch.float32))
+
+
 def test_zero_delta_reconstruction_is_exact_and_differentiable() -> None:
     """Preserve exact zeros and gradient flow through physical reconstruction."""
     artifact = _artifact()

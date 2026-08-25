@@ -8,11 +8,12 @@ independent run bundles under `03_experiments/transient_drying`, and remains
 usable when the original CPU Generation workspace has been deleted.
 
 This workflow owns Training, Optuna, checkpoint/resume, W&B telemetry, matched
-compute, and inference loading. Completed-output transient EDA is implemented
-against admitted Generation evidence and validated Dataset runtime items.
-Transient Evaluation and post-training Evaluation artifact generation are not
-implemented yet. The training CLI still reports that limitation after a
-successful transient run instead of invoking the steady-flow artifact builder.
+compute, inference loading, and task-aware post-training artifacts.
+Completed-output transient EDA is implemented against admitted Generation
+evidence and validated Dataset runtime items. Transient Evaluation uses a
+sequence artifact and the current inference, scaling, Dataset, report, and
+artifact-service owners; it does not route transient runs through steady-only
+schemas.
 
 ## Maintained experiment plans
 
@@ -292,6 +293,91 @@ not parse those files, solver logs, scheduler text, or `sacct` output.
 | 4 | Which Generation phase drives computational cost? | Stationary-airflow, transient-drying, scientific-solver, queue, licence, and end-to-end timing | Per-component distributions and correlations against case metadata | Component fields are explicitly unavailable in current persisted timing | Generation for persistence; EDA for later presentation | EDA must not infer component timing from logs or scheduler text. |
 
 
+## Evaluation
+
+A successful transient Training run now invokes the shared task-aware artifact
+service unless `--no-build-artifacts` is selected. Existing completed runs can
+be processed explicitly with:
+
+```bash
+python -m src.experiments.cli.cli_build_artifacts --task transient_drying
+```
+
+The immutable artifact stores reference and predicted absolute sequences,
+physical times, transition and origin identities, masks, conditioning,
+checkpoint-bound scaling and profile identity, Dataset membership, Training
+lineage, target and censoring evidence, and admitted timing provenance. It
+supports FNO, U-NO, and official RNO checkpoints through the public transient
+inference API. Independent cases and rolling origins reset RNO state; one
+rollout forwards state only within that request.
+
+Evaluation distinguishes teacher-forced one-step prediction, full autonomous
+rollout, and early/middle/late rolling origins. Fixed horizons are measured in
+transitions at `1, 2, 4, 8, 16, 32, 64, and 128`, while `full` means every
+available transition. Unsupported fixed horizons remain unavailable rather than
+being shortened. Artifact admission requires the exact deterministic
+mode/origin/horizon inventory for every saved complete case, including explicit
+unsupported-horizon evidence; an incomplete cache is rejected before reporting.
+Every result retains elapsed physical time and separate cumulative and endpoint
+reductions.
+
+Only the full-autonomous/full-horizon record carries canonical completed-case
+reference target evidence from Generation. Its reached-only time preserves an
+irregular diagnostic exact-stop time even when that time is not on the learned
+regular rollout grid. Prediction target evidence remains explicitly
+regular-grid-local. Teacher-forced and rolling-origin intervals mark the
+completed-case reference target unavailable instead of relabelling a partial
+interval as right-censored. Final-gap errors are paired only when reference and
+prediction endpoints are the same physical time.
+
+The central metric is
+`normalized_drying_group_macro_rmse` with checkpoint-bound Train-only scaling
+and channel weights `T=1/3`, `phi=1/3`, `w_surf=1/6`, and `w_int=1/6`.
+Complete-Dataset sufficient statistics are accumulated before RMSE reduction.
+Reports also include normalized and physical channel errors, granular moisture,
+canonical masked bulk dry- and wet-basis moisture, target censoring, plausibility
+and stability diagnostics, and contributing and unavailable case counts. Bulk
+moisture uses the same structured-grid trapezoidal boundary weighting as the
+Generation consistency owner and never imputes physically invalid predictions.
+
+Exact three-run A0/A+/B selections admit persisted common-parent and
+matched-compute evidence. B versus A+ is the primary technique comparison; B
+versus A0 remains separate because it includes additional post-handoff compute.
+The Airflow-to-Drying analysis preserves conditions A, B, and C. If a compatible
+Airflow-NO checkpoint, normalizer, profile, Dataset, or case mapping is absent,
+C is reported unavailable with its reason and no prediction or zero error is
+fabricated.
+
+Timing uses the stable Generation timing interpreter plus bounded public
+inference benchmarks. Cold timing, warm-up, raw warmed repetitions, backend,
+PT-payload identity, precision, batch size, hardware, and software versions are
+retained. Solver and surrogate timing components remain separate; algebraically
+combined comparisons are labelled component-composed and aggregate paired cases
+with a ratio of summed reference time to summed surrogate time. Missing
+components retain exact unavailable reasons.
+
+Use `notebooks/eval_single_model.ipynb` for one completed run and
+`notebooks/eval_comparison_models.ipynb` for compatible comparisons. Both
+notebooks dispatch by task, treat absent transient OOD evidence honestly, and
+can render reports outside immutable artifact caches. Transient panels and local
+reports include sequence maps, physical-time and horizon error, endpoint versus
+cumulative error, target status, pipeline degradation, matched-compute
+performance, runtime distributions, accuracy versus inference time, accuracy
+versus speedup, and all five speedup definitions. The Evaluation session exposes
+only bounded aggregate tracking fields; large sequence arrays remain in local
+immutable artifacts.
+
+The resolved `tracking.wandb` configuration remains the sole publication gate.
+When its mode is enabled and `upload.evaluation_artifacts` is true, the explicit
+artifact-build workflow validates transient ID and any saved OOD role before it
+resumes the existing W&B observer. It publishes one bounded flat summary of
+aggregate metrics, availability and sample counts, timing medians,
+ratio-of-sums speedups, and Dataset, checkpoint, input-profile, model, backend,
+hardware, precision, and timing identities. It never publishes
+sequence arrays, raw Dataset values, per-case timings, provenance files, media,
+checkpoints, or arbitrary files. Disabled mode performs no observer work;
+steady-flow provenance and curated-media behavior is unchanged.
+
 ## Inference
 
 A completed transient run can be reconstructed without reopening its Dataset:
@@ -317,8 +403,18 @@ claiming a speedup.
 
 ## Current limitations
 
-- Transient Evaluation and post-training Evaluation artifacts are not yet implemented.
-- The steady-flow artifact builder does not consume transient runs.
+- No compatible Airflow-NO checkpoint, normalizer, profile, and complete case
+  mapping is selected by the current transient artifact plan, so pipeline
+  condition C remains explicitly unavailable until that evidence exists.
+- A real Evaluation report still requires completed compatible transient run and
+  Dataset artifacts outside the repository; tests use bounded synthetic
+  fixtures and do not claim measured model quality or speedup.
+- Timing components absent from admitted Generation or inference evidence remain
+  unavailable and are never inferred from logs or substituted with zero.
+- Surrogate mass-balance closure remains unavailable because the sequence artifact
+  does not preserve the gas-water storage and inlet/outlet mass-flux series needed
+  for the canonical differential and integral balances; no closure value is
+  inferred from moisture states alone.
 - Production scientific hyperparameters and Dataset names remain mutable config
   choices; inspect the resolved run config rather than treating this guide as a
   frozen experiment inventory.

@@ -652,12 +652,12 @@ def plot_meta_statistics(
 
         units_by_column: dict[str, str] = {}
         for key in keys:
-            units = {cache[name]["units"][key] for name in active if key in cache[name]["units"]}
-            if len(units) > 1:
+            available_units = {cache[name]["units"][key] for name in active if key in cache[name]["units"]}
+            if len(available_units) > 1:
                 message = f"Generated parameter {key!r} has incompatible units across datasets."
                 raise ValueError(message)
-            if units:
-                units_by_column[key] = next(iter(units))
+            if available_units:
+                units_by_column[key] = next(iter(available_units))
         data = {
             name: {
                 key: field_labels.display_values(

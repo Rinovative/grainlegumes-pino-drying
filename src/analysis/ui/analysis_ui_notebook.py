@@ -18,6 +18,7 @@ This module does NOT:
   - Load artifact cases or implement case-level plot mathematics
 """
 
+import re
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from inspect import signature
@@ -31,7 +32,9 @@ from IPython.display import clear_output, display
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
-COMPACT_VIEW_SELECTOR_WIDTH_PX = 230
+from . import analysis_ui_components as components
+
+COMPACT_VIEW_SELECTOR_WIDTH_PX = components.COMPACT_CONTROL_WIDTH_PX
 STANDARD_VIEW_SELECTOR_WIDTH_PX = 360
 
 
@@ -84,6 +87,42 @@ def _sanitize_name(name: str) -> str:
     validation is performed here.
     """
     return name.lower().replace(" ", "_").replace("–", "-").replace("—", "-").replace("/", "_")  # noqa: RUF001
+
+
+def _sanitize_export_basename(value: Any) -> str:
+    """Return one safe concise basename for context-aware PDF export."""
+    if not isinstance(value, str):
+        return "plot"
+    normalized = _sanitize_name(value).strip()
+    normalized = re.sub(r"[^a-z0-9._-]+", "_", normalized)
+    normalized = re.sub(r"[_-]{2,}", "_", normalized).strip("._-")
+    return normalized[:96] or "plot"
+
+
+def _export_stem(export_state: dict[str, Any]) -> str:
+    """Resolve a dynamic stem or combine stable panel context with the plot kind."""
+    dynamic = export_state.get("filename_stem")
+    if isinstance(dynamic, str) and dynamic:
+        return _sanitize_export_basename(dynamic)
+    context = tuple(
+        value
+        for value in (
+            export_state.get("filename_prefix"),
+            export_state.get("plot_name"),
+        )
+        if isinstance(value, str) and value
+    )
+    return _sanitize_export_basename("__".join(context) or "plot")
+
+
+def _next_export_path(directory: Path, *, stem: str, timestamp: str) -> Path:
+    """Return one timestamped PDF path without overwriting an existing export."""
+    candidate = directory / f"{stem}_{timestamp}.pdf"
+    index = 1
+    while candidate.exists():
+        candidate = directory / f"{stem}_{timestamp}_{index}.pdf"
+        index += 1
+    return candidate
 
 
 def _show_anything(result: Any) -> None:
@@ -194,6 +233,7 @@ def make_dropdown_section(
                 export_state["figures"] = ()
                 export_state["plot_name"] = None
                 export_state["title"] = None
+                export_state["filename_stem"] = None
             with output:
                 output.clear_output(wait=True)
             last_idx["idx"] = idx
@@ -211,6 +251,7 @@ def make_dropdown_section(
                 export_state["figures"] = ()
                 export_state["plot_name"] = plot_name
                 export_state["title"] = title
+                export_state["filename_stem"] = None
 
             result = _invoke_dropdown_entry(
                 plot_func,
@@ -422,9 +463,9 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
                 return
             out_dir = Path(export_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            stem = export_state.get("plot_name") or "plot"
+            stem = _export_stem(export_state)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"{stem}_{timestamp}.pdf"
+            out_path = _next_export_path(out_dir, stem=stem, timestamp=timestamp)
             if len(figures) == 1:
                 figures[0].savefig(out_path, bbox_inches="tight")
             else:
@@ -461,6 +502,8 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
             "figures": export_state.get("figures", ()),
             "plot_name": export_state.get("plot_name"),
             "title": export_state.get("title"),
+            "filename_stem": export_state.get("filename_stem"),
+            "filename_prefix": export_state.get("filename_prefix"),
         }
 
     def deactivate_section(index: int | None) -> None:
@@ -496,6 +539,8 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
                         "figures": (),
                         "plot_name": None,
                         "title": None,
+                        "filename_stem": None,
+                        "filename_prefix": None,
                     },
                 )
             )
@@ -558,6 +603,8 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
                     "figures": (),
                     "plot_name": None,
                     "title": None,
+                    "filename_stem": None,
+                    "filename_prefix": export_state.get("filename_prefix"),
                 }
             )
         if expanded["value"]:

@@ -31,9 +31,22 @@ import numpy as np
 from src.analysis.presentation.analysis_field_labels import field_label
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from matplotlib.axes import Axes
+
+COMPACT_CONTROL_WIDTH_PX = 230
+COMPACT_CASE_STEP_WIDTH_PX = 40
+COMPACT_CASE_VALUE_WIDTH_PX = COMPACT_CONTROL_WIDTH_PX - 2 * COMPACT_CASE_STEP_WIDTH_PX
+
+_COMPACT_CONTROL_WIDTH = f"{COMPACT_CONTROL_WIDTH_PX}px"
+_WIDGET_DEFAULT_MARGIN_PX = 2.0
+_SCOPE_BUTTON_INCREMENT_POINTS = 1.0
+_CSS_PIXELS_PER_POINT = 96.0 / 72.0
+_SCOPE_BUTTON_WIDTH_PX = (COMPACT_CONTROL_WIDTH_PX - 4.0 * _WIDGET_DEFAULT_MARGIN_PX) / 2.0 + _SCOPE_BUTTON_INCREMENT_POINTS * _CSS_PIXELS_PER_POINT
+_SCOPE_BUTTON_WIDTH = f"{_SCOPE_BUTTON_WIDTH_PX:.12g}px"
+_SCOPE_BUTTON_GROUP_WIDTH_PX = 2.0 * _SCOPE_BUTTON_WIDTH_PX + 4.0 * _WIDGET_DEFAULT_MARGIN_PX
+_SCOPE_BUTTON_GROUP_WIDTH = f"{_SCOPE_BUTTON_GROUP_WIDTH_PX:.12g}px"
 
 # =============================================================================
 # TYPE CONTRACTS
@@ -63,6 +76,96 @@ class _CheckboxGroupVBox(widgets.VBox):
     """Own typed checkbox state while preserving the public ``VBox`` contract."""
 
     boxes: dict[str, widgets.Checkbox]
+
+
+class ChannelCheckboxState:
+    """Preserve compatible checkbox channels through one external state owner."""
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        callback: Callable[[], None],
+        selection_getter: Callable[[], Sequence[str] | None],
+        selection_setter: Callable[[tuple[str, ...]], None],
+    ) -> None:
+        """Initialize an empty three-column channel selector."""
+        self._title = title
+        self._callback = callback
+        self._selection_getter = selection_getter
+        self._selection_setter = selection_setter
+        self._known: tuple[str, ...] = ()
+        self._group: _CheckboxGroupVBox | None = None
+        self.status = widgets.HTML(layout=widgets.Layout(display="none"))
+        self.container = widgets.VBox(
+            layout=widgets.Layout(
+                display="none",
+                width="max-content",
+                max_width="100%",
+                align_items="flex-start",
+            )
+        )
+
+    @property
+    def selected(self) -> tuple[str, ...]:
+        """Return checked channels in canonical visible order."""
+        if self._group is None:
+            return ()
+        return tuple(name for name, checkbox in self._group.boxes.items() if checkbox.value)
+
+    @property
+    def group(self) -> _CheckboxGroupVBox | None:
+        """Return the current concrete checkbox group for widget composition."""
+        return self._group
+
+    def _changed(self) -> None:
+        """Retain one accepted selection before rendering."""
+        self._selection_setter(self.selected)
+        self._callback()
+
+    def rebind(
+        self,
+        options: Sequence[str],
+        *,
+        labels: Mapping[str, str] | None = None,
+    ) -> None:
+        """Keep retained compatible choices and report removed selections."""
+        resolved = tuple(options)
+        if not resolved or len(resolved) != len(set(resolved)):
+            message = "Channel controls require unique compatible options."
+            raise ValueError(message)
+        retained_value = self._selection_getter()
+        if retained_value is None:
+            defaults = resolved
+            removed: tuple[str, ...] = ()
+        else:
+            retained = tuple(retained_value)
+            allowed = set(resolved)
+            previously_known = set(self._known)
+            defaults = tuple(name for name in resolved if name in retained or name not in previously_known)
+            removed = tuple(name for name in retained if name not in allowed)
+        group = ui_checkbox_channels(
+            channels=resolved,
+            default_on=defaults,
+            labels=labels,
+            fixed_columns=3,
+        )
+        for checkbox in group.boxes.values():
+            checkbox.observe(
+                lambda _change: self._changed(),
+                names="value",
+            )
+        self._group = group
+        self._known = resolved
+        self._selection_setter(defaults)
+        self.status.value = "<p>Unavailable channels removed: " + ", ".join(removed) + ".</p>" if removed else ""
+        self.status.layout.display = "flex" if removed else "none"
+        self.container.children = (
+            widgets.HTML(f"<b>{self._title}</b>"),
+            group,
+            self.status,
+        )
+        self.container.layout.display = "flex"
 
 
 # =============================================================================
@@ -394,6 +497,119 @@ def ui_step_case_index(
         msg = "Unit-step case navigation must construct a bounded integer text control."
         raise TypeError(msg)
     return control, previous, following
+
+
+def ui_compact_case_row(
+    case: widgets.DOMWidget,
+    previous: widgets.Button,
+    following: widgets.Button,
+) -> widgets.HBox:
+    """Apply the maintained EDA case navigator dimensions and row behavior."""
+    case_width = f"{COMPACT_CASE_VALUE_WIDTH_PX}px"
+    step_width = f"{COMPACT_CASE_STEP_WIDTH_PX}px"
+    case.layout = widgets.Layout(
+        width=case_width,
+        min_width=case_width,
+        max_width=case_width,
+        flex=f"0 0 {case_width}",
+        margin="0",
+    )
+    previous.tooltip = "Previous shared case"
+    following.tooltip = "Next shared case"
+    for button in (previous, following):
+        button.layout = widgets.Layout(
+            width=step_width,
+            min_width=step_width,
+            max_width=step_width,
+            flex=f"0 0 {step_width}",
+            margin="0",
+        )
+    return widgets.HBox(
+        (case, previous, following),
+        layout=widgets.Layout(
+            align_items="center",
+            flex_flow="row nowrap",
+            grid_gap="0",
+            width=_COMPACT_CONTROL_WIDTH,
+            min_width=_COMPACT_CONTROL_WIDTH,
+            max_width=_COMPACT_CONTROL_WIDTH,
+            flex=f"0 0 {_COMPACT_CONTROL_WIDTH}",
+        ),
+    )
+
+
+def ui_scope_toggle(*, value: str = "aggregate") -> widgets.ToggleButtons:
+    """Build the maintained EDA Aggregate and Single case control."""
+    if value not in {"aggregate", "single"}:
+        message = "Scope must be 'aggregate' or 'single'."
+        raise ValueError(message)
+    return widgets.ToggleButtons(
+        options=(("Aggregate", "aggregate"), ("Single case", "single")),
+        value=value,
+    )
+
+
+def ui_compact_scope_controls(
+    scope: widgets.ToggleButtons | None,
+) -> tuple[widgets.HBox, widgets.HBox]:
+    """Build the maintained bounded scope row and replaceable detail column."""
+    detail = widgets.HBox(
+        layout=widgets.Layout(
+            align_items="center",
+            min_width="0",
+        )
+    )
+    if scope is None:
+        detail.layout = widgets.Layout(
+            align_items="center",
+            width=_COMPACT_CONTROL_WIDTH,
+            min_width=_COMPACT_CONTROL_WIDTH,
+            max_width=_COMPACT_CONTROL_WIDTH,
+            flex=f"0 0 {_COMPACT_CONTROL_WIDTH}",
+        )
+        children: tuple[widgets.Widget, ...] = (detail,)
+    else:
+        scope.layout = widgets.Layout(
+            display="flex",
+            flex_flow="row nowrap",
+            align_items="stretch",
+            justify_content="flex-start",
+            width=_SCOPE_BUTTON_GROUP_WIDTH,
+            min_width=_SCOPE_BUTTON_GROUP_WIDTH,
+            max_width=_SCOPE_BUTTON_GROUP_WIDTH,
+            flex=f"0 0 {_SCOPE_BUTTON_GROUP_WIDTH}",
+            margin="0",
+        )
+        scope.style.button_width = _SCOPE_BUTTON_WIDTH
+        detail.layout = widgets.Layout(
+            align_items="center",
+            width="auto",
+            min_width="0",
+            flex="0 1 auto",
+        )
+        children = (scope, detail)
+    row = widgets.HBox(
+        children,
+        layout=widgets.Layout(
+            align_items="center",
+            flex_flow="row nowrap",
+            width="auto",
+            min_width=(_COMPACT_CONTROL_WIDTH if scope is None else _SCOPE_BUTTON_GROUP_WIDTH),
+        ),
+    )
+    return row, detail
+
+
+def ui_set_scope_detail(
+    detail: widgets.HBox,
+    controls: Sequence[widgets.Widget],
+) -> None:
+    """Install exactly one active case or aggregate-count control group."""
+    resolved = tuple(controls)
+    if not resolved:
+        message = "Scope detail requires one active case or count control."
+        raise ValueError(message)
+    detail.children = resolved
 
 
 def ui_step_case_count(

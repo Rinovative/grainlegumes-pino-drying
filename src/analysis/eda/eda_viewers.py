@@ -21,7 +21,7 @@ This module does NOT:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
@@ -42,16 +42,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
 _TransientCaseKind = Literal["snapshot", "trajectory"]
-_SCOPE_ROW_WIDTH = f"{ui.notebook.COMPACT_VIEW_SELECTOR_WIDTH_PX}px"
-_WIDGET_DEFAULT_MARGIN_PX = 2.0
-_SCOPE_BUTTON_INCREMENT_POINTS = 1.0
-_CSS_PIXELS_PER_POINT = 96.0 / 72.0
-_SCOPE_BUTTON_WIDTH_PX = (
-    ui.notebook.COMPACT_VIEW_SELECTOR_WIDTH_PX - 4.0 * _WIDGET_DEFAULT_MARGIN_PX
-) / 2.0 + _SCOPE_BUTTON_INCREMENT_POINTS * _CSS_PIXELS_PER_POINT
-_SCOPE_BUTTON_WIDTH = f"{_SCOPE_BUTTON_WIDTH_PX:.12g}px"
-_SCOPE_BUTTON_GROUP_WIDTH_PX = 2.0 * _SCOPE_BUTTON_WIDTH_PX + 4.0 * _WIDGET_DEFAULT_MARGIN_PX
-_SCOPE_BUTTON_GROUP_WIDTH = f"{_SCOPE_BUTTON_GROUP_WIDTH_PX:.12g}px"
 _MINIMUM_COMPARABLE_MAP_COUNT = 2
 
 
@@ -143,52 +133,8 @@ def _show_message(
 def _compact_scope_controls(
     scope: widgets.ToggleButtons | None,
 ) -> tuple[widgets.HBox, widgets.HBox]:
-    """Build one bounded scope row with a replaceable case/count column."""
-    detail = widgets.HBox(
-        layout=widgets.Layout(
-            align_items="center",
-            min_width="0",
-        )
-    )
-    if scope is None:
-        detail.layout = widgets.Layout(
-            align_items="center",
-            width=_SCOPE_ROW_WIDTH,
-            min_width=_SCOPE_ROW_WIDTH,
-            max_width=_SCOPE_ROW_WIDTH,
-            flex=f"0 0 {_SCOPE_ROW_WIDTH}",
-        )
-        children: tuple[widgets.Widget, ...] = (detail,)
-    else:
-        scope.layout = widgets.Layout(
-            display="flex",
-            flex_flow="row nowrap",
-            align_items="stretch",
-            justify_content="flex-start",
-            width=_SCOPE_BUTTON_GROUP_WIDTH,
-            min_width=_SCOPE_BUTTON_GROUP_WIDTH,
-            max_width=_SCOPE_BUTTON_GROUP_WIDTH,
-            flex=f"0 0 {_SCOPE_BUTTON_GROUP_WIDTH}",
-            margin="0",
-        )
-        scope.style.button_width = _SCOPE_BUTTON_WIDTH
-        detail.layout = widgets.Layout(
-            align_items="center",
-            width="auto",
-            min_width="0",
-            flex="0 1 auto",
-        )
-        children = (scope, detail)
-    row = widgets.HBox(
-        children,
-        layout=widgets.Layout(
-            align_items="center",
-            flex_flow="row nowrap",
-            width="auto",
-            min_width=(_SCOPE_ROW_WIDTH if scope is None else _SCOPE_BUTTON_GROUP_WIDTH),
-        ),
-    )
-    return row, detail
+    """Build one bounded scope row through the shared EDA control owner."""
+    return ui.components.ui_compact_scope_controls(scope)
 
 
 def _set_optional_children(
@@ -205,12 +151,8 @@ def _set_scope_detail(
     detail: widgets.HBox,
     controls: Sequence[widgets.Widget],
 ) -> None:
-    """Fit one active case/count navigator into the bounded scope column."""
-    resolved = tuple(controls)
-    if not resolved:
-        message = "Scope detail requires one active case or count control."
-        raise ValueError(message)
-    detail.children = resolved
+    """Fit one active case/count navigator through the shared control owner."""
+    ui.components.ui_set_scope_detail(detail, controls)
 
 
 def _scale_lock_is_meaningful(
@@ -347,14 +289,7 @@ def make_spectral_view(
     )
     if aggregate_plot_function is None:
         retained_scope = "single"
-    scope = (
-        widgets.ToggleButtons(
-            options=(("Aggregate", "aggregate"), ("Single case", "single")),
-            value=retained_scope,
-        )
-        if aggregate_plot_function is not None
-        else None
-    )
+    scope = ui.components.ui_scope_toggle(value=retained_scope) if aggregate_plot_function is not None else None
     semantic = dict(semantic_controls or {})
     semantic_rows = (widgets.HBox(tuple(semantic.values())),) if semantic else ()
     scope_row, scope_detail = _compact_scope_controls(scope)
@@ -517,8 +452,8 @@ def make_spectral_view(
     return view
 
 
-class _ChannelState:
-    """Preserve compatible checkbox channels in shared session state."""
+class _ChannelState(ui.components.ChannelCheckboxState):
+    """Adapt the shared channel checkbox owner to EDA selection state."""
 
     def __init__(
         self,
@@ -528,85 +463,16 @@ class _ChannelState:
         selection_state: selection.GeneratedOutputSelectionState,
         capability: str,
     ) -> None:
-        """Initialize an empty capability-bound checkbox container."""
-        self._title = title
-        self._callback = callback
-        self._selection_state = selection_state
-        self._capability = capability
-        self._known: tuple[str, ...] = ()
-        self._group: ui.components.CheckboxGroup | None = None
-        self.status = widgets.HTML(
-            layout=widgets.Layout(display="none"),
-        )
-        self.container = widgets.VBox(
-            layout=widgets.Layout(
-                display="none",
-                width="max-content",
-                max_width="100%",
-                align_items="flex-start",
-            )
-        )
-
-    @property
-    def selected(self) -> tuple[str, ...]:
-        """Return checked channels in canonical visible order."""
-        if self._group is None:
-            return ()
-        return tuple(name for name, checkbox in self._group.boxes.items() if checkbox.value)
-
-    def _changed(self) -> None:
-        """Retain one accepted channel selection before rendering."""
-        self._selection_state.select_channels(
-            self._capability,
-            self.selected,
-        )
-        self._callback()
-
-    def rebind(
-        self,
-        options: Sequence[str],
-        *,
-        labels: Mapping[str, str] | None = None,
-    ) -> None:
-        """Keep retained compatible choices and report removed selections."""
-        resolved = tuple(options)
-        if not resolved or len(resolved) != len(set(resolved)):
-            message = "Channel controls require unique compatible options."
-            raise ValueError(message)
-        retained = self._selection_state.channel_selection(self._capability)
-        if retained is None:
-            defaults = resolved
-            removed: tuple[str, ...] = ()
-        else:
-            allowed = set(resolved)
-            previously_known = set(self._known)
-            defaults = tuple(name for name in resolved if name in retained or name not in previously_known)
-            removed = tuple(name for name in retained if name not in allowed)
-        group = cast(
-            "ui.components.CheckboxGroup",
-            ui.components.ui_checkbox_channels(
-                channels=resolved,
-                default_on=defaults,
-                labels=labels,
-                fixed_columns=3,
+        """Bind one EDA capability key to the shared channel controller."""
+        super().__init__(
+            title=title,
+            callback=callback,
+            selection_getter=lambda: selection_state.channel_selection(capability),
+            selection_setter=lambda values: selection_state.select_channels(
+                capability,
+                values,
             ),
         )
-        for checkbox in group.boxes.values():
-            checkbox.observe(
-                lambda _change: self._changed(),
-                names="value",
-            )
-        self._group = group
-        self._known = resolved
-        self._selection_state.select_channels(self._capability, defaults)
-        self.status.value = "<p>Unavailable channels removed: " + ", ".join(removed) + ".</p>" if removed else ""
-        self.status.layout.display = "flex" if removed else "none"
-        self.container.children = (
-            widgets.HTML(f"<b>{self._title}</b>"),
-            cast("widgets.Widget", group),
-            self.status,
-        )
-        self.container.layout.display = "flex"
 
 
 def _scale_lock(
@@ -1041,12 +907,11 @@ def _make_transient_trajectory_view(
         max_cases=initial_maximum,
         step_size=50,
     )
-    scope = widgets.ToggleButtons(
-        options=(("Aggregate", "aggregate"), ("Single case", "single")),
+    scope = ui.components.ui_scope_toggle(
         value=selection_state.scope_selection(
             "transient_trajectories",
             default="aggregate",
-        ),
+        )
     )
     scope_row, scope_detail = _compact_scope_controls(scope)
     output = ui.components.ui_output_plot()

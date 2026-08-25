@@ -21,7 +21,7 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.container import BarContainer
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Polygon
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +40,7 @@ class HistogramArtists:
 
     heights: np.ndarray
     bin_edges: np.ndarray
-    bars: BarContainer | None
+    bars: BarContainer | Polygon | list[BarContainer | Polygon] | None
     constant_line: Line2D | None
     constant_value: float | None
 
@@ -97,7 +98,7 @@ def plot_histogram(
 
     heights, bin_edges, bars = axis.hist(
         array,
-        bins=bins,
+        bins=cast("int | Sequence[float] | str | None", bins),
         weights=resolved_weights,
         density=density,
         **kwargs,

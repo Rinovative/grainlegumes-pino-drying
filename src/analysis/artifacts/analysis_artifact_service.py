@@ -19,7 +19,7 @@ Design principles:
 This module does NOT:
   - Parse CLI arguments or choose which runs a user intends to process
   - Define scientific metrics or the Parquet/NPZ payload schema
-  - Render notebook figures or broaden the curated W&B upload inventory
+  - Render notebook figures or bypass bounded W&B publication contracts
 """
 
 from __future__ import annotations
@@ -31,11 +31,12 @@ import shutil
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 import numpy as np
@@ -44,7 +45,8 @@ import torch
 
 from src import common, domain, experiments
 
-from . import contracts, generation, timing
+from . import analysis_artifact_performance as artifact_performance
+from . import contracts, generation, timing, transient
 
 if TYPE_CHECKING:
     from src import datasets
@@ -76,8 +78,9 @@ class RunArtifactPlan:
         Current evaluable run whose config and saved split metadata were validated.
     id_dataset_name : str
         Logical training dataset supplying the saved evaluation membership.
-    ood_dataset_name : str
-        Logical OOD dataset supplying the saved OOD membership.
+    ood_dataset_name : str | None
+        Logical OOD dataset supplying saved OOD membership. Completed transient
+        runs without an OOD package retain None rather than inventing a role.
 
     Notes
     -----
@@ -87,7 +90,7 @@ class RunArtifactPlan:
 
     run_dir: Path
     id_dataset_name: str
-    ood_dataset_name: str
+    ood_dataset_name: str | None
     lifecycle_status: str
     is_completed: bool
     scientific_run_name: str
@@ -324,6 +327,20 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     """
     run_dir = Path(run_dir).expanduser().resolve()
     admitted = experiments.run.validate_evaluable_run(run_dir)
+    if admitted["config"].get("task") == "transient_drying":
+        transient_plan = transient.transient_artifact_plan_from_completed(
+            admitted,
+            run_dir=run_dir,
+        )
+        return RunArtifactPlan(
+            run_dir=run_dir,
+            id_dataset_name=transient_plan.id_role.dataset_name,
+            ood_dataset_name=(None if transient_plan.ood_role is None else transient_plan.ood_role.dataset_name),
+            lifecycle_status="completed",
+            is_completed=True,
+            scientific_run_name=transient_plan.run_name,
+        )
+
     data_cfg = _load_data_config(run_dir)
     from src import datasets  # noqa: PLC0415
 
@@ -1709,6 +1726,165 @@ def rebuild_artifact_target(*, run_dir: Path, save_root: Path) -> None:
         _rebuild_artifact_target_locked(run_dir=run_dir, save_root=save_root)
 
 
+def _transient_progress_reporter(
+    *,
+    completed: Mapping[str, Any],
+    role: transient.TransientArtifactRolePlan,
+    device_resolution: DeviceResolution,
+    output_root: Path,
+) -> artifact_performance.ArtifactProgressReporter:
+    """Build one compact reporter from already-admitted runtime metadata."""
+    config = completed.get("config")
+    training = config.get("training") if isinstance(config, Mapping) else None
+    raw_stage = None
+    if isinstance(training, Mapping):
+        raw_stage = training.get("comparison_arm") or training.get("stage")
+    stage_label = str(raw_stage or "run").replace("a_plus", "a+")
+    run_name = completed.get("scientific_run_name")
+    reporter = artifact_performance.ArtifactProgressReporter(
+        task="transient_drying",
+        run=str(run_name or "transient_run"),
+        stage_label=stage_label,
+        checkpoint_label="best",
+        device=device_resolution.device,
+        dtype="float32",
+        total_cases=sum(len(case_ids) for case_ids in role.case_ids_by_source),
+        split=role.dataset_role,
+        output_root=output_root,
+    )
+    reporter.startup()
+    return reporter
+
+
+def _run_or_load_transient_artifacts_locked(
+    *,
+    run_dir: Path,
+    dataset_name: str,
+    split: ArtifactSplit,
+    device_resolution: DeviceResolution,
+    dataset_root: Path,
+    rebuild: bool,
+) -> pd.DataFrame:
+    """Load or atomically generate one completed transient sequence artifact."""
+    from src.analysis.evaluation import (  # noqa: PLC0415
+        evaluation_transient_artifact as sequence_artifact,
+    )
+
+    completed = experiments.run.validate_completed_run(run_dir)
+    plan = transient.transient_artifact_plan_from_completed(
+        completed,
+        run_dir=run_dir,
+    )
+    role = plan.id_role if split == "eval" else plan.ood_role
+    if role is None:
+        msg = "Completed transient run has no saved OOD artifact role."
+        raise FileNotFoundError(msg)
+    if role.dataset_name != dataset_name:
+        msg = f"Requested transient dataset {dataset_name!r} does not match saved {split!r} identity {role.dataset_name!r}."
+        raise RuntimeError(msg)
+    save_root = _artifact_save_root(
+        run_dir=run_dir,
+        dataset_name=dataset_name,
+        split=split,
+    )
+    parquet_path = save_root / f"{dataset_name}.parquet"
+    npz_dir = save_root / "npz"
+
+    def admit(root: Path) -> Any:
+        try:
+            return transient.validate_transient_role_artifact_index(
+                root,
+                completed=completed,
+                role=role,
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            msg = f"Transient artifact cache is incompatible for {run_dir.name}/{split}/{dataset_name}: {type(error).__name__}: {error}"
+            raise ArtifactCacheError(msg) from error
+
+    if not rebuild and _cache_has_outputs(
+        save_root=save_root,
+        parquet_path=parquet_path,
+        npz_dir=npz_dir,
+    ):
+        print(f"[RUN] {run_dir.name} | split={split} | dataset={dataset_name}")
+        print(f"      run_dir={run_dir}")
+        print(f"      save_root={save_root}")
+        loaded = admit(save_root)
+        frame = loaded.frame
+        frame.attrs["artifact_root"] = str(save_root.resolve())
+        frame.attrs["artifact_provenance"] = dict(loaded.provenance)
+        frame.attrs["artifact_kind"] = "transient_sequence"
+        frame.attrs["transient_sequence_index"] = loaded
+        frame.attrs["transient_unavailable_horizons"] = loaded.unavailable_horizons
+        frame.attrs["transient_scaling_state"] = deepcopy(completed["normalizer_state"])
+        print(f"[LOAD] {run_dir.name} | {split} | {dataset_name} (validated transient sequence cache)")
+        return frame
+
+    reporter = _transient_progress_reporter(
+        completed=completed,
+        role=role,
+        device_resolution=device_resolution,
+        output_root=save_root,
+    )
+    staging_root: Path | None = None
+    published: Any | None = None
+    try:
+        staging_root = _create_artifact_staging_root(save_root)
+        staged = transient.generate_transient_role_artifact(
+            run_dir=run_dir,
+            role=role,
+            device_resolution=device_resolution,
+            dataset_root=dataset_root,
+            staging_root=staging_root,
+            progress_reporter=reporter,
+        )
+        with reporter.phase("validation"):
+            transient.validate_staged_transient_role_artifact(
+                staged,
+                completed=completed,
+                role=role,
+            )
+        with reporter.phase("publication"):
+            _publish_staged_artifact(
+                run_dir=run_dir,
+                save_root=save_root,
+                staging_root=staging_root,
+            )
+            published = admit(save_root)
+        snapshot = reporter.final_snapshot()
+        sequence_artifact.publish_transient_operational_performance(
+            save_root,
+            snapshot,
+        )
+        reporter.done(snapshot)
+    except BaseException:
+        reporter.failure(phase="preflight" if staging_root is None else None)
+        raise
+    finally:
+        if staging_root is not None and staging_root.exists():
+            shutil.rmtree(staging_root)
+        cleanup_runtime(device_resolution.device)
+    if published is None:
+        message = "Transient artifact publication did not complete."
+        raise RuntimeError(message)
+    frame = published.frame
+    with contracts.artifact_provenance_path(save_root).open("r", encoding="utf-8") as handle:
+        final_provenance = json.load(handle)
+    frame.attrs["artifact_root"] = str(save_root.resolve())
+    frame.attrs["artifact_provenance"] = final_provenance
+    frame.attrs["artifact_kind"] = "transient_sequence"
+    frame.attrs["transient_sequence_index"] = published
+    frame.attrs["transient_unavailable_horizons"] = published.unavailable_horizons
+    frame.attrs["transient_scaling_state"] = deepcopy(completed["normalizer_state"])
+    return frame
+
+
 def _run_or_load_artifacts_locked(
     *,
     run_dir: Path,
@@ -1758,6 +1934,16 @@ def _run_or_load_artifacts_locked(
 
     """
     dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
+    task = experiments.config.loader.validate_resolved_task_contract(_load_run_config(run_dir))
+    if task.id == "transient_drying":
+        return _run_or_load_transient_artifacts_locked(
+            run_dir=run_dir,
+            dataset_name=dataset_name,
+            split=split,
+            device_resolution=device_resolution,
+            dataset_root=dataset_root,
+            rebuild=rebuild,
+        )
 
     save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split)
     npz_dir = save_root / "npz"
@@ -1771,8 +1957,6 @@ def _run_or_load_artifacts_locked(
         dataset_root=dataset_root,
         metadata_root=metadata_root,
     )
-    task = experiments.config.loader.validate_resolved_task_contract(_load_run_config(run_dir))
-
     print(f"[RUN] {run_dir.name} | split={split} | dataset={dataset_name}")
     print(f"      run_dir={run_dir}")
     print(f"      save_root={save_root}")
@@ -1922,6 +2106,39 @@ def validate_artifact_upload_source(
     if _normalise_path(validated_target) != _normalise_path(root):
         msg = f"Artifact upload target does not resolve to the explicit artifact root: {root}"
         raise ArtifactCacheError(msg)
+    completed = experiments.run.validate_completed_run(run_path)
+    config = completed["config"]
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    if task.id == "transient_drying":
+        plan = transient.transient_artifact_plan_from_completed(
+            completed,
+            run_dir=run_path,
+        )
+        if root == common.paths.resolve_id_analysis_dir(run_path).resolve():
+            role = plan.id_role
+        elif (
+            plan.ood_role is not None
+            and root
+            == common.paths.resolve_ood_analysis_dir(
+                run_path,
+                plan.ood_role.dataset_name,
+            ).resolve()
+        ):
+            role = plan.ood_role
+        else:
+            msg = "Transient artifact upload target does not match a saved ID/OOD role."
+            raise ArtifactCacheError(msg)
+        try:
+            loaded = transient.validate_transient_role_artifact(
+                root,
+                completed=completed,
+                role=role,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+            msg = f"Transient artifact upload source is incompatible: {type(error).__name__}: {error}"
+            raise ArtifactCacheError(msg) from error
+        return loaded.provenance
+
     provenance_path = contracts.artifact_provenance_path(root)
     provenance = dict(_read_artifact_provenance(provenance_path))
     _require_current_provenance_schema(provenance)
@@ -1935,10 +2152,7 @@ def validate_artifact_upload_source(
         msg = f"Artifact upload source payload manifest mismatch: {provenance_path}"
         raise ArtifactCacheError(msg)
 
-    completed = experiments.run.validate_completed_run(run_path)
     summary = completed["summary"]
-    config = completed["config"]
-    task = experiments.config.loader.validate_resolved_task_contract(config)
     run_identity = provenance.get("run")
     expected_identity = {
         "name": config["run"]["name"],
@@ -2081,14 +2295,58 @@ def run_or_load_artifacts(
         )
 
 
+def _transient_wandb_publication_evidence(
+    *,
+    plan: RunArtifactPlan,
+    id_frame: pd.DataFrame,
+    ood_frame: pd.DataFrame | None,
+) -> dict[str, bool | float | int | str]:
+    """Validate every transient role before reducing bounded W&B evidence."""
+    if (plan.ood_dataset_name is None) is not (ood_frame is None):
+        msg = "Transient W&B publication requires matching saved OOD identity and frame availability."
+        raise ArtifactCacheError(msg)
+    role_specs: list[tuple[str, ArtifactSplit, str, pd.DataFrame]] = [
+        ("id", "eval", plan.id_dataset_name, id_frame),
+    ]
+    if plan.ood_dataset_name is not None and ood_frame is not None:
+        role_specs.append(("ood", "ood", plan.ood_dataset_name, ood_frame))
+
+    frames: dict[str, pd.DataFrame] = {}
+    for role, split, dataset_name, frame in role_specs:
+        artifact_root = _artifact_save_root(
+            run_dir=plan.run_dir,
+            dataset_name=dataset_name,
+            split=split,
+        )
+        validated = validate_artifact_upload_source(
+            run_dir=plan.run_dir,
+            artifact_root=artifact_root,
+        )
+        frame_provenance = frame.attrs.get("artifact_provenance")
+        if not isinstance(frame_provenance, Mapping) or common.serialization.canonical_json_sha256(
+            frame_provenance
+        ) != common.serialization.canonical_json_sha256(validated):
+            msg = f"Transient {role.upper()} frame provenance is not the validated upload source."
+            raise ArtifactCacheError(msg)
+        frames[role] = frame
+
+    from src.analysis.evaluation import transient_session  # noqa: PLC0415
+
+    evaluation = transient_session.TransientEvaluationSession(frames)
+    try:
+        return evaluation.wandb_publication_summary()
+    finally:
+        evaluation.close()
+
+
 def _upload_published_artifacts(
     *,
     plan: RunArtifactPlan,
     device_resolution: DeviceResolution,
     id_frame: pd.DataFrame,
-    ood_frame: pd.DataFrame,
+    ood_frame: pd.DataFrame | None,
 ) -> None:
-    """Upload only explicitly enabled completed-run provenance and curated media."""
+    """Publish only configured steady media or bounded transient summaries."""
     if not plan.is_completed:
         return
     config = _load_run_config(plan.run_dir)
@@ -2099,6 +2357,21 @@ def _upload_published_artifacts(
     upload = settings.get("upload")
     if settings.get("mode") == "disabled" or not isinstance(upload, Mapping) or not bool(upload.get("evaluation_artifacts")):
         return
+
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    transient_evidence: dict[str, bool | float | int | str] | None = None
+    ood_dataset_name = plan.ood_dataset_name
+    if task.id == "transient_drying":
+        transient_evidence = _transient_wandb_publication_evidence(
+            plan=plan,
+            id_frame=id_frame,
+            ood_frame=ood_frame,
+        )
+    elif ood_dataset_name is None or ood_frame is None:
+        msg = "The current steady-flow W&B report path requires both saved ID and OOD artifacts."
+        raise ArtifactCacheError(msg)
+    steady_ood_dataset_name = cast("str", ood_dataset_name)
+    steady_ood_frame = cast("pd.DataFrame", ood_frame)
 
     started_at = datetime.now(timezone.utc)
     runtime_session_id = uuid4().hex
@@ -2131,42 +2404,45 @@ def _upload_published_artifacts(
     )
     upload_error: BaseException | None = None
     try:
-        artifact_specs: tuple[tuple[ArtifactSplit, str], ...] = (
-            ("eval", plan.id_dataset_name),
-            ("ood", plan.ood_dataset_name),
-        )
-        artifact_roots = {
-            split: _artifact_save_root(
-                run_dir=plan.run_dir,
-                dataset_name=dataset_name,
-                split=split,
+        if transient_evidence is not None:
+            session.log_transient_evaluation_summary(transient_evidence)
+        else:
+            artifact_specs: tuple[tuple[ArtifactSplit, str], ...] = (
+                ("eval", plan.id_dataset_name),
+                ("ood", steady_ood_dataset_name),
             )
-            for split, dataset_name in artifact_specs
-        }
-        for artifact_root in artifact_roots.values():
-            validate_artifact_upload_source(
-                run_dir=plan.run_dir,
-                artifact_root=artifact_root,
-            )
-            session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
+            artifact_roots = {
+                split: _artifact_save_root(
+                    run_dir=plan.run_dir,
+                    dataset_name=dataset_name,
+                    split=split,
+                )
+                for split, dataset_name in artifact_specs
+            }
+            for artifact_root in artifact_roots.values():
+                validate_artifact_upload_source(
+                    run_dir=plan.run_dir,
+                    artifact_root=artifact_root,
+                )
+                session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
 
-        from src.analysis.evaluation import evaluation_dataframe  # noqa: PLC0415
-        from src.analysis.presentation import curated  # noqa: PLC0415
+            from src.analysis.evaluation import evaluation_dataframe  # noqa: PLC0415
+            from src.analysis.presentation import curated  # noqa: PLC0415
 
-        datasets_eval = {
-            f"{plan.run_dir.name} ID": evaluation_dataframe.build_eval_df(id_frame),
-            f"{plan.run_dir.name} OOD": evaluation_dataframe.build_eval_df(ood_frame),
-        }
-        with tempfile.TemporaryDirectory(prefix="grainlegumes-curated-analysis-") as temporary_directory:
-            bundle = curated.render_curated_analysis(
-                datasets=datasets_eval,
-                output_dir=temporary_directory,
-            )
-            session.upload_post_artifact(
-                artifact_root=artifact_roots["eval"],
-                media_files=bundle.media_files,
-                tables=bundle.tables,
-            )
+            datasets_eval = {
+                f"{plan.run_dir.name} ID": evaluation_dataframe.build_eval_df(id_frame),
+                f"{plan.run_dir.name} OOD": evaluation_dataframe.build_eval_df(steady_ood_frame),
+            }
+            with tempfile.TemporaryDirectory(prefix="grainlegumes-curated-analysis-") as temporary_directory:
+                bundle = curated.render_curated_analysis(
+                    datasets=datasets_eval,
+                    output_dir=temporary_directory,
+                )
+                session.upload_post_artifact(
+                    artifact_root=artifact_roots["eval"],
+                    media_files=bundle.media_files,
+                    tables=bundle.tables,
+                )
     except BaseException as error:
         upload_error = error
         raise
@@ -2198,6 +2474,17 @@ def _upload_published_artifacts(
 
 
 @dataclass(frozen=True)
+class ScopedTransientArtifact:
+    """Report one validated noncanonical transient debug artifact."""
+
+    root: Path
+    split: Literal["id", "ood"]
+    dataset_name: str
+    case_ids: tuple[str, ...]
+    identity_sha256: str
+
+
+@dataclass(frozen=True)
 class PreparedRunArtifacts:
     """
     Report path-based artifact loading and any explicit local generation.
@@ -2223,6 +2510,7 @@ def load_or_build_run_artifacts(
     run_dir: Path | str,
     *,
     artifact_roles: tuple[Literal["id", "ood"], ...] = ("id", "ood"),
+    artifact_root_overrides: Mapping[Literal["id", "ood"], Path | str] | None = None,
     dataset_root: Path | str | None = None,
     metadata_root: Path | str | None = None,
     auto_build_missing: bool = True,
@@ -2248,6 +2536,31 @@ def load_or_build_run_artifacts(
         msg = "artifact_roles must contain unique values from {'id', 'ood'}."
         raise ValueError(msg)
     path = Path(run_dir).expanduser().resolve()
+    overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
+    if set(overrides).difference(roles):
+        msg = "Artifact root overrides must belong to selected roles."
+        raise ValueError(msg)
+    if overrides:
+        if auto_build_missing or rebuild_incompatible:
+            msg = "Scoped artifact overrides require read-only load policy."
+            raise ValueError(msg)
+        loaded = artifact_loader.load_run_artifacts(
+            path,
+            artifact_roles=roles,
+            artifact_root_overrides=overrides,
+        )
+        return PreparedRunArtifacts(
+            loaded_run=loaded,
+            role_actions={role: ("reused_scoped_partial" if role in overrides else "reused") for role in roles},
+            artifact_device=None,
+        )
+    plan = load_run_artifact_plan(path)
+    if plan.ood_dataset_name is None and "ood" in roles:
+        if roles == ("id", "ood"):
+            roles = ("id",)
+        else:
+            msg = "Completed transient run has no saved OOD artifact role."
+            raise ValueError(msg)
     current_dataset_root = Path(dataset_root) if dataset_root is not None else common.paths.get_dataset_packages_root()
     current_metadata_root = Path(metadata_root) if metadata_root is not None else common.paths.get_dataset_metadata_root()
     actions: dict[str, str] = {}
@@ -2282,10 +2595,15 @@ def load_or_build_run_artifacts(
             rebuild = True
             action = "rebuilt"
 
+        if selected_role is None:
+            msg = "Artifact load failure did not identify a selected role."
+            raise RuntimeError(msg)
         if resolution is None:
             resolution = learning.device.resolve_device(device_policy, path="device_policy")
-        plan = load_run_artifact_plan(path)
         dataset_name = plan.id_dataset_name if selected_role == "id" else plan.ood_dataset_name
+        if dataset_name is None:
+            msg = f"Selected artifact role {selected_role!r} has no saved Dataset identity."
+            raise RuntimeError(msg)
         run_or_load_artifacts(
             run_dir=path,
             dataset_name=dataset_name,
@@ -2300,6 +2618,140 @@ def load_or_build_run_artifacts(
     raise RuntimeError(msg)
 
 
+def _publish_scoped_transient_stage(*, target: Path, stage: Path) -> None:
+    """Publish one validated scoped stage without overwriting a concurrent target."""
+    if target.exists() or target.is_symlink():
+        message = f"Scoped artifact output appeared concurrently: {target}"
+        raise FileExistsError(message)
+    stage.replace(target)
+
+
+def build_scoped_transient_artifact(
+    *,
+    run_dir: Path | str,
+    dataset_root: Path | str,
+    output_root: Path | str,
+    split: Literal["id", "ood"],
+    case_ids: Sequence[str] | None = None,
+    one_case: bool = False,
+    device_policy: str = "auto",
+) -> ScopedTransientArtifact:
+    """Generate selected transient cases into one explicit noncanonical root."""
+    from src import learning  # noqa: PLC0415
+    from src.analysis.evaluation import (  # noqa: PLC0415
+        evaluation_transient_artifact as sequence_artifact,
+    )
+
+    if split not in {"id", "ood"}:
+        msg = "Scoped transient split must be 'id' or 'ood'."
+        raise ValueError(msg)
+    if not isinstance(one_case, bool):
+        msg = "one_case must be boolean."
+        raise TypeError(msg)
+    requested = () if case_ids is None else tuple(case_ids)
+    if one_case and requested:
+        msg = "Select --one-case or explicit case IDs, not both."
+        raise ValueError(msg)
+    if not one_case and not requested:
+        msg = "Scoped transient generation requires --one-case or case IDs."
+        raise ValueError(msg)
+
+    path = Path(run_dir).expanduser().resolve(strict=True)
+    plan = transient.load_transient_artifact_plan(path)
+    saved_role = plan.id_role if split == "id" else plan.ood_role
+    if saved_role is None:
+        msg = "The completed transient run has no saved OOD role."
+        raise FileNotFoundError(msg)
+    available = tuple(case_id for source_case_ids in saved_role.case_ids_by_source for case_id in source_case_ids)
+    selected_ids = available[:1] if one_case else requested
+    selected_role = transient.select_transient_role_cases(
+        saved_role,
+        selected_ids,
+    )
+
+    target = _normalise_path(Path(output_root))
+    if target == Path(target.anchor) or path.is_relative_to(target) or target.is_relative_to(path):
+        msg = f"Scoped artifact output must be one narrow directory outside the run: {target}"
+        raise ValueError(msg)
+    canonical_analysis = _normalise_path(common.paths.resolve_analysis_root(path))
+    if target.is_relative_to(canonical_analysis):
+        msg = "Scoped artifacts cannot be written below the canonical run analysis root."
+        raise ValueError(msg)
+    if target.exists() or target.is_symlink():
+        msg = f"Scoped artifact output already exists; refusing to overwrite it: {target}"
+        raise FileExistsError(msg)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.parent.is_symlink() or target.parent.resolve() != target.parent:
+        msg = f"Scoped artifact output parent must be one exact regular directory: {target.parent}"
+        raise ValueError(msg)
+
+    resolution = learning.device.resolve_device(
+        device_policy,
+        path="device_policy",
+    )
+    completed = experiments.run.validate_completed_run(path)
+    reporter = _transient_progress_reporter(
+        completed=completed,
+        role=selected_role,
+        device_resolution=resolution,
+        output_root=target,
+    )
+    stage: Path | None = None
+    loaded: sequence_artifact.TransientSequenceArtifactIndex | None = None
+    try:
+        stage = _create_artifact_staging_root(target)
+        with experiments.run.run_reader_lease(path):
+            staged = transient.generate_transient_role_artifact(
+                run_dir=path,
+                role=selected_role,
+                saved_role=saved_role,
+                device_resolution=resolution,
+                dataset_root=dataset_root,
+                staging_root=stage,
+                progress_reporter=reporter,
+            )
+            with reporter.phase("validation"):
+                transient.validate_staged_transient_role_artifact(
+                    staged,
+                    completed=completed,
+                    role=selected_role,
+                )
+        lock_path = target.parent / f".{target.name}.scoped.lock"
+        with (
+            reporter.phase("publication"),
+            common.locking.exclusive_file_lock(lock_path, blocking=True),
+        ):
+            _publish_scoped_transient_stage(target=target, stage=stage)
+            loaded = transient.validate_scoped_transient_role_artifact_index(
+                target,
+                completed=completed,
+                saved_role=saved_role,
+            )
+        snapshot = reporter.final_snapshot()
+        sequence_artifact.publish_transient_operational_performance(
+            target,
+            snapshot,
+        )
+        reporter.done(snapshot)
+    except BaseException:
+        reporter.failure(phase="preflight" if stage is None else None)
+        raise
+    finally:
+        if stage is not None and stage.exists():
+            shutil.rmtree(stage)
+        cleanup_runtime(resolution.device)
+    if loaded is None:
+        msg = "Scoped transient artifact validation did not complete."
+        raise RuntimeError(msg)
+    return ScopedTransientArtifact(
+        root=target,
+        split=split,
+        dataset_name=selected_role.dataset_name,
+        case_ids=tuple(case_id for source_case_ids in selected_role.case_ids_by_source for case_id in source_case_ids),
+        identity_sha256=loaded.identity_sha256,
+    )
+
+
 def build_artifacts(
     *,
     runs_root: Path,
@@ -2310,7 +2762,7 @@ def build_artifacts(
     rebuild: bool = False,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
-    Build or validate ID and OOD artifacts for every selected run.
+    Build or validate every saved ID and optional OOD artifact role.
 
     Parameters
     ----------
@@ -2332,7 +2784,7 @@ def build_artifacts(
     Returns
     -------
     dict[str, dict[str, pandas.DataFrame]]
-        Validated ``eval`` and ``ood`` frames keyed by run name.
+        Validated ``eval`` and any saved ``ood`` frames keyed by run name.
 
     Raises
     ------
@@ -2342,10 +2794,12 @@ def build_artifacts(
 
     Notes
     -----
-    Each run's ID and OOD caches are locally authoritative. When persisted W&B
-    settings explicitly request evaluation-artifact upload, the function appends
-    an observer runtime session and uploads only after both local targets validate.
-    Any requested online or offline observer failure propagates.
+    Each saved cache role is locally authoritative. Persisted W&B settings are
+    the sole publication opt-in. Steady runs retain the validated ID/OOD
+    provenance-and-curated-media upload. Transient runs validate ID and any saved
+    OOD role before observer initialization, then log only one bounded aggregate
+    scalar/string summary without provenance files or media. Any requested online
+    or offline observer failure propagates.
 
     """
     from src import learning  # noqa: PLC0415
@@ -2367,16 +2821,20 @@ def build_artifacts(
             metadata_root=resolved_metadata_root,
             rebuild=rebuild,
         )
-        ood_frame = run_or_load_artifacts(
-            run_dir=plan.run_dir,
-            dataset_name=plan.ood_dataset_name,
-            split="ood",
-            device_resolution=device_resolution,
-            dataset_root=dataset_root,
-            metadata_root=resolved_metadata_root,
-            rebuild=rebuild,
-        )
-        results[run_dir.name] = {"eval": id_frame, "ood": ood_frame}
+        ood_frame: pd.DataFrame | None = None
+        role_results = {"eval": id_frame}
+        if plan.ood_dataset_name is not None:
+            ood_frame = run_or_load_artifacts(
+                run_dir=plan.run_dir,
+                dataset_name=plan.ood_dataset_name,
+                split="ood",
+                device_resolution=device_resolution,
+                dataset_root=dataset_root,
+                metadata_root=resolved_metadata_root,
+                rebuild=rebuild,
+            )
+            role_results["ood"] = ood_frame
+        results[run_dir.name] = role_results
         _upload_published_artifacts(
             plan=plan,
             device_resolution=device_resolution,

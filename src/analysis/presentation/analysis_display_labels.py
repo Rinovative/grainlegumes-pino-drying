@@ -35,6 +35,13 @@ _TASK_LABELS = {
     "steady_flow": "Airflow",
     "transient_drying": "Drying",
 }
+_EVALUATION_ROLE_LABELS = {
+    "id": "ID",
+    "ood": "Near-family OOD",
+}
+_EVALUATION_PROTOCOL_LABELS = {
+    "normalized_drying_group_macro_rmse": "Drying group macro RMSE",
+}
 _ROLE_LABELS = {
     "id": "ID",
     "seen": "ID",
@@ -131,6 +138,23 @@ def material_display_label(material_family: str) -> str:
 def regime_display_label(sampling_regime: str) -> str:
     """Return the centralized human-readable label for one sampling regime."""
     return humanize_identifier(sampling_regime)
+
+
+def evaluation_role_display_label(dataset_role: str) -> str:
+    """Return the run-relative scientific role for one Evaluation artifact."""
+    _require_identifier(dataset_role, label="dataset_role")
+    return _EVALUATION_ROLE_LABELS.get(dataset_role, humanize_identifier(dataset_role))
+
+
+def material_role_display_label(material_family: str, dataset_role: str) -> str:
+    """Return one material-first label with run-relative Evaluation role."""
+    return f"{material_display_label(material_family)} · {evaluation_role_display_label(dataset_role)}"
+
+
+def evaluation_protocol_display_label(protocol: str) -> str:
+    """Return the shared human-facing label for one exact Evaluation objective."""
+    _require_identifier(protocol, label="protocol")
+    return _EVALUATION_PROTOCOL_LABELS.get(protocol, humanize_identifier(protocol))
 
 
 def campaign_role_display_label(metadata: DatasetDisplayMetadata) -> str:

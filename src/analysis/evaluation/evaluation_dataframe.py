@@ -35,6 +35,8 @@ import pandas as pd
 from src.analysis.artifacts import contracts
 
 COMPLETED_RUN_CONFIG_ATTR = "completed_run_config"
+RUNTIME_COMPARISON_ATTR = "runtime_comparison"
+RUNTIME_COMPARISON_ERROR_ATTR = "runtime_comparison_error"
 PRIMARY_OBJECTIVE_ID = "normalized_group_macro_rmse"
 PRIMARY_OBJECTIVE_DEFINITION = {
     "id": PRIMARY_OBJECTIVE_ID,

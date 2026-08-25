@@ -30,10 +30,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from src import common, datasets, domain, experiments
 from src.analysis.artifacts import contracts
+from src.analysis.artifacts import timing as artifact_timing
 
 from . import evaluation_dataframe as dataframe
 
@@ -999,6 +1000,94 @@ def _bind_artifact_to_run(
     return contracts.artifact_identity_digest(provenance)
 
 
+def _runtime_case_ids(role: _SavedRole, frame: pd.DataFrame) -> tuple[str, ...]:
+    """Return exact Dataset sample identities for the artifact's effective rows."""
+    raw_ids = role.dataset_identity.get("sample_ids")
+    if not isinstance(raw_ids, (list, tuple)) or not raw_ids or any(not isinstance(value, str) or not value for value in raw_ids):
+        msg = "Saved Dataset identity does not expose exact runtime sample IDs."
+        raise ValueError(msg)
+    source_indices = tuple(int(value) for value in frame["source_index"])
+    if any(index < 0 or index >= len(raw_ids) for index in source_indices):
+        msg = "Artifact source membership is outside the saved Dataset sample identity."
+        raise ValueError(msg)
+    return tuple(raw_ids[index] for index in source_indices)
+
+
+def _validate_runtime_comparison_binding(
+    value: Any,
+    *,
+    frame: pd.DataFrame,
+    role: _SavedRole,
+) -> dict[str, Any]:
+    """Bind optional runtime evidence to exact run, Dataset, role, and cases."""
+    payload = artifact_timing.validate_runtime_comparison(value)
+    provenance = dataframe.require_complete_provenance(frame)
+    run = _mapping(provenance.get("run"), label="artifact provenance run")
+    dataset = _mapping(provenance.get("dataset"), label="artifact provenance dataset")
+    selection = _mapping(provenance.get("selection"), label="artifact provenance selection")
+    runtime = _mapping(provenance.get("runtime"), label="artifact provenance runtime")
+    expected_dataset = {
+        "name": dataset.get("name"),
+        "fingerprint": dataset.get("fingerprint"),
+        "data_contract_digest": dataset.get("data_contract_digest"),
+        "saved_membership_digest": dataset.get("saved_membership_digest"),
+        "effective_ordered_source_indices_sha256": selection.get("effective_ordered_source_indices_sha256"),
+    }
+    expected_model = {
+        "run_name": run.get("name"),
+        "effective_config_digest": run.get("effective_config_digest"),
+        "best_checkpoint_sha256": run.get("best_checkpoint_sha256"),
+    }
+    cases = payload["cases"]
+    if payload["dataset_identity"] != expected_dataset or payload["model_identity"] != expected_model:
+        msg = "Runtime comparison disagrees with exact artifact Dataset or checkpoint identity."
+        raise ValueError(msg)
+    if payload["split_role"] != role.split_role or payload["measurement"]["batch_size"] != runtime.get("batch_size"):
+        msg = "Runtime comparison disagrees with the artifact role or evaluation batch size."
+        raise ValueError(msg)
+    if tuple(case["source_index"] for case in cases) != tuple(int(value) for value in frame["source_index"]):
+        msg = "Runtime comparison source membership disagrees with the artifact."
+        raise ValueError(msg)
+    if tuple(case["case_id"] for case in cases) != _runtime_case_ids(role, frame):
+        msg = "Runtime comparison case identity disagrees with the saved Dataset."
+        raise ValueError(msg)
+    return payload
+
+
+def _load_runtime_comparison_sidecar(
+    frame: pd.DataFrame,
+    *,
+    role: _SavedRole,
+) -> dict[str, Any]:
+    """Load and bind one regular artifact-local runtime sidecar."""
+    path = artifact_timing.runtime_comparison_path(role.root)
+    if not path.is_file() or path.is_symlink():
+        msg = "Runtime comparison sidecar must be one regular artifact-local file."
+        raise ValueError(msg)
+    return _validate_runtime_comparison_binding(
+        artifact_timing.load_runtime_comparison(role.root),
+        frame=frame,
+        role=role,
+    )
+
+
+def _attach_optional_runtime_comparison(
+    frame: pd.DataFrame,
+    *,
+    role: _SavedRole,
+) -> None:
+    """Attach valid operational timing while leaving core science independently valid."""
+    path = artifact_timing.runtime_comparison_path(role.root)
+    if not path.exists():
+        return
+    try:
+        payload = _load_runtime_comparison_sidecar(frame, role=role)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        frame.attrs[dataframe.RUNTIME_COMPARISON_ERROR_ATTR] = f"{type(error).__name__}: {error}"
+        return
+    frame.attrs[dataframe.RUNTIME_COMPARISON_ATTR] = deepcopy(payload)
+
+
 def _load_role(
     *,
     role: _SavedRole,
@@ -1113,6 +1202,10 @@ def _load_role(
             run_name=run_name,
             evaluation=evaluation,
         )
+        _attach_optional_runtime_comparison(
+            frame,
+            role=role,
+        )
     except EvaluationArtifactLoadError:
         raise
     except Exception as error:
@@ -1133,11 +1226,153 @@ def _load_role(
     )
 
 
+def _load_admitted_transient_run_artifacts(
+    run_dir: Path,
+    admitted: Mapping[str, Any],
+    *,
+    artifact_roles: tuple[ArtifactSelectionRole, ...],
+    artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
+) -> LoadedRunArtifacts:
+    """Load completed transient sequence roles without static artifact assumptions."""
+    if not bool(admitted.get("is_completed")):
+        msg = "Transient Evaluation requires a completed run; provisional artifacts are not admitted."
+        raise ValueError(msg)
+    from src.analysis.artifacts import transient  # noqa: PLC0415
+
+    plan = transient.transient_artifact_plan_from_completed(
+        admitted,
+        run_dir=run_dir,
+    )
+    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "ood"}):
+        msg = "artifact_roles must contain unique values from {'id', 'ood'}."
+        raise ValueError(msg)
+    overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
+    if set(overrides).difference(artifact_roles):
+        msg = "Artifact root overrides must belong to selected transient roles."
+        raise ValueError(msg)
+
+    def load_role(
+        role_plan: transient.TransientArtifactRolePlan | None,
+        *,
+        selection_role: ArtifactSelectionRole,
+    ) -> LoadedEvaluationArtifact:
+        split_role: ArtifactRole = "eval" if selection_role == "id" else "ood"
+        if role_plan is None:
+            root = common.paths.resolve_analysis_root(run_dir) / "ood"
+            raise _missing(
+                task="transient_drying",
+                run_name=plan.run_name,
+                run_dir=run_dir,
+                role=split_role,
+                root=root,
+            )
+        canonical_root = (
+            common.paths.resolve_id_analysis_dir(run_dir)
+            if selection_role == "id"
+            else common.paths.resolve_ood_analysis_dir(run_dir, role_plan.dataset_name)
+        ).absolute()
+        override = overrides.get(selection_role)
+        root = canonical_root if override is None else Path(override).expanduser().resolve(strict=False)
+        if not root.exists():
+            raise _missing(
+                task="transient_drying",
+                run_name=plan.run_name,
+                run_dir=run_dir,
+                role=split_role,
+                root=root,
+            )
+        if not root.is_dir() or root.resolve(strict=True) != root:
+            raise _incompatible(
+                task="transient_drying",
+                run_name=plan.run_name,
+                run_dir=run_dir,
+                role=split_role,
+                root=root,
+                reason="artifact root is not one exact regular run-owned directory",
+            )
+        marker = contracts.artifact_provenance_path(root)
+        if not marker.is_file():
+            if not any(root.iterdir()):
+                raise _missing(
+                    task="transient_drying",
+                    run_name=plan.run_name,
+                    run_dir=run_dir,
+                    role=split_role,
+                    root=root,
+                )
+            raise _incompatible(
+                task="transient_drying",
+                run_name=plan.run_name,
+                run_dir=run_dir,
+                role=split_role,
+                root=root,
+                reason=f"partial sequence artifact has no completion marker {marker.name}",
+            )
+        try:
+            loaded = (
+                transient.validate_transient_role_artifact_index(
+                    root,
+                    completed=admitted,
+                    role=role_plan,
+                )
+                if override is None
+                else transient.validate_scoped_transient_role_artifact_index(
+                    root,
+                    completed=admitted,
+                    saved_role=role_plan,
+                )
+            )
+        except Exception as error:
+            raise _incompatible(
+                task="transient_drying",
+                run_name=plan.run_name,
+                run_dir=run_dir,
+                role=split_role,
+                root=root,
+                reason=f"{type(error).__name__}: {error}",
+            ) from error
+        frame = loaded.frame
+        frame.attrs["artifact_root"] = str(root.resolve())
+        frame.attrs["artifact_provenance"] = deepcopy(dict(loaded.provenance))
+        frame.attrs["artifact_kind"] = "transient_sequence"
+        frame.attrs["artifact_scope"] = "canonical" if override is None else "scoped_partial"
+        frame.attrs["transient_sequence_index"] = loaded
+        frame.attrs["transient_unavailable_horizons"] = loaded.unavailable_horizons
+        frame.attrs["transient_scaling_state"] = deepcopy(cast("Mapping[str, Any]", admitted["normalizer_state"]))
+        frame.attrs[dataframe.COMPLETED_RUN_CONFIG_ATTR] = deepcopy(dict(cast("Mapping[str, Any]", admitted["config"])))
+        return LoadedEvaluationArtifact(
+            split_role=split_role,
+            dataset_name=role_plan.dataset_name,
+            root=root,
+            frame=frame,
+            identity_sha256=loaded.identity_sha256,
+        )
+
+    id_artifact = load_role(plan.id_role, selection_role="id") if "id" in artifact_roles else None
+    ood_artifact = load_role(plan.ood_role, selection_role="ood") if "ood" in artifact_roles else None
+    summary = _mapping(admitted.get("summary"), label="completed transient summary")
+    return LoadedRunArtifacts(
+        task="transient_drying",
+        run_name=plan.run_name,
+        run_dir=run_dir,
+        id_artifact=id_artifact,
+        ood_artifact=ood_artifact,
+        lifecycle_status="completed",
+        is_completed=True,
+        is_provisional=False,
+        selected_checkpoint_role=str(admitted["selected_checkpoint_role"]),
+        selected_checkpoint_epoch=int(admitted["selected_checkpoint_epoch"]),
+        selected_checkpoint_sha256=str(admitted["selected_checkpoint_sha256"]),
+        summary=deepcopy(dict(summary)),
+    )
+
+
 def _load_admitted_run_artifacts(
     run_dir: Path,
     admitted: Mapping[str, Any],
     *,
     artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
 ) -> LoadedRunArtifacts:
     """Load both artifact roles from one already admitted current run path."""
     run_dir = run_dir.expanduser().resolve()
@@ -1145,6 +1380,16 @@ def _load_admitted_run_artifacts(
     summary = _mapping(admitted.get("summary"), label="evaluable summary")
     normalizer_state = _mapping(admitted.get("normalizer_state"), label="evaluable normalizer state")
     task_spec = experiments.config.loader.validate_resolved_task_contract(config)
+    if task_spec.id == "transient_drying":
+        return _load_admitted_transient_run_artifacts(
+            run_dir,
+            admitted,
+            artifact_roles=artifact_roles,
+            artifact_root_overrides=artifact_root_overrides,
+        )
+    if artifact_root_overrides:
+        msg = "Explicit artifact root overrides are supported only for transient scoped artifacts."
+        raise ValueError(msg)
     run_config = _mapping(config.get("run"), label="config.yaml run")
     scientific_run_name = _nonempty_string(run_config.get("name"), label="config.yaml run.name")
     if config.get("task") != task_spec.id or summary.get("task") != task_spec.id:
@@ -1223,6 +1468,7 @@ def load_run_artifacts(
     run_dir: Path | str,
     *,
     artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
 ) -> LoadedRunArtifacts:
     """
     Load strict ID and OOD artifacts from one explicit current run directory.
@@ -1233,4 +1479,9 @@ def load_run_artifacts(
     """
     path = Path(run_dir).expanduser().resolve()
     with experiments.run.evaluable_run_lease(path) as admitted:
-        return _load_admitted_run_artifacts(path, admitted, artifact_roles=artifact_roles)
+        return _load_admitted_run_artifacts(
+            path,
+            admitted,
+            artifact_roles=artifact_roles,
+            artifact_root_overrides=artifact_root_overrides,
+        )

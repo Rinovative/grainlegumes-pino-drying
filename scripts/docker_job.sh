@@ -13,7 +13,7 @@ usage() {
 Usage:
   $0 train <experiment_config> [training options...] [--queue-gpu auto|INDEX] [--follow]
   $0 optuna <optuna_config> [Optuna options...] [--queue-gpu auto|INDEX] [--follow]
-  $0 artifacts (--task TASK | --runs-root PATH) [artifact options...] [--queue-gpu auto|INDEX]
+  $0 artifacts (--task TASK | --runs-root PATH | --run-dir PATH) [artifact options...] [--queue-gpu auto|INDEX]
 
 Workflows:
   train <experiment_config>
@@ -22,8 +22,9 @@ Workflows:
       Resume is explicit.
   optuna <optuna_config>
       Submit one Optuna study and return immediately. Persistent continuation uses study storage.
-  artifacts (--task TASK | --runs-root PATH)
+  artifacts (--task TASK | --runs-root PATH | --run-dir PATH)
       Generate or validate analysis artifacts for completed runs and return immediately.
+      Bounded transient cases require --run-dir and a new explicit --output-root.
 
 GPU selection:
   omit --queue-gpu  in an interactive TTY, show usage, and prompt for one host GPU.
@@ -178,7 +179,7 @@ is_semantic_path_option() {
   local option="$2"
 
   case "${job_type}:${option}" in
-    train:--resume|train:--output-root|optuna:--output-root|artifacts:--runs-root|artifacts:--dataset-root|artifacts:--metadata-root)
+    train:--resume|train:--output-root|optuna:--output-root|artifacts:--runs-root|artifacts:--run-dir|artifacts:--dataset-root|artifacts:--metadata-root|artifacts:--output-root)
       return 0
       ;;
     *)
@@ -274,6 +275,7 @@ resolve_artifact_selection() {
   local value
   local task_seen=false
   local runs_root_seen=false
+  local run_dir_seen=false
   local artifact_task=""
 
   while (( index < ${#arguments[@]} )); do
@@ -311,14 +313,33 @@ resolve_artifact_selection() {
         runs_root_seen=true
         index=$((index + 1))
         ;;
+      --run-dir)
+        if (( index + 1 >= ${#arguments[@]} )) || [[ -z "${arguments[index + 1]}" || "${arguments[index + 1]}" == --* ]]; then
+          fail 2 "--run-dir requires a non-empty path value."
+        fi
+        run_dir_seen=true
+        index=$((index + 2))
+        ;;
+      --run-dir=*)
+        value="${argument#--run-dir=}"
+        if [[ -z "${value}" ]]; then
+          fail 2 "--run-dir requires a non-empty path value."
+        fi
+        run_dir_seen=true
+        index=$((index + 1))
+        ;;
       *)
         index=$((index + 1))
         ;;
     esac
   done
 
-  if [[ "${task_seen}" == "${runs_root_seen}" ]]; then
-    fail 2 "Artifact jobs require exactly one of --task TASK or --runs-root PATH."
+  local selection_count=0
+  [[ "${task_seen}" == true ]] && selection_count=$((selection_count + 1))
+  [[ "${runs_root_seen}" == true ]] && selection_count=$((selection_count + 1))
+  [[ "${run_dir_seen}" == true ]] && selection_count=$((selection_count + 1))
+  if (( selection_count != 1 )); then
+    fail 2 "Artifact jobs require exactly one of --task TASK, --runs-root PATH, or --run-dir PATH."
   fi
   if [[ "${task_seen}" == true ]]; then
     if [[ "$(trim_whitespace "${artifact_task}")" != "${artifact_task}" || "${artifact_task}" == */* || "${artifact_task}" == *\\* || "${artifact_task}" == "." || "${artifact_task}" == ".." ]]; then
@@ -327,7 +348,7 @@ resolve_artifact_selection() {
     RESOLVED_TASK="${artifact_task}"
     LOG_SCOPE="${artifact_task}"
   else
-    RESOLVED_TASK="not supplied"
+    RESOLVED_TASK="selected-runs"
     LOG_SCOPE="artifacts"
   fi
 }
@@ -416,7 +437,7 @@ if [[ -z "${JOB_TYPE}" ]]; then
   exit 2
 fi
 
-RESOLVED_TASK="not supplied"
+RESOLVED_TASK="selected-runs"
 LOG_SCOPE=""
 CANONICAL_CONFIG_PATH="not applicable"
 PREFLIGHT_RUN_LABEL="not applicable"

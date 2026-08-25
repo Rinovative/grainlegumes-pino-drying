@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
@@ -184,7 +185,7 @@ def _load_candidates(
 
 @dataclass(frozen=True, slots=True)
 class _CompositeBatchEvidence:
-    """Present independently admitted cases through the existing batch consumer contract."""
+    """Present one admitted partial parent through the generated-batch consumer contract."""
 
     simulation_profile: str
     available_learning_views: tuple[str, ...]
@@ -193,24 +194,39 @@ class _CompositeBatchEvidence:
     sampling_regime: str
     template_sha256: str
     git_commit: str
-    git_commits: tuple[str, ...]
     cases: tuple[Any, ...]
+    _scientific_config_json: str
 
     def case(self, case_id: str) -> Any:
-        """Return one exact case from the immutable composite membership."""
+        """Return one exact case from the immutable partial-parent membership."""
         matches = tuple(case for case in self.cases if case.case_id == case_id)
         if len(matches) != 1:
-            raise ValueError(f"Composite batch {self.batch_id!r} has no unique case {case_id!r}.")
+            raise ValueError(f"Partial batch {self.batch_id!r} has no unique case {case_id!r}.")
         return matches[0]
 
+    def scientific_config_payload(self) -> dict[str, Any]:
+        """Return an independent mutable copy of the admitted parent science."""
+        payload = json.loads(self._scientific_config_json)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Admitted scientific configuration for {self.batch_id!r} is no longer an object.")
+        return payload
 
-def _composite_member_case(
+
+@dataclass(frozen=True, slots=True)
+class _CompositeMemberEvidence:
+    """Bind one re-admitted composite case to its actual terminal batch when present."""
+
+    case: Any
+    terminal_evidence: Any | None
+
+
+def _composite_member_evidence(
     member: Mapping[str, Any],
     batch: generation.cases.config.GenerationConfig,
     *,
     storage_root: Path,
-) -> Any:
-    """Re-admit one case from its declared partial or terminal composite source."""
+) -> _CompositeMemberEvidence:
+    """Re-admit one case and retain its actual terminal source owner when present."""
     source_kind = member.get("source_kind")
     source_run_id = common.paths.validate_logical_name(member.get("source_run_id"), label="source_run_id")
     source_manifest_path = generation.publication.campaign_evidence.campaign_run_manifest_path(
@@ -228,6 +244,7 @@ def _composite_member_case(
     case_index = member.get("case_index")
     if isinstance(case_index, bool) or not isinstance(case_index, int):
         raise ValueError("Composite case membership has an invalid case index.")
+    terminal = None
     if source_kind == "parent_partial":
         case = generation.runtime.admit_completed_case(
             batch,
@@ -260,10 +277,20 @@ def _composite_member_case(
         "case_hdf5_sha256": case.case_hdf5_sha256,
     }
     observed = {key: member.get(key) for key in expected}
-    case_commit = terminal.git_commit if source_kind == "replacement" else source_manifest["git_commit"]
+    case_commit = source_manifest["git_commit"] if terminal is None else terminal.git_commit
     if observed != expected or case_commit != member.get("source_git_commit"):
         raise RuntimeError(f"Composite receipt conflicts with re-admitted case evidence: {case.case_id!r}.")
-    return case
+    return _CompositeMemberEvidence(case=case, terminal_evidence=terminal)
+
+
+def _composite_member_case(
+    member: Mapping[str, Any],
+    batch: generation.cases.config.GenerationConfig,
+    *,
+    storage_root: Path,
+) -> Any:
+    """Return one re-admitted composite case for callers that do not need source ownership."""
+    return _composite_member_evidence(member, batch, storage_root=storage_root).case
 
 
 def _composite_template_relative_path(cases: Sequence[Any]) -> str:
@@ -316,7 +343,8 @@ def _load_composite_candidates(
         batch_members = [member for member in selected if member["batch_id"] == batch.batch_id]
         if not batch_members:
             raise ValueError(f"Composite receipt has no source cases for batch {batch.batch_id!r}.")
-        cases = tuple(_composite_member_case(member, batch, storage_root=storage) for member in batch_members)
+        admitted_members = tuple(_composite_member_evidence(member, batch, storage_root=storage) for member in batch_members)
+        cases = tuple(admitted.case for admitted in admitted_members)
         template_relative_path = _composite_template_relative_path(cases)
         first = cases[0].hdf5_identity
         shared_identity = (
@@ -341,16 +369,31 @@ def _load_composite_candidates(
         ):
             raise RuntimeError(f"Composite cases have incompatible HDF5 identities for batch {batch.batch_id!r}.")
         member_commits = tuple(sorted({str(member["source_git_commit"]) for member in batch_members}))
-        evidence = _CompositeBatchEvidence(
-            simulation_profile=first.simulation_profile,
-            available_learning_views=first.available_learning_views,
-            airflow_source=first.airflow_source,
-            batch_id=batch.batch_id,
-            sampling_regime=batch.sampling_regime,
-            template_sha256=first.template_sha256,
-            git_commit=member_commits[0] if len(member_commits) == 1 else "",
-            git_commits=member_commits,
-            cases=cases,
+        parent_pairs = tuple(
+            (member, admitted) for member, admitted in zip(batch_members, admitted_members, strict=True) if member["source_kind"] == "parent_partial"
+        )
+        parent_commits = {str(member["source_git_commit"]) for member, _admitted in parent_pairs}
+        if len(parent_commits) > 1:
+            raise RuntimeError(f"Partial parent cases have conflicting source commits for batch {batch.batch_id!r}.")
+        parent_evidence = (
+            _CompositeBatchEvidence(
+                simulation_profile=first.simulation_profile,
+                available_learning_views=first.available_learning_views,
+                airflow_source=first.airflow_source,
+                batch_id=batch.batch_id,
+                sampling_regime=batch.sampling_regime,
+                template_sha256=first.template_sha256,
+                git_commit=next(iter(parent_commits)),
+                cases=tuple(admitted.case for _member, admitted in parent_pairs),
+                _scientific_config_json=json.dumps(
+                    batch.scientific_values,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            if parent_pairs
+            else None
         )
         batch_records.append(
             {
@@ -358,22 +401,23 @@ def _load_composite_candidates(
                 "batch_id": batch.batch_id,
                 "batch_identity": batch.batch_identity,
                 "manifest_sha256": common.serialization.canonical_json_sha256(list(batch_members)),
-                "simulation_profile": evidence.simulation_profile,
-                "template": {"relative_path": template_relative_path, "sha256": evidence.template_sha256},
+                "simulation_profile": first.simulation_profile,
+                "template": {"relative_path": template_relative_path, "sha256": first.template_sha256},
                 "scientific_config_digest": first.scientific_config_digest,
-                "git_commits": list(evidence.git_commits),
+                "git_commits": list(member_commits),
                 "material_config_digest": batch.scientific_values["material_config_digest"],
                 "material_role": batch.material_role,
                 "evaluation_regime": batch.evaluation_regime,
                 "natural_support_state": batch.scientific_values["natural_support_state"],
                 "operation_config_digest": batch.scientific_values["operation_config_digest"],
-                "airflow_source": evidence.airflow_source,
-                "available_learning_views": list(evidence.available_learning_views),
+                "airflow_source": first.airflow_source,
+                "available_learning_views": list(first.available_learning_views),
                 "export_contract_sha256": first.export_contract_sha256,
                 "steady_flow_conditioning": copy.deepcopy(batch.scientific_values["steady_flow_conditioning"]),
             }
         )
-        for member, case in zip(batch_members, cases, strict=True):
+        for member, admitted in zip(batch_members, admitted_members, strict=True):
+            case = admitted.case
             payload = case.metadata_payload()
             observed_ownership = (
                 payload.get("material_family"),
@@ -389,12 +433,15 @@ def _load_composite_candidates(
             )
             if observed_ownership != expected_ownership:
                 raise ValueError(f"Composite case {case.case_id!r} disagrees with its parent package ownership.")
+            source_evidence = admitted.terminal_evidence if member["source_kind"] == "replacement" else parent_evidence
+            if source_evidence is None:
+                raise RuntimeError(f"Composite case {case.case_id!r} has no admitted source-batch evidence.")
             candidates.append(
                 {
                     "batch": batch,
-                    "terminal_evidence": evidence,
+                    "terminal_evidence": source_evidence,
                     "case_evidence": case,
-                    "manifest": evidence,
+                    "manifest": source_evidence,
                     "record": case.record_payload(),
                     "case_payload": payload,
                     "batch_id": batch.batch_id,
@@ -402,7 +449,7 @@ def _load_composite_candidates(
                     "case_id": case.case_id,
                     "package_case_id": _global_case_id(batch.batch_name, case.case_id),
                     "material_family": case.material_family,
-                    "simulation_profile": evidence.simulation_profile,
+                    "simulation_profile": first.simulation_profile,
                     "case_input_id": case.case_input_id,
                     "simulation_case_id": case.simulation_case_id,
                     "case_hdf5_relative": case.hdf5_path.relative_to(storage).as_posix(),

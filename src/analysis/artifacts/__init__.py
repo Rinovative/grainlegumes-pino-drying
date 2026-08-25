@@ -6,6 +6,7 @@ Provides:
 - generation: deterministic Parquet and NPZ artifact production
 - service: artifact lifecycle, cache, rebuilding, and publication
 - timing: COMSOL and neural runtime evidence
+- transient: sequence-aware transient artifact planning and generation
 """
 
 from __future__ import annotations
@@ -18,14 +19,16 @@ if TYPE_CHECKING:
     from . import analysis_artifact_generation as generation
     from . import analysis_artifact_service as service
     from . import analysis_artifact_timing as timing
+    from . import analysis_artifact_transient as transient
 
 _MODULES = {
     "contracts": "analysis_artifact_contracts",
     "generation": "analysis_artifact_generation",
     "service": "analysis_artifact_service",
     "timing": "analysis_artifact_timing",
+    "transient": "analysis_artifact_transient",
 }
-__all__ = ["contracts", "generation", "service", "timing"]
+__all__ = ["contracts", "generation", "service", "timing", "transient"]
 
 
 def __getattr__(name: str) -> object:

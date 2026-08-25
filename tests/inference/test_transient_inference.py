@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import pytest
 import torch
@@ -213,9 +213,51 @@ def test_airflow_policy_preserves_comsol_and_replaces_only_airflow_without_mutat
         transient.predict_transient_step(context, **request, external_airflow=external)
 
 
-def test_one_step_and_autonomous_recurrence_cast_deltas_and_report_cpu_timing() -> None:
-    """Reconstruct recurrence from float32 scaled deltas and factual CPU metadata only."""
-    context = _context(_IncrementModel(output_dtype=torch.float64))
+def test_prepared_request_owns_runtime_tensors_and_windows_without_recopies() -> None:
+    """Own admitted inputs once and reuse zero-copy conditioning windows."""
+    context = _context(_IncrementModel())
+    request = _request(3)
+    prepared = transient.prepare_transient_request(context, **request)
+
+    assert prepared.context is context
+    assert prepared.state.device == context.device
+    assert prepared.state.dtype == torch.float32
+    assert prepared.state.data_ptr() != request["state"].data_ptr()
+    request["state"].add_(9.0)
+    assert torch.count_nonzero(prepared.state) == 0
+
+    current = torch.full_like(prepared.state, 2.0)
+    window = transient.window_transient_prepared_request(
+        prepared,
+        origin=1,
+        length=2,
+        state=current,
+    )
+    assert window.static.data_ptr() == prepared.static.data_ptr()
+    assert window.boundary.untyped_storage().data_ptr() == prepared.boundary.untyped_storage().data_ptr()
+    assert window.boundary.shape == (1, 2, 9)
+
+    result = transient.rollout_prepared_transient_autonomous(context, window)
+
+    assert result.states.device == context.device
+    assert result.states.dtype == torch.float32
+    assert torch.allclose(result.states[:, 1], torch.full((1, 4, 2, 3), 11.0))
+
+
+def test_prepared_request_rejects_post_admission_mutation() -> None:
+    """Reject mutable prepared evidence before scaler or model execution."""
+    context = _context(_IncrementModel())
+    prepared = transient.prepare_transient_request(context, **_request(2))
+    prepared.static.add_(1.0)
+
+    with pytest.raises(RuntimeError, match="mutated after strict admission"):
+        transient.rollout_prepared_transient_autonomous(context, prepared)
+
+
+@pytest.mark.parametrize("model_kind", ["fno", "uno"])
+def test_one_step_and_autonomous_recurrence_cast_deltas_and_report_cpu_timing(model_kind: str) -> None:
+    """Reconstruct FNO/U-NO recurrence from float32 deltas and factual CPU timing."""
+    context = _context(_IncrementModel(output_dtype=torch.float64), model_kind=model_kind)
     request = _request(3)
     step = transient.predict_transient_step(context, **request)
     rollout = transient.rollout_transient_autonomous(context, **request)
@@ -227,6 +269,173 @@ def test_one_step_and_autonomous_recurrence_cast_deltas_and_report_cpu_timing() 
     assert rollout.timing.model_calls == 3
     assert rollout.timing.model_seconds >= 0.0
     assert not hasattr(rollout.timing, "speedup")
+
+
+def test_autonomous_rollout_preallocates_outputs_without_list_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retain exact recurrence while avoiding a second full trajectory allocation."""
+
+    class _Tensorizer:
+        def assemble_step(
+            self,
+            current: torch.Tensor,
+            _static: torch.Tensor,
+            _boundary: torch.Tensor,
+            _scalars: torch.Tensor,
+            _time: torch.Tensor,
+        ) -> torch.Tensor:
+            return current
+
+        def reconstruct_next_state(
+            self,
+            current: torch.Tensor,
+            delta: torch.Tensor,
+        ) -> torch.Tensor:
+            return current + delta
+
+    scaling = SimpleNamespace(
+        spatial_shape=(2, 3),
+        horizon=8.0,
+        device=torch.device("cpu"),
+    )
+    context = transient.TransientInferenceContext(
+        model=_IncrementModel().eval(),
+        tensorizer=cast("Any", _Tensorizer()),
+        scaling=cast("Any", scaling),
+        device=torch.device("cpu"),
+        model_kind="fno",
+        precision="float32",
+    )
+    request = _request(3)
+    monkeypatch.setattr(
+        torch,
+        "stack",
+        lambda *_args, **_kwargs: pytest.fail(
+            "autonomous inference used list-to-stack accumulation",
+        ),
+    )
+
+    result = transient.rollout_transient_autonomous(context, **request)
+
+    assert result.states.shape == (1, 3, 4, 2, 3)
+    assert result.scaled_deltas.shape == result.states.shape
+    assert torch.allclose(result.states[:, 2], torch.full((1, 4, 2, 3), 7.0))
+
+
+def test_cuda_rollout_timing_preserves_model_call_boundaries_with_one_completion_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aggregate per-dispatch CUDA events with one bounded completion wait."""
+
+    class _Tensorizer:
+        def assemble_step(
+            self,
+            current: torch.Tensor,
+            _static: torch.Tensor,
+            _boundary: torch.Tensor,
+            _scalars: torch.Tensor,
+            _time: torch.Tensor,
+        ) -> torch.Tensor:
+            return current
+
+        def reconstruct_next_state(self, current: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+            return current + delta
+
+    events: list[str] = []
+
+    class _Event:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing
+
+        def record(self, _stream: object) -> None:
+            events.append("record")
+
+        def synchronize(self) -> None:
+            events.append("synchronize")
+
+        def elapsed_time(self, _other: object) -> float:
+            return 12.5
+
+    request = _request(3)
+    scaling = SimpleNamespace(spatial_shape=(2, 3), horizon=8.0, device=torch.device("cpu"))
+    context = transient.TransientInferenceContext(
+        model=_IncrementModel().eval(),
+        tensorizer=cast("Any", _Tensorizer()),
+        scaling=cast("Any", scaling),
+        device=torch.device("cuda", 7),
+        model_kind="fno",
+        precision="float32",
+    )
+    monkeypatch.setattr(
+        transient,
+        "_owned_runtime_inputs",
+        lambda **_kwargs: (
+            request["state"],
+            request["static"],
+            request["boundary"],
+            request["scalars"],
+            request["t_n"],
+            request["t_next"],
+            request["dt"],
+        ),
+    )
+    monkeypatch.setattr(
+        transient,
+        "_require_prepared_request",
+        lambda _context, _request: None,
+    )
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: pytest.fail("rollout used global CUDA synchronization"))
+
+    result = transient.rollout_transient_autonomous(context, **request)
+
+    assert events == ["record", "record", "record", "record", "record", "record", "synchronize"]
+    assert result.timing.model_seconds == pytest.approx(0.0375)
+    assert result.timing.model_calls == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
+def test_cuda_runtime_prepares_cpu_request_and_retains_rollout_state() -> None:
+    """Move one CPU request once and retain model and rollout tensors on the runtime device."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = _IncrementModel().to(device).eval()
+    scaling = _scaling().to(device)
+    context = transient.TransientInferenceContext(
+        model=model,
+        tensorizer=TransientTensorizer(scaling.tensorizer, scaling),
+        scaling=scaling,
+        device=device,
+        model_kind="fno",
+        precision="float32",
+    )
+    model_input_devices: list[torch.device] = []
+
+    def capture_model_input(_module: nn.Module, args: tuple[object, ...]) -> None:
+        value = args[0]
+        assert isinstance(value, torch.Tensor)
+        model_input_devices.append(value.device)
+
+    handle = model.register_forward_pre_hook(capture_model_input)
+    request = _request(3)
+
+    try:
+        result = transient.rollout_transient_autonomous(context, **request)
+    finally:
+        handle.remove()
+
+    request_tensors = (
+        request["state"],
+        request["static"],
+        request["boundary"],
+        request["scalars"],
+        request["t_n"],
+        request["t_next"],
+        request["dt"],
+    )
+    assert all(value.device.type == "cpu" for value in request_tensors)
+    assert model_input_devices == [device, device, device]
+    assert result.states.device == device
+    assert result.scaled_deltas.device == device
 
 
 def test_rno_carries_hidden_within_each_rollout_and_resets_between_public_requests() -> None:

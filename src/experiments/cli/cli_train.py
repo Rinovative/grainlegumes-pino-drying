@@ -171,10 +171,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_build_artifacts:
         print("Post-training artifacts: skipped by --no-build-artifacts")
         return 0
-    if "stage_runs" in outcome or outcome.get("task") == "transient_drying":
-        print("Post-training artifacts: not implemented for transient_drying")
-        return 0
-
     try:
         from src import analysis  # noqa: PLC0415
 

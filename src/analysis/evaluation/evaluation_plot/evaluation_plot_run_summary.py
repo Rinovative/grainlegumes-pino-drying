@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from src.analysis.artifacts import contracts
+from src.analysis.artifacts import timing as artifact_timing
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
@@ -236,6 +237,69 @@ def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.V
     if any(count_headings.values()):
         visible = visible.rename(index={label: count_headings[label] for label in datasets})
     return _styled_table(visible, title=title)
+
+
+def build_runtime_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build one row per exact identity-bound operational timing sidecar."""
+    dataframe.validate_comparison(datasets)
+    rows: list[dict[str, Any]] = []
+    for label, frame in datasets.items():
+        raw_payload = frame.attrs.get(dataframe.RUNTIME_COMPARISON_ATTR)
+        if not isinstance(raw_payload, Mapping):
+            msg = f"Artifact {label!r} has no admitted runtime comparison capability."
+            raise dataframe.ComparisonCompatibilityError(msg)
+        payload = artifact_timing.validate_runtime_comparison(raw_payload)
+        runtime = payload["neural_runtime"]
+        aggregates = payload["aggregates"]
+        rows.append(
+            {
+                "label": label,
+                "device": runtime["resolved_device"],
+                "inference_dtype": runtime["inference_dtype"],
+                "case_count": len(payload["cases"]),
+                "neural_operator_forward_median_s": aggregates["neural_operator_forward_s"]["median"],
+                "comsol_solve_median_s": aggregates["comsol_solve_s"]["median"],
+                "speedup_median": aggregates["speedup"]["median"],
+                "comparison_status": payload["comparison"]["status"],
+            }
+        )
+    return pd.DataFrame(rows).set_index("label")
+
+
+def plot_runtime_comparison(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
+    """Plot warmed artifact-time forward, solver, and matched speedup evidence."""
+    summary = build_runtime_summary_table(datasets)
+    labels = tuple(str(label) for label in summary.index)
+    positions = np.arange(len(labels), dtype=float)
+    neural = np.asarray(
+        pd.to_numeric(summary["neural_operator_forward_median_s"], errors="raise"),
+        dtype=np.float64,
+    )
+    comsol = np.asarray(pd.to_numeric(summary["comsol_solve_median_s"], errors="coerce"), dtype=np.float64)
+    speedup = np.asarray(pd.to_numeric(summary["speedup_median"], errors="coerce"), dtype=np.float64)
+    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
+    width = 0.36
+    axes[0].bar(positions - width / 2.0, neural, width=width, label="Neural operator")
+    available_comsol = np.isfinite(comsol)
+    if available_comsol.any():
+        axes[0].bar(positions[available_comsol] + width / 2.0, comsol[available_comsol], width=width, label="COMSOL")
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("Warmed runtime [s]")
+    axes[0].set_title("Case-matched median runtime")
+    axes[0].legend()
+    available_speedup = np.isfinite(speedup)
+    if available_speedup.any():
+        axes[1].bar(positions[available_speedup], speedup[available_speedup], width=0.55)
+    else:
+        axes[1].text(0.5, 0.5, "Matched COMSOL timing unavailable", ha="center", va="center", transform=axes[1].transAxes)
+    axes[1].set_ylabel("COMSOL / neural operator [ratio]")
+    axes[1].set_title("Case-matched median speedup")
+    tick_labels = tuple(f"{label}\n{summary.loc[label, 'device']}" for label in labels)
+    for axis in axes:
+        axis.set_xticks(positions, tick_labels)
+        axis.grid(axis="y", alpha=0.25)
+    figure.suptitle("Authoritative artifact runtime")
+    return figure
 
 
 def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
