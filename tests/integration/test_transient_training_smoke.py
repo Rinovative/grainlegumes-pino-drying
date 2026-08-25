@@ -579,11 +579,11 @@ def test_transient_completed_inference_and_tracking_smoke(transient_smoke_packag
         {},
         history_metric_definitions=definitions,
     )
-    observer.log_epoch(1, {"train/loss_total": 1.25, "transient/curriculum_progress": 0.5, "ignored": 9.0})
+    observer.log_epoch(1, {"train/loss_total": 1.25, "transient/curriculum_max_horizon": 4.0, "ignored": 9.0})
     payload, epoch = fake_run.logged[0]
     assert epoch == 1
-    assert payload["Transient/Loss/train_total"] == 1.25
-    assert payload["Transient/Curriculum/progress"] == 0.5
+    assert payload["Overview/train_loss"] == 1.25
+    assert payload["Curriculum/horizon"] == 4.0
     assert "ignored" not in payload
 
 

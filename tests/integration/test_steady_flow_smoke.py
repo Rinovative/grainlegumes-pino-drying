@@ -1061,7 +1061,7 @@ def test_interrupted_direct_run_resumes_from_renamed_directory(
     raw["data"].pop("dataset_references")
     raw["run"].pop("name")
     raw["run"].pop("naming_schema_version")
-    for key in ("project", "entity", "tags", "metric_schema_version"):
+    for key in ("project", "entity", "tags"):
         raw["tracking"]["wandb"].pop(key)
     raw["model"]["params"].pop("in_channels")
     raw["model"]["params"].pop("out_channels")

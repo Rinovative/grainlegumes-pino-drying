@@ -11,6 +11,8 @@ from support import configs
 
 from src import datasets, experiments
 
+_CURRENT_METRIC_SCHEMA_VERSION = 2
+
 
 def _record(name: str, dataset_id: str, *, revision: int = 0) -> dict[str, Any]:
     """Return one complete test-owned immutable Dataset-reference record."""
@@ -72,9 +74,24 @@ def test_logical_references_resolve_once_and_persist_exact_evidence(monkeypatch:
         "ood": [records[("synthetic_ood", 1)]],
     }
     assert "synthetic_id" in resolved["run"]["name"]
+    assert resolved["tracking"]["wandb"]["metric_schema_version"] == _CURRENT_METRIC_SCHEMA_VERSION
     assert "_d0" not in resolved["run"]["name"]
     assert "_d1" not in resolved["run"]["name"]
     assert experiments.config.loader.validate_resolved_config(resolved) == resolved
+
+
+def test_metric_schema_accepts_current_and_rejects_retired_selector() -> None:
+    """Persist only the maintained W&B metric projection selector."""
+    raw = configs.direct_config(suffix=None)
+    raw["tracking"]["wandb"]["metric_schema_version"] = _CURRENT_METRIC_SCHEMA_VERSION
+
+    resolved = experiments.config.loader.resolve_config(raw)
+
+    assert resolved["tracking"]["wandb"]["metric_schema_version"] == _CURRENT_METRIC_SCHEMA_VERSION
+
+    raw["tracking"]["wandb"]["metric_schema_version"] = 1
+    with pytest.raises(experiments.config.loader.ConfigError, match="metric_schema_version"):
+        experiments.config.loader.resolve_config(raw)
 
 
 def test_train_dataset_revision_one_is_visible_in_the_run_label(monkeypatch: pytest.MonkeyPatch) -> None:

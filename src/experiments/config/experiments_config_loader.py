@@ -252,6 +252,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                         "study",
                         "monitor",
                         "upload",
+                        "metric_schema_version",
                     }
                 ),
                 path="tracking.wandb",
@@ -1287,38 +1288,25 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
         ),
         path="tracking.wandb",
     )
-    metric_schema_version = wandb.get(
-        "metric_schema_version",
-        config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
+    metric_schema_version = wandb.get("metric_schema_version")
+    naming_schema_version = _as_mapping(config.get("run"), path="run").get(
+        "naming_schema_version",
+        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
     )
-    if (
+    current_identity = naming_schema_version == RUN_NAMING_SCHEMA_VERSION
+    if metric_schema_version is None:
+        if require_derived and current_identity:
+            msg = "Current resolved configs must persist tracking.wandb.metric_schema_version."
+            raise ConfigError(msg)
+        if current_identity:
+            wandb["metric_schema_version"] = config_defaults.WANDB_METRIC_SCHEMA_VERSION
+    elif (
         isinstance(metric_schema_version, bool)
         or not isinstance(metric_schema_version, int)
-        or metric_schema_version
-        not in {
-            config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
-            config_defaults.WANDB_METRIC_SCHEMA_VERSION,
-        }
+        or metric_schema_version != config_defaults.WANDB_METRIC_SCHEMA_VERSION
     ):
         msg = "tracking.wandb.metric_schema_version is unsupported."
         raise ConfigError(msg)
-    if not require_derived:
-        naming_schema_version = _as_mapping(config.get("run"), path="run").get(
-            "naming_schema_version",
-            _LEGACY_RUN_NAMING_SCHEMA_VERSION,
-        )
-        metric_schema_version = (
-            config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION
-            if naming_schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION
-            else config_defaults.WANDB_METRIC_SCHEMA_VERSION
-        )
-    persist_metric_schema = (
-        "metric_schema_version" in wandb or _as_mapping(config.get("run"), path="run").get("naming_schema_version") == RUN_NAMING_SCHEMA_VERSION
-    )
-    if persist_metric_schema:
-        wandb["metric_schema_version"] = metric_schema_version
-    else:
-        wandb.pop("metric_schema_version", None)
 
     mode = wandb.get("mode")
     if mode not in {"online", "offline", "disabled"}:
@@ -2047,7 +2035,6 @@ def resolve_config(
         effective["run"].pop("revision", None)
         effective["run"].pop("naming_schema_version", None)
         effective["data"].pop("dataset_references", None)
-        effective["tracking"]["wandb"].pop("metric_schema_version", None)
     return effective
 
 

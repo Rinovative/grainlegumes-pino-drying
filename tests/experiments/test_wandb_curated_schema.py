@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from support import configs
 
 from src.experiments import experiments_wandb_schema as schema
@@ -76,19 +78,23 @@ def test_current_stage_children_share_parent_group_and_use_distinct_job_types() 
     group_a, job_a = schema.transient_run_organization(
         plan.stage_a,
         workflow="train",
-        metric_schema_version=2,
     )
     group_b, job_b = schema.transient_run_organization(
         plan.stage_b,
         workflow="train",
-        metric_schema_version=2,
+    )
+    stage_a_plus = copy.deepcopy(dict(plan.stage_a))
+    stage_a_plus["training"]["comparison_arm"] = "a_plus"
+    group_a_plus, job_a_plus = schema.transient_run_organization(
+        stage_a_plus,
+        workflow="train",
     )
 
     assert group_a is not None
-    assert group_a == group_b == loader.generate_parent_experiment_label(plan.stage_a)
+    assert group_a == group_b == group_a_plus == loader.generate_parent_experiment_label(plan.stage_a)
     assert job_a == "stage_a0"
+    assert job_a_plus == "stage_a_plus"
     assert job_b == "stage_b"
     assert plan.stage_a["data"]["train_dataset"] not in group_a
     assert "transient_drying" not in group_a
     assert "0123456789abcdef" not in group_a
-    assert schema.transient_run_organization(plan.stage_a, workflow="train", metric_schema_version=1) == (None, "train")

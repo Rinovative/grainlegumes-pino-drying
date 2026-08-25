@@ -78,8 +78,8 @@ Training queue labels are derived from the resolved child run label, for example
 in the queue descriptor and log metadata, so the short process label is not
 identity evidence.
 
-Current transient W&B runs use the parent label as `group` and
-`stage_a0` or `stage_b` as `job_type`. Opaque persisted W&B IDs remain the
+Current transient W&B runs use the parent label as `group` and `stage_a0`,
+`stage_a_plus`, or `stage_b` as `job_type`. Opaque persisted W&B IDs remain the
 only resume identity. Current history projects approximately 25 authoritative
 completed-epoch series into the `Overview`, `Loss`, `Accuracy`,
 `Optimization`, `Curriculum`, and `Performance` namespaces. Local history
@@ -87,7 +87,6 @@ and summaries remain authoritative. The only unit projection is CUDA allocated
 bytes to GiB at the W&B boundary.
 
 Historical W&B runs and existing personal-workspace panels are not rewritten.
-After adopting the current metric schema, remove obsolete `Transient/*` panels
-or reset the personal workspace once if the UI retains old panel definitions.
-Legacy runs that lack the current metric-schema version continue to register
-their original history keys and organization.
+The maintained observer registers only the curated projection above. Remove
+obsolete `Transient/*` panels or reset the personal workspace once if the UI
+retains old panel definitions from historical runs.

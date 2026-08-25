@@ -91,7 +91,6 @@ WANDB_TASK_PROJECTS = {
     "transient_drying": "grainlegumes-pino-drying-transient",
 }
 WANDB_MAX_TAGS = 2
-WANDB_LEGACY_METRIC_SCHEMA_VERSION = 1
 WANDB_METRIC_SCHEMA_VERSION = 2
 WANDB_WORKFLOWS = (
     "train",

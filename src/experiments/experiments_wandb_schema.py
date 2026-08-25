@@ -12,7 +12,7 @@ Responsibilities:
 Design principles:
   - Local training and evaluation metrics remain authoritative
   - W&B history is a bounded projection, not a mirror of all telemetry
-  - Metric-schema version selects legacy compatibility or current presentation
+  - One maintained projection defines current transient presentation
 
 This module does NOT:
   - Initialize W&B, persist opaque run IDs, or perform network operations
@@ -26,7 +26,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from .config import experiments_config_defaults as config_defaults
 from .config import experiments_config_loader as config_loader
 
 _GIB: Final = float(1024**3)
@@ -106,14 +105,8 @@ def transient_run_organization(
     config: Mapping[str, Any],
     *,
     workflow: str,
-    metric_schema_version: int,
 ) -> tuple[str | None, str]:
-    """Return schema-compatible W&B group and job type for one transient child."""
-    if metric_schema_version == config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION:
-        return None, workflow
-    if metric_schema_version != config_defaults.WANDB_METRIC_SCHEMA_VERSION:
-        message = f"Unsupported transient W&B metric schema: {metric_schema_version!r}."
-        raise ValueError(message)
+    """Return the maintained W&B group and job type for one transient child."""
     if workflow != "train":
         return None, workflow
     training = config.get("training")
@@ -124,6 +117,8 @@ def transient_run_organization(
     stage = training.get("stage")
     if stage == "a" and arm == "a0":
         job_type = "stage_a0"
+    elif stage == "a" and arm == "a_plus":
+        job_type = "stage_a_plus"
     elif stage == "b" and arm == "b":
         job_type = "stage_b"
     else:

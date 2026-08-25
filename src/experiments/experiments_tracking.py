@@ -358,133 +358,6 @@ def _definition(
     )
 
 
-def _legacy_transient_history_metric_definitions(
-    evaluation_metrics: Sequence[Mapping[str, Any]],
-    *,
-    objective_id: str,
-    cuda_enabled: bool,
-) -> tuple[HistoryMetricDefinition, ...]:
-    """Register only authoritative transient training-loop telemetry."""
-    definitions: list[HistoryMetricDefinition] = []
-    loop_owner = "src.learning.training.learning_training_loop.train_loop"
-    for source, destination in (
-        ("train/loss_total", "Transient/Loss/train_total"),
-        ("train/loss_data", "Transient/Loss/train_data"),
-        ("train/loss_data_T", "Transient/Loss/train_data_T"),
-        ("train/loss_data_phi", "Transient/Loss/train_data_phi"),
-        ("train/loss_data_w_surf", "Transient/Loss/train_data_w_surf"),
-        ("train/loss_data_w_int", "Transient/Loss/train_data_w_int"),
-        ("train/loss_state_aux", "Transient/Loss/train_state_aux"),
-        ("transient/curriculum_progress", "Transient/Curriculum/progress"),
-        ("transient/curriculum_active_stage", "Transient/Curriculum/active_stage"),
-        ("transient/curriculum_max_horizon", "Transient/Curriculum/max_horizon"),
-        ("transient/curriculum_draw_index", "Transient/Curriculum/draw_index"),
-        ("transient/self_fed_stage", "Transient/Curriculum/self_fed_stage"),
-        ("transient/planned_teacher_forcing_budget_seconds", "Transient/Compute/planned_seconds"),
-        ("transient/planned_teacher_forcing_budget_steps", "Transient/Compute/planned_steps"),
-        ("transient/rollout_reference_compute_seconds", "Transient/Compute/rollout_reference_seconds"),
-        ("transient/rollout_reference_compute_steps", "Transient/Compute/rollout_reference_steps"),
-        ("transient/post_handoff_optimizer_device_seconds", "Transient/Compute/post_handoff_seconds"),
-        ("transient/post_handoff_optimizer_steps", "Transient/Compute/post_handoff_steps"),
-        ("transient/successful_optimizer_steps", "Transient/Compute/successful_optimizer_steps"),
-        ("transient/processed_target_transitions", "Transient/Compute/processed_target_transitions"),
-        ("transient/forward_transitions", "Transient/Compute/forward_transitions"),
-        ("transient/validation_seconds", "Transient/Compute/validation_seconds"),
-        ("transient/budget_complete", "Transient/Compute/budget_complete"),
-        ("transient/selected_rollout_horizon", "Transient/Curriculum/selected_horizon"),
-        ("transient/last_origin_min", "Transient/Curriculum/origin_min"),
-        ("transient/last_origin_max", "Transient/Curriculum/origin_max"),
-        ("transient/teacher_forcing_optimizer_steps", "Transient/Compute/teacher_forcing_steps"),
-        ("transient/teacher_forcing_optimizer_device_seconds", "Transient/Compute/teacher_forcing_seconds"),
-        ("transient/remaining_to_planned_teacher_forcing_budget_seconds", "Transient/Compute/remaining_planned_seconds"),
-        ("transient/remaining_teacher_forcing_compute_to_match_rollout_seconds", "Transient/Compute/remaining_matched_seconds"),
-        ("transient/remaining_to_planned_teacher_forcing_budget_steps", "Transient/Compute/remaining_planned_steps"),
-        ("transient/remaining_teacher_forcing_compute_to_match_rollout_steps", "Transient/Compute/remaining_matched_steps"),
-        ("transient/wall_seconds", "Transient/Diagnostics/wall_seconds"),
-        ("transient/peak_cuda_memory_bytes", "Transient/Diagnostics/peak_cuda_memory_bytes"),
-        ("transient/train/samples", "Transient/Train/samples"),
-        ("transient/train/processed_target_transitions", "Transient/Train/processed_target_transitions"),
-        ("transient/train/forward_transitions", "Transient/Train/forward_transitions"),
-        ("transient/train/microbatches", "Transient/Train/microbatches"),
-        ("transient/train/optimizer_groups", "Transient/Train/optimizer_groups"),
-        ("system/train_samples_per_second", "Transient/Diagnostics/train_samples_per_second"),
-        ("system/train_duration_seconds", "Transient/Diagnostics/train_duration_seconds"),
-        ("system/epoch_duration_seconds", "Transient/Diagnostics/epoch_duration_seconds"),
-        ("system/estimated_remaining_seconds", "Transient/Diagnostics/estimated_remaining_seconds"),
-    ):
-        definitions.append(
-            _definition(
-                source,
-                destination,
-                owner=loop_owner,
-                computation_cost="existing training-loop telemetry",
-                scientific_question="What does this authoritative transient training value report?",
-            )
-        )
-    metric_ids = tuple(str(metric["id"]) for metric in evaluation_metrics)
-    for role in ("id", "ood"):
-        for metric_id in metric_ids:
-            definitions.append(
-                _definition(
-                    f"{role}/{metric_id}",
-                    f"Transient/{role.upper()}/{metric_id}",
-                    owner=loop_owner,
-                    computation_cost="existing evaluation pass",
-                    scientific_question="What is the authoritative transient evaluation metric?",
-                )
-            )
-            definitions.append(
-                _definition(
-                    f"{role}/guardrail/one_step/{metric_id}",
-                    f"Transient/{role.upper()}/Guardrail/one_step/{metric_id}",
-                    owner=loop_owner,
-                    computation_cost="existing adapter evaluation pass",
-                    scientific_question="How does the one-step diagnostic compare?",
-                )
-            )
-        definitions.extend(
-            _definition(
-                f"{role}/{metric_id}",
-                f"Transient/{role.upper()}/{metric_id}",
-                owner=loop_owner,
-                computation_cost="existing adapter evaluation pass",
-                scientific_question="What is the reconstructed grain-moisture diagnostic?",
-            )
-            for metric_id in ("physical/w_gr_mae", "physical/w_gr_rmse")
-        )
-        if objective_id in metric_ids:
-            definitions.append(
-                _definition(
-                    f"{role}/{objective_id}/component/T",
-                    f"Transient/{role.upper()}/{objective_id}/component/T",
-                    owner=loop_owner,
-                    computation_cost="existing metric accumulator",
-                    scientific_question="What is the temperature component?",
-                )
-            )
-            definitions.extend(
-                _definition(
-                    f"{role}/{objective_id}/component/{component}",
-                    f"Transient/{role.upper()}/{objective_id}/component/{component}",
-                    owner=loop_owner,
-                    computation_cost="existing metric accumulator",
-                    scientific_question="What is this drying-group component?",
-                )
-                for component in ("phi", "w_surf", "w_int", "grain_moisture_error", "normalized_drying_group_macro_rmse")
-            )
-    if cuda_enabled:
-        definitions.append(
-            _definition(
-                "system/cuda_peak_memory_allocated_bytes",
-                "Transient/Diagnostics/cuda_peak_memory_allocated_bytes",
-                owner=loop_owner,
-                computation_cost="existing CUDA allocator counter",
-                scientific_question="What CUDA memory was allocated?",
-            )
-        )
-    return tuple(definitions)
-
-
 def _curated_transient_history_metric_definitions(
     *,
     objective_id: str,
@@ -520,7 +393,6 @@ def automatic_history_metric_definitions(
     cuda_enabled: bool,
     optuna_trial: bool = False,
     task_id: str | None = None,
-    metric_schema_version: int = config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION,
     state_aux_enabled: bool = False,
 ) -> tuple[HistoryMetricDefinition, ...]:
     """
@@ -533,21 +405,11 @@ def automatic_history_metric_definitions(
     personal workspace will preserve registration order in its UI.
     """
     if task_id == "transient_drying":
-        if metric_schema_version == config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION:
-            transient_definitions = _legacy_transient_history_metric_definitions(
-                evaluation_metrics,
-                objective_id=objective_id,
-                cuda_enabled=cuda_enabled,
-            )
-        elif metric_schema_version == config_defaults.WANDB_METRIC_SCHEMA_VERSION:
-            transient_definitions = _curated_transient_history_metric_definitions(
-                objective_id=objective_id,
-                state_aux_enabled=state_aux_enabled,
-                cuda_enabled=cuda_enabled,
-            )
-        else:
-            message = f"Unsupported transient W&B metric schema: {metric_schema_version!r}."
-            raise ValueError(message)
+        transient_definitions = _curated_transient_history_metric_definitions(
+            objective_id=objective_id,
+            state_aux_enabled=state_aux_enabled,
+            cuda_enabled=cuda_enabled,
+        )
         if optuna_trial:
             transient_definitions = (
                 *transient_definitions,
@@ -935,7 +797,6 @@ def _build_transient_semantic_config(
     task_contract = cast("Mapping[str, Any]", config["task_contract"])
     data_config = cast("Mapping[str, Any]", config["data"])
     run_config = cast("Mapping[str, Any]", config["run"])
-    wandb_config = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
     roles = cast("Mapping[str, Any]", split_indices["roles"])
     datasets_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", split_indices["dataset_identity"])))
     split_payload = {
@@ -995,7 +856,7 @@ def _build_transient_semantic_config(
                 "run": run_config.get("naming_schema_version", 1),
                 "checkpoint": 1,
                 "tracking_integration": TRACKING_INTEGRATION_VERSION,
-                "wandb_metrics": wandb_config.get("metric_schema_version", 1),
+                "wandb_metrics": config_defaults.WANDB_METRIC_SCHEMA_VERSION,
             },
         },
         "runtime": {
@@ -1737,14 +1598,12 @@ def initialize_wandb(
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
     mode = str(settings["mode"])
     workflow = str(settings["workflow"])
-    metric_schema_version = int(settings.get("metric_schema_version", config_defaults.WANDB_LEGACY_METRIC_SCHEMA_VERSION))
     group = str(settings["study"]) if workflow == "optuna_trial" else None
     job_type = workflow
     if task_id == "transient_drying" and workflow == "train":
         group, job_type = wandb_schema.transient_run_organization(
             config,
             workflow=workflow,
-            metric_schema_version=metric_schema_version,
         )
     runtime_tags = _runtime_wandb_tags(settings, semantic_config)
 
@@ -1785,7 +1644,6 @@ def initialize_wandb(
         "tags": runtime_tags,
         "group": group,
         "job_type": job_type,
-        "metric_schema_version": metric_schema_version,
         "session_started_at": _utc_now(),
         "session_kind": "resume" if resume else "fresh",
         "status": "offline" if mode == "offline" else "active",
@@ -1829,7 +1687,6 @@ def initialize_wandb(
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
-        metric_schema_version=metric_schema_version,
         state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
     )
 

@@ -518,12 +518,12 @@ def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys()
         physics_monitor_enabled=False,
         cuda_enabled=False,
         task_id="transient_drying",
-        metric_schema_version=1,
     )
     destinations = {definition.wandb_key for definition in definitions}
-    assert "Transient/Loss/train_data_w_int" in destinations
-    assert "Transient/ID/normalized_drying_group_macro_rmse" in destinations
-    assert "Transient/ID/Guardrail/one_step/physical_mae_T" in destinations
+    assert "Loss/w_int" in destinations
+    assert "Overview/id_objective" in destinations
+    assert "Accuracy/ID/T" in destinations
+    assert all(not destination.startswith("Transient/") for destination in destinations)
     assert len(destinations) == len(definitions)
 
 
@@ -578,6 +578,59 @@ def test_current_transient_session_projects_curated_history_and_parent_group(
     assert step == 1
     assert len(payload) == _CURATED_CUDA_LOG_ENTRY_COUNT
     assert payload["Performance/cuda_peak_memory_gib"] == _PROJECTED_GIB
+
+
+def test_legacy_transient_resume_reports_the_active_curated_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume legacy identity while reporting the maintained runtime projection."""
+    config = _current_transient_config()
+    config["run"].pop("revision")
+    config["run"].pop("naming_schema_version")
+    config["data"].pop("dataset_references")
+    config["tracking"]["wandb"].pop("metric_schema_version")
+    config["run"]["name"] = experiments.config.loader.generate_run_name(config)
+    assert experiments.config.loader.validate_resolved_config(config) == config
+
+    semantic = tracking.build_semantic_config(
+        config,
+        split_indices=_transient_split_evidence(),
+        split_indices_sha256="d" * 64,
+        normalizer_sha256="e" * 64,
+        checkpoint_identity={"effective_config_digest": "f" * 64},
+        model=torch.nn.Linear(2, 3),
+        device_metadata={"resolved_device": "cpu", "pytorch_version": torch.__version__},
+        duration_contract=experiments.run.RUN_DURATION_CONTRACT,
+        runtime_provenance={"train": "pt_shards"},
+        transient_scaling={"semantic_digest": "1" * 64, "scale_mode": "state_std"},
+    )
+    fake = _FakeWandb(resumed_tags=("legacy",))
+    _patch_wandb(monkeypatch, fake)
+    persisted_id = "legacy-opaque-id"
+
+    session = tracking.initialize_wandb(
+        config,
+        run_dir=tmp_path,
+        semantic_config=semantic,
+        resume=True,
+        persisted_run_id=persisted_id,
+    )
+
+    initialization = fake.initializations[0]
+    assert initialization["id"] == persisted_id
+    assert initialization["resume"] == "must"
+    assert initialization["group"] == experiments.config.loader.generate_parent_experiment_label(config)
+    assert initialization["job_type"] == "stage_a0"
+    assert semantic["provenance"]["schema_versions"]["wandb_metrics"] == _CURRENT_METRIC_SCHEMA_VERSION
+    assert all(not definition.wandb_key.startswith("Transient/") for definition in session.history_metric_definitions)
+
+    train_loss = 1.25
+    session.log_epoch(1, {"train/loss_total": train_loss})
+    payload, step = fake.runs[0].logs[-1]
+    assert step == 1
+    assert payload["Overview/train_loss"] == train_loss
+    assert all(not key.startswith("Transient/") for key in payload)
 
 
 def test_model_parameter_counts_ignore_device_and_dtype() -> None:
