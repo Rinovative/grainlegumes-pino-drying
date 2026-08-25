@@ -138,8 +138,12 @@ def test_spatial_stride_defaults_to_one_and_changes_run_identity_only_when_expli
     stride_two_raw["data"]["spatial_stride"] = _STRIDE_TWO
     stride_two = transient_plan.resolve_transient_training_plan(stride_two_raw)
 
+    persisted_without_stride = copy.deepcopy(dict(stride_one.stage_a))
+    persisted_without_stride["data"].pop("spatial_stride")
+
     assert stride_one.stage_a["data"]["spatial_stride"] == 1
     assert stride_one.stage_b["data"]["spatial_stride"] == 1
+    assert loader.validate_resolved_config(persisted_without_stride)["data"]["spatial_stride"] == 1
     assert stride_two.stage_a["data"]["spatial_stride"] == _STRIDE_TWO
     assert "_stride2_" in stride_two.stage_a["run"]["name"]
     assert stride_one.stage_a["run"]["name"] != stride_two.stage_a["run"]["name"]

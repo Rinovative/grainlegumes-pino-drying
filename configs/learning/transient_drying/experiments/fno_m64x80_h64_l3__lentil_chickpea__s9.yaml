@@ -1,22 +1,19 @@
 task: transient_drying
 run:
-  revision: 0
   seed: 9
-  deterministic: true
+  deterministic: false
   device: cuda
   suffix: null
 data:
-  train_dataset:
-    name: lentil+chickpea_id
-    revision: 0
+  train_dataset: transient_drying__lentil+chickpea__id__edeafe22ec484ec3
   ood_datasets:
-  - name: kidney_bean_near_family_ood
-    revision: 0
+  - transient_drying__kidney_bean__near_family_ood__3cc7db648cf437b5
   batch_size: 2
   transient_backend_preference: pt_shards
   transient_backend_required: true
   hdf5_cache_size: 0
   allow_technical_smoke: false
+  spatial_stride: 2
 input_profile: canonical_physics_complete_v1
 temporal:
   temporal_conditioning:
@@ -101,7 +98,7 @@ training:
       rollout_reference_steps: null
 tracking:
   wandb:
-    mode: offline
+    mode: online
     workflow: train
     monitor:
       enabled: false
@@ -111,8 +108,8 @@ model:
   kind: fno
   params:
     n_modes:
-    - 128
-    - 160
+    - 64
+    - 80
     hidden_channels: 64
     n_layers: 3
     lifting_channel_ratio: 2

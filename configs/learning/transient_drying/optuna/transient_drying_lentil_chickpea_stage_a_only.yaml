@@ -28,6 +28,7 @@ experiment:
     transient_backend_required: true
     hdf5_cache_size: 0
     allow_technical_smoke: false
+    spatial_stride: 2
   input_profile: canonical_physics_complete_v1
   temporal:
     sampling:
@@ -105,7 +106,7 @@ experiment:
     kind: fno
     params:
       n_modes:
-      - 128
+      - 64
       - 160
       hidden_channels: 64
       n_layers: 3
@@ -120,11 +121,11 @@ search_space:
   model.params.n_modes.0:
     name: modes_y
     kind: categorical
-    values: [64, 96, 128]
+    values: [32, 64, 96]
   model.params.n_modes.1:
     name: modes_x
     kind: categorical
-    values: [96, 128, 160]
+    values: [64, 80, 96, 128, 160]
   model.params.hidden_channels:
     name: hidden_channels
     kind: categorical

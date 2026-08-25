@@ -19,13 +19,20 @@ schemas.
 
 Normal experiments use one architecture-first YAML per model:
 
-- `configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml`
+- `configs/learning/transient_drying/experiments/fno_m64x80_h64_l3__lentil_chickpea__s9.yaml`
 - `configs/learning/transient_drying/experiments/uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495__lentil_chickpea__s9.yaml`
 - `configs/learning/transient_drying/experiments/rno_m24x24_h16_l3__lentil_chickpea__s9.yaml`
 
 The filename makes the architecture recognizable during scheduling and review.
 The resolved YAML remains authoritative; filenames do not replace persisted
 configuration, Dataset identity, seeds, or checkpoint hashes.
+
+The maintained selections bind exact Dataset IDs and use the endpoint-preserving
+`spatial_stride: 2` view. They set `run.deterministic: false`, so seeds, resolved
+configuration, and checkpoint provenance remain exact but executions do not
+promise bitwise replay. Their W&B mode is `online`; a nonblank `WANDB_API_KEY`
+must be available before epoch 1. Optuna and technical-smoke plans retain their
+separate offline and disabled tracking policies.
 
 Each file is an authored two-stage plan. Shared sections define the task, data,
 model, loss, optimizer, scaling, and tracking policy. One
@@ -65,14 +72,14 @@ Run preflight before allocating any experiment directory:
 
 ```bash
 python -m src.experiments.cli.cli_config_preflight train \
-  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml
+  configs/learning/transient_drying/experiments/fno_m64x80_h64_l3__lentil_chickpea__s9.yaml
 ```
 
 Start the complete A0-to-B workflow with the same file:
 
 ```bash
 python -m src.experiments.cli.cli_train \
-  configs/learning/transient_drying/experiments/fno_m128x160_h64_l3__lentil_chickpea__s9.yaml
+  configs/learning/transient_drying/experiments/fno_m64x80_h64_l3__lentil_chickpea__s9.yaml
 ```
 
 The CLI prints both derived run directories. If the exact Stage A leaf already

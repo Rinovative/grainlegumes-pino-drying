@@ -12,6 +12,7 @@ data:
   transient_backend_required: false
   hdf5_cache_size: 0
   allow_technical_smoke: true
+  spatial_stride: 2
 input_profile: canonical_physics_complete_v1
 temporal:
   sampling:

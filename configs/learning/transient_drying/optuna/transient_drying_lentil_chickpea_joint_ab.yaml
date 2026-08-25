@@ -28,6 +28,7 @@ experiment:
     transient_backend_required: true
     hdf5_cache_size: 0
     allow_technical_smoke: false
+    spatial_stride: 2
   input_profile: canonical_physics_complete_v1
   temporal:
     temporal_conditioning:
@@ -122,8 +123,8 @@ experiment:
     kind: fno
     params:
       n_modes:
-      - 128
-      - 160
+      - 64
+      - 80
       hidden_channels: 64
       n_layers: 3
       lifting_channel_ratio: 2

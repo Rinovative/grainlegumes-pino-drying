@@ -1727,6 +1727,8 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
     config["temporal"] = temporal
     config["scaling"] = {"mode": scaling["mode"]}
     data = _as_mapping(config["data"], path="data")
+    if "spatial_stride" not in data:
+        data["spatial_stride"] = 1
     required_data = {
         "train_dataset",
         "ood_datasets",
@@ -1756,6 +1758,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
     except (TypeError, ValueError) as error:
         message = f"data.spatial_stride: {error}"
         raise ConfigError(message) from error
+    config["data"] = data
     training = _as_mapping(config["training"], path="training")
     required_training = {
         "epochs",
