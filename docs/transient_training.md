@@ -130,13 +130,71 @@ deduplicated by state identity, and increment scaling preserves exact zero by
 scaling without centering. The scaling artifact binds the task and data contract
 digests, Dataset identity, Train membership, tensorizer selection, spatial
 shape, channel names, horizon, and fitted statistics. The same admitted artifact
-is used by both stages, resume, and inference.
+is used by both stages, resume, and inference. Its fitted values are scalars or
+channel vectors, so the spatial-compatibility owner may reuse them by pointwise
+broadcast on another explicitly compatible Evaluation grid. Artifact generation
+never refits or mutates them; a future location-dependent statistic, spatial mask,
+or other shape-bound value must instead make cross-grid use unsupported.
 
 Production plans require PT shards bound to the exact immutable family package;
 missing or incompatible shard publication fails preflight. The technical smoke
 config alone explicitly permits canonical HDF5 and the material-pilot package.
 Backend provenance and split membership are persisted, so admitted production
 Training does not depend on the deleted CPU Generation workspace.
+
+## Artifact spatial representations
+
+Transient artifacts distinguish four spatial concepts:
+
+| Concept | Owner and meaning | Maintained stride-two example |
+| --- | --- | --- |
+| Canonical source grid | Complete scientific grid in canonical HDF5/PT package evidence | `251 x 401` |
+| Training grid | Endpoint-preserving view persisted by resolved Training config, split evidence, scaler, and checkpoint | stride `2`, shape `126 x 201` |
+| Artifact Evaluation grid | Operator-selected grid for model input, reference, prediction, and persisted sequence fields | default stride `1`, shape `251 x 401` |
+| Display grid | Later plotting-only sampling | must not change artifacts, metrics, scaling, checkpoint, or Dataset identity |
+
+The exact artifact interface is
+`--evaluation-spatial-stride <positive integer>` and its default is `1`.
+Indices are selected from the canonical axes with one endpoint-preserving regular
+stride; incompatible values are rejected rather than adjusted. For the current
+stride-two plans, default artifact materialization therefore has source shape
+`251 x 401`, Training/scaling shape `126 x 201`, Evaluation reference/static/mask
+shape `251 x 401`, model input shape `[B, 28, 251, 401]`, model output shape
+`[B, 4, 251, 401]`, and written reference/prediction shape
+`[time, 4, 251, 401]`. An explicit Evaluation stride `2` uses `126 x 201` for
+every spatial tensor instead.
+
+The original failure recreated Dataset items at the source-grid default while
+inference required every request to equal the scaler's Training shape. The
+stride-two RNO therefore materialized `251 x 401` states against a `126 x 201`
+scaler shape and failed before its first completed case. Inference now validates
+requests against the admitted Evaluation shape after separate scaling and model
+capability decisions; it does not weaken the scaler's Training-grid identity.
+
+Maintained architecture outcomes are explicit:
+
+| Architecture | Same Training/Evaluation shape | Cross-resolution decision |
+| --- | --- | --- |
+| FNO | `SUPPORTED_EXACTLY` after retained-mode validation | `SUPPORTED_WITH_CONTRACT` only when retained modes fit the requested axes and an exact-output probe passes |
+| U-NO | `SUPPORTED_EXACTLY` after every mode/resampling level validates | `SUPPORTED_WITH_CONTRACT` only when every requested-grid level remains valid and an exact-output probe passes |
+| RNO | `SUPPORTED_EXACTLY` after retained-mode validation | `SUPPORTED_WITH_CONTRACT` only when modes fit, request-local hidden state remains valid, and an exact-output probe passes |
+
+All maintained kinds resolve from `UNKNOWN`. An unsupported or unknown request
+fails before Dataset case materialization with architecture, checkpoint,
+Training shape, Evaluation shape, reason, and the common Training stride that can
+be requested across compared models. The synthetic probe loads the admitted
+checkpoint and requires output on the exact requested grid; theoretical neural
+operator resolution invariance is not treated as proof. Reference and prediction
+then share one exact per-case grid digest based on indices, coordinate bytes,
+mask, field order, extent, and representation transformation, not shape alone.
+
+Canonical stride-one artifacts remain below `analysis/id` and
+`analysis/ood/<dataset>`. Explicit nonunit variants are isolated below
+`analysis/grid_sN/id` and `analysis/grid_sN/ood/<dataset>`. Schema-2 transient
+caches do not contain the exact grid evidence, and schema 3 does not contain the
+current prediction-validity contract; both require an explicit rebuild to schema 4.
+The queue command, descriptor, worker argv, preflight, manifest, inference
+context, record identity, and output target all carry the same resolved value.
 
 ## Losses, metrics, and model implementations
 
@@ -307,7 +365,7 @@ service unless `--no-build-artifacts` is selected. Existing completed runs can
 be processed explicitly with:
 
 ```bash
-python -m src.experiments.cli.cli_build_artifacts --task transient_drying
+python -m src.experiments.cli.cli_build_artifacts --task transient_drying --evaluation-spatial-stride 1
 ```
 
 The immutable artifact stores reference and predicted absolute sequences,
@@ -398,6 +456,10 @@ from src.learning.inference import (
 
 context = load_transient_inference_context(run_dir=run_dir, device="cuda")
 ```
+
+The general loader retains the checkpoint's Training shape when no Evaluation
+shape is supplied. Artifact generation always supplies its separately resolved
+Evaluation shape and records the compatibility decision.
 
 `predict_transient_step` accepts one explicit physical interval.
 `rollout_transient_autonomous` accepts a validated interval sequence and

@@ -8,6 +8,7 @@ or publish an artifact target into a completed run.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections import OrderedDict
@@ -15,7 +16,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, NoReturn, cast
 
 import numpy as np
 import pandas as pd
@@ -24,10 +25,11 @@ from src import common
 from src.analysis.artifacts import analysis_artifact_performance as artifact_performance
 from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
+from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "transient_drying_evaluation_sequence"
-TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 2
+TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 4
 TRANSIENT_ARTIFACT_KIND: Final = "transient_sequence"
 _STEP_CONTRACT: Final = transient_contract.TRANSIENT_STEP_CONTRACT
 STATE_ORDER: Final = tuple(field.name for field in _STEP_CONTRACT.dynamic_state)
@@ -38,7 +40,11 @@ SCALAR_ORDER: Final = tuple(field.name for field in _STEP_CONTRACT.scalar_condit
 FIXED_HORIZONS: Final = (1, 2, 4, 8, 16, 32, 64, 128)
 TARGET_CRITERION: Final = "dry_solid_mass_fraction_with_local_X_wb_above_X_target_wb_le_f_wet_dm_max"
 _MINIMUM_TRAJECTORY_STATES: Final = 2
+_SPATIAL_AXIS_COUNT: Final = 2
+_SPATIAL_STATE_RANK: Final = 4
 _SHA256_HEX_LENGTH: Final = 64
+_RESUME_DESCRIPTOR_NAME: Final = ".transient-resume.json"
+_CASE_MANIFEST_DIRECTORY_NAME: Final = ".transient-cases"
 
 EvaluationMode = Literal["teacher_forced_one_step", "autonomous_full", "rolling_origin"]
 DatasetRole = Literal["id", "ood"]
@@ -63,6 +69,7 @@ _IDENTITY_KEYS: Final = {
     "coordinate_policy",
     "boundary_representation",
     "scaling_identity",
+    "spatial_representation",
     "training_airflow_source",
     "inference_airflow_source",
     "stage_identity",
@@ -97,6 +104,23 @@ _TARGET_KEYS: Final = {
     "predicted_final_time",
 }
 _EXCLUSION_KEYS: Final = {"excluded", "reason"}
+_SPATIAL_IDENTITY_KEYS: Final = {
+    "schema_version",
+    "source_shape",
+    "evaluation_spatial_stride",
+    "evaluation_shape",
+    "axis_indices",
+    "index_identity_sha256",
+    "coordinate_identity",
+    "physical_extent",
+    "spatial_mask_identity",
+    "field_order",
+    "representation_transformation",
+    "grid_identity_sha256",
+    "reference_grid_identity_sha256",
+    "prediction_grid_identity_sha256",
+}
+_ARRAY_IDENTITY_KEYS: Final = {"shape", "dtype", "sha256"}
 
 
 class TransientSequenceArtifactError(ValueError):
@@ -155,6 +179,23 @@ def _finite_array(
     return np.ascontiguousarray(converted)
 
 
+def _prediction_array(
+    value: Any,
+    *,
+    label: str,
+    ndim: int,
+) -> np.ndarray:
+    """Return one owned float32 prediction array while preserving IEEE values."""
+    array = np.asarray(value)
+    if array.ndim != ndim:
+        message = f"{label} must have rank {ndim}, got shape {array.shape}."
+        raise TransientSequenceArtifactError(message)
+    if array.dtype.kind != "f":
+        message = f"{label} must be a real floating-point array."
+        raise TypeError(message)
+    return np.ascontiguousarray(array, dtype=np.float32)
+
+
 def _mask_array(value: Any, *, label: str, ndim: int) -> np.ndarray:
     """Return one owned boolean mask without truth-value coercion."""
     array = np.asarray(value)
@@ -178,6 +219,227 @@ def _nonnegative_int(value: Any, *, label: str) -> int:
         message = f"{label} must be a non-negative integer."
         raise TypeError(message)
     return int(value)
+
+
+def _array_identity(value: Any, *, label: str) -> dict[str, Any]:
+    """Return an exact dtype-, shape-, and byte-bound array identity."""
+    array = np.asarray(value)
+    if array.dtype.kind not in {"b", "f", "i", "u"} or not np.isfinite(array).all():
+        message = f"{label} must contain finite real or boolean values."
+        raise ValueError(message)
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.dtype).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(json.dumps(list(contiguous.shape), separators=(",", ":")).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(contiguous.tobytes(order="C"))
+    return {
+        "shape": list(contiguous.shape),
+        "dtype": str(contiguous.dtype),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _validate_array_identity(
+    value: Any,
+    *,
+    label: str,
+    observed: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Admit one exact array identity and optionally compare current bytes."""
+    if not isinstance(value, Mapping) or set(value) != _ARRAY_IDENTITY_KEYS:
+        message = f"{label} must contain exactly shape, dtype, and sha256."
+        raise TransientSequenceArtifactError(message)
+    identity = dict(value)
+    shape = identity["shape"]
+    digest = identity["sha256"]
+    if (
+        not isinstance(shape, list)
+        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < 1 for axis in shape)
+        or not isinstance(identity["dtype"], str)
+        or not identity["dtype"]
+        or not isinstance(digest, str)
+        or len(digest) != _SHA256_HEX_LENGTH
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        message = f"{label} contains malformed array identity evidence."
+        raise TransientSequenceArtifactError(message)
+    if observed is not None and identity != _array_identity(observed, label=label):
+        message = f"{label} contradicts current artifact array bytes."
+        raise TransientSequenceArtifactError(message)
+    return identity
+
+
+def _validate_spatial_representation_identity(
+    value: Any,
+    *,
+    expected_shape: tuple[int, int] | None = None,
+    static_conditioning: np.ndarray | None = None,
+    spatial_mask: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Admit exact source indices, coordinates, mask, and shared ref/pred grid."""
+    if not isinstance(value, Mapping) or set(value) != _SPATIAL_IDENTITY_KEYS:
+        message = "Sequence spatial representation fields do not match the schema."
+        raise TransientSequenceArtifactError(message)
+    result = _json_copy(value, label="sequence spatial representation")
+    source = result["source_shape"]
+    evaluation = result["evaluation_shape"]
+    if (
+        not isinstance(source, list)
+        or not isinstance(evaluation, list)
+        or len(source) != _SPATIAL_AXIS_COUNT
+        or len(evaluation) != _SPATIAL_AXIS_COUNT
+        or any(isinstance(axis, bool) or not isinstance(axis, int) for axis in (*source, *evaluation))
+    ):
+        message = "Sequence spatial source and Evaluation shapes must contain two exact integers."
+        raise TransientSequenceArtifactError(message)
+    try:
+        representation = transient_contract.resolve_spatial_representation(
+            cast("tuple[int, int]", tuple(source)),
+            transient_contract.validate_spatial_stride(result["evaluation_spatial_stride"]),
+        )
+    except (TypeError, ValueError) as error:
+        message = f"Sequence spatial index representation is invalid: {error}"
+        raise TransientSequenceArtifactError(message) from error
+    serialized = representation.as_dict()
+    if (
+        result["schema_version"] != serialized["schema_version"]
+        or evaluation != serialized["represented_shape"]
+        or result["axis_indices"] != serialized["axis_indices"]
+        or result["index_identity_sha256"] != serialized["index_identity_sha256"]
+        or result["representation_transformation"] != serialized["representation_transformation"]
+    ):
+        message = "Sequence spatial identity contradicts its exact endpoint-preserving index map."
+        raise TransientSequenceArtifactError(message)
+    if expected_shape is not None and tuple(evaluation) != expected_shape:
+        message = "Sequence spatial identity contradicts record array shapes."
+        raise TransientSequenceArtifactError(message)
+    field_order = result["field_order"]
+    if field_order != {"dynamic": list(STATE_ORDER), "static": list(STATIC_ORDER)}:
+        message = "Sequence spatial field order contradicts the transient data contract."
+        raise TransientSequenceArtifactError(message)
+    coordinate = result["coordinate_identity"]
+    if not isinstance(coordinate, Mapping) or set(coordinate) != {"field_order", "x", "y", "combined_sha256"}:
+        message = "Sequence coordinate identity fields do not match the schema."
+        raise TransientSequenceArtifactError(message)
+    if coordinate["field_order"] != ["x", "y"]:
+        message = "Sequence coordinate identity must retain exact x, y field order."
+        raise TransientSequenceArtifactError(message)
+    observed_x = None if static_conditioning is None else static_conditioning[STATIC_ORDER.index("x")]
+    observed_y = None if static_conditioning is None else static_conditioning[STATIC_ORDER.index("y")]
+    x_identity = _validate_array_identity(coordinate["x"], label="sequence x coordinates", observed=observed_x)
+    y_identity = _validate_array_identity(coordinate["y"], label="sequence y coordinates", observed=observed_y)
+    coordinate_core = {"field_order": ["x", "y"], "x": x_identity, "y": y_identity}
+    if coordinate["combined_sha256"] != common.serialization.canonical_json_sha256(coordinate_core):
+        message = "Sequence combined coordinate identity digest is invalid."
+        raise TransientSequenceArtifactError(message)
+    extent = result["physical_extent"]
+    if not isinstance(extent, Mapping) or set(extent) != {"x", "y"}:
+        message = "Sequence physical extent must contain exactly x and y."
+        raise TransientSequenceArtifactError(message)
+    for axis in ("x", "y"):
+        bounds = extent[axis]
+        if (
+            not isinstance(bounds, list)
+            or len(bounds) != _SPATIAL_AXIS_COUNT
+            or any(isinstance(bound, bool) or not isinstance(bound, Real) or not math.isfinite(float(bound)) for bound in bounds)
+            or float(bounds[0]) > float(bounds[1])
+        ):
+            message = f"Sequence {axis} physical extent is invalid."
+            raise TransientSequenceArtifactError(message)
+    if observed_x is not None and observed_y is not None:
+        expected_extent = {
+            "x": [float(np.min(observed_x)), float(np.max(observed_x))],
+            "y": [float(np.min(observed_y)), float(np.max(observed_y))],
+        }
+        if extent != expected_extent:
+            message = "Sequence physical extent contradicts persisted coordinate fields."
+            raise TransientSequenceArtifactError(message)
+    mask_identity = _validate_array_identity(
+        result["spatial_mask_identity"],
+        label="sequence spatial mask",
+        observed=spatial_mask,
+    )
+    if mask_identity["shape"] != evaluation:
+        message = "Sequence spatial-mask identity contradicts the Evaluation shape."
+        raise TransientSequenceArtifactError(message)
+    core = {key: result[key] for key in _SPATIAL_IDENTITY_KEYS if not key.endswith("grid_identity_sha256")}
+    grid_digest = common.serialization.canonical_json_sha256(core)
+    if (
+        result["grid_identity_sha256"] != grid_digest
+        or result["reference_grid_identity_sha256"] != grid_digest
+        or result["prediction_grid_identity_sha256"] != grid_digest
+    ):
+        message = "Reference and prediction must retain one exact valid grid identity."
+        raise TransientSequenceArtifactError(message)
+    return result
+
+
+def build_transient_spatial_identity(
+    representation: transient_contract.TransientSpatialRepresentation,
+    *,
+    reference_states: np.ndarray,
+    static_conditioning: np.ndarray,
+    spatial_mask: np.ndarray,
+) -> dict[str, Any]:
+    """Build exact per-case Evaluation-grid identity from persisted scientific arrays."""
+    if not isinstance(representation, transient_contract.TransientSpatialRepresentation):
+        message = "representation must be one admitted transient spatial representation."
+        raise TypeError(message)
+    reference = np.asarray(reference_states)
+    static = np.asarray(static_conditioning)
+    mask = np.asarray(spatial_mask)
+    shape = representation.represented_shape
+    if (
+        reference.ndim != _SPATIAL_STATE_RANK
+        or reference.shape[1:] != (len(STATE_ORDER), *shape)
+        or static.shape != (len(STATIC_ORDER), *shape)
+        or mask.dtype != np.bool_
+        or mask.shape != shape
+    ):
+        message = "Transient spatial identity inputs must share the represented dynamic/static/mask grid."
+        raise ValueError(message)
+    x_coordinates = static[STATIC_ORDER.index("x")]
+    y_coordinates = static[STATIC_ORDER.index("y")]
+    coordinate_core = {
+        "field_order": ["x", "y"],
+        "x": _array_identity(x_coordinates, label="x coordinates"),
+        "y": _array_identity(y_coordinates, label="y coordinates"),
+    }
+    serialized = representation.as_dict()
+    core = {
+        "schema_version": serialized["schema_version"],
+        "source_shape": serialized["source_shape"],
+        "evaluation_spatial_stride": serialized["spatial_stride"],
+        "evaluation_shape": serialized["represented_shape"],
+        "axis_indices": serialized["axis_indices"],
+        "index_identity_sha256": serialized["index_identity_sha256"],
+        "coordinate_identity": {
+            **coordinate_core,
+            "combined_sha256": common.serialization.canonical_json_sha256(coordinate_core),
+        },
+        "physical_extent": {
+            "x": [float(np.min(x_coordinates)), float(np.max(x_coordinates))],
+            "y": [float(np.min(y_coordinates)), float(np.max(y_coordinates))],
+        },
+        "spatial_mask_identity": _array_identity(mask, label="spatial mask"),
+        "field_order": {"dynamic": list(STATE_ORDER), "static": list(STATIC_ORDER)},
+        "representation_transformation": serialized["representation_transformation"],
+    }
+    digest = common.serialization.canonical_json_sha256(core)
+    result = {
+        **core,
+        "grid_identity_sha256": digest,
+        "reference_grid_identity_sha256": digest,
+        "prediction_grid_identity_sha256": digest,
+    }
+    return _validate_spatial_representation_identity(
+        result,
+        expected_shape=shape,
+        static_conditioning=static,
+        spatial_mask=mask,
+    )
 
 
 def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: DatasetRole) -> dict[str, Any]:
@@ -222,6 +484,7 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
         "model_parameters",
         "checkpoint_identity",
         "scaling_identity",
+        "spatial_representation",
         "stage_identity",
         "curriculum_identity",
         "parent_checkpoint",
@@ -231,6 +494,7 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
         if not isinstance(identity[key], dict) or not identity[key]:
             message = f"Sequence identity.{key} must be a non-empty mapping."
             raise TransientSequenceArtifactError(message)
+    _validate_spatial_representation_identity(identity["spatial_representation"])
     if identity["parent_checkpoint"] != identity["stage_a_handoff"]:
         message = "Sequence parent checkpoint and Stage-A handoff identity disagree."
         raise TransientSequenceArtifactError(message)
@@ -377,7 +641,12 @@ class TransientSequenceRecord:
     reference_states: np.ndarray
     predicted_states: np.ndarray
     reference_increments: np.ndarray | None
-    predicted_increments: np.ndarray | None
+    predicted_increments: np.ndarray
+    scaled_model_outputs: np.ndarray
+    prediction_available: np.ndarray
+    prediction_nonfinite_mask: np.ndarray
+    prediction_physical_invalid_mask: np.ndarray
+    prediction_validity: Mapping[str, Any]
     spatial_mask: np.ndarray
     temporal_mask: np.ndarray
     static_conditioning: np.ndarray
@@ -400,6 +669,7 @@ class TransientSequenceRecord:
             "requested_horizon": self.requested_horizon,
             "inference_airflow_source": self.identity["inference_airflow_source"],
             "checkpoint_identity": self.identity["checkpoint_identity"],
+            "spatial_grid_identity": self.identity["spatial_representation"]["grid_identity_sha256"],
         }
         return common.serialization.canonical_json_sha256(payload)
 
@@ -408,7 +678,7 @@ class TransientSequenceRecord:
         """Return exact final minus origin time for this available sequence."""
         return float(self.physical_times[-1] - self.physical_times[0])
 
-    def validated(self) -> TransientSequenceRecord:  # noqa: C901
+    def validated(self) -> TransientSequenceRecord:  # noqa: C901, PLR0912, PLR0915
         """Return an owned, schema-normalized copy after fail-closed validation."""
         if self.mode not in {"teacher_forced_one_step", "autonomous_full", "rolling_origin"}:
             message = f"Unsupported transient Evaluation mode {self.mode!r}."
@@ -451,9 +721,12 @@ class TransientSequenceRecord:
             raise TransientSequenceArtifactError(message)
 
         reference = _finite_array(self.reference_states, label="reference_states", dtype=np.dtype(np.float32), ndim=4)
-        predicted = _finite_array(self.predicted_states, label="predicted_states", dtype=np.dtype(np.float32), ndim=4)
+        predicted = _prediction_array(self.predicted_states, label="predicted_states", ndim=4)
         if reference.shape != predicted.shape or reference.shape[0:2] != (available + 1, len(STATE_ORDER)):
             message = "Reference and predicted states must share [available+1,4,Y,X] shape."
+            raise TransientSequenceArtifactError(message)
+        if not np.array_equal(predicted[0], reference[0]):
+            message = "Predicted sequences must begin from the exact finite reference source state."
             raise TransientSequenceArtifactError(message)
         height, width = reference.shape[-2:]
         if min(height, width) < 1:
@@ -481,25 +754,106 @@ class TransientSequenceRecord:
             message = "Scalar conditioning must contain the exact eight material parameters."
             raise TransientSequenceArtifactError(message)
 
-        def increments(value: np.ndarray | None, *, label: str) -> np.ndarray | None:
-            if value is None:
-                return None
-            result = _finite_array(value, label=label, dtype=np.dtype(np.float32), ndim=4)
-            if result.shape != (available, len(STATE_ORDER), height, width):
-                message = f"{label} must have [available,4,Y,X] shape."
+        reference_increments = None
+        if self.reference_increments is not None:
+            reference_increments = _finite_array(
+                self.reference_increments,
+                label="reference_increments",
+                dtype=np.dtype(np.float32),
+                ndim=4,
+            )
+            if reference_increments.shape != (available, len(STATE_ORDER), height, width):
+                message = "reference_increments must have [available,4,Y,X] shape."
                 raise TransientSequenceArtifactError(message)
-            return result
-
-        reference_increments = increments(self.reference_increments, label="reference_increments")
-        predicted_increments = increments(self.predicted_increments, label="predicted_increments")
+        predicted_increments = _prediction_array(
+            self.predicted_increments,
+            label="predicted_increments",
+            ndim=4,
+        )
+        scaled_outputs = _prediction_array(
+            self.scaled_model_outputs,
+            label="scaled_model_outputs",
+            ndim=4,
+        )
+        expected_prediction_shape = (available, len(STATE_ORDER), height, width)
+        if predicted_increments.shape != expected_prediction_shape or scaled_outputs.shape != expected_prediction_shape:
+            message = "Prediction increments and raw scaled outputs must have [available,4,Y,X] shape."
+            raise TransientSequenceArtifactError(message)
+        prediction_available = _mask_array(
+            self.prediction_available,
+            label="prediction_available",
+            ndim=1,
+        )
+        prediction_nonfinite = _mask_array(
+            self.prediction_nonfinite_mask,
+            label="prediction_nonfinite_mask",
+            ndim=4,
+        )
+        prediction_physical_invalid = _mask_array(
+            self.prediction_physical_invalid_mask,
+            label="prediction_physical_invalid_mask",
+            ndim=4,
+        )
+        if (
+            prediction_available.shape != (available,)
+            or prediction_nonfinite.shape != expected_prediction_shape
+            or prediction_physical_invalid.shape != expected_prediction_shape
+        ):
+            message = "Prediction availability and invalid masks do not match the sequence prediction axes."
+            raise TransientSequenceArtifactError(message)
+        computed_steps = int(prediction_available.sum())
+        if computed_steps < 1 or not np.array_equal(
+            prediction_available,
+            np.arange(available) < computed_steps,
+        ):
+            message = "Prediction availability must identify one non-empty computed prefix."
+            raise TransientSequenceArtifactError(message)
+        computed_mask = prediction_available[:, None, None, None]
+        expected_nonfinite = (~np.isfinite(predicted[1:])) & computed_mask
+        expected_physical_invalid = transient_validity.prediction_physical_invalid_mask(predicted[1:]) & computed_mask
+        if not np.array_equal(prediction_nonfinite, expected_nonfinite):
+            message = "Prediction non-finite mask contradicts reconstructed prediction values."
+            raise TransientSequenceArtifactError(message)
+        if not np.array_equal(prediction_physical_invalid, expected_physical_invalid):
+            message = "Prediction physical-invalid mask contradicts reconstructed prediction values."
+            raise TransientSequenceArtifactError(message)
+        if not prediction_available.all() and any(
+            not bool(np.isnan(values[~prediction_available]).all()) for values in (scaled_outputs, predicted_increments, predicted[1:])
+        ):
+            message = "Uncomputed prediction tails must contain only explicit NaN sentinels."
+            raise TransientSequenceArtifactError(message)
+        with np.errstate(invalid="ignore", over="ignore"):
+            reconstructed = predicted[:-1] + predicted_increments
+        if not np.allclose(
+            reconstructed[prediction_available],
+            predicted[1:][prediction_available],
+            rtol=0.0,
+            atol=2.0e-5,
+            equal_nan=True,
+        ):
+            message = "Decoded prediction increments contradict reconstructed prediction states."
+            raise TransientSequenceArtifactError(message)
         if reference_increments is not None and not np.allclose(reference_increments, np.diff(reference, axis=0), rtol=0.0, atol=2.0e-5):
             message = "Reference increments contradict reference absolute states."
             raise TransientSequenceArtifactError(message)
-        if predicted_increments is not None and not np.allclose(predicted_increments, np.diff(predicted, axis=0), rtol=0.0, atol=2.0e-5):
-            message = "Predicted increments contradict predicted absolute states."
-            raise TransientSequenceArtifactError(message)
+        prediction_validity = transient_validity.validate_prediction_validity(
+            self.prediction_validity,
+            scaled_model_outputs=scaled_outputs,
+            decoded_physical_increments=predicted_increments,
+            reconstructed_states=predicted[1:],
+            prediction_available=prediction_available,
+            physical_times=times,
+            mode=self.mode,
+            origin_index=origin_index,
+        )
 
         identity = _validate_identity(self.identity, case_id=case_id, dataset_role=self.dataset_role)
+        _validate_spatial_representation_identity(
+            identity["spatial_representation"],
+            expected_shape=(height, width),
+            static_conditioning=static,
+            spatial_mask=spatial_mask,
+        )
         target = _validate_target(self.target)
         _validate_record_target_scope(
             target,
@@ -526,6 +880,11 @@ class TransientSequenceRecord:
             predicted_states=predicted,
             reference_increments=reference_increments,
             predicted_increments=predicted_increments,
+            scaled_model_outputs=scaled_outputs,
+            prediction_available=prediction_available,
+            prediction_nonfinite_mask=prediction_nonfinite,
+            prediction_physical_invalid_mask=prediction_physical_invalid,
+            prediction_validity=prediction_validity,
             spatial_mask=spatial_mask,
             temporal_mask=temporal_mask,
             static_conditioning=static,
@@ -630,6 +989,7 @@ def _record_row(
         "inference_airflow_source": record.identity["inference_airflow_source"],
         "model_kind": record.identity["model_kind"],
         "dataset_backend": record.identity["dataset_backend"],
+        "prediction_validity_status": record.prediction_validity["status"],
         "reference_reached": target["reference_reached"],
         "predicted_reached": target["predicted_reached"],
         "reference_censored": target["reference_censored"],
@@ -642,6 +1002,13 @@ def _record_row(
         "metric_statistics_json": json.dumps(metric_statistics, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
         if metric_statistics is not None
         else None,
+        "prediction_validity_json": json.dumps(
+            record.prediction_validity,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         "identity_json": json.dumps(record.identity, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True),
         "target_json": json.dumps(record.target, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True),
         "timing_json": json.dumps(record.timing, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True),
@@ -739,6 +1106,13 @@ def _validate_parent_experiment_evidence(value: Any) -> dict[str, Any]:
     return evidence
 
 
+def _prediction_arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    """Compare raw prediction arrays while treating matching NaNs as evidence."""
+    if left.dtype.kind == "f" and right.dtype.kind == "f":
+        return bool(np.array_equal(left, right, equal_nan=True))
+    return bool(np.array_equal(left, right))
+
+
 def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -> None:
     """Write one deduplicated complete-case bundle and unique prediction chains."""
     if not records:
@@ -812,15 +1186,18 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
         current = chains.get(chain)
         if current is None or record.available_horizon > current.available_horizon:
             chains[chain] = record
-        elif record.available_horizon == current.available_horizon and (
-            not np.array_equal(record.predicted_states, current.predicted_states)
-            or (
-                record.predicted_increments is not None
-                and current.predicted_increments is not None
-                and not np.array_equal(
-                    record.predicted_increments,
-                    current.predicted_increments,
-                )
+        elif record.available_horizon == current.available_horizon and any(
+            not _prediction_arrays_equal(left, right)
+            for left, right in (
+                (record.predicted_states, current.predicted_states),
+                (record.predicted_increments, current.predicted_increments),
+                (record.scaled_model_outputs, current.scaled_model_outputs),
+                (record.prediction_available, current.prediction_available),
+                (record.prediction_nonfinite_mask, current.prediction_nonfinite_mask),
+                (
+                    record.prediction_physical_invalid_mask,
+                    current.prediction_physical_invalid_mask,
+                ),
             )
         ):
             message = "One transient prediction chain has contradictory duplicate evidence."
@@ -841,13 +1218,19 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
     for chain, record in chains.items():
         prefix = f"chain_{chain}_"
         payload[f"{prefix}predicted_states"] = record.predicted_states
-        if record.predicted_increments is not None:
-            payload[f"{prefix}predicted_increments"] = record.predicted_increments
+        payload[f"{prefix}predicted_increments"] = record.predicted_increments
+        payload[f"{prefix}scaled_model_outputs"] = record.scaled_model_outputs
+        payload[f"{prefix}prediction_available"] = record.prediction_available
+        payload[f"{prefix}prediction_nonfinite_mask"] = record.prediction_nonfinite_mask
+        payload[f"{prefix}prediction_physical_invalid_mask"] = record.prediction_physical_invalid_mask
     cast("Any", np.savez)(path, **payload)
 
 
 class TransientSequenceArtifactStager:
-    """Stream exact case bundles into one private incomplete artifact root."""
+    """Stream case bundles into an incomplete root, optionally resuming exact work."""
+
+    _RESUME_DESCRIPTOR = _RESUME_DESCRIPTOR_NAME
+    _CASE_MANIFEST_DIRECTORY = _CASE_MANIFEST_DIRECTORY_NAME
 
     def __init__(
         self,
@@ -855,37 +1238,225 @@ class TransientSequenceArtifactStager:
         *,
         dataset_name: str,
         dataset_role: DatasetRole,
+        resume_identity: Mapping[str, Any] | None = None,
     ) -> None:
-        """Create one empty staging root without publishing a completion marker."""
-        artifact_root = Path(root)
-        if artifact_root.exists() and any(artifact_root.iterdir()):
-            message = f"Transient artifact staging root must be empty: {artifact_root}"
-            raise FileExistsError(message)
-        artifact_root.mkdir(parents=True, exist_ok=True)
-        (artifact_root / "npz").mkdir()
-        self.root = artifact_root.resolve()
-        self.dataset_name = common.paths.validate_logical_name(
-            dataset_name,
-            label="dataset_name",
-        )
+        """Create an empty stage or reopen one with an exact resume descriptor."""
+        artifact_root = Path(root).expanduser()
+        if artifact_root.is_symlink():
+            message = f"Transient artifact staging root must not be symbolic: {artifact_root}"
+            raise ValueError(message)
+        self.dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
         if dataset_role not in {"id", "ood"}:
             message = "dataset_role must be 'id' or 'ood'."
             raise ValueError(message)
-        self.dataset_role = dataset_role
+        self.dataset_role: DatasetRole = dataset_role
+        self.root = artifact_root.resolve()
         self._rows: list[dict[str, Any]] = []
         self._unavailable: list[dict[str, Any]] = []
         self._case_payloads: dict[str, tuple[str, str]] = {}
+        self._case_evidence: dict[str, dict[str, Any]] = {}
         self._record_ids: set[str] = set()
         self._finalized = False
+        self._resume_identity = None if resume_identity is None else _json_copy(resume_identity, label="transient artifact resume identity")
+        if self._resume_identity is None:
+            if artifact_root.exists() and any(artifact_root.iterdir()):
+                message = f"Transient artifact staging root must be empty: {artifact_root}"
+                raise FileExistsError(message)
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            (artifact_root / "npz").mkdir()
+            return
+        self._open_or_create_resumable_stage()
+
+    @property
+    def completed_case_ids(self) -> frozenset[str]:
+        """Return exact completed cases admitted from durable manifests."""
+        return frozenset(self._case_payloads)
+
+    def completed_case_evidence(self, case_id: str) -> Mapping[str, Any] | None:
+        """Return detached caller-owned resume evidence for one completed case."""
+        evidence = self._case_evidence.get(case_id)
+        return None if evidence is None else _json_copy(evidence, label="stored transient case resume evidence")
+
+    def _resume_descriptor_path(self) -> Path:
+        return self.root / self._RESUME_DESCRIPTOR
+
+    def _manifest_path(self, case_id: str) -> Path:
+        digest = common.serialization.canonical_json_sha256({"case_id": case_id})
+        return self.root / self._CASE_MANIFEST_DIRECTORY / f"case-{digest}.json"
+
+    def _open_or_create_resumable_stage(self) -> None:
+        descriptor_path = self._resume_descriptor_path()
+        if not self.root.exists():
+            self.root.mkdir(parents=True)
+            (self.root / "npz").mkdir()
+            (self.root / self._CASE_MANIFEST_DIRECTORY).mkdir()
+            common.serialization.atomic_write_json(
+                descriptor_path,
+                {
+                    "schema_version": 1,
+                    "dataset_name": self.dataset_name,
+                    "dataset_role": self.dataset_role,
+                    "resume_identity": self._resume_identity,
+                },
+            )
+            return
+        if contracts.artifact_provenance_path(self.root).exists():
+            message = f"Transient resume stage is already finalized: {self.root}"
+            raise FileExistsError(message)
+        if not descriptor_path.is_file() or descriptor_path.is_symlink():
+            message = f"Transient partial artifact is incompatible or corrupt; rerun with --rebuild: {self.root}"
+            raise TransientSequenceArtifactError(message)
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
+            raise TransientSequenceArtifactError(message) from error
+        expected = {
+            "schema_version": 1,
+            "dataset_name": self.dataset_name,
+            "dataset_role": self.dataset_role,
+            "resume_identity": self._resume_identity,
+        }
+        if descriptor != expected:
+            message = f"Transient partial artifact is incompatible; rerun with --rebuild: {self.root}"
+            raise TransientSequenceArtifactError(message)
+        manifest_directory = self.root / self._CASE_MANIFEST_DIRECTORY
+        npz_directory = self.root / "npz"
+        if not manifest_directory.is_dir() or manifest_directory.is_symlink() or not npz_directory.is_dir() or npz_directory.is_symlink():
+            message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
+            raise TransientSequenceArtifactError(message)
+        manifests = sorted(manifest_directory.glob("case-*.json"))
+        for manifest_path in manifests:
+            self._restore_case_manifest(manifest_path)
+        expected_payloads = {self.root / relative for relative, _digest in self._case_payloads.values()}
+        observed_payloads = set(npz_directory.glob("*.npz"))
+        missing_payloads = expected_payloads.difference(observed_payloads)
+        if missing_payloads:
+            message = f"Transient partial artifact payload inventory is corrupt; rerun with --rebuild: {self.root}"
+            raise TransientSequenceArtifactError(message)
+        for orphan in observed_payloads.difference(expected_payloads):
+            if orphan.is_symlink() or not orphan.is_file():
+                message = f"Transient partial artifact contains an unsafe orphan payload; rerun with --rebuild: {orphan}"
+                raise TransientSequenceArtifactError(message)
+            orphan.unlink()
+
+    def _restore_case_manifest(self, manifest_path: Path) -> None:
+        """Restore one strictly bound compact case manifest and payload digest."""
+
+        def fail(detail: str) -> NoReturn:
+            message = f"Transient case resume {detail}; rerun with --rebuild: {manifest_path}"
+            raise TransientSequenceArtifactError(message)
+
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            fail("manifest is unsafe")
+        try:
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            message = f"Transient case resume manifest is corrupt; rerun with --rebuild: {manifest_path}"
+            raise TransientSequenceArtifactError(message) from error
+        if not isinstance(document, dict) or set(document) != {
+            "case_id",
+            "payload",
+            "rows",
+            "unavailable_horizons",
+            "resume_evidence",
+        }:
+            fail("manifest is incompatible")
+        case_id = document["case_id"]
+        payload = document["payload"]
+        rows = document["rows"]
+        unavailable = document["unavailable_horizons"]
+        if (
+            not isinstance(case_id, str)
+            or not case_id
+            or manifest_path != self._manifest_path(case_id)
+            or not isinstance(payload, dict)
+            or set(payload) != {"path", "sha256"}
+        ):
+            fail("manifest identity is corrupt")
+        relative = payload["path"]
+        digest = payload["sha256"]
+        if (
+            not isinstance(relative, str)
+            or relative != _case_payload_path(case_id).as_posix()
+            or not isinstance(digest, str)
+            or len(digest) != _SHA256_HEX_LENGTH
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            fail("payload identity is corrupt")
+        try:
+            payload_path = _require_relative_payload(self.root, relative)
+        except (FileNotFoundError, OSError, ValueError) as error:
+            message = f"Transient case resume payload is corrupt; rerun with --rebuild: {manifest_path}"
+            raise TransientSequenceArtifactError(message) from error
+        if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
+            fail("summary rows are corrupt")
+        summaries = tuple(
+            _summary_from_row(
+                self.root,
+                cast("Mapping[str, Any]", row),
+                dataset_role=self.dataset_role,
+            )
+            for row in rows
+        )
+        record_ids = {summary.record_id for summary in summaries}
+        if len(record_ids) != len(rows) or any(
+            summary.case_id != case_id or summary.payload_path != relative or summary.payload_sha256 != digest for summary in summaries
+        ):
+            fail("summary rows contradict the case")
+        try:
+            case_payload = _TransientCasePayload(
+                payload_path,
+                expected_sha256=digest,
+            )
+            try:
+                for row in rows:
+                    _record_from_row(
+                        self.root,
+                        cast("Mapping[str, Any]", row),
+                        case_payload,
+                    )
+            finally:
+                case_payload.close()
+        except (OSError, TypeError, ValueError) as error:
+            message = f"Transient case resume payload semantics conflict; rerun with --rebuild: {manifest_path}"
+            raise TransientSequenceArtifactError(message) from error
+        evidence = _json_copy(
+            document["resume_evidence"],
+            label="stored transient case resume evidence",
+        )
+        if not isinstance(unavailable, list):
+            fail("unavailable horizons are corrupt")
+        unavailable_copy = [
+            _json_copy(
+                item,
+                label="stored transient unavailable horizon",
+            )
+            for item in unavailable
+        ]
+        if any(item.get("case_id") != case_id or item.get("dataset_role") != self.dataset_role for item in unavailable_copy):
+            fail("unavailable horizons are corrupt")
+        if case_id in self._case_payloads or self._record_ids.intersection(record_ids):
+            fail("manifests conflict")
+        self._case_payloads[case_id] = (relative, digest)
+        self._case_evidence[case_id] = evidence
+        self._record_ids.update(record_ids)
+        self._rows.extend(cast("list[dict[str, Any]]", rows))
+        self._unavailable.extend(unavailable_copy)
 
     def write_case(
         self,
         records: Sequence[TransientSequenceRecord],
         *,
         unavailable_horizons: Sequence[UnavailableHorizon] = (),
-        metric_statistics: Mapping[str, Mapping[str, Mapping[str, object]]] | None = None,
+        metric_statistics: Mapping[
+            str,
+            Mapping[str, Mapping[str, object]],
+        ]
+        | None = None,
+        resume_evidence: Mapping[str, Any] | None = None,
     ) -> None:
-        """Validate, persist, and release one exact case-local record group."""
+        """Validate and atomically persist one case and its durable manifest."""
         if self._finalized:
             message = "Transient artifact staging is already finalized."
             raise RuntimeError(message)
@@ -911,7 +1482,9 @@ class TransientSequenceArtifactStager:
             raise ValueError(message)
         relative = _case_payload_path(case_id)
         payload_path = self.root / relative
-        _write_case_bundle(payload_path, admitted)
+        temporary_path = payload_path.with_name(f".{payload_path.stem}.partial{payload_path.suffix}")
+        _write_case_bundle(temporary_path, admitted)
+        temporary_path.replace(payload_path)
         payload_digest = common.serialization.file_sha256(payload_path)
         payload = (relative.as_posix(), payload_digest)
         rows = [
@@ -923,7 +1496,26 @@ class TransientSequenceArtifactStager:
             )
             for record in admitted
         ]
+        evidence = _json_copy(
+            resume_evidence or {},
+            label="transient case resume evidence",
+        )
+        if self._resume_identity is not None:
+            common.serialization.atomic_write_json(
+                self._manifest_path(case_id),
+                {
+                    "case_id": case_id,
+                    "payload": {
+                        "path": payload[0],
+                        "sha256": payload[1],
+                    },
+                    "rows": rows,
+                    "unavailable_horizons": list(unavailable),
+                    "resume_evidence": evidence,
+                },
+            )
         self._case_payloads[case_id] = payload
+        self._case_evidence[case_id] = evidence
         self._record_ids.update(record_ids)
         self._rows.extend(rows)
         self._unavailable.extend(unavailable)
@@ -933,7 +1525,7 @@ class TransientSequenceArtifactStager:
         *,
         provenance: Mapping[str, Any],
     ) -> TransientSequenceArtifactIndex:
-        """Publish compact summary/provenance last and return an index without payload rereads."""
+        """Validate final outputs, publish the marker last, and clean resume data."""
         if self._finalized:
             message = "Transient artifact staging is already finalized."
             raise RuntimeError(message)
@@ -947,17 +1539,26 @@ class TransientSequenceArtifactStager:
             provenance,
             label="transient artifact provenance",
         )
-        required_provenance = {"run", "dataset", "evaluation", "runtime", "lineage"}
+        required_provenance = {
+            "run",
+            "dataset",
+            "evaluation",
+            "spatial_representation",
+            "runtime",
+            "lineage",
+        }
         if set(admitted_provenance) != required_provenance:
-            message = "Transient artifact provenance must contain exactly run, dataset, evaluation, runtime, and lineage."
+            message = "Transient artifact provenance fields do not match the current role-level schema."
+            raise ValueError(message)
+        spatial_representation = admitted_provenance["spatial_representation"]
+        if not isinstance(spatial_representation, dict) or not spatial_representation:
+            message = "Transient artifact role spatial representation must be a non-empty mapping."
             raise ValueError(message)
         run = admitted_provenance["run"]
         if not isinstance(run, dict) or "parent_experiment" not in run:
             message = "Transient artifact run provenance requires parent_experiment evidence."
             raise ValueError(message)
-        run["parent_experiment"] = _validate_parent_experiment_evidence(
-            run["parent_experiment"],
-        )
+        run["parent_experiment"] = _validate_parent_experiment_evidence(run["parent_experiment"])
         outputs = {
             "parquet": {
                 "path": parquet_path.relative_to(self.root).as_posix(),
@@ -966,7 +1567,7 @@ class TransientSequenceArtifactStager:
             "npz": [{"path": relative, "sha256": digest} for relative, digest in sorted(self._case_payloads.values())],
         }
         document = {
-            "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+            "provenance_schema_version": (contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
             "artifact_schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
             "artifact_kind": TRANSIENT_ARTIFACT_KIND,
             "task": "transient_drying",
@@ -978,13 +1579,7 @@ class TransientSequenceArtifactStager:
             },
             "outputs": outputs,
         }
-        document["identity_sha256"] = common.serialization.canonical_json_sha256(
-            _scientific_identity_document(document),
-        )
-        common.serialization.atomic_write_json(
-            contracts.artifact_provenance_path(self.root),
-            document,
-        )
+        document["identity_sha256"] = common.serialization.canonical_json_sha256(_scientific_identity_document(document))
         index = _index_from_admitted_frame(
             self.root,
             provenance=document,
@@ -992,8 +1587,51 @@ class TransientSequenceArtifactStager:
             cache_limit=1,
         )
         validate_transient_sequence_payload_inventory(index)
+        common.serialization.atomic_write_json(
+            contracts.artifact_provenance_path(self.root),
+            document,
+        )
+        if self._resume_identity is not None:
+            cleanup_transient_resume_metadata(self.root)
         self._finalized = True
         return index
+
+
+def cleanup_transient_resume_metadata(root: Path | str) -> None:
+    """Remove only exact resumable metadata from one completed artifact root."""
+    candidate = Path(root).expanduser()
+    if candidate.is_symlink():
+        message = f"Completed transient artifact root must not be symbolic: {candidate}"
+        raise ValueError(message)
+    artifact_root = candidate.resolve(strict=True)
+    marker = contracts.artifact_provenance_path(artifact_root)
+    if marker.is_symlink() or not marker.is_file():
+        message = "Transient resume metadata cleanup requires a regular completion marker."
+        raise TransientSequenceArtifactError(message)
+    manifest_directory = artifact_root / _CASE_MANIFEST_DIRECTORY_NAME
+    if manifest_directory.is_symlink():
+        message = f"Transient resume manifest directory must not be symbolic: {manifest_directory}"
+        raise TransientSequenceArtifactError(message)
+    if manifest_directory.exists():
+        if not manifest_directory.is_dir():
+            message = f"Transient resume manifest path must be a directory: {manifest_directory}"
+            raise TransientSequenceArtifactError(message)
+        manifests = tuple(manifest_directory.iterdir())
+        if any(path.is_symlink() or not path.is_file() or not path.name.startswith("case-") or path.suffix != ".json" for path in manifests):
+            message = f"Transient resume manifest directory contains unsafe evidence: {manifest_directory}"
+            raise TransientSequenceArtifactError(message)
+        for manifest in manifests:
+            manifest.unlink()
+        manifest_directory.rmdir()
+    descriptor = artifact_root / _RESUME_DESCRIPTOR_NAME
+    if descriptor.is_symlink():
+        message = f"Transient resume descriptor must not be symbolic: {descriptor}"
+        raise TransientSequenceArtifactError(message)
+    if descriptor.exists():
+        if not descriptor.is_file():
+            message = f"Transient resume descriptor must be a regular file: {descriptor}"
+            raise TransientSequenceArtifactError(message)
+        descriptor.unlink()
 
 
 def write_transient_sequence_artifact(
@@ -1073,8 +1711,12 @@ def _require_relative_payload(root: Path, relative: Any) -> Path:
     if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
         message = "Transient artifact contains an unsafe payload path."
         raise TransientSequenceArtifactError(message)
-    path = (root / relative).resolve(strict=True)
-    if not path.is_relative_to(root) or path.is_symlink() or path.suffix != ".npz":
+    candidate = root / relative
+    if candidate.is_symlink():
+        message = "Transient payload must not use symbolic indirection."
+        raise TransientSequenceArtifactError(message)
+    path = candidate.resolve(strict=True)
+    if not path.is_relative_to(root) or not path.is_file() or path.suffix != ".npz":
         message = "Transient payload must be one regular NPZ below the artifact root."
         raise TransientSequenceArtifactError(message)
     return path
@@ -1186,7 +1828,17 @@ def _record_from_row(root: Path, row: Mapping[str, Any], payload: Mapping[str, n
             raise TransientSequenceArtifactError(message)
     chain = _nonempty_text(row["chain_id"], label="summary chain_id")
     prefix = f"chain_{chain}_"
-    needed = {f"{prefix}predicted_states"}
+    needed = {
+        f"{prefix}{suffix}"
+        for suffix in (
+            "predicted_states",
+            "predicted_increments",
+            "scaled_model_outputs",
+            "prediction_available",
+            "prediction_nonfinite_mask",
+            "prediction_physical_invalid_mask",
+        )
+    }
     if not needed.issubset(payload):
         message = "Transient case bundle lacks the selected prediction chain."
         raise TransientSequenceArtifactError(message)
@@ -1211,7 +1863,12 @@ def _record_from_row(root: Path, row: Mapping[str, Any], payload: Mapping[str, n
                 if "reference_increments" not in payload
                 else payload["reference_increments"][int(row["origin_index"]) : int(row["origin_index"]) + available]
             ),
-            predicted_increments=(None if f"{prefix}predicted_increments" not in payload else payload[f"{prefix}predicted_increments"][:available]),
+            predicted_increments=payload[f"{prefix}predicted_increments"][:available],
+            scaled_model_outputs=payload[f"{prefix}scaled_model_outputs"][:available],
+            prediction_available=payload[f"{prefix}prediction_available"][:available],
+            prediction_nonfinite_mask=payload[f"{prefix}prediction_nonfinite_mask"][:available],
+            prediction_physical_invalid_mask=payload[f"{prefix}prediction_physical_invalid_mask"][:available],
+            prediction_validity=json.loads(str(row["prediction_validity_json"])),
             spatial_mask=payload["spatial_mask"],
             temporal_mask=payload["temporal_mask"][int(row["origin_index"]) : int(row["origin_index"]) + state_count],
             static_conditioning=payload["static_conditioning"],
@@ -1249,6 +1906,7 @@ class TransientSequenceRecordSummary:
     payload_sha256: str
     chain_id: str
     metric_statistics: Mapping[str, Mapping[str, object]] | None
+    prediction_validity: Mapping[str, Any]
     identity: Mapping[str, Any]
     target: Mapping[str, Any]
     timing: Mapping[str, Any]
@@ -1360,6 +2018,7 @@ _SUMMARY_COLUMNS = frozenset(
         "inference_airflow_source",
         "model_kind",
         "dataset_backend",
+        "prediction_validity_status",
         "reference_reached",
         "predicted_reached",
         "reference_censored",
@@ -1370,6 +2029,7 @@ _SUMMARY_COLUMNS = frozenset(
         "payload_sha256",
         "chain_id",
         "metric_statistics_json",
+        "prediction_validity_json",
         "identity_json",
         "target_json",
         "timing_json",
@@ -1378,7 +2038,9 @@ _SUMMARY_COLUMNS = frozenset(
 )
 
 
-def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: DatasetRole) -> TransientSequenceRecordSummary:
+def _summary_from_row(  # noqa: C901, PLR0912
+    root: Path, row: Mapping[str, Any], *, dataset_role: DatasetRole
+) -> TransientSequenceRecordSummary:
     """Validate one compact record row without decompressing its case bundle."""
     if set(row) != _SUMMARY_COLUMNS:
         message = "Transient sequence summary columns do not match the current schema."
@@ -1420,6 +2082,7 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
         target = _validate_target(json.loads(str(row["target_json"])))
         timing = _json_copy(json.loads(str(row["timing_json"])), label="sequence timing")
         exclusion = _validate_exclusion(json.loads(str(row["exclusion_json"])))
+        prediction_validity = transient_validity.validate_prediction_validity_document(json.loads(str(row["prediction_validity_json"])))
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         message = f"Transient sequence summary JSON is invalid: {error}"
         raise TransientSequenceArtifactError(message) from error
@@ -1434,6 +2097,7 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
             "requested_horizon": requested,
             "inference_airflow_source": identity["inference_airflow_source"],
             "checkpoint_identity": identity["checkpoint_identity"],
+            "spatial_grid_identity": identity["spatial_representation"]["grid_identity_sha256"],
         }
     )
     if record_id != expected:
@@ -1443,8 +2107,12 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
         row["inference_airflow_source"] != identity["inference_airflow_source"]
         or row["model_kind"] != identity["model_kind"]
         or row["dataset_backend"] != identity["dataset_backend"]
+        or row["prediction_validity_status"] != prediction_validity["status"]
+        or prediction_validity["mode"] != mode
+        or prediction_validity["origin_index"] != origin
+        or prediction_validity["requested_step_count"] != available
     ):
-        message = "Transient sequence summary duplicates contradict identity JSON."
+        message = "Transient sequence summary duplicates contradict identity or prediction-validity JSON."
         raise TransientSequenceArtifactError(message)
     chain_id = _nonempty_text(row["chain_id"], label="summary chain_id")
     expected_chain_id = _chain_id_from_coordinates(
@@ -1469,12 +2137,58 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
         }:
             message = "Transient record metric statistics are invalid."
             raise TransientSequenceArtifactError(message)
+        metric_scope_fields = {
+            "classification",
+            "available",
+            "unavailable_reason",
+            "required_value_count",
+            "computed_value_count",
+            "finite_value_count",
+            "nonfinite_value_count",
+            "statistics",
+        }
         for scope in ("cumulative", "endpoint"):
             state = parsed_statistics[scope]
-            if not isinstance(state, dict):
-                message = "Transient record metric sufficient statistics must be mappings."
+            if (
+                not isinstance(state, dict)
+                or set(state) != metric_scope_fields
+                or state["classification"] != "REQUIRES_ALL_FINITE_VALUES"
+                or not isinstance(state["available"], bool)
+            ):
+                message = "Transient record metric availability evidence is invalid."
                 raise TransientSequenceArtifactError(message)
-            transient_metrics.TransientMetricAccumulator.from_state_dict(state)
+            counts = tuple(
+                state[name]
+                for name in (
+                    "required_value_count",
+                    "computed_value_count",
+                    "finite_value_count",
+                    "nonfinite_value_count",
+                )
+            )
+            if (
+                any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts)
+                or state["required_value_count"] < 1
+                or state["computed_value_count"] > state["required_value_count"]
+                or state["finite_value_count"] + state["nonfinite_value_count"] != state["computed_value_count"]
+            ):
+                message = "Transient record metric support counts are invalid."
+                raise TransientSequenceArtifactError(message)
+            metric_available = state["computed_value_count"] == state["required_value_count"] == state["finite_value_count"]
+            if state["available"] is not metric_available:
+                message = "Transient record metric status contradicts its exact support."
+                raise TransientSequenceArtifactError(message)
+            if metric_available:
+                if state["unavailable_reason"] is not None or not isinstance(
+                    state["statistics"],
+                    dict,
+                ):
+                    message = "Available transient metrics require sufficient statistics."
+                    raise TransientSequenceArtifactError(message)
+                transient_metrics.TransientMetricAccumulator.from_state_dict(state["statistics"])
+            elif not isinstance(state["unavailable_reason"], str) or not state["unavailable_reason"] or state["statistics"] is not None:
+                message = "Unavailable transient metrics require one reason and null statistics."
+                raise TransientSequenceArtifactError(message)
         diagnostics = parsed_statistics["diagnostics"]
         diagnostic_fields = {
             "plausibility": {
@@ -1491,7 +2205,11 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
                 "abnormal_growth_count",
             },
         }
-        if not isinstance(diagnostics, dict) or set(diagnostics) != set(diagnostic_fields):
+        if (
+            not isinstance(diagnostics, dict)
+            or set(diagnostics) != {"classification", *diagnostic_fields}
+            or diagnostics["classification"] != "PHYSICAL_VALIDITY_METRIC"
+        ):
             message = "Transient record diagnostic statistics are invalid."
             raise TransientSequenceArtifactError(message)
         for label, fields in diagnostic_fields.items():
@@ -1508,24 +2226,25 @@ def _summary_from_row(root: Path, row: Mapping[str, Any], *, dataset_role: Datas
             parsed_statistics,
         )
     return TransientSequenceRecordSummary(
-        record_id,
-        cast("EvaluationMode", mode),
-        case_id,
-        dataset_role,
-        origin,
-        requested,
-        available,
-        trajectory_length,
-        float(row["origin_time"]),
-        float(row["elapsed_physical_time"]),
-        str(row["payload_path"]),
-        payload_digest,
-        chain_id,
-        metric_statistics,
-        identity,
-        target,
-        timing,
-        exclusion,
+        record_id=record_id,
+        mode=cast("EvaluationMode", mode),
+        case_id=case_id,
+        dataset_role=dataset_role,
+        origin_index=origin,
+        requested_horizon=requested,
+        available_horizon=available,
+        trajectory_length=trajectory_length,
+        origin_time=float(row["origin_time"]),
+        elapsed_physical_time=float(row["elapsed_physical_time"]),
+        payload_path=str(row["payload_path"]),
+        payload_sha256=payload_digest,
+        chain_id=chain_id,
+        metric_statistics=metric_statistics,
+        prediction_validity=prediction_validity,
+        identity=identity,
+        target=target,
+        timing=timing,
+        exclusion=exclusion,
     )
 
 
@@ -1553,11 +2272,19 @@ def validate_transient_sequence_payload_inventory(
     for case_id in index.case_ids:
         summaries = tuple(summary for summary in index.summaries if summary.case_id == case_id)
         path = _require_relative_payload(index.root, summaries[0].payload_path)
-        chain_fields = {f"chain_{summary.chain_id}_predicted_states" for summary in summaries}
-        optional_fields = {
-            "reference_increments",
-            *(f"chain_{summary.chain_id}_predicted_increments" for summary in summaries),
+        chain_fields = {
+            f"chain_{summary.chain_id}_{suffix}"
+            for summary in summaries
+            for suffix in (
+                "predicted_states",
+                "predicted_increments",
+                "scaled_model_outputs",
+                "prediction_available",
+                "prediction_nonfinite_mask",
+                "prediction_physical_invalid_mask",
+            )
         }
+        optional_fields = {"reference_increments"}
         with np.load(path, allow_pickle=False) as loaded:
             actual = set(loaded.files)
         allowed = common_fields.union(chain_fields, optional_fields)
@@ -1744,6 +2471,7 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
         "run",
         "dataset",
         "evaluation",
+        "spatial_representation",
         "runtime",
         "lineage",
         "availability",
@@ -1770,6 +2498,9 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
         message = "Transient artifact identity digest is invalid."
         raise TransientSequenceArtifactError(message)
     _validate_runtime_performance(provenance)
+    if not isinstance(provenance["spatial_representation"], dict) or not provenance["spatial_representation"]:
+        message = "Transient artifact role spatial representation must be a non-empty mapping."
+        raise TransientSequenceArtifactError(message)
     run = provenance["run"]
     if not isinstance(run, dict) or "parent_experiment" not in run:
         message = "Transient artifact run provenance lacks parent experiment evidence."

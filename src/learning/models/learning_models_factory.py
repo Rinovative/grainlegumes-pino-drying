@@ -302,6 +302,72 @@ def validate_transient_model_spatial_shape(
             shape = (_scaled_axis_size(shape[0], scale_y), _scaled_axis_size(shape[1], scale_x))
 
 
+def assess_transient_model_spatial_compatibility(
+    config: Mapping[str, Any],
+    *,
+    training_shape: tuple[int, int],
+    evaluation_shape: tuple[int, int],
+) -> dict[str, Any]:
+    """Return one explicit architecture decision for a requested grid."""
+    model = config.get("model")
+    if config.get("task") != "transient_drying" or not isinstance(model, Mapping):
+        message = "Transient spatial compatibility requires resolved transient_drying model configuration."
+        raise TypeError(message)
+    kind = model.get("kind")
+    if kind not in {"fno", "uno", "rno"}:
+        return {
+            "decision": "UNKNOWN",
+            "model_kind": kind,
+            "training_shape": list(training_shape),
+            "evaluation_shape": list(evaluation_shape),
+            "reason": "The model kind has no maintained transient spatial capability contract.",
+        }
+    try:
+        validate_transient_model_spatial_shape(config, training_shape)
+        if evaluation_shape != training_shape:
+            validate_transient_model_spatial_shape(config, evaluation_shape)
+    except (TypeError, ValueError) as error:
+        return {
+            "decision": "UNSUPPORTED",
+            "model_kind": kind,
+            "training_shape": list(training_shape),
+            "evaluation_shape": list(evaluation_shape),
+            "reason": str(error),
+        }
+    decision = "SUPPORTED_EXACTLY" if evaluation_shape == training_shape else "SUPPORTED_WITH_CONTRACT"
+    constraints = [
+        "retained_fourier_modes_fit_requested_axes",
+        "explicit_coordinate_channels_follow_requested_grid",
+        "no_persisted_fixed_spatial_shape_parameter",
+        "model_output_must_match_requested_shape_exactly",
+    ]
+    if kind == "uno":
+        constraints.append("every_uno_resampling_level_retains_valid_axis_modes")
+    if kind == "rno":
+        constraints.append("recurrent_hidden_state_is_request_local_and_shape_checked")
+    params = model.get("params")
+    positional_embedding = params.get("positional_embedding") if isinstance(params, Mapping) else None
+    return {
+        "decision": decision,
+        "model_kind": kind,
+        "training_shape": list(training_shape),
+        "evaluation_shape": list(evaluation_shape),
+        "validated_constraints": constraints,
+        "coordinate_handling": {
+            "tensorizer": "explicit_x_y_channels",
+            "model_positional_embedding": positional_embedding,
+        },
+        "forward_output_shape_proof": (
+            "checkpoint_training_shape_contract" if decision == "SUPPORTED_EXACTLY" else "pending_synthetic_single_step_probe"
+        ),
+        "reason": (
+            "Requested Evaluation shape equals the admitted Training shape."
+            if decision == "SUPPORTED_EXACTLY"
+            else "The maintained architecture has shape-independent parameters and passes all requested-grid mode and resampling constraints."
+        ),
+    }
+
+
 def build_uno(
     in_channels: int,
     out_channels: int,

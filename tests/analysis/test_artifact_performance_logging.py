@@ -53,7 +53,7 @@ def test_full_artifact_log_is_bounded_and_reports_major_runtime_state(
                 model_forward_seconds=0.01,
             )
     reporter.inference_summary()
-    for phase in ("metrics", "serialization", "validation", "publication"):
+    for phase in ("metrics", "serialization", "finalization", "validation", "publication"):
         with reporter.phase(phase):
             pass
     snapshot = reporter.done()
@@ -74,10 +74,10 @@ def test_full_artifact_log_is_bounded_and_reports_major_runtime_state(
     assert any(line.startswith("[INFERENCE] 100 cases | 137000 forwards |") for line in lines)
     assert any(line.startswith("[DONE] artifact validated |") and "total=" in line for line in lines)
     phase_summary = next(line for line in lines if line.startswith("[DONE] phases |"))
-    for phase in ("inference", "metrics", "serialization", "validation", "publication"):
+    for phase in ("inference", "metrics", "serialization", "finalization", "validation", "publication"):
         assert f"{phase}=" in phase_summary
     status_lines = [line for line in lines if line.startswith(("[ARTIFACT]", "[DEVICE]", "[PHASE]", "[PROGRESS]", "[INFERENCE]", "[DONE]"))]
-    assert len(status_lines) <= 40
+    assert len(status_lines) <= 42
     assert snapshot["counts"]["case_count"] == 100
     assert snapshot["counts"]["forward_call_count"] == 137000
     assert snapshot["runtime"] == {"device": "cpu", "dtype": "float32"}
@@ -165,8 +165,10 @@ def test_interleaved_case_phases_are_announced_and_completed_once(
         assert sum(line.startswith(f"[PHASE] {phase} done |") for line in lines) == 1
 
 
+@pytest.mark.parametrize("phase", ["metrics", "finalization"])
 def test_failure_log_reports_phase_progress_and_preserves_exception(
     capsys: pytest.CaptureFixture[str],
+    phase: str,
 ) -> None:
     """Prepend bounded failure context while allowing the exact error to escape."""
     reporter = _reporter(total_cases=4)
@@ -176,10 +178,10 @@ def test_failure_log_reports_phase_progress_and_preserves_exception(
         rollout_steps=161,
     )
     message = "exact scientific failure"
-    with pytest.raises(ValueError, match=message), reporter.phase("metrics"):
+    with pytest.raises(ValueError, match=message), reporter.phase(phase):
         raise ValueError(message)
 
     output = capsys.readouterr().out
-    assert "[FAILED] phase=metrics | completed=0/4 |" in output
+    assert f"[FAILED] phase={phase} | completed=0/4 |" in output
     assert "[FAILED] last_case=case_0007" in output
     assert "[FAILED] output=/workspace/artifacts/example" in output

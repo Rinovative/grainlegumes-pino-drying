@@ -44,6 +44,7 @@ import pandas as pd
 import torch
 
 from src import common, domain, experiments
+from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 from . import analysis_artifact_performance as artifact_performance
 from . import contracts, generation, timing, transient
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from src.learning.learning_device import DeviceResolution
 
 ArtifactSplit = Literal["eval", "ood"]
+_MINIMUM_GRID_VARIANT_STRIDE = 2
 
 
 class ArtifactCacheError(RuntimeError):
@@ -378,11 +380,51 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     )
 
 
-def _artifact_save_root(*, run_dir: Path, dataset_name: str, split: ArtifactSplit) -> Path:
-    """Resolve the artifact save root for a split."""
+def _artifact_save_root(
+    *,
+    run_dir: Path,
+    dataset_name: str,
+    split: ArtifactSplit,
+    evaluation_spatial_stride: int = 1,
+) -> Path:
+    """Resolve one split- and Evaluation-grid-qualified artifact save root."""
+    stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
+    if stride == 1:
+        return common.paths.resolve_id_analysis_dir(run_dir) if split == "eval" else common.paths.resolve_ood_analysis_dir(run_dir, dataset_name)
+    variant_root = common.paths.resolve_analysis_root(run_dir) / f"grid_s{stride}"
+    return variant_root / "id" if split == "eval" else variant_root / "ood" / dataset_name
+
+
+def _grid_token_stride(name: str) -> int | None:
+    """Return one exact noncanonical Evaluation stride from a path token."""
+    suffix = name.removeprefix("grid_s")
+    if not name.startswith("grid_s") or not suffix.isdigit() or suffix.startswith("0"):
+        return None
+    stride = int(suffix)
+    return stride if stride >= _MINIMUM_GRID_VARIANT_STRIDE else None
+
+
+def _artifact_target_stride(
+    target: Path,
+    *,
+    analysis_root: Path,
+    split: ArtifactSplit,
+    dataset_name: str,
+) -> int | None:
+    """Resolve a canonical or exact sibling grid-variant role target."""
+    canonical = analysis_root / "id" if split == "eval" else analysis_root / "ood" / dataset_name
+    if target == canonical:
+        return 1
     if split == "eval":
-        return common.paths.resolve_id_analysis_dir(run_dir)
-    return common.paths.resolve_ood_analysis_dir(run_dir, dataset_name)
+        variant_root = target.parent
+        exact_leaf = target.name == "id"
+    else:
+        variant_root = target.parent.parent
+        exact_leaf = target.parent.name == "ood" and target.name == dataset_name
+    stride = _grid_token_stride(variant_root.name)
+    if variant_root.parent != analysis_root or not exact_leaf:
+        return None
+    return stride
 
 
 def _normalise_path(path: Path) -> Path:
@@ -407,7 +449,14 @@ def _validated_artifact_target(*, run_dir: Path, save_root: Path) -> tuple[Path,
     id_target = analysis_root / "id"
     ood_root = analysis_root / "ood"
     is_named_ood_target = target.parent == ood_root and target.name not in {"", ".", ".."}
-    if target != id_target and not is_named_ood_target:
+    is_id_grid_target = target.name == "id" and target.parent.parent == analysis_root and _grid_token_stride(target.parent.name) is not None
+    is_ood_grid_target = (
+        target.parent.name == "ood"
+        and target.parent.parent.parent == analysis_root
+        and target.name not in {"", ".", ".."}
+        and _grid_token_stride(target.parent.parent.name) is not None
+    )
+    if target != id_target and not is_named_ood_target and not is_id_grid_target and not is_ood_grid_target:
         msg = f"Refusing rebuild outside one exact artifact target: {target}"
         raise ValueError(msg)
 
@@ -1632,6 +1681,22 @@ def _create_artifact_staging_root(save_root: Path) -> Path:
     )
 
 
+def _transient_resume_staging_root(save_root: Path) -> Path:
+    """Return the one deterministic sibling retained for resumable transient work."""
+    save_root.parent.mkdir(parents=True, exist_ok=True)
+    return save_root.parent / f".{save_root.name}.transient-resume"
+
+
+def _clear_transient_resume_staging_root(staging_root: Path) -> None:
+    """Remove one exact resumable stage after refusing symbolic indirection."""
+    if staging_root.is_symlink():
+        message = f"Refusing to rebuild through a symbolic transient resume stage: {staging_root}"
+        raise ValueError(message)
+    if not staging_root.exists():
+        return
+    shutil.rmtree(staging_root)
+
+
 def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Path) -> None:
     """
     Atomically publish one validated sibling stage at an exact run-owned target.
@@ -1651,7 +1716,8 @@ def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Pa
     """
     _analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
     stage = _normalise_path(staging_root)
-    if stage.parent != target.parent or not stage.name.startswith(f".{target.name}.staging."):
+    expected_resume = f".{target.name}.transient-resume"
+    if stage.parent != target.parent or (not stage.name.startswith(f".{target.name}.staging.") and stage.name != expected_resume):
         msg = f"Artifact staging root is not the expected sibling of the exact target: {stage}"
         raise ValueError(msg)
     if not contracts.artifact_provenance_path(stage).is_file():
@@ -1693,6 +1759,8 @@ def _rebuild_artifact_target_locked(*, run_dir: Path, save_root: Path) -> None:
     )
     if target.exists():
         shutil.rmtree(target)
+    resume_stage = _transient_resume_staging_root(target)
+    _clear_transient_resume_staging_root(resume_stage)
 
 
 def rebuild_artifact_target(*, run_dir: Path, save_root: Path) -> None:
@@ -1764,6 +1832,7 @@ def _run_or_load_transient_artifacts_locked(
     device_resolution: DeviceResolution,
     dataset_root: Path,
     rebuild: bool,
+    evaluation_spatial_stride: int,
 ) -> pd.DataFrame:
     """Load or atomically generate one completed transient sequence artifact."""
     from src.analysis.evaluation import (  # noqa: PLC0415
@@ -1786,6 +1855,7 @@ def _run_or_load_transient_artifacts_locked(
         run_dir=run_dir,
         dataset_name=dataset_name,
         split=split,
+        evaluation_spatial_stride=evaluation_spatial_stride,
     )
     parquet_path = save_root / f"{dataset_name}.parquet"
     npz_dir = save_root / "npz"
@@ -1796,6 +1866,7 @@ def _run_or_load_transient_artifacts_locked(
                 root,
                 completed=completed,
                 role=role,
+                evaluation_spatial_stride=evaluation_spatial_stride,
             )
         except (
             FileNotFoundError,
@@ -1804,7 +1875,11 @@ def _run_or_load_transient_artifacts_locked(
             TypeError,
             ValueError,
         ) as error:
-            msg = f"Transient artifact cache is incompatible for {run_dir.name}/{split}/{dataset_name}: {type(error).__name__}: {error}"
+            msg = (
+                "Transient artifact cache is incompatible for "
+                f"{run_dir.name}/{split}/{dataset_name}: {type(error).__name__}: {error}. "
+                "Rerun only this exact target with --rebuild."
+            )
             raise ArtifactCacheError(msg) from error
 
     if not rebuild and _cache_has_outputs(
@@ -1826,6 +1901,14 @@ def _run_or_load_transient_artifacts_locked(
         print(f"[LOAD] {run_dir.name} | {split} | {dataset_name} (validated transient sequence cache)")
         return frame
 
+    if not rebuild and save_root.exists():
+        if save_root.is_symlink() or not save_root.is_dir():
+            message = f"Transient artifact target is unsafe; rerun with --rebuild: {save_root}"
+            raise ArtifactCacheError(message)
+        if any(save_root.iterdir()):
+            message = f"Transient artifact target contains incomplete or conflicting evidence; rerun this exact target with --rebuild: {save_root}"
+            raise ArtifactCacheError(message)
+
     reporter = _transient_progress_reporter(
         completed=completed,
         role=role,
@@ -1835,20 +1918,37 @@ def _run_or_load_transient_artifacts_locked(
     staging_root: Path | None = None
     published: Any | None = None
     try:
-        staging_root = _create_artifact_staging_root(save_root)
-        staged = transient.generate_transient_role_artifact(
-            run_dir=run_dir,
-            role=role,
-            device_resolution=device_resolution,
-            dataset_root=dataset_root,
-            staging_root=staging_root,
-            progress_reporter=reporter,
-        )
+        staging_root = _transient_resume_staging_root(save_root)
+        if rebuild:
+            _clear_transient_resume_staging_root(staging_root)
+        staged_marker = contracts.artifact_provenance_path(staging_root)
+        if staged_marker.is_file() and not staged_marker.is_symlink():
+            with reporter.phase("finalization"):
+                staged = admit(staging_root)
+                sequence_artifact.cleanup_transient_resume_metadata(staging_root)
+            material_by_case = {summary.case_id: str(summary.identity["material_family"]) for summary in staged.summaries}
+            for case_id in staged.case_ids:
+                reporter.case_reused(
+                    case_id=case_id,
+                    material=material_by_case[case_id],
+                )
+        else:
+            staged = transient.generate_transient_role_artifact(
+                run_dir=run_dir,
+                role=role,
+                device_resolution=device_resolution,
+                dataset_root=dataset_root,
+                staging_root=staging_root,
+                completed=completed,
+                evaluation_spatial_stride=evaluation_spatial_stride,
+                progress_reporter=reporter,
+            )
         with reporter.phase("validation"):
             transient.validate_staged_transient_role_artifact(
                 staged,
                 completed=completed,
                 role=role,
+                evaluation_spatial_stride=evaluation_spatial_stride,
             )
         with reporter.phase("publication"):
             _publish_staged_artifact(
@@ -1867,8 +1967,8 @@ def _run_or_load_transient_artifacts_locked(
         reporter.failure(phase="preflight" if staging_root is None else None)
         raise
     finally:
-        if staging_root is not None and staging_root.exists():
-            shutil.rmtree(staging_root)
+        # A deterministic transient resume stage is intentionally retained on failure.
+        # Successful publication moves it into the exact target, so no cleanup is needed.
         cleanup_runtime(device_resolution.device)
     if published is None:
         message = "Transient artifact publication did not complete."
@@ -1894,6 +1994,7 @@ def _run_or_load_artifacts_locked(
     dataset_root: Path,
     metadata_root: Path,
     rebuild: bool = False,
+    evaluation_spatial_stride: int = 1,
 ) -> pd.DataFrame:
     """
     Load or generate artifacts for one run and saved split.
@@ -1919,6 +2020,8 @@ def _run_or_load_artifacts_locked(
         Current validated dataset-metadata root.
     rebuild : bool, optional
         Force staged regeneration and atomically replace only this target.
+    evaluation_spatial_stride : int, optional
+        Transient artifact Evaluation-grid stride. The default one retains the canonical source grid.
 
     Returns
     -------
@@ -1943,7 +2046,11 @@ def _run_or_load_artifacts_locked(
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             rebuild=rebuild,
+            evaluation_spatial_stride=evaluation_spatial_stride,
         )
+    if evaluation_spatial_stride != 1:
+        msg = "Non-unit --evaluation-spatial-stride is supported only for transient_drying artifacts."
+        raise ValueError(msg)
 
     save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split)
     npz_dir = save_root / "npz"
@@ -2114,25 +2221,38 @@ def validate_artifact_upload_source(
             completed,
             run_dir=run_path,
         )
-        if root == common.paths.resolve_id_analysis_dir(run_path).resolve():
+        analysis_root = common.paths.resolve_analysis_root(run_path).resolve()
+        id_stride = _artifact_target_stride(
+            root,
+            analysis_root=analysis_root,
+            split="eval",
+            dataset_name=plan.id_role.dataset_name,
+        )
+        ood_stride = (
+            None
+            if plan.ood_role is None
+            else _artifact_target_stride(
+                root,
+                analysis_root=analysis_root,
+                split="ood",
+                dataset_name=plan.ood_role.dataset_name,
+            )
+        )
+        if id_stride is not None:
             role = plan.id_role
-        elif (
-            plan.ood_role is not None
-            and root
-            == common.paths.resolve_ood_analysis_dir(
-                run_path,
-                plan.ood_role.dataset_name,
-            ).resolve()
-        ):
+            evaluation_spatial_stride = id_stride
+        elif plan.ood_role is not None and ood_stride is not None:
             role = plan.ood_role
+            evaluation_spatial_stride = ood_stride
         else:
-            msg = "Transient artifact upload target does not match a saved ID/OOD role."
+            msg = "Transient artifact upload target does not match a saved ID/OOD Evaluation-grid role."
             raise ArtifactCacheError(msg)
         try:
             loaded = transient.validate_transient_role_artifact(
                 root,
                 completed=completed,
                 role=role,
+                evaluation_spatial_stride=evaluation_spatial_stride,
             )
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             msg = f"Transient artifact upload source is incompatible: {type(error).__name__}: {error}"
@@ -2225,6 +2345,7 @@ def run_or_load_artifacts(
     dataset_root: Path,
     metadata_root: Path,
     rebuild: bool = False,
+    evaluation_spatial_stride: int = 1,
 ) -> pd.DataFrame:
     """
     Validate, reuse, or atomically generate one split-qualified artifact cache.
@@ -2246,6 +2367,8 @@ def run_or_load_artifacts(
     rebuild : bool, optional
         Replace only the observed target. A concurrent newer publication wins and
         is validated instead of being deleted.
+    evaluation_spatial_stride : int, optional
+        Transient artifact Evaluation-grid stride. The default is one.
 
     Returns
     -------
@@ -2270,10 +2393,12 @@ def run_or_load_artifacts(
 
     """
     logical_dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
+    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
     save_root = _artifact_save_root(
         run_dir=run_dir,
         dataset_name=logical_dataset_name,
         split=split,
+        evaluation_spatial_stride=resolved_evaluation_stride,
     )
     completion_path = contracts.artifact_provenance_path(save_root)
     observed_completion = _completion_marker_identity(completion_path) if rebuild else None
@@ -2292,6 +2417,7 @@ def run_or_load_artifacts(
             dataset_root=dataset_root,
             metadata_root=metadata_root,
             rebuild=effective_rebuild,
+            evaluation_spatial_stride=resolved_evaluation_stride,
         )
 
 
@@ -2300,6 +2426,7 @@ def _transient_wandb_publication_evidence(
     plan: RunArtifactPlan,
     id_frame: pd.DataFrame,
     ood_frame: pd.DataFrame | None,
+    evaluation_spatial_stride: int = 1,
 ) -> dict[str, bool | float | int | str]:
     """Validate every transient role before reducing bounded W&B evidence."""
     if (plan.ood_dataset_name is None) is not (ood_frame is None):
@@ -2317,6 +2444,7 @@ def _transient_wandb_publication_evidence(
             run_dir=plan.run_dir,
             dataset_name=dataset_name,
             split=split,
+            evaluation_spatial_stride=evaluation_spatial_stride,
         )
         validated = validate_artifact_upload_source(
             run_dir=plan.run_dir,
@@ -2345,6 +2473,7 @@ def _upload_published_artifacts(
     device_resolution: DeviceResolution,
     id_frame: pd.DataFrame,
     ood_frame: pd.DataFrame | None,
+    evaluation_spatial_stride: int = 1,
 ) -> None:
     """Publish only configured steady media or bounded transient summaries."""
     if not plan.is_completed:
@@ -2366,6 +2495,7 @@ def _upload_published_artifacts(
             plan=plan,
             id_frame=id_frame,
             ood_frame=ood_frame,
+            evaluation_spatial_stride=evaluation_spatial_stride,
         )
     elif ood_dataset_name is None or ood_frame is None:
         msg = "The current steady-flow W&B report path requires both saved ID and OOD artifacts."
@@ -2635,6 +2765,7 @@ def build_scoped_transient_artifact(
     case_ids: Sequence[str] | None = None,
     one_case: bool = False,
     device_policy: str = "auto",
+    evaluation_spatial_stride: int = 1,
 ) -> ScopedTransientArtifact:
     """Generate selected transient cases into one explicit noncanonical root."""
     from src import learning  # noqa: PLC0415
@@ -2642,6 +2773,7 @@ def build_scoped_transient_artifact(
         evaluation_transient_artifact as sequence_artifact,
     )
 
+    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
     if split not in {"id", "ood"}:
         msg = "Scoped transient split must be 'id' or 'ood'."
         raise ValueError(msg)
@@ -2708,6 +2840,8 @@ def build_scoped_transient_artifact(
                 device_resolution=resolution,
                 dataset_root=dataset_root,
                 staging_root=stage,
+                completed=completed,
+                evaluation_spatial_stride=resolved_evaluation_stride,
                 progress_reporter=reporter,
             )
             with reporter.phase("validation"):
@@ -2715,6 +2849,7 @@ def build_scoped_transient_artifact(
                     staged,
                     completed=completed,
                     role=selected_role,
+                    evaluation_spatial_stride=resolved_evaluation_stride,
                 )
         lock_path = target.parent / f".{target.name}.scoped.lock"
         with (
@@ -2726,6 +2861,7 @@ def build_scoped_transient_artifact(
                 target,
                 completed=completed,
                 saved_role=saved_role,
+                evaluation_spatial_stride=resolved_evaluation_stride,
             )
         snapshot = reporter.final_snapshot()
         sequence_artifact.publish_transient_operational_performance(
@@ -2760,6 +2896,7 @@ def build_artifacts(
     run_names: Iterable[str] | None = None,
     device_policy: str = "auto",
     rebuild: bool = False,
+    evaluation_spatial_stride: int = 1,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
     Build or validate every saved ID and optional OOD artifact role.
@@ -2780,6 +2917,8 @@ def build_artifacts(
     rebuild : bool, optional
         Stage and validate a replacement for each exact selected target. A newer
         concurrent publication is preserved and validated instead.
+    evaluation_spatial_stride : int, optional
+        Transient artifact Evaluation-grid stride. The default one uses the original grid.
 
     Returns
     -------
@@ -2804,6 +2943,7 @@ def build_artifacts(
     """
     from src import learning  # noqa: PLC0415
 
+    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
     device_resolution = learning.device.resolve_device(
         device_policy,
         path="device_policy",
@@ -2820,6 +2960,7 @@ def build_artifacts(
             dataset_root=dataset_root,
             metadata_root=resolved_metadata_root,
             rebuild=rebuild,
+            evaluation_spatial_stride=resolved_evaluation_stride,
         )
         ood_frame: pd.DataFrame | None = None
         role_results = {"eval": id_frame}
@@ -2832,6 +2973,7 @@ def build_artifacts(
                 dataset_root=dataset_root,
                 metadata_root=resolved_metadata_root,
                 rebuild=rebuild,
+                evaluation_spatial_stride=resolved_evaluation_stride,
             )
             role_results["ood"] = ood_frame
         results[run_dir.name] = role_results
@@ -2840,6 +2982,7 @@ def build_artifacts(
             device_resolution=device_resolution,
             id_frame=id_frame,
             ood_frame=ood_frame,
+            evaluation_spatial_stride=resolved_evaluation_stride,
         )
         cleanup_runtime(device_resolution.device)
     return results

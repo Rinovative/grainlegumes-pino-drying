@@ -361,12 +361,16 @@ def _validate_runtime_value(
     label: str,
     device: torch.device,
     dtype: torch.dtype,
+    require_finite: bool = True,
 ) -> torch.Tensor:
-    """Require one finite runtime tensor on the scaler device and dtype."""
+    """Require one real runtime tensor with explicit finiteness policy."""
+    if not isinstance(require_finite, bool):
+        message = "require_finite must be boolean."
+        raise TypeError(message)
     if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.is_complex():
         message = f"{label} must be one real floating-point tensor."
         raise TypeError(message)
-    if not bool(torch.isfinite(value).all().item()):
+    if require_finite and not bool(torch.isfinite(value).all().item()):
         message = f"{label} must contain only finite values."
         raise ValueError(message)
     if value.device != device or value.dtype != dtype:
@@ -569,6 +573,33 @@ class TransientScalingArtifact:
         """Return the shared runtime tensor dtype."""
         return self.state_mean.dtype
 
+    def assess_spatial_compatibility(
+        self,
+        evaluation_shape: tuple[int, int],
+    ) -> dict[str, Any]:
+        """Describe exact or broadcast-safe use on one Evaluation grid."""
+        if (
+            not isinstance(evaluation_shape, tuple)
+            or len(evaluation_shape) != _SPATIAL_BATCH_RANK - _VECTOR_BATCH_RANK
+            or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < 1 for axis in evaluation_shape)
+        ):
+            message = "evaluation_shape must contain two positive exact [Y, X] integers."
+            raise ValueError(message)
+        decision = "SUPPORTED_EXACTLY" if evaluation_shape == self.spatial_shape else "SUPPORTED_WITH_CONTRACT"
+        return {
+            "decision": decision,
+            "training_shape": list(self.spatial_shape),
+            "evaluation_shape": list(evaluation_shape),
+            "statistics_scope": "channelwise_pointwise_broadcastable",
+            "shape_specific_values": [],
+            "fitted_statistics_mutated": False,
+            "reason": (
+                "Evaluation shape equals the admitted Training shape."
+                if decision == "SUPPORTED_EXACTLY"
+                else "All admitted fitted statistics are channel vectors or scalars and broadcast pointwise without spatial interpolation."
+            ),
+        }
+
     @property
     def digest(self) -> str:
         """Return the device-independent SHA-256 of all persisted evidence."""
@@ -737,7 +768,7 @@ class TransientScalingArtifact:
         return tensor / scale
 
     def decode_delta(self, value: torch.Tensor) -> torch.Tensor:
-        """Decode zero-preserving scaled increments."""
+        """Decode zero-preserving scaled increments under the strict finite contract."""
         tensor = _validate_runtime_value(
             value,
             label="scaled increment",
@@ -754,6 +785,22 @@ class TransientScalingArtifact:
             message = "Decoded transient increment is non-finite."
             raise FloatingPointError(message)
         return decoded
+
+    def decode_delta_diagnostic(self, value: torch.Tensor) -> torch.Tensor:
+        """Decode a model output while preserving IEEE non-finite diagnostic values."""
+        tensor = _validate_runtime_value(
+            value,
+            label="diagnostic scaled increment",
+            device=self.device,
+            dtype=self.dtype,
+            require_finite=False,
+        )
+        scale = _channel_view(
+            self.increment_scale,
+            tensor,
+            channels=_STATE_CHANNELS,
+        )
+        return tensor * scale
 
     def encode_static(self, value: torch.Tensor) -> torch.Tensor:
         """Standardize static spatial conditioning channels."""

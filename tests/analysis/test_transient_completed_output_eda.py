@@ -418,8 +418,8 @@ def test_spectral_scope_and_orientation_keep_functional_state(
     viewer = viewers.make_spectral_view(
         catalog=catalog,
         selection_state=state,
-        single_plot_function=lambda **_kwargs: None,
-        aggregate_plot_function=lambda **_kwargs: None,
+        single_plot_function=cast("Any", lambda **_kwargs: None),
+        aggregate_plot_function=cast("Any", lambda **_kwargs: None),
         semantic_controls={"orientation": orientation},
         export_state=None,
         export_plot_name=None,

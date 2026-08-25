@@ -121,6 +121,7 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
         == 0
     )
     assert artifact_cli_call["device_policy"] == "cuda"
+    assert artifact_cli_call["evaluation_spatial_stride"] == 1
     assert artifact_cli_call["dataset_root"] == tmp_path / "raw"
     assert artifact_cli_call["metadata_root"] == tmp_path / "meta"
 
@@ -169,6 +170,8 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
                 str(output_root),
                 "--device",
                 "cuda",
+                "--evaluation-spatial-stride",
+                "2",
             ]
         )
         == 0
@@ -181,7 +184,17 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
         "case_ids": ["case-a", "case-c"],
         "one_case": False,
         "device_policy": "cuda",
+        "evaluation_spatial_stride": 2,
     }
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "2.0", "02", "+2", "x"])
+def test_artifact_cli_rejects_malformed_or_nonpositive_evaluation_stride(value: str) -> None:
+    """Reject ambiguous or invalid Evaluation-grid stride syntax before delegation."""
+    with pytest.raises(SystemExit):
+        cli_build_artifacts.main(
+            ["--runs-root", "unused", "--evaluation-spatial-stride", value],
+        )
 
 
 def test_direct_cli_opt_out_skips_only_post_training_artifacts(

@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Final, Literal, TypeAlias, cast
 
 from src import generation
@@ -31,6 +31,7 @@ TransientSampleMode: TypeAlias = Literal["one_step_transition", "rollout_window"
 TRANSIENT_PROFILE_ID: Final = "transient_drying"
 TRANSIENT_VIEW_ID: Final = "transient_drying"
 TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION: Final = 1
+TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION: Final = 1
 TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "one_step_transition",
     "rollout_window",
@@ -50,26 +51,122 @@ def validate_spatial_stride(value: Any) -> int:
     return value
 
 
+@dataclass(frozen=True, slots=True)
+class TransientSpatialRepresentation:
+    """Describe one exact endpoint-preserving view of a canonical grid."""
+
+    source_shape: tuple[int, int]
+    spatial_stride: int
+    represented_shape: tuple[int, int]
+    y_indices: tuple[int, ...]
+    x_indices: tuple[int, ...]
+    _index_identity_sha256: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Reject shape, stride, endpoint, or index-map drift."""
+        stride = validate_spatial_stride(self.spatial_stride)
+        source_shape = _validate_spatial_shape(
+            self.source_shape,
+            label="source_shape",
+        )
+        expected_y = tuple(range(0, source_shape[0], stride))
+        expected_x = tuple(range(0, source_shape[1], stride))
+        represented_shape = (len(expected_y), len(expected_x))
+        if represented_shape != self.represented_shape:
+            message = "represented_shape does not match the source grid and spatial stride."
+            raise ValueError(message)
+        if self.y_indices != expected_y or self.x_indices != expected_x:
+            message = "Transient spatial indices must be the exact endpoint-preserving strided source indices."
+            raise ValueError(message)
+        if expected_y[-1] != source_shape[0] - 1 or expected_x[-1] != source_shape[1] - 1:
+            message = "Transient spatial indices must retain both physical endpoints."
+            raise ValueError(message)
+        object.__setattr__(self, "_index_identity_sha256", self._compute_index_identity_sha256())
+
+    @property
+    def index_identity_sha256(self) -> str:
+        """Return the exact source-index-map identity."""
+        return self._index_identity_sha256
+
+    def _compute_index_identity_sha256(self) -> str:
+        """Compute the immutable exact source-index-map identity once."""
+        encoded = json.dumps(
+            {
+                "schema_version": TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION,
+                "source_shape": list(self.source_shape),
+                "spatial_stride": self.spatial_stride,
+                "represented_shape": list(self.represented_shape),
+                "y_indices": list(self.y_indices),
+                "x_indices": list(self.x_indices),
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize the exact index-based spatial representation."""
+        return {
+            "schema_version": TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION,
+            "source_shape": list(self.source_shape),
+            "spatial_stride": self.spatial_stride,
+            "represented_shape": list(self.represented_shape),
+            "axis_indices": {
+                "y": list(self.y_indices),
+                "x": list(self.x_indices),
+            },
+            "index_identity_sha256": self.index_identity_sha256,
+            "representation_transformation": "endpoint_preserving_strided_source_index_selection",
+        }
+
+
+def _validate_spatial_shape(value: Any, *, label: str) -> tuple[int, int]:
+    """Return one exact two-axis spatial shape."""
+    if (
+        not isinstance(value, tuple)
+        or len(value) != _SPATIAL_AXIS_COUNT
+        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in value)
+    ):
+        message = f"{label} must contain two integer spatial axes >= 2."
+        raise ValueError(message)
+    return cast("tuple[int, int]", value)
+
+
+def resolve_spatial_representation(
+    canonical_shape: tuple[int, int],
+    spatial_stride: int,
+) -> TransientSpatialRepresentation:
+    """Return one exact endpoint-preserving canonical-grid representation."""
+    stride = validate_spatial_stride(spatial_stride)
+    source_shape = _validate_spatial_shape(
+        canonical_shape,
+        label="canonical_shape",
+    )
+    if any((axis - 1) % stride != 0 for axis in source_shape):
+        message = f"spatial_stride={stride} does not preserve both boundaries of canonical spatial shape {source_shape}."
+        raise ValueError(message)
+    y_indices = tuple(range(0, source_shape[0], stride))
+    x_indices = tuple(range(0, source_shape[1], stride))
+    return TransientSpatialRepresentation(
+        source_shape=source_shape,
+        spatial_stride=stride,
+        represented_shape=(len(y_indices), len(x_indices)),
+        y_indices=y_indices,
+        x_indices=x_indices,
+    )
+
+
 def resolve_spatial_view(
     canonical_shape: tuple[int, int],
     spatial_stride: int,
 ) -> tuple[int, int]:
     """Return the boundary-preserving effective ``(Y, X)`` shape."""
-    stride = validate_spatial_stride(spatial_stride)
-    if (
-        not isinstance(canonical_shape, tuple)
-        or len(canonical_shape) != _SPATIAL_AXIS_COUNT
-        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in canonical_shape)
-    ):
-        message = "canonical_shape must contain two integer spatial axes >= 2."
-        raise ValueError(message)
-    if any((axis - 1) % stride != 0 for axis in canonical_shape):
-        message = f"spatial_stride={stride} does not preserve both boundaries of canonical spatial shape {canonical_shape}."
-        raise ValueError(message)
-    return (
-        (canonical_shape[0] - 1) // stride + 1,
-        (canonical_shape[1] - 1) // stride + 1,
-    )
+    return resolve_spatial_representation(
+        canonical_shape,
+        spatial_stride,
+    ).represented_shape
 
 
 @dataclass(frozen=True, slots=True)

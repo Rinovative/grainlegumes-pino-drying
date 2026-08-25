@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, TypedDict, cast
 
@@ -41,6 +42,27 @@ class _IncrementModel(nn.Module):
         if self.use_airflow:
             return value[:, 6:7].expand(-1, 4, -1, -1).to(self.output_dtype)
         return (value[:, :4] + 1.0).to(self.output_dtype)
+
+
+class _SecondStepNonfiniteModel(_IncrementModel):
+    """Emit distinct IEEE invalid values on the second model dispatch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, value: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        output = super().forward(value, **kwargs)
+        if not isinstance(output, torch.Tensor):
+            message = "Synthetic FNO model unexpectedly returned hidden state."
+            raise TypeError(message)
+        self.calls += 1
+        if self.calls == 2:
+            output = output.clone()
+            output[:, 0, 0, 0] = float("nan")
+            output[:, 1, 0, 0] = float("inf")
+            output[:, 2, 0, 0] = float("-inf")
+        return output
 
 
 def _scaling() -> TransientScalingArtifact:
@@ -97,6 +119,10 @@ def _context(model: nn.Module, *, model_kind: str = "fno") -> transient.Transien
         device=torch.device("cpu"),
         model_kind=model_kind,  # type: ignore[arg-type]
         precision="float32",
+        training_spatial_shape=scaling.spatial_shape,
+        evaluation_spatial_shape=scaling.spatial_shape,
+        architecture_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
+        scaling_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
     )
 
 
@@ -133,6 +159,7 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
         "model": {"kind": "fno", "params": {}},
     }
     completed = {
+        "is_completed": True,
         "config": config,
         "normalizer_state": scaling.state_dict(),
         "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
@@ -163,6 +190,114 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
     completed["config"] = {**config, "task": "steady_flow"}
     with pytest.raises(RuntimeError, match="transient_drying"):
         transient.load_transient_inference_context(run_dir="synthetic")
+
+
+def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regress the real artifact failure through exact cross-grid model and scaler proof."""
+    base_scaling = _scaling()
+    scaling = replace(
+        base_scaling,
+        dataset_identity={
+            "synthetic": "stride-two-rno",
+            "spatial_stride": 2,
+            "canonical_spatial_shape": [251, 401],
+            "effective_spatial_shape": [126, 201],
+        },
+        spatial_shape=(126, 201),
+    )
+    model = _IncrementModel()
+    observed_model_inputs: list[tuple[int, ...]] = []
+
+    def capture_model_input(_module: nn.Module, args: tuple[object, ...]) -> None:
+        value = args[0]
+        assert isinstance(value, torch.Tensor)
+        observed_model_inputs.append(tuple(value.shape))
+
+    model.register_forward_pre_hook(capture_model_input)
+    config: dict[str, Any] = {
+        "task": "transient_drying",
+        "input_profile": "canonical_physics_complete_v1",
+        "temporal": {"temporal_conditioning": {"kind": "none"}},
+        "model": {
+            "kind": "rno",
+            "params": {"in_channels": 28, "n_modes": [24, 24]},
+        },
+    }
+    completed = {
+        "is_completed": True,
+        "config": config,
+        "normalizer_state": scaling.state_dict(),
+        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
+        "checkpoint_identity": {"epoch": 7},
+        "selected_checkpoint_sha256": "b" * 64,
+        "selected_checkpoint_epoch": 7,
+    }
+    monkeypatch.setattr(transient.model_factory, "build_model", lambda _cfg, *, device: model.to(device))
+
+    context = transient.build_transient_inference_context(
+        completed=completed,
+        evaluation_spatial_shape=(251, 401),
+    )
+
+    assert context.training_spatial_shape == (126, 201)
+    assert context.evaluation_spatial_shape == (251, 401)
+    assert context.architecture_spatial_compatibility["decision"] == "SUPPORTED_WITH_CONTRACT"
+    assert context.architecture_spatial_compatibility["forward_output_shape_proof"]["output_shape"] == [1, 4, 251, 401]
+    assert context.scaling_spatial_compatibility["decision"] == "SUPPORTED_WITH_CONTRACT"
+    assert context.scaling.spatial_shape == (126, 201)
+    assert context.scaling.digest == scaling.digest
+
+    request: _Request = {
+        "state": torch.zeros(1, 4, 251, 401),
+        "static": torch.zeros(1, 7, 251, 401),
+        "boundary": torch.zeros(1, 1, 9),
+        "scalars": torch.zeros(1, 8),
+        "t_n": torch.zeros(1, 1),
+        "t_next": torch.ones(1, 1),
+        "dt": torch.ones(1, 1),
+    }
+    result = transient.predict_transient_step(context, **request)
+    assert observed_model_inputs == [(1, 1, 28, 251, 401), (1, 1, 28, 251, 401)]
+    assert result.next_state.shape == (1, 4, 251, 401)
+
+
+def test_cross_resolution_incompatibility_fails_before_model_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject retained modes that do not fit the requested grid before case inference."""
+    scaling = replace(
+        _scaling(),
+        dataset_identity={"spatial_stride": 2},
+        spatial_shape=(126, 201),
+    )
+    model = _IncrementModel()
+    completed = {
+        "is_completed": True,
+        "config": {
+            "task": "transient_drying",
+            "input_profile": "canonical_physics_complete_v1",
+            "temporal": {"temporal_conditioning": {"kind": "none"}},
+            "model": {"kind": "rno", "params": {"in_channels": 20, "n_modes": [64, 64]}},
+        },
+        "normalizer_state": scaling.state_dict(),
+        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
+        "checkpoint_identity": {"epoch": 7},
+        "selected_checkpoint_sha256": "b" * 64,
+        "selected_checkpoint_epoch": 7,
+    }
+    monkeypatch.setattr(
+        transient.model_factory,
+        "build_model",
+        lambda *_args, **_kwargs: pytest.fail("incompatible preflight reached model setup"),
+    )
+
+    with pytest.raises(ValueError, match=r"checkpoint=.*Training shape=.*Evaluation shape=.*modes"):
+        transient.build_transient_inference_context(
+            completed=completed,
+            evaluation_spatial_shape=(32, 48),
+        )
 
 
 def test_request_validation_rejects_shape_dtype_placement_and_time_contracts() -> None:
@@ -254,6 +389,40 @@ def test_prepared_request_rejects_post_admission_mutation() -> None:
         transient.rollout_prepared_transient_autonomous(context, prepared)
 
 
+def test_diagnostic_rollout_preserves_ieee_values_and_stops_before_invalid_feedback() -> None:
+    """Keep raw invalid output, mark its computed prefix, and never feed it back."""
+    strict_context = _context(_SecondStepNonfiniteModel())
+    strict_request = transient.prepare_transient_request(
+        strict_context,
+        **_request(3),
+    )
+    with pytest.raises(FloatingPointError, match="finite"):
+        transient.rollout_prepared_transient_autonomous(
+            strict_context,
+            strict_request,
+        )
+
+    model = _SecondStepNonfiniteModel()
+    context = _context(model)
+    prepared = transient.prepare_transient_request(context, **_request(3))
+    result = transient.rollout_prepared_transient_autonomous_diagnostic(
+        context,
+        prepared,
+    )
+
+    assert model.calls == 2
+    assert result.timing.model_calls == 2
+    assert result.prediction_available is not None
+    assert result.prediction_available.tolist() == [[True, True, False]]
+    assert result.decoded_deltas is not None
+    assert torch.isnan(result.scaled_deltas[0, 1, 0, 0, 0])
+    assert torch.isposinf(result.scaled_deltas[0, 1, 1, 0, 0])
+    assert torch.isneginf(result.scaled_deltas[0, 1, 2, 0, 0])
+    assert torch.isnan(result.states[:, 2]).all()
+    assert torch.isnan(result.scaled_deltas[:, 2]).all()
+    assert torch.isnan(result.decoded_deltas[:, 2]).all()
+
+
 @pytest.mark.parametrize("model_kind", ["fno", "uno"])
 def test_one_step_and_autonomous_recurrence_cast_deltas_and_report_cpu_timing(model_kind: str) -> None:
     """Reconstruct FNO/U-NO recurrence from float32 deltas and factual CPU timing."""
@@ -306,6 +475,10 @@ def test_autonomous_rollout_preallocates_outputs_without_list_stack(
         device=torch.device("cpu"),
         model_kind="fno",
         precision="float32",
+        training_spatial_shape=(2, 3),
+        evaluation_spatial_shape=(2, 3),
+        architecture_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
+        scaling_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
     )
     request = _request(3)
     monkeypatch.setattr(
@@ -364,6 +537,10 @@ def test_cuda_rollout_timing_preserves_model_call_boundaries_with_one_completion
         device=torch.device("cuda", 7),
         model_kind="fno",
         precision="float32",
+        training_spatial_shape=(2, 3),
+        evaluation_spatial_shape=(2, 3),
+        architecture_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
+        scaling_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
     )
     monkeypatch.setattr(
         transient,
@@ -407,6 +584,10 @@ def test_cuda_runtime_prepares_cpu_request_and_retains_rollout_state() -> None:
         device=device,
         model_kind="fno",
         precision="float32",
+        training_spatial_shape=(2, 3),
+        evaluation_spatial_shape=(2, 3),
+        architecture_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
+        scaling_spatial_compatibility={"decision": "SUPPORTED_EXACTLY"},
     )
     model_input_devices: list[torch.device] = []
 

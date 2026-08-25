@@ -241,14 +241,37 @@ def test_transient_package_pt_runtime_and_scaling_smoke(transient_smoke_package:
     index_path = root / "02_datasets" / "packages" / id_dataset_id / f"{id_dataset_id}.json"
     canonical = datasets.runtime.transient.TransientPhysicalDataset(index_path, sampling=one_step, source_root=root)
     sharded = datasets.runtime.transient.TransientPTShardDataset(index_path, sampling=one_step, source_root=root)
+    sampled_canonical = datasets.runtime.transient.TransientPhysicalDataset(
+        index_path,
+        sampling=one_step,
+        source_root=root,
+        spatial_stride=3,
+    )
+    sampled_sharded = datasets.runtime.transient.TransientPTShardDataset(
+        index_path,
+        sampling=one_step,
+        source_root=root,
+        spatial_stride=3,
+    )
     window = datasets.runtime.transient.TransientPTShardDataset(index_path, sampling=rollout, source_root=root)
     try:
         _assert_item_equal(canonical[0], sharded[0])
+        sampled_hdf5_item = sampled_canonical[0]
+        sampled_pt_item = sampled_sharded[0]
+        _assert_item_equal(sampled_hdf5_item, sampled_pt_item)
+        assert sampled_hdf5_item["state"].shape[-2:] == (6, 6)
+        assert sampled_hdf5_item["static"].shape[-2:] == (6, 6)
+        assert sampled_hdf5_item["target"].shape[-2:] == (6, 6)
+        assert sampled_hdf5_item["metadata"]["spatial_y_indices"] == (0, 3, 6, 9, 12, 15)
+        assert sampled_hdf5_item["metadata"]["spatial_x_indices"] == (0, 3, 6, 9, 12, 15)
+        assert sampled_hdf5_item["metadata"]["spatial_index_identity_sha256"] == sampled_pt_item["metadata"]["spatial_index_identity_sha256"]
         assert sharded.storage_backend == "pt_shards"
         assert window[0]["target"].shape[0] == 2
     finally:
         canonical.close()
         sharded.close()
+        sampled_canonical.close()
+        sampled_sharded.close()
         window.close()
     receipt = datasets.packages.transient_shards.load_transient_shard_receipt(
         id_dataset_id,

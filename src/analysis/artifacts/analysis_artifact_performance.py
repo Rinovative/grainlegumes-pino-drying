@@ -32,6 +32,7 @@ _PHASES: Final = frozenset(
         "inference",
         "metrics",
         "serialization",
+        "finalization",
         "validation",
         "publication",
     }
@@ -365,6 +366,22 @@ class ArtifactProgressReporter:
         parts.append(self._memory_text())
         print(" | ".join(parts), flush=True)
 
+    def case_reused(
+        self,
+        *,
+        case_id: str,
+        material: str,
+    ) -> None:
+        """Count one strictly admitted staged case without model operations."""
+        self.recorder.increment("reused_case_count")
+        self.case_completed(
+            case_id=case_id,
+            material=material,
+            forward_calls=0,
+            timed_forward_calls=0,
+            model_forward_seconds=0.0,
+        )
+
     def inference_summary(self) -> None:
         """Print bounded operational inference timing and throughput."""
         inference_seconds = self.recorder.stage_seconds.get("inference", 0.0)
@@ -418,7 +435,8 @@ class ArtifactProgressReporter:
         print(
             "[DONE] phases | "
             + " | ".join(
-                f"{name}={_duration(stages.get(name, 0.0))}" for name in ("inference", "metrics", "serialization", "validation", "publication")
+                f"{name}={_duration(stages.get(name, 0.0))}"
+                for name in ("inference", "metrics", "serialization", "finalization", "validation", "publication")
             ),
             flush=True,
         )

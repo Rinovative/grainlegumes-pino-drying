@@ -211,3 +211,59 @@ def test_fno_stride_two_grid_checks_modes_against_effective_axes() -> None:
     config["model"]["params"]["n_modes"] = [127, 64]
     with pytest.raises(ValueError, match="modes_y"):
         learning.models.factory.validate_transient_model_spatial_shape(config, (126, 201))
+
+
+@pytest.mark.parametrize(
+    ("kind", "params"),
+    [
+        ("fno", {"n_modes": [24, 24]}),
+        ("rno", {"n_modes": [24, 24]}),
+        (
+            "uno",
+            {
+                "modes_y": 64,
+                "modes_x": 64,
+                "n_layers": 7,
+                "mode_ratio": 0.495,
+                "uno_scalings": [
+                    [1.0, 1.0],
+                    [0.5, 0.5],
+                    [0.5, 0.5],
+                    [1.0, 1.0],
+                    [1.0, 1.0],
+                    [2.0, 2.0],
+                    [2.0, 2.0],
+                ],
+            },
+        ),
+    ],
+)
+def test_transient_architectures_share_explicit_cross_resolution_capability(
+    kind: str,
+    params: dict[str, Any],
+) -> None:
+    """Resolve every maintained transient architecture from UNKNOWN on the original grid."""
+    evidence = learning.models.factory.assess_transient_model_spatial_compatibility(
+        {"task": "transient_drying", "model": {"kind": kind, "params": params}},
+        training_shape=(126, 201),
+        evaluation_shape=(251, 401),
+    )
+
+    assert evidence["decision"] == "SUPPORTED_WITH_CONTRACT"
+    assert evidence["model_kind"] == kind
+    assert evidence["training_shape"] == [126, 201]
+    assert evidence["evaluation_shape"] == [251, 401]
+    assert evidence["forward_output_shape_proof"] == "pending_synthetic_single_step_probe"
+
+
+def test_transient_architecture_capability_rejects_requested_grid_before_inference() -> None:
+    """Return an actionable unsupported decision when retained modes cannot fit."""
+    evidence = learning.models.factory.assess_transient_model_spatial_compatibility(
+        {"task": "transient_drying", "model": {"kind": "rno", "params": {"n_modes": [64, 64]}}},
+        training_shape=(126, 201),
+        evaluation_shape=(32, 48),
+    )
+
+    assert evidence["decision"] == "UNSUPPORTED"
+    assert evidence["model_kind"] == "rno"
+    assert "modes" in evidence["reason"]

@@ -70,15 +70,21 @@ class TransientBatch:
         return int(self.target.shape[1])
 
 
-def _finite_tensor(value: Any, *, label: str) -> torch.Tensor:
-    """Require one finite real floating tensor without copying it."""
+def _real_tensor(value: Any, *, label: str) -> torch.Tensor:
+    """Require one real floating tensor without copying it."""
     if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.is_complex():
         message = f"Transient {label} must be a real floating-point tensor."
         raise TypeError(message)
-    if not bool(torch.isfinite(value).all().item()):
+    return value
+
+
+def _finite_tensor(value: Any, *, label: str) -> torch.Tensor:
+    """Require one finite real floating tensor without copying it."""
+    tensor = _real_tensor(value, label=label)
+    if not bool(torch.isfinite(tensor).all().item()):
         message = f"Transient {label} contains non-finite values."
         raise ValueError(message)
-    return value
+    return tensor
 
 
 def _require_shared_placement(
@@ -414,3 +420,22 @@ class TransientTensorizer:
             message = "Transient reconstruction produced non-finite state."
             raise FloatingPointError(message)
         return result
+
+    def reconstruct_next_state_diagnostic(
+        self,
+        current_state: torch.Tensor,
+        scaled_delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Preserve decoded and reconstructed IEEE output from one finite model input."""
+        current = _finite_tensor(current_state, label="diagnostic current state")
+        delta = _real_tensor(scaled_delta, label="diagnostic scaled delta")
+        if current.ndim != _SPATIAL_BATCH_RANK or current.shape[1] != _STATE_CHANNELS or delta.shape != current.shape:
+            message = "Transient diagnostic reconstruction requires matching [B,4,Y,X] tensors."
+            raise ValueError(message)
+        _require_shared_placement(
+            (("diagnostic current state", current), ("diagnostic scaled delta", delta)),
+            device=self.scaling.device,
+            dtype=self.scaling.dtype,
+        )
+        decoded = self.scaling.decode_delta_diagnostic(delta)
+        return current + decoded, decoded

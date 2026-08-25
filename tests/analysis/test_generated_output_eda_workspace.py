@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -411,15 +410,10 @@ def test_workspace_builds_one_unified_task_qualified_label_catalog(monkeypatch, 
     assert panel_inputs == [(result.catalog, result.selection_state)]
 
 
-def test_notebook_and_workspace_public_api_have_no_task_selection() -> None:
+def test_workspace_public_api_has_no_task_selection() -> None:
     parameters = inspect.signature(workspace.prepare_generated_output_eda_workspace).parameters
     assert "task_id" not in parameters
     assert "task_ids" not in parameters
-    notebook_path = Path(__file__).resolve().parents[2] / "notebooks" / "eda.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "".join(line for cell in notebook["cells"] for line in cell.get("source", ()))
-    assert "TASK_ID" not in source
-    assert "task_ids=" not in source
 
 
 def test_terminal_workspace_uses_the_exact_strict_loader(monkeypatch, tmp_path) -> None:

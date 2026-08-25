@@ -296,8 +296,9 @@ def test_other_censoring_points_remain_but_are_not_in_the_legend() -> None:
         assert "Other censoring time" not in legend_labels
         assert all("\n" not in label for label in legend_labels)
         assert len(time_axis.collections) == 1
+        offsets = np.asarray(time_axis.collections[0].get_offsets(), dtype=np.float64)
         np.testing.assert_allclose(
-            time_axis.collections[0].get_offsets()[:, 0],
+            offsets[:, 0],
             (85.0 / 24.0,),
         )
         assert time_axis.get_xlabel() == "Time [d]"

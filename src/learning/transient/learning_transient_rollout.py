@@ -81,13 +81,22 @@ def _require_model_kind(model_kind: str) -> ModelKind:
     return model_kind  # type: ignore[return-value]
 
 
-def _require_prediction(value: object, *, batch_size: int, height: int, width: int) -> torch.Tensor:
-    """Require one finite real floating scaled increment with the expected BCHW shape."""
+def _require_prediction(
+    value: object,
+    *,
+    batch_size: int,
+    height: int,
+    width: int,
+    require_finite: bool = True,
+) -> torch.Tensor:
+    """Require one real floating scaled increment under an explicit finite policy."""
+    if not isinstance(require_finite, bool):
+        raise TypeError("Transient prediction require_finite must be boolean.")
     if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.is_complex():
         raise TypeError("Transient model prediction must be one real floating-point tensor.")
     if value.shape != (batch_size, 4, height, width):
         raise ValueError("Transient model prediction must have shape [B,4,Y,X].")
-    if not bool(torch.isfinite(value).all().item()):
+    if require_finite and not bool(torch.isfinite(value).all().item()):
         raise FloatingPointError("Transient model prediction contains non-finite values.")
     return value
 
@@ -99,6 +108,7 @@ def predict_step(
     model_kind: str,
     hidden: object | None,
     model_call: Callable[[Callable[[], object]], object] | None = None,
+    require_finite_output: bool = True,
 ) -> tuple[torch.Tensor, object | None]:
     """
     Predict one transient scaled increment with model-kind-specific recurrence.
@@ -116,6 +126,9 @@ def predict_step(
     model_call : callable, optional
         Wrapper receiving one zero-argument model invocation. The wrapper may
         measure only that invocation; prediction validation remains outside it.
+    require_finite_output : bool, optional
+        Require finite model values. Artifact diagnostics alone may disable this
+        after strict source-input admission to preserve the returned IEEE values.
 
     Returns
     -------
@@ -125,6 +138,8 @@ def predict_step(
 
     """
     kind = _require_model_kind(model_kind)
+    if not isinstance(require_finite_output, bool):
+        raise TypeError("require_finite_output must be boolean.")
     if not isinstance(model, nn.Module):
         raise TypeError("Transient prediction requires one torch.nn.Module.")
     if not isinstance(step_input, torch.Tensor) or not step_input.is_floating_point() or step_input.is_complex():
@@ -149,7 +164,23 @@ def predict_step(
     else:
         prediction = result
         next_hidden = None
-    return _require_prediction(prediction, batch_size=batch_size, height=height, width=width), next_hidden
+    admitted = (
+        _require_prediction(
+            prediction,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+        )
+        if require_finite_output
+        else _require_prediction(
+            prediction,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            require_finite=False,
+        )
+    )
+    return admitted, next_hidden
 
 
 def _predict_steps(model: nn.Module, inputs: torch.Tensor, *, model_kind: ModelKind) -> torch.Tensor:

@@ -771,6 +771,8 @@ def test_scoped_artifact_submission_translates_run_and_output_paths(
         "--one-case",
         "--split",
         "id",
+        "--evaluation-spatial-stride",
+        "2",
         "--output-root",
         str(output_root),
     )
@@ -784,6 +786,8 @@ def test_scoped_artifact_submission_translates_run_and_output_paths(
         "--one-case",
         "--split",
         "id",
+        "--evaluation-spatial-stride",
+        "2",
         "--output-root",
         "/workspace/storage/04_reports/evaluation/debug one case",
     ]

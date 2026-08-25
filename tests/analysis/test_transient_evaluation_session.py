@@ -22,6 +22,7 @@ from matplotlib.figure import Figure
 from src import analysis, datasets, domain, experiments
 from src.analysis.evaluation import evaluation_transient_session as session
 from src.analysis.evaluation import evaluation_transient_timing as timing
+from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 from src.learning.transient.learning_transient_contracts import TemporalConditioningSpec, TransientTensorizerSpec
 from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
 
@@ -349,11 +350,24 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
                 cell_weights=analysis.evaluation.transient_metrics.trapezoidal_cell_weights(record.spatial_mask),
                 valid_mask=mask,
             )
-            result[scope] = accumulator.state_dict()
+            state = accumulator.state_dict()
+            counts = cast("list[int]", state["counts"])
+            value_count = int(sum(counts))
+            result[scope] = {
+                "classification": "REQUIRES_ALL_FINITE_VALUES",
+                "available": True,
+                "unavailable_reason": None,
+                "required_value_count": value_count,
+                "computed_value_count": value_count,
+                "finite_value_count": value_count,
+                "nonfinite_value_count": 0,
+                "statistics": state,
+            }
         diagnostic_prediction = record.predicted_states.copy()
         if record.case_id == "long":
             diagnostic_prediction[1, 0, 0, 0] = 3_000.0
         result["diagnostics"] = {
+            "classification": "PHYSICAL_VALIDITY_METRIC",
             "plausibility": asdict(
                 analysis.evaluation.transient_metrics.derive_plausibility_diagnostics(
                     diagnostic_prediction[1:],
@@ -380,6 +394,21 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
             payload_sha256=str(index) * 64,
             chain_id=f"chain-{index}",
             metric_statistics=statistics(record),
+            prediction_validity=transient_validity.build_prediction_validity(
+                scaled_model_outputs=np.diff(record.predicted_states, axis=0),
+                decoded_physical_increments=np.diff(
+                    record.predicted_states,
+                    axis=0,
+                ),
+                reconstructed_states=record.predicted_states[1:],
+                prediction_available=np.ones(
+                    len(record.physical_times) - 1,
+                    dtype=bool,
+                ),
+                physical_times=record.physical_times,
+                mode="autonomous_full",
+                origin_index=0,
+            ),
             identity=record.identity,
             target=record.target,
             timing={},

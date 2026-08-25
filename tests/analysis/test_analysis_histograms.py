@@ -42,8 +42,8 @@ def test_exact_constant_histogram_has_only_one_count_line() -> None:
         np.testing.assert_allclose(artists.heights, (3.0,))
         assert artists.constant_value == 2.0
         assert artists.constant_line is not None
-        np.testing.assert_allclose(artists.constant_line.get_xdata(), (2.0, 2.0))
-        np.testing.assert_allclose(artists.constant_line.get_ydata(), (0.0, 3.0))
+        np.testing.assert_allclose(np.asarray(artists.constant_line.get_xdata(), dtype=np.float64), (2.0, 2.0))
+        np.testing.assert_allclose(np.asarray(artists.constant_line.get_ydata(), dtype=np.float64), (0.0, 3.0))
     finally:
         plt.close(figure)
 
@@ -70,9 +70,9 @@ def test_exact_constant_histogram_preserves_weight_and_density_semantics() -> No
         assert len(density_axis.patches) == 0
         assert weighted.heights[0] == pytest.approx(10.0)
         assert weighted.constant_line is not None
-        assert weighted.constant_line.get_ydata()[-1] == pytest.approx(10.0)
+        assert np.asarray(weighted.constant_line.get_ydata(), dtype=np.float64)[-1] == pytest.approx(10.0)
         assert density.constant_line is not None
-        assert density.constant_line.get_ydata()[-1] == pytest.approx(density.heights[0])
+        assert np.asarray(density.constant_line.get_ydata(), dtype=np.float64)[-1] == pytest.approx(density.heights[0])
     finally:
         plt.close(weighted_figure)
         plt.close(density_figure)

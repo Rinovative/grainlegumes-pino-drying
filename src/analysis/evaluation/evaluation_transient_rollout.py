@@ -21,6 +21,7 @@ from src import domain
 from src.learning.inference import learning_inference_transient as inference
 
 from . import evaluation_transient_metrics as transient_metrics
+from . import evaluation_transient_validity as transient_validity
 from .evaluation_transient_artifact import (
     BOUNDARY_ORDER,
     FIXED_HORIZONS,
@@ -76,10 +77,12 @@ class PreparedTransientEvaluationCase:
 
 @dataclass(frozen=True, slots=True)
 class TransientRolloutEvaluation:
-    """Return available sequence records and explicit unsupported horizons."""
+    """Return sequence records, unsupported horizons, and exact case diagnostics."""
 
     records: tuple[TransientSequenceRecord, ...]
     unavailable_horizons: tuple[UnavailableHorizon, ...]
+    prediction_validity: Mapping[str, Any]
+    model_calls: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,36 +443,49 @@ def benchmark_transient_full_rollout(
         length=case.transition_count,
     )
 
-    def invoke() -> tuple[float, float]:
-        """Run one independent prepared request and retain factual model/wall clocks."""
+    def invoke() -> tuple[float, float, int]:
+        """Run one independent diagnostic request and retain factual clocks/calls."""
         started = perf_counter()
-        result = inference.rollout_prepared_transient_autonomous(
+        result = inference.rollout_prepared_transient_autonomous_diagnostic(
             context,
             request,
         )
         elapsed = perf_counter() - started
         model_seconds = float(result.timing.model_seconds)
-        if not math.isfinite(model_seconds) or model_seconds < 0.0 or not math.isfinite(elapsed) or elapsed <= 0.0:
-            message = "Transient benchmark produced invalid model or wall-clock duration."
+        model_calls = int(result.timing.model_calls)
+        if (
+            not math.isfinite(model_seconds)
+            or model_seconds < 0.0
+            or not math.isfinite(elapsed)
+            or elapsed <= 0.0
+            or not 1 <= model_calls <= case.transition_count
+        ):
+            message = "Transient benchmark produced invalid model, wall-clock, or operation evidence."
             raise RuntimeError(message)
-        return model_seconds, elapsed
+        return model_seconds, elapsed, model_calls
 
-    cold_model, cold_wall = invoke()
+    cold_model, cold_wall, cold_calls = invoke()
+    observed_calls = [cold_calls]
     for _ in range(warmup_passes):
-        invoke()
+        _model_seconds, _wall_seconds, model_calls = invoke()
+        observed_calls.append(model_calls)
     warmed_model: list[float] = []
     warmed_wall: list[float] = []
     for _ in range(repetitions):
-        model_seconds, wall_seconds = invoke()
+        model_seconds, wall_seconds, model_calls = invoke()
         warmed_model.append(model_seconds)
         warmed_wall.append(wall_seconds)
+        observed_calls.append(model_calls)
+    if len(set(observed_calls)) != 1:
+        message = "Independent transient benchmark repetitions produced inconsistent model-call counts."
+        raise RuntimeError(message)
     return TransientRolloutBenchmark(
         case_id=case.case_id,
         warmup_passes=warmup_passes,
         repetitions=repetitions,
         model_clock=("torch.cuda.Event" if context.device.type == "cuda" else "time.perf_counter"),
         wall_clock="time.perf_counter",
-        model_calls_per_repetition=case.transition_count,
+        model_calls_per_repetition=cold_calls,
         cold_model_seconds=cold_model,
         cold_end_to_end_seconds=cold_wall,
         warmed_model_seconds=tuple(warmed_model),
@@ -587,7 +603,7 @@ def _wet_fraction_series(
             dtype=np.float64,
         )
         admitted_water = w_gr[mask]
-        if np.any(admitted_water < 0.0):
+        if not bool(np.isfinite(admitted_water).all()) or np.any(admitted_water < 0.0):
             values.append(math.nan)
             continue
         wet_basis = domain.moisture.wet_basis_moisture(admitted_water, admitted_rho)
@@ -607,6 +623,7 @@ def _target_evidence(
     target_wet_basis: float,
     target_fraction_limit: float,
     reference_completion: CanonicalTargetCompletion | None,
+    prediction_status: transient_validity.PredictionValidityStatus,
 ) -> dict[str, Any]:
     """Build distinct canonical-reference and regular-grid prediction target evidence."""
     if not 0.0 < target_fraction_limit < 1.0:
@@ -622,6 +639,8 @@ def _target_evidence(
 
     def classify(values: np.ndarray) -> tuple[bool, bool, str | None, float | None, float | None, float | None]:
         """Classify one prediction on its exact regular sequence grid."""
+        if prediction_status == transient_validity.NONFINITE:
+            return False, False, "prediction_contains_nonfinite_model_output", None, None, None
         if not bool(np.isfinite(values).all()):
             return False, False, "target_fraction_unavailable_for_nonphysical_state", None, None, None
         reached_positions = np.flatnonzero(values <= target_fraction_limit)
@@ -674,6 +693,9 @@ def _record(
     origin: int,
     requested_horizon: int | Literal["full"],
     predicted: np.ndarray,
+    scaled_model_outputs: np.ndarray,
+    decoded_physical_increments: np.ndarray,
+    prediction_available: np.ndarray,
     identity: Mapping[str, Any],
     timing: Mapping[str, Any],
     target_wet_basis: float,
@@ -689,6 +711,22 @@ def _record(
     stop = origin + length
     reference = np.ascontiguousarray(case.reference_states[origin : stop + 1])
     times = np.ascontiguousarray(case.physical_times[origin : stop + 1])
+    state_outputs = np.ascontiguousarray(predicted[1:], dtype=np.float32)
+    scaled_outputs = np.ascontiguousarray(scaled_model_outputs, dtype=np.float32)
+    decoded_increments = np.ascontiguousarray(
+        decoded_physical_increments,
+        dtype=np.float32,
+    )
+    available = np.ascontiguousarray(prediction_available, dtype=bool)
+    prediction_validity = transient_validity.build_prediction_validity(
+        scaled_model_outputs=scaled_outputs,
+        decoded_physical_increments=decoded_increments,
+        reconstructed_states=state_outputs,
+        prediction_available=available,
+        physical_times=times,
+        mode=mode,
+        origin_index=origin,
+    )
     target = _target_evidence(
         predicted,
         times,
@@ -698,7 +736,14 @@ def _record(
         target_wet_basis=target_wet_basis,
         target_fraction_limit=target_fraction_limit,
         reference_completion=reference_completion,
+        prediction_status=cast(
+            "transient_validity.PredictionValidityStatus",
+            prediction_validity["status"],
+        ),
     )
+    computed_mask = available[:, None, None, None]
+    prediction_nonfinite = (~np.isfinite(state_outputs)) & computed_mask
+    prediction_physical_invalid = transient_validity.prediction_physical_invalid_mask(state_outputs) & computed_mask
     return TransientSequenceRecord(
         mode=mode,
         case_id=case.case_id,
@@ -712,7 +757,12 @@ def _record(
         reference_states=reference,
         predicted_states=np.ascontiguousarray(predicted, dtype=np.float32),
         reference_increments=np.diff(reference, axis=0),
-        predicted_increments=np.diff(predicted, axis=0),
+        predicted_increments=decoded_increments,
+        scaled_model_outputs=scaled_outputs,
+        prediction_available=available,
+        prediction_nonfinite_mask=prediction_nonfinite,
+        prediction_physical_invalid_mask=prediction_physical_invalid,
+        prediction_validity=prediction_validity,
         spatial_mask=case.spatial_mask,
         temporal_mask=np.ones(length + 1, dtype=bool),
         static_conditioning=case.static_conditioning,
@@ -805,7 +855,13 @@ def evaluate_transient_case(
             origin=origin,
             length=1,
         )
-        result = inference.predict_prepared_transient_step(context, request)
+        result = inference.predict_prepared_transient_step_diagnostic(
+            context,
+            request,
+        )
+        if result.decoded_delta is None:
+            message = "Diagnostic one-step inference omitted its decoded physical increment."
+            raise RuntimeError(message)
         predicted = np.concatenate(
             (
                 case.reference_states[origin : origin + 1],
@@ -820,6 +876,9 @@ def evaluate_transient_case(
                 origin=origin,
                 requested_horizon=1,
                 predicted=predicted,
+                scaled_model_outputs=result.scaled_delta.detach().cpu().numpy(),
+                decoded_physical_increments=result.decoded_delta.detach().cpu().numpy(),
+                prediction_available=np.ones(1, dtype=bool),
                 identity=admitted_identity,
                 timing={
                     "kind": "model_only_public_inference",
@@ -839,14 +898,23 @@ def evaluate_transient_case(
         origin=0,
         length=case.transition_count,
     )
-    full_result = inference.rollout_prepared_transient_autonomous(
+    full_result = inference.rollout_prepared_transient_autonomous_diagnostic(
         context,
         full_request,
     )
+    if full_result.decoded_deltas is None or full_result.prediction_available is None:
+        message = "Diagnostic autonomous inference omitted raw availability evidence."
+        raise RuntimeError(message)
     full_predicted = np.concatenate(
-        (case.reference_states[0:1], full_result.states.detach().cpu().numpy()[0]),
+        (
+            case.reference_states[0:1],
+            full_result.states.detach().cpu().numpy()[0],
+        ),
         axis=0,
     )
+    full_scaled = full_result.scaled_deltas.detach().cpu().numpy()[0]
+    full_decoded = full_result.decoded_deltas.detach().cpu().numpy()[0]
+    full_available = full_result.prediction_available.detach().cpu().numpy()[0]
     records.append(
         _record(
             case=case,
@@ -854,6 +922,9 @@ def evaluate_transient_case(
             origin=0,
             requested_horizon="full",
             predicted=full_predicted,
+            scaled_model_outputs=full_scaled,
+            decoded_physical_increments=full_decoded,
+            prediction_available=full_available,
             identity=admitted_identity,
             timing={
                 "kind": "model_only_public_inference",
@@ -884,14 +955,23 @@ def evaluate_transient_case(
             origin=origin,
             length=remaining,
         )
-        origin_result = inference.rollout_prepared_transient_autonomous(
+        origin_result = inference.rollout_prepared_transient_autonomous_diagnostic(
             context,
             origin_request,
         )
+        if origin_result.decoded_deltas is None or origin_result.prediction_available is None:
+            message = "Diagnostic rolling inference omitted raw availability evidence."
+            raise RuntimeError(message)
         origin_predicted = np.concatenate(
-            (case.reference_states[origin : origin + 1], origin_result.states.detach().cpu().numpy()[0]),
+            (
+                case.reference_states[origin : origin + 1],
+                origin_result.states.detach().cpu().numpy()[0],
+            ),
             axis=0,
         )
+        origin_scaled = origin_result.scaled_deltas.detach().cpu().numpy()[0]
+        origin_decoded = origin_result.decoded_deltas.detach().cpu().numpy()[0]
+        origin_available = origin_result.prediction_available.detach().cpu().numpy()[0]
         for horizon in horizons:
             if remaining < horizon:
                 unavailable.append(
@@ -912,11 +992,14 @@ def evaluate_transient_case(
                     origin=origin,
                     requested_horizon=horizon,
                     predicted=origin_predicted[: horizon + 1],
+                    scaled_model_outputs=origin_scaled[:horizon],
+                    decoded_physical_increments=origin_decoded[:horizon],
+                    prediction_available=origin_available[:horizon],
                     identity=admitted_identity,
                     timing={
                         "kind": "shared_origin_rollout_prefix",
                         "seconds": None,
-                        "model_calls": horizon,
+                        "model_calls": int(origin_available[:horizon].sum()),
                         "device": origin_result.timing.device,
                         "precision": origin_result.timing.precision,
                         "source_full_request_seconds": origin_result.timing.model_seconds,
@@ -934,6 +1017,9 @@ def evaluate_transient_case(
                 origin=origin,
                 requested_horizon="full",
                 predicted=origin_predicted,
+                scaled_model_outputs=origin_scaled,
+                decoded_physical_increments=origin_decoded,
+                prediction_available=origin_available,
                 identity=admitted_identity,
                 timing={
                     "kind": "model_only_public_inference",
@@ -947,4 +1033,15 @@ def evaluate_transient_case(
                 reference_completion=None,
             )
         )
-    return TransientRolloutEvaluation(records=tuple(records), unavailable_horizons=tuple(unavailable))
+    unique_chains = tuple(record for record in records if record.mode != "rolling_origin" or record.requested_horizon == "full")
+    prediction_validity = transient_validity.aggregate_case_prediction_validity(
+        case_id=case.case_id,
+        records=tuple(record.prediction_validity for record in unique_chains),
+    )
+    model_calls = sum(int(record.timing["model_calls"]) for record in unique_chains)
+    return TransientRolloutEvaluation(
+        records=tuple(records),
+        unavailable_horizons=tuple(unavailable),
+        prediction_validity=prediction_validity,
+        model_calls=model_calls,
+    )

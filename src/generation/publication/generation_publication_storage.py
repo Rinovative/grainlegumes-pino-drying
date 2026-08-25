@@ -2326,7 +2326,7 @@ def validate_case_hdf5(
         if "git_commit" in handle.attrs:
             message = "Canonical HDF5 scientific content must not embed execution Git provenance."
             raise ValueError(message)
-        result = {
+        result: dict[str, Any] = {
             "simulation_profile": profile,
             "git_commit": None,
             "template_relative_path": template_relative_path,

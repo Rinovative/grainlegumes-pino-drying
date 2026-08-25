@@ -2146,12 +2146,12 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(report, sort_keys=True))
         return 0
     if args.command == "campaign-completion-status":
-        campaign = None if args.config is None else config_service.load_campaign_config(args.config)
+        parent_campaign = None if args.config is None else config_service.load_campaign_config(args.config)
         report = completion_service.completion_status_for_id(
             args.completion_id,
             storage_root=args.storage_root,
             if_present=args.if_present,
-            parent_campaign=campaign,
+            parent_campaign=parent_campaign,
         )
         print(json.dumps(report, sort_keys=True))
         return 0

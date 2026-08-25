@@ -74,6 +74,9 @@ class TransientMetadata(TypedDict):
     spatial_stride: int
     canonical_spatial_shape: tuple[int, int]
     effective_spatial_shape: tuple[int, int]
+    spatial_y_indices: tuple[int, ...]
+    spatial_x_indices: tuple[int, ...]
+    spatial_index_identity_sha256: str
 
 
 class TransientItem(TypedDict):
@@ -130,6 +133,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         self.storage_backend = "canonical_hdf5"
         self.dataset_manifest_digest: str | None = None
         self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:
@@ -193,6 +197,21 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         effective = transient_contract.resolve_spatial_view(canonical, self.spatial_stride)
         self._spatial_view = (canonical, effective)
         return self._spatial_view
+
+    def spatial_representation(self) -> transient_contract.TransientSpatialRepresentation:
+        """Return the cached exact canonical-grid index representation."""
+        if self._spatial_representation is not None:
+            return self._spatial_representation
+        canonical, effective = self.spatial_view()
+        representation = transient_contract.resolve_spatial_representation(
+            canonical,
+            self.spatial_stride,
+        )
+        if representation.represented_shape != effective:
+            message = "Transient runtime spatial shape contradicts its exact index representation."
+            raise RuntimeError(message)
+        self._spatial_representation = representation
+        return representation
 
     def runtime_item_ids(self) -> tuple[str, ...]:
         """Return stable IDs for the fully expanded runtime sampling items."""
@@ -449,7 +468,9 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         first_time_index = int(samples[0]["time_index_n"])
         last_time_index = int(samples[-1]["time_index_n_plus_1"])
         sample_id = str(samples[0]["sample_id"]) if one_step else f"{case['package_case_id']}__window_{first_time_index:04d}_{last_time_index:04d}"
-        canonical_shape, effective_shape = self.spatial_view()
+        spatial_representation = self.spatial_representation()
+        canonical_shape = spatial_representation.source_shape
+        effective_shape = spatial_representation.represented_shape
         item: TransientItem = {
             "state": states[0],
             "static": self._finite_tensor(
@@ -493,6 +514,9 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "spatial_stride": self.spatial_stride,
                 "canonical_spatial_shape": canonical_shape,
                 "effective_spatial_shape": effective_shape,
+                "spatial_y_indices": spatial_representation.y_indices,
+                "spatial_x_indices": spatial_representation.x_indices,
+                "spatial_index_identity_sha256": spatial_representation.index_identity_sha256,
             },
         }
         return item if self.transform is None else self.transform(item)
@@ -547,6 +571,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self.storage_backend = "pt_shards"
         self.dataset_manifest_digest: str | None = None
         self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:

@@ -128,7 +128,7 @@ python -m src.experiments.cli.cli_config_preflight train <experiment_config>
 python -m src.experiments.cli.cli_train <experiment_config>
 python -m src.experiments.cli.cli_optuna <optuna_config>
 python -m src.experiments.cli.cli_build_artifacts --task steady_flow
-python -m src.experiments.cli.cli_build_artifacts --task transient_drying
+python -m src.experiments.cli.cli_build_artifacts --task transient_drying --evaluation-spatial-stride 1
 ```
 
 For transient drying, one normal architecture config automatically persists its

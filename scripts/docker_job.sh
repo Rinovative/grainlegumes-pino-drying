@@ -24,6 +24,7 @@ Workflows:
       Submit one Optuna study and return immediately. Persistent continuation uses study storage.
   artifacts (--task TASK | --runs-root PATH | --run-dir PATH)
       Generate or validate analysis artifacts for completed runs and return immediately.
+      Use --evaluation-spatial-stride N to select the artifact Evaluation grid (default: 1).
       Bounded transient cases require --run-dir and a new explicit --output-root.
 
 GPU selection:

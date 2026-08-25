@@ -6,6 +6,7 @@ Provides:
 - curated: fixed local scientific media rendering
 - display_labels: concise task and dataset display labels
 - field_labels: canonical user-facing scientific field labels
+- field_maps: exact shared discrete scientific field-map scales
 - histograms: shared exact constant and non-constant histogram rendering
 - registry: numbered EDA and evaluation presentation definitions
 - visual_semantics: semantic colormaps and deterministic dataset colors
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from . import analysis_channel_semantics as channel_semantics
     from . import analysis_display_labels as display_labels
     from . import analysis_field_labels as field_labels
+    from . import analysis_field_maps as field_maps
     from . import analysis_histograms as histograms
     from . import analysis_presentation_curated as curated
     from . import analysis_presentation_registry as registry
@@ -30,11 +32,12 @@ _MODULES = {
     "curated": "analysis_presentation_curated",
     "display_labels": "analysis_display_labels",
     "field_labels": "analysis_field_labels",
+    "field_maps": "analysis_field_maps",
     "histograms": "analysis_histograms",
     "registry": "analysis_presentation_registry",
     "visual_semantics": "analysis_visual_semantics",
 }
-__all__ = ["channel_semantics", "curated", "display_labels", "field_labels", "histograms", "registry", "visual_semantics"]
+__all__ = ["channel_semantics", "curated", "display_labels", "field_labels", "field_maps", "histograms", "registry", "visual_semantics"]
 
 
 def __getattr__(name: str) -> object:

@@ -1422,7 +1422,20 @@ def _summarize_group(
             if statistics is None:
                 message = "Indexed transient summaries require persisted metric statistics."
                 raise ValueError(message)
-            states.append(statistics[scope])
+            metric_evidence = _require_mapping(
+                statistics[scope],
+                label=f"metric_statistics.{scope}",
+            )
+            if metric_evidence.get("available") is not True:
+                reason = metric_evidence.get("unavailable_reason")
+                message = f"Ordinary transient summary metrics are unavailable for {record.record_id}: {reason}."
+                raise ValueError(message)
+            states.append(
+                _require_mapping(
+                    metric_evidence.get("statistics"),
+                    label=f"metric_statistics.{scope}.statistics",
+                )
+            )
             current_plausibility, current_stability = _persisted_diagnostics(statistics["diagnostics"])
             plausibility = metrics.PlausibilityDiagnostics(
                 plausibility.inspected_values + current_plausibility.inspected_values,

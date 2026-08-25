@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: D100, D103, PLR2004, S101, SLF001
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -16,6 +17,9 @@ from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient.learning_transient_contracts import (
     TransientTensorizerSpec,
 )
+
+if TYPE_CHECKING:
+    from src.learning.transient.learning_transient_scaling import TransientScaleMode
 
 
 def _dataset(*, mode: str) -> transient.TransientPhysicalDataset:
@@ -115,6 +119,16 @@ def test_boundary_preserving_spatial_view_resolves_canonical_grid() -> None:
     """Keep both physical boundaries when subsampling 251x401 by two."""
     assert training.transient_contract.resolve_spatial_view((251, 401), 1) == (251, 401)
     assert training.transient_contract.resolve_spatial_view((251, 401), 2) == (126, 201)
+    representation = training.transient_contract.resolve_spatial_representation((251, 401), 2)
+    assert representation.source_shape == (251, 401)
+    assert representation.represented_shape == (126, 201)
+    assert representation.y_indices == tuple(range(0, 251, 2))
+    assert representation.x_indices == tuple(range(0, 401, 2))
+    assert representation.y_indices[-1] == 250
+    assert representation.x_indices[-1] == 400
+    assert representation.as_dict()["index_identity_sha256"] == representation.index_identity_sha256
+    assert len(representation.index_identity_sha256) == 64
+    assert training.transient_contract.resolve_spatial_representation((251, 401), 1).index_identity_sha256 != representation.index_identity_sha256
     with pytest.raises(ValueError, match="preserve both boundaries"):
         training.transient_contract.resolve_spatial_view((250, 401), 2)
 
@@ -303,7 +317,7 @@ def test_transient_loader_workers_preserve_order_and_runtime_flags(workers: int)
     assert loader.persistent_workers is (workers > 0)
     iterator = loader._iterator
     if iterator is not None:
-        iterator._shutdown_workers()
+        cast("Any", iterator)._shutdown_workers()
 
 
 def test_ood_package_regime_uses_immutable_manifest(
@@ -461,8 +475,8 @@ def test_scaler_cache_reuses_exact_identity_and_rejects_corruption_or_stride_han
         _dataset: transient.TransientPhysicalDataset,
         **kwargs: object,
     ) -> training.scaling.TransientScalingArtifact:
-        identity = dict(kwargs["dataset_identity"])
-        ny, nx = identity["effective_spatial_shape"]
+        identity = dict(cast("dict[str, object]", kwargs["dataset_identity"]))
+        ny, nx = cast("list[int]", identity["effective_spatial_shape"])
 
         def item(index: int) -> dict[str, object]:
             state = torch.arange(4 * ny * nx, dtype=torch.float32).reshape(4, ny, nx) + index
@@ -486,11 +500,11 @@ def test_scaler_cache_reuses_exact_identity_and_rejects_corruption_or_stride_han
 
         artifact = training.scaling.fit_transient_scaling(
             [item(0), item(1)],
-            tensorizer=kwargs["tensorizer"],
+            tensorizer=cast("TransientTensorizerSpec", kwargs["tensorizer"]),
             dataset_identity=identity,
-            train_membership_digest=kwargs["train_membership_digest"],
+            train_membership_digest=cast("str", kwargs["train_membership_digest"]),
             horizon=10.0,
-            scale_mode=kwargs["scale_mode"],
+            scale_mode=cast("TransientScaleMode", kwargs["scale_mode"]),
         )
         fitted.append(artifact)
         return artifact
@@ -501,7 +515,7 @@ def test_scaler_cache_reuses_exact_identity_and_rejects_corruption_or_stride_han
     def load(
         identity: dict[str, object],
         digest: str,
-        mode: str,
+        mode: TransientScaleMode,
         view: dict[str, int],
     ) -> training.scaling.TransientScalingArtifact:
         return training._fit_or_load_scaling_artifact(
