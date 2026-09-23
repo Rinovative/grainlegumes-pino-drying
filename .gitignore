@@ -38,7 +38,6 @@ htmlcov/
 *.env
 .venv/
 venv/
-mamba-lock.yaml
 
 # ================================
 # Build / packaging artifacts
@@ -49,7 +48,19 @@ dist/
 *.egg
 
 # ================================
-# Docker-related files
+# Apptainer / replaceable runtime artifacts
+# ================================
+/runtime/
+*.sif
+/.apptainer/
+/.apptainer-cache/
+/apptainer-cache/
+/apptainer-tmp/
+slurm-*.out
+slurm-*.err
+
+# ================================
+# Local archives and process state
 # ================================
 *.tar.gz
 *.pid

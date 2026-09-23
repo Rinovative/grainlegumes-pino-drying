@@ -11,7 +11,7 @@ Design principles:
   - Cleanup gates bind retained evidence before any source deletion
   - Failed and successful materials use the same generic evidence path
 This module does NOT:
-  - Execute SSH, Slurm, COMSOL, rsync, or destructive source cleanup
+  - Execute Slurm or COMSOL, or remove durable scientific source data
   - Retune scientific values, invent tolerances, or build production datasets
 """
 
@@ -1017,6 +1017,51 @@ def record_transfer_staging_inventory(
         message = "Pilot staging inventory does not match the exact staging tree."
         raise RuntimeError(message)
     return payload
+
+
+def record_shared_staging_inventory(
+    run_id: str,
+    *,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Record an owned accounting marker without copying shared campaign data."""
+    storage = workspace_service.resolve_storage_root(storage_root, create=False)
+    destination = campaign_evidence.campaign_run_directory(run_id, storage_root=storage) / PILOT_STAGING_INVENTORY_FILENAME
+    if destination.exists():
+        inventory = validate_transfer_staging_inventory(
+            run_id,
+            storage_root=storage,
+        )
+        staging = Path(inventory["transfer_staging_path"])
+        if staging.exists():
+            return inventory
+        directory = pilot_check_directory(run_id, storage_root=storage)
+        cleanup_path = directory / PILOT_STAGING_CLEANUP_FILENAME
+        if not cleanup_path.is_file():
+            message = f"Pilot accounting staging is missing without cleanup evidence: {staging}"
+            raise FileNotFoundError(message)
+        _validate_staging_cleanup_receipt(
+            _load_json(cleanup_path, label="pilot staging cleanup receipt"),
+            run_id=run_id,
+            staging=staging,
+            pre_cleanup_snapshot_sha256=common.serialization.file_sha256(
+                directory / PILOT_PRE_CLEANUP_FILENAME,
+            ),
+            receipt_path=cleanup_path,
+        )
+        return inventory
+    staging = workspace_service.create_transfer_staging(storage_root=storage, run_id=run_id)
+    try:
+        inventory = record_transfer_staging_inventory(run_id, staging_root=staging)
+        common.serialization.atomic_write_json(destination, inventory)
+    except Exception:
+        workspace_service.cleanup_transfer_staging(staging, storage_root=storage, run_id=run_id)
+        raise
+    return validate_transfer_staging_inventory(
+        run_id,
+        storage_root=storage,
+        require_staging_present=True,
+    )
 
 
 def validate_cpu_source_inventory(

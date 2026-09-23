@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from . import common_paths as paths
     from . import common_serialization as serialization
 
-# The queue-log CLI is executable-only and intentionally absent from the public surface.
 _MODULES = {
     "locking": "common_locking",
     "paths": "common_paths",

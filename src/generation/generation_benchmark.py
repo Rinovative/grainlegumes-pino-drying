@@ -930,7 +930,7 @@ def resolve_core_benchmark_runtime_identity(
 
 
 def _repository_commit() -> str:
-    """Return the exact commit of the current CPU checkout."""
+    """Return the exact commit of the current shared repository."""
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
         cwd=common.paths.get_project_root(),
@@ -1223,7 +1223,7 @@ def preflight_core_benchmark(
     requested_commit = source_service.validate_git_commit(git_commit)
     current_commit = _repository_commit()
     if current_commit != requested_commit:
-        message = f"CPU checkout commit {current_commit} does not match requested benchmark commit {requested_commit}."
+        message = f"Shared repository commit {current_commit} does not match requested benchmark commit {requested_commit}."
         raise RuntimeError(message)
     _require_clean_repository()
     suite = load_core_benchmark_suite(path, require_executable=True)
@@ -1259,7 +1259,7 @@ def preflight_core_benchmark(
         comsol_version=version,
     )
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    logs = directory / "scheduler"
+    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     commands = [
         build_core_benchmark_slurm_command(
             suite,
@@ -1328,6 +1328,7 @@ def preflight_core_benchmark(
             git_commit=requested_commit,
         )
         return existing
+    source_service.validate_admitted_source_before_publication()
     _write_immutable_json(
         receipt_path,
         payload,
@@ -1376,10 +1377,27 @@ def _variant_records(suite: CoreBenchmarkSuite) -> list[dict[str, Any]]:
     ]
 
 
-def _node_environment(suite: CoreBenchmarkSuite, run_id: str) -> list[str]:
+def _node_environment(suite: CoreBenchmarkSuite, run_id: str, storage_root: Path) -> list[str]:
     """Return exact environment bindings consumed by the compute-node script."""
     site = suite.case_campaign.execution_values["site"]
+    runtime_root = common.paths.get_runtime_root().resolve()
+    source_commit = os.environ.get("GENERATION_GIT_COMMIT", "")
+    source_sha = os.environ.get("GENERATION_SOURCE_SHA256", "")
+    native_venv = os.environ.get("GENERATION_NATIVE_VENV", "")
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        message = "GENERATION_GIT_COMMIT must contain the exact launch commit."
+        raise ValueError(message)
+    if re.fullmatch(r"[0-9a-f]{64}", source_sha) is None:
+        message = "GENERATION_SOURCE_SHA256 must contain the launch source fingerprint."
+        raise ValueError(message)
+    if Path(native_venv) != runtime_root / "venvs" / "generation":
+        message = "GENERATION_NATIVE_VENV must be the sibling runtime Generation venv."
+        raise ValueError(message)
     return [
+        f"GENERATION_GIT_COMMIT={source_commit}",
+        f"GENERATION_SOURCE_SHA256={source_sha}",
+        f"GENERATION_NATIVE_VENV={native_venv}",
+        f"STORAGE_ROOT={storage_root.resolve()}",
         f"GENERATION_BENCHMARK_RUN_ID={run_id}",
         f"GENERATION_PYTHON_MODULE={site['python_module']}",
         f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
@@ -1415,8 +1433,9 @@ def build_core_benchmark_slurm_command(
     if not storage_root.is_absolute() or not log_directory.is_absolute():
         message = "Benchmark Slurm storage and log roots must be absolute."
         raise ValueError(message)
+    runtime_logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     suite.work_unit_id(variant, case_position)
-    environment = _node_environment(suite, run_id)
+    environment = _node_environment(suite, run_id, storage_root)
     representative = suite.representative_case(case_position)
     worker = [
         str(launcher),
@@ -1440,8 +1459,8 @@ def build_core_benchmark_slurm_command(
         f"--chdir={repository}",
         f"--job-name={job_name}",
         "--export=ALL",
-        f"--output={log_directory}/slurm-%j.out",
-        f"--error={log_directory}/slurm-%j.err",
+        f"--output={runtime_logs}/slurm-%j.out",
+        f"--error={runtime_logs}/slurm-%j.err",
     ]
     if suite.partition is not None:
         command.append(f"--partition={suite.partition}")
@@ -1462,7 +1481,7 @@ def _plan_payload(
     """Build the canonical two-case, four-wave benchmark plan."""
     run_id = str(preflight["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    logs = directory / "scheduler"
+    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     sequence = _measured_sequence(suite)
     work_unit_commands = [
         {
@@ -2658,7 +2677,11 @@ def _active_benchmark_job_ids(scheduler: Mapping[str, Any]) -> frozenset[str]:
 def _scientific_failure_count(attempts: Sequence[Path]) -> int:
     """Count only terminal scientific failures in one admitted attempt chain."""
     _validate_benchmark_attempt_chain(attempts)
-    return sum(_load_json(path, label="benchmark work-unit attempt").get("status") == "failed" for path in attempts)
+    return sum(
+        record.get("status") == "failed" and _mapping(record.get("error"), label="benchmark attempt error").get("type") != "SourceAdmissionError"
+        for path in attempts
+        if (record := _load_json(path, label="benchmark work-unit attempt"))
+    )
 
 
 def _work_unit_directory(
@@ -2766,7 +2789,7 @@ def _submit_pending(
     manifest_path = _manifest_path(run_id, storage_root=storage)
     if manifest.get("state") in {"cancel_requested", "force_cancel_requested"}:
         return manifest
-    logs = directory / "scheduler"
+    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     logs.mkdir(parents=True, exist_ok=True)
     persisted_job_ids = [str(value) for value in manifest["measured_job_ids"]]
     if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted_job_ids):
@@ -2974,7 +2997,7 @@ def submit_core_benchmark(
     comsol_version_output: str,
     comsol_executable_path: Path | str,
 ) -> dict[str, Any]:
-    """Reuse canonical login-node input, then submit one measured work unit."""
+    """Reuse canonical Slurm-prepared input, then submit one measured work unit."""
     plan = plan_core_benchmark(
         path,
         git_commit=git_commit,
@@ -3006,8 +3029,9 @@ def resume_core_benchmark(
     run_id: str,
     *,
     storage_root: Path | str,
+    scratch_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Repair missing input readiness and submit the next measured work unit."""
+    """Repair missing input readiness using current scratch, then submit work."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest_path = _manifest_path(run_id, storage_root=storage)
     lock = manifest_path.parent / "submission.lock"
@@ -3032,11 +3056,14 @@ def resume_core_benchmark(
                 )["scratch"],
                 label="benchmark preflight scratch capability",
             )
+            work_root = Path(str(scratch["path"])) if scratch_root is None else Path(scratch_root)
+            if scratch_root is not None:
+                _probe_directory_capability(work_root, label="benchmark scratch")
             try:
                 _materialize_core_benchmark_inputs(
                     run_id,
                     storage_root=storage,
-                    work_root=Path(str(scratch["path"])),
+                    work_root=work_root,
                 )
             except Exception:
                 manifest["state"] = "input_preparation_failed"
@@ -3157,6 +3184,7 @@ def _materialize_core_benchmark_inputs(
                 prepared,
                 canonical_input_preparation_seconds=(time.monotonic() - preparation_start),
             )
+            source_service.validate_admitted_source_before_publication()
             _write_immutable_json(
                 path,
                 proof,
@@ -3524,6 +3552,7 @@ def run_core_benchmark_case(
                     "retained_as_scientific_case": False,
                 },
             }
+            source_service.validate_admitted_source_before_publication()
             _write_immutable_json(attempt_path, success, label="benchmark attempt")
             _write_immutable_json(
                 success_path,
@@ -5399,7 +5428,7 @@ def publish_transferred_core_benchmark(
     expected_file_count: int,
     expected_size_bytes: int,
 ) -> dict[str, Any]:
-    """Validate staged benchmark evidence and atomically publish it on hpc115."""
+    """Validate staged benchmark evidence and atomically publish it in shared storage."""
     if not source_host or any(character in source_host for character in "\r\n\t"):
         message = "Benchmark transfer source_host must be safe non-empty text."
         raise ValueError(message)

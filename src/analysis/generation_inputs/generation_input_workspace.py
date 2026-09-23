@@ -32,10 +32,7 @@ if TYPE_CHECKING:
 
 _GENERATION_DOCUMENTATION_LINK: Final = "../docs/simulation_generation.md#canonical-input-case-generation-and-eda"
 _GENERIC_GENERATION_COMMAND: Final = (
-    "./scripts/docker_python.sh -m src.generation.cli.cli_generation "
-    'generate-input-cases "$CAMPAIGN_CONFIG" '
-    '--only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT" '
-    '--git-commit "$(git rev-parse HEAD)" --storage-root "$STORAGE_ROOT"'
+    './scripts/generation_workflow.sh inputs "$CAMPAIGN_CONFIG" --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"'
 )
 _MAXIMUM_DISPLAYED_ISSUES: Final = 5
 

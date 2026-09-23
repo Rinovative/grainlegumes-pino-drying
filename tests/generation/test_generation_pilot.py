@@ -30,6 +30,68 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_shared_pilot_staging_records_only_owned_accounting_marker(tmp_path: Path) -> None:
+    """Keep shared campaign data in place while retaining cleanup evidence."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    run_id = "synthetic_pilot__0123456789abcdef"
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
+    run_directory.mkdir(parents=True)
+    scientific = run_directory / "campaign_terminal.json"
+    scientific.write_bytes(b"owned scientific evidence")
+
+    receipt = pilot_service.record_shared_staging_inventory(run_id, storage_root=storage)
+    repeated = pilot_service.record_shared_staging_inventory(run_id, storage_root=storage)
+
+    assert repeated == receipt
+    assert scientific.read_bytes() == b"owned scientific evidence"
+    staging = workspace_service.validate_transfer_staging(
+        receipt["transfer_staging_path"],
+        run_id=run_id,
+    )
+    assert sorted(path.name for path in staging.rglob("*") if path.is_file()) == [
+        ".generation-transfer-staging.json",
+        "pilot_staging_inventory.json",
+    ]
+    assert (
+        pilot_service.validate_transfer_staging_inventory(
+            run_id,
+            storage_root=storage,
+            require_staging_present=True,
+        )
+        == receipt
+    )
+
+    pilot_directory = pilot_service.pilot_check_directory(run_id, storage_root=storage)
+    pilot_directory.mkdir(parents=True)
+    snapshot = pilot_directory / pilot_service.PILOT_PRE_CLEANUP_FILENAME
+    snapshot.write_bytes(b"validated pre-cleanup evidence")
+    files = [path for path in staging.rglob("*") if path.is_file()]
+    expected_bytes = sum(path.stat().st_size for path in files)
+    expected_count = len(files)
+    workspace_service.cleanup_transfer_staging(staging, storage_root=storage, run_id=run_id)
+    with pytest.raises(FileNotFoundError, match="without cleanup evidence"):
+        pilot_service.record_shared_staging_inventory(run_id, storage_root=storage)
+    common.serialization.atomic_write_json(
+        pilot_directory / pilot_service.PILOT_STAGING_CLEANUP_FILENAME,
+        {
+            "schema_kind": "generation_pilot_staging_cleanup",
+            "schema_version": pilot_service.PILOT_SCHEMA_VERSION,
+            "campaign_run_id": run_id,
+            "staging_path": str(staging),
+            "pre_cleanup_snapshot_sha256": common.serialization.file_sha256(snapshot),
+            "expected_bytes": expected_bytes,
+            "expected_file_count": expected_count,
+            "status": "complete",
+            "removed": True,
+            "reclaimed_bytes": expected_bytes,
+            "started_at": "2026-09-23T00:00:00+00:00",
+            "completed_at": "2026-09-23T00:00:01+00:00",
+        },
+    )
+    assert pilot_service.record_shared_staging_inventory(run_id, storage_root=storage) == receipt
+
+
 @pytest.fixture
 def pilot_campaign_path(generation_config_factory: Any) -> Path:
     """Return one compact test-owned transient pilot campaign."""

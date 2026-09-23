@@ -214,7 +214,7 @@ def _load_result(directory: Path) -> dict[str, Any] | None:
 def _command_script(
     *,
     stable_script: Path,
-    docker_python: Path,
+    python_executable: Path,
     arguments: Sequence[str],
     session_id: str,
     storage_root: Path,
@@ -224,7 +224,7 @@ def _command_script(
     workflow = shlex.join((str(stable_script), *arguments))
     completion = shlex.join(
         (
-            str(docker_python),
+            str(python_executable),
             "-m",
             "src.generation.cli.cli_generation",
             "complete-background-session",
@@ -257,7 +257,7 @@ def create_background_session(
     source_commit: str,
     storage_root: Path | str,
     stable_script: Path | str,
-    docker_python: Path | str,
+    python_executable: Path | str,
     host_storage_root: Path | str,
     host_name: str,
     active_tmux_sessions: Sequence[str],
@@ -275,11 +275,11 @@ def create_background_session(
         message = "Background subcommand disagrees with exact argv."
         raise ValueError(message)
     script = Path(stable_script).expanduser()
-    runner = Path(docker_python).expanduser()
+    runner = Path(python_executable).expanduser()
     host_storage = Path(host_storage_root).expanduser()
     paths = (script, runner, host_storage)
     if any(not value.is_absolute() or value == Path("/") or ".." in value.parts for value in paths):
-        message = "Host workflow, Docker Python, and storage paths must be absolute, non-root, and traversal-free."
+        message = "Host workflow, Python executable, and storage paths must be absolute, non-root, and traversal-free."
         raise ValueError(message)
     root = _sessions_root(storage_root, create=True)
     storage = root.parents[2]
@@ -318,7 +318,7 @@ def create_background_session(
         local_log_path.touch(mode=0o600)
         command = _command_script(
             stable_script=script,
-            docker_python=runner,
+            python_executable=runner,
             arguments=argv,
             session_id=session_id,
             storage_root=host_storage,

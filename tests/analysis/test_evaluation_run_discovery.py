@@ -238,7 +238,9 @@ def test_failed_runs_remain_visible_and_artifacts_report_missing_or_available(
     assert available_record.availability == "available"
     assert available_record.evaluable
     assert available_record.action_enabled
-    assert available_record.artifact_command == f"./scripts/docker_job.sh artifacts --run-dir {available.resolve()}"
+    assert available_record.artifact_command == (
+        f"./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 --mem 16G --time 02:00:00 artifacts --run-dir {available.resolve()}"
+    )
 
 
 def test_marker_discovery_does_not_hash_numerical_payloads(
@@ -507,8 +509,8 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     assert descriptions.isdisjoint({"Task:", "Stage:", "Seed:", "Regime:", "View:"})
     assert descriptions == {"Run:"}
     assert "ID · missing; Near-family OOD · missing" in controller.status.value
-    assert "docker_job.sh" in controller.status.value
-    assert "--queue-gpu" not in controller.status.value
+    assert "slurm_ml.sh" in controller.status.value
+    assert "artifacts --run-dir" in controller.status.value
     assert "--one-case" not in controller.status.value
     prepared.close()
 

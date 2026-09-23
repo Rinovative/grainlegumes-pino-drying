@@ -7,16 +7,55 @@ name = "grainlegumes-pino-drying"
 version = "0.1.0"
 description = "Physics-informed neural-operator pipeline for steady 2D airflow through heterogeneous porous media, motivated by grain-legume drying applications."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 authors = [{ name = "Rino M. Albertin" }]
-
-[project.optional-dependencies]
-generation-cpu = [
+license = "Apache-2.0"
+license-files = ["LICENSE.md"]
+dependencies = [
   "h5py",
+  "ipykernel",
+  "ipython",
+  "ipywidgets",
+  "matplotlib",
+  "nbconvert",
+  "neuraloperator @ git+https://github.com/neuraloperator/neuraloperator.git@86a8bc7812a31b42c4f7895693cf4ac11521c066",
   "numpy",
+  "optuna",
+  "pandas",
+  "pyarrow",
   "PyYAML",
   "scipy",
+  "seaborn",
+  "torch>=2.4,<2.5",
+  "tqdm",
+  "wandb==0.28.1",
 ]
+
+[dependency-groups]
+dev = [
+  "basedpyright",
+  "mypy",
+  "pandas-stubs",
+  "pip",
+  "pytest",
+  "radon",
+  "ruff==0.15.11",
+  "setuptools",
+  "types-PyYAML",
+  "typing-extensions",
+  "wheel",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -35,7 +74,7 @@ markers = [
 
 [tool.ruff]
 line-length = 150
-target-version = "py310"
+target-version = "py312"
 extend-exclude = [
   "venv",
   ".venv",
@@ -84,7 +123,11 @@ ignore = [
   "T201",  # Allow print statements
   "D205", # Allow multi-line docstring summary to be on a separate line
   "D400", # Allow the first line to not end with a period
-  "D415" # Allow the first line to not end with a period, question mark, or exclamation point
+  "D415", # Allow the first line to not end with a period, question mark, or exclamation point
+  "UP017", # Keep existing UTC timezone objects without unrelated timestamp churn
+  "UP040", # Preserve runtime TypeAlias objects in persisted-data and public contracts
+  "UP042", # Preserve the established string-enum runtime type
+  "FURB162", # Preserve existing timestamp parsing and normalization behavior
 ]
 fixable = ["ALL"]
 
@@ -116,11 +159,11 @@ max-returns = 10
 [tool.basedpyright]
 include = ["src", "tests"]
 extraPaths = [".", "tests"]
-pythonVersion = "3.10"
+pythonVersion = "3.12"
 typeCheckingMode = "basic"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_unused_configs = true
 strict_optional = true
 

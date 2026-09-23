@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from src import common
 from src.generation.cases import generation_cases_input as input_service
+from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -816,6 +817,7 @@ def publish_case_attempt(
         _require_previous_attempt_identity(previous, receipt)
         common.serialization.atomic_write_json(staging / "attempt.json", receipt)
         _reject_success_marker(staging)
+        source_service.validate_admitted_source_before_publication()
         staging.replace(target)
     except BaseException:
         if staging.exists():

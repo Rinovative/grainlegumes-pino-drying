@@ -1,9 +1,11 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, S603, S607
 """Native CPU preflight environment, resource, and self-cleaning contracts."""
 
 from __future__ import annotations
 
 import copy
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,57 @@ import pytest
 import yaml
 
 from src import generation
+from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.runtime import generation_runtime_preflight as preflight
+
+
+def test_admitted_source_is_checked_before_case_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse publication after a shared scientific source edit."""
+    repository = tmp_path / "repo"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[2] / "scripts/source_fingerprint.py"
+    shutil.copy2(source, scripts / source.name)
+    scientific = repository / "science.py"
+    scientific.write_text("value = 1\n", encoding="utf-8")
+    for arguments in (
+        ("init", "-q"),
+        ("config", "user.name", "Test"),
+        ("config", "user.email", "test@example.invalid"),
+        ("add", "."),
+        ("commit", "-qm", "test source"),
+    ):
+        subprocess.run(["git", "-C", str(repository), *arguments], check=True)
+    expected = subprocess.run(
+        [str(preflight.sys.executable), str(scripts / source.name), str(repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(source_service.common.paths, "get_project_root", lambda: repository)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", expected)
+    monkeypatch.setenv(
+        "GENERATION_GIT_COMMIT",
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+    )
+    source_service.validate_admitted_source_before_publication()
+
+    scientific.write_text("value = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source changed"):
+        source_service.validate_admitted_source_before_publication()
+
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-qm", "changed source"], check=True)
+    with pytest.raises(RuntimeError, match="commit changed"):
+        source_service.validate_admitted_source_before_publication()
 
 
 @pytest.fixture
@@ -26,7 +78,7 @@ def campaign_path(generation_config_factory: Any) -> Path:
     )
     execution_path = path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["site"]["python_module"] = "Python/3.10"
+    execution["site"]["python_module"] = "Python/3.12"
     execution["site"]["comsol_module"] = "Comsol/6.4"
     execution_path.write_text(
         yaml.safe_dump(execution, sort_keys=False),
@@ -43,8 +95,8 @@ def _paths(
     storage = tmp_path / "persistent storage"
     work = tmp_path / "node work"
     venv = tmp_path / "native venv"
-    base_prefix = tmp_path / "software/Python/3.10"
-    base_python = base_prefix / "bin/python3.10"
+    base_prefix = tmp_path / "software/Python/3.12"
+    base_python = base_prefix / "bin/python3.12"
     storage.mkdir(parents=True)
     work.mkdir()
     (venv / "bin").mkdir(parents=True)
@@ -53,15 +105,15 @@ def _paths(
     base_python.chmod(0o755)
     (venv / "bin/python").symlink_to(base_python)
     (venv / "pyvenv.cfg").write_text(
-        f"home = {base_python.parent}\nversion = 3.10.14\n",
+        f"home = {base_python.parent}\nversion = 3.12.7\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(preflight.sys, "executable", str(venv / "bin/python"))
     monkeypatch.setattr(preflight.sys, "prefix", str(venv))
     monkeypatch.setattr(preflight.sys, "base_prefix", str(base_prefix))
     monkeypatch.setattr(preflight.sys, "exec_prefix", str(venv))
-    monkeypatch.setattr(preflight.sys, "version_info", (3, 10, 14, "final", 0))
-    monkeypatch.setattr(preflight.sys, "version", "3.10.14 (synthetic test runtime)")
+    monkeypatch.setattr(preflight.sys, "version_info", (3, 12, 7, "final", 0))
+    monkeypatch.setattr(preflight.sys, "version", "3.12.7 (synthetic test runtime)")
     return storage, work, venv
 
 
@@ -69,7 +121,7 @@ def _fake_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide non-solving native command and version evidence."""
 
     def fake_which(name: str) -> str | None:
-        login_only = {"quota", "rsync", "sbatch", "squeue", "sacct", "scancel"}
+        login_only = {"quota", "sbatch", "squeue", "sacct", "scancel"}
         return None if name in login_only else f"/synthetic/bin/{name}"
 
     def fake_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
@@ -77,7 +129,7 @@ def _fake_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
         return {
             "arguments": command,
             "exit_code": 0,
-            "output": "Python 3.10.14; COMSOL Multiphysics 6.4; synthetic tool",
+            "output": "Python 3.12.7; COMSOL Multiphysics 6.4; synthetic tool",
         }
 
     monkeypatch.setattr(preflight.shutil, "which", fake_which)
@@ -111,12 +163,12 @@ def test_generation_venv_accepts_external_module_python_target(
 
     launcher = venv / "bin/python"
     assert launcher.is_symlink()
-    assert launcher.resolve().parent.parent == tmp_path / "software/Python/3.10"
+    assert launcher.resolve().parent.parent == tmp_path / "software/Python/3.12"
     assert launcher.resolve().is_relative_to(venv) is False
     assert evidence["launcher"] == str(launcher)
     assert evidence["resolved_launcher_target"] == str(launcher.resolve())
     assert evidence["sys_prefix"] == str(venv)
-    assert evidence["sys_base_prefix"] == str(tmp_path / "software/Python/3.10")
+    assert evidence["sys_base_prefix"] == str(tmp_path / "software/Python/3.12")
 
 
 def test_generation_venv_rejects_system_python(
@@ -125,8 +177,8 @@ def test_generation_venv_rejects_system_python(
 ) -> None:
     """Reject an interpreter whose runtime prefix is its base prefix."""
     _storage, _work, venv = _paths(tmp_path, monkeypatch)
-    base_prefix = tmp_path / "software/Python/3.10"
-    monkeypatch.setattr(preflight.sys, "executable", str(base_prefix / "bin/python3.10"))
+    base_prefix = tmp_path / "software/Python/3.12"
+    monkeypatch.setattr(preflight.sys, "executable", str(base_prefix / "bin/python3.12"))
     monkeypatch.setattr(preflight.sys, "prefix", str(base_prefix))
     monkeypatch.setattr(preflight.sys, "base_prefix", str(base_prefix))
     monkeypatch.setattr(preflight.sys, "exec_prefix", str(base_prefix))
@@ -207,7 +259,7 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
     assert set(report["versions"]) == {"python", "comsol"}
     assert report["checks"]["Generation-venv-imports"]["status"] == "pass"
     assert report["python"]["executable"].endswith("native venv/bin/python")
-    assert report["python"]["resolved_executable"].endswith("software/Python/3.10/bin/python3.10")
+    assert report["python"]["resolved_executable"].endswith("software/Python/3.12/bin/python3.12")
     assert report["python"]["venv_runtime"]["sys_prefix"].endswith("native venv")
     campaign = generation.cases.config.load_campaign_config(campaign_path)
     assert report["submission_plan"] == {
@@ -288,14 +340,14 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
         require_executable=False,
     )
     execution = copy.deepcopy(campaign.execution_values)
-    execution["site"]["python_module"] = "Python/3.11"
+    execution["site"]["python_module"] = "Python/3.13"
     wrong = replace(campaign, execution_values=execution)
     monkeypatch.setattr(
         preflight.config_service,
         "load_campaign_config",
         lambda *_args, **_kwargs: wrong,
     )
-    with pytest.raises(RuntimeError, match=r"Configured Python module expects version 3[.]11"):
+    with pytest.raises(RuntimeError, match=r"Configured Python module expects version 3[.]13"):
         preflight.run_cpu_preflight(
             campaign_path,
             only_batch=None,
@@ -362,16 +414,16 @@ def test_preflight_rejects_wrong_binding_runtime_version(
     """Protect configured Python and COMSOL module/runtime versions."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
-    expected = r"Configured Python module expects version 3[.]10"
+    expected = r"Configured Python module expects version 3[.]12"
     if wrong_runtime == "python":
-        monkeypatch.setattr(preflight.sys, "version_info", (3, 11, 0, "final", 0))
-        monkeypatch.setattr(preflight.sys, "version", "3.11.0 (synthetic wrong runtime)")
+        monkeypatch.setattr(preflight.sys, "version_info", (3, 13, 0, "final", 0))
+        monkeypatch.setattr(preflight.sys, "version", "3.13.0 (synthetic wrong runtime)")
     else:
         expected = r"Configured comsol module expects version 6[.]4"
 
         def wrong_comsol_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
             assert timeout_seconds > 0.0
-            output = "COMSOL Multiphysics 6.3" if command[0].endswith("/comsol") else "Python 3.10.14; synthetic tool"
+            output = "COMSOL Multiphysics 6.3" if command[0].endswith("/comsol") else "Python 3.12.7; synthetic tool"
             return {"arguments": command, "exit_code": 0, "output": output}
 
         monkeypatch.setattr(preflight, "_version_output", wrong_comsol_version)

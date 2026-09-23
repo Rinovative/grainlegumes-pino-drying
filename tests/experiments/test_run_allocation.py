@@ -11,6 +11,7 @@ resume extension. Checkpoint tensor/RNG restoration is covered by
 from __future__ import annotations
 
 import copy
+import json
 import multiprocessing as mp
 import queue
 import threading
@@ -209,6 +210,30 @@ def _admission_report(
     after = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
     assert after == before
     return report, run_dir, config
+
+
+def test_cpu_run_resume_guidance_does_not_request_gpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep explicit resume guidance neutral to the requested Slurm device."""
+    _report, run_dir, config = _admission_report(
+        tmp_path,
+        monkeypatch,
+        status="interrupted",
+        completed_epoch=1,
+    )
+
+    error = experiments.run.reject_existing_fresh_run(
+        run_dir,
+        config,
+        config_path=tmp_path / "synthetic-request.yaml",
+    )
+
+    reason = str(error.report["reason"])
+    assert "RESOURCE_OPTIONS" in reason
+    assert "--resume" in reason
+    assert "--mode gpu" not in reason
 
 
 def test_completed_admission_is_distinct_from_resume(
@@ -489,6 +514,45 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
     assert summary["runtime_sessions"][1]["resolved_device"] == "cpu"
     assert summary["runtime_sessions"][1]["started_at"] == second_started.isoformat()
     assert summary["runtime_device"] == second_resolution.as_dict()
+
+
+def test_runtime_session_records_validated_slurm_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attach worker evidence to this session without altering run identity."""
+    run_dir = experiments.run.allocate_run_directory(tmp_path / "slurm-session")
+    experiments.run.transition_run_status(run_dir, "initializing")
+    provenance = {
+        "job_id": "12345",
+        "partition": "gpu",
+        "cpus_per_task": 4,
+        "requested_memory": "32G",
+        "requested_wall_time": "04:00:00",
+        "allocated_mem_per_node": "32768",
+        "mode": "gpu",
+        "gres": "gpu:rtx6000ada:1",
+        "source_commit": "a" * 40,
+        "source_worktree_sha256": "b" * 64,
+        "config_sha256": "c" * 64,
+        "sif_path": "/workspace/runtime/containers/grainlegumes-pino-drying.sif",
+        "sif_sha256": "d" * 64,
+    }
+    monkeypatch.setenv("ML_SLURM_PROVENANCE", json.dumps(provenance))
+    resolution = experiments.run.learning.device.resolve_device("cpu")
+
+    summary = experiments.run.transition_run_status(
+        run_dir,
+        "running",
+        updates=experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(timezone.utc)),
+    )
+
+    assert summary["runtime_sessions"][0]["slurm"] == provenance
+    assert "slurm" not in summary["runtime_device"]
+    provenance["source_worktree_sha256"] = "invalid"
+    monkeypatch.setenv("ML_SLURM_PROVENANCE", json.dumps(provenance))
+    with pytest.raises(experiments.run.RunLifecycleError, match="source_worktree_sha256"):
+        experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(timezone.utc))
 
 
 def test_tracking_runtime_updates_are_atomic_and_session_scoped(

@@ -14,6 +14,61 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_runtime_root_defaults_beside_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The portable runtime root is the sibling of the selected repository."""
+    project_root = tmp_path / "project" / "repo"
+    monkeypatch.setenv("PROJECT_ROOT", str(project_root))
+    monkeypatch.delenv("RUNTIME_ROOT", raising=False)
+
+    runtime_root = common.paths.get_runtime_root()
+
+    assert runtime_root == tmp_path / "project" / "runtime"
+    assert not runtime_root.exists()
+
+
+def test_runtime_root_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RUNTIME_ROOT is the sole environment-level runtime override."""
+    configured_root = tmp_path / "configured runtime"
+    monkeypatch.setenv("RUNTIME_ROOT", str(configured_root))
+
+    assert common.paths.get_runtime_root() == configured_root
+
+
+def test_explicit_runtime_root_takes_precedence_over_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A controlled caller can override RUNTIME_ROOT without mutating it."""
+    monkeypatch.setenv("RUNTIME_ROOT", str(tmp_path / "environment runtime"))
+    explicit_root = tmp_path / "explicit runtime"
+
+    assert common.paths.get_runtime_root(runtime_root=explicit_root) == explicit_root
+
+
+def test_storage_root_precedence_and_default_remain_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime contract does not alter durable storage-root resolution."""
+    project_root = tmp_path / "project" / "repo"
+    monkeypatch.setenv("PROJECT_ROOT", str(project_root))
+    monkeypatch.delenv("STORAGE_ROOT", raising=False)
+
+    assert common.paths.get_storage_root() == tmp_path / "project" / "storage"
+
+    configured_root = tmp_path / "configured storage"
+    monkeypatch.setenv("STORAGE_ROOT", str(configured_root))
+    assert common.paths.get_storage_root() == configured_root
+    explicit_root = tmp_path / "explicit storage"
+    assert common.paths.get_storage_root(storage_root=explicit_root) == explicit_root
+
+
 def test_dataset_packages_root_is_canonical_and_preserves_logical_id(tmp_path: Path) -> None:
     """Relocating the lifecycle root must not alter one logical Dataset ID."""
     dataset_id = "steady_flow__lentil__id"
@@ -109,7 +164,5 @@ def test_owned_path_resolvers_apply_logical_name_validation(tmp_path: Path) -> N
         common.paths.resolve_optuna_trial_dir("steady_flow", "study", invalid_name, output_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_runs_root(invalid_name, output_root=tmp_path)
-    with pytest.raises(ValueError, match="single non-empty path component"):
-        common.paths.resolve_queue_log_dir(invalid_name, storage_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_ood_analysis_dir(tmp_path / "run", invalid_name)

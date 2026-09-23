@@ -3,14 +3,9 @@ set -Eeuo pipefail
 
 ORIGINAL_ARGUMENTS=("$@")
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-DEVELOPMENT_REPO_ROOT=""
 HOST_REPO_ROOT=""
 HOST_STORAGE_ROOT=""
-DOCKER_PYTHON=""
-PINNED_SOURCE_CONTAINER=""
-PINNED_SOURCE_PARENT=""
-PINNED_SOURCE_COMMIT=""
-CPU_BOOTSTRAP_REPOSITORY_URL="https://github.com/Rinovative/grainlegumes-pino-drying.git"
+SOURCE_COMMIT=""
 GENERATION_MODULE="src.generation.cli.cli_generation"
 BENCHMARK_SUITE_RELATIVE_PATH="configs/generation/benchmarks/transient_core_scaling/suite.yaml"
 STATIONARY_SMOKE_CAMPAIGN_PATH=""
@@ -39,22 +34,20 @@ CPU_BYTES_RECLAIMED=0
 CPU_CLEANUP_RECEIPT_SHA=""
 PILOT_MODE=false
 PILOT_STAGING_RECLAIMED=0
-REMOTE_SETUP_IDENTITY=""
 HUMAN_WORKFLOW_MODE=false
 CONSOLE_PROGRESS_KEY=""
 CONSOLE_PROGRESS_SIGNATURE=""
 CONSOLE_PROGRESS_DETAIL_SIGNATURE=""
 CONSOLE_PROGRESS_RENDERED_AT=0
-REMOTE_CAMPAIGN_STATE=""
-REMOTE_CAMPAIGN_STATE_SIGNATURE=""
-REMOTE_CAMPAIGN_PROGRESS_SIGNATURE=""
-REMOTE_CAMPAIGN_SUMMARY=""
+SHARED_CAMPAIGN_STATE=""
+SHARED_CAMPAIGN_STATE_SIGNATURE=""
+SHARED_CAMPAIGN_PROGRESS_SIGNATURE=""
+SHARED_CAMPAIGN_SUMMARY=""
 TRANSFER_SUMMARY=""
 DATASET_SUMMARY=""
 WORKFLOW_FAILURE_EVIDENCE=""
 CAMPAIGN_INTERRUPT_ACTIVE=false
 CAMPAIGN_INTERRUPT_COUNT=0
-DEFER_COLLECTION=false
 CONSOLE_CHANGED_PROGRESS_SECONDS="${GENERATION_CONSOLE_CHANGED_PROGRESS_SECONDS:-60}"
 CONSOLE_HEARTBEAT_SECONDS="${GENERATION_CONSOLE_HEARTBEAT_SECONDS:-120}"
 COMPOSITE_CHILD_MODE=false
@@ -82,29 +75,25 @@ COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS=()
 usage() {
   cat >&2 <<EOF
 Usage:
-  $0 run CONFIG [--replacement-pool-size N [--parent-run-id RUN_ID]] [--background] [--keep-cpu-source] [remote options]
+  $0 run CONFIG [--replacement-pool-size N [--parent-run-id RUN_ID]] [--background]
   $0 run CONFIG --dry-run [--replacement-pool-size N [--parent-run-id RUN_ID]]
-  $0 run CONFIG --preflight-only [--replacement-pool-size N [--parent-run-id RUN_ID]] [remote options]
-  $0 setup-cpu [--execute] [remote options]
-  $0 status CONFIG_OR_RUN_ID [remote options]
-  $0 cancel RUN_ID [--force] [remote options]
-  $0 cleanup RUN_ID --confirm [remote options]
+  $0 run CONFIG --preflight-only [--replacement-pool-size N [--parent-run-id RUN_ID]]
+  $0 inputs CAMPAIGN_CONFIG [generate-input-cases selection options]
+  $0 status CONFIG_OR_RUN_ID
+  $0 cancel RUN_ID [--force]
+  $0 smoke [--partition gpu|standard]
   $0 background-status WORKFLOW_SESSION_ID
   $0 background-list
 
-Remote options:
-  --cpu-host HOST       explicit override for the configured CPU site
-  --remote-root PATH    bootstrap layout default: remote HOME/grainlegumes-generation
-  --git-commit COMMIT   exact lowercase 40-character commit
+Source option:
+  --git-commit COMMIT   require current shared HEAD to equal this commit
 
 Every maintained Generation workflow starts and resumes with run CONFIG.
 --replacement-pool-size N enables cumulative deterministic completion of a partial
 campaign; increasing N extends the stable candidate prefix. --parent-run-id is an
 expert disambiguation override and is valid only with the replacement pool.
 Foreground execution is the default. --background changes only controller ownership.
---defer-collection leaves the validated CPU source as the exclusive copy; rerun the
-same CONFIG without it to collect and finish. --keep-cpu-source collects and retains
-an additional CPU copy. The two collection options are mutually exclusive.
+Durable inputs, case results, receipts, and Dataset packages remain in sibling storage.
 EOF
 }
 fail() {
@@ -120,12 +109,6 @@ fail_preserving_interrupt() {
   (( observed_status != 130 )) || exit 130
   fail "${failure_status}" "$@"
 }
-
-SSH_TRANSPORT_HELPER="${SCRIPT_DIRECTORY}/generation_ssh_transport.sh"
-[[ -f "${SSH_TRANSPORT_HELPER}" && ! -L "${SSH_TRANSPORT_HELPER}" ]] ||
-  fail 1 "Generation SSH transport helper is missing or unsafe: ${SSH_TRANSPORT_HELPER}"
-# shellcheck source=scripts/generation_ssh_transport.sh
-source "${SSH_TRANSPORT_HELPER}"
 
 generation_console_stage() {
   local index="$1" total="$2" label="$3" status="$4" detail="${5:-}"
@@ -256,11 +239,11 @@ campaign_interrupt_handler() {
     cancellation=(cancel-core-benchmark "${RUN_ID}")
     run_label=benchmark
   fi
-  cancellation+=(--storage-root "${REMOTE_STORAGE_ROOT}")
+  cancellation+=(--storage-root "${SHARED_STORAGE_ROOT}")
   if (( CAMPAIGN_INTERRUPT_COUNT == 1 )); then
     printf '%s
 '       "Graceful ${run_label} cancellation requested."       'Press Ctrl+C again to force cancellation.' >&2
-    remote_cli "${cancellation[@]}" >/dev/null &
+    shared_cli "${cancellation[@]}" >/dev/null &
     local cancellation_pid=$!
     if ! wait "${cancellation_pid}"; then
       generation_console_warning         "graceful cancellation request failed; ${run_label} state remains authoritative"
@@ -270,7 +253,7 @@ campaign_interrupt_handler() {
   printf 'Force %s cancellation requested.
 ' "${run_label}" >&2
   cancellation+=(--force)
-  if ! remote_cli "${cancellation[@]}" >/dev/null; then
+  if ! shared_cli "${cancellation[@]}" >/dev/null; then
     generation_console_warning       "force cancellation request failed; inspect scheduler and run evidence"
   fi
   disarm_campaign_interrupt
@@ -286,11 +269,7 @@ require_command() {
   local command_name="$1"
   local blocked_operation="${2:-host control}"
   command -v "${command_name}" >/dev/null 2>&1 ||
-    fail 1 "Bare hpc115 prerequisite missing: ${command_name} (blocks ${blocked_operation})."
-}
-
-validate_host() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 2 "Unsafe CPU host: $1"
+    fail 1 "ICE login prerequisite missing: ${command_name} (blocks ${blocked_operation})."
 }
 
 validate_path() {
@@ -323,36 +302,24 @@ validate_logical_path() {
 resolve_host_layout() {
   require_command git
   require_command realpath
-  local discovered_root script_relative
-  discovered_root="$(git -C "${SCRIPT_DIRECTORY}" rev-parse --show-toplevel)" ||
-    fail 1 "Could not resolve the bare-host repository root."
-  HOST_REPO_ROOT="$(realpath -e -- "${discovered_root}")" ||
-    fail 1 "Could not canonicalize the bare-host repository root."
-  [[ -d "${HOST_REPO_ROOT}" && ! -L "${HOST_REPO_ROOT}" ]] ||
-    fail 1 "Bare-host repository root is not a safe directory."
-  script_relative="$(realpath --relative-to="${HOST_REPO_ROOT}" -- "${SCRIPT_DIRECTORY}")" ||
-    fail 1 "Could not locate the workflow script inside the repository."
-  [[ "${script_relative}" != .. && "${script_relative}" != ../* ]] ||
-    fail 1 "Generation workflow script is outside the resolved repository."
-  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1 ]]; then
-    local development_root storage_root
-    development_root="$(realpath -e -- "${GENERATION_WORKFLOW_DEVELOPMENT_REPO_ROOT:-}")" ||
-      fail 1 "Could not recover the development checkout from the pinned-source handoff."
-    [[ -d "${development_root}" && ! -L "${development_root}" ]] ||
-      fail 1 "Pinned-source handoff development checkout is not a safe directory."
-    validate_path "development repository" "${development_root}"
-    DEVELOPMENT_REPO_ROOT="${development_root}"
-    storage_root="$(realpath -m -- "${GENERATION_WORKFLOW_STORAGE_ROOT:-}")" ||
-      fail 1 "Could not recover local storage from the pinned-source handoff."
-    validate_path "pinned-source local storage" "${storage_root}"
-    HOST_STORAGE_ROOT="${storage_root}"
-  else
-    DEVELOPMENT_REPO_ROOT="${HOST_REPO_ROOT}"
-    HOST_STORAGE_ROOT="$(realpath -m -- "${STORAGE_ROOT:-${DEVELOPMENT_REPO_ROOT}/../storage}")" ||
-      fail 1 "Could not resolve canonical local storage."
-    validate_path "local storage" "${HOST_STORAGE_ROOT}"
-  fi
-  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
+  HOST_REPO_ROOT="$(realpath -e -- "${SCRIPT_DIRECTORY}/..")" ||
+    fail 1 "Could not resolve the shared repository."
+  [[ -d "${HOST_REPO_ROOT}/.git" && ! -L "${HOST_REPO_ROOT}" ]] ||
+    fail 1 "Generation requires the current shared Git repository."
+  HOST_STORAGE_ROOT="$(realpath -m -- "${STORAGE_ROOT:-${HOST_REPO_ROOT}/../storage}")"
+  RUNTIME_ROOT="$(realpath -m -- "${RUNTIME_ROOT:-${HOST_REPO_ROOT}/../runtime}")"
+  [[ "${HOST_STORAGE_ROOT}" == "$(realpath -m -- "${HOST_REPO_ROOT}/../storage")" \
+    && "${RUNTIME_ROOT}" == "$(realpath -m -- "${HOST_REPO_ROOT}/../runtime")" ]] ||
+    fail 2 "Generation requires the sibling storage and runtime roots."
+  [[ -d "${HOST_STORAGE_ROOT}" && ! -L "${HOST_STORAGE_ROOT}" ]] ||
+    fail 1 "Shared durable storage is missing or unsafe."
+  [[ -d "${RUNTIME_ROOT}" && ! -L "${RUNTIME_ROOT}" ]] ||
+    fail 1 "Replaceable runtime root is missing or unsafe."
+  GENERATION_NATIVE_VENV="${GENERATION_NATIVE_VENV:-${RUNTIME_ROOT}/venvs/generation}"
+  [[ "${GENERATION_NATIVE_VENV}" == "${RUNTIME_ROOT}/venvs/generation" \
+    && -x "${GENERATION_NATIVE_VENV}/bin/python" ]] ||
+    fail 1 "Native Python 3.12 environment is missing: ${GENERATION_NATIVE_VENV}."
+  export GENERATION_NATIVE_VENV
 }
 
 admit_repository_file() {
@@ -364,8 +331,6 @@ admit_repository_file() {
       fail 2 "Could not normalize ${label}."
     if [[ "${lexical}" == "${HOST_REPO_ROOT}/"* ]]; then
       relative="${lexical#"${HOST_REPO_ROOT}/"}"
-    elif [[ "${lexical}" == "${DEVELOPMENT_REPO_ROOT}/"* ]]; then
-      relative="${lexical#"${DEVELOPMENT_REPO_ROOT}/"}"
     else
       fail 2 "${label} must remain inside the repository."
     fi
@@ -378,7 +343,7 @@ admit_repository_file() {
   lexical="$(realpath -ms -- "${candidate}")" ||
     fail 2 "Could not normalize ${label}."
   resolved="$(realpath -e -- "${candidate}")" ||
-    fail 2 "${label} does not exist in pinned commit ${REQUESTED_COMMIT}."
+    fail 2 "${label} does not exist in the current shared repository."
   [[ "${lexical}" == "${resolved}" ]] ||
     fail 2 "${label} must not traverse a symbolic link."
   [[ -f "${resolved}" && ! -L "${resolved}" ]] ||
@@ -388,11 +353,6 @@ admit_repository_file() {
   validate_logical_path "${label}" "${relative}"
   ADMITTED_HOST_PATH="${resolved}"
   ADMITTED_REPOSITORY_PATH="${relative}"
-}
-
-remote_repository_path() {
-  validate_logical_path "remote repository input" "$1"
-  printf '%s/%s' "${REMOTE_REPOSITORY}" "$1"
 }
 
 validate_commit() {
@@ -440,182 +400,38 @@ print_command() {
   printf '\n'
 }
 
-collection_mode_argument() {
-  if [[ "${KEEP_CPU_SOURCE:-false}" == true ]]; then
-    printf '%s' --keep-cpu-source
-  elif [[ "${DEFER_COLLECTION:-false}" == true ]]; then
-    printf '%s' --defer-collection
-  fi
+resolve_shared_layout() {
+  resolve_local_storage
+  SHARED_STORAGE_ROOT="${LOCAL_STORAGE_ROOT}"
+  CPU_HOST="shared-filesystem"
 }
 
-remote_bash() {
-  remote_bash_once "$@"
-}
-
-read_remote_home() {
-  remote_bash_retryable "remote HOME resolution" "$1" <<'REMOTE'
-set -euo pipefail
-printf '%s\n' "${HOME}"
-REMOTE
-}
-
-resolve_remote_layout() {
-  ensure_execution_bootstrap
-  require_command ssh "CPU login control"
-  validate_host "${CPU_HOST}"
-  REMOTE_HOME="$(read_remote_home "${CPU_HOST}")" ||
-    fail_preserving_interrupt "$?" 1 "Could not resolve remote HOME."
-  validate_path "remote HOME" "${REMOTE_HOME}"
-  [[ -n "${REMOTE_ROOT}" ]] || REMOTE_ROOT="${REMOTE_HOME}/grainlegumes-generation"
-  validate_path "remote root" "${REMOTE_ROOT}"
-  [[ "${REMOTE_ROOT}" != "${REMOTE_HOME}" ]] || fail 2 "Remote root must not equal HOME."
-  REMOTE_REPOSITORY="${REMOTE_ROOT}/repo"
-  REMOTE_STORAGE_ROOT="${REMOTE_ROOT}/storage"
-  REMOTE_VENV="${REMOTE_ROOT}/venv"
-  validate_path "remote repository" "${REMOTE_REPOSITORY}"
-  validate_path "remote storage" "${REMOTE_STORAGE_ROOT}"
-  validate_path "remote venv" "${REMOTE_VENV}"
-}
-
-cleanup_pinned_source() {
-  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1
-    && "${GENERATION_WORKFLOW_PINNED_CLEANUP_OWNER:-}" == bootstrap ]]; then
-    return 0
-  fi
-  local container="${PINNED_SOURCE_CONTAINER}"
-  [[ -n "${container}" ]] || return 0
-  PINNED_SOURCE_CONTAINER=""
-  local marker="${container}/.generation-workflow-source"
-  if [[ ! -d "${container}" || -L "${container}" || ! -f "${marker}" || -L "${marker}" \
-    || -z "${PINNED_SOURCE_PARENT}" \
-    || "${container}" != "${PINNED_SOURCE_PARENT}/generation-workflow-source."* ]]; then
-    generation_console_warning "refusing to remove an unverified pinned-source directory: ${container}"
-    return 1
-  fi
-  rm -rf -- "${container}"
-  if [[ -e "${container}" ]]; then
-    generation_console_warning "could not remove pinned-source directory: ${container}"
-    return 1
-  fi
-}
-
-adopt_pinned_source() {
-  local source container commit marker marker_kind marker_commit marker_development extra
-  source="$(realpath -e -- "${GENERATION_WORKFLOW_PINNED_SOURCE_ROOT:-}")" ||
-    fail 1 "Could not recover the exact pinned source checkout."
-  container="$(realpath -e -- "${GENERATION_WORKFLOW_PINNED_SOURCE_CONTAINER:-}")" ||
-    fail 1 "Could not recover the pinned source container."
-  commit="${GENERATION_WORKFLOW_PINNED_COMMIT:-}"
-  validate_commit "${commit}"
-  [[ "${source}" == "${HOST_REPO_ROOT}" && "${source}" == "${container}/repo" \
-    && -d "${source}/.git" && ! -L "${source}" && ! -L "${container}" ]] ||
-    fail 1 "Pinned-source handoff does not identify the executing clean checkout."
-  marker="${container}/.generation-workflow-source"
-  [[ -f "${marker}" && ! -L "${marker}" ]] ||
-    fail 1 "Pinned-source handoff marker is missing or unsafe."
-  IFS=$'\t' read -r marker_kind marker_commit marker_development extra < "${marker}"
-  [[ "${marker_kind}" == generation-workflow-source && "${marker_commit}" == "${commit}" \
-    && "${marker_development}" == "${DEVELOPMENT_REPO_ROOT}" && -z "${extra:-}" ]] ||
-    fail 1 "Pinned-source handoff marker is malformed or inconsistent."
-  PINNED_SOURCE_CONTAINER="${container}"
-  PINNED_SOURCE_PARENT="${container%/*}"
-  local head status
-  head="$(git -C "${source}" rev-parse HEAD)" ||
-    fail 1 "Could not verify the pinned source commit."
-  status="$(git --no-optional-locks -C "${source}" status --porcelain=v1 --untracked-files=all)" ||
-    fail 1 "Could not verify the pinned source worktree."
-  [[ "${head}" == "${commit}" && -z "${status}" ]] ||
-    fail 1 "Pinned source is not the exact clean committed checkout."
-  [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${commit}" ]] ||
-    fail 1 "Requested commit differs from the pinned workflow source."
-  PINNED_SOURCE_COMMIT="${commit}"
-  REQUESTED_COMMIT="${commit}"
-  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
-}
-
-materialize_pinned_source() {
-  require_command git
-  require_command mktemp
-  require_command rm
-  local head requested resolved_commit status temporary_parent container source snapshot_head snapshot_status
-  head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
-    fail 1 "Could not resolve Git HEAD."
+admit_shared_source() {
+  local head requested status requires_clean=false
+  head="$(git -C "${HOST_REPO_ROOT}" rev-parse HEAD)" ||
+    fail 1 "Could not resolve the shared source revision."
   validate_commit "${head}"
   requested="${REQUESTED_COMMIT:-${head}}"
-  resolved_commit="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse --verify "${requested}^{commit}")" ||
-    fail 1 "Requested commit is unavailable in the local repository: ${requested}."
-  [[ "${resolved_commit}" == "${requested}" ]] ||
-    fail 1 "Requested Git object is not the exact commit ${requested}."
-  status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ||
-    fail 1 "Could not inspect the local worktree for committed HEAD ${head}."
-  REQUESTED_COMMIT="${requested}"
-  if [[ "${requested}" == "${head}" ]]; then
-    printf 'Source: committed HEAD %s\n' "${head}" >&2
-  else
-    printf 'Source: explicit commit %s (local HEAD %s)\n' "${requested}" "${head}" >&2
+  [[ "${requested}" == "${head}" ]] ||
+    fail 2 "Generation runs only the current shared repository HEAD; requested commit differs."
+  REQUESTED_COMMIT="${head}"
+  SOURCE_COMMIT="${head}"
+  GENERATION_SOURCE_SHA256="$(python3 "${HOST_REPO_ROOT}/scripts/source_fingerprint.py" "${HOST_REPO_ROOT}")" ||
+    fail 1 "Could not fingerprint the current shared source."
+  validate_digest "${GENERATION_SOURCE_SHA256}"
+  export GENERATION_SOURCE_SHA256
+  status="$(git --no-optional-locks -C "${HOST_REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ||
+    fail 1 "Could not inspect the shared source worktree."
+  if [[ "${ORIGINAL_ARGUMENTS[0]}" == inputs && "${INPUT_DRY_RUN:-false}" != true ]]; then
+    requires_clean=true
+  elif [[ "${SUBCOMMAND:-}" == run && "${DRY_RUN:-false}" != true \
+    && "${PREFLIGHT_ONLY:-false}" != true ]]; then
+    requires_clean=true
   fi
-  if [[ -n "${status}" ]]; then
-    printf 'Local worktree: dirty; uncommitted changes ignored\n' >&2
-  else
-    printf 'Local worktree: clean\n' >&2
+  if [[ "${requires_clean}" == true && -n "${status}" ]]; then
+    fail 2 "Generation publication requires a clean committed shared source; current worktree has changes."
   fi
-  temporary_parent="$(realpath -e -- "${TMPDIR:-/tmp}")" ||
-    fail 1 "Could not resolve the temporary source parent."
-  case "${temporary_parent}/" in
-    "${DEVELOPMENT_REPO_ROOT}/"*|"${HOST_STORAGE_ROOT}/"*)
-      temporary_parent="$(realpath -e -- /tmp)" ||
-        fail 1 "Could not resolve the fallback temporary source parent."
-      ;;
-  esac
-  validate_path "temporary source parent" "${temporary_parent}"
-  [[ "${temporary_parent}/" != "${DEVELOPMENT_REPO_ROOT}/"* \
-    && "${temporary_parent}/" != "${HOST_STORAGE_ROOT}/"* ]] ||
-    fail 1 "Temporary source infrastructure must remain outside the repository and canonical storage."
-  [[ -d "${temporary_parent}" && ! -L "${temporary_parent}" && -w "${temporary_parent}" ]] ||
-    fail 1 "Temporary source parent is not a safe writable directory: ${temporary_parent}"
-  container="$(mktemp -d "${temporary_parent%/}/generation-workflow-source.XXXXXXXX")" ||
-    fail 1 "Could not create the pinned source container."
-  PINNED_SOURCE_CONTAINER="${container}"
-  PINNED_SOURCE_PARENT="${temporary_parent}"
-  printf 'generation-workflow-source\t%s\t%s\n' \
-    "${requested}" "${DEVELOPMENT_REPO_ROOT}" > "${container}/.generation-workflow-source"
-  source="${container}/repo"
-  if ! git init --quiet "${source}" \
-    || ! git -C "${source}" fetch --quiet --depth=1 --no-tags \
-      "${DEVELOPMENT_REPO_ROOT}" "${requested}" \
-    || ! git -C "${source}" -c advice.detachedHead=false checkout --quiet --detach "${requested}"; then
-    cleanup_pinned_source || true
-    fail 1 "Could not materialize the exact committed Generation source."
-  fi
-  snapshot_head="$(git -C "${source}" rev-parse HEAD)" || {
-    cleanup_pinned_source || true
-    fail 1 "Could not verify the materialized source commit."
-  }
-  snapshot_status="$(git --no-optional-locks -C "${source}" status --porcelain=v1 --untracked-files=all)" || {
-    cleanup_pinned_source || true
-    fail 1 "Could not verify the materialized source worktree."
-  }
-  [[ "${snapshot_head}" == "${requested}" && -z "${snapshot_status}" ]] || {
-    cleanup_pinned_source || true
-    fail 1 "Materialized Generation source is not the exact clean pinned commit."
-  }
-  HOST_REPO_ROOT="$(realpath -e -- "${source}")"
-  DOCKER_PYTHON="${HOST_REPO_ROOT}/scripts/docker_python.sh"
-  PINNED_SOURCE_COMMIT="${requested}"
-}
-
-resolve_local_commit() {
-  if [[ -n "${PINNED_SOURCE_COMMIT}" ]]; then
-    [[ -z "${REQUESTED_COMMIT}" || "${REQUESTED_COMMIT}" == "${PINNED_SOURCE_COMMIT}" ]] ||
-      fail 1 "Requested commit differs from the pinned workflow source."
-    REQUESTED_COMMIT="${PINNED_SOURCE_COMMIT}"
-    return
-  fi
-  if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" == 1 ]]; then
-    adopt_pinned_source
-  else
-    materialize_pinned_source
-  fi
+  printf 'Source: shared HEAD %s fingerprint %s\n' "${head}" "${GENERATION_SOURCE_SHA256}" >&2
 }
 
 resolve_bootstrap_requested_commit() {
@@ -632,30 +448,6 @@ resolve_bootstrap_requested_commit() {
   [[ -z "${REQUESTED_COMMIT}" ]] || validate_commit "${REQUESTED_COMMIT}"
 }
 
-handoff_to_pinned_workflow() {
-  [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" != 1 ]] || return 0
-  local workflow="${HOST_REPO_ROOT}/scripts/generation_workflow.sh"
-  [[ -x "${workflow}" && ! -L "${workflow}" ]] ||
-    fail 1 "Pinned Generation workflow is missing or unsafe: ${workflow}"
-  local workflow_status
-  if env \
-    GENERATION_WORKFLOW_PINNED_HANDOFF=1 \
-    GENERATION_WORKFLOW_PINNED_CLEANUP_OWNER=bootstrap \
-    GENERATION_WORKFLOW_PINNED_SOURCE_ROOT="${HOST_REPO_ROOT}" \
-    GENERATION_WORKFLOW_PINNED_SOURCE_CONTAINER="${PINNED_SOURCE_CONTAINER}" \
-    GENERATION_WORKFLOW_PINNED_COMMIT="${PINNED_SOURCE_COMMIT}" \
-    GENERATION_WORKFLOW_DEVELOPMENT_REPO_ROOT="${DEVELOPMENT_REPO_ROOT}" \
-    GENERATION_WORKFLOW_STORAGE_ROOT="${HOST_STORAGE_ROOT}" \
-    "${workflow}" "${ORIGINAL_ARGUMENTS[@]}"; then
-    workflow_status=0
-  else
-    workflow_status=$?
-  fi
-  cleanup_pinned_source || true
-  trap - EXIT
-  exit "${workflow_status}"
-}
-
 background_active_arguments() {
   BACKGROUND_ACTIVE_ARGUMENTS=()
   command -v tmux >/dev/null 2>&1 || return 0
@@ -669,34 +461,16 @@ background_active_arguments() {
 
 resolve_background_host_runtime() {
   local require_clean="${1:-false}"
-  [[ "${require_clean}" == true || "${require_clean}" == false ]] ||
-    fail 2 "Internal background clean-check selector is invalid."
   resolve_bootstrap_requested_commit
   resolve_host_layout
-  local head requested resolved_commit status
-  head="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse HEAD)" ||
-    fail 1 "Could not resolve the background workflow source commit."
-  validate_commit "${head}"
-  requested="${REQUESTED_COMMIT:-${head}}"
-  resolved_commit="$(git -C "${DEVELOPMENT_REPO_ROOT}" rev-parse --verify "${requested}^{commit}")" ||
-    fail 1 "Requested commit is unavailable in the local repository: ${requested}."
-  [[ "${resolved_commit}" == "${requested}" ]] ||
-    fail 1 "Requested Git object is not the exact commit ${requested}."
+  admit_shared_source
   if [[ "${require_clean}" == true ]]; then
-    status="$(git --no-optional-locks -C "${DEVELOPMENT_REPO_ROOT}" status \
-      --porcelain=v1 --untracked-files=all)" ||
-      fail 1 "Could not verify the stable background workflow checkout."
+    local status
+    status="$(git --no-optional-locks -C "${HOST_REPO_ROOT}" status --porcelain=v1 --untracked-files=all)" ||
+      fail 1 "Could not inspect the shared source."
     [[ -z "${status}" ]] ||
-      fail 1 "--background requires the stable host checkout to be clean and committed."
+      fail 1 "Background Generation requires a clean committed shared source."
   fi
-  REQUESTED_COMMIT="${requested}"
-  PINNED_SOURCE_COMMIT="${requested}"
-  HOST_REPO_ROOT="${DEVELOPMENT_REPO_ROOT}"
-  DOCKER_PYTHON="${DEVELOPMENT_REPO_ROOT}/scripts/docker_python.sh"
-  [[ -x "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
-    && ! -L "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
-    && -x "${DOCKER_PYTHON}" && ! -L "${DOCKER_PYTHON}" ]] ||
-    fail 1 "Stable host workflow or canonical Docker Python runner is missing or unsafe."
   resolve_local_storage
   resolve_local_python
 }
@@ -705,14 +479,14 @@ background_host_paths_json() {
   local host_name
   host_name="$(hostname -f 2>/dev/null || hostname)"
   printf '%s\n%s\n%s\n%s\n' \
-    "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" \
-    "${DEVELOPMENT_REPO_ROOT}/scripts/docker_python.sh" \
+    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" \
+    "${GENERATION_NATIVE_VENV}/bin/python" \
     "${LOCAL_STORAGE_ROOT}" "${host_name}" |
     local_python -c 'import json, sys
 values = [line.rstrip("\n") for line in sys.stdin]
 if len(values) != 4 or any(not value for value in values):
     raise SystemExit("background host paths are incomplete")
-print(json.dumps(dict(zip(("stable_script", "docker_python", "storage_root", "host"), values, strict=True)), separators=(",", ":"), sort_keys=True))'
+print(json.dumps(dict(zip(("stable_script", "python_executable", "storage_root", "host"), values, strict=True)), separators=(",", ":"), sort_keys=True))'
 }
 
 launch_background_workflow() {
@@ -723,7 +497,7 @@ launch_background_workflow() {
   [[ "${subcommand}" == run ]] ||
     fail 2 "--background is supported only by run CONFIG."
   local -a child_arguments=()
-  local has_commit=false has_cpu_host=false has_remote_root=false
+  local has_commit=false
   for argument in "${ORIGINAL_ARGUMENTS[@]}"; do
     if [[ "${argument}" == --background ]]; then
       background_count=$((background_count + 1))
@@ -731,33 +505,14 @@ launch_background_workflow() {
     fi
     child_arguments+=("${argument}")
     [[ "${argument}" != --git-commit ]] || has_commit=true
-    [[ "${argument}" != --cpu-host ]] || has_cpu_host=true
-    [[ "${argument}" != --remote-root ]] || has_remote_root=true
   done
   (( background_count == 1 )) || fail 2 "Specify --background exactly once."
-  if [[ " ${child_arguments[*]} " == *' --defer-collection '* \
-    && " ${child_arguments[*]} " == *' --keep-cpu-source '* ]]; then
-    fail 2 "--defer-collection cannot be combined with --keep-cpu-source."
-  fi
   resolve_background_host_runtime true
   if [[ "${has_commit}" != true ]]; then
     child_arguments+=(--git-commit "${REQUESTED_COMMIT}")
   fi
-  if [[ "${subcommand}" == run ]]; then
-    CPU_HOST="${GENERATION_CPU_HOST:-}"
-    REMOTE_ROOT=""
-    local index
-    for ((index=0; index<${#child_arguments[@]}; index++)); do
-      case "${child_arguments[index]}" in
-        --cpu-host) CPU_HOST="${child_arguments[index+1]:-}" ;;
-        --remote-root) REMOTE_ROOT="${child_arguments[index+1]:-}" ;;
-      esac
-    done
-    ensure_execution_bootstrap
-    resolve_remote_layout
-    [[ "${has_cpu_host}" == true ]] || child_arguments+=(--cpu-host "${CPU_HOST}")
-    [[ "${has_remote_root}" == true ]] || child_arguments+=(--remote-root "${REMOTE_ROOT}")
-  fi
+  ensure_execution_bootstrap
+  resolve_shared_layout
   background_active_arguments
   local host_paths session_json record status session_id tmux_name source_commit log_path command_path
   host_paths="$(background_host_paths_json)" || fail 1 "Could not encode background host paths."
@@ -776,7 +531,7 @@ print("\t".join(str(value[key]) for key in keys))')" ||
     printf 'BACKGROUND REUSED\nworkflow_session_id=%s\ntmux_session=%s\nhost=%s\nsource_commit=%s\nlog=%s\n\nAttach:\n  tmux attach-session -t %q\n\nStatus:\n  %q background-status %q\n' \
       "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
       "${log_path}" "${tmux_name}" \
-      "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}"
+      "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}"
     exit 3
   fi
   [[ "${status}" == created && -x "${command_path}" ]] ||
@@ -839,7 +594,7 @@ log=%s
   printf 'BACKGROUND STARTED\nworkflow_session_id=%s\ntmux_session=%s\nhost=%s\nsource_commit=%s\npid=%s\nlog=%s\n\nAttach:\n  tmux attach-session -t %q\n\nDetach without stopping:\n  press Ctrl+B, then D\n\nStatus:\n  %q background-status %q\n\nFollow log:\n  tail -n 100 -F %q\n\nThe workflow survives terminal/SSH disconnection.\nIt does not survive a reboot of %s; rerun the same config afterwards.\n' \
     "${session_id}" "${tmux_name}" "${session_host}" "${source_commit}" \
     "${pane_pid}" "${log_path}" "${tmux_name}" \
-    "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}" \
+    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" "${session_id}" \
     "${log_path}" "${session_host}"
 }
 
@@ -1023,7 +778,7 @@ ensure_execution_bootstrap() {
     resolve_workflow_campaigns
   fi
   [[ "${SCHEDULER_KIND}" == slurm ]] ||
-    fail 2 "The maintained remote workflow requires configured scheduler=slurm."
+    fail 2 "The maintained Generation workflow requires configured scheduler=slurm."
   validate_positive "configured cores_per_node" "${CORES_PER_NODE}"
 }
 
@@ -1086,7 +841,7 @@ print("\t".join(clean(value.get(key)) for key in (
       validate_run_id "${COMPLETION_PARENT_RUN_ID}"
       validate_completion_id "${COMPLETION_ID}"
       validate_digest "${partial_sha}"
-      COMPLETION_PARENT_PARTIAL_PATH="$(container_path_to_host "${partial_path}")"
+      COMPLETION_PARENT_PARTIAL_PATH="$(admit_shared_cli_path "${partial_path}")"
       COMPLETION_PARENT_PARTIAL_PATH="$(realpath -e -- "${COMPLETION_PARENT_PARTIAL_PATH}")" ||
         fail 1 "Could not resolve compatible parent partial evidence on the host."
       [[ "${COMPLETION_PARENT_PARTIAL_PATH}" == "${LOCAL_STORAGE_ROOT}/"* \
@@ -1156,313 +911,84 @@ validate_resources() {
 }
 
 print_layout() {
-  printf 'CPU host: %s\nRemote HOME: %s\nRepository: %s\n'     "${CPU_HOST}" "${REMOTE_HOME}" "${REMOTE_REPOSITORY}"
-  printf 'Persistent storage: %s\nVenv: %s\nRepository source: %s\nExact commit: %s\n' \
-    "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" \
-    "${REQUESTED_COMMIT}"
-  printf 'Modules: %s, %s\n' "${PYTHON_MODULE}" "${COMSOL_MODULE}"
+  printf 'Repository: %s\nPersistent storage: %s\nReplaceable runtime: %s\nNative Python: %s\n'     "${HOST_REPO_ROOT}" "${SHARED_STORAGE_ROOT}" "${RUNTIME_ROOT}" "${GENERATION_NATIVE_VENV}"
+  printf 'Source commit: %s\nSource fingerprint: %s\nModules: %s, %s\n'     "${REQUESTED_COMMIT}" "${GENERATION_SOURCE_SHA256}" "${PYTHON_MODULE}" "${COMSOL_MODULE}"
 }
 
-verify_remote_setup() {
-  resolve_remote_layout
-  local setup_identity
-  printf -v setup_identity '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-    "${CPU_HOST}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${PYTHON_MODULE}" "${PYTHON_EXECUTABLE}"
-  [[ "${REMOTE_SETUP_IDENTITY}" != "${setup_identity}" ]] || return 0
-  if remote_bash_retryable "remote setup verification" "${CPU_HOST}" \
-    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${PYTHON_MODULE}" \
-    "${PYTHON_EXECUTABLE}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; repository_url="$5"
-python_module="$6"; python_executable="$7"
-"${repository}/scripts/generation_cpu_login_preflight.sh" \
-  "${repository}" "${storage}" "${venv}" "${commit}" "${repository_url}" \
-  "${python_module}" "${python_executable}"
-REMOTE
-  then
-    REMOTE_SETUP_IDENTITY="${setup_identity}"
-  else
-    return $?
-  fi
+verify_shared_setup() {
+  resolve_shared_layout
+  resolve_local_python
+  [[ -x "${HOST_REPO_ROOT}/scripts/generation_campaign_node.sh"     && -x "${HOST_REPO_ROOT}/scripts/generation_benchmark_node.sh" ]] ||
+    fail 1 "Native Generation Slurm workers are missing."
+  [[ "${SCHEDULER_KIND}" == slurm ]] ||
+    fail 2 "Generation requires native Slurm."
+  [[ "${PARTITION}" == standard || "${PARTITION}" == long ]] ||
+    fail 2 "Generation requires the standard or long CPU partition."
+  mkdir -p -- "${RUNTIME_ROOT}/logs/generation"
+  printf 'Shared Generation setup verified: %s\n' "${HOST_REPO_ROOT}"
 }
 
-verify_remote_setup_for_output() {
+verify_shared_setup_for_output() {
   if [[ "${HUMAN_WORKFLOW_MODE}" == true ]]; then
-    verify_remote_setup >/dev/null
+    verify_shared_setup >/dev/null
   else
-    verify_remote_setup >&2
+    verify_shared_setup >&2
   fi
 }
 
 
-setup_cpu() {
-  resolve_local_commit
-  resolve_remote_layout
-  print_layout
-  printf 'Mode: %s\n' "$([[ "${EXECUTE_SETUP}" == true ]] && printf execute || printf dry-run)"
-  print_command mkdir -p "${REMOTE_ROOT}" "${REMOTE_STORAGE_ROOT}"
-  print_command git clone --no-checkout "${CPU_BOOTSTRAP_REPOSITORY_URL}" "${REMOTE_REPOSITORY}"
-  print_command "${REMOTE_VENV}/bin/python" -m src.generation.cli.cli_generation \
-    assert-shared-setup-idle --storage-root "${REMOTE_STORAGE_ROOT}"
-  print_command git -C "${REMOTE_REPOSITORY}" fetch origin "${REQUESTED_COMMIT}"
-  print_command git -C "${REMOTE_REPOSITORY}" checkout --detach "${REQUESTED_COMMIT}"
-  print_command module load "${PYTHON_MODULE}"
-  print_command "${PYTHON_EXECUTABLE}" -m venv "${REMOTE_VENV}"
-  print_command "${REMOTE_VENV}/bin/python" -m pip install -e "${REMOTE_REPOSITORY}[generation-cpu]"
-  print_command module load "${COMSOL_MODULE}"
-  if [[ "${EXECUTE_SETUP}" != true ]]; then
-    printf 'Dry run: no remote files or jobs were created.\n'
-    return
-  fi
-  remote_bash "${CPU_HOST}" \
-    "${REMOTE_ROOT}" "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" \
-    "${REMOTE_VENV}" "${REQUESTED_COMMIT}" "${CPU_BOOTSTRAP_REPOSITORY_URL}" \
-    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${PYTHON_EXECUTABLE}" \
-    "${COMSOL_EXECUTABLE}" <<'REMOTE'
-set -euo pipefail
-root="$1"; repository="$2"; storage="$3"; venv="$4"; commit="$5"; repository_url="$6"
-python_module="$7"; comsol_module="$8"; python_executable="$9"; comsol_executable="${10}"
-setup_require_command() {
-  command -v "$1" >/dev/null 2>&1 || {
-    printf 'CPU login prerequisite missing: %s (blocks setup).\n' "$1" >&2
-    exit 1
-  }
-}
-setup_fail() {
-  printf 'CPU setup refused: %s\n' "$1" >&2
-  exit 1
-}
-for name in git stat module; do setup_require_command "${name}"; done
-[[ "${root}" != / && "${root}" != "${HOME}" ]] || setup_fail "remote root is unsafe"
-parent="${root}"
-while [[ ! -e "${parent}" ]]; do parent="$(dirname "${parent}")"; done
-[[ -d "${parent}" && ! -L "${parent}" && "$(stat -c %u "${parent}")" -eq "${UID}" && -w "${parent}" ]] ||
-  setup_fail "remote root parent is not a writable owned directory"
-if [[ ! -e "${root}" ]]; then
-  mkdir -p -- "${root}" "${storage}"
-elif [[ -d "${root}" && ! -L "${root}" ]]; then
-  mkdir -p -- "${storage}"
-else
-  setup_fail "remote root is not a directory"
-fi
-[[ -d "${root}" && ! -L "${root}" && -d "${storage}" && ! -L "${storage}" ]] ||
-  setup_fail "remote layout contains an unsafe root or storage path"
-shopt -s nullglob dotglob
-root_entries=("${root}"/*)
-shopt -u nullglob dotglob
-for entry in "${root_entries[@]}"; do
-  case "${entry}" in
-    "${repository}"|"${storage}"|"${venv}") ;;
-    *) setup_fail "remote root contains an unsupported top-level entry: ${entry}" ;;
-  esac
-done
-repository_ready=false
-if [[ -e "${repository}" ]]; then
-  [[ -d "${repository}/.git" && ! -L "${repository}" ]] ||
-    setup_fail "existing repository is unsafe or incomplete"
-  [[ -z "$(git -C "${repository}" status --porcelain)" ]] ||
-    setup_fail "existing repository has uncommitted changes"
-  [[ "$(git -C "${repository}" remote get-url origin)" == "${repository_url}" ]] ||
-    setup_fail "existing repository origin differs from the configured source"
-  repository_ready=true
-fi
-venv_ready=false
-if [[ -e "${venv}" ]]; then
-  [[ -d "${venv}" && ! -L "${venv}" && -x "${venv}/bin/python" ]] ||
-    setup_fail "existing virtual environment is unsafe or incomplete"
-  venv_ready=true
-fi
-if [[ "${venv_ready}" == true && "${repository_ready}" != true ]]; then
-  setup_fail "existing virtual environment has no matching repository"
-fi
-if [[ "${repository_ready}" == true && "${venv_ready}" == true ]]; then
-  fresh_installation=false
-  if ! module load "${python_module}"; then
-    printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
-      "${python_module}" >&2
-    exit 1
-  fi
-  if ! "${venv}/bin/python" -m src.generation.cli.cli_generation \
-    assert-shared-setup-idle --storage-root "${storage}"; then
-    exit 1
-  fi
-else
-  fresh_installation=true
-  shopt -s nullglob dotglob
-  storage_entries=("${storage}"/*)
-  shopt -u nullglob dotglob
-  (( ${#storage_entries[@]} == 0 )) ||
-    setup_fail "incomplete installation cannot be repaired while persistent storage is non-empty"
-fi
-if [[ "${repository_ready}" != true ]]; then
-  git clone --no-checkout "${repository_url}" "${repository}"
-fi
-if [[ "${fresh_installation}" == false \
-  && "$(git -C "${repository}" rev-parse HEAD)" == "${commit}" ]]; then
-  setup_changed=false
-else
-  git -C "${repository}" fetch origin "${commit}"
-  git -C "${repository}" cat-file -e "${commit}^{commit}"
-  git -C "${repository}" checkout --detach "${commit}"
-  setup_changed=true
-fi
-if [[ "${fresh_installation}" == true ]]; then
-  if ! module load "${python_module}"; then
-    printf 'CPU login prerequisite failed: Python module %s (blocks setup).\n' \
-      "${python_module}" >&2
-    exit 1
-  fi
-fi
-setup_require_command "${python_executable}"
-if [[ "${fresh_installation}" == true ]]; then
-  "${python_executable}" -m venv "${venv}"
-fi
-if [[ "${fresh_installation}" == true || "${setup_changed}" == true ]]; then
-  "${venv}/bin/python" -m pip install -e "${repository}[generation-cpu]"
-fi
-if ! module load "${comsol_module}"; then
-  printf 'CPU login prerequisite failed: COMSOL module %s (blocks setup capability check).\n' \
-    "${comsol_module}" >&2
-  exit 1
-fi
-setup_require_command "${comsol_executable}"
-"${comsol_executable}" -version 2>&1
-printf 'CPU setup complete: %s\n' "${root}"
-REMOTE
-  verify_remote_setup
-}
-
-remote_plan_submit() {
+shared_plan_submit() {
   local operation="$1"
-  verify_remote_setup_for_output || return $?
-  local remote_campaign
-  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
-  remote_bash "${CPU_HOST}" \
-    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${remote_campaign}" "${operation}" \
-    "${PYTHON_MODULE}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; campaign="$5"
-operation="$6"; python_module="$7"
-module load "${python_module}"
-export GENERATION_CPU_VENV="${venv}"
-export STORAGE_ROOT="${storage}"
-export GENERATION_GIT_COMMIT="${commit}"
-cd "${repository}"
-command=("${venv}/bin/python" -m src.generation.cli.cli_generation
-  "${operation}" "${campaign}"
-  --git-commit "${commit}" --storage-root "${storage}")
-if [[ "${operation}" == submit-campaign ]]; then
-  command+=(--inputs-prepared)
-fi
-"${command[@]}"
-REMOTE
+  verify_shared_setup_for_output || return $?
+  local -a arguments=(
+    "${operation}" "${CAMPAIGN_CONFIG_PATH}"
+    --git-commit "${REQUESTED_COMMIT}" --storage-root "${SHARED_STORAGE_ROOT}"
+  )
+  [[ "${operation}" != submit-campaign ]] || arguments+=(--inputs-prepared)
+  local_cli "${arguments[@]}"
 }
 
-
-remote_prepare_campaign_inputs() {
-  remote_plan_submit prepare-campaign-inputs
+prepare_shared_campaign_inputs() {
+  shared_plan_submit prepare-campaign-inputs
 }
 
 
 technical_smoke_evidence_status_cpu() {
-  local campaign_argument="$1"
-  local comsol_version_output="$2"
+  local campaign_argument="$1" comsol_version_output="$2"
   resolve_campaign "${campaign_argument}"
-  resolve_configured_resources
-  resolve_remote_layout
-  local remote_campaign
-  remote_campaign="$(remote_repository_path "${CAMPAIGN_RELATIVE_PATH}")"
-  remote_bash_retryable "technical-smoke evidence status" "${CPU_HOST}" \
-    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${remote_campaign}" "${comsol_version_output}" "${PYTHON_MODULE}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; campaign="$4"
-comsol_version_output="$5"; python_module="$6"
-module load "${python_module}"
-cd "${repository}"
-"${venv}/bin/python" -m src.generation.cli.cli_generation \
-  technical-smoke-evidence-status "${campaign}" --storage-root "${storage}" \
-  --comsol-version-output "${comsol_version_output}"
-REMOTE
+  local_cli technical-smoke-evidence-status "${CAMPAIGN_CONFIG_PATH}"     --storage-root "${LOCAL_STORAGE_ROOT}"     --comsol-version-output "${comsol_version_output}"
 }
 
-
-remote_comsol_version() {
-  remote_bash_retryable "remote COMSOL version query" \
-    "${CPU_HOST}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
-set -euo pipefail
-comsol_module="$1"; comsol_executable="$2"
-if ! module load "${comsol_module}"; then
-  printf 'CPU login prerequisite failed: COMSOL module %s (blocks native smoke finalization).\n' \
-    "${comsol_module}" >&2
-  exit 1
-fi
-if ! command -v "${comsol_executable}" >/dev/null 2>&1; then
-  printf 'CPU login prerequisite missing: %s (blocks native smoke finalization).\n' \
-    "${comsol_executable}" >&2
-  exit 1
-fi
-if ! "${comsol_executable}" -version 2>&1; then
-  printf 'CPU login prerequisite failed: COMSOL version query (blocks native smoke finalization).\n' >&2
-  exit 1
-fi
-REMOTE
-}
-
+native_comsol_version() (
+  module load "${COMSOL_MODULE}" ||
+    fail 1 "COMSOL module ${COMSOL_MODULE} is unavailable."
+  command -v "${COMSOL_EXECUTABLE}" >/dev/null ||
+    fail 1 "Native COMSOL executable is unavailable."
+  # shellcheck source=generation_prerequisites.sh
+  source "${HOST_REPO_ROOT}/scripts/generation_prerequisites.sh"
+  generation_comsol_version "${COMSOL_EXECUTABLE}"
+)
 
 sync_technical_smoke_evidence() {
   local evidence="$1" campaign_argument="$2" comsol_version_output="$3"
-  require_command rsync "technical-smoke evidence transfer"
   [[ "${evidence}" == "${LOCAL_STORAGE_ROOT}/"* && -f "${evidence}" && ! -L "${evidence}" ]] ||
-    fail 1 "Technical-smoke evidence is outside canonical local storage."
-  local relative="${evidence#"${LOCAL_STORAGE_ROOT}/"}"
-  validate_transfer_path "${relative}"
-  local destination="${REMOTE_STORAGE_ROOT}/${relative}"
-  local temporary="${destination}.incoming.$$"
-  remote_bash "${CPU_HOST}" "$(dirname "${destination}")" <<'REMOTE'
-set -euo pipefail
-directory="$1"
-mkdir -p "${directory}"
-REMOTE
-  rsync -a --protect-args "${evidence}" "${CPU_HOST}:${temporary}" ||
-    fail 1 "Could not transfer compact technical-smoke evidence to the CPU host."
-  remote_bash "${CPU_HOST}" "${destination}" "${temporary}" <<'REMOTE'
-set -euo pipefail
-destination="$1"; temporary="$2"
-[[ -f "${temporary}" && ! -L "${temporary}" ]]
-if [[ -e "${destination}" ]]; then
-  [[ -f "${destination}" && ! -L "${destination}" ]]
-  if ! cmp -s "${temporary}" "${destination}"; then
-    rm -f -- "${temporary}"
-    printf 'Existing CPU technical-smoke evidence conflicts: %s\n' "${destination}" >&2
-    exit 1
-  fi
-  rm -f -- "${temporary}"
-else
-  mv -- "${temporary}" "${destination}"
-fi
-REMOTE
-  technical_smoke_evidence_status_cpu \
-    "${campaign_argument}" "${comsol_version_output}" >/dev/null ||
-    fail_preserving_interrupt "$?" 2 \
-      "CPU-side technical-smoke evidence is missing, stale, or incomplete after transfer."
+    fail 1 "Technical-smoke evidence is outside shared durable storage."
+  technical_smoke_evidence_status_cpu     "${campaign_argument}" "${comsol_version_output}" >/dev/null ||
+    fail_preserving_interrupt "$?" 2 "Shared technical-smoke evidence is missing or invalid."
 }
 
 finalize_smoke_runs() {
   local stationary_run_id="$1" transient_run_id="$2"
   validate_run_id "${stationary_run_id}"
   validate_run_id "${transient_run_id}"
-  resolve_local_commit
+  admit_shared_source
   resolve_workflow_campaigns
   resolve_local_storage
   resolve_local_python
-  resolve_remote_layout
-  verify_remote_setup_for_output >/dev/null
+  resolve_shared_layout
+  verify_shared_setup_for_output >/dev/null
   local comsol_version steady_evidence transient_evidence smoke_children
-  comsol_version="$(remote_comsol_version)"
+  comsol_version="$(native_comsol_version)"
   printf -v smoke_children "children=%s,%s" \
     "${stationary_run_id}" "${transient_run_id}"
   RUN_ID="${stationary_run_id}"
@@ -1474,7 +1000,7 @@ finalize_smoke_runs() {
       --comsol-version-output "${comsol_version}" \
       --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not finalize steady-flow Technical Smoke evidence for ${stationary_run_id}."
-  steady_evidence="$(container_path_to_host "${steady_evidence}")"
+  steady_evidence="$(admit_shared_cli_path "${steady_evidence}")"
   sync_technical_smoke_evidence \
     "${steady_evidence}" "${STATIONARY_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
   RUN_ID="${transient_run_id}"
@@ -1486,7 +1012,7 @@ finalize_smoke_runs() {
       --comsol-version-output "${comsol_version}" \
       --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not finalize transient-drying Technical Smoke evidence for ${transient_run_id}."
-  transient_evidence="$(container_path_to_host "${transient_evidence}")"
+  transient_evidence="$(admit_shared_cli_path "${transient_evidence}")"
   sync_technical_smoke_evidence \
     "${transient_evidence}" "${TRANSIENT_SMOKE_CAMPAIGN_PATH}" "${comsol_version}"
   PAIRED_SMOKE_RECEIPT="$(generation_run_with_heartbeat \
@@ -1496,7 +1022,7 @@ finalize_smoke_runs() {
       --comsol-version-output "${comsol_version}" \
       --storage-root "${LOCAL_STORAGE_ROOT}")" ||
     fail 1 "Could not atomically finalize paired Technical Smoke evidence."
-  PAIRED_SMOKE_RECEIPT="$(container_path_to_host "${PAIRED_SMOKE_RECEIPT}")"
+  PAIRED_SMOKE_RECEIPT="$(admit_shared_cli_path "${PAIRED_SMOKE_RECEIPT}")"
   generation_run_with_heartbeat \
     "paired-smoke-validation-${RUN_PLAN_ID}" 8 9 "Paired finalizer" \
     "validating the current paired Smoke receipt" "${smoke_children}" \
@@ -1512,8 +1038,8 @@ finalize_smoke_runs() {
 
 launch_campaign() {
   local output observed_run_id
-  output="$(remote_plan_submit submit-campaign)" ||
-    fail 1 "Remote campaign submission failed."
+  output="$(shared_plan_submit submit-campaign)" ||
+    fail 1 "Shared campaign submission failed."
   if [[ ${output} =~ \"campaign_run_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]+__[0-9a-f]{16})\" ]]; then
     observed_run_id="${BASH_REMATCH[1]}"
   else
@@ -1526,46 +1052,9 @@ launch_campaign() {
   printf 'campaign_run_id=%s\n' "${RUN_ID}"
 }
 
-_remote_cli_with_transport() {
-  local transport_kind="$1" operation="$2"
-  shift 2
-  verify_remote_setup_for_output || return $?
-  validate_commit "${REQUESTED_COMMIT}"
-  local -a transport=(remote_bash)
-  case "${transport_kind}" in
-    once) ;;
-    retryable) transport=(remote_bash_retryable "${operation}") ;;
-    *) fail 2 "Unsupported remote CLI transport kind: ${transport_kind}" ;;
-  esac
-  "${transport[@]}" "${CPU_HOST}" "${REMOTE_REPOSITORY}" \
-    "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" "${REQUESTED_COMMIT}" \
-    "${PYTHON_MODULE}" "$@" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; python_module="$5"
-shift 5
-module load "${python_module}"
-export GENERATION_CPU_VENV="${venv}"
-export STORAGE_ROOT="${storage}"
-export GENERATION_GIT_COMMIT="${commit}"
-cd "${repository}"
-"${venv}/bin/python" -m src.generation.cli.cli_generation "$@"
-REMOTE
-}
-
-remote_cli() {
-  _remote_cli_with_transport once "" "$@"
-}
-
-remote_cli_retryable() {
-  local operation="$1"
-  shift
-  _remote_cli_with_transport retryable "${operation}" "$@"
-}
-
-remote_transfer_plan() {
-  local -a arguments=(campaign-transfer-plan "${RUN_ID}" --format tsv --storage-root "${REMOTE_STORAGE_ROOT}")
-  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || arguments+=(--partial)
-  remote_cli_retryable "campaign transfer-plan read" "${arguments[@]}"
+shared_cli() {
+  verify_shared_setup_for_output || return $?
+  local_cli "$@"
 }
 
 resolve_local_storage() {
@@ -1577,19 +1066,73 @@ resolve_local_storage() {
 
 resolve_local_python() {
   [[ "${LOCAL_PYTHON_READY}" != true ]] || return 0
-  [[ -x "${DOCKER_PYTHON}" ]] || fail 1 "Canonical Docker Python runner is not executable: ${DOCKER_PYTHON}"
-  local_python -c 'import h5py, numpy, scipy, yaml; import src.generation.cli.cli_generation' ||
-    fail 1 "Canonical Docker Python environment lacks required dependencies."
+  [[ -x "${GENERATION_NATIVE_VENV}/bin/python" ]] ||
+    fail 1 "Native Generation Python environment is missing."
+  local_python -c 'import h5py, numpy, scipy, yaml, torch; import src.generation.cli.cli_generation' ||
+    fail 1 "Locked native Python environment lacks required Generation dependencies."
   LOCAL_PYTHON_READY=true
 }
 
 local_python() {
-  env GENERATION_GIT_COMMIT="${PINNED_SOURCE_COMMIT}" \
-    STORAGE_ROOT="${LOCAL_STORAGE_ROOT:-${HOST_STORAGE_ROOT}}" \
-    "${DOCKER_PYTHON}" "$@"
+  env GENERATION_GIT_COMMIT="${SOURCE_COMMIT}"     GENERATION_SOURCE_SHA256="${GENERATION_SOURCE_SHA256}"     GENERATION_NATIVE_VENV="${GENERATION_NATIVE_VENV}"     STORAGE_ROOT="${LOCAL_STORAGE_ROOT:-${HOST_STORAGE_ROOT}}"     "${GENERATION_NATIVE_VENV}/bin/python" "$@"
+}
+
+slurm_python_cli() {
+  local mode="$1" operation="$2"
+  shift
+  [[ "${PARTITION:-}" == standard || "${PARTITION:-}" == long ]] ||
+    fail 2 "Native Generation Python work requires the configured standard or long partition."
+  [[ -x "${HOST_REPO_ROOT}/scripts/generation_python_node.sh" ]] ||
+    fail 1 "Native Generation Python worker is missing."
+  require_command srun "native Generation Python work"
+  resolve_local_storage
+  local logs="${RUNTIME_ROOT}/logs/generation" output_log error_log status
+  mkdir -p -- "${logs}" || fail 1 "Could not prepare Generation runtime logs."
+  output_log="$(mktemp "${logs}/python-${operation}.XXXXXXXX.out")" ||
+    fail 1 "Could not prepare Generation Python output log."
+  error_log="${output_log%.out}.err"
+  export GENERATION_GIT_COMMIT="${SOURCE_COMMIT}"
+  export STORAGE_ROOT="${HOST_STORAGE_ROOT}"
+  if srun --partition="${PARTITION}" --nodes=1 --ntasks=1 \
+    --cpus-per-task=4 --mem=16G --time="${WALL_TIME:-02:00:00}" \
+    --job-name="generation-python-${operation}" \
+    --chdir="${HOST_REPO_ROOT}" --export=ALL \
+    --error="${error_log}" \
+    "${HOST_REPO_ROOT}/scripts/generation_python_node.sh" \
+    "${HOST_REPO_ROOT}" "${mode}" "$@" | tee "${output_log}"; then
+    return 0
+  else
+    status=$?
+    [[ ! -f "${error_log}" ]] || tail -n 80 -- "${error_log}" >&2
+    return "${status}"
+  fi
 }
 
 local_cli() {
+  if [[ "${SUBCOMMAND:-}" == run && "${DRY_RUN:-false}" != true \
+    && "${PREFLIGHT_ONLY:-false}" != true ]]; then
+    case "$1" in
+      resume-core-benchmark)
+        slurm_python_cli benchmark "$@"
+        return $?
+        ;;
+      prepare-campaign-inputs|resume-campaign|\
+        build-campaign-datasets|prepare-gpu-datasets|prepare-all-workflow|\
+        advance-campaign-completion|build-campaign-completion-composite|\
+        build-campaign-completion-lifecycle|finalize-core-benchmark|\
+        finalize-technical-smoke-evidence|finalize-real-smoke|\
+        repair-transferred-campaign|repair-partial-campaign-publication|\
+        record-pilot-source-inventory|record-shared-pilot-staging|\
+        prepare-pilot-check|cleanup-pilot-staging|campaign-transfer-authority|\
+        validate-published-campaign|validate-campaign-terminal|\
+        validate-campaign-package-state|validate-all-workflow|\
+        validate-pilot-check|validate-core-benchmark|validate-real-smoke|\
+        validate-campaign-completion-lifecycle)
+        slurm_python_cli cli "$@"
+        return $?
+        ;;
+    esac
+  fi
   local_python -m "${GENERATION_MODULE}" "$@"
 }
 
@@ -1597,24 +1140,13 @@ local_cli_quiet() {
   local_cli "$@" >/dev/null 2>&1
 }
 
-container_path_to_host() {
-  local value="$1"
-  local relative
-  if [[ "${value}" == /workspace/storage ]]; then
-    printf '%s' "${LOCAL_STORAGE_ROOT}"
-  elif [[ "${value}" == /workspace/storage/* ]]; then
-    relative="${value#/workspace/storage/}"
-    validate_logical_path "container storage output" "${relative}"
-    printf '%s/%s' "${LOCAL_STORAGE_ROOT}" "${relative}"
-  elif [[ "${value}" == /workspace/repo ]]; then
-    printf '%s' "${HOST_REPO_ROOT}"
-  elif [[ "${value}" == /workspace/repo/* ]]; then
-    relative="${value#/workspace/repo/}"
-    validate_logical_path "container repository output" "${relative}"
-    printf '%s/%s' "${HOST_REPO_ROOT}" "${relative}"
-  else
-    printf '%s' "${value}"
-  fi
+admit_shared_cli_path() {
+  local resolved
+  resolved="$(realpath -e -- "$1")" || fail 1 "Generation CLI path does not exist: $1"
+  [[ "${resolved}" == "${LOCAL_STORAGE_ROOT}/"* \
+    || "${resolved}" == "${HOST_REPO_ROOT}/"* ]] ||
+    fail 1 "Generation CLI path is outside shared repository and storage: ${resolved}"
+  printf '%s' "${resolved}"
 }
 
 validate_transfer_path() {
@@ -1647,118 +1179,40 @@ gpu_publication_is_valid() {
 
 repair_existing_campaign_publication() {
   local authority
-  authority="$(remote_cli_retryable "campaign transfer-authority read" \
-    campaign-transfer-authority "${RUN_ID}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}")" || {
+  authority="$(shared_cli campaign-transfer-authority "${RUN_ID}" \
+    --storage-root "${SHARED_STORAGE_ROOT}")" || {
     local status=$?
     (( status != 130 )) || exit 130
     return 1
   }
   local_cli repair-transferred-campaign "${RUN_ID}" \
-    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}" \
+    --source-host "${CPU_HOST}" --source-storage-root "${SHARED_STORAGE_ROOT}" \
     --authority-json "${authority}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1
 }
 
 collect_campaign() {
   resolve_local_python
-  resolve_remote_layout
+  resolve_shared_layout
   resolve_local_storage
-  verify_remote_setup_for_output
-  if gpu_publication_is_valid; then
-    printf 'GPU generation publication validated and reused for %s.\n' "${RUN_ID}"
-    return
-  fi
-  if [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] && repair_existing_campaign_publication; then
-    printf 'GPU generation publication receipt reconstructed from canonical CPU identity for %s.\n' "${RUN_ID}"
-    return
+  verify_shared_setup_for_output
+  if [[ "${CAMPAIGN_PARTIAL:-false}" == true ]]; then
+    local_cli repair-partial-campaign-publication "${RUN_ID}" \
+      --source-host shared-filesystem --source-storage-root "${LOCAL_STORAGE_ROOT}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+      fail 1 "Partial campaign shared publication failed validation."
+  elif ! gpu_publication_is_valid; then
+    repair_existing_campaign_publication ||
+      fail 1 "Complete campaign shared publication failed exact source/inventory validation."
   fi
   if [[ "${PILOT_MODE}" == true ]]; then
-    remote_cli record-pilot-source-inventory "${RUN_ID}" \
-      --storage-root "${REMOTE_STORAGE_ROOT}" >/dev/null ||
-      fail 1 "Could not record exact pre-cleanup CPU pilot storage."
+    local_cli record-pilot-source-inventory "${RUN_ID}" \
+      --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+      fail 1 "Could not bind pilot source inventory."
+    local_cli record-shared-pilot-staging "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+      fail 1 "Could not bind pilot accounting staging inventory."
   fi
-  local plan
-  plan="$(remote_transfer_plan)" ||
-    fail_preserving_interrupt "$?" 1 "Remote campaign is not terminally valid."
-  local -a directories=()
-  local kind field2 field3 field4 field5 field6 field7 extra
-  while IFS=$'\t' read -r kind field2 field3 field4 field5 field6 field7 extra; do
-    [[ -z "${extra:-}" ]] || fail 1 "Malformed transfer plan."
-    case "${kind}" in
-      campaign)
-        [[ -n "${field2}" && -n "${field3}" && -n "${field4}" \
-          && -n "${field5}" && -z "${field6}" && -z "${field7}" ]] ||
-          fail 1 "Malformed campaign transfer-plan row."
-        directories+=("${field4}")
-        ;;
-      batch)
-        [[ -n "${field2}" && -n "${field3}" && -n "${field4}" \
-          && -n "${field5}" && -n "${field6}" && -n "${field7}" ]] ||
-          fail 1 "Malformed batch transfer-plan row."
-        directories+=("${field5}" "${field6}" "${field7}")
-        ;;
-      attempt)
-        [[ -n "${field2}" && -n "${field3}" && -z "${field4}" \
-          && -z "${field5}" && -z "${field6}" && -z "${field7}" ]] ||
-          fail 1 "Malformed attempt transfer-plan row."
-        directories+=("${field3}")
-        ;;
-      *) fail 1 "Unknown transfer-plan row." ;;
-    esac
-  done <<< "${plan}"
-  (( ${#directories[@]} >= 4 )) || fail 1 "Transfer plan is empty."
-  local directory
-  for directory in "${directories[@]}"; do validate_transfer_path "${directory}"; done
-  require_command rsync "campaign transfer"
-  local staging receipt directory_index=0 directory_total transfer_progress
-  staging="$(local_cli create-transfer-staging "${RUN_ID}" \
-    --storage-root "${LOCAL_STORAGE_ROOT}")" ||
-    fail 1 "Could not create marked transfer staging."
-  staging="$(container_path_to_host "${staging}")"
-  printf 'Transfer staging: %s\n' "${staging}"
-  directory_total="${#directories[@]}"
-  for directory in "${directories[@]}"; do
-    directory_index="$((directory_index + 1))"
-    printf -v transfer_progress \
-      "directories_completed=%s/%s\ncurrent_artifact=%s" \
-      "$((directory_index - 1))" "${directory_total}" "${directory}"
-    local -a rsync_arguments=(
-      -a --protect-args --relative --exclude='.state/' --exclude='work/'
-    )
-    if [[ -d "${LOCAL_STORAGE_ROOT}/${directory}" ]]; then
-      rsync_arguments+=(--link-dest="${LOCAL_STORAGE_ROOT}")
-    fi
-    generation_run_with_heartbeat \
-      "host-transfer-${RUN_ID}-${directory_index}" 6 9 "Host publication" \
-      "transferring ${directory}" "${transfer_progress}" \
-      rsync "${rsync_arguments[@]}" \
-        "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${directory}" "${staging}/" ||
-      fail 1 "Transfer failed; staging retained at ${staging}."
-  done
-  if [[ "${PILOT_MODE}" == true ]]; then
-    local_cli record-pilot-staging-inventory "${RUN_ID}" --staging-root "${staging}" >/dev/null ||
-      fail 1 "Could not record exact pilot transfer-staging storage."
-  fi
-  printf -v transfer_progress \
-    "directories_completed=%s/%s" "${directory_total}" "${directory_total}"
-  local -a publication_arguments=(
-    publish-transferred-campaign "${RUN_ID}"
-    --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}"
-    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}"
-  )
-  [[ "${CAMPAIGN_PARTIAL:-false}" != true ]] || publication_arguments+=(--partial)
-  receipt="$(generation_run_with_heartbeat \
-    "host-publication-validate-${RUN_ID}" 6 9 "Host publication" \
-    "validating destination inventory and hashes" "${transfer_progress}" \
-    local_cli "${publication_arguments[@]}")" ||
-    fail 1 "GPU publication validation failed; staging retained at ${staging}."
-  if [[ "${PILOT_MODE}" != true ]]; then
-    local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
-      --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" --confirm >/dev/null
-  else
-    printf 'Pilot transfer staging marker retained through analysis: %s\n' "${staging}"
-  fi
-  printf '%s\nCPU source retained: %s:%s\n' "${receipt}" "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}"
+  printf 'Shared campaign publication validated: %s
+' "${RUN_ID}"
 }
 
 build_datasets() {
@@ -1772,15 +1226,15 @@ build_datasets() {
     local_cli "${arguments[@]}"
 }
 
-remote_campaign_monitor() {
-  remote_cli_retryable "campaign status read" campaign-status \
+shared_campaign_monitor() {
+  shared_cli campaign-status \
     "${RUN_ID}" --format monitor --max-active-cases 8 \
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${SHARED_STORAGE_ROOT}"
 }
 
-read_remote_campaign_monitor() {
+read_shared_campaign_monitor() {
   local output header kind state state_signature progress_signature extra
-  output="$(remote_campaign_monitor)" ||
+  output="$(shared_campaign_monitor)" ||
     fail_preserving_interrupt "$?" 1 "Could not reconstruct campaign case status."
   [[ "${output}" == *$'\n'* ]] || fail 1 "Malformed campaign monitor output."
   header="${output%%$'\n'*}"
@@ -1788,52 +1242,52 @@ read_remote_campaign_monitor() {
   [[ "${kind}" == campaign-monitor && "${state_signature}" =~ ^[0-9a-f]{64}$ \
     && "${progress_signature}" =~ ^[0-9a-f]{64}$ && -z "${extra:-}" ]] ||
     fail 1 "Malformed campaign monitor header."
-  REMOTE_CAMPAIGN_STATE="${state}"
-  REMOTE_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
-  REMOTE_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
-  REMOTE_CAMPAIGN_SUMMARY="${output#*$'\n'}"
+  SHARED_CAMPAIGN_STATE="${state}"
+  SHARED_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
+  SHARED_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
+  SHARED_CAMPAIGN_SUMMARY="${output#*$'\n'}"
 }
 
-remote_source_status_tsv() {
-  remote_cli_retryable "campaign source-status read" campaign-source-status \
+shared_source_status_tsv() {
+  shared_cli campaign-source-status \
     "${RUN_ID}" --query-scheduler --include-sizes --format tsv \
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${SHARED_STORAGE_ROOT}"
 }
 
-read_remote_source_status() {
+read_shared_source_status() {
   local line kind status_run campaign_state source_state bytes eligibility active extra
-  line="$(remote_source_status_tsv)"
+  line="$(shared_source_status_tsv)"
   IFS=$'\t' read -r kind status_run campaign_state source_state bytes \
     eligibility active extra <<< "${line}"
   [[ "${kind}" == source-status && "${status_run}" == "${RUN_ID}" \
     && -z "${extra:-}" ]] || fail 1 "Malformed CPU source status."
   validate_nonnegative "CPU retained bytes" "${bytes}"
-  REMOTE_RUN_STATE="${campaign_state}"
-  REMOTE_SOURCE_STATE="${source_state}"
+  SHARED_RUN_STATE="${campaign_state}"
+  SHARED_SOURCE_STATE="${source_state}"
   CPU_BYTES_RETAINED="${bytes}"
   CPU_BYTES_RETAINED_EXACT=true
-  REMOTE_CLEANUP_ELIGIBILITY="${eligibility}"
-  REMOTE_SOURCE_ACTIVE="${active}"
+  SHARED_CLEANUP_ELIGIBILITY="${eligibility}"
+  SHARED_SOURCE_ACTIVE="${active}"
 }
 
-remote_workflow_monitor() {
-  remote_cli_retryable "campaign resume and status snapshot" resume-campaign \
+shared_workflow_monitor() {
+  shared_cli resume-campaign \
     "${RUN_ID}" --format workflow-monitor --max-active-cases 8 \
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${SHARED_STORAGE_ROOT}"
 }
 
-read_remote_workflow_monitor() {
+read_shared_workflow_monitor() {
   local output campaign_header source_header tab
   local kind state state_signature progress_signature extra
   local source_kind status_run campaign_state source_state bytes eligibility active source_extra
   local -a monitor_lines=()
-  output="$(remote_workflow_monitor)" ||
+  output="$(shared_workflow_monitor)" ||
     fail_preserving_interrupt "$?" 1 "Could not resume and reconstruct campaign status."
   mapfile -t monitor_lines <<< "${output}"
   (( ${#monitor_lines[@]} >= 3 )) || fail 1 "Malformed combined campaign monitor output."
   campaign_header="${monitor_lines[0]}"
   source_header="${monitor_lines[1]}"
-  REMOTE_CAMPAIGN_SUMMARY="$(printf "%s\n" "${monitor_lines[@]:2}")"
+  SHARED_CAMPAIGN_SUMMARY="$(printf "%s\n" "${monitor_lines[@]:2}")"
   tab="$(printf "\t")"
   IFS="${tab}" read -r kind state state_signature progress_signature extra <<< "${campaign_header}"
   [[ "${kind}" == campaign-monitor && "${state_signature}" =~ ^[0-9a-f]{64}$ \
@@ -1850,46 +1304,29 @@ read_remote_workflow_monitor() {
   else
     CPU_BYTES_RETAINED_EXACT=false
   fi
-  REMOTE_CAMPAIGN_STATE="${state}"
-  REMOTE_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
-  REMOTE_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
-  REMOTE_RUN_STATE="${campaign_state}"
-  REMOTE_SOURCE_STATE="${source_state}"
+  SHARED_CAMPAIGN_STATE="${state}"
+  SHARED_CAMPAIGN_STATE_SIGNATURE="${state_signature}"
+  SHARED_CAMPAIGN_PROGRESS_SIGNATURE="${progress_signature}"
+  SHARED_RUN_STATE="${campaign_state}"
+  SHARED_SOURCE_STATE="${source_state}"
   CPU_BYTES_RETAINED="${bytes}"
-  REMOTE_CLEANUP_ELIGIBILITY="${eligibility}"
-  REMOTE_SOURCE_ACTIVE="${active}"
+  SHARED_CLEANUP_ELIGIBILITY="${eligibility}"
+  SHARED_SOURCE_ACTIVE="${active}"
 }
 
 refresh_failure_cpu_bytes() {
   [[ "${CPU_BYTES_RETAINED_EXACT}" == true ]] && return 0
   [[ "${RUN_KIND:-}" == campaign && -n "${RUN_ID:-}" \
-    && -n "${REMOTE_STORAGE_ROOT:-}" ]] || return 1
+    && -n "${SHARED_STORAGE_ROOT:-}" ]] || return 1
   local line kind status_run campaign_state source_state bytes eligibility active extra
-  line="$(remote_cli campaign-source-status "${RUN_ID}" --include-sizes --format tsv \
-    --storage-root "${REMOTE_STORAGE_ROOT}" 2>/dev/null)" || return 1
+  line="$(shared_cli campaign-source-status "${RUN_ID}" --include-sizes --format tsv \
+    --storage-root "${SHARED_STORAGE_ROOT}" 2>/dev/null)" || return 1
   IFS=$'\t' read -r kind status_run campaign_state source_state bytes \
     eligibility active extra <<< "${line}"
   [[ "${kind}" == source-status && "${status_run}" == "${RUN_ID}" \
     && "${bytes}" =~ ^[0-9]+$ && -z "${extra:-}" ]] || return 1
   CPU_BYTES_RETAINED="${bytes}"
   CPU_BYTES_RETAINED_EXACT=true
-}
-
-deferred_campaign_report() {
-  read_remote_source_status
-  printf 'campaign_run_id=%s\n' "${RUN_ID}"
-  printf 'state=awaiting_collection\nsource_state=%s\nretained_cpu_bytes=%s\n' \
-    "${REMOTE_SOURCE_STATE}" "${CPU_BYTES_RETAINED}"
-  printf 'Resume collection with the same config:\n'
-  local -a continuation_arguments=(
-    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run
-    "${RUN_CONFIG_ARGUMENT}" --cpu-host "${CPU_HOST}"
-    --remote-root "${REMOTE_ROOT}" --git-commit "${REQUESTED_COMMIT}"
-  )
-  local collection_mode
-  collection_mode="$(collection_mode_argument)"
-  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
-  print_command "${continuation_arguments[@]}"
 }
 
 prepare_all_receipt() {
@@ -1905,121 +1342,32 @@ prepare_all_receipt() {
     local_cli "${arguments[@]}"
 }
 
-read_cleanup_authorization() {
-  local line kind authorization_destination_host extra
-  line="$(generation_run_with_heartbeat \
-    "cleanup-authorization-${RUN_ID}" 8 9 "Retention policy" \
-    "validating cleanup authorization inventory" "" \
-    local_cli cpu-cleanup-authorization "${RUN_ID}" --format tsv \
-      --storage-root "${LOCAL_STORAGE_ROOT}")"
-  IFS=$'\t' read -r kind AUTHORIZATION_SHA AUTH_SOURCE_HOST AUTH_SOURCE_ROOT \
-    AUTH_DESTINATION_ROOT AUTH_TRANSFER_SHA AUTH_DATASET_SHA AUTH_WORKFLOW_SHA \
-    AUTH_SOURCE_INVENTORY_SHA AUTH_SOURCE_FILE_COUNT AUTH_SOURCE_BYTES extra <<< "${line}"
-  [[ "${kind}" == authorization && -z "${extra:-}" ]] || fail 1 "Malformed CPU cleanup authorization."
-  [[ "${AUTH_SOURCE_HOST}" == "${CPU_HOST}" ]] ||
-    fail 1 "Cleanup authorization source host differs from the selected CPU host."
-  [[ "${AUTH_SOURCE_ROOT}" == "${REMOTE_STORAGE_ROOT}" ]] ||
-    fail 1 "Cleanup authorization source root differs from the selected CPU storage."
-  authorization_destination_host="$(container_path_to_host "${AUTH_DESTINATION_ROOT}")"
-  [[ "${authorization_destination_host}" == "${LOCAL_STORAGE_ROOT}" ]] ||
-    fail 1 "Cleanup authorization destination differs from GPU storage."
-  validate_digest "${AUTHORIZATION_SHA}"
-  validate_digest "${AUTH_TRANSFER_SHA}"
-  validate_digest "${AUTH_DATASET_SHA}"
-  validate_digest "${AUTH_WORKFLOW_SHA}"
-  validate_digest "${AUTH_SOURCE_INVENTORY_SHA}"
-  validate_nonnegative "authorized source file count" "${AUTH_SOURCE_FILE_COUNT}"
-  validate_nonnegative "authorized source bytes" "${AUTH_SOURCE_BYTES}"
-  CPU_BYTES_RETAINED="${AUTH_SOURCE_BYTES}"
-  CPU_BYTES_RETAINED_EXACT=true
-}
-
-remote_cleanup_arguments() {
-  CLEANUP_ARGUMENTS=(
-    cleanup-campaign-source "${RUN_ID}"
-    --storage-root "${REMOTE_STORAGE_ROOT}"
-    --source-host "${AUTH_SOURCE_HOST}"
-    --destination-storage-root "${AUTH_DESTINATION_ROOT}"
-    --transfer-receipt-sha256 "${AUTH_TRANSFER_SHA}"
-    --dataset-receipt-sha256 "${AUTH_DATASET_SHA}"
-    --workflow-gate-sha256 "${AUTH_WORKFLOW_SHA}"
-    --source-inventory-sha256 "${AUTH_SOURCE_INVENTORY_SHA}"
-    --source-file-count "${AUTH_SOURCE_FILE_COUNT}"
-    --source-bytes "${AUTH_SOURCE_BYTES}"
-    --authorization-sha256 "${AUTHORIZATION_SHA}"
-  )
-}
-
-confirm_cpu_cleanup() {
-  read_cleanup_authorization
-  remote_cleanup_arguments
-  local line kind cleanup_status cleanup_mode cleanup_auth reclaimed receipt_sha extra
-  local cleanup_progress
-  printf -v cleanup_progress "bytes_completed=0/%s" "${AUTH_SOURCE_BYTES}"
-  line="$(generation_run_with_heartbeat \
-    "cpu-cleanup-${RUN_ID}" 8 9 "Retention policy" \
-    "removing the exact authorized CPU source" "${cleanup_progress}" \
-    remote_cli "${CLEANUP_ARGUMENTS[@]}" --confirm --format tsv)"
-  IFS=$'\t' read -r kind cleanup_status cleanup_mode cleanup_auth reclaimed receipt_sha extra <<< "${line}"
-  [[ "${kind}" == cleanup && "${cleanup_status}" == complete \
-    && "${cleanup_auth}" == "${AUTHORIZATION_SHA}" && -z "${extra:-}" ]] ||
-    fail 1 "Malformed or incomplete CPU cleanup result."
-  validate_nonnegative "CPU reclaimed bytes" "${reclaimed}"
-  validate_digest "${receipt_sha}"
-  [[ "${reclaimed}" == "${AUTH_SOURCE_BYTES}" ]] || fail 1 "CPU reclaimed bytes differ from authorization."
-  generation_run_with_heartbeat \
-    "cleanup-record-${RUN_ID}" 8 9 "Retention policy" \
-    "recording and revalidating cleanup completion" \
-    "bytes_completed=${reclaimed}/${AUTH_SOURCE_BYTES}" \
-    local_cli record-cpu-cleanup "${RUN_ID}" --storage-root "${LOCAL_STORAGE_ROOT}" \
-      --authorization-sha256 "${AUTHORIZATION_SHA}" \
-      --cleanup-receipt-sha256 "${receipt_sha}" --reclaimed-bytes "${reclaimed}"
-  CPU_BYTES_RETAINED=0
-  CPU_BYTES_RETAINED_EXACT=true
-  CPU_BYTES_RECLAIMED="${reclaimed}"
-  CPU_CLEANUP_RECEIPT_SHA="${receipt_sha}"
-}
-
-cleanup_cpu_source() {
-  resolve_local_python
-  resolve_remote_layout
-  resolve_local_storage
-  verify_remote_setup_for_output
-  if [[ "${CONFIRM_CLEANUP}" == true ]]; then
-    confirm_cpu_cleanup
-    return
-  fi
-  read_cleanup_authorization
-  remote_cleanup_arguments
-  remote_cli "${CLEANUP_ARGUMENTS[@]}"
-}
-
 storage_status_report() {
   resolve_local_python
-  resolve_remote_layout
+  resolve_shared_layout
   resolve_local_storage
   local -a local_arguments=(
     storage-status --role gpu --metadata-only --omit-run-status
     --storage-root "${LOCAL_STORAGE_ROOT}"
   )
-  local -a remote_arguments=(
+  local -a shared_arguments=(
     storage-status --role cpu --metadata-only --omit-run-status
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${SHARED_STORAGE_ROOT}"
   )
   if [[ -n "${RUN_ID}" ]]; then
     local_arguments+=(--campaign-run-id "${RUN_ID}")
-    remote_arguments+=(--campaign-run-id "${RUN_ID}")
+    shared_arguments+=(--campaign-run-id "${RUN_ID}")
   fi
   if [[ -n "${RUN_ID}" ]]; then
     printf 'Campaign status:\n'
-    remote_cli_retryable "campaign status read" campaign-status \
+    shared_cli campaign-status \
       "${RUN_ID}" --format workflow-monitor --max-active-cases 8 \
-      --storage-root "${REMOTE_STORAGE_ROOT}"
+      --storage-root "${SHARED_STORAGE_ROOT}"
   fi
-  printf 'GPU storage status:\n'
+  printf 'Durable storage status:\n'
   local_cli "${local_arguments[@]}"
-  printf 'CPU storage status:\n'
-  remote_cli_retryable "CPU storage-status read" "${remote_arguments[@]}"
+  printf 'Shared source status:\n'
+  shared_cli "${shared_arguments[@]}"
   if [[ -n "${RUN_ID}" ]]; then
     local_cli validate-pilot-check "${RUN_ID}" --if-present --format summary \
       --storage-root "${LOCAL_STORAGE_ROOT}"
@@ -2030,32 +1378,19 @@ workflow_failure_report() {
   local status="$1"
   trap - EXIT
   ALL_WORKFLOW_ACTIVE=false
-  local -a continuation_arguments=()
-  if [[ "${COMPLETION_OWNER_PERSISTED:-false}" == true ]]; then
-    continuation_arguments=(
-      ./scripts/generation_workflow.sh run
-      "${RUN_CONFIG_ARGUMENT:-CONFIG}"
-    )
-    if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
-      continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
-    fi
-  else
-    continuation_arguments=(
-      "${DEVELOPMENT_REPO_ROOT}/scripts/generation_workflow.sh" run
-      "${RUN_CONFIG_ARGUMENT:-CONFIG}"
-      --cpu-host "${CPU_HOST:-configured}"
-      --remote-root "${REMOTE_ROOT:-configured}"
-      --git-commit "${REQUESTED_COMMIT:-unknown}"
-    )
-    if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
-      continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
-      [[ -z "${COMPLETION_PARENT_RUN_ID:-}" ]] ||
-        continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
+  local -a continuation_arguments=(
+    "${HOST_REPO_ROOT}/scripts/generation_workflow.sh" run
+    "${RUN_CONFIG_ARGUMENT:-CONFIG}"
+  )
+  [[ -z "${REQUESTED_COMMIT:-}" ]] ||
+    continuation_arguments+=(--git-commit "${REQUESTED_COMMIT}")
+  if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
+    continuation_arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
+    if [[ "${COMPLETION_OWNER_PERSISTED:-false}" != true \
+      && -n "${COMPLETION_PARENT_RUN_ID:-}" ]]; then
+      continuation_arguments+=(--parent-run-id "${COMPLETION_PARENT_RUN_ID}")
     fi
   fi
-  local collection_mode
-  collection_mode="$(collection_mode_argument)"
-  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
   local continuation="" argument quoted
   for argument in "${continuation_arguments[@]}"; do
     printf -v quoted '%q' "${argument}"
@@ -2076,7 +1411,7 @@ workflow_failure_report() {
       IFS=$'\t' read -r kind canonical visible extra <<< "${record}"
       if [[ "${kind}" == workflow-failure && -n "${canonical}" \
         && -n "${visible}" && -z "${extra:-}" ]]; then
-        WORKFLOW_FAILURE_EVIDENCE="local canonical=${canonical} container=${visible}"
+        WORKFLOW_FAILURE_EVIDENCE="canonical=${canonical} visible=${visible}"
       fi
     fi
   fi
@@ -2091,7 +1426,6 @@ workflow_exit_handler() {
   if [[ "${ALL_WORKFLOW_ACTIVE}" == true && "${status}" -ne 0 ]]; then
     workflow_failure_report "${status}" || true
   fi
-  cleanup_pinned_source || true
 }
 
 prepare_pilot_check_receipt() {
@@ -2186,139 +1520,19 @@ print("\t".join(("benchmark", *(str(item) for item in fields))))')" ||
   printf '%s\n' "${inspection}"
 }
 
-remote_benchmark_plan_submit() {
+shared_benchmark_plan_submit() (
   local operation="$1"
-  local remote_suite
-  remote_suite="$(remote_repository_path "${BENCHMARK_SUITE_RELATIVE_PATH}")"
-  remote_bash "${CPU_HOST}" \
-    "${REMOTE_REPOSITORY}" "${REMOTE_STORAGE_ROOT}" "${REMOTE_VENV}" \
-    "${REQUESTED_COMMIT}" "${remote_suite}" "${operation}" \
-    "${PYTHON_MODULE}" "${COMSOL_MODULE}" "${COMSOL_EXECUTABLE}" <<'REMOTE'
-set -euo pipefail
-repository="$1"; storage="$2"; venv="$3"; commit="$4"; suite="$5"
-operation="$6"; python_module="$7"; comsol_module="$8"; comsol_executable="$9"
-for name in realpath stat mktemp rm; do
-  command -v "${name}" >/dev/null 2>&1 || {
-    printf 'CPU benchmark preflight failed: required command %s is unavailable.\n' "${name}" >&2
-    exit 1
-  }
-done
-benchmark_scratch_parent="$(realpath -e -- "${TMPDIR:-/tmp}")" || {
-  printf 'CPU benchmark preflight failed: temporary parent cannot be resolved.\n' >&2
-  exit 1
-}
-[[ -d "${benchmark_scratch_parent}" && ! -L "${benchmark_scratch_parent}" \
-  && -w "${benchmark_scratch_parent}" && -x "${benchmark_scratch_parent}" ]] || {
-  printf 'CPU benchmark preflight failed: temporary parent is unsafe.\n' >&2
-  exit 1
-}
-scratch="$(mktemp -d "${benchmark_scratch_parent%/}/generation-benchmark-preflight.XXXXXXXX")" || {
-  printf 'CPU benchmark preflight failed: temporary scratch creation failed.\n' >&2
-  exit 1
-}
-[[ -d "${scratch}" && ! -L "${scratch}" \
-  && "$(stat -c %u "${scratch}")" -eq "${UID}" ]] || {
-  printf 'CPU benchmark preflight failed: temporary scratch ownership is unsafe.\n' >&2
-  exit 1
-}
-scratch_marker="${scratch}/.generation-benchmark-preflight"
-printf 'generation-benchmark-preflight\n' > "${scratch_marker}"
-cleanup_benchmark_scratch() {
-  local status="$1"
-  if [[ -d "${scratch}" && ! -L "${scratch}" && -f "${scratch_marker}" \
-    && ! -L "${scratch_marker}" \
-    && "${scratch}" == "${benchmark_scratch_parent}/generation-benchmark-preflight."* ]]; then
-    rm -rf -- "${scratch}"
-  else
-    printf 'CPU benchmark preflight refused to remove an unverified scratch directory.\n' >&2
-    status=1
-  fi
-  trap - EXIT
-  exit "${status}"
-}
-trap 'cleanup_benchmark_scratch "$?"' EXIT
-module load "${python_module}"
-if ! module load "${comsol_module}"; then
-  printf 'CPU benchmark preflight failed: COMSOL module %s is unavailable.\n' \
-    "${comsol_module}" >&2
-  exit 1
-fi
-resolved_comsol="$(command -v "${comsol_executable}")" || {
-  printf 'CPU benchmark preflight failed: COMSOL executable %s is unavailable.\n' \
-    "${comsol_executable}" >&2
-  exit 1
-}
-resolved_comsol="$(readlink -f -- "${resolved_comsol}")"
-[[ "${resolved_comsol}" == /* && -x "${resolved_comsol}" ]] || {
-  printf 'CPU benchmark preflight resolved an unsafe executable: %s\n' \
-    "${resolved_comsol}" >&2
-  exit 1
-}
-comsol_version="$("${resolved_comsol}" -version 2>&1)" || {
-  printf 'CPU benchmark preflight failed: COMSOL version query failed.\n' >&2
-  exit 1
-}
-export GENERATION_CPU_VENV="${venv}"
-export STORAGE_ROOT="${storage}"
-export GENERATION_GIT_COMMIT="${commit}"
-cd "${repository}"
-command=("${venv}/bin/python" -m src.generation.cli.cli_generation
-  "${operation}" "${suite}"
-  --git-commit "${commit}"
-  --storage-root "${storage}"
-  --scratch-root "${scratch}"
-  --comsol-version-output "${comsol_version}"
-  --comsol-executable-path "${resolved_comsol}")
-"${command[@]}"
-REMOTE
-}
+  verify_shared_setup_for_output || return $?
+  slurm_python_cli benchmark "${operation}" "${BENCHMARK_SUITE_PATH}" \
+    --git-commit "${REQUESTED_COMMIT}" --storage-root "${SHARED_STORAGE_ROOT}"
+)
+
 
 collect_core_benchmark() {
-  require_command rsync "core benchmark transfer"
-  if local_cli validate-core-benchmark "${RUN_ID}" \
-    --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
-    printf 'GPU benchmark publication validated and reused for %s.\n' "${RUN_ID}"
-    local_cli core-benchmark-summary "${RUN_ID}" --format markdown \
-      --storage-root "${LOCAL_STORAGE_ROOT}"
-    return
-  fi
-  local plan kind plan_run plan_commit relative inventory_sha file_count size_bytes extra staging receipt
-  plan="$(remote_cli_retryable "benchmark transfer-plan read" \
-    core-benchmark-transfer-plan "${RUN_ID}" --format tsv \
-    --storage-root "${REMOTE_STORAGE_ROOT}")" ||
-    fail_preserving_interrupt "$?" 1 "Remote core benchmark is not terminally valid."
-  IFS=$'\t' read -r kind plan_run plan_commit relative inventory_sha file_count size_bytes extra <<< "${plan}"
-  [[ "${kind}" == benchmark && "${plan_run}" == "${RUN_ID}" \
-    && "${plan_commit}" == "${REQUESTED_COMMIT}" \
-    && "${inventory_sha}" =~ ^[0-9a-f]{64}$ \
-    && "${file_count}" =~ ^[0-9]+$ && "${size_bytes}" =~ ^[0-9]+$ \
-    && -z "${extra:-}" ]] ||
-    fail 1 "Malformed core benchmark transfer plan."
-  validate_transfer_path "${relative}"
-  staging="$(local_cli create-transfer-staging "${RUN_ID}" \
-    --storage-root "${LOCAL_STORAGE_ROOT}")" ||
-    fail 1 "Could not create marked benchmark transfer staging."
-  staging="$(container_path_to_host "${staging}")"
-  rsync -a --protect-args --relative --exclude='.state/' --exclude='work/' \
-    "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${relative}" "${staging}/" ||
-    fail 1 "Benchmark transfer failed; staging retained at ${staging}."
-  receipt="$(local_cli publish-transferred-core-benchmark "${RUN_ID}" \
-    --staging-root "${staging}" --destination-root "${LOCAL_STORAGE_ROOT}" \
-    --source-host "${CPU_HOST}" --source-storage-root "${REMOTE_STORAGE_ROOT}" \
-    --expected-inventory-sha256 "${inventory_sha}" \
-    --expected-file-count "${file_count}" --expected-size-bytes "${size_bytes}")" ||
-    fail 1 "GPU benchmark publication failed; staging retained at ${staging}."
-  local_cli cleanup-transfer-staging --campaign-run-id "${RUN_ID}" \
-    --directory "${staging}" --storage-root "${LOCAL_STORAGE_ROOT}" \
-    --confirm >/dev/null
-  printf '%s\n' "${receipt}"
-  local_cli core-benchmark-summary "${RUN_ID}" --format markdown \
-    --storage-root "${LOCAL_STORAGE_ROOT}"
-  printf 'CPU benchmark evidence retained at %s:%s.\n' \
-    "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}"
+  local_cli validate-core-benchmark "${RUN_ID}"     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Shared core benchmark did not validate."
+  local_cli core-benchmark-summary "${RUN_ID}" --format markdown     --storage-root "${LOCAL_STORAGE_ROOT}"
 }
-
-
 
 resolve_generation_run_plan() {
   resolve_local_storage
@@ -2423,7 +1637,7 @@ print("\t".join((
         fail 1 "Compatible campaign source reported an invalid current package state."
       LEAF_STATE=complete
       LEAF_RESULT=REUSED
-      LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID artifact_set=$artifact_identity compatible host workflow"
+      LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID artifact_set=$artifact_identity compatible shared workflow"
       ;;
     extension_required)
       LEAF_STATE=package_only
@@ -2460,8 +1674,8 @@ print("\t".join((
     compatible_repairable)
       validate_run_id "$compatible_run"
       RUN_ID="$compatible_run"
-      resolve_remote_layout
-      verify_remote_setup >/dev/null
+      resolve_shared_layout
+      verify_shared_setup >/dev/null
       LEAF_STATE=transfer_repair
       LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID compatible scientific source requires transfer-evidence recovery"
       ;;
@@ -2478,15 +1692,14 @@ monitor_generation_units() {
   while true; do
     case "$monitor_kind" in
       campaign)
-        read_remote_workflow_monitor
+        read_shared_workflow_monitor
         local campaign_detail
-        campaign_detail="$REMOTE_CAMPAIGN_SUMMARY"$'\n'"Source storage: state=$REMOTE_SOURCE_STATE retained_bytes=$CPU_BYTES_RETAINED"
-        generation_console_progress units 5 9 "Work units" RUNNING           "$REMOTE_CAMPAIGN_STATE_SIGNATURE|$REMOTE_SOURCE_STATE|$REMOTE_SOURCE_ACTIVE"           "$campaign_detail"           "$REMOTE_CAMPAIGN_PROGRESS_SIGNATURE|$CPU_BYTES_RETAINED"
-        case "$REMOTE_CAMPAIGN_STATE" in
+        campaign_detail="$SHARED_CAMPAIGN_SUMMARY"$'\n'"Source storage: state=$SHARED_SOURCE_STATE retained_bytes=$CPU_BYTES_RETAINED"
+        generation_console_progress units 5 9 "Work units" RUNNING           "$SHARED_CAMPAIGN_STATE_SIGNATURE|$SHARED_SOURCE_STATE|$SHARED_SOURCE_ACTIVE"           "$campaign_detail"           "$SHARED_CAMPAIGN_PROGRESS_SIGNATURE|$CPU_BYTES_RETAINED"
+        case "$SHARED_CAMPAIGN_STATE" in
           successful|transfer_complete)
-            remote_cli_retryable "campaign terminal validation" \
-              validate-campaign-terminal "$RUN_ID" \
-              --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+            shared_cli validate-campaign-terminal "$RUN_ID" \
+              --storage-root "$SHARED_STORAGE_ROOT" >/dev/null
             disarm_campaign_interrupt
             return
             ;;
@@ -2504,17 +1717,16 @@ monitor_generation_units() {
             ;;
           *)
             disarm_campaign_interrupt
-            fail 1 "Campaign entered unsupported state: $REMOTE_CAMPAIGN_STATE"
+            fail 1 "Campaign entered unsupported state: $SHARED_CAMPAIGN_STATE"
             ;;
         esac
         ;;
       benchmark)
-        remote_cli resume-core-benchmark "$RUN_ID" \
-          --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+        shared_cli resume-core-benchmark "$RUN_ID" \
+          --storage-root "$SHARED_STORAGE_ROOT" >/dev/null
         local output header state state_signature progress_signature detail extra
-        output="$(remote_cli_retryable "benchmark status read" \
-          core-benchmark-status "$RUN_ID" \
-          --storage-root "$REMOTE_STORAGE_ROOT" --format monitor)" ||
+        output="$(shared_cli core-benchmark-status "$RUN_ID" \
+          --storage-root "$SHARED_STORAGE_ROOT" --format monitor)" ||
           fail_preserving_interrupt "$?" 1 \
             "Could not reconstruct benchmark work-unit status."
         header="${output%%$'\n'*}"
@@ -2576,24 +1788,24 @@ resolve_leaf_plan() {
       if campaign_local_completion_is_valid; then
         LEAF_RESULT=REUSED
         LEAF_STATE=complete
-        LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID complete host workflow"
+        LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID complete shared workflow"
         return
       fi
       if select_compatible_campaign_source; then
         return
       fi
-      resolve_remote_layout
-      verify_remote_setup >/dev/null
+      resolve_shared_layout
+      verify_shared_setup >/dev/null
       LEAF_EXISTING_DETAIL="campaign_run_id=$RUN_ID continuation inspected"
       ;;
     benchmark)
       resolve_benchmark_contract >/dev/null
       [[ "$SCHEDULER_KIND" == slurm ]] ||
         fail 2 "Core benchmarking requires configured scheduler=slurm."
-      resolve_remote_layout
-      verify_remote_setup >/dev/null
+      resolve_shared_layout
+      verify_shared_setup >/dev/null
       local comsol_version identity_json
-      comsol_version="$(remote_comsol_version)"
+      comsol_version="$(native_comsol_version)"
       identity_json="$(local_cli resolve-core-benchmark-run "$BENCHMARK_SUITE_PATH" \
         --git-commit "$REQUESTED_COMMIT" \
         --comsol-version-output "$comsol_version")" ||
@@ -2606,11 +1818,8 @@ print(json.load(sys.stdin)["benchmark_run_id"])')" ||
       if local_cli validate-core-benchmark "$RUN_ID" \
         --storage-root "$LOCAL_STORAGE_ROOT" >/dev/null 2>&1; then
         LEAF_RESULT=REUSED
-        if [[ "$KEEP_CPU_SOURCE" != true ]]; then
-          cleanup_core_benchmark_cpu
-        fi
         LEAF_STATE=complete
-        LEAF_EXISTING_DETAIL="benchmark_run_id=$RUN_ID complete host workflow"
+        LEAF_EXISTING_DETAIL="benchmark_run_id=$RUN_ID complete shared workflow"
       fi
       ;;
     *) fail 2 "Unsupported common leaf run kind: $RUN_KIND" ;;
@@ -2621,7 +1830,7 @@ materialize_leaf_inputs() {
   case "$RUN_KIND" in
     campaign)
       local input_record input_kind generated reused extra
-      input_record="$(remote_prepare_campaign_inputs)" ||
+      input_record="$(prepare_shared_campaign_inputs)" ||
         fail 1 "Canonical campaign input preparation failed before submission."
       IFS=$'\t' read -r input_kind generated reused extra <<< "$input_record"
       [[ "$input_kind" == canonical-inputs && -z "${extra:-}" ]] ||
@@ -2632,14 +1841,14 @@ materialize_leaf_inputs() {
       ;;
     benchmark)
       local output observed_run
-      output="$(remote_benchmark_plan_submit materialize-core-benchmark-inputs)" ||
+      output="$(shared_benchmark_plan_submit materialize-core-benchmark-inputs)" ||
         fail 1 "Benchmark canonical input preparation failed before submission."
       observed_run="$(printf '%s' "$output" | local_python -c 'import json, sys
 print(json.load(sys.stdin)["benchmark_run_id"])')" ||
         fail 1 "Benchmark input preparation returned no run identity."
       [[ "$observed_run" == "$RUN_ID" ]] ||
         fail 1 "Benchmark input preparation identity disagrees with the common run plan."
-      LEAF_INPUT_DETAIL="benchmark_run_id=$RUN_ID canonical input ready on CPU login node"
+      LEAF_INPUT_DETAIL="benchmark_run_id=$RUN_ID canonical input ready in Slurm allocation"
       ;;
     *) fail 2 "Unsupported canonical-input adapter: $RUN_KIND" ;;
   esac
@@ -2653,7 +1862,7 @@ submit_leaf_units() {
       ;;
     benchmark)
       local output observed_run
-      output="$(remote_benchmark_plan_submit submit-core-benchmark)" ||
+      output="$(shared_benchmark_plan_submit submit-core-benchmark)" ||
         fail 1 "Benchmark first work-unit submission failed after input readiness."
       observed_run="$(printf '%s' "$output" | local_python -c 'import json, sys
 print(json.load(sys.stdin)["benchmark_run_id"])')" ||
@@ -2666,77 +1875,14 @@ print(json.load(sys.stdin)["benchmark_run_id"])')" ||
   esac
 }
 
-cleanup_core_benchmark_cpu() {
-  local line kind auth_run source_host source_root destination_root destination_host inventory_sha
-  local file_count size_bytes authorization_sha extra
-  line="$(local_cli core-benchmark-cleanup-authorization "$RUN_ID"     --format tsv --storage-root "$LOCAL_STORAGE_ROOT")" ||
-    fail 1 "Could not authorize benchmark CPU cleanup."
-  IFS=$'\t' read -r kind auth_run source_host source_root destination_root     inventory_sha file_count size_bytes authorization_sha extra <<< "$line"
-  destination_host="$(container_path_to_host "$destination_root")"
-  [[ "$kind" == benchmark-cleanup-authorization && "$auth_run" == "$RUN_ID"     && "$source_host" == "$CPU_HOST" && "$source_root" == "$REMOTE_STORAGE_ROOT"     && "$destination_host" == "$LOCAL_STORAGE_ROOT" && -z "${extra:-}" ]] ||
-    fail 1 "Malformed benchmark cleanup authorization."
-  validate_digest "$inventory_sha"
-  validate_nonnegative "benchmark source file count" "$file_count"
-  validate_nonnegative "benchmark source bytes" "$size_bytes"
-  validate_digest "$authorization_sha"
-  local output record cleanup_status receipt_sha reclaimed
-  output="$(remote_cli cleanup-core-benchmark-source "$RUN_ID"     --storage-root "$REMOTE_STORAGE_ROOT" --source-host "$source_host"     --destination-storage-root "$destination_root"     --expected-inventory-sha256 "$inventory_sha"     --expected-file-count "$file_count" --expected-size-bytes "$size_bytes"     --authorization-sha256 "$authorization_sha" --confirm)" ||
-    fail 1 "Authorized benchmark CPU cleanup failed."
-  record="$(printf '%s' "$output" | local_python -c 'import json, sys
-value = json.load(sys.stdin)
-print("\t".join((
-    str(value["status"]), str(value["receipt_sha256"]),
-    str(value["reclaimed_bytes"]),
-)))')" || fail 1 "Could not decode benchmark cleanup result."
-  IFS=$'\t' read -r cleanup_status receipt_sha reclaimed extra <<< "$record"
-  [[ "$cleanup_status" == complete && -z "${extra:-}" ]] ||
-    fail 1 "Benchmark cleanup did not return complete evidence."
-  validate_digest "$receipt_sha"
-  validate_nonnegative "benchmark reclaimed bytes" "$reclaimed"
-  [[ "$reclaimed" == "$size_bytes" ]] ||
-    fail 1 "Benchmark cleanup reclaimed-byte count differs from authorization."
-  local_cli record-core-benchmark-cleanup "$RUN_ID"     --storage-root "$LOCAL_STORAGE_ROOT"     --authorization-sha256 "$authorization_sha"     --cleanup-receipt-sha256 "$receipt_sha"     --reclaimed-bytes "$reclaimed" >/dev/null
-  CPU_BYTES_RECLAIMED="$reclaimed"
-}
-
-benchmark_deferred_report() {
-  local output record source_state bytes extra
-  output="$(remote_cli_retryable "benchmark source-status read" \
-    core-benchmark-source-status "$RUN_ID" --format tsv \
-    --storage-root "$REMOTE_STORAGE_ROOT")" ||
-    fail_preserving_interrupt "$?" 1 \
-      "Could not reconstruct deferred benchmark source state."
-  IFS=$'\t' read -r _kind _run _run_state source_state bytes _eligibility _active extra <<< "$output"
-  [[ -z "${extra:-}" ]] || fail 1 "Malformed deferred benchmark source state."
-  printf 'benchmark_run_id=%s\nstate=awaiting_collection\nsource_state=%s\nretained_cpu_bytes=%s\n'     "$RUN_ID" "$source_state" "$bytes"
-  printf 'Resume collection with the same config:\n'
-  local -a continuation_arguments=(
-    "$HOST_REPO_ROOT/scripts/generation_workflow.sh" run
-    "$RUN_CONFIG_ARGUMENT" --cpu-host "$CPU_HOST"
-    --remote-root "$REMOTE_ROOT" --git-commit "$REQUESTED_COMMIT"
-  )
-  local collection_mode
-  collection_mode="$(collection_mode_argument)"
-  [[ -z "${collection_mode}" ]] || continuation_arguments+=("${collection_mode}")
-  print_command "${continuation_arguments[@]}"
-}
-
 finalize_leaf_cpu_evidence() {
   case "$RUN_KIND" in
     campaign) ;;
     benchmark)
-      remote_cli finalize-core-benchmark "$RUN_ID" \
-        --storage-root "$REMOTE_STORAGE_ROOT" >/dev/null
+      shared_cli finalize-core-benchmark "$RUN_ID" \
+        --storage-root "$SHARED_STORAGE_ROOT" >/dev/null
       ;;
     *) fail 2 "Unsupported CPU-finalization adapter: $RUN_KIND" ;;
-  esac
-}
-
-deferred_leaf_report() {
-  case "$RUN_KIND" in
-    campaign) deferred_campaign_report ;;
-    benchmark) benchmark_deferred_report ;;
-    *) fail 2 "Unsupported deferred-collection adapter: $RUN_KIND" ;;
   esac
 }
 
@@ -2790,24 +1936,18 @@ print("\t".join((str(value["status"]), reason, str(count))))')" ||
 
 apply_leaf_retention() {
   CPU_BYTES_RECLAIMED=0
+  KEEP_CPU_SOURCE=true
   case "$RUN_KIND" in
     campaign)
       prepare_all_receipt >/dev/null
-      if [[ "${CAMPAIGN_PARTIAL:-false}" == true || "$KEEP_CPU_SOURCE" == true ]]; then
-        read_remote_source_status
-      else
-        confirm_cpu_cleanup >/dev/null
-      fi
-      if [[ "$CAMPAIGN_PURPOSE" == pilot_check \
-        && "${CAMPAIGN_PARTIAL:-false}" != true ]]; then
+      read_shared_source_status
+      if [[ "$CAMPAIGN_PURPOSE" == pilot_check         && "${CAMPAIGN_PARTIAL:-false}" != true ]]; then
         cleanup_pilot_staging >/dev/null
         record_pilot_cleanup_result
       fi
       ;;
     benchmark)
-      if [[ "$KEEP_CPU_SOURCE" != true ]]; then
-        cleanup_core_benchmark_cpu
-      fi
+      local_cli validate-core-benchmark "${RUN_ID}"         --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null
       ;;
     *) fail 2 "Unsupported retention adapter: $RUN_KIND" ;;
   esac
@@ -2890,37 +2030,36 @@ sync_completion_parent_evidence() {
   validate_digest "${COMPLETION_PARENT_PARTIAL_SHA256}"
   [[ -f "${COMPLETION_PARENT_PARTIAL_PATH}" && ! -L "${COMPLETION_PARENT_PARTIAL_PATH}" ]] ||
     fail 1 "Completion parent partial evidence is missing or unsafe."
-  require_command rsync "completion parent-evidence transfer"
   local relative="01_generation/meta/completion-inputs/${COMPLETION_ID}/campaign_partial.json"
   validate_transfer_path "${relative}"
-  COMPLETION_REMOTE_PARENT_PARTIAL="${REMOTE_STORAGE_ROOT}/${relative}"
-  remote_bash "${CPU_HOST}" "${REMOTE_STORAGE_ROOT}" "${relative}" <<'REMOTE'
-set -euo pipefail
-storage="$1"; relative="$2"; destination="${storage}/${relative}"; directory="${destination%/*}"
-[[ "${storage}" == /* && "${storage}" != / && "${relative}" != /* && "${relative}" != *..* ]] || exit 2
-mkdir -p -- "${directory}"
-[[ -d "${directory}" && ! -L "${directory}" ]] || exit 1
-REMOTE
-  local incoming="${COMPLETION_REMOTE_PARENT_PARTIAL}.incoming.${COMPLETION_PARENT_PARTIAL_SHA256}"
-  rsync -a --protect-args "${COMPLETION_PARENT_PARTIAL_PATH}" "${CPU_HOST}:${incoming}" ||
-    fail 1 "Could not transfer compact parent partial evidence to the CPU completion owner."
-  remote_bash "${CPU_HOST}" "${COMPLETION_REMOTE_PARENT_PARTIAL}" "${incoming}" \
-    "${COMPLETION_PARENT_PARTIAL_SHA256}" <<'REMOTE'
-set -euo pipefail
-destination="$1"; incoming="$2"; expected="$3"
-[[ -f "${incoming}" && ! -L "${incoming}" ]] || exit 1
-observed="$(sha256sum -- "${incoming}")"; observed="${observed%% *}"
-[[ "${observed}" == "${expected}" ]] || exit 1
-if [[ -e "${destination}" ]]; then
-  [[ -f "${destination}" && ! -L "${destination}" ]] || exit 1
-  cmp -s -- "${incoming}" "${destination}" || exit 1
-  rm -- "${incoming}"
-else
-  mv -- "${incoming}" "${destination}"
-fi
-observed="$(sha256sum -- "${destination}")"; observed="${observed%% *}"
-[[ "${observed}" == "${expected}" ]]
-REMOTE
+  COMPLETION_SHARED_PARENT_PARTIAL="${LOCAL_STORAGE_ROOT}/${relative}"
+  local directory temporary observed
+  directory="$(dirname -- "${COMPLETION_SHARED_PARENT_PARTIAL}")"
+  mkdir -p -- "${directory}"
+  [[ -d "${directory}" && ! -L "${directory}" ]] ||
+    fail 1 "Completion input directory is unsafe."
+  temporary="$(mktemp "${directory}/.campaign_partial.XXXXXXXX")" ||
+    fail 1 "Could not create atomic completion evidence copy."
+  if ! cp -- "${COMPLETION_PARENT_PARTIAL_PATH}" "${temporary}"; then
+    rm -f -- "${temporary}"
+    fail 1 "Could not stage exact parent partial evidence."
+  fi
+  observed="$(sha256sum -- "${temporary}")"; observed="${observed%% *}"
+  [[ "${observed}" == "${COMPLETION_PARENT_PARTIAL_SHA256}" ]] || {
+    rm -f -- "${temporary}"
+    fail 1 "Staged parent partial evidence hash changed."
+  }
+  if [[ -e "${COMPLETION_SHARED_PARENT_PARTIAL}" ]]; then
+    [[ -f "${COMPLETION_SHARED_PARENT_PARTIAL}" && ! -L "${COMPLETION_SHARED_PARENT_PARTIAL}" ]] ||
+      fail 1 "Existing completion input is unsafe."
+    cmp -s -- "${temporary}" "${COMPLETION_SHARED_PARENT_PARTIAL}" || {
+      rm -f -- "${temporary}"
+      fail 1 "Existing completion input conflicts with parent evidence."
+    }
+    rm -f -- "${temporary}"
+  else
+    mv -- "${temporary}" "${COMPLETION_SHARED_PARENT_PARTIAL}"
+  fi
 }
 
 render_completion_plan() {
@@ -2976,30 +2115,30 @@ print("\nNext:\n  {}".format(value["next_operation"]))' ||
     fail 1 "Could not render exact completion startup plan."
 }
 
-initialize_remote_completion() {
+initialize_shared_completion() {
   local output record status observed_id extra
   local -a arguments=(
     initialize-campaign-completion "${CAMPAIGN_RELATIVE_PATH}"
     --parent-run-id "${COMPLETION_PARENT_RUN_ID}"
-    --parent-partial "${COMPLETION_REMOTE_PARENT_PARTIAL}"
+    --parent-partial "${COMPLETION_SHARED_PARENT_PARTIAL}"
     --parent-partial-sha256 "${COMPLETION_PARENT_PARTIAL_SHA256}"
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+    --storage-root "${SHARED_STORAGE_ROOT}"
   )
   if (( REPLACEMENT_POOL_OPTION_COUNT == 1 )); then
     arguments+=(--replacement-pool-size "${REPLACEMENT_POOL_SIZE}")
   fi
-  output="$(remote_cli "${arguments[@]}")" ||
-    fail 1 "Could not initialize or extend the remote campaign completion owner."
+  output="$(shared_cli "${arguments[@]}")" ||
+    fail 1 "Could not initialize or extend the shared campaign completion owner."
   COMPLETION_INITIAL_STATUS_JSON="${output}"
   record="$(printf '%s' "${output}" | local_python -c 'import json, sys
 value = json.load(sys.stdin)
 print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
-    fail 1 "Could not decode remote completion initialization."
+    fail 1 "Could not decode shared completion initialization."
   IFS=$'\t' read -r status observed_id extra <<< "${record}"
-  [[ -z "${extra:-}" ]] || fail 1 "Malformed remote completion initialization result."
+  [[ -z "${extra:-}" ]] || fail 1 "Malformed shared completion initialization result."
   validate_completion_id "${observed_id}"
   [[ "${observed_id}" == "${COMPLETION_ID}" ]] ||
-    fail 1 "Remote completion identity differs from the compatible parent resolution."
+    fail 1 "Shared completion identity differs from the compatible parent resolution."
   COMPLETION_OWNER_PERSISTED=true
   case "${status}" in
     active|complete|pool_exhausted) ;;
@@ -3008,11 +2147,11 @@ print("\t".join((str(value["status"]), str(value["completion_id"]))))')" ||
         "${COMPLETION_ID}" >&2
       return 4
       ;;
-    *) fail 1 "Remote completion initialization returned unsupported status: ${status}" ;;
+    *) fail 1 "Shared completion initialization returned unsupported status: ${status}" ;;
   esac
 }
 
-advance_remote_completion() {
+advance_shared_completion() {
   validate_positive "configured poll_interval_seconds" "${STATUS_POLL_SECONDS}"
   local previous_run_id="${RUN_ID}"
   while true; do
@@ -3029,9 +2168,9 @@ advance_remote_completion() {
       "completion-advance-${COMPLETION_ID}" 3 9 "Canonical inputs" \
       "reconciling evidence, allocating exact deficits, and preparing replacement inputs" \
       "completion_id=${COMPLETION_ID}" \
-      remote_cli advance-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
+      shared_cli advance-campaign-completion "${CAMPAIGN_RELATIVE_PATH}" \
       "${COMPLETION_ID}" --git-commit "${REQUESTED_COMMIT}" \
-      --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+      --storage-root "${SHARED_STORAGE_ROOT}")" ||
       fail_preserving_interrupt "$?" 1 "Could not advance replacement campaign completion."
     record="$(printf '%s' "${output}" | local_python -c 'import json, sys
 value = json.load(sys.stdin)
@@ -3112,8 +2251,8 @@ print("\t".join((
 }
 
 sync_completion_state_and_plan() {
-  COMPLETION_TRANSFER_JSON="$(remote_cli campaign-completion-transfer-plan \
-    "${COMPLETION_ID}" --storage-root "${REMOTE_STORAGE_ROOT}")" ||
+  COMPLETION_TRANSFER_JSON="$(shared_cli campaign-completion-transfer-plan \
+    "${COMPLETION_ID}" --storage-root "${SHARED_STORAGE_ROOT}")" ||
     fail 1 "Could not resolve successful replacement transfer membership."
   local records kind field2 field3 field4 field5 field6 extra
   records="$(printf '%s' "${COMPLETION_TRANSFER_JSON}" | local_python -c 'import json, sys
@@ -3178,38 +2317,18 @@ for item in value["replacement_campaigns"]:
     && ${#COMPLETION_REPLACEMENT_RUN_IDS[@]} == ${#COMPLETION_REPLACEMENT_RUN_PARTIAL[@]} \
     && ${#COMPLETION_REPLACEMENT_TERMINAL_BATCH_IDS[@]} > 0 )) ||
     fail 1 "Complete campaign completion has malformed successful replacement transfer membership."
-  local expected_state="${REMOTE_STORAGE_ROOT}/01_generation/meta/completions/${COMPLETION_ID}/completion.json"
+  local expected_state="${SHARED_STORAGE_ROOT}/01_generation/meta/completions/${COMPLETION_ID}/completion.json"
   [[ "${state_path}" == "${expected_state}" ]] ||
     fail 1 "Completion state path differs from its dedicated owner."
-  local relative="${state_path#"${REMOTE_STORAGE_ROOT}/"}"
-  validate_transfer_path "${relative}"
-  require_command rsync "completion-state transfer"
-  require_command sha256sum "completion-state verification"
-  local destination="${LOCAL_STORAGE_ROOT}/${relative}"
-  local directory="${destination%/*}"
-  mkdir -p -- "${directory}"
-  [[ -d "${directory}" && ! -L "${directory}" ]] ||
-    fail 1 "Local completion owner directory is unsafe."
-  local incoming="${destination}.incoming.${state_sha}"
-  rsync -a --protect-args "${CPU_HOST}:${REMOTE_STORAGE_ROOT}/./${relative}" "${incoming}" ||
-    fail 1 "Could not transfer compact completion state to host storage."
+  [[ -f "${state_path}" && ! -L "${state_path}" ]] ||
+    fail 1 "Shared completion state is missing or unsafe."
   local observed
-  observed="$(sha256sum -- "${incoming}")"
+  observed="$(sha256sum -- "${state_path}")"
   observed="${observed%% *}"
   [[ "${observed}" == "${state_sha}" ]] ||
-    fail 1 "Transferred completion state failed exact digest validation."
-  if [[ -e "${destination}" ]]; then
-    [[ -f "${destination}" && ! -L "${destination}" ]] ||
-      fail 1 "Existing local completion state is unsafe."
-    cmp -s -- "${incoming}" "${destination}" ||
-      fail 1 "Existing local completion state conflicts with CPU completion evidence."
-    rm -- "${incoming}"
-  else
-    mv -- "${incoming}" "${destination}"
-  fi
-  local_cli campaign-completion-status "${COMPLETION_ID}" \
-    --config "${CAMPAIGN_CONFIG_PATH}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
-    fail 1 "Transferred host completion state did not validate."
+    fail 1 "Shared completion state failed exact digest validation."
+  local_cli campaign-completion-status "${COMPLETION_ID}"     --config "${CAMPAIGN_CONFIG_PATH}" --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null ||
+    fail 1 "Shared completion state did not validate."
 }
 
 collect_completion_replacements() {
@@ -3275,7 +2394,7 @@ if not cleanup.get("eligible") or observed != expected:
   CAMPAIGN_PARTIAL=false
   LEAF_RESULT=OK
   LEAF_STATE=complete
-  REMOTE_CAMPAIGN_STATE=complete_composite
+  SHARED_CAMPAIGN_STATE=complete_composite
 }
 
 run_campaign_with_completion() {
@@ -3321,12 +2440,12 @@ run_campaign_with_completion() {
     "${COMPLETION_ID}|execution"
   resolve_configured_resources executable
   validate_resources
-  resolve_remote_layout
+  resolve_shared_layout
   generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
     "${COMPLETION_ID}|cpu-setup" \
-    "operation=validating the pinned CPU execution environment" \
+    "operation=validating the shared native execution environment" \
     "${COMPLETION_ID}|cpu-setup"
-  verify_remote_setup >/dev/null
+  verify_shared_setup >/dev/null
   generation_console_progress completion-inspection 1 9 "Run plan" RUNNING \
     "${COMPLETION_ID}|parent" \
     "operation=validating retained parent successes and persisted completion evidence" \
@@ -3336,11 +2455,11 @@ run_campaign_with_completion() {
     "${COMPLETION_ID}|state" \
     "operation=reconciling existing replacement state and exact per-material reservations" \
     "${COMPLETION_ID}|state"
-  initialize_remote_completion
+  initialize_shared_completion
   render_completion_plan "${COMPLETION_INITIAL_STATUS_JSON}"
   generation_console_stage 2 9 "Existing state" OK \
     "parent_run=${COMPLETION_PARENT_RUN_ID} completion_id=${COMPLETION_ID}"
-  advance_remote_completion || return $?
+  advance_shared_completion || return $?
   sync_completion_state_and_plan
   collect_completion_replacements
   finalize_completion_composite
@@ -3394,11 +2513,6 @@ run_leaf_plan() {
       "repair continuation adds zero Generation work units and zero COMSOL submissions"
     generation_console_stage 5 9 "Work units" REUSED \
       "completed source run=$RUN_ID remains authoritative"
-    if [[ "$DEFER_COLLECTION" == true ]]; then
-      LEAF_STATE=awaiting_collection
-      deferred_leaf_report
-      return
-    fi
     ALL_STAGE="repairable host transfer publication"
     generation_console_stage 6 9 "Host publication" RUNNING
     collect_leaf_results
@@ -3448,13 +2562,8 @@ run_leaf_plan() {
       "run_id=$RUN_ID kind=$RUN_KIND state=cpu_complete"
   fi
 
-  if [[ "$DEFER_COLLECTION" == true ]]; then
-    LEAF_STATE=awaiting_collection
-    deferred_leaf_report
-    return
-  fi
 
-  ALL_STAGE="atomic host publication"
+  ALL_STAGE="atomic shared publication"
   generation_console_stage 6 9 "Host publication" RUNNING
   collect_leaf_results
   generation_console_stage 6 9 "Host publication" OK \
@@ -3502,17 +2611,10 @@ run_workflow_plan() {
     fi
     case "$LEAF_STATE" in
       complete|ready_for_parent) ;;
-      awaiting_collection)
-        WORKFLOW_STATE="$LEAF_STATE"
-        ;;
       *) fail 1 "Workflow child returned unsupported state: $LEAF_STATE" ;;
     esac
   done
   COMPOSITE_CHILD_MODE=false
-  if [[ "${WORKFLOW_STATE:-}" == awaiting_collection ]]; then
-    printf 'AWAITING: workflow=%s state=awaiting_collection\n' "$RUN_PLAN_ID"
-    return
-  fi
   if [[ "$workflow_partial" == true ]]; then
     LEAF_RESULT=PARTIAL
     LEAF_STATE=complete
@@ -3600,10 +2702,10 @@ preflight_generation_plan() {
       ;;
     *) fail 2 "Unsupported common preflight run kind: $RUN_KIND" ;;
   esac
-  resolve_remote_layout
-  verify_remote_setup >/dev/null
+  resolve_shared_layout
+  verify_shared_setup >/dev/null
   local version
-  version="$(remote_comsol_version)"
+  version="$(native_comsol_version)"
   printf 'PREFLIGHT COMPLETE: plan=%s kind=%s host=%s COMSOL=%s\n'     "$RUN_PLAN_ID" "$RUN_KIND" "$CPU_HOST" "$version"
 }
 
@@ -3627,11 +2729,9 @@ execute_generation_run() {
       fi
       case "$LEAF_STATE" in
         complete)
-          generation_console_final             "run_identity=$RUN_PLAN_ID campaign_run_id=$RUN_ID state=${REMOTE_CAMPAIGN_STATE:-complete} result=$LEAF_RESULT"
+          generation_console_final             "run_identity=$RUN_PLAN_ID campaign_run_id=$RUN_ID state=${SHARED_CAMPAIGN_STATE:-complete} result=$LEAF_RESULT"
           ;;
-        awaiting_collection)
-          printf 'AWAITING: run_identity=%s state=%s\n'             "$RUN_PLAN_ID" "$LEAF_STATE"
-          ;;
+        *) fail 1 "Campaign returned unsupported final state: $LEAF_STATE" ;;
       esac
       ;;
     benchmark)
@@ -3640,9 +2740,7 @@ execute_generation_run() {
         complete)
           generation_console_final             "run_identity=$RUN_PLAN_ID benchmark_run_id=$RUN_ID state=complete result=$LEAF_RESULT"
           ;;
-        awaiting_collection)
-          printf 'AWAITING: run_identity=%s state=awaiting_collection\n'             "$RUN_PLAN_ID"
-          ;;
+        *) fail 1 "Benchmark returned unsupported final state: $LEAF_STATE" ;;
       esac
       ;;
     workflow)
@@ -3660,14 +2758,13 @@ execute_generation_run() {
 benchmark_status_report() {
   resolve_local_storage
   resolve_local_python
-  resolve_remote_layout
+  resolve_shared_layout
   printf 'Benchmark status:\n'
-  remote_cli_retryable "benchmark status read" core-benchmark-status \
-    "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}" --format summary
+  shared_cli core-benchmark-status \
+    "${RUN_ID}" --storage-root "${SHARED_STORAGE_ROOT}" --format summary
   printf 'CPU source status:\n'
-  remote_cli_retryable "benchmark source-status read" \
-    core-benchmark-source-status "${RUN_ID}" \
-    --storage-root "${REMOTE_STORAGE_ROOT}"
+  shared_cli core-benchmark-source-status "${RUN_ID}" \
+    --storage-root "${SHARED_STORAGE_ROOT}"
   if local_cli validate-core-benchmark "${RUN_ID}" \
     --storage-root "${LOCAL_STORAGE_ROOT}" >/dev/null 2>&1; then
     printf 'Host publication state: complete\n'
@@ -3696,11 +2793,10 @@ print("\t".join((str(value["status"]), str(identifier))))')" ||
     printf 'GPU completion and finalization status:\n'
     local_cli campaign-completion-status "${completion_id}" --if-present \
       --config "${CAMPAIGN_CONFIG_PATH}" --storage-root "${LOCAL_STORAGE_ROOT}"
-    resolve_remote_layout
+    resolve_shared_layout
     printf 'CPU completion execution status:\n'
-    remote_cli_retryable "completion execution status read" \
-      campaign-completion-status "${completion_id}" --if-present \
-      --config "${CAMPAIGN_RELATIVE_PATH}" --storage-root "${REMOTE_STORAGE_ROOT}"
+    shared_cli campaign-completion-status "${completion_id}" --if-present \
+      --config "${CAMPAIGN_RELATIVE_PATH}" --storage-root "${SHARED_STORAGE_ROOT}"
   fi
 }
 
@@ -3730,9 +2826,9 @@ status_generation_target() {
       benchmark)
         RUN_LEAF_CONFIG="${RUN_PLAN_CONFIG}"
         resolve_benchmark_contract >/dev/null
-        resolve_remote_layout
+        resolve_shared_layout
         local version identity_json
-        version="$(remote_comsol_version)"
+        version="$(native_comsol_version)"
         identity_json="$(local_cli resolve-core-benchmark-run \
           "${BENCHMARK_SUITE_PATH}" --git-commit "${REQUESTED_COMMIT}" \
           --comsol-version-output "${version}")" ||
@@ -3785,39 +2881,47 @@ cancel_generation_run() {
     validate_benchmark_run_id "${RUN_ID}"
     RUN_LEAF_CONFIG="${BENCHMARK_SUITE_RELATIVE_PATH}"
     resolve_benchmark_contract >/dev/null
-    resolve_remote_layout
+    resolve_shared_layout
     local -a benchmark_arguments=(
       cancel-core-benchmark "${RUN_ID}"
-      --storage-root "${REMOTE_STORAGE_ROOT}"
+      --storage-root "${SHARED_STORAGE_ROOT}"
     )
     [[ "${FORCE_CANCEL}" != true ]] || benchmark_arguments+=(--force)
-    remote_cli "${benchmark_arguments[@]}"
+    shared_cli "${benchmark_arguments[@]}"
     return
   fi
   validate_run_id "${RUN_ID}"
   resolve_workflow_campaigns
-  resolve_remote_layout
+  resolve_shared_layout
   local -a campaign_arguments=(
-    cancel-campaign "${RUN_ID}" --storage-root "${REMOTE_STORAGE_ROOT}"
+    cancel-campaign "${RUN_ID}" --storage-root "${SHARED_STORAGE_ROOT}"
   )
   [[ "${FORCE_CANCEL}" != true ]] || campaign_arguments+=(--force)
-  remote_cli "${campaign_arguments[@]}"
+  shared_cli "${campaign_arguments[@]}"
 }
 
-cleanup_generation_run() {
-  if [[ "${RUN_ID}" == core_scaling_transient__* ]]; then
-    validate_benchmark_run_id "${RUN_ID}"
-    RUN_LEAF_CONFIG="${BENCHMARK_SUITE_RELATIVE_PATH}"
-    resolve_benchmark_contract >/dev/null
-    resolve_remote_layout
-    resolve_local_storage
-    resolve_local_python
-    cleanup_core_benchmark_cpu
-    return
-  fi
-  validate_run_id "${RUN_ID}"
-  resolve_workflow_campaigns
-  cleanup_cpu_source
+submit_generation_smoke() {
+  local worker="${HOST_REPO_ROOT}/scripts/generation_smoke_node.sh"
+  local logs="${RUNTIME_ROOT}/logs/generation"
+  require_command sbatch "native Generation smoke submission"
+  [[ -x "${GENERATION_NATIVE_VENV}/bin/python" ]] ||
+    fail 1 "Native Generation Python environment is missing: ${GENERATION_NATIVE_VENV}"
+  [[ -f "${worker}" && -x "${worker}" && ! -L "${worker}" ]] ||
+    fail 1 "Native Generation smoke worker is missing or unsafe: ${worker}"
+  mkdir -p -- "${logs}" || fail 1 "Could not prepare Generation runtime logs: ${logs}"
+  export GENERATION_GIT_COMMIT="${SOURCE_COMMIT}"
+  local job_id
+  job_id="$(sbatch --parsable \
+    --nodes=1 --ntasks=1 --cpus-per-task=1 --mem=4G --time=00:10:00 \
+    "--partition=${SMOKE_PARTITION}" "--chdir=${HOST_REPO_ROOT}" \
+    --job-name=generation-native-smoke \
+    "--output=${logs}/slurm-%j.out" "--error=${logs}/slurm-%j.err" \
+    --export=ALL \
+    "${worker}" "${HOST_REPO_ROOT}")" || fail 1 "Native Generation smoke submission failed."
+  [[ "${job_id}" =~ ^[0-9]+(;[A-Za-z0-9._-]+)?$ ]] ||
+    fail 1 "Native Generation smoke returned an invalid Slurm job ID: ${job_id}"
+  printf 'GENERATION SMOKE SUBMITTED job=%s partition=%s logs=%s\n' \
+    "${job_id}" "${SMOKE_PARTITION}" "${logs}"
 }
 
 (( $# > 0 )) || { usage; exit 2; }
@@ -3841,26 +2945,54 @@ for bootstrap_argument in "${ORIGINAL_ARGUMENTS[@]}"; do
   fi
 done
 
-if [[ "${GENERATION_WORKFLOW_PINNED_HANDOFF:-}" != 1 ]]; then
-  resolve_bootstrap_requested_commit
+if [[ "${ORIGINAL_ARGUMENTS[0]}" == inputs ]]; then
+  shift
+  (( $# >= 1 )) || fail 2 "inputs requires one campaign config and case selection."
+  input_config="$1"
+  shift
+  input_arguments=("$@")
+  REQUESTED_COMMIT=""
+  input_commit_seen=false
+  INPUT_DRY_RUN=false
+  while (( $# > 0 )); do
+    case "$1" in
+      --dry-run)
+        INPUT_DRY_RUN=true
+        shift
+        ;;
+      --git-commit)
+        [[ "${input_commit_seen}" == false && $# -ge 2 ]] ||
+          fail 2 "inputs accepts exactly one valued --git-commit."
+        REQUESTED_COMMIT="$2"
+        input_commit_seen=true
+        shift 2
+        ;;
+      --storage-root|--storage-root=*|--git-commit=*)
+        fail 2 "inputs owns the sibling storage root and requires separate --git-commit syntax."
+        ;;
+      *) shift ;;
+    esac
+  done
+  [[ -z "${REQUESTED_COMMIT}" ]] || validate_commit "${REQUESTED_COMMIT}"
   resolve_host_layout
-  trap 'workflow_exit_handler $?' EXIT
-  resolve_local_commit
-  handoff_to_pinned_workflow
+  admit_shared_source
+  admit_repository_file "${input_config}" "input-generation campaign config"
+  PARTITION=standard
+  slurm_python_cli cli generate-input-cases "${ADMITTED_HOST_PATH}" "${input_arguments[@]}" \
+    --git-commit "${SOURCE_COMMIT}" --storage-root "${HOST_STORAGE_ROOT}"
+  exit $?
 fi
 
 SUBCOMMAND="$1"
 shift
-CPU_HOST="${GENERATION_CPU_HOST:-}"
-REMOTE_ROOT=""
+CPU_HOST="shared-filesystem"
 REQUESTED_COMMIT=""
-EXECUTE_SETUP=false
-CONFIRM_CLEANUP=false
-KEEP_CPU_SOURCE=false
-DEFER_COLLECTION=false
+KEEP_CPU_SOURCE=true
 FORCE_CANCEL=false
 DRY_RUN=false
 PREFLIGHT_ONLY=false
+SMOKE_PARTITION=gpu
+SMOKE_PARTITION_GIVEN=false
 ALLOW_INCOMPLETE_PLAN=false
 REPLACEMENT_POOL_SIZE=""
 PARENT_RUN_ID=""
@@ -3870,16 +3002,6 @@ POSITIONAL=()
 
 while (( $# > 0 )); do
   case "$1" in
-    --cpu-host)
-      (( $# >= 2 )) || fail 2 "--cpu-host requires a value."
-      CPU_HOST="$2"
-      shift 2
-      ;;
-    --remote-root)
-      (( $# >= 2 )) || fail 2 "--remote-root requires a value."
-      REMOTE_ROOT="$2"
-      shift 2
-      ;;
     --git-commit)
       (( $# >= 2 )) || fail 2 "--git-commit requires a value."
       REQUESTED_COMMIT="$2"
@@ -3901,13 +3023,16 @@ while (( $# > 0 )); do
       PARENT_RUN_ID="$2"
       shift 2
       ;;
-    --execute) EXECUTE_SETUP=true; shift ;;
-    --confirm) CONFIRM_CLEANUP=true; shift ;;
     --force) FORCE_CANCEL=true; shift ;;
-    --keep-cpu-source) KEEP_CPU_SOURCE=true; shift ;;
-    --defer-collection) DEFER_COLLECTION=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --preflight-only) PREFLIGHT_ONLY=true; shift ;;
+    --partition)
+      (( $# >= 2 )) || fail 2 "--partition requires gpu or standard."
+      [[ "${SMOKE_PARTITION_GIVEN}" == false ]] || fail 2 "Specify --partition at most once."
+      SMOKE_PARTITION="$2"
+      SMOKE_PARTITION_GIVEN=true
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     --*) fail 2 "Unsupported option: $1" ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -3923,28 +3048,34 @@ fi
 if [[ -n "${REPLACEMENT_POOL_SIZE}" && "${SUBCOMMAND}" != run ]]; then
   fail 2 "Replacement completion options are supported only by run CONFIG."
 fi
-if [[ "${DEFER_COLLECTION}" == true && "${KEEP_CPU_SOURCE}" == true ]]; then
-  fail 2 "--defer-collection cannot be combined with --keep-cpu-source."
-fi
 if [[ "${DRY_RUN}" == true && "${PREFLIGHT_ONLY}" == true ]]; then
   fail 2 "--dry-run cannot be combined with --preflight-only."
+fi
+if [[ "${SMOKE_PARTITION_GIVEN}" == true && "${SUBCOMMAND}" != smoke ]]; then
+  fail 2 "--partition is supported only by smoke."
+fi
+if [[ "${SUBCOMMAND}" == smoke \
+  && "${SMOKE_PARTITION}" != gpu && "${SMOKE_PARTITION}" != standard ]]; then
+  fail 2 "Smoke partition must be gpu or standard."
 fi
 
 resolve_host_layout
 trap 'workflow_exit_handler $?' EXIT
-resolve_local_commit
-handoff_to_pinned_workflow
+admit_shared_source
 
 case "${SUBCOMMAND}" in
+  smoke)
+    (( ${#POSITIONAL[@]} == 0 )) || fail 2 "smoke accepts no positional arguments."
+    [[ "${FORCE_CANCEL}" == false && "${DRY_RUN}" == false \
+      && "${PREFLIGHT_ONLY}" == false ]] ||
+      fail 2 "smoke received an unsupported option."
+    submit_generation_smoke
+    ;;
   run)
     (( ${#POSITIONAL[@]} == 1 )) ||
       fail 2 "run requires exactly one Generation config."
-    [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false \
-      && "${FORCE_CANCEL}" == false ]] ||
+    [[ "${FORCE_CANCEL}" == false ]] ||
       fail 2 "run received an administrative-only option."
-    if [[ -n "${REPLACEMENT_POOL_SIZE}" && "${DEFER_COLLECTION}" == true ]]; then
-      fail 2 "--replacement-pool-size cannot be combined with --defer-collection; composite finalization requires host collection."
-    fi
     RUN_CONFIG_ARGUMENT="${POSITIONAL[0]}"
     [[ "${DRY_RUN}" != true ]] || ALLOW_INCOMPLETE_PLAN=true
     resolve_generation_run_plan
@@ -3968,21 +3099,10 @@ case "${SUBCOMMAND}" in
     fi
     execute_generation_run
     ;;
-  setup-cpu)
-    (( ${#POSITIONAL[@]} == 0 )) ||
-      fail 2 "setup-cpu accepts no positional arguments."
-    [[ "${CONFIRM_CLEANUP}" == false && "${FORCE_CANCEL}" == false \
-      && "${KEEP_CPU_SOURCE}" == false && "${DEFER_COLLECTION}" == false \
-      && "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false ]] ||
-      fail 2 "setup-cpu received an unsupported option."
-    setup_cpu
-    ;;
   status)
     (( ${#POSITIONAL[@]} == 1 )) ||
       fail 2 "status requires exactly one config or run ID."
-    [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false \
-      && "${FORCE_CANCEL}" == false && "${KEEP_CPU_SOURCE}" == false \
-      && "${DEFER_COLLECTION}" == false && "${DRY_RUN}" == false \
+    [[ "${FORCE_CANCEL}" == false && "${DRY_RUN}" == false \
       && "${PREFLIGHT_ONLY}" == false ]] ||
       fail 2 "status received an unsupported option."
     status_generation_target "${POSITIONAL[0]}"
@@ -3990,24 +3110,10 @@ case "${SUBCOMMAND}" in
   cancel)
     (( ${#POSITIONAL[@]} == 1 )) ||
       fail 2 "cancel requires exactly one run ID."
-    [[ "${EXECUTE_SETUP}" == false && "${CONFIRM_CLEANUP}" == false \
-      && "${KEEP_CPU_SOURCE}" == false && "${DEFER_COLLECTION}" == false \
-      && "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false ]] ||
+    [[ "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false ]] ||
       fail 2 "cancel received an unsupported option."
     RUN_ID="${POSITIONAL[0]}"
     cancel_generation_run
-    ;;
-  cleanup)
-    (( ${#POSITIONAL[@]} == 1 )) ||
-      fail 2 "cleanup requires exactly one run ID."
-    [[ "${CONFIRM_CLEANUP}" == true ]] ||
-      fail 2 "cleanup requires --confirm."
-    [[ "${EXECUTE_SETUP}" == false && "${FORCE_CANCEL}" == false \
-      && "${KEEP_CPU_SOURCE}" == false && "${DEFER_COLLECTION}" == false \
-      && "${DRY_RUN}" == false && "${PREFLIGHT_ONLY}" == false ]] ||
-      fail 2 "cleanup received an unsupported option."
-    RUN_ID="${POSITIONAL[0]}"
-    cleanup_generation_run
     ;;
   *)
     usage

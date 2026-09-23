@@ -575,7 +575,7 @@ def discover_generated_output_eda_catalog(
             issue = _merge_batch(batches, _terminal_batch(evidence))
             if issue is not None:
                 issues.append(issue)
-        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:  # noqa: PERF203 -- source isolation is intentional.
+        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:  # source isolation is intentional.
             issues.append(_issue(storage_name, error))
     for run_id in _run_ids(root):
         try:
@@ -586,7 +586,7 @@ def discover_generated_output_eda_catalog(
                 issue = _merge_batch(batches, candidate)
                 if issue is not None:
                     issues.append(issue)
-        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:  # noqa: PERF203 -- campaign isolation is intentional.
+        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:  # campaign isolation is intentional.
             issues.append(_issue(run_id, error))
     ordered = tuple(sorted(batches.values(), key=lambda batch: (batch.material_family, batch.sampling_regime, batch.batch_id)))
     return GeneratedOutputEDACatalog(

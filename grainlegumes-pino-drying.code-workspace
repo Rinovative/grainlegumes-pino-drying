@@ -7,14 +7,14 @@
     {
       "name": "Storage",
       "path": "../storage"
+    },
+    {
+      "name": "Runtime",
+      "path": "../runtime"
     }
   ],
   "settings": {
-    "files.exclude": {
-      "**/.docker_home": true
-    },
-    "search.exclude": {
-      "**/.docker_home": true
-    }
+    "git.autoRepositoryDetection": false,
+    "git.openRepositoryInParentFolders": "never"
   }
 }

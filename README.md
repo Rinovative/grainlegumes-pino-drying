@@ -30,7 +30,7 @@ Generation, Dataset publication, preprocessing, training, resume, and evaluation
 are identity-bound and fail closed. Current values, campaign inventories, seeds,
 and derived supports are resolved from configuration rather than maintained as
 parallel documentation snapshots. The
-[identity and provenance policy](docs/simulation_generation.md#identity-and-provenance-policy)
+[source admission and lifecycle](docs/simulation_generation.md#source-admission-and-lifecycle)
 defines which dependencies invalidate each durable stage.
 
 > Configured scientific values are modelling and sampling decisions. Source
@@ -83,10 +83,11 @@ flowchart TD
 
 | Workflow | Entry point | Guidance |
 | --- | --- | --- |
-| Run or continue any Generation workflow | `./scripts/generation_workflow.sh run CONFIG` on bare `hpc115` | [Generation operations](docs/simulation_generation.md) |
+| Run or continue any Generation workflow | `./scripts/generation_workflow.sh run CONFIG` on ICE | [Generation operations](docs/simulation_generation.md) |
 | Interpret Generation parameters and assumptions | Validated YAML under `configs/generation` | [Scientific parameter reference](docs/generation_parameter_reference.md) |
-| Publish declared immutable Dataset packages | Automatic stage of `run CONFIG` | [Generation operations](docs/simulation_generation.md#common-plan-and-lifecycle) |
-| Train, tune, and build artifacts | `src.experiments.cli` commands | Commands below and `configs/learning` |
+| Publish declared immutable Dataset packages | Automatic stage of `run CONFIG` | [Generation operations](docs/simulation_generation.md#source-admission-and-lifecycle) |
+| Submit training | `./scripts/slurm_ml.sh ... train CONFIG` on ICE | Commands below and `configs/learning` |
+| Tune and build standalone artifacts | `./scripts/slurm_ml.sh ... optuna CONFIG` or `... artifacts ...` on ICE | Commands below |
 | Train transient A0 then B | One architecture-first YAML under `configs/learning/transient_drying/experiments` | [Transient training](docs/transient_training.md) |
 
 The stable package facades are `src.generation` and `src.datasets`. Reusable
@@ -100,35 +101,71 @@ execution under `configs/generation`. Edit model, optimizer, training, and
 evaluation decisions under `configs/learning/<task>`. Use `validate-config` to
 inspect the resolved plan instead of copying current values into Markdown.
 
-For local development, install Git, Docker, Visual Studio Code, and the Dev
-Containers extension. NVIDIA Container Toolkit is required for GPU workflows.
+Use the ICE three-root workspace: `repo` for source,
+`../storage` for durable scientific state, and `../runtime` for
+replaceable environments and logs. ML runs through Slurm and Apptainer.
+Generation runs through native Slurm and `Comsol/v6.4` with the locked
+Python 3.12 environment under `../runtime/venvs/generation`.
+Provisioning details are in the [Generation guide](docs/simulation_generation.md).
+
+Build the ML image once from `container/Apptainer.def` in a CPU Slurm
+allocation. The definition uses an immutable OCI base digest and installs
+the runtime dependencies from `pyproject.toml` and `uv.lock`. From `repo/`:
 
 ```bash
-git clone https://github.com/Rinovative/grainlegumes-pino-drying.git
-cd grainlegumes-pino-drying
-./scripts/docker_build.sh
-./scripts/docker_dev.sh
+srun --partition=standard --nodes=1 --ntasks=1 --cpus-per-task=4 \
+  --mem=16G --time=02:00:00 --pty bash -l
+mkdir -p ../runtime/containers ../runtime/apptainer/cache
+export APPTAINER_CACHEDIR="$(realpath -m ../runtime/apptainer/cache)"
+export APPTAINER_TMPDIR="${TMPDIR:-/tmp}"
+apptainer build --fakeroot \
+  ../runtime/containers/grainlegumes-pino-drying.sif container/Apptainer.def
+sha256sum ../runtime/containers/grainlegumes-pino-drying.sif
 ```
 
-Attach Visual Studio Code to `grainlegumes-pino-drying-dev` and open
-`/workspace/repo`.
+Keep the resulting SIF and its hash in `../runtime`; the ML launcher records
+the exact SIF hash and admitted source fingerprint for each submitted job.
 
-Generation workflow commands run from the bare `hpc115` checkout. Start with:
+Generation workflow commands run from the shared ICE repository. Start with:
 
 ```bash
 ./scripts/generation_workflow.sh --help
 ./scripts/generation_workflow.sh run \
+  configs/generation/campaigns/steady_flow/id_dataset.yaml --preflight-only
+./scripts/generation_workflow.sh run \
   configs/generation/campaigns/steady_flow/id_dataset.yaml
 ```
 
-Inside the development container, the established learning commands are:
+Submit training from the ICE repository checkout. The wrapper validates the
+config, requests Slurm resources, and runs `python -m src.experiments.cli.cli_train`
+through the maintained Apptainer executor. Slurm writes stdout and stderr below
+`../runtime/logs/ml`; run data and checkpoints remain below `../storage`.
 
 ```bash
-python -m src.experiments.cli.cli_config_preflight train <experiment_config>
-python -m src.experiments.cli.cli_train <experiment_config>
-python -m src.experiments.cli.cli_optuna <optuna_config>
-python -m src.experiments.cli.cli_build_artifacts --task steady_flow
-python -m src.experiments.cli.cli_build_artifacts --task transient_drying --evaluation-spatial-stride 1
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train \
+  configs/learning/steady_flow/experiments/best_of_class/fno_m128x160_h64_l3__id_dataset__s9__best_of_class.yaml
+```
+
+Choose the CPU and memory request appropriate for the experiment. CPU training
+uses `--mode cpu`, a CPU partition, and no `--gres`; the wrapper passes strict
+`--device cpu`. GPU training passes strict `--device cuda` and lets Slurm assign
+the physical GPU. `--resume RUN_DIR` keeps the existing checkpoint contract.
+Use the same resource options with `probe` for a small runtime check that opens
+no Dataset.
+
+Submit Optuna and standalone artifact work through the same Slurm wrapper.
+Set resources for the workload. CPU mode uses no GPU GRES; GPU mode requires a
+typed GPU GRES and forwards strict CUDA to the Python CLI.
+
+```bash
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 optuna <optuna_config>
+./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 \
+  --mem 16G --time 02:00:00 artifacts --task steady_flow
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts \
+  --task transient_drying --evaluation-spatial-stride 1
 ```
 
 For transient drying, one normal architecture config automatically persists its
@@ -146,9 +183,6 @@ controls, and loading behavior are in the [Evaluation guide](docs/evaluation.md)
 comparison semantics and resume rules are in the
 [transient training guide](docs/transient_training.md).
 
-From the host, `scripts/docker_job.sh` supplies the corresponding GPU-queue
-workflow.
-
 ## 💾 Storage and Results
 
 `STORAGE_ROOT` is the sole scientific storage-root override. It defaults to the
@@ -165,11 +199,11 @@ STORAGE_ROOT/
 └── 03_experiments/  # training, tuning, logs, and analysis artifacts
 ```
 
-Generation source is retained independently of Dataset packages. Canonical
-completed science lives in <code>case.h5</code>; compact Production publications
-retain neither direct COMSOL CSV exports nor <code>solved.mph</code>. Cleanup of
-CPU source must use the gated Generation workflow; it never removes the
-canonical GPU-side publication. Immutable Dataset packages use the sole
+Generation source is retained independently of Dataset packages in sibling
+storage. Canonical completed science lives in <code>case.h5</code>; compact
+Production publications retain neither direct COMSOL CSV exports nor
+<code>solved.mph</code>. The shared source is the sole durable copy; the
+workflow does not run remote-source cleanup. Immutable Dataset packages use the sole
 <code>02_datasets/packages</code> root.
 
 ## ✅ Maintained Validation
@@ -178,11 +212,11 @@ canonical GPU-side publication. Immutable Dataset packages use the sole
 python scripts/check_package_install.py
 python scripts/check_notebooks.py
 python -m ruff check notebooks
-python -m ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
-python -m ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py --exclude '*.ipynb'
+python -m ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py
+python -m ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py --exclude '*.ipynb'
 python -m mypy src
 python -m basedpyright
-python -m compileall -q src scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
+python -m compileall -q src scripts/check_notebooks.py scripts/check_package_install.py
 python -m pytest -q -m "not real_data" tests
 ```
 
@@ -195,6 +229,7 @@ python -m pytest -q -m "not real_data" tests
 .
 ├── .github/workflows/quality.yml
 ├── .vscode/settings.json
+├── container/Apptainer.def
 ├── configs/
 │   ├── generation/
 │   └── learning/
@@ -219,10 +254,8 @@ python -m pytest -q -m "not real_data" tests
 │   ├── generation/
 │   └── learning/
 ├── tests/
-├── Dockerfile
-├── environment.yml
-├── environment-dev.yml
 ├── pyproject.toml
+├── uv.lock
 └── README.md
 ```
 

@@ -36,6 +36,7 @@ from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.generation import generation_campaign_completion as campaign_completion
+from src.generation.contracts import generation_contracts_source as source_service
 
 from . import dataset_packages_generated_batch as generated
 from . import dataset_packages_manifest as package_manifest
@@ -543,6 +544,7 @@ def _replace_package_publication(
     """Replace recoverable same-identity state with rollback on interruption."""
     published_payload = False
     published_metadata = False
+    source_service.validate_admitted_source_before_publication()
     try:
         if destination_dir.exists():
             destination_dir.replace(payload_backup)

@@ -25,6 +25,51 @@ _COMMIT = "a" * 40
 _RUN_ID = "core_scaling_transient__0123456789abcdef"
 
 
+def test_resume_repairs_missing_input_with_current_node_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed benchmark must not reuse a prior node's deleted TMPDIR."""
+    benchmark = generation.benchmark
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    scratch = tmp_path / "current-node-scratch"
+    scratch.mkdir()
+    old_scratch = tmp_path / "old-node-scratch"
+    manifest_path = storage / "benchmark_manifest.json"
+    manifest = {"git_commit": _COMMIT, "state": "input_preparation_failed"}
+    suite = SimpleNamespace(representative_cases=(SimpleNamespace(case_role="nominal"),))
+    observed: list[Path] = []
+    monkeypatch.setattr(benchmark.workspace_service, "resolve_storage_root", lambda *_a, **_k: storage)
+    monkeypatch.setattr(benchmark, "_manifest_path", lambda *_a, **_k: manifest_path)
+    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (manifest, suite))
+    monkeypatch.setattr(benchmark, "_require_current_checkout", lambda *_a: None)
+    monkeypatch.setattr(benchmark, "_canonical_case_proof_path", lambda *_a: storage / "missing-proof.json")
+    monkeypatch.setattr(
+        benchmark,
+        "_load_core_benchmark_preflight",
+        lambda *_a, **_k: {"storage_capabilities": {"scratch": {"path": str(old_scratch)}}},
+    )
+    monkeypatch.setattr(benchmark, "_probe_directory_capability", lambda path, **_k: observed.append(Path(path)))
+    monkeypatch.setattr(
+        benchmark,
+        "_materialize_core_benchmark_inputs",
+        lambda *_a, **kwargs: observed.append(Path(kwargs["work_root"])),
+    )
+    monkeypatch.setattr(benchmark, "_persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(benchmark, "_submit_pending", lambda current, *_a, **_k: current)
+
+    assert (
+        benchmark.resume_core_benchmark(
+            _RUN_ID,
+            storage_root=storage,
+            scratch_root=scratch,
+        )["state"]
+        == "inputs_ready"
+    )
+    assert observed == [scratch, scratch]
+
+
 def _synthetic_suite(
     generation_config_factory: Any,
 ) -> generation.benchmark.CoreBenchmarkSuite:
@@ -719,6 +764,7 @@ def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
 def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     generation_config_factory: Any,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Order both production cases first and encode readable case-role jobs."""
     suite = _synthetic_suite(generation_config_factory)
@@ -735,6 +781,10 @@ def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     ]
     assert [position for _variant, position in sequence] == [1, 2] * 4
     project_root = common.paths.get_project_root()
+    runtime = common.paths.get_runtime_root().resolve()
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
+    monkeypatch.setenv("GENERATION_NATIVE_VENV", str(runtime / "venvs" / "generation"))
     launcher = project_root / "scripts/generation_benchmark_node.sh"
     source_launcher = Path(__file__).resolve().parents[2] / "scripts/generation_benchmark_node.sh"
     launcher.parent.mkdir(parents=True, exist_ok=True)
@@ -749,7 +799,10 @@ def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     )
     assert any(value.startswith("--job-name=td-bench-c16-nat-") for value in command)
     assert not any(value.startswith("--licenses") for value in command)
+    assert f"--output={runtime}/logs/generation/slurm-%j.out" in command
     wrapped = shlex.split(command[-1].removeprefix("--wrap="))
+    assert f"STORAGE_ROOT={tmp_path.resolve()}" in wrapped
+    assert "GENERATION_SOURCE_SHA256=" + "b" * 64 in wrapped
     assert wrapped[-5:] == [
         str(launcher),
         str(project_root),
@@ -918,6 +971,7 @@ def test_login_preparation_creates_two_proofs_and_submits_nothing(
     assert manifest["state"] == "inputs_ready"
     assert manifest["measured_job_ids"] == []
     assert manifest["submission_history"] == []
+    assert not (generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=storage) / "scheduler").exists()
     assert len(tuple((storage / "01_generation/meta/performance_benchmarks/core_scaling" / _RUN_ID / "canonical_cases").glob("*.json"))) == 2
 
 
@@ -1037,6 +1091,49 @@ def test_first_wave_failure_is_canary_failure_without_extra_solve(
     )
     assert manifest["state"] == "canary_failed"
     assert manifest["submission_history"] == []
+
+
+def test_source_admission_failure_does_not_exhaust_benchmark_scientific_retries(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed source remains operational evidence and permits resubmission."""
+    suite = _synthetic_suite(generation_config_factory)
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    directory = _prepare_submission_test(suite, storage, monkeypatch)
+    variant = suite.canary_variant()
+    representative = suite.representative_case(1)
+    attempt_path = directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, 1) / "attempt-0001.json"
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_text(
+        json.dumps(
+            {
+                "attempt": 1,
+                "previous_attempt": None,
+                "status": "failed",
+                "error": {"type": "SourceAdmissionError", "message": "source changed"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    records = _pending_records(suite)
+    records[0]["status"] = "failed"
+    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args: records)
+    submitted: list[str] = []
+
+    def submit(command: list[str], **_kwargs: Any) -> str:
+        submitted.append(command[-1])
+        return str(800 + len(submitted))
+
+    monkeypatch.setattr(generation.benchmark, "_submit", submit)
+    manifest = generation.benchmark._submit_pending(_minimal_manifest(), suite, storage=storage)
+
+    assert generation.benchmark._scientific_failure_count((attempt_path,)) == 0
+    assert manifest["state"] == "running"
+    assert representative.case_role in [record["case_role"] for record in manifest["submission_history"]]
+    assert submitted
 
 
 def test_license_block_waits_and_retries_without_manual_variant(

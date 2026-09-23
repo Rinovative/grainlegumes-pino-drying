@@ -3994,6 +3994,7 @@ def publish_completed_case(
             raise FileExistsError(msg)
         _quarantine_incomplete(processed_destination, state_root=state_root)
         processed_destination.parent.mkdir(parents=True, exist_ok=True)
+        source_service.validate_admitted_source_before_publication()
         processed_stage.replace(processed_destination)
         validate_completed_case(
             config,

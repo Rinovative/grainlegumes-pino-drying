@@ -54,8 +54,8 @@ def test_background_session_executes_exact_argv_and_preserves_result(
             f"exit {_CHILD_EXIT_CODE}",
         ),
     )
-    docker_python = _executable(
-        tmp_path / "docker python.sh",
+    python_executable = _executable(
+        tmp_path / "native python.sh",
         (f'exec {shlex.quote(sys.executable)} "$@"',),
     )
     fixed_now = datetime(2026, 8, 18, 15, 45, 1, tzinfo=timezone.utc)
@@ -74,7 +74,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
         source_commit=_COMMIT,
         storage_root=storage,
         stable_script=workflow,
-        docker_python=docker_python,
+        python_executable=python_executable,
         host_storage_root=storage,
         host_name="synthetic-host",
         active_tmux_sessions=(),
@@ -96,7 +96,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
         source_commit=_COMMIT,
         storage_root=storage,
         stable_script=workflow,
-        docker_python=docker_python,
+        python_executable=python_executable,
         host_storage_root=storage,
         host_name="synthetic-host",
         active_tmux_sessions=(created["tmux_session_name"],),
@@ -125,7 +125,7 @@ def test_background_session_executes_exact_argv_and_preserves_result(
         source_commit=_COMMIT,
         storage_root=storage,
         stable_script=workflow,
-        docker_python=docker_python,
+        python_executable=python_executable,
         host_storage_root=storage,
         host_name="synthetic-host",
         active_tmux_sessions=(created["tmux_session_name"],),
@@ -187,7 +187,7 @@ def test_background_session_rejects_recursive_or_unsupported_argv(tmp_path: Path
         "source_commit": _COMMIT,
         "storage_root": storage,
         "stable_script": tmp_path / "workflow.sh",
-        "docker_python": tmp_path / "docker-python.sh",
+        "python_executable": tmp_path / "native-python.sh",
         "host_storage_root": storage,
         "host_name": "synthetic-host",
         "active_tmux_sessions": (),

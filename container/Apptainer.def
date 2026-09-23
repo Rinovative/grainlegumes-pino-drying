@@ -1,0 +1,37 @@
+Bootstrap: docker
+From: python@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+
+%labels
+    org.opencontainers.image.title grainlegumes-pino-drying
+    org.opencontainers.image.description "Locked Python 3.12 and CUDA 12.1 PyTorch runtime"
+
+%files
+    pyproject.toml /opt/grainlegumes-environment/pyproject.toml
+    uv.lock /opt/grainlegumes-environment/uv.lock
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install --yes --no-install-recommends ca-certificates git
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir "uv==0.11.7"
+
+    export UV_CACHE_DIR=/tmp/uv-cache
+    export UV_COMPILE_BYTECODE=1
+    export UV_LINK_MODE=copy
+    export UV_PROJECT_ENVIRONMENT=/opt/venv
+    export UV_PYTHON_DOWNLOADS=never
+    cd /opt/grainlegumes-environment
+    uv sync --frozen --no-dev --no-install-project --python /usr/local/bin/python3.12
+    rm -rf "${UV_CACHE_DIR}" /opt/grainlegumes-environment
+
+%environment
+    export PATH="/opt/venv/bin:${PATH}"
+    export PYTHONNOUSERSITE=1
+
+%runscript
+    exec "$@"
+
+%test
+    python -c 'import sys; assert sys.version_info[:2] == (3, 12)'

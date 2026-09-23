@@ -2383,7 +2383,7 @@ def _index_from_admitted_frame(
     if frame.empty or "record_id" not in frame or frame["record_id"].duplicated().any():
         message = "Transient artifact summary must contain unique non-empty records."
         raise TransientSequenceArtifactError(message)
-    rows = tuple(frame.to_dict(orient="records"))
+    rows = tuple(cast("Mapping[str, Any]", row) for row in frame.to_dict(orient="records"))
     admitted_role = cast("DatasetRole", dataset_role)
     summaries = tuple(
         _summary_from_row(

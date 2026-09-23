@@ -11,7 +11,7 @@ Design principles:
   - Running jobs are unlimited unless the execution config declares a cap
   - Durable case evidence and scheduler accounting make resume duplicate-safe
 This module does NOT:
-  - Generate scientific inputs, implement SSH/rsync, or build dataset packages
+  - Generate scientific inputs, submit Slurm jobs, or build dataset packages
   - Poll indefinitely, submit a whole campaign queue, or delete remote sources
 """
 
@@ -164,7 +164,7 @@ def _repository_commit() -> str:
         text=True,
     )
     if status.stdout:
-        message = "Campaign launch requires a clean CPU repository checkout."
+        message = "Campaign launch requires a clean shared repository."
         raise RuntimeError(message)
     result = subprocess.run(  # noqa: S603 -- fixed Git argument vector
         ["git", "-C", str(repository), "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
@@ -407,7 +407,7 @@ def plan_campaign(
     requested_commit = source_service.validate_git_commit(git_commit)
     current_commit = _repository_commit()
     if current_commit != requested_commit:
-        message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
+        message = f"Shared repository commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     if not storage.is_dir():
@@ -415,12 +415,13 @@ def plan_campaign(
         raise FileNotFoundError(message)
     run_id = campaign_run_id(campaign, git_commit=requested_commit)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
-    log_directory = run_directory / "scheduler"
+    log_directory = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     tasks = cluster_service.campaign_tasks(campaign)
     first_command = cluster_service.build_campaign_case_slurm_submission_command(
         campaign,
         tasks[0],
         run_id=run_id,
+        storage_root=storage,
         scheduler_log_directory=log_directory,
         scheduler_job_name=_scheduler_job_name(
             campaign,
@@ -2467,6 +2468,7 @@ def _submit_one(
         campaign,
         task,
         run_id=str(manifest["campaign_run_id"]),
+        storage_root=Path(manifest["remote_storage_root"]),
         scheduler_log_directory=Path(manifest["scheduler_log_directory"]),
         scheduler_job_name=job_name,
         attempt_index=resolved_attempt_index,
@@ -2490,6 +2492,7 @@ def _submit_one(
         str(manifest["campaign_run_id"]),
         storage_root=storage_root,
     )
+    source_service.validate_admitted_source_before_publication()
     common.serialization.atomic_write_json(path, manifest)
     try:
         job_id = _submit_case(
@@ -3102,7 +3105,7 @@ def submit_campaign(
     requested_commit = source_service.validate_git_commit(git_commit)
     current_commit = _repository_commit()
     if current_commit != requested_commit:
-        message = f"CPU checkout commit {current_commit} does not match requested commit {requested_commit}."
+        message = f"Shared repository commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
     run_id = campaign_run_id(campaign, git_commit=requested_commit)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root)
@@ -3145,8 +3148,8 @@ def submit_campaign(
         )
     )
     run_directory.mkdir(parents=True, exist_ok=True)
-    scheduler_log_directory = run_directory / "scheduler"
-    scheduler_log_directory.mkdir(exist_ok=True)
+    scheduler_log_directory = common.paths.get_runtime_root().resolve() / "logs" / "generation"
+    scheduler_log_directory.mkdir(parents=True, exist_ok=True)
     lock_path = run_directory / "submission.lock"
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         intent = _new_campaign_manifest(
@@ -3163,6 +3166,7 @@ def submit_campaign(
             immutable_keys = set(intent).difference(
                 {
                     "dataset_packages",
+                    "scheduler_log_directory",
                     "slurm_job_ids",
                     "submissions",
                     "submission_intent",
@@ -3174,6 +3178,7 @@ def submit_campaign(
                 message = f"Existing campaign-run manifest conflicts with {run_id!r}."
                 raise FileExistsError(message)
         else:
+            source_service.validate_admitted_source_before_publication()
             common.serialization.atomic_write_json(path, intent)
     return feed_campaign(
         run_id,
@@ -3199,6 +3204,7 @@ def _write_campaign_manifest(
     )
     if current == payload:
         return current
+    source_service.validate_admitted_source_before_publication()
     common.serialization.atomic_write_json(
         campaign_evidence.campaign_run_manifest_path(
             run_id,
@@ -5140,8 +5146,87 @@ def repair_transferred_campaign(
         },
         "source_removed": False,
     }
+    source_service.validate_admitted_source_before_publication()
     common.serialization.atomic_write_json(receipt_path, receipt)
     return validate_transferred_campaign(run_id, storage_root=destination)
+
+
+def repair_partial_campaign_publication(
+    run_id: str,
+    *,
+    source_host: str,
+    source_storage_root: str,
+    storage_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Bind a terminal partial campaign already present in shared storage."""
+    if not source_host or any(character in source_host for character in "\r\n\t"):
+        message = "Shared publication source_host must be safe non-empty text."
+        raise ValueError(message)
+    source_storage = Path(source_storage_root)
+    destination = workspace_service.resolve_storage_root(storage_root, create=False)
+    if not source_storage.is_absolute() or source_storage.resolve() != destination:
+        message = "Partial shared publication source must equal durable destination storage."
+        raise ValueError(message)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=destination)
+    receipt_path = run_directory / _PARTIAL_TRANSFER_FILENAME
+    if receipt_path.exists():
+        existing = validate_partially_transferred_campaign(run_id, storage_root=destination)
+        if existing["source_host"] != source_host or existing["source_storage_root"] != str(destination):
+            message = f"Existing partial publication source conflicts: {receipt_path}"
+            raise FileExistsError(message)
+        return existing
+
+    plan = partial_campaign_transfer_plan(run_id, storage_root=destination, refresh=True)
+    evidence_path = run_directory / _PARTIAL_CAMPAIGN_FILENAME
+    evidence = campaign_evidence.load_json_object(evidence_path, label="partial campaign evidence")
+    inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
+    directories = [
+        {
+            "directory": relative,
+            "status": "reused",
+            "identity": campaign_evidence.directory_identity(
+                destination / relative,
+                ignored_relative_paths=_transfer_ignored_paths(plan, relative),
+            ),
+        }
+        for relative in (
+            plan["campaign_directory"],
+            *(
+                directory
+                for batch in plan["batches"]
+                for directory in (
+                    batch["meta_directory"],
+                    batch["raw_directory"],
+                    batch["processed_directory"],
+                    *batch["attempt_directories"],
+                )
+            ),
+        )
+    ]
+    receipt = {
+        "schema_kind": "generation_campaign_partial_transfer",
+        "schema_version": 1,
+        "status": "partial",
+        "recorded_at": _utc_now(),
+        "campaign_run_id": run_id,
+        "campaign_id": evidence["campaign_id"],
+        "git_commit": evidence["git_commit"],
+        "source_host": source_host,
+        "source_storage_root": str(destination),
+        "destination_storage_root": str(destination),
+        "campaign_partial_sha256": common.serialization.file_sha256(evidence_path),
+        "transferred_file_count": inventory["file_count"],
+        "transferred_bytes": inventory["size_bytes"],
+        "transfer_inventory_sha256": inventory["inventory_sha256"],
+        "files": inventory["files"],
+        "directories": directories,
+        "successful_cases": evidence["successful_cases"],
+        "failed_cases": evidence["failed_cases"],
+        "source_removed": False,
+    }
+    source_service.validate_admitted_source_before_publication()
+    common.serialization.atomic_write_json(receipt_path, receipt)
+    return validate_partially_transferred_campaign(run_id, storage_root=destination)
 
 
 def validate_transferred_campaign(

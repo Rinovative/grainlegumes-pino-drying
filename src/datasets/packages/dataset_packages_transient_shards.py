@@ -33,6 +33,7 @@ import torch
 
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
+from src.generation.contracts import generation_contracts_source as source_service
 
 from . import DEFAULT_TRANSIENT_PT_SHARD_BYTES
 from . import dataset_packages_manifest as package_manifest
@@ -1310,6 +1311,7 @@ def build_transient_shards(
                 content_hash_verified=True,
             )
             destination.parent.mkdir(parents=True, exist_ok=True)
+            source_service.validate_admitted_source_before_publication()
             if replace_invalid:
                 backup = state_root / (f".{dataset_id}.transient-pt.invalid-{uuid.uuid4().hex}.backup")
                 destination.replace(backup)

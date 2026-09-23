@@ -374,9 +374,9 @@ def test_grouped_tables_expand_components_and_preserve_raw_values(
     summary = generation_inputs.diagnostics.build_dataset_diagnostics((first, second))
     _pressure_x, pressure_values = generation_inputs.diagnostics.inlet_pressure_boundary(first)
     pressure_statistics = generation_inputs.diagnostics.field_statistics(first).loc["p_in_bc"]
-    assert pressure_statistics["min"] == pytest.approx(float(np.min(pressure_values)))
-    assert pressure_statistics["mean"] == pytest.approx(float(np.mean(pressure_values)))
-    assert pressure_statistics["min"] > 0.0
+    assert float(cast("Any", pressure_statistics["min"])) == pytest.approx(float(np.min(pressure_values)))
+    assert float(cast("Any", pressure_statistics["mean"])) == pytest.approx(float(np.mean(pressure_values)))
+    assert float(cast("Any", pressure_statistics["min"])) > 0.0
     parameter_table = generation_inputs.diagnostics.parameter_comparison_table(
         first,
         summary,

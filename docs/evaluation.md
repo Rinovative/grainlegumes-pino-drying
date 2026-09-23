@@ -81,7 +81,8 @@ Generate or validate canonical artifacts outside the notebooks. For one exact
 transient run on the canonical original grid, use:
 
 ```bash
-./scripts/docker_job.sh --queue-gpu auto artifacts \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts \
   --run-dir <run-dir> \
   --evaluation-spatial-stride 1
 ```
@@ -92,7 +93,8 @@ canonical source grid; it never inherits the checkpoint's Training stride.
 A lower-resolution artifact must be requested explicitly, for example:
 
 ```bash
-./scripts/docker_job.sh --queue-gpu auto artifacts \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts \
   --run-dir <run-dir> \
   --evaluation-spatial-stride 2
 ```
@@ -101,8 +103,8 @@ The stride must retain both physical endpoints on both axes. The same exact
 source indices materialize dynamic fields, static fields, coordinates, masks,
 conditioning, targets, model inputs, references, and predictions. No
 interpolation, upsampling, or fallback to the Training grid is allowed. The
-operator argument is retained verbatim by the queue descriptor and worker
-command, then resolved once by the artifact service. Preflight logs one concise
+operator argument is forwarded by the Slurm worker and resolved once by the
+artifact service. Preflight logs one concise
 summary:
 
 ```text
@@ -175,7 +177,8 @@ For a disposable transient UI/debug artifact, generate one saved case into a
 new noncanonical directory:
 
 ```bash
-./scripts/docker_job.sh --queue-gpu auto artifacts \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts \
   --run-dir <run-dir> \
   --one-case \
   --split id \

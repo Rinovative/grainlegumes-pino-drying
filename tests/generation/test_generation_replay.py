@@ -369,6 +369,11 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
 
     target_commit = "b" * 40
     monkeypatch.setenv("GENERATION_GIT_COMMIT", target_commit)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "c" * 64)
+    monkeypatch.setenv(
+        "GENERATION_NATIVE_VENV",
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+    )
     submitted: list[list[str]] = []
 
     def submit_case(command: list[str], **_kwargs: Any) -> str:
@@ -376,6 +381,11 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
         return str(7_000 + len(submitted))
 
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: target_commit)
+    monkeypatch.setattr(
+        generation.campaign.source_service,
+        "validate_admitted_source_before_publication",
+        lambda: None,
+    )
     monkeypatch.setattr(generation.campaign, "_submit_case", submit_case)
     monkeypatch.setattr(
         generation.campaign,

@@ -1,508 +1,222 @@
-# ruff: noqa: S101, S603
-"""Execution-domain routing for Generation shell prerequisites."""
+# ruff: noqa: S101, S603, S607, PLR2004
+"""Native Generation worker source, environment, and scratch contracts."""
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
-_COMMIT = "a" * 40
-_REPOSITORY_URL = "https://github.com/Rinovative/grainlegumes-pino-drying.git"
 _CAMPAIGN_RUN_ID = "synthetic__0123456789abcdef"
 _BENCHMARK_RUN_ID = "core_scaling_transient__0123456789abcdef"
-_WORKER_SCRIPTS = (
-    "generation_cpu_smoke.sh",
+_SCRIPTS = (
     "generation_campaign_node.sh",
     "generation_benchmark_node.sh",
+    "generation_smoke_node.sh",
+    "generation_prerequisites.sh",
+    "source_fingerprint.py",
 )
 
 
-def _executable(path: Path, body: str) -> Path:
-    """Create one test-owned executable."""
-    path.write_text(f"#!/bin/bash\nset -euo pipefail\n{body}\n", encoding="utf-8")
+def _write_executable(path: Path, contents: str) -> None:
+    path.write_text("#!/bin/bash\nset -euo pipefail\n" + contents, encoding="utf-8")
     path.chmod(0o755)
-    return path
 
 
-def _link_command(binary: Path, name: str) -> None:
-    """Expose one host utility inside the otherwise isolated fake PATH."""
-    source = shutil.which(name)
-    if source is None:
-        message = f"Test requires host utility {name!r}."
-        raise RuntimeError(message)
-    (binary / name).symlink_to(source)
-
-
-def _fake_environment(tmp_path: Path, *, include_rsync: bool) -> tuple[dict[str, str], Path, Path]:
-    """Build isolated login/compute commands without exposing host rsync."""
-    binary = tmp_path / "bin"
-    binary.mkdir(parents=True)
-    log = tmp_path / "commands.log"
-    for name in ("date", "dirname", "hostname", "mktemp", "rmdir", "stat"):
-        _link_command(binary, name)
-    _executable(binary / "module", 'printf \'module <%s>\\n\' "$*" >> "${FAKE_COMMAND_LOG}"')
-    _executable(
-        binary / "git",
-        """printf 'git <%s>\\n' "$*" >> "${FAKE_COMMAND_LOG}"
-case " $* " in
-  *" status --porcelain "*) ;;
-  *" rev-parse HEAD "*) printf '%s\\n' "${FAKE_GIT_COMMIT}" ;;
-  *" remote get-url origin "*) printf '%s\\n' "${FAKE_REPOSITORY_URL}" ;;
-esac""",
-    )
-    _executable(binary / "python3", "printf 'Python 3.10.13\\n'")
-    _executable(binary / "comsol", "printf 'COMSOL Multiphysics 6.4.0.293\\n'")
-    _executable(binary / "sbatch", "printf 'slurm 22.05.9\\n'")
-    for name in ("squeue", "sacct", "scancel"):
-        _executable(binary / name, ":")
-    if include_rsync:
-        _executable(binary / "rsync", "printf 'rsync version 3.2.7\\n'")
-
-    venv = tmp_path / "venv"
-    base_python = tmp_path / "software/Python/3.10/bin/python3.10"
-    (venv / "bin").mkdir(parents=True)
-    base_python.parent.mkdir(parents=True)
-    (venv / "pyvenv.cfg").write_text(
-        f"home = {base_python.parent}\nversion = 3.10.13\n",
-        encoding="utf-8",
-    )
-    _executable(
-        base_python,
-        """printf 'venv-python <%s>\n' "$*" >> "${FAKE_COMMAND_LOG}"
-if [[ "${FAKE_VENV_IMPORT_FAIL:-false}" == true && " $* " == *" -c "* ]]; then
-  printf 'synthetic package import failure\n' >&2
-  exit 17
-fi""",
-    )
-    (venv / "bin/python").symlink_to(base_python)
-    environment = {
-        "PATH": str(binary),
-        "FAKE_COMMAND_LOG": str(log),
-        "FAKE_GIT_COMMIT": _COMMIT,
-        "FAKE_REPOSITORY_URL": _REPOSITORY_URL,
-    }
-    return environment, venv, log
-
-
-def _fake_checkout(tmp_path: Path) -> Path:
-    """Create one detached exact checkout containing only worker-owned scripts."""
-    source_repository = Path(__file__).resolve().parents[2]
-    repository = tmp_path / "fake/home/grainlegumes-generation/repo"
+@pytest.fixture
+def native_worker(request: pytest.FixtureRequest) -> tuple[Path, dict[str, str], Path]:
+    """Build one shared checkout with inert site commands and a disposable venv."""
+    temporary = TemporaryDirectory(prefix="generation-worker-test-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)  # noqa: PT021 -- clean the checkout if fixture setup fails
+    tmp_path = Path(temporary.name)
+    source = Path(__file__).resolve().parents[2] / "scripts"
+    repository = tmp_path / "project" / "repo"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
-    git_directory = repository / ".git"
-    git_directory.mkdir()
-    (git_directory / "HEAD").write_text(f"{_COMMIT}\n", encoding="utf-8")
-    for name in (*_WORKER_SCRIPTS, "generation_prerequisites.sh"):
-        shutil.copy2(source_repository / "scripts" / name, scripts / name)
-    return repository
-
-
-def _spooled_script(repository: Path, name: str, tmp_path: Path) -> Path:
-    """Copy one submitted worker to the scheduler-managed runtime location."""
-    spool = tmp_path / "var/spool/slurmd/job123"
-    spool.mkdir(parents=True)
-    runtime_script = spool / "slurm_script"
-    shutil.copy2(repository / "scripts" / name, runtime_script)
-    assert not (spool / "generation_prerequisites.sh").exists()
-    return runtime_script
-
-
-def _compute_command(
-    runtime_script: Path,
-    repository: Path,
-    venv: Path,
-    tmp_path: Path,
-    storage: Path,
-    *,
-    mode: str = "environment-only",
-) -> list[str]:
-    """Return the exact relocated fake compute preflight command."""
-    return [
-        "/bin/bash",
-        str(runtime_script),
-        str(repository),
-        str(venv),
-        str(tmp_path / "campaign.yaml"),
-        str(storage),
-        "-",
-        mode,
-        "Python/3.10",
-        "Comsol/v6.4",
-        "python3",
-        "comsol",
-        "slurm",
-    ]
-
-
-def _campaign_command(runtime_script: Path, repository: Path) -> list[str]:
-    """Return one relocated production-worker startup command."""
-    return [
-        "/bin/bash",
-        str(runtime_script),
-        str(repository),
-        _CAMPAIGN_RUN_ID,
-        "synthetic.batch",
-        "1",
-        "16",
-    ]
-
-
-def _benchmark_command(runtime_script: Path, repository: Path) -> list[str]:
-    """Return one relocated benchmark measurement-worker startup command."""
-    return [
-        "/bin/bash",
-        str(runtime_script),
-        str(repository),
-        _BENCHMARK_RUN_ID,
-        "cores_04",
-        "nominal",
-    ]
-
-
-def _login_command(repository: Path, venv: Path, storage: Path) -> list[str]:
-    """Return the exact fake login preflight command."""
-    return [
-        "/bin/bash",
-        str(repository / "scripts/generation_cpu_login_preflight.sh"),
-        str(repository),
-        str(storage),
-        str(venv),
-        _COMMIT,
-        _REPOSITORY_URL,
-        "Python/3.10",
-        "python3",
-    ]
-
-
-def _assert_canonical_venv_validation(log: Path) -> None:
-    """Prove one shell entry point invoked the sole semantic validator."""
-    command_log = log.read_text(encoding="utf-8")
-    assert "preflight.validate_generation_venv" in command_log
-
-
-def test_compute_preflight_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
-    """Pass beyond helper loading when Slurm relocates the submitted preflight."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
+    storage = repository.parent / "storage"
+    runtime = repository.parent / "runtime"
+    storage.mkdir()
+    runtime.mkdir()
+    for name in _SCRIPTS:
+        shutil.copy2(source / name, scripts / name)
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-qm", "fixture"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+    source_sha = subprocess.check_output(["python3", str(scripts / "source_fingerprint.py"), str(repository)], text=True).strip()
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    command_log = tmp_path / "commands.log"
+    _write_executable(binary / "module", 'printf "module <%s>\\n" "$*" >> "$COMMAND_LOG"\n')
+    _write_executable(binary / "comsol", 'printf "COMSOL Multiphysics 6.4.0.293\\n"\n')
+    venv = runtime / "venvs" / "generation"
+    (venv / "bin").mkdir(parents=True)
+    _write_executable(
+        venv / "bin" / "python",
+        'printf "python <%s>\\n" "$*" >> "$COMMAND_LOG"\nif [[ "${3:-}" == cleanup-worker-workspace ]]; then rmdir -- "$4"; fi\n',
+    )
     scratch = tmp_path / "scratch"
-    storage = tmp_path / "storage"
     scratch.mkdir()
-    storage.mkdir()
-    environment.update(
-        {
-            "SLURM_JOB_ID": "123",
-            "TMPDIR": str(scratch),
-            "GENERATION_GIT_COMMIT": _COMMIT,
-        }
-    )
-
-    result = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "check=exact-worker-checkout status=pass" in result.stdout
-    assert "Native CPU environment-only completed" in result.stdout
-    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
-    _assert_canonical_venv_validation(log)
-    evidence = result.stdout + result.stderr + log.read_text(encoding="utf-8")
-    for login_only in ("rsync", "sbatch", "squeue", "sacct", "scancel"):
-        assert login_only not in evidence
-    assert not tuple(scratch.iterdir())
-
-
-def test_login_preflight_requires_rsync_with_explicit_diagnostic(tmp_path: Path) -> None:
-    """Fail the CPU login gate clearly when transfer-side rsync is absent."""
-    repository = Path(__file__).resolve().parents[2]
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-
-    result = subprocess.run(
-        _login_command(repository, venv, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 1
-    assert "CPU login prerequisite missing: rsync (blocks transfer)." in result.stderr
-
-
-def test_login_preflight_accepts_complete_control_plane(tmp_path: Path) -> None:
-    """Pass the authoritative login gate when all used capabilities exist."""
-    repository = Path(__file__).resolve().parents[2]
-    environment, venv, log = _fake_environment(tmp_path, include_rsync=True)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-
-    result = subprocess.run(
-        _login_command(repository, venv, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "domain=CPU login check=transfer-version:rsync status=pass" in result.stdout
-    assert "domain=CPU login check=Generation-venv-runtime status=pass" in result.stdout
-    _assert_canonical_venv_validation(log)
-
-
-def test_compute_preflight_reports_missing_venv_launcher(tmp_path: Path) -> None:
-    """Report a missing launcher before attempting canonical Python validation."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
-    (venv / "bin/python").unlink()
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
-
-    result = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 1
-    assert "CPU compute-node prerequisite missing: executable Generation venv launcher" in result.stderr
-    assert "No such file or directory" not in result.stderr
-
-
-def test_compute_preflight_reports_package_import_failure(tmp_path: Path) -> None:
-    """Surface a project/dependency import failure as a compute prerequisite."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
-    scratch = tmp_path / "scratch"
-    storage = tmp_path / "storage"
-    scratch.mkdir()
-    storage.mkdir()
-    environment.update(
-        {
-            "SLURM_JOB_ID": "123",
-            "TMPDIR": str(scratch),
-            "FAKE_VENV_IMPORT_FAIL": "true",
-            "GENERATION_GIT_COMMIT": _COMMIT,
-        }
-    )
-
-    result = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert result.returncode == 1
-    assert "synthetic package import failure" in result.stderr
-    assert "CPU compute-node prerequisite failed: Generation-venv-runtime" in result.stderr
-
-
-def _worker_environment(
-    environment: dict[str, str],
-    *,
-    venv: Path,
-    storage: Path,
-    scratch: Path,
-) -> dict[str, str]:
-    """Bind the shared compute values supplied by the control plane."""
-    return {
-        **environment,
-        "SLURM_JOB_ID": "123",
-        "SLURMD_NODENAME": "node-test",
+    environment = {
+        **{key: value for key, value in os.environ.items() if not key.startswith("BASH_FUNC_module")},
+        "PATH": f"{binary}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+        "SLURM_JOB_ID": "12345",
+        "SLURM_CPUS_PER_TASK": "2",
         "TMPDIR": str(scratch),
-        "GENERATION_GIT_COMMIT": _COMMIT,
-        "GENERATION_CPU_VENV": str(venv),
-        "STORAGE_ROOT": str(storage),
-        "GENERATION_PYTHON_MODULE": "Python/3.10",
+        "GENERATION_GIT_COMMIT": commit,
+        "GENERATION_SOURCE_SHA256": source_sha,
+        "GENERATION_NATIVE_VENV": str(venv),
+        "GENERATION_PYTHON_MODULE": "Python/3.12",
         "GENERATION_COMSOL_MODULE": "Comsol/v6.4",
         "GENERATION_PYTHON_EXECUTABLE": "python3",
         "GENERATION_COMSOL_EXECUTABLE": "comsol",
+        "GENERATION_ATTEMPT_INDEX": "1",
+        "GENERATION_CAMPAIGN_RUN_ID": _CAMPAIGN_RUN_ID,
+        "GENERATION_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
+        "STORAGE_ROOT": str(storage),
     }
+    return repository, environment, command_log
 
 
-def test_campaign_worker_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
-    """Start the real campaign worker from a spool copy with no sibling helper."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_campaign_node.sh", tmp_path)
-    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
-    scratch = tmp_path / "scratch"
-    storage = tmp_path / "storage"
-    scratch.mkdir()
-    storage.mkdir()
-    worker_environment = _worker_environment(
-        environment,
-        venv=venv,
-        storage=storage,
-        scratch=scratch,
-    )
-    worker_environment.update(
-        {
-            "SLURM_CPUS_PER_TASK": "16",
-            "GENERATION_CAMPAIGN_RUN_ID": _CAMPAIGN_RUN_ID,
-            "GENERATION_ATTEMPT_INDEX": "1",
-        }
-    )
-
+@pytest.mark.parametrize(
+    ("script", "arguments", "expected_cli"),
+    [
+        ("generation_campaign_node.sh", (_CAMPAIGN_RUN_ID, "batch", "1", "2"), "run-campaign-case"),
+        ("generation_benchmark_node.sh", (_BENCHMARK_RUN_ID, "cores_02", "nominal"), "run-core-benchmark-case"),
+    ],
+)
+def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
+    native_worker: tuple[Path, dict[str, str], Path],
+    tmp_path: Path,
+    script: str,
+    arguments: tuple[str, ...],
+    expected_cli: str,
+) -> None:
+    """Run the worker from Slurm's spool path with only shared source beside it."""
+    repository, environment, command_log = native_worker
+    spooled = tmp_path / "slurm_script"
+    shutil.copy2(repository / "scripts" / script, spooled)
     result = subprocess.run(
-        _campaign_command(runtime_script, repository),
-        check=False,
-        capture_output=True,
+        ["/bin/bash", str(spooled), str(repository), *arguments],
+        env=environment,
         text=True,
-        env=worker_environment,
+        capture_output=True,
+        check=False,
     )
-
     assert result.returncode == 0, result.stderr
-    start_lines = [line for line in result.stdout.splitlines() if line.startswith("CASE START ")]
-    assert len(start_lines) == 1
-    assert result.stdout.splitlines()[0] == start_lines[0]
-    assert f"campaign_run_id={_CAMPAIGN_RUN_ID}" in start_lines[0]
-    assert "batch=synthetic.batch" in start_lines[0]
-    assert "case=case_0001 case_index=1 job=123 node=node-test cores=16" in start_lines[0]
-    assert start_lines[0].endswith("Z")
-    assert "check=exact-worker-checkout status=pass" in result.stdout
-    assert "initialize-worker-workspace" in log.read_text(encoding="utf-8")
-    assert "run-campaign-case" in log.read_text(encoding="utf-8")
-    _assert_canonical_venv_validation(log)
-    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+    assert "check=source-worktree status=pass" in result.stdout
+    commands = command_log.read_text(encoding="utf-8")
+    assert "module <load Python/3.12>" in commands
+    assert "module <load Comsol/v6.4>" in commands
+    assert expected_cli in commands
+    assert "cleanup-worker-workspace" in commands
+    assert not tuple(Path(environment["TMPDIR"]).iterdir())
 
 
-def test_benchmark_worker_is_independent_of_slurm_spool_location(tmp_path: Path) -> None:
-    """Start a benchmark measurement from a spool copy with no sibling helper."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_benchmark_node.sh", tmp_path)
-    environment, venv, log = _fake_environment(tmp_path, include_rsync=False)
-    scratch = tmp_path / "scratch"
-    storage = tmp_path / "storage"
-    scratch.mkdir()
-    storage.mkdir()
-    worker_environment = _worker_environment(
-        environment,
-        venv=venv,
-        storage=storage,
-        scratch=scratch,
-    )
-    worker_environment.update(
-        {
-            "SLURM_CPUS_PER_TASK": "1",
-            "GENERATION_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
-        }
-    )
-
+def test_worker_rejects_source_change_before_python_or_comsol(
+    native_worker: tuple[Path, dict[str, str], Path],
+) -> None:
+    """Fail closed when shared source changes after the launch fingerprint."""
+    repository, environment, command_log = native_worker
+    helper = repository / "scripts" / "source_fingerprint.py"
+    helper.write_text(helper.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
     result = subprocess.run(
-        _benchmark_command(runtime_script, repository),
-        check=False,
-        capture_output=True,
+        ["/bin/bash", str(repository / "scripts" / "generation_campaign_node.sh"), str(repository), _CAMPAIGN_RUN_ID, "batch", "1", "2"],
+        env=environment,
         text=True,
-        env=worker_environment,
+        capture_output=True,
+        check=False,
     )
-
-    assert result.returncode == 0, result.stderr
-    assert "check=exact-worker-checkout status=pass" in result.stdout
-    log_text = log.read_text(encoding="utf-8")
-    assert "run-core-benchmark-case" in log_text
-    _assert_canonical_venv_validation(log)
-    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
+    assert result.returncode != 0
+    assert "unchanged source worktree since submission" in result.stderr
+    assert not command_log.exists()
 
 
-def test_relocated_worker_reports_missing_repository_helper(tmp_path: Path) -> None:
-    """Fail explicitly instead of letting source report a spool sibling error."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    (repository / "scripts/generation_prerequisites.sh").unlink()
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
-
+def test_comsol_version_rejects_zero_exit_with_invalid_launcher_output(
+    native_worker: tuple[Path, dict[str, str], Path],
+) -> None:
+    """Do not report a ready solver when its launcher prints an error and exits zero."""
+    repository, environment, _command_log = native_worker
+    fake_comsol = Path(environment["PATH"].split(os.pathsep)[0]) / "comsol"
+    _write_executable(fake_comsol, 'printf "Invalid Configuration Location\\n"\n')
     result = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
-        text=True,
+        [
+            "/bin/bash",
+            "-c",
+            'source "$1"; generation_comsol_version comsol',
+            "bash",
+            str(repository / "scripts" / "generation_prerequisites.sh"),
+        ],
         env=environment,
-    )
-
-    assert result.returncode == 1
-    assert "CPU compute-node prerequisite failed: repository helper missing or unreadable" in result.stderr
-    assert f"canonical CPU checkout: {repository}" in result.stderr
-    assert f"Slurm script: {runtime_script}" in result.stderr
-    assert str(runtime_script.parent / "generation_prerequisites.sh") not in result.stderr
-
-
-def test_worker_repository_rejects_unsafe_paths_and_wrong_commit(tmp_path: Path) -> None:
-    """Reject relative, symlinked, helper-symlinked, and wrong-commit checkouts."""
-    repository = _fake_checkout(tmp_path)
-    runtime_script = _spooled_script(repository, "generation_cpu_smoke.sh", tmp_path)
-    environment, venv, _log = _fake_environment(tmp_path, include_rsync=False)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    environment.update({"SLURM_JOB_ID": "123", "GENERATION_GIT_COMMIT": _COMMIT})
-
-    relative = subprocess.run(
-        _compute_command(runtime_script, Path("relative/repo"), venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
         text=True,
-        env=environment,
-    )
-    assert relative.returncode == 1
-    assert "explicit canonical CPU repository required" in relative.stderr
-
-    alias = tmp_path / "checkout-alias"
-    alias.symlink_to(repository, target_is_directory=True)
-    linked_repository = subprocess.run(
-        _compute_command(runtime_script, alias, venv, tmp_path, storage),
-        check=False,
         capture_output=True,
-        text=True,
-        env=environment,
-    )
-    assert linked_repository.returncode == 1
-    assert "safe canonical CPU checkout" in linked_repository.stderr
-
-    helper = repository / "scripts/generation_prerequisites.sh"
-    external_helper = tmp_path / "external-prerequisites.sh"
-    shutil.copy2(helper, external_helper)
-    helper.unlink()
-    helper.symlink_to(external_helper)
-    linked_helper = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
         check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
     )
-    assert linked_helper.returncode == 1
-    assert "repository helper missing or unreadable" in linked_helper.stderr
+    assert result.returncode != 0
+    assert "invalid v6.4 evidence" in result.stderr
+    assert not tuple(Path(environment["TMPDIR"]).iterdir())
 
-    helper.unlink()
-    shutil.copy2(external_helper, helper)
-    (repository / ".git/HEAD").write_text(f"{'b' * 40}\n", encoding="utf-8")
-    wrong_commit = subprocess.run(
-        _compute_command(runtime_script, repository, venv, tmp_path, storage),
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
+
+@pytest.mark.parametrize("batch_exit", [0, 37])
+def test_native_smoke_runs_compiled_java_and_propagates_batch_failure(
+    native_worker: tuple[Path, dict[str, str], Path],
+    batch_exit: int,
+) -> None:
+    """Exercise the disposable COMSOL batch contract and scratch cleanup."""
+    repository, environment, command_log = native_worker
+    fake_comsol = Path(environment["PATH"].split(os.pathsep)[0]) / "comsol"
+    _write_executable(
+        fake_comsol,
+        'printf "comsol <%s>\\n" "$*" >> "$COMMAND_LOG"\n'
+        'if [[ "$1" == -configuration ]]; then printf "COMSOL Multiphysics 6.4.0.293\\n"; exit 0; fi\n'
+        'if [[ "$1" == compile ]]; then\n'
+        '  grep -Fq "public static void main(String[] args) throws java.io.IOException" GenerationNativeSmoke.java\n'
+        '  grep -Fq "model.save(\\"smoke.mph\\");" GenerationNativeSmoke.java\n'
+        '  printf "compiled" > GenerationNativeSmoke.class\n'
+        "  exit 0\n"
+        "fi\n"
+        'printf "batch log\\n" > smoke.log\n'
+        'if (( SMOKE_BATCH_EXIT != 0 )); then exit "$SMOKE_BATCH_EXIT"; fi\n'
+        'printf "disposable model" > smoke.mph\n',
     )
-    assert wrong_commit.returncode == 1
-    assert f"checkout commit {_COMMIT}" in wrong_commit.stderr
+    environment["SLURM_CPUS_PER_TASK"] = "1"
+    environment["SMOKE_BATCH_EXIT"] = str(batch_exit)
+    result = subprocess.run(
+        ["/bin/bash", str(repository / "scripts" / "generation_smoke_node.sh"), str(repository)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == batch_exit, result.stderr
+    assert "check=source-worktree status=pass" in result.stdout
+    assert "comsol <compile" in command_log.read_text(encoding="utf-8")
+    assert "comsol <batch" in command_log.read_text(encoding="utf-8")
+    assert ("GENERATION NATIVE SMOKE PASS" in result.stdout) == (batch_exit == 0)
+    assert not tuple(Path(environment["TMPDIR"]).iterdir())
+
+
+def test_worker_rejects_non_sibling_environment(
+    native_worker: tuple[Path, dict[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """Keep durable storage and the canonical venv in their sibling roots."""
+    repository, environment, command_log = native_worker
+    environment["STORAGE_ROOT"] = str(tmp_path / "other-storage")
+    result = subprocess.run(
+        ["/bin/bash", str(repository / "scripts" / "generation_campaign_node.sh"), str(repository), _CAMPAIGN_RUN_ID, "batch", "1", "2"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "sibling storage" in result.stderr
+    assert not command_log.exists()

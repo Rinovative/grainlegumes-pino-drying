@@ -12,7 +12,7 @@ Design principles:
   - Parser and dispatch code stays thin and import-light
   - Runtime overrides are forwarded without semantic reinterpretation
   - Training completion and artifact post-processing remain separate facts
-  - Material lifecycle failures remain visible to shell and queue callers
+  - Material lifecycle failures remain visible to shell and scheduler callers
 
 This module does NOT:
   - Allocate, seed, persist, resume, or train runs. ``experiments.run`` owns lifecycle
@@ -91,8 +91,9 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
         config_path = shlex.quote(str(report.get("config_path")))
         run_dir = shlex.quote(str(report.get("run_dir")))
         print("Resume explicitly with:", file=sys.stderr)
+        print("  Replace RESOURCE_OPTIONS with matching CPU or typed-GPU flags; see ./scripts/slurm_ml.sh --help.", file=sys.stderr)
         print(
-            f"  ./scripts/docker_job.sh train {config_path} --resume {run_dir}",
+            f"  ./scripts/slurm_ml.sh RESOURCE_OPTIONS train {config_path} --resume {run_dir}",
             file=sys.stderr,
         )
 

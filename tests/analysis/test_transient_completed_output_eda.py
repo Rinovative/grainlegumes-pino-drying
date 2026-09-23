@@ -305,9 +305,9 @@ def test_transient_dispatch_discovers_complete_canonical_evidence(
     )
     intervals = transient.boundary_interval_table(transient_frame)
     assert intervals.loc[0, "startup_support_present"] == 1.0
-    support_offset = float(intervals.loc[0, "startup_support_time_offset"])
+    support_offset = float(cast("Any", intervals.loc[0, "startup_support_time_offset"]))
     assert support_offset > 0.0
-    support_time = float(intervals.loc[0, "t_n_hours"]) + support_offset
+    support_time = float(cast("Any", intervals.loc[0, "t_n_hours"])) + support_offset
     schedule_time = np.asarray(transient_frame.iloc[0]["schedule"]["t"], dtype=float)
     assert np.count_nonzero(np.isclose(schedule_time, support_time, rtol=0.0, atol=1.0e-7)) == 1
     schedule = transient_frame.iloc[0]["schedule"]
@@ -315,8 +315,8 @@ def test_transient_dispatch_discovers_complete_canonical_evidence(
         ("T_in_bc", "T_in_bc_t_n", "T_in_bc_t_n_plus_1"),
         ("omega_in_bc", "omega_in_bc_t_n", "omega_in_bc_t_n_plus_1"),
     ):
-        current_index = int(np.flatnonzero(np.isclose(schedule_time, intervals.loc[0, "t_n_hours"]))[0])
-        following_index = int(np.flatnonzero(np.isclose(schedule_time, intervals.loc[0, "t_n_plus_1_hours"]))[0])
+        current_index = int(np.flatnonzero(np.isclose(schedule_time, cast("Any", intervals.loc[0, "t_n_hours"])))[0])
+        following_index = int(np.flatnonzero(np.isclose(schedule_time, cast("Any", intervals.loc[0, "t_n_plus_1_hours"])))[0])
         assert intervals.loc[0, current_name] == pytest.approx(schedule[schedule_name][current_index])
         assert intervals.loc[0, following_name] == pytest.approx(schedule[schedule_name][following_index])
     assert not transient.schedule_summary(transient_frame).empty
@@ -721,7 +721,7 @@ def test_inlet_pressure_profile_uses_the_authoritative_spatial_coordinate(
     transient_frame: pd.DataFrame,
 ) -> None:
     """Extract the inlet-pressure line on its stored spatial support."""
-    row = transient_frame.loc["case_0001"]
+    row = cast("pd.Series[Any]", transient_frame.loc["case_0001"])
     inlet_coordinate, pressure = capabilities.inlet_pressure_boundary(
         transient_frame,
         row,

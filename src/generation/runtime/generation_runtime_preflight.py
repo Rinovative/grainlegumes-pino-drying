@@ -251,7 +251,7 @@ def _path_guard_probe(
                 expected_case_id="preflight-probe",
                 allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
             )
-        except (ValueError, RuntimeError):  # noqa: PERF203 -- every protected target is independently audited
+        except (ValueError, RuntimeError):  # every protected target is independently audited
             rejected.append(str(candidate))
         else:
             message = f"Cleanup guard unexpectedly accepted protected path: {candidate}"

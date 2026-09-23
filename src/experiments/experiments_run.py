@@ -29,6 +29,8 @@ import hashlib
 import json
 import os
 import random
+import re
+import shlex
 import shutil
 import time
 import uuid
@@ -428,12 +430,70 @@ def runtime_session_updates(
         "started_at": started_at.isoformat(),
         **device_metadata,
     }
+    slurm_provenance = _slurm_runtime_provenance()
+    if slurm_provenance is not None:
+        session["slurm"] = slurm_provenance
     if tracking_state is not None:
         session["tracking"] = copy.deepcopy(dict(tracking_state))
     return {
         "runtime_device": device_metadata,
         "runtime_sessions": [*copy.deepcopy(raw_sessions), session],
     }
+
+
+def _slurm_runtime_provenance() -> dict[str, Any] | None:
+    """Read the allocated worker's operational evidence for one runtime session."""
+    raw = os.environ.get("ML_SLURM_PROVENANCE")
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        msg = "ML_SLURM_PROVENANCE must contain valid JSON from the Slurm worker."
+        raise RunLifecycleError(msg) from error
+    required = {
+        "job_id",
+        "partition",
+        "cpus_per_task",
+        "requested_memory",
+        "requested_wall_time",
+        "allocated_mem_per_node",
+        "mode",
+        "gres",
+        "source_commit",
+        "source_worktree_sha256",
+        "config_sha256",
+        "sif_path",
+        "sif_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        msg = "ML_SLURM_PROVENANCE has an unsupported worker schema."
+        raise RunLifecycleError(msg)
+    if (
+        not isinstance(payload["job_id"], str)
+        or re.fullmatch(r"[1-9][0-9]*", payload["job_id"]) is None
+        or not isinstance(payload["cpus_per_task"], int)
+        or isinstance(payload["cpus_per_task"], bool)
+        or payload["cpus_per_task"] < 1
+        or not isinstance(payload["mode"], str)
+        or payload["mode"] not in {"cpu", "gpu"}
+        or not isinstance(payload["gres"], str)
+        or (payload["mode"] == "cpu" and payload["gres"] != "none")
+        or (payload["mode"] == "gpu" and re.fullmatch(r"gpu:(?:v100|rtxa6000|rtx6000ada):1", payload["gres"]) is None)
+        or payload["sif_path"] != "/workspace/runtime/containers/grainlegumes-pino-drying.sif"
+    ):
+        msg = "ML_SLURM_PROVENANCE has invalid Slurm resource or SIF fields."
+        raise RunLifecycleError(msg)
+    for key in ("source_commit", "source_worktree_sha256", "config_sha256", "sif_sha256"):
+        length = 40 if key == "source_commit" else 64
+        if not isinstance(payload[key], str) or re.fullmatch(rf"[0-9a-f]{{{length}}}", payload[key]) is None:
+            msg = f"ML_SLURM_PROVENANCE has an invalid {key} digest."
+            raise RunLifecycleError(msg)
+    for key in ("partition", "requested_memory", "requested_wall_time", "allocated_mem_per_node"):
+        if not isinstance(payload[key], str):
+            msg = f"ML_SLURM_PROVENANCE has an invalid {key} field."
+            raise RunLifecycleError(msg)
+    return payload
 
 
 def _update_runtime_session_locked(
@@ -954,7 +1014,11 @@ def reject_existing_fresh_run(
     requested_digest = report["requested_config_digest"]
     if existing_digest == requested_digest:
         report["reason"] = (
-            f"Matching run already exists; use explicit resume: ./scripts/docker_job.sh train {report['config_path']} --resume {report['run_dir']}"
+            "Matching run already exists; use explicit resume: "
+            "replace RESOURCE_OPTIONS with matching CPU or typed-GPU flags "
+            "(./scripts/slurm_ml.sh --help), then run "
+            "./scripts/slurm_ml.sh RESOURCE_OPTIONS "
+            f"train {shlex.quote(str(report['config_path']))} --resume {shlex.quote(str(report['run_dir']))}"
         )
     elif existing_digest is not None:
         report["reason"] = (

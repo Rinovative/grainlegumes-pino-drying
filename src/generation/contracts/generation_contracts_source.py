@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,53 @@ from src import common
 
 GIT_COMMIT_ENVIRONMENT_VARIABLE = "GENERATION_GIT_COMMIT"
 _GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+_SOURCE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+class SourceAdmissionError(RuntimeError):
+    """Report changed or unavailable shared source before durable publication."""
+
+
+def validate_admitted_source_before_publication() -> None:
+    """Reject changed shared source before Slurm work publishes durable evidence."""
+    expected = os.environ.get("GENERATION_SOURCE_SHA256")
+    if expected is None:
+        return
+    if _SOURCE_SHA256_PATTERN.fullmatch(expected) is None:
+        message = "Generation source admission fingerprint is malformed."
+        raise SourceAdmissionError(message)
+    try:
+        expected_commit = required_git_commit()
+    except (RuntimeError, ValueError) as error:
+        message = "Generation source admission commit is missing or malformed."
+        raise SourceAdmissionError(message) from error
+    repository = common.paths.get_project_root().resolve()
+    try:
+        current_commit = subprocess.run(  # noqa: S603 -- fixed Git argument vector
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        message = "Shared Generation commit cannot be verified before publication."
+        raise SourceAdmissionError(message) from error
+    if current_commit != expected_commit:
+        message = "Shared Generation commit changed after Slurm admission; publication refused."
+        raise SourceAdmissionError(message)
+    try:
+        result = subprocess.run(  # noqa: S603 -- fixed source fingerprint invocation
+            [sys.executable, str(repository / "scripts/source_fingerprint.py"), str(repository)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        message = "Shared Generation source cannot be fingerprinted before publication."
+        raise SourceAdmissionError(message) from error
+    if result.stdout.strip() != expected:
+        message = "Shared Generation source changed after Slurm admission; publication refused."
+        raise SourceAdmissionError(message)
 
 
 def validate_git_commit(value: Any) -> str:

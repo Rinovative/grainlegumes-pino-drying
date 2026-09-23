@@ -150,7 +150,8 @@ def mismatch_message(result: ConfigPreflight, *, requested_workflow: str) -> str
                 "Requested workflow: train",
                 "",
                 "Use:",
-                f"./scripts/docker_job.sh optuna {_quoted(result.canonical_path)}",
+                "Replace RESOURCE_OPTIONS with matching CPU or typed-GPU flags; see ./scripts/slurm_ml.sh --help.",
+                f"./scripts/slurm_ml.sh RESOURCE_OPTIONS optuna {_quoted(result.canonical_path)}",
             )
         )
     lines = [
@@ -161,7 +162,8 @@ def mismatch_message(result: ConfigPreflight, *, requested_workflow: str) -> str
         "This file is a normal training experiment.",
         "",
         "Train it with:",
-        f"./scripts/docker_job.sh train {_quoted(result.canonical_path)}",
+        "Replace RESOURCE_OPTIONS with matching CPU or typed-GPU flags; see ./scripts/slurm_ml.sh --help.",
+        f"./scripts/slurm_ml.sh RESOURCE_OPTIONS train {_quoted(result.canonical_path)}",
     ]
     matches = matching_optuna_configs(result)
     if len(matches) == 1:
@@ -169,7 +171,7 @@ def mismatch_message(result: ConfigPreflight, *, requested_workflow: str) -> str
             (
                 "",
                 "Matching Optuna study:",
-                f"./scripts/docker_job.sh optuna {_quoted(matches[0].canonical_path)}",
+                f"./scripts/slurm_ml.sh RESOURCE_OPTIONS optuna {_quoted(matches[0].canonical_path)}",
             )
         )
     return "\n".join(lines)

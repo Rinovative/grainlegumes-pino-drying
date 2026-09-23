@@ -1,22 +1,23 @@
 """
 common_paths.py
 
-Resolve repository paths and the unified scientific storage lifecycle.
+Resolve repository, runtime, and scientific-storage paths.
 
 Responsibilities:
-  - Resolve the sole public ``STORAGE_ROOT`` contract and its numbered areas
+  - Resolve repository, replaceable runtime, and scientific-storage root contracts
   - Derive generation, dataset, experiment, and coordination-state paths
   - Resolve final datasets, metadata snapshots, runs, studies, and artifacts
   - Identify completed and evaluable saved-run directories by required local files
 
 Design principles:
-  - Every scientific path descends from one explicitly resolved storage root
-  - The portable default is the storage directory beside the repository
+  - Durable scientific paths descend from one explicitly resolved storage root
+  - Portable storage and runtime defaults are sibling directories beside the repository
   - Generation, immutable datasets, and experiments remain separate lifecycle areas
   - Logical names are validated as single path components before composition
   - The current saved-run file contract is explicit and centralized
 
 This module does NOT:
+  - Redefine durable scientific paths or their ``.state`` coordination semantics
   - Create datasets, runs, checkpoints, summaries, or analysis artifacts
   - Decide dataset membership, experiment semantics, or resume eligibility
   - Validate run or artifact contents beyond shallow discovery predicates
@@ -101,6 +102,31 @@ def get_storage_root(*, storage_root: Path | str | None = None) -> Path:
     if root:
         return Path(root).expanduser()
     return get_project_root().parent / "storage"
+
+
+def get_runtime_root(*, runtime_root: Path | str | None = None) -> Path:
+    """
+    Return the canonical replaceable runtime root.
+
+    Parameters
+    ----------
+    runtime_root : Path | str | None, optional
+        Explicit internal boundary used by controlled callers and tests. When
+        omitted, ``RUNTIME_ROOT`` is the sole environment override and the
+        portable default is ``<repository-parent>/runtime``.
+
+    Returns
+    -------
+    Path
+        Expanded runtime-root path without creating it.
+
+    """
+    if runtime_root is not None:
+        return Path(runtime_root).expanduser()
+    root = os.environ.get("RUNTIME_ROOT")
+    if root:
+        return Path(root).expanduser()
+    return get_project_root().parent / "runtime"
 
 
 def get_generation_root(*, storage_root: Path | str | None = None) -> Path:
@@ -217,16 +243,6 @@ def get_run_locks_root(*, storage_root: Path | str | None = None) -> Path:
 def get_transient_scaler_cache_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the integrity-bound transient Train-scaler cache root."""
     return get_experiment_state_root(storage_root=storage_root) / "transient_scalers"
-
-
-def resolve_queue_log_dir(
-    scope: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Return one validated experiment scope's host-visible queue-log directory."""
-    scope = validate_logical_name(scope, label="queue log scope")
-    return get_experiments_root(storage_root=storage_root) / scope / "logs" / "queue"
 
 
 def resolve_generation_batch_metadata_directory(

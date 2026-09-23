@@ -1,6 +1,4 @@
 {
-  "python.defaultInterpreterPath": "/opt/micromamba/envs/grainlegumes-pino/bin/python",
-
   "editor.formatOnSave": true,
   "editor.defaultFormatter": "charliermarsh.ruff",
 

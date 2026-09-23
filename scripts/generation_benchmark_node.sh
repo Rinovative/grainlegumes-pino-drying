@@ -46,12 +46,12 @@ TASK_ID="${CASE_ROLE}"
 REPOSITORY_ROOT="$1"
 PREREQUISITE_HELPER="${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
 if [[ "${REPOSITORY_ROOT}" != /* || "${REPOSITORY_ROOT}" == / ]]; then
-  printf 'CPU compute-node prerequisite failed: explicit canonical CPU repository required: %s (Slurm script: %s).\n' \
+  printf 'Generation compute-node prerequisite failed: explicit shared repository required: %s (Slurm script: %s).\n' \
     "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
   exit 1
 fi
 if [[ ! -f "${PREREQUISITE_HELPER}" || -L "${PREREQUISITE_HELPER}" || ! -r "${PREREQUISITE_HELPER}" ]]; then
-  printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (canonical CPU checkout: %s; Slurm script: %s).\n' \
+  printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (shared repository: %s; Slurm script: %s).\n' \
     "${REPOSITORY_ROOT}" "${BASH_SOURCE[0]}" >&2
   exit 1
 fi
@@ -60,25 +60,15 @@ fi
 # shellcheck source=generation_prerequisites.sh
 source "${PREREQUISITE_HELPER}"
 COMPUTE_DOMAIN="CPU compute-node"
-generation_require_command "${COMPUTE_DOMAIN}" git "benchmark checkout validation"
-[[ -d "${REPOSITORY_ROOT}/.git" ]] || {
-  printf 'Benchmark repository checkout is missing: %s\n' "${REPOSITORY_ROOT}" >&2
-  exit 1
-}
-ACTUAL_COMMIT="$(git -C "${REPOSITORY_ROOT}" rev-parse HEAD)"
-if [[ "${ACTUAL_COMMIT}" != "${GENERATION_GIT_COMMIT}" ]]; then
-  printf 'Benchmark checkout %s does not match launch commit %s.\n' \
-    "${ACTUAL_COMMIT}" "${GENERATION_GIT_COMMIT}" >&2
-  exit 1
-fi
-if [[ -n "$(git -C "${REPOSITORY_ROOT}" status --porcelain)" ]]; then
-  printf 'Benchmark repository checkout must be clean.\n' >&2
-  exit 1
-fi
-GENERATION_CPU_VENV="${GENERATION_CPU_VENV:-}"
+GENERATION_NATIVE_VENV="${GENERATION_NATIVE_VENV:-}"
 STORAGE_ROOT="${STORAGE_ROOT:-}"
-if [[ "${GENERATION_CPU_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
-  printf 'GENERATION_CPU_VENV and STORAGE_ROOT must be explicit absolute paths.\n' >&2
+if [[ "${GENERATION_NATIVE_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
+  printf 'GENERATION_NATIVE_VENV and STORAGE_ROOT must be explicit absolute paths.\n' >&2
+  exit 2
+fi
+if [[ "$(realpath -m -- "${STORAGE_ROOT}")" != "$(realpath -m -- "${REPOSITORY_ROOT}/../storage")" \
+  || "$(realpath -m -- "${GENERATION_NATIVE_VENV}")" != "$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/generation")" ]]; then
+  printf 'Generation worker requires the sibling storage and runtime Generation venv.\n' >&2
   exit 2
 fi
 for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
@@ -109,10 +99,10 @@ generation_require_command \
   "${COMPUTE_DOMAIN}" "${GENERATION_COMSOL_EXECUTABLE}" "benchmark compute"
 generation_run_check \
   "${COMPUTE_DOMAIN}" "comsol-version:${GENERATION_COMSOL_EXECUTABLE}" "benchmark compute" \
-  "${GENERATION_COMSOL_EXECUTABLE}" -version
+  generation_comsol_version "${GENERATION_COMSOL_EXECUTABLE}"
 cd "${REPOSITORY_ROOT}"
-generation_validate_cpu_venv \
-  "${COMPUTE_DOMAIN}" "${GENERATION_CPU_VENV}" \
+generation_validate_native_venv \
+  "${COMPUTE_DOMAIN}" "${GENERATION_NATIVE_VENV}" \
   "benchmark preparation and HDF5 conversion/admission"
 
 export STORAGE_ROOT
@@ -128,9 +118,10 @@ INTERRUPTION_SIGNAL=""
 
 cleanup_worker() {
   if [[ "${MARKER_READY}" != true ]]; then
-    return 0
+    rmdir -- "${WORK_ROOT}"
+    return
   fi
-  "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation \
+  "${GENERATION_NATIVE_VENV}/bin/python" -m src.generation.cli.cli_generation \
     cleanup-worker-workspace "${WORK_ROOT}" \
     --campaign-run-id "${RUN_ID}" \
     --storage-root "${STORAGE_ROOT}"
@@ -164,14 +155,14 @@ trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
 trap on_exit EXIT
 
-"${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation \
+"${GENERATION_NATIVE_VENV}/bin/python" -m src.generation.cli.cli_generation \
   initialize-worker-workspace "${WORK_ROOT}" \
   --campaign-run-id "${RUN_ID}" \
   --storage-root "${STORAGE_ROOT}" >/dev/null
 MARKER_READY=true
 
 COMMAND=(
-  "${GENERATION_CPU_VENV}/bin/python" -m src.generation.cli.cli_generation
+  "${GENERATION_NATIVE_VENV}/bin/python" -m src.generation.cli.cli_generation
   run-core-benchmark-case "${RUN_ID}" "${VARIANT_ID}"
   "${CASE_ROLE}"
   --storage-root "${STORAGE_ROOT}"

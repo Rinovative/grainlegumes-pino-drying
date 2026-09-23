@@ -10,12 +10,11 @@ from collections import defaultdict
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 
 import h5py
 import pytest
 import yaml
-from typing_extensions import Self
 
 from src import common, generation
 from src.generation import generation_campaign_status as status_service
@@ -26,6 +25,21 @@ from src.generation.runtime import generation_runtime_cluster as cluster_service
 
 _COMMIT = "a" * 40
 _SCALING_CASE_COUNTS = (4, 8, 16, 32)
+
+
+def _admit_synthetic_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply launch provenance while testing metadata costs in a synthetic tree."""
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", _COMMIT)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
+    monkeypatch.setenv(
+        "GENERATION_NATIVE_VENV",
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+    )
+    monkeypatch.setattr(
+        generation.campaign.source_service,
+        "validate_admitted_source_before_publication",
+        lambda: None,
+    )
 
 
 class _CountingReader:
@@ -508,6 +522,7 @@ def test_stage4_reuses_stage3_evidence_with_linear_metadata_work(
         )
         job_id = str(9100 + case_count)
         with monkeypatch.context() as scoped:
+            _admit_synthetic_submission(scoped)
             counts = _install_operation_counters(scoped, storage=storage)
             scoped.setattr(
                 input_service,
@@ -588,6 +603,7 @@ def test_stage4_submission_manifest_loads_remain_bounded_as_work_units_scale(
         job_ids = tuple(str(9300 + case_count * 100 + index) for index in range(case_count))
 
         with monkeypatch.context() as scoped:
+            _admit_synthetic_submission(scoped)
             counts = _install_operation_counters(scoped, storage=storage)
             original_manifest_load = generation.campaign.campaign_evidence.load_campaign_run
 
@@ -649,6 +665,7 @@ def test_unchanged_monitor_scaling_is_linear_metadata_work(
         job_id = str(9200 + case_count)
         setup_counts: defaultdict[str, int] = defaultdict(int)
         with monkeypatch.context() as scoped:
+            _admit_synthetic_submission(scoped)
             scoped.setattr(generation.campaign, "_repository_commit", lambda: _COMMIT)
             scoped.setattr(generation.campaign.subprocess, "run", _fake_slurm(job_id, setup_counts, active=False))
             manifest = generation.campaign.submit_campaign(

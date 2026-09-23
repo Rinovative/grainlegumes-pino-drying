@@ -1,7 +1,7 @@
 # Dataset and experiment identity
 
 Human-readable labels and immutable scientific identity serve different purposes.
-Labels organize queues, local directories, and W&B views. Exact Dataset IDs,
+Labels organize scheduler jobs, local directories, and W&B views. Exact Dataset IDs,
 resolved configurations, hashes, revisions, checkpoints, and opaque W&B run IDs
 remain authoritative for reproducibility and resume.
 
@@ -71,12 +71,12 @@ it never silently reuses a completed Stage A0. Continue only with an explicit
 matching parent record. Legacy saved runs keep their legacy names and resume
 schema.
 
-## Queue and W&B presentation
+## Slurm and W&B presentation
 
-Training queue labels are derived from the resolved child run label, for example
-`train-<parent>_a0-<short-log-id>`. The full config path and invocation remain
-in the queue descriptor and log metadata, so the short process label is not
-identity evidence.
+The ML submission wrapper names Slurm jobs by operation and task. Its job ID,
+resource request, source revision and worktree fingerprint, config hash, and SIF
+identity appear in runtime logs. Training runtime sessions also record this
+operational provenance. A scheduler label is not scientific identity evidence.
 
 Current transient W&B runs use the parent label as `group` and `stage_a0`,
 `stage_a_plus`, or `stage_b` as `job_type`. Opaque persisted W&B IDs remain the

@@ -646,6 +646,7 @@ def _recover_input_transaction(
     ):
         message = f"Input-generation transaction evidence is invalid: {transaction}"
         raise RuntimeError(message)
+    source_service.validate_admitted_source_before_publication()
     raw_directory.mkdir(parents=True, exist_ok=True)
     for case_id in new_case_ids:
         target = raw_directory / case_id
@@ -840,6 +841,7 @@ def generate_input_cases(
                     manifest_path=staged_metadata / "input_generation_manifest.json",
                     new_case_ids=tuple(config.case_id(index) for index in generated_indices),
                 )
+                source_service.validate_admitted_source_before_publication()
                 raw_directory.mkdir(parents=True, exist_ok=True)
                 for case_index in generated_indices:
                     target_case = raw_directory / config.case_id(case_index)
@@ -953,19 +955,26 @@ def _equivalent_cli_command(
     request: CampaignInputGenerationRequest,
     campaign: config_service.CampaignConfig,
     git_commit: str,
-) -> str:
-    """Return the equivalent copyable canonical CLI command."""
+) -> tuple[str | None, str | None]:
+    """Return a copyable canonical command only for a supported shared launch."""
     repository = common.paths.get_project_root().resolve()
     campaign_path = campaign.source_path.resolve()
+    storage_root = Path(request.storage_root).expanduser().resolve()
+    if storage_root != (repository.parent / "storage").resolve():
+        return None, "The maintained Generation launcher owns the sibling storage root."
     try:
         campaign_argument = campaign_path.relative_to(repository).as_posix()
     except ValueError:
-        campaign_argument = str(campaign_path)
+        return None, "The maintained Generation launcher requires a campaign config in the repository."
+    try:
+        current_commit = source_service.clean_repository_git_commit(repository)
+    except RuntimeError as error:
+        return None, str(error)
+    if current_commit != git_commit:
+        return None, "The maintained Generation launcher requires the selected commit to equal clean shared HEAD."
     command = [
-        "./scripts/docker_python.sh",
-        "-m",
-        "src.generation.cli.cli_generation",
-        "generate-input-cases",
+        "./scripts/generation_workflow.sh",
+        "inputs",
         campaign_argument,
     ]
     if request.all_batches:
@@ -982,8 +991,8 @@ def _equivalent_cli_command(
         command.extend(("--case-count", str(request.case_count)))
     if request.action == "dry_run":
         command.append("--dry-run")
-    command.extend(("--git-commit", git_commit, "--storage-root", str(Path(request.storage_root).expanduser())))
-    return shlex.join(command)
+    command.extend(("--git-commit", git_commit))
+    return shlex.join(command), None
 
 
 def prepare_campaign_inputs(
@@ -1297,15 +1306,18 @@ def run_campaign_input_generation(
                     "input_generation_id": input_generation_id,
                 }
             )
+    equivalent_command, equivalent_blocker = _equivalent_cli_command(request, campaign, git_commit)
     response.update(
         {
             "estimated_storage_bytes": sum(int(item["estimated_storage_bytes"]) for item in batch_results),
             "generated_case_count": sum(int(item["generated_case_count"]) for item in batch_results),
             "reused_case_count": sum(int(item["reused_case_count"]) for item in batch_results),
             "batches": batch_results,
-            "equivalent_cli_command": _equivalent_cli_command(request, campaign, git_commit),
+            "equivalent_cli_command": equivalent_command,
         }
     )
+    if equivalent_blocker is not None:
+        response["equivalent_cli_command_blocker"] = equivalent_blocker
     if len(batch_results) == 1:
         response.update(batch_results[0])
     return response

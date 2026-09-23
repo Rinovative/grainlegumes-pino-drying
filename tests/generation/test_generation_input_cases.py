@@ -796,7 +796,7 @@ def test_campaign_input_generation_actions_remain_thin_and_non_mutating(
         "lentil",
         "natural",
     )
-    storage = tmp_path / "storage"
+    storage = tmp_path / "custom-storage"
     base = {
         "campaign_config": config_path,
         "storage_root": storage,
@@ -817,13 +817,38 @@ def test_campaign_input_generation_actions_remain_thin_and_non_mutating(
     assert planned["batch_identity"]
     assert planned["simulation_profile"] == "transient_drying"
     assert planned["campaign_purpose"] == "family_generalization"
-    assert planned["equivalent_cli_command"].endswith(f"--storage-root {storage}")
+    assert planned["equivalent_cli_command"] is None
+    assert "sibling storage" in planned["equivalent_cli_command_blocker"]
     assert not storage.exists()
 
     executed = service.run_campaign_input_generation(service.CampaignInputGenerationRequest(action="execute", **base))
     assert executed["generated_case_count"] == 1
     assert executed["reused_case_count"] == 0
     assert Path(executed["raw_case_paths"][0]).is_dir()
+
+
+def test_input_generation_command_matches_supported_shared_launch(tmp_path: Path) -> None:
+    """Offer a copyable command only for the launcher's source and storage."""
+    service = generation.cases.input_generation
+    repository = tmp_path / "repo"
+    campaign = SimpleNamespace(source_path=repository / "configs" / "campaign.yaml")
+    request = service.CampaignInputGenerationRequest(
+        campaign_config=campaign.source_path,
+        storage_root=tmp_path / "storage",
+        only_batch="synthetic-batch",
+        case_count=1,
+        git_commit=_FAKE_GIT_COMMIT,
+    )
+    with (
+        patch.object(common.paths, "get_project_root", return_value=repository),
+        patch.object(service.source_service, "clean_repository_git_commit", return_value=_FAKE_GIT_COMMIT),
+    ):
+        command, blocker = service._equivalent_cli_command(request, cast("Any", campaign), _FAKE_GIT_COMMIT)
+    assert blocker is None
+    assert command == (
+        "./scripts/generation_workflow.sh inputs configs/campaign.yaml --only-batch synthetic-batch "
+        f"--case-count 1 --dry-run --git-commit {_FAKE_GIT_COMMIT}"
+    )
 
 
 def test_campaign_input_generation_rejects_actions_and_reports_source_blocker(

@@ -298,7 +298,11 @@ def _nonempty_string(value: Any, *, label: str) -> str:
 def _artifact_command(*, run_dir: Path, rebuild: bool) -> str:
     """Return the host wrapper command for one exact current run directory."""
     suffix = " --rebuild" if rebuild else ""
-    return f"./scripts/docker_job.sh --queue-gpu auto artifacts --run-dir {shlex.quote(str(run_dir))}{suffix}"
+    return (
+        "./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 "
+        "--mem 16G --time 02:00:00 artifacts --run-dir "
+        f"{shlex.quote(str(run_dir))}{suffix}"
+    )
 
 
 def _missing(*, task: str, run_name: str, run_dir: Path, role: ArtifactRole, root: Path) -> MissingEvaluationArtifactsError:

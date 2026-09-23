@@ -224,7 +224,7 @@ def styled_dataframe(
         number = _finite_number(value)
         return format_spec.format(number) if number is not None else str(value)
 
-    formats: dict[Any, Callable[[object], str]] = dict.fromkeys(
+    formats: dict[Any, str | Callable[[object], str] | None] = dict.fromkeys(
         display_table.columns,
         format_value,
     )

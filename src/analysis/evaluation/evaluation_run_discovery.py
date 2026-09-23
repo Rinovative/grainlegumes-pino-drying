@@ -645,7 +645,10 @@ def _run_from_leaf(
         checkpoints=EvaluationCheckpointInspection(best, best_digest, latest, _checkpoint(latest)),
         id_artifact=id_artifact,
         ood_artifact=ood_artifact,
-        artifact_command="./scripts/docker_job.sh artifacts --run-dir " + shlex.quote(str(run_dir)),
+        artifact_command=(
+            "./scripts/slurm_ml.sh --mode cpu --partition standard --cpus-per-task 4 "
+            "--mem 16G --time 02:00:00 artifacts --run-dir " + shlex.quote(str(run_dir))
+        ),
     )
 
 
@@ -659,7 +662,7 @@ def _parent_records(experiments_root: Path) -> tuple[dict[Path, Mapping[str, Any
             for child in record["children"].values():
                 child_path = Path(child["path"]).expanduser().resolve(strict=False)
                 children[child_path] = record
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:  # noqa: PERF203
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             issues.append(EvaluationDiscoveryIssue(path, f"invalid parent record: {type(error).__name__}"))
     return children, tuple(issues)
 

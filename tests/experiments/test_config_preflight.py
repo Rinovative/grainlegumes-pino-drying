@@ -57,6 +57,9 @@ def test_wrong_workflow_is_rejected(
         )
 
     assert captured.value.result.family != requested_workflow
+    assert "RESOURCE_OPTIONS" in str(captured.value)
+    assert "./scripts/slurm_ml.sh --help" in str(captured.value)
+    assert "--mode gpu" not in str(captured.value)
 
 
 def test_mixed_root_is_never_classified_by_filename(tmp_path: Path) -> None:

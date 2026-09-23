@@ -18,6 +18,7 @@ import yaml
 
 from src import common, generation
 from src.generation.cli import cli_generation
+from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
 from src.generation.runtime import generation_runtime_workspace as workspace
@@ -53,6 +54,17 @@ def _scheduler(
     }
 
 
+def _set_native_launch_evidence(monkeypatch: pytest.MonkeyPatch, commit: str) -> None:
+    """Supply explicit test-owned source and runtime evidence for Slurm jobs."""
+    monkeypatch.setattr(source_service, "validate_admitted_source_before_publication", lambda: None)
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
+    monkeypatch.setenv(
+        "GENERATION_NATIVE_VENV",
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+    )
+
+
 def _synthetic_input_sources(campaign: Any) -> dict[str, dict[str, Any]]:
     """Return current persisted source ownership for isolated resume tests."""
     return {
@@ -76,6 +88,7 @@ def _synthetic_input_references(campaign: Any) -> dict[str, dict[int, Any]]:
 def test_one_case_submission_and_local_only_concurrency(
     generation_config_factory: Any,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protect ordinary one-case jobs and isolate local development concurrency."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
@@ -85,10 +98,13 @@ def test_one_case_submission_and_local_only_concurrency(
     assert len({(task.batch_id, task.case_id) for task in tasks}) == len(tasks)
 
     task = tasks[0]
+    runtime = common.paths.get_runtime_root().resolve()
+    _set_native_launch_evidence(monkeypatch, "a" * 40)
     command = cluster.build_campaign_case_slurm_submission_command(
         campaign,
         task,
         run_id="synthetic__0123456789abcdef",
+        storage_root=tmp_path.resolve(),
         scheduler_log_directory=tmp_path.resolve(),
         scheduler_job_name="vp2-synthetic-0001",
         attempt_index=1,
@@ -99,7 +115,8 @@ def test_one_case_submission_and_local_only_concurrency(
     assert f"--cpus-per-task={campaign.execution_values['cluster']['cores_per_case']}" in command
     assert not any(argument.startswith("--array") for argument in command)
     assert "--exclusive" not in command
-    assert f"--output={tmp_path.resolve()}/slurm-%j.out" in command
+    assert f"--output={runtime}/logs/generation/slurm-%j.out" in command
+    assert f"--error={runtime}/logs/generation/slurm-%j.err" in command
     wrapped = command[-1]
     assert wrapped.startswith("--wrap=")
     worker_arguments = shlex.split(wrapped.removeprefix("--wrap="))
@@ -109,6 +126,8 @@ def test_one_case_submission_and_local_only_concurrency(
     assert task.batch_name in worker_arguments
     assert str(task.case_index) in worker_arguments
     assert "GENERATION_ATTEMPT_INDEX=1" in worker_arguments
+    assert f"STORAGE_ROOT={tmp_path.resolve()}" in worker_arguments
+    assert "GENERATION_SOURCE_SHA256=" + "b" * 64 in worker_arguments
 
     plan = cluster.build_local_resource_plan(
         cores_per_case=1,
@@ -133,6 +152,7 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     commit = "8" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     calls: list[list[str]] = []
     submitted_ids = iter(("12345", "12346"))
@@ -190,6 +210,8 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         storage_root=storage,
     )
     assert persisted["submissions"][0]["job_id"] == "12345"
+    assert persisted["scheduler_log_directory"] == str(common.paths.get_runtime_root().resolve() / "logs" / "generation")
+    assert not (campaign_evidence.campaign_run_directory(first["campaign_run_id"], storage_root=storage) / "scheduler").exists()
     assert [event["scheduler_submissions"] for event in first_progress if event.get("operation") == "scheduler_submission"] == [1]
 
     blocked = AssertionError("Current canonical inputs were regenerated before resubmission.")
@@ -306,6 +328,7 @@ def test_license_retry_waits_then_resubmits_the_same_case_once(
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     commit = "9" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     submitted_ids = iter(("4101", "4102", "4103"))
     submit_commands: list[list[str]] = []
@@ -524,6 +547,7 @@ def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
     )
 
     current_commit = "8" * 40
+    _set_native_launch_evidence(monkeypatch, current_commit)
     current_run_id = generation.campaign.campaign_run_id(
         campaign,
         git_commit=current_commit,
@@ -798,6 +822,7 @@ def test_malformed_persisted_job_id_fails_before_scheduler_query(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "7" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
     monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: "123")
@@ -843,6 +868,7 @@ def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "a" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     submitted = iter(("101", "102", "103", "104"))
     scheduler_state: dict[str, list[str]] = {}
 
@@ -952,6 +978,7 @@ def test_feeder_refills_max_admission_cases_after_one_pending_case(
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "e" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     submitted = iter(("301", "302"))
     scheduler_state: dict[str, list[str]] = {}
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -985,6 +1012,7 @@ def test_feeder_pending_jobs_do_not_consume_running_capacity(
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "f" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     submitted = iter(("401", "402", "403", "404"))
     scheduler_state: dict[str, list[str]] = {}
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -1017,6 +1045,7 @@ def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     commit = "f" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     job_ids = iter(("401", "402"))
     scheduler = _scheduler()
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -1057,6 +1086,7 @@ def test_optional_running_cap_blocks_only_while_capacity_is_occupied(
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     commit = "b" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     job_ids = iter(("201", "202"))
     scheduler = _scheduler()
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -2261,6 +2291,7 @@ def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "c" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     scheduler = _scheduler()
     commands: list[list[str]] = []
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -2347,6 +2378,7 @@ def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "c" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -2394,6 +2426,7 @@ def test_resume_recovers_next_case_intent_while_first_case_is_pending(
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     commit = "d" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     submitted = iter(("101",))
     real_scheduler_evidence = generation.campaign._scheduler_evidence
@@ -2481,6 +2514,7 @@ def test_config_owned_plan_is_machine_parseable_and_read_only(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "d" * 40
+    _set_native_launch_evidence(monkeypatch, commit)
     storage = tmp_path / "storage"
     storage.mkdir()
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
@@ -2991,6 +3025,7 @@ def test_partial_transfer_publication_is_distinct_and_hash_validated(
         )
 
     published_partial = destination / campaign_directory / "campaign_partial.json"
+    original_partial = published_partial.read_bytes()
     payload = json.loads(published_partial.read_text(encoding="utf-8"))
     payload["resume_command"] = "resume conflicting-run"
     published_partial.write_text(
@@ -3002,3 +3037,24 @@ def test_partial_transfer_publication_is_distinct_and_hash_validated(
             run_id,
             storage_root=destination,
         )
+
+    published_partial.write_bytes(original_partial)
+    (destination / campaign_directory / "transfer_partial.json").unlink()
+    shared = generation.campaign.repair_partial_campaign_publication(
+        run_id,
+        source_host="shared-filesystem",
+        source_storage_root=str(destination),
+        storage_root=destination,
+    )
+    assert shared["source_removed"] is False
+    assert shared["source_storage_root"] == str(destination)
+    assert all(record["status"] == "reused" for record in shared["directories"])
+    assert (
+        generation.campaign.repair_partial_campaign_publication(
+            run_id,
+            source_host="shared-filesystem",
+            source_storage_root=str(destination),
+            storage_root=destination,
+        )
+        == shared
+    )

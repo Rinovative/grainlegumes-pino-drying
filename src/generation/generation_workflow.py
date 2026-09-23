@@ -13,7 +13,7 @@ Design principles:
   - Cleanup authorization binds immutable identities, hashes, paths, and bytes
   - Existing valid publications are validated and reused instead of recreated
 This module does NOT:
-  - Implement SSH, rsync, Slurm submission, COMSOL execution, or scientific logic
+  - Submit Slurm jobs, execute COMSOL, or implement scientific generation
   - Delete GPU generation sources, dataset packages, repositories, or templates
 """
 
@@ -30,6 +30,7 @@ from src import common
 
 from . import generation_campaign as campaign_runtime
 from .cases import generation_cases_config as config_service
+from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
 from .runtime import generation_runtime_batch as batch_runtime
 from .runtime import generation_runtime_workspace as workspace_service
@@ -1007,6 +1008,7 @@ def build_campaign_datasets(
                     "pilot_pre_cleanup_receipt_sha256": (pilot_pre_cleanup_sha256),
                     "packages": package_records,
                 }
+                source_service.validate_admitted_source_before_publication()
                 common.serialization.atomic_write_json(receipt_path, receipt)
         return validate_dataset_packages_receipt(
             run_id,
@@ -3013,7 +3015,7 @@ def _cleanup_cpu_campaign_source_locked(
             try:
                 source.parent.mkdir(parents=True, exist_ok=True)
                 target.replace(source)
-            except OSError as error:  # noqa: PERF203 -- attempt every rollback
+            except OSError as error:  # attempt every rollback
                 rollback_errors.append(f"{target}: {error}")
         if not rollback_errors:
             shutil.rmtree(transaction)
@@ -4038,6 +4040,7 @@ def build_composite_completion_lifecycle(
             },
             "created_at": _utc_now(),
         }
+        source_service.validate_admitted_source_before_publication()
         common.serialization.atomic_write_json(receipt_path, lifecycle)
     return validate_composite_completion_lifecycle(parent_run_id, completion_id, storage_root=storage)
 

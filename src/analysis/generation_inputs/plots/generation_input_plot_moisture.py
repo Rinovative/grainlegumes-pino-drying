@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import numpy as np
 from matplotlib.lines import Line2D
@@ -30,6 +30,8 @@ from . import generation_input_plot_layout as layout
 from . import generation_input_plot_spatial as spatial
 
 if TYPE_CHECKING:
+    from typing import SupportsFloat
+
     import ipywidgets as widgets
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
@@ -89,9 +91,9 @@ def _case_relationship(
     startup = diagnostics.transient_evidence(record)[3]
     inlet = startup.variables["phi_in_bc"]
     return (
-        float(statistics["q05"]),
-        float(statistics["median"]),
-        float(statistics["q95"]),
+        float(cast("SupportsFloat", statistics["q05"])),
+        float(cast("SupportsFloat", statistics["median"])),
+        float(cast("SupportsFloat", statistics["q95"])),
         inlet.start,
         inlet.end,
     )

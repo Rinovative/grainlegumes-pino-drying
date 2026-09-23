@@ -381,6 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     resume_benchmark.add_argument("benchmark_run_id")
     resume_benchmark.add_argument("--storage-root", type=Path, required=True)
+    resume_benchmark.add_argument("--scratch-root", type=Path)
 
     cancel_benchmark = subparsers.add_parser(
         "cancel-core-benchmark",
@@ -721,6 +722,15 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     repair_transfer.add_argument("--authority-json", required=True)
     _add_storage_arguments(repair_transfer)
 
+    repair_partial = subparsers.add_parser(
+        "repair-partial-campaign-publication",
+        help="bind a terminal partial campaign already present in shared storage",
+    )
+    repair_partial.add_argument("campaign_run_id")
+    repair_partial.add_argument("--source-host", required=True)
+    repair_partial.add_argument("--source-storage-root", required=True)
+    _add_storage_arguments(repair_partial)
+
     validate_publication = subparsers.add_parser(
         "validate-published-campaign",
         help="validate an exact GPU generation publication and transfer receipt",
@@ -742,6 +752,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     )
     pilot_staging_inventory.add_argument("campaign_run_id")
     pilot_staging_inventory.add_argument("--staging-root", type=Path, required=True)
+
+    shared_pilot_staging = subparsers.add_parser(
+        "record-shared-pilot-staging",
+        help="record a marked pilot accounting workspace without copying campaign data",
+    )
+    shared_pilot_staging.add_argument("campaign_run_id")
+    _add_storage_arguments(shared_pilot_staging)
 
     validate_pilot_staging = subparsers.add_parser(
         "validate-pilot-staging-inventory",
@@ -1351,11 +1368,11 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         host_paths = json.loads(args.host_paths_json)
         if not isinstance(host_paths, dict) or set(host_paths) != {
             "stable_script",
-            "docker_python",
+            "python_executable",
             "storage_root",
             "host",
         }:
-            message = "Background host paths JSON must contain exactly stable_script, docker_python, storage_root, and host."
+            message = "Background host paths JSON must contain exactly stable_script, python_executable, storage_root, and host."
             raise ValueError(message)
         session = background_service.create_background_session(
             arguments[0],
@@ -1363,7 +1380,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             source_commit=args.source_commit,
             storage_root=args.storage_root,
             stable_script=host_paths["stable_script"],
-            docker_python=host_paths["docker_python"],
+            python_executable=host_paths["python_executable"],
             host_storage_root=host_paths["storage_root"],
             host_name=host_paths["host"],
             active_tmux_sessions=args.active_tmux_session,
@@ -1547,6 +1564,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         manifest = benchmark_service.resume_core_benchmark(
             args.benchmark_run_id,
             storage_root=args.storage_root,
+            scratch_root=args.scratch_root,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0
@@ -1980,6 +1998,15 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
+    if args.command == "repair-partial-campaign-publication":
+        receipt = campaign_runtime.repair_partial_campaign_publication(
+            args.campaign_run_id,
+            source_host=args.source_host,
+            source_storage_root=args.source_storage_root,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
     if args.command == "validate-published-campaign":
         receipt = (
             campaign_runtime.validate_partially_transferred_campaign(
@@ -2005,6 +2032,13 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         inventory = pilot_service.record_transfer_staging_inventory(
             args.campaign_run_id,
             staging_root=args.staging_root,
+        )
+        print(json.dumps(inventory, sort_keys=True))
+        return 0
+    if args.command == "record-shared-pilot-staging":
+        inventory = pilot_service.record_shared_staging_inventory(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
         )
         print(json.dumps(inventory, sort_keys=True))
         return 0

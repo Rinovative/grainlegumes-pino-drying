@@ -14,45 +14,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up CPU test environment
-        uses: mamba-org/setup-micromamba@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          environment-file: environment-dev.yml
-          cache-environment: true
-          cache-downloads: true
-          init-shell: bash
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Synchronize locked development environment
+        run: uv sync --frozen --group dev
 
       - name: Verify editable and wheel installation contracts
-        shell: bash -l {0}
-        run: python scripts/check_package_install.py
+        run: uv run --frozen python scripts/check_package_install.py
 
       - name: Lint
-        shell: bash -l {0}
-        run: ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
+        run: uv run --frozen ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py
 
       - name: Check formatting
-        shell: bash -l {0}
-        run: ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py --exclude '*.ipynb'
+        run: uv run --frozen ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py --exclude '*.ipynb'
 
       - name: Validate maintained notebooks
-        shell: bash -l {0}
         run: |
-          python scripts/check_notebooks.py
-          ruff check notebooks
+          uv run --frozen python scripts/check_notebooks.py
+          uv run --frozen ruff check notebooks
 
       - name: Type-check with Mypy
-        shell: bash -l {0}
-        run: mypy src
+        run: uv run --frozen mypy src
 
       - name: Type-check with BasedPyright
-        shell: bash -l {0}
-        run: python -m basedpyright
+        run: uv run --frozen python -m basedpyright
 
       - name: Complexity report (informational)
         continue-on-error: true
-        shell: bash -l {0}
         run: |
-          python - << 'EOF'
+          uv run --frozen python - << 'EOF'
           import json
           import subprocess
 
@@ -171,20 +170,16 @@ jobs:
           print("============================================================")
           EOF
       - name: Compile maintained Python
-        shell: bash -l {0}
-        run: python -m compileall -q src scripts/check_notebooks.py scripts/check_package_install.py scripts/config_preflight_runtime.py
+        run: uv run --frozen python -m compileall -q src scripts/check_notebooks.py scripts/check_package_install.py
 
       - name: Run CPU tests
-        shell: bash -l {0}
-        run: python -m pytest -q -m "not real_data" tests
+        run: uv run --frozen python -m pytest -q -m "not real_data" tests
 
       - name: Smoke-test imports and command-line interfaces
-        shell: bash -l {0}
         run: |
-          python -c "from src import analysis, common, datasets, domain, experiments, learning"
-          python -m src.common.common_queue_log_cli --help
-          python -m src.datasets.dataset_packages --help
-          python -m src.experiments.cli.cli_train --help
-          python -m src.experiments.cli.cli_optuna --help
-          python -m src.experiments.cli.cli_config_preflight --help
-          python -m src.experiments.cli.cli_build_artifacts --help
+          uv run --frozen python -c "from src import analysis, common, datasets, domain, experiments, learning"
+          uv run --frozen python -m src.datasets.dataset_packages --help
+          uv run --frozen python -m src.experiments.cli.cli_train --help
+          uv run --frozen python -m src.experiments.cli.cli_optuna --help
+          uv run --frozen python -m src.experiments.cli.cli_config_preflight --help
+          uv run --frozen python -m src.experiments.cli.cli_build_artifacts --help

@@ -68,17 +68,19 @@ each must complete its exact derived epoch allocation.
 
 ## Preflight and training
 
-Run preflight before allocating any experiment directory:
+The Slurm training wrapper runs authoritative config preflight before submission.
+To inspect the config separately inside the maintained Apptainer environment:
 
 ```bash
-python -m src.experiments.cli.cli_config_preflight train \
+./scripts/apptainer_exec.sh python -m src.experiments.cli.cli_config_preflight train \
   configs/learning/transient_drying/experiments/fno_m64x80_h64_l3__lentil_chickpea__s9.yaml
 ```
 
 Start the complete A0-to-B workflow with the same file:
 
 ```bash
-python -m src.experiments.cli.cli_train \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train \
   configs/learning/transient_drying/experiments/fno_m64x80_h64_l3__lentil_chickpea__s9.yaml
 ```
 
@@ -90,8 +92,8 @@ incompatible existing leaf is never reopened implicitly.
 Resume names one exact derived leaf:
 
 ```bash
-python -m src.experiments.cli.cli_train CONFIG.yaml --resume /exact/stage_a0/run/leaf
-python -m src.experiments.cli.cli_train CONFIG.yaml --resume /exact/stage_b/run/leaf
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train CONFIG.yaml --resume /exact/stage_a0/run/leaf
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train CONFIG.yaml --resume /exact/stage_b/run/leaf
 ```
 
 Resuming Stage A completes and validates A before a fresh B is allocated.
@@ -100,8 +102,8 @@ Normal resume rules still apply: the saved semantics, split, scaling, checkpoint
 identity, and output root must match, and completed runs require a deliberate
 epoch extension.
 
-Use `--device` only as an explicit runtime override. `cuda` is strict and never
-falls back silently. `--output-root` applies to both derived leaves and does not
+The wrapper sets `--device cuda` strictly for GPU allocations or `--device cpu`
+for CPU allocations. `--output-root` applies to both derived leaves and does not
 change Dataset roots.
 
 ## Tensorization and scaling
@@ -193,8 +195,9 @@ Canonical stride-one artifacts remain below `analysis/id` and
 `analysis/grid_sN/id` and `analysis/grid_sN/ood/<dataset>`. Schema-2 transient
 caches do not contain the exact grid evidence, and schema 3 does not contain the
 current prediction-validity contract; both require an explicit rebuild to schema 4.
-The queue command, descriptor, worker argv, preflight, manifest, inference
-context, record identity, and output target all carry the same resolved value.
+The Slurm wrapper forwards an explicit stride to the artifact CLI. The artifact
+service resolves that value once for its manifest, inference context, record
+identity, and output target.
 
 ## Losses, metrics, and model implementations
 
@@ -211,9 +214,10 @@ physical MAE, and grain moisture `w_gr` are reported separately.
 
 FNO and U-NO use the repository's neuraloperator-backed factory. RNO is imported
 from the official neuraloperator package; no local recurrent imitation or
-UNO-RNO alias exists. Both Conda environments pin neuraloperator commit
-`86a8bc7812a31b42c4f7895693cf4ac11521c066` so construction, sequence behavior,
-and checkpoint loading use one reproducible API.
+UNO-RNO alias exists. The authoritative `pyproject.toml` and `uv.lock` pin
+neuraloperator commit `86a8bc7812a31b42c4f7895693cf4ac11521c066`; the
+maintained Apptainer image uses that lock for construction, sequence behavior,
+and checkpoint loading.
 
 ## Matched-compute A+ comparison
 
@@ -228,7 +232,8 @@ python -m src.experiments.cli.cli_transient_matched_config \
   --arm a_plus \
   --b-run-dir /path/to/completed_stage_b
 
-python -m src.experiments.cli.cli_train /path/to/new_a_plus.yaml
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 \
+  --mem 32G --time 04:00:00 --gres gpu:rtx6000ada:1 train /path/to/new_a_plus.yaml
 ```
 
 The generator refuses to overwrite its destination. It derives the A+ budget
@@ -264,17 +269,20 @@ receives the exact remainder, so every completed joint trial consumes exactly
 200 epochs. The maintained fixed FNO, U-NO, and RNO plans use the same schedule
 resolver with a fixed fraction of 0.5.
 
-Run either study with preflight first:
+The Slurm wrapper preflights either study before submission. To inspect a
+config separately, use the maintained Apptainer executor:
 
 ```bash
-python -m src.experiments.cli.cli_config_preflight optuna \
+./scripts/apptainer_exec.sh python -m src.experiments.cli.cli_config_preflight optuna \
   configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml
-python -m src.experiments.cli.cli_optuna \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 --mem 32G \
+  --time 04:00:00 --gres gpu:rtx6000ada:1 optuna \
   configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_stage_a_only.yaml
 
-python -m src.experiments.cli.cli_config_preflight optuna \
+./scripts/apptainer_exec.sh python -m src.experiments.cli.cli_config_preflight optuna \
   configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml
-python -m src.experiments.cli.cli_optuna \
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 --mem 32G \
+  --time 04:00:00 --gres gpu:rtx6000ada:1 optuna \
   configs/learning/transient_drying/optuna/transient_drying_lentil_chickpea_joint_ab.yaml
 ```
 
@@ -365,7 +373,9 @@ service unless `--no-build-artifacts` is selected. Existing completed runs can
 be processed explicitly with:
 
 ```bash
-python -m src.experiments.cli.cli_build_artifacts --task transient_drying --evaluation-spatial-stride 1
+./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 --mem 32G \
+  --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts \
+  --task transient_drying --evaluation-spatial-stride 1
 ```
 
 The immutable artifact stores reference and predicted absolute sequences,

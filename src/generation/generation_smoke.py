@@ -2219,7 +2219,7 @@ def validate_current_real_smoke_receipts(
                 storage=storage,
                 require_canonical_path=True,
             )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:  # noqa: PERF203
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             invalid.append({"path": str(candidate), "error": str(error)})
         else:
             valid.append(

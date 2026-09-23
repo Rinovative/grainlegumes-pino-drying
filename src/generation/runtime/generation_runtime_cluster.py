@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from src.generation.cases import generation_cases_config as config_contract
 
 _MAX_SCHEDULER_JOB_NAME_LENGTH: Final = 48
+_GIT_COMMIT_LENGTH: Final = 40
+_SOURCE_SHA256_LENGTH: Final = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +257,7 @@ def build_campaign_case_slurm_submission_command(
     task: CampaignTask,
     *,
     run_id: str,
+    storage_root: Path,
     scheduler_log_directory: Path,
     scheduler_job_name: str,
     attempt_index: int,
@@ -281,9 +284,19 @@ def build_campaign_case_slurm_submission_command(
     if not launcher.is_file() or launcher.is_symlink():
         message = f"Campaign compute-node launcher is missing or unsafe: {launcher}"
         raise FileNotFoundError(message)
-    log_directory = Path(scheduler_log_directory)
-    if not log_directory.is_absolute() or log_directory.is_symlink() or (log_directory.exists() and not log_directory.is_dir()):
-        message = f"Scheduler log directory must be one safe absolute directory: {log_directory}."
+    requested_log_directory = Path(scheduler_log_directory)
+    if (
+        not requested_log_directory.is_absolute()
+        or requested_log_directory.is_symlink()
+        or (requested_log_directory.exists() and not requested_log_directory.is_dir())
+    ):
+        message = f"Scheduler log directory must be one safe absolute directory: {requested_log_directory}."
+        raise ValueError(message)
+    runtime_root = common.paths.get_runtime_root().resolve()
+    runtime_logs = runtime_root / "logs" / "generation"
+    storage = Path(storage_root).resolve()
+    if not storage.is_dir() or storage in (repository, runtime_root):
+        message = "Generation storage root must be one separate existing directory."
         raise ValueError(message)
     job_name = common.paths.validate_logical_name(
         scheduler_job_name,
@@ -298,7 +311,23 @@ def build_campaign_case_slurm_submission_command(
     cluster = campaign.execution_values["cluster"]
     cores_per_case = int(cluster["cores_per_case"])
     site = campaign.execution_values["site"]
+    source_commit = os.environ.get("GENERATION_GIT_COMMIT", "")
+    source_sha = os.environ.get("GENERATION_SOURCE_SHA256", "")
+    native_venv = os.environ.get("GENERATION_NATIVE_VENV", "")
+    if len(source_commit) != _GIT_COMMIT_LENGTH or any(character not in "0123456789abcdef" for character in source_commit):
+        message = "GENERATION_GIT_COMMIT must contain the exact launch commit."
+        raise ValueError(message)
+    if len(source_sha) != _SOURCE_SHA256_LENGTH or any(character not in "0123456789abcdef" for character in source_sha):
+        message = "GENERATION_SOURCE_SHA256 must contain the launch source fingerprint."
+        raise ValueError(message)
+    if Path(native_venv) != runtime_root / "venvs" / "generation":
+        message = "GENERATION_NATIVE_VENV must be the sibling runtime Generation venv."
+        raise ValueError(message)
     worker_environment = [
+        f"GENERATION_GIT_COMMIT={source_commit}",
+        f"GENERATION_SOURCE_SHA256={source_sha}",
+        f"GENERATION_NATIVE_VENV={native_venv}",
+        f"STORAGE_ROOT={storage}",
         f"GENERATION_PYTHON_MODULE={site['python_module']}",
         f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
         f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
@@ -323,8 +352,8 @@ def build_campaign_case_slurm_submission_command(
         f"--chdir={repository}",
         f"--job-name={job_name}",
         "--export=ALL",
-        f"--output={log_directory}/slurm-%j.out",
-        f"--error={log_directory}/slurm-%j.err",
+        f"--output={runtime_logs}/slurm-%j.out",
+        f"--error={runtime_logs}/slurm-%j.err",
     ]
     if cluster["partition"] is not None:
         command.append(f"--partition={cluster['partition']}")

@@ -22,6 +22,7 @@ This module does NOT:
 from __future__ import annotations
 
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -66,9 +67,10 @@ def _copy_source(destination: Path) -> None:
 
 def _bootstrap(editable_target: Path | None) -> str:
     """Return child-process path initialization without checkout fallbacks."""
+    dependency_paths = [str(path) for path in site.getsitepackages()]
     if editable_target is None:
-        return "import sys, sysconfig; sys.path.append(sysconfig.get_paths()['purelib']); "
-    return f"import site, sys, sysconfig; site.addsitedir({str(editable_target)!r}); sys.path.append(sysconfig.get_paths()['purelib']); "
+        return f"import sys; sys.path.extend({dependency_paths!r}); "
+    return f"import site, sys; site.addsitedir({str(editable_target)!r}); sys.path.extend({dependency_paths!r}); "
 
 
 def _probe_install(

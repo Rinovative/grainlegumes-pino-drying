@@ -65,7 +65,27 @@ generation_run_check() {
   [[ -z "${output}" ]] || printf '%s\n' "${output}"
 }
 
-generation_validate_cpu_venv() {
+generation_comsol_version() (
+  local executable="$1" scratch_parent version_scratch output
+  scratch_parent="${TMPDIR:-/tmp}"
+  if [[ "${scratch_parent}" != /* || ! -d "${scratch_parent}" || ! -w "${scratch_parent}" ]]; then
+    printf 'Native COMSOL version scratch is unavailable: %s\n' "${scratch_parent}" >&2
+    return 1
+  fi
+  version_scratch="$(mktemp -d "${scratch_parent%/}/generation-comsol-version.XXXXXXXX")" || return 1
+  trap 'rm -rf -- "${version_scratch}"' EXIT
+  if ! output="$("${executable}" -configuration "${version_scratch}" -version 2>&1)"; then
+    printf 'Native COMSOL version query failed: %s\n' "${output}" >&2
+    return 1
+  fi
+  if [[ ! "${output}" =~ ^COMSOL\ Multiphysics\ 6\.4(\.[0-9]+)+$ ]]; then
+    printf 'Native COMSOL version query returned invalid v6.4 evidence: %s\n' "${output}" >&2
+    return 1
+  fi
+  printf '%s\n' "${output}"
+)
+
+generation_validate_native_venv() {
   local domain="$1"
   local venv="$2"
   local blocked_operation="$3"
@@ -93,12 +113,12 @@ generation_validate_worker_repository() {
   local expected_commit="$2"
   local runtime_script="$3"
   local helper_path="${repository}/scripts/generation_prerequisites.sh"
-  local repository_physical scripts_physical checkout_head
+  local repository_physical scripts_physical checkout_head source_sha
 
   if [[ "${repository}" != /* || "${repository}" == / \
     || "${repository}" == *$'\n'* || "${repository}" == *$'\r'* || "${repository}" == *$'\t'* ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "explicit canonical CPU repository: ${repository}" \
+      "CPU compute-node" "explicit shared repository: ${repository}" \
       "repository-owned worker dependencies; Slurm script: ${runtime_script}"
     return 1
   fi
@@ -109,19 +129,19 @@ generation_validate_worker_repository() {
   fi
   if [[ ! -d "${repository}" || -L "${repository}" || ! -r "${repository}" || ! -x "${repository}" ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "safe canonical CPU checkout: ${repository}" \
+      "CPU compute-node" "safe shared repository: ${repository}" \
       "repository-owned worker dependencies; Slurm script: ${runtime_script}"
     return 1
   fi
   if ! repository_physical="$(cd "${repository}" && pwd -P)"; then
     generation_prerequisite_failed \
-      "CPU compute-node" "canonical CPU checkout: ${repository}" \
+      "CPU compute-node" "shared repository: ${repository}" \
       "repository-owned worker dependencies"
     return 1
   fi
   if [[ "${repository_physical}" != "${repository}" ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "non-canonical CPU checkout: ${repository}" \
+      "CPU compute-node" "non-canonical shared repository: ${repository}" \
       "repository-owned worker dependencies"
     return 1
   fi
@@ -133,39 +153,56 @@ generation_validate_worker_repository() {
   fi
   if ! scripts_physical="$(cd "${repository}/scripts" && pwd -P)"; then
     generation_prerequisite_failed \
-      "CPU compute-node" "canonical repository scripts directory" \
+      "CPU compute-node" "shared repository scripts directory" \
       "repository-owned worker dependencies"
     return 1
   fi
   if [[ "${scripts_physical}" != "${repository}/scripts" \
     || ! -f "${helper_path}" || -L "${helper_path}" || ! -r "${helper_path}" \
     || "${BASH_SOURCE[0]}" != "${helper_path}" ]]; then
-    printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (canonical CPU checkout: %s; Slurm script: %s).\n' \
+    printf 'CPU compute-node prerequisite failed: repository helper missing or unreadable: scripts/generation_prerequisites.sh (shared repository: %s; Slurm script: %s).\n' \
       "${repository}" "${runtime_script}" >&2
     return 1
   fi
-  if [[ ! -d "${repository}/.git" || -L "${repository}/.git" \
-    || ! -f "${repository}/.git/HEAD" || -L "${repository}/.git/HEAD" \
-    || ! -r "${repository}/.git/HEAD" ]]; then
+  if [[ ! "${GENERATION_SOURCE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "detached exact-checkout evidence: ${repository}/.git/HEAD" \
+      "CPU compute-node" "GENERATION_SOURCE_SHA256 launch fingerprint" \
       "repository-owned worker dependencies"
     return 1
   fi
-  if ! IFS= read -r checkout_head < "${repository}/.git/HEAD"; then
+  if [[ ! -f "${repository}/scripts/source_fingerprint.py" \
+    || -L "${repository}/scripts/source_fingerprint.py" ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "readable exact-checkout evidence" \
+      "CPU compute-node" "shared source fingerprint helper" \
+      "repository-owned worker dependencies"
+    return 1
+  fi
+  if ! checkout_head="$(git -C "${repository}" rev-parse HEAD)"; then
+    generation_prerequisite_failed \
+      "CPU compute-node" "readable shared Git revision" \
       "repository-owned worker dependencies"
     return 1
   fi
   if [[ "${checkout_head}" != "${expected_commit}" ]]; then
     generation_prerequisite_failed \
-      "CPU compute-node" "checkout commit ${expected_commit}" \
+      "CPU compute-node" "source commit ${expected_commit}" \
       "repository-owned worker dependencies; found ${checkout_head}"
     return 1
   fi
+  if ! source_sha="$(python3 "${repository}/scripts/source_fingerprint.py" "${repository}")"; then
+    generation_prerequisite_failed \
+      "CPU compute-node" "readable shared source worktree" \
+      "repository-owned worker dependencies"
+    return 1
+  fi
+  if [[ "${source_sha}" != "${GENERATION_SOURCE_SHA256}" ]]; then
+    generation_prerequisite_failed \
+      "CPU compute-node" "unchanged source worktree since submission" \
+      "repository-owned worker dependencies"
+    return 1
+  fi
   generation_report_pass \
-    "CPU compute-node" "exact-worker-checkout" "${repository}@${expected_commit}"
+    "CPU compute-node" "source-worktree" "${repository}@${expected_commit}:${source_sha}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
