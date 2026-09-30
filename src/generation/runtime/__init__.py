@@ -4,6 +4,7 @@ Native solver, workspace, cluster, and single-batch execution services.
 Provides:
 - batch: single-case execution and terminal batch admission
 - cluster: scheduler planning and submission
+- host: admitted host processes and scheduled service commands
 - license: bounded temporary floating-license retry evidence
 - comsol: fixed COMSOL command and workspace-name conventions
 - comsol_timing: structural COMSOL scientific solver timing
@@ -30,6 +31,7 @@ Provides:
 - PreparedCase: prepared isolated case workspace
 - reset_runtime_cancellation: clear worker cancellation state
 - runtime_cancellation_requested: inspect worker cancellation state
+- runtime_force_cancellation_requested: inspect forced worker cancellation state
 - request_runtime_cancellation: gracefully stop active worker solvers
 - request_runtime_force_cancellation: force-stop active worker solvers
 - replay_case_postprocessing: conversion/publication replay without COMSOL
@@ -66,6 +68,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_cluster as cluster
     from . import generation_runtime_comsol as comsol
     from . import generation_runtime_comsol_timing as comsol_timing
+    from . import generation_runtime_host as host
     from . import generation_runtime_license as license  # noqa: A004 -- public service name
     from . import generation_runtime_preflight as preflight
     from . import generation_runtime_preparation as preparation
@@ -124,6 +127,7 @@ _MODULES = {
     "cluster": "generation_runtime_cluster",
     "comsol": "generation_runtime_comsol",
     "comsol_timing": "generation_runtime_comsol_timing",
+    "host": "generation_runtime_host",
     "license": "generation_runtime_license",
     "preflight": "generation_runtime_preflight",
     "preparation": "generation_runtime_preparation",
@@ -211,6 +215,7 @@ __all__ = [
     "comsol_timing",
     "execute_prepared_case",
     "finalize_batch",
+    "host",
     "initialize_batch_metadata",
     "license",
     "preflight",

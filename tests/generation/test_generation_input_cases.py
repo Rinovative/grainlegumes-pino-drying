@@ -846,8 +846,7 @@ def test_input_generation_command_matches_supported_shared_launch(tmp_path: Path
         command, blocker = service._equivalent_cli_command(request, cast("Any", campaign), _FAKE_GIT_COMMIT)
     assert blocker is None
     assert command == (
-        "./scripts/generation_workflow.sh inputs configs/campaign.yaml --only-batch synthetic-batch "
-        f"--case-count 1 --dry-run --git-commit {_FAKE_GIT_COMMIT}"
+        f"./scripts/generation inputs configs/campaign.yaml --only-batch synthetic-batch --case-count 1 --dry-run --git-commit {_FAKE_GIT_COMMIT}"
     )
 
 

@@ -27,6 +27,26 @@ def _state(tmp_path: Path, pool: int = 4, maximum_failed_cases: int = 1) -> dict
     )
 
 
+def test_parent_partial_file_digest_is_admitted_before_completion_creation(generation_config_factory: Any, tmp_path: Path) -> None:
+    """The completion owner rejects changed bytes at the canonical parent path."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm", natural_count=3)
+    parent = generation.cases.config.load_campaign_config(config_path)
+    partial = tmp_path / "campaign_partial.json"
+    partial.write_text("{}", encoding="utf-8")
+    digest = common.serialization.file_sha256(partial)
+    partial.write_text('{"changed": true}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="bytes differ"):
+        completion.create_completion_from_partial_path(
+            parent_campaign=parent,
+            parent_run_id="parent__abc",
+            parent_partial_path=partial,
+            parent_partial_sha256=digest,
+            replacement_pool_size=4,
+            storage_root=tmp_path,
+        )
+
+
 def _deficit_state(
     tmp_path: Path,
     deficits: dict[str, int],

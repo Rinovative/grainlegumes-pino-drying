@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 _GENERATION_DOCUMENTATION_LINK: Final = "../docs/simulation_generation.md#canonical-input-case-generation-and-eda"
 _GENERIC_GENERATION_COMMAND: Final = (
-    './scripts/generation_workflow.sh inputs "$CAMPAIGN_CONFIG" --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"'
+    './scripts/generation inputs "$CAMPAIGN_CONFIG" --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"'
 )
 _MAXIMUM_DISPLAYED_ISSUES: Final = 5
 

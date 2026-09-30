@@ -973,7 +973,7 @@ def _equivalent_cli_command(
     if current_commit != git_commit:
         return None, "The maintained Generation launcher requires the selected commit to equal clean shared HEAD."
     command = [
-        "./scripts/generation_workflow.sh",
+        "./scripts/generation",
         "inputs",
         campaign_argument,
     ]

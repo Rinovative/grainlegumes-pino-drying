@@ -1,18 +1,17 @@
 """
 generation_run.py
 
-Resolve immutable Generation run plans and pure lifecycle decisions.
+Resolve immutable Generation run plans and declared lifecycle stages.
 
 Responsibilities:
   - Dispatch validated run configuration schemas to their authoritative loaders
   - Describe campaign, benchmark, and paired technical-smoke execution units
   - Bind workflow identities to authored bytes, child identities, and source commits
-  - Provide fail-closed lifecycle continuation decisions without executing work
 
 Design principles:
   - Scientific campaign and benchmark identities remain owned by their existing loaders
   - Workflow orchestration identity never changes a child scientific identity
-  - Lifecycle decisions are deterministic, serializable, and side-effect free
+  - Run plans are deterministic, serializable, and side-effect free
 
 This module does NOT:
   - Submit jobs, materialize inputs, transfer artifacts, or execute solvers
@@ -23,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
@@ -34,7 +33,7 @@ from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_source as source_service
 
-from . import generation_benchmark as benchmark_service
+from . import generation_benchmark_config as benchmark_config
 from . import generation_campaign as campaign_service
 
 WORKFLOW_SCHEMA_KIND: Final = "generation_workflow"
@@ -67,26 +66,6 @@ LIFECYCLE_STAGES: Final = (
     "validate",
     "complete",
 )
-RUN_STATES: Final = frozenset(
-    {
-        "planned",
-        "preflight_ready",
-        "inputs_ready",
-        "running",
-        "license_blocked",
-        "cpu_complete",
-        "awaiting_collection",
-        "collecting",
-        "host_complete",
-        "packages_complete",
-        "finalizing",
-        "complete",
-        "failed",
-        "cancelled",
-    }
-)
-_TERMINAL_STATES: Final = frozenset({"complete", "failed", "cancelled"})
-_COLLECTION_STAGES: Final = frozenset({"transfer", "publish", "build_packages"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,121 +201,6 @@ class GenerationRunPlan:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class GenerationRunController:
-    """
-    Pure, fail-closed lifecycle state for one immutable run plan.
-
-    Parameters
-    ----------
-    plan : GenerationRunPlan
-        Immutable run plan being continued.
-    completed_stages : frozenset[str]
-        Persisted lifecycle stages already completed in their declared order.
-    state : str
-        Current common lifecycle state.
-    defer_collection : bool
-        Hold transfer and publication while the validated CPU source is retained.
-
-    """
-
-    plan: GenerationRunPlan
-    completed_stages: frozenset[str] = frozenset()
-    state: str = "planned"
-    defer_collection: bool = False
-
-    def __post_init__(self) -> None:
-        """Validate persisted continuation state against the immutable plan."""
-        if self.state not in RUN_STATES:
-            message = f"Unknown Generation run state {self.state!r}."
-            raise ValueError(message)
-        unknown = self.completed_stages.difference(self.plan.lifecycle_stages)
-        if unknown:
-            message = f"Completed lifecycle stages are not declared by the plan: {sorted(unknown)}."
-            raise ValueError(message)
-        expected = self.plan.lifecycle_stages[: len(self.completed_stages)]
-        if set(expected) != set(self.completed_stages):
-            message = "Completed lifecycle stages must be an ordered prefix of the declared plan lifecycle."
-            raise ValueError(message)
-        if self.state == "complete" and "complete" not in self.completed_stages:
-            message = "Complete Generation run state requires the complete lifecycle stage."
-            raise ValueError(message)
-        if "complete" in self.completed_stages and self.state != "complete":
-            message = "The complete lifecycle stage requires complete Generation run state."
-            raise ValueError(message)
-        if self.defer_collection and self.plan.collection_policy == "none":
-            message = "Collection cannot be deferred for a run plan without collection stages."
-            raise ValueError(message)
-
-    def next_stage(self) -> str | None:
-        """Return the next executable stage, or ``None`` when continuation must wait."""
-        if self.state in _TERMINAL_STATES:
-            return None
-        for stage in self.plan.lifecycle_stages:
-            if stage in self.completed_stages:
-                continue
-            if stage in _COLLECTION_STAGES and self.defer_collection:
-                return None
-            return stage
-        return None
-
-    def continuation_state(self) -> str:
-        """Return the visible state that explains the next continuation decision."""
-        if self.state in _TERMINAL_STATES or self.state == "license_blocked":
-            return self.state
-        pending = self.next_stage()
-        if pending is None:
-            if self.defer_collection:
-                return "awaiting_collection"
-            return self.state
-        if pending == "preflight":
-            return "preflight_ready"
-        if pending == "prepare_inputs":
-            return "inputs_ready"
-        if pending in _COLLECTION_STAGES:
-            return "collecting"
-        if pending == "finalize":
-            return "finalizing"
-        return "running" if self.completed_stages else "planned"
-
-    def advance(self, stage: str) -> GenerationRunController:
-        """Return state after exactly the next declared lifecycle stage completes."""
-        expected = self.next_stage()
-        if expected is None:
-            message = f"Generation run cannot advance while state is {self.continuation_state()!r}."
-            raise RuntimeError(message)
-        if stage != expected:
-            message = f"Invalid Generation lifecycle transition: expected {expected!r}, got {stage!r}."
-            raise ValueError(message)
-        completed = self.completed_stages | {stage}
-        state = _state_after_stage(stage)
-        return replace(self, completed_stages=completed, state=state)
-
-    def resume(
-        self,
-        *,
-        defer_collection: bool | None = None,
-    ) -> GenerationRunController:
-        """Return a validated continuation view without changing plan identity."""
-        return replace(
-            self,
-            defer_collection=self.defer_collection if defer_collection is None else defer_collection,
-            state=self.state,
-        )
-
-    def to_payload(self) -> dict[str, Any]:
-        """Return deterministic serializable continuation state."""
-        return {
-            "schema_kind": "generation_run_controller",
-            "schema_version": 1,
-            "plan_identity": self.plan.identity,
-            "completed_stages": [stage for stage in self.plan.lifecycle_stages if stage in self.completed_stages],
-            "state": self.continuation_state(),
-            "defer_collection": self.defer_collection,
-            "next_stage": self.next_stage(),
-        }
-
-
 def resolve_generation_run(
     path: Path | str,
     *,
@@ -389,7 +253,7 @@ def resolve_generation_run(
         _validate_schema_version(
             raw,
             schema_kind=BENCHMARK_SCHEMA_KIND,
-            version=benchmark_service.BENCHMARK_SCHEMA_VERSION,
+            version=benchmark_config.BENCHMARK_SCHEMA_VERSION,
         )
         return _benchmark_plan(
             source_path,
@@ -491,7 +355,7 @@ def _benchmark_plan(
     require_executable: bool,
 ) -> GenerationRunPlan:
     """Build two-case work units in production-first sequential waves."""
-    suite = benchmark_service.load_core_benchmark_suite(
+    suite = benchmark_config.load_core_benchmark_suite(
         source_path,
         require_executable=require_executable,
     )
@@ -722,23 +586,6 @@ def _workflow_lifecycle() -> tuple[str, ...]:
         "validate",
         "complete",
     )
-
-
-def _state_after_stage(stage: str) -> str:
-    """Map one completed lifecycle stage to the corresponding common state."""
-    states = {
-        "resolve_config": "preflight_ready",
-        "preflight": "preflight_ready",
-        "prepare_inputs": "inputs_ready",
-        "terminalize": "cpu_complete",
-        "validate_terminal": "cpu_complete",
-        "transfer": "collecting",
-        "publish": "host_complete",
-        "build_packages": "packages_complete",
-        "finalize": "host_complete",
-        "complete": "complete",
-    }
-    return states.get(stage, "running")
 
 
 def _case_input_identity(batch: Any, case_index: int) -> str:

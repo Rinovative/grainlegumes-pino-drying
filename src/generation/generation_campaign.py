@@ -2,16 +2,20 @@
 generation_campaign.py
 
 Persist, feed, inspect, and terminally validate one campaign run.
+
 Responsibilities:
   - Bind campaign execution to one clean exact Git commit and execution config
   - Reconcile exact per-case Slurm jobs within one logical admission pool
   - Persist scheduler identity before and after each ordinary job submission
+  - Validate terminal case evidence and publish exact campaign inventories
+
 Design principles:
   - One Slurm job owns one exact campaign case with no arrays or node packing
   - Running jobs are unlimited unless the execution config declares a cap
   - Durable case evidence and scheduler accounting make resume duplicate-safe
+
 This module does NOT:
-  - Generate scientific inputs, submit Slurm jobs, or build dataset packages
+  - Construct scientific cases, execute COMSOL, or build dataset packages
   - Poll indefinitely, submit a whole campaign queue, or delete remote sources
 """
 
@@ -315,10 +319,10 @@ def _scheduler_job_name(
     return value
 
 
-def _state_batch_root_for_plan(
+def _batch_state_directory(
     batch: config_service.GenerationConfig,
     *,
-    storage_root: Path,
+    storage_root: Path | str | None,
 ) -> Path:
     """Return a flat batch state path without creating it."""
     return common.paths.resolve_generation_state_batch_directory(
@@ -447,7 +451,7 @@ def plan_campaign(
             "storage_root": str(storage),
             "run_root": str(run_directory),
             "log_root": str(log_directory),
-            "failures": [str(_state_batch_root_for_plan(batch, storage_root=storage) / "failures") for batch in campaign.batches],
+            "failures": [str(_batch_state_directory(batch, storage_root=storage) / "failures") for batch in campaign.batches],
             "publications": [
                 {
                     "batch_id": batch.batch_id,
@@ -3637,7 +3641,7 @@ def _batch_status(
 ) -> dict[str, Any]:
     """Return persistent per-batch case counts and terminal evidence."""
     selected = [view for view in task_views if view["batch_name"] == batch.batch_name]
-    state_root = batch_runtime._state_batch_root(  # noqa: SLF001
+    state_root = _batch_state_directory(
         batch,
         storage_root=storage_root,
     )

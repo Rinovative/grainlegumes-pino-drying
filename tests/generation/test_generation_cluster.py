@@ -120,9 +120,10 @@ def test_one_case_submission_and_local_only_concurrency(
     wrapped = command[-1]
     assert wrapped.startswith("--wrap=")
     worker_arguments = shlex.split(wrapped.removeprefix("--wrap="))
-    launcher_index = next(index for index, argument in enumerate(worker_arguments) if argument.endswith("generation_campaign_node.sh"))
+    launcher_index = next(index for index, argument in enumerate(worker_arguments) if argument.endswith("generation_node.sh"))
     launcher = Path(worker_arguments[launcher_index])
     assert worker_arguments[launcher_index + 1] == str(launcher.parents[1])
+    assert worker_arguments[launcher_index + 2] == "campaign-case"
     assert task.batch_name in worker_arguments
     assert str(task.case_index) in worker_arguments
     assert "GENERATION_ATTEMPT_INDEX=1" in worker_arguments

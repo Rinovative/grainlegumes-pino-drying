@@ -83,7 +83,7 @@ flowchart TD
 
 | Workflow | Entry point | Guidance |
 | --- | --- | --- |
-| Run or continue any Generation workflow | `./scripts/generation_workflow.sh run CONFIG` on ICE | [Generation operations](docs/simulation_generation.md) |
+| Run or continue any Generation campaign, benchmark, or workflow | `./scripts/generation run CONFIG` on ICE | [Generation operations](docs/simulation_generation.md) |
 | Interpret Generation parameters and assumptions | Validated YAML under `configs/generation` | [Scientific parameter reference](docs/generation_parameter_reference.md) |
 | Publish declared immutable Dataset packages | Automatic stage of `run CONFIG` | [Generation operations](docs/simulation_generation.md#source-admission-and-lifecycle) |
 | Submit training | `./scripts/slurm_ml.sh ... train CONFIG` on ICE | Commands below and `configs/learning` |
@@ -132,15 +132,24 @@ sha256sum ../runtime/containers/grainlegumes-pino-drying.sif
 Keep the resulting SIF and its hash in `../runtime`; the ML launcher records
 the exact SIF hash and admitted source fingerprint for each submitted job.
 
-Generation workflow commands run from the shared ICE repository. Start with:
+Generation has one command for native runtime smoke checks, campaigns,
+benchmarks, and resume. Open the outer project folder in VS Code Remote SSH,
+then run these from `repo/`:
 
 ```bash
-./scripts/generation_workflow.sh --help
-./scripts/generation_workflow.sh run \
-  configs/generation/campaigns/steady_flow/id_dataset.yaml --preflight-only
-./scripts/generation_workflow.sh run \
-  configs/generation/campaigns/steady_flow/id_dataset.yaml
+export PATH="$(realpath -e ../runtime/venvs/native/bin):$PATH"
+python -m pytest -q tests/generation/test_generation_run.py
+./scripts/generation smoke
+./scripts/generation run configs/generation/campaigns/steady_flow/id_dataset.yaml --preflight-only
+./scripts/generation run configs/generation/campaigns/steady_flow/id_dataset.yaml
+./scripts/generation run configs/generation/benchmarks/transient_core_scaling/suite.yaml
+./scripts/generation status configs/generation/campaigns/steady_flow/id_dataset.yaml
 ```
+
+Repeat `./scripts/generation run CONFIG` to resume a campaign or benchmark.
+The Python controller infers its kind from the validated YAML and reconstructs
+continuation from durable service evidence. Slurm logs are in
+`../runtime/logs/generation`; durable run evidence is in `../storage`.
 
 Submit training from the ICE repository checkout. The wrapper validates the
 config, requests Slurm resources, and runs `python -m src.experiments.cli.cli_train`

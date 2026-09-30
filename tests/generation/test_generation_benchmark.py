@@ -17,6 +17,8 @@ import pytest
 import yaml
 
 from src import common, generation
+from src.generation import generation_benchmark_config as benchmark_config
+from src.generation import generation_benchmark_report as benchmark_report
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -72,7 +74,7 @@ def test_resume_repairs_missing_input_with_current_node_scratch(
 
 def _synthetic_suite(
     generation_config_factory: Any,
-) -> generation.benchmark.CoreBenchmarkSuite:
+) -> benchmark_config.CoreBenchmarkSuite:
     """Return two representative cases and four resource-only variants."""
     config_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
@@ -85,14 +87,14 @@ def _synthetic_suite(
         sampling_regime="natural",
     )
     variants = tuple(
-        generation.benchmark.CoreBenchmarkVariant(
+        benchmark_config.CoreBenchmarkVariant(
             source_path=config_path.parent / f"cores_{cores:02d}.yaml",
             variant_id=f"cores_{cores:02d}",
             cores_per_case=cores,
         )
         for cores in (4, 8, 16, 32)
     )
-    return generation.benchmark.CoreBenchmarkSuite(
+    return benchmark_config.CoreBenchmarkSuite(
         source_path=config_path.parent / "suite.yaml",
         suite_name="synthetic_core_selection",
         suite_digest="c" * 64,
@@ -100,11 +102,11 @@ def _synthetic_suite(
         case_campaign=campaign,
         case_config=case_config,
         representative_cases=(
-            generation.benchmark.CoreBenchmarkRepresentativeCase(
+            benchmark_config.CoreBenchmarkRepresentativeCase(
                 case_role="nominal",
                 case_index=1,
             ),
-            generation.benchmark.CoreBenchmarkRepresentativeCase(
+            benchmark_config.CoreBenchmarkRepresentativeCase(
                 case_role="natural",
                 case_index=2,
             ),
@@ -169,7 +171,7 @@ def _production() -> dict[str, Any]:
 
 
 def _success_records(
-    suite: generation.benchmark.CoreBenchmarkSuite,
+    suite: benchmark_config.CoreBenchmarkSuite,
     runtimes: Mapping[int, tuple[float, float]],
     *,
     queue_seconds: float = 0.0,
@@ -239,7 +241,7 @@ def _success_records(
 
 
 def _pending_records(
-    suite: generation.benchmark.CoreBenchmarkSuite,
+    suite: benchmark_config.CoreBenchmarkSuite,
     *,
     successful: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[dict[str, Any]]:
@@ -270,7 +272,7 @@ def _minimal_manifest(run_id: str = _RUN_ID) -> dict[str, Any]:
 
 
 def _prepare_submission_test(
-    suite: generation.benchmark.CoreBenchmarkSuite,
+    suite: benchmark_config.CoreBenchmarkSuite,
     storage: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Path:
@@ -503,7 +505,7 @@ def test_finalize_same_result_refreshes_only_improved_queue_accounting(
         records,
         unavailable_scheduler,
     )
-    initial = generation.benchmark.summarize_core_benchmark_results(suite, records)
+    initial = benchmark_report.summarize_core_benchmark_results(suite, records)
     generation.benchmark._apply_controller_queue_to_summary(
         initial,
         unavailable_measurements,
@@ -526,7 +528,7 @@ def test_finalize_same_result_refreshes_only_improved_queue_accounting(
     common.serialization.atomic_write_json(directory / "summary.json", initial)
     common.serialization.atomic_write_text(
         directory / "runs.csv",
-        generation.benchmark._results_csv(
+        benchmark_report.results_csv(
             records,
             queue_by_work_unit=generation.benchmark._controller_queue_by_work_unit(
                 unavailable_measurements,
@@ -535,7 +537,7 @@ def test_finalize_same_result_refreshes_only_improved_queue_accounting(
     )
     common.serialization.atomic_write_text(
         directory / "summary.md",
-        generation.benchmark.core_benchmark_markdown(initial),
+        benchmark_report.core_benchmark_markdown(initial),
     )
     scheduler_rows = "\n".join(f"{item['job_id']}|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05" for item in submissions)
     scheduler = {
@@ -735,7 +737,7 @@ def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
     repository = Path(__file__).resolve().parents[2]
     suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
     monkeypatch.setenv("PROJECT_ROOT", str(repository))
-    before = generation.benchmark.load_core_benchmark_suite(
+    before = benchmark_config.load_core_benchmark_suite(
         suite_path,
         require_executable=False,
     )
@@ -749,7 +751,7 @@ def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
         require_executable=False,
     )
     monkeypatch.setenv("PROJECT_ROOT", str(repository))
-    after = generation.benchmark.load_core_benchmark_suite(
+    after = benchmark_config.load_core_benchmark_suite(
         suite_path,
         require_executable=False,
     )
@@ -785,8 +787,8 @@ def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
     monkeypatch.setenv("GENERATION_NATIVE_VENV", str(runtime / "venvs" / "native"))
-    launcher = project_root / "scripts/generation_benchmark_node.sh"
-    source_launcher = Path(__file__).resolve().parents[2] / "scripts/generation_benchmark_node.sh"
+    launcher = project_root / "scripts/generation_node.sh"
+    source_launcher = Path(__file__).resolve().parents[2] / "scripts/generation_node.sh"
     launcher.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_launcher, launcher)
     command = generation.benchmark.build_core_benchmark_slurm_command(
@@ -803,9 +805,10 @@ def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     wrapped = shlex.split(command[-1].removeprefix("--wrap="))
     assert f"STORAGE_ROOT={tmp_path.resolve()}" in wrapped
     assert "GENERATION_SOURCE_SHA256=" + "b" * 64 in wrapped
-    assert wrapped[-5:] == [
+    assert wrapped[-6:] == [
         str(launcher),
         str(project_root),
+        "benchmark-case",
         _RUN_ID,
         "cores_16",
         "natural",
@@ -873,7 +876,7 @@ def test_preflight_is_standalone_and_plans_eight_commands(
     monkeypatch.setattr(generation.benchmark, "_repository_commit", lambda: _COMMIT)
     monkeypatch.setattr(generation.benchmark, "_require_clean_repository", lambda: None)
     monkeypatch.setattr(
-        generation.benchmark,
+        benchmark_config,
         "load_core_benchmark_suite",
         lambda *_args, **_kwargs: suite,
     )
@@ -907,12 +910,12 @@ def test_preflight_is_standalone_and_plans_eight_commands(
     assert not (storage / "01_generation/meta/real_smoke").exists()
 
 
-def test_login_preparation_creates_two_proofs_and_submits_nothing(
+def test_input_preparation_creates_two_proofs_and_submits_nothing(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Materialize both canonical inputs on the login side before submission."""
+    """Materialize both canonical inputs before measured-case submission."""
     suite = _synthetic_suite(generation_config_factory)
     storage = tmp_path / "storage"
     storage.mkdir()
@@ -928,11 +931,11 @@ def test_login_preparation_creates_two_proofs_and_submits_nothing(
     }
     monkeypatch.setattr(generation.benchmark, "plan_core_benchmark", lambda *_args, **_kwargs: plan)
     monkeypatch.setattr(
-        generation.benchmark,
+        benchmark_config,
         "load_core_benchmark_suite",
         lambda *_args, **_kwargs: suite,
     )
-    monkeypatch.setattr(generation.benchmark, "_repository_relative", lambda path: path.name)
+    monkeypatch.setattr(benchmark_config, "repository_relative", lambda path: path.name)
 
     def materialize(
         observed_run_id: str,
@@ -1244,13 +1247,13 @@ def test_summary_uses_only_successful_comsol_runtime_for_ranking(
 ) -> None:
     """Keep queue, license, conversion, and publication out of recommendation."""
     suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
     runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    baseline = generation.benchmark.summarize_core_benchmark_results(
+    baseline = benchmark_report.summarize_core_benchmark_results(
         suite,
         _success_records(suite, runtimes),
     )
-    delayed = generation.benchmark.summarize_core_benchmark_results(
+    delayed = benchmark_report.summarize_core_benchmark_results(
         suite,
         _success_records(
             suite,
@@ -1282,9 +1285,9 @@ def test_resource_infeasible_variant_cannot_be_recommended(
         node_memory_limit_bytes=100,
         node_scratch_limit_bytes=1000,
     )
-    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
     runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = generation.benchmark.summarize_core_benchmark_results(
+    summary = benchmark_report.summarize_core_benchmark_results(
         suite,
         _success_records(suite, runtimes, peak_memory_bytes=20),
     )
@@ -1298,9 +1301,9 @@ def test_five_percent_tie_is_deterministic(
 ) -> None:
     """Break exact throughput and core-hour ties toward fewer cores."""
     suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
     runtimes = {4: (100.0, 100.0), 8: (50.0, 50.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = generation.benchmark.summarize_core_benchmark_results(
+    summary = benchmark_report.summarize_core_benchmark_results(
         suite,
         _success_records(suite, runtimes),
     )
@@ -1315,9 +1318,9 @@ def test_license_overlap_qualification_does_not_change_compute_metrics(
 ) -> None:
     """Report absent overlap separately from compute-only performance."""
     suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
     runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = generation.benchmark.summarize_core_benchmark_results(
+    summary = benchmark_report.summarize_core_benchmark_results(
         suite,
         _success_records(
             suite,
@@ -1350,7 +1353,7 @@ def test_markdown_summary_loader_reads_only_persisted_canonical_bytes(
         lambda *_args, **_kwargs: summary,
     )
     monkeypatch.setattr(
-        generation.benchmark,
+        benchmark_report,
         "core_benchmark_markdown",
         lambda _summary: expected,
     )
@@ -1446,7 +1449,7 @@ def test_completed_status_exposes_the_persisted_validated_summary(
         lambda *_args, **_kwargs: summary,
     )
     monkeypatch.setattr(
-        generation.benchmark,
+        benchmark_report,
         "core_benchmark_markdown",
         lambda _summary: markdown,
     )
@@ -1612,7 +1615,7 @@ def test_partial_evaluation_uses_only_complete_waves(
 ) -> None:
     """Keep incomplete waves out of provisional and final recommendations."""
     suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(generation.benchmark, "_production_interpretation", lambda _suite: _production())
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
     runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
     successes = _success_records(suite, runtimes, queue_seconds=999.0, license_wait_seconds=888.0)
     successful_by_unit = {record["work_unit_id"]: record for record in successes}

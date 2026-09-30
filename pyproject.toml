@@ -161,6 +161,8 @@ include = ["src", "tests"]
 extraPaths = [".", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
+venvPath = "../runtime/venvs"
+venv = "native"
 
 [tool.mypy]
 python_version = "3.12"

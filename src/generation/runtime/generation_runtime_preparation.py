@@ -2,13 +2,16 @@
 generation_runtime_preparation.py
 
 Prepare isolated runtime workspaces from deterministic scientific case bundles.
+
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
   - Generate case-local adapters and copy a digest-verified COMSOL model
   - Preserve cleanup boundaries when preparation fails
+
 Design principles:
   - Scientific bundle construction remains owned by the cases package
   - Workspace creation and template copying remain runtime concerns
+
 This module does NOT:
   - Execute COMSOL, convert outputs, or publish canonical case results
 """
@@ -103,7 +106,7 @@ def _materialize_canonical_raw_bundle(
     except (FileNotFoundError, FileExistsError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = (
             f"Canonical input readiness is required before worker execution for {case_id}; "
-            "run submit-campaign or generate-input-cases on the CPU login node first."
+            "prepare canonical inputs through ./scripts/generation before worker execution."
         )
         raise RuntimeError(message) from error
     source_case_json = reference.case_directory / "case.json"

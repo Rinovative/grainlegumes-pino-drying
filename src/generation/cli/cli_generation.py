@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from src import common
 from src.generation import generation_background as background_service
 from src.generation import generation_benchmark as benchmark_service
+from src.generation import generation_benchmark_config as benchmark_config
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_completion as completion_service
 from src.generation import generation_campaign_status as campaign_status_service
@@ -1477,7 +1478,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(json.dumps(report, sort_keys=True))
         return 0
     if args.command == "inspect-core-benchmark":
-        inspection = benchmark_service.inspect_core_benchmark(
+        inspection = benchmark_config.inspect_core_benchmark(
             args.suite,
             require_executable=args.require_executable,
         )

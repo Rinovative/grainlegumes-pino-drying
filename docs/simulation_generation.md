@@ -5,6 +5,32 @@ Slurm/COMSOL execution. Scientific parameter meanings remain in the
 [scientific parameter reference](generation_parameter_reference.md), and
 current values remain in validated YAML under `configs/generation`.
 
+## Everyday commands
+
+Open the outer `grainlegumes-pino-drying` folder in VS Code Remote SSH and
+select `runtime/venvs/native/bin/python` as the interpreter. In its terminal:
+
+```bash
+cd repo
+export PATH="$(realpath -e ../runtime/venvs/native/bin):$PATH"
+python -m pytest -q tests/generation/test_generation_run.py
+./scripts/generation smoke
+./scripts/generation run configs/generation/campaigns/steady_flow/id_dataset.yaml
+./scripts/generation run configs/generation/benchmarks/transient_core_scaling/suite.yaml
+./scripts/generation status configs/generation/campaigns/steady_flow/id_dataset.yaml
+squeue -u "$USER"
+ls -lt ../runtime/logs/generation | head
+```
+
+The small focused test above is suitable for development on the login node.
+Run the full Generation suite in a CPU Slurm allocation. `smoke` submits a
+disposable native COMSOL probe; for scientific paired technical smoke use
+`./scripts/generation run configs/generation/workflows/technical_smoke.yaml`.
+Repeat the same `run CONFIG` command to resume or replay eligible missing
+work. `run` reads the validated configuration kind, so campaigns, benchmarks,
+and ordered workflows need no different launch command. See the source
+admission rules below before a publication run.
+
 ## Setup and entry points
 
 Work from `repo/` on ICE. The sibling roots are `../storage` for
@@ -48,6 +74,76 @@ inside a Slurm allocation, review the diff, then rebuild and validate. The
 Apptainer image consumes the same lock without the development group; rebuilding
 the native environment does not require rebuilding the SIF.
 
+`scripts/generation` only starts the canonical native Python interpreter.
+`src/generation/cli/cli_generation_controller.py` parses the public command;
+`generation_controller.py` owns the run lifecycle, monitoring, continuation,
+and publication sequence; and `runtime/generation_runtime_host.py` owns source
+admission, host/Slurm command execution, and background process ownership.
+Campaign, benchmark, completion, workflow, smoke, and background services own
+their persisted evidence and scientific behavior. The shared
+`scripts/generation_node.sh` is the Slurm node boundary, and
+`scripts/generation_prerequisites.sh` checks modules and source identity
+before node-side Python imports. Developers never invoke either shell file
+directly for a normal workflow.
+
+### Package responsibilities
+
+The public controller reconstructs continuation from service-owned evidence.
+`generation_run.py` describes immutable run plans and their declared stages;
+it does not maintain another execution-state machine. The controller's command
+port isolates real host processes from lifecycle decisions. Host service calls
+cross the worker CLI because that boundary also selects the native interpreter,
+checks source identity, and allocates Slurm resources when needed.
+
+| Owner | Responsibility |
+| --- | --- |
+| `cli/` | Argument parsing, service dispatch, output, and process exit status |
+| `generation_controller.py`, `generation_run.py` | Workflow sequencing and immutable plans |
+| `generation_campaign.py`, `generation_campaign_completion.py` | Case admission, scheduler reconciliation, replacement completion, and resume |
+| `generation_benchmark_config.py` | Benchmark suite validation and immutable resource/case selections |
+| `generation_benchmark.py` | Benchmark work-unit execution, recovery, and persisted evidence |
+| `generation_benchmark_report.py` | Measurement interpretation and deterministic CSV/Markdown reports |
+| `cases/`, `contracts/` | Scientific configuration, deterministic inputs, admission, and semantic contracts |
+| `runtime/` | Admitted host processes, case commands, COMSOL execution, scratch ownership, and runtime evidence |
+| `publication/` | Canonical export conversion, case/attempt admission, inventories, and composite evidence |
+| `generation_workflow.py` | Dataset-package gates, retention, cleanup authorization, and workflow receipts |
+| `generation_smoke.py`, `generation_readiness.py`, `validation/` | Technical smoke evidence, readiness, pilot analysis, and scientific gates |
+| `generation_campaign_status.py`, `generation_background.py` | Status presentation and durable controller-session evidence |
+
+<details>
+<summary>Dependency and execution boundaries</summary>
+
+```mermaid
+flowchart TD
+    CLI[Public CLI] --> Controller[Lifecycle controller]
+    Controller --> Host[Runtime host boundary]
+    Host --> Worker[Worker CLI: native process or Slurm]
+    Worker --> Plan[Immutable run planning]
+    Worker --> Campaign[Campaign and completion]
+    Worker --> Benchmark[Benchmark lifecycle]
+    Worker --> Workflow[Publication and package gates]
+    Plan --> Config[Case and benchmark configuration]
+    Benchmark --> Config
+    Benchmark --> Report[Benchmark reports]
+    Campaign --> Cases[Deterministic cases]
+    Campaign --> Runtime[Case runtime and cluster commands]
+    Benchmark --> Runtime
+    Runtime --> Publication[Canonical publication and evidence]
+    Workflow --> Publication
+    Workflow --> Datasets[Dataset package services]
+```
+
+Benchmark configuration and reporting have no dependency on the benchmark
+lifecycle. Generic paths, serialization, and locking remain in `src/common`;
+Generation-specific admission and source-evidence rules remain in Generation.
+The deliberate local-import dependency between completion and campaign evidence
+admits synthetic replacement manifests through their existing semantic owner.
+Completion consumes the canonical parent partial receipt directly, with storage
+containment checked by the controller and exact digest/schema admission by the
+completion service.
+
+</details>
+
 Run the maintained checks from `repo/` in a CPU Slurm allocation, with
 `native-candidate` substituted for `native` during staged validation:
 
@@ -63,6 +159,7 @@ python -m mypy src
 python -m basedpyright --pythonpath "$(command -v python)"
 python -m pytest -q -m 'not real_data' -p no:cacheprovider tests
 for script in scripts/*.sh; do bash -n "$script"; done
+bash -n scripts/generation
 git diff --check
 ```
 
@@ -74,15 +171,11 @@ set on the login node. COMSOL is loaded
 natively on compute nodes with `module load Comsol/v6.4`; it is not in
 the ML Apptainer image.
 
-```bash
-./scripts/generation_workflow.sh run CONFIG --dry-run
-./scripts/generation_workflow.sh run CONFIG --preflight-only
-./scripts/generation_workflow.sh run CONFIG
-./scripts/generation_workflow.sh run CONFIG --background
-./scripts/generation_workflow.sh status CONFIG_OR_RUN_ID
-./scripts/generation_workflow.sh cancel RUN_ID
-./scripts/generation_workflow.sh smoke
-```
+Use `./scripts/generation run CONFIG --dry-run` to inspect a plan and
+`./scripts/generation run CONFIG --preflight-only` to check launch readiness.
+The optional `--background` flag starts the same run under a durable controller
+session. `status CONFIG_OR_RUN_ID` and `cancel RUN_ID` are the administrative
+commands.
 
 The optional `smoke` command submits one disposable COMSOL batch
 acceptance job with one CPU, no GPU GRES, and no scientific publication.
@@ -134,9 +227,9 @@ session. Slurm still owns the case jobs. A login-host reboot can end the
 controller; rerun the same config to reconcile durable state.
 
 ```bash
-./scripts/generation_workflow.sh run CONFIG --background
-./scripts/generation_workflow.sh background-status "$WORKFLOW_SESSION_ID"
-./scripts/generation_workflow.sh background-list
+./scripts/generation run CONFIG --background
+./scripts/generation background-status "$WORKFLOW_SESSION_ID"
+./scripts/generation background-list
 ```
 
 ## Partial campaigns and completion
@@ -150,8 +243,8 @@ still fails closed on missing or conflicting evidence.
 Deterministic completion uses the same interface:
 
 ```bash
-./scripts/generation_workflow.sh run CONFIG --replacement-pool-size N
-./scripts/generation_workflow.sh run CONFIG \
+./scripts/generation run CONFIG --replacement-pool-size N
+./scripts/generation run CONFIG \
   --replacement-pool-size N --parent-run-id PARENT_RUN_ID
 ```
 
@@ -172,7 +265,7 @@ Each case loads `Comsol/v6.4` in its Slurm allocation and executes Python
 through the canonical native venv. The `python_module: Python/3.12` site field
 is retained as the declared version contract for preflight; it is not loaded.
 The site Python probe uses `/usr/bin/python3.12` directly.
-The native worker invokes the maintained Generation Python CLI;
+The single native node launcher invokes the maintained Generation Python CLI;
 the Python runtime constructs and executes `comsol batch` with the
 existing inputs, `-batchlog`, and `-batchlogout`. The worker
 uses unique node-local scratch and removes it after case completion. COMSOL
@@ -207,7 +300,7 @@ input-only operation, the maintained wrapper admits the current clean source
 and runs the Python CLI inside a CPU Slurm allocation:
 
 ```bash
-./scripts/generation_workflow.sh inputs "$CAMPAIGN_CONFIG" \
+./scripts/generation inputs "$CAMPAIGN_CONFIG" \
   --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"
 ```
 
@@ -216,9 +309,9 @@ source commit, and sibling storage. Input EDA reads only admitted canonical
 manifests.
 
 ```bash
-./scripts/generation_workflow.sh status CONFIG_OR_RUN_ID
-./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID"
-./scripts/generation_workflow.sh cancel "$GENERATION_RUN_ID" --force
+./scripts/generation status CONFIG_OR_RUN_ID
+./scripts/generation cancel "$GENERATION_RUN_ID"
+./scripts/generation cancel "$GENERATION_RUN_ID" --force
 ```
 
 The first Ctrl+C after campaign launch requests graceful cancellation of

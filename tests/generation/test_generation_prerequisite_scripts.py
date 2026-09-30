@@ -14,9 +14,7 @@ import pytest
 _CAMPAIGN_RUN_ID = "synthetic__0123456789abcdef"
 _BENCHMARK_RUN_ID = "core_scaling_transient__0123456789abcdef"
 _SCRIPTS = (
-    "generation_campaign_node.sh",
-    "generation_benchmark_node.sh",
-    "generation_smoke_node.sh",
+    "generation_node.sh",
     "generation_prerequisites.sh",
     "source_fingerprint.py",
 )
@@ -98,8 +96,8 @@ def native_worker(request: pytest.FixtureRequest) -> tuple[Path, dict[str, str],
 @pytest.mark.parametrize(
     ("script", "arguments", "expected_cli"),
     [
-        ("generation_campaign_node.sh", (_CAMPAIGN_RUN_ID, "batch", "1", "2"), "run-campaign-case"),
-        ("generation_benchmark_node.sh", (_BENCHMARK_RUN_ID, "cores_02", "nominal"), "run-core-benchmark-case"),
+        ("campaign-case", (_CAMPAIGN_RUN_ID, "batch", "1", "2"), "run-campaign-case"),
+        ("benchmark-case", (_BENCHMARK_RUN_ID, "cores_02", "nominal"), "run-core-benchmark-case"),
     ],
 )
 def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
@@ -112,9 +110,9 @@ def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
     """Run the worker from Slurm's spool path with only shared source beside it."""
     repository, environment, command_log = native_worker
     spooled = tmp_path / "slurm_script"
-    shutil.copy2(repository / "scripts" / script, spooled)
+    shutil.copy2(repository / "scripts/generation_node.sh", spooled)
     result = subprocess.run(
-        ["/bin/bash", str(spooled), str(repository), *arguments],
+        ["/bin/bash", str(spooled), str(repository), script, *arguments],
         env=environment,
         text=True,
         capture_output=True,
@@ -138,7 +136,7 @@ def test_worker_rejects_source_change_before_python_or_comsol(
     helper = repository / "scripts" / "source_fingerprint.py"
     helper.write_text(helper.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
     result = subprocess.run(
-        ["/bin/bash", str(repository / "scripts" / "generation_campaign_node.sh"), str(repository), _CAMPAIGN_RUN_ID, "batch", "1", "2"],
+        ["/bin/bash", str(repository / "scripts" / "generation_node.sh"), str(repository), "campaign-case", _CAMPAIGN_RUN_ID, "batch", "1", "2"],
         env=environment,
         text=True,
         capture_output=True,
@@ -199,7 +197,7 @@ def test_native_smoke_runs_compiled_java_and_propagates_batch_failure(
     environment["SLURM_CPUS_PER_TASK"] = "1"
     environment["SMOKE_BATCH_EXIT"] = str(batch_exit)
     result = subprocess.run(
-        ["/bin/bash", str(repository / "scripts" / "generation_smoke_node.sh"), str(repository)],
+        ["/bin/bash", str(repository / "scripts" / "generation_node.sh"), str(repository), "smoke"],
         env=environment,
         text=True,
         capture_output=True,
@@ -221,7 +219,7 @@ def test_worker_rejects_non_sibling_environment(
     repository, environment, command_log = native_worker
     environment["STORAGE_ROOT"] = str(tmp_path / "other-storage")
     result = subprocess.run(
-        ["/bin/bash", str(repository / "scripts" / "generation_campaign_node.sh"), str(repository), _CAMPAIGN_RUN_ID, "batch", "1", "2"],
+        ["/bin/bash", str(repository / "scripts" / "generation_node.sh"), str(repository), "campaign-case", _CAMPAIGN_RUN_ID, "batch", "1", "2"],
         env=environment,
         text=True,
         capture_output=True,

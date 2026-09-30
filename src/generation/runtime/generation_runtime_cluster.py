@@ -1,11 +1,11 @@
 """
 generation_runtime_cluster.py
 
-Coordinate local development concurrency and one-case Slurm submissions.
+Coordinate local development concurrency and Generation case Slurm commands.
 Responsibilities:
   - Validate a bounded local-only development execution plan
   - Run local cases without reusing production scheduler controls
-  - Build one ordinary non-exclusive Slurm submission per campaign case
+  - Build ordinary non-exclusive Slurm submissions for campaign and benchmark cases
 Design principles:
   - The scheduler owns cluster concurrency; each Slurm job owns exactly one case
   - Campaign job identity binds one declared batch and case before submission
@@ -280,7 +280,7 @@ def build_campaign_case_slurm_submission_command(
         message = "Campaign submission task identity is inconsistent."
         raise ValueError(message)
     repository = common.paths.get_project_root().resolve()
-    launcher = repository / "scripts" / "generation_campaign_node.sh"
+    launcher = repository / "scripts" / "generation_node.sh"
     if not launcher.is_file() or launcher.is_symlink():
         message = f"Campaign compute-node launcher is missing or unsafe: {launcher}"
         raise FileNotFoundError(message)
@@ -293,7 +293,6 @@ def build_campaign_case_slurm_submission_command(
         message = f"Scheduler log directory must be one safe absolute directory: {requested_log_directory}."
         raise ValueError(message)
     runtime_root = common.paths.get_runtime_root().resolve()
-    runtime_logs = runtime_root / "logs" / "generation"
     storage = Path(storage_root).resolve()
     if not storage.is_dir() or storage in (repository, runtime_root):
         message = "Generation storage root must be one separate existing directory."
@@ -336,28 +335,52 @@ def build_campaign_case_slurm_submission_command(
     worker_command = [
         str(launcher),
         str(repository),
+        "campaign-case",
         run_id,
         task.batch_name,
         str(task.case_index),
         str(cores_per_case),
     ]
     wrapped = shlex.join(["env", *worker_environment, *worker_command])
+    return build_generation_slurm_command(
+        repository=repository,
+        job_name=job_name,
+        cores_per_task=cores_per_case,
+        partition=cluster["partition"],
+        wall_time=cluster["wall_time"],
+        scheduler_options=cluster["scheduler_options"],
+        wrapped=wrapped,
+    )
+
+
+def build_generation_slurm_command(
+    *,
+    repository: Path,
+    job_name: str,
+    cores_per_task: int,
+    partition: str | None,
+    wall_time: str | None,
+    scheduler_options: Sequence[str],
+    wrapped: str,
+) -> list[str]:
+    """Build the common native Generation case submission command."""
+    runtime_logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
     command = [
         "sbatch",
         "--parsable",
         "--nodes=1",
         "--ntasks=1",
-        f"--cpus-per-task={cores_per_case}",
+        f"--cpus-per-task={cores_per_task}",
         f"--chdir={repository}",
         f"--job-name={job_name}",
         "--export=ALL",
         f"--output={runtime_logs}/slurm-%j.out",
         f"--error={runtime_logs}/slurm-%j.err",
     ]
-    if cluster["partition"] is not None:
-        command.append(f"--partition={cluster['partition']}")
-    if cluster["wall_time"] is not None:
-        command.append(f"--time={cluster['wall_time']}")
-    command.extend(cluster["scheduler_options"])
+    if partition is not None:
+        command.append(f"--partition={partition}")
+    if wall_time is not None:
+        command.append(f"--time={wall_time}")
+    command.extend(scheduler_options)
     command.append(f"--wrap={wrapped}")
     return command

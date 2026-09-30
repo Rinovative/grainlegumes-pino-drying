@@ -123,9 +123,9 @@ def generation_config_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     """Return a factory for complete layered synthetic campaign configurations."""
     repository_root = Path(__file__).resolve().parents[2]
     project_root = tmp_path / "project"
-    node_script = project_root / "scripts/generation_campaign_node.sh"
+    node_script = project_root / "scripts/generation_node.sh"
     node_script.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(repository_root / "scripts/generation_campaign_node.sh", node_script)
+    shutil.copy2(repository_root / "scripts/generation_node.sh", node_script)
     monkeypatch.setenv("PROJECT_ROOT", str(project_root))
 
     registry = yaml.safe_load((repository_root / "configs/generation/registry.yaml").read_text(encoding="utf-8"))

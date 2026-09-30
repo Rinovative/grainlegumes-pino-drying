@@ -155,7 +155,7 @@ def test_benchmark_units_are_canary_first_and_never_prepare(tmp_path: Path, monk
         tmp_path / "suite.yaml",
         "schema_kind: generation_core_scaling_benchmark_suite\nschema_version: 1\n",
     )
-    monkeypatch.setattr(run_service.benchmark_service, "load_core_benchmark_suite", lambda *_args, **_kwargs: _benchmark_suite())
+    monkeypatch.setattr(run_service.benchmark_config, "load_core_benchmark_suite", lambda *_args, **_kwargs: _benchmark_suite())
 
     plan = run_service.resolve_generation_run(config, source_commit=COMMIT, repository_root=tmp_path)
 
@@ -208,32 +208,6 @@ finalizers:
     assert [child.input_identity for child in plan.children] == ["steady_flow-campaign-digest", "transient_drying-campaign-digest"]
     assert plan.finalizers[0].finalizer_kind == "paired_technical_smoke"
     assert plan.identity.startswith("workflow__")
-
-
-def test_controller_selects_common_lifecycle_and_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Advance only the next declared stage and stop before deferred transfer."""
-    config = _write_yaml(tmp_path / "campaign.yaml", "schema_kind: generation_campaign\nschema_version: 1\n")
-    packages: tuple[dict[str, object], ...] = ({"dataset_name": "airflow-id"},)
-    monkeypatch.setattr(run_service.config_service, "load_campaign_config", lambda *_args, **_kwargs: _campaign(packages=packages))
-    plan = run_service.resolve_generation_run(config, source_commit=COMMIT, repository_root=tmp_path)
-
-    controller = run_service.GenerationRunController(plan)
-    assert controller.next_stage() == "resolve_config"
-    with pytest.raises(ValueError, match="expected 'resolve_config'"):
-        controller.advance("submit")
-    controller = controller.advance("resolve_config")
-    assert controller.continuation_state() == "preflight_ready"
-    deferred = controller.resume(defer_collection=True)
-    assert deferred.next_stage() == "preflight"
-    transfer_index = plan.lifecycle_stages.index("transfer")
-    completed = frozenset(plan.lifecycle_stages[:transfer_index])
-    awaiting = run_service.GenerationRunController(
-        plan,
-        completed_stages=completed,
-        defer_collection=True,
-    )
-    assert awaiting.next_stage() is None
-    assert awaiting.continuation_state() == "awaiting_collection"
 
 
 def test_workflow_rejects_duplicate_and_unsafe_children(tmp_path: Path) -> None:

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+python="${repository}/../runtime/venvs/native/bin/python"
+if [[ ! -x "${python}" ]]; then
+  printf 'Native Generation Python environment is missing: %s\n' "${python}" >&2
+  exit 1
+fi
+cd "${repository}"
+exec "${python}" -m src.generation.cli.cli_generation_controller "$@"

@@ -55,7 +55,8 @@ def _write_setup_idle_campaign(
             "command": [
                 "sbatch",
                 f"--job-name=setup-idle-{index}",
-                "generation_campaign_node.sh",
+                "generation_node.sh",
+                "campaign-case",
             ],
             "job_id": job_id,
             "status": "submitted",
@@ -431,7 +432,7 @@ def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(
         _RUN_ID,
         storage_root=storage,
         stage="synthetic transfer",
-        continuation_command="./scripts/generation_workflow.sh run configs/generation/campaigns/steady_flow/id_dataset.yaml",
+        continuation_command="./scripts/generation run configs/generation/campaigns/steady_flow/id_dataset.yaml",
         cpu_bytes_retained=17,
     )
     first_bytes = first.read_bytes()
@@ -439,7 +440,7 @@ def test_workflow_failure_receipts_are_visible_verified_campaign_metadata(
         _RUN_ID,
         storage_root=storage,
         stage="synthetic publication",
-        continuation_command="./scripts/generation_workflow.sh run configs/generation/campaigns/steady_flow/id_dataset.yaml",
+        continuation_command="./scripts/generation run configs/generation/campaigns/steady_flow/id_dataset.yaml",
         cpu_bytes_retained=17,
     )
 

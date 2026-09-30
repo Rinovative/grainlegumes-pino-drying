@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -52,12 +53,9 @@ def native_controller(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]
     storage.mkdir()
     (runtime / "venvs/native/bin").mkdir(parents=True)
     for name in (
-        "generation_workflow.sh",
+        "generation",
         "source_fingerprint.py",
-        "generation_smoke_node.sh",
-        "generation_campaign_node.sh",
-        "generation_benchmark_node.sh",
-        "generation_python_node.sh",
+        "generation_node.sh",
         "generation_prerequisites.sh",
     ):
         shutil.copy2(source / "scripts" / name, scripts / name)
@@ -167,7 +165,7 @@ else:
     _write_executable(
         fake_bin / "srun",
         f"#!{sys.executable}\n"
-        "import json, os, pathlib, sys\n"
+        "import json, os, pathlib, sys, time\n"
         "pathlib.Path(os.environ['FAKE_SRUN_LOG']).write_text(\n"
         "    json.dumps({'args': sys.argv[1:], 'env': {\n"
         "        key: os.environ.get(key) for key in (\n"
@@ -178,6 +176,9 @@ else:
         "    raise SystemExit(int(os.environ['FAKE_SRUN_FAIL']))\n"
         "if 'validate-all-workflow' in sys.argv:\n"
         "    raise SystemExit(6)\n"
+        "if os.environ.get('FAKE_SRUN_STREAM'):\n"
+        "    print('streamed-before-completion', flush=True)\n"
+        "    time.sleep(0.7)\n"
         "print('canonical-inputs\\t1\\t0')\n",
     )
     _write_executable(fake_bin / "module", "#!/usr/bin/env bash\nexit 0\n")
@@ -210,7 +211,7 @@ else:
 def _run(controller: tuple[Path, Path, Path, dict[str, str]], *arguments: str) -> subprocess.CompletedProcess[str]:
     repository, _storage, _runtime, environment = controller
     return subprocess.run(
-        ["bash", str(repository / "scripts/generation_workflow.sh"), *arguments],
+        ["bash", str(repository / "scripts/generation"), *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -237,7 +238,7 @@ def test_smoke_submits_native_worker_with_runtime_logs_and_source_evidence(
     assert f"--chdir={repository}" in arguments
     assert f"--output={runtime}/logs/generation/slurm-%j.out" in arguments
     assert f"--error={runtime}/logs/generation/slurm-%j.err" in arguments
-    assert arguments[-2:] == [str(repository / "scripts/generation_smoke_node.sh"), str(repository)]
+    assert arguments[-3:] == [str(repository / "scripts/generation_node.sh"), str(repository), "smoke"]
     assert not any(argument.startswith(("--gres", "--nodelist", "--exclude")) for argument in arguments)
     assert submission["env"]["GENERATION_GIT_COMMIT"] == _git(repository, "rev-parse", "HEAD")
     assert len(submission["env"]["GENERATION_SOURCE_SHA256"]) == 64
@@ -371,6 +372,36 @@ def test_requested_historical_commit_is_rejected(
     assert not Path(environment["FAKE_SBATCH_LOG"]).exists()
 
 
+def test_preflight_rejects_missing_node_launcher(
+    native_controller: tuple[Path, Path, Path, dict[str, str]],
+) -> None:
+    """A preflight result requires the actual scheduled worker boundary."""
+    repository, _storage, _runtime, _environment = native_controller
+    (repository / "scripts/generation_node.sh").unlink()
+
+    result = _run(native_controller, "run", _CAMPAIGN, "--preflight-only")
+
+    assert result.returncode == 1
+    assert "Slurm worker is missing" in result.stderr
+
+
+def test_preflight_rejects_unsafe_runtime_log_directory(
+    native_controller: tuple[Path, Path, Path, dict[str, str]],
+) -> None:
+    """Preflight admits the log destination before promising scheduled work."""
+    _repository, _storage, runtime, _environment = native_controller
+    outside = runtime.parent / "other-logs"
+    outside.mkdir()
+    logs_parent = runtime / "logs"
+    logs_parent.mkdir()
+    (logs_parent / "generation").symlink_to(outside, target_is_directory=True)
+
+    result = _run(native_controller, "run", _CAMPAIGN, "--preflight-only")
+
+    assert result.returncode == 1
+    assert "runtime log directory is unsafe" in result.stderr
+
+
 def test_campaign_run_materializes_inputs_through_native_srun(
     native_controller: tuple[Path, Path, Path, dict[str, str]],
 ) -> None:
@@ -389,7 +420,7 @@ def test_campaign_run_materializes_inputs_through_native_srun(
     assert f"--chdir={repository}" in arguments
     assert any(argument.startswith(f"--error={runtime}/logs/generation/") for argument in arguments)
     assert arguments[-9:] == [
-        str(repository / "scripts/generation_python_node.sh"),
+        str(repository / "scripts/generation_node.sh"),
         str(repository),
         "cli",
         "prepare-campaign-inputs",
@@ -433,7 +464,7 @@ def test_input_only_generation_uses_standard_cpu_allocation_and_preserves_select
     assert not any(argument.startswith(("--gres", "--nodelist")) for argument in arguments)
     assert any(argument.startswith(f"--error={runtime}/logs/generation/") for argument in arguments)
     assert arguments[-15:] == [
-        str(repository / "scripts/generation_python_node.sh"),
+        str(repository / "scripts/generation_node.sh"),
         str(repository),
         "cli",
         "generate-input-cases",
@@ -480,6 +511,38 @@ def test_srun_failure_stops_campaign_before_submission(
     assert "submit-campaign" not in [call[0] for call in _cli_calls(native_controller)]
 
 
+def test_scheduled_operation_log_streams_before_worker_exits(
+    native_controller: tuple[Path, Path, Path, dict[str, str]],
+) -> None:
+    """The runtime log remains useful while a scheduled operation is active."""
+    repository, _storage, runtime, environment = native_controller
+    environment["FAKE_SRUN_STREAM"] = "1"
+    process = subprocess.Popen(
+        ["bash", str(repository / "scripts/generation"), "inputs", _CAMPAIGN, "--all-batches", "--all-cases"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    observed_while_running = False
+    deadline = time.monotonic() + 3
+    try:
+        while time.monotonic() < deadline and process.poll() is None:
+            logs = list((runtime / "logs/generation").glob("python-generate-input-cases.*.out"))
+            if logs and "streamed-before-completion" in logs[0].read_text(encoding="utf-8"):
+                observed_while_running = True
+                break
+            time.sleep(0.02)
+        stdout, stderr = process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0, stderr
+    assert observed_while_running
+    assert "streamed-before-completion" in stdout
+
+
 @pytest.mark.parametrize(
     ("cli_failure", "mutate_source", "expected_status"),
     [("", False, 0), ("9", False, 9), ("", True, 1)],
@@ -514,7 +577,7 @@ def test_python_worker_preserves_cli_status_and_rechecks_source(
     result = subprocess.run(
         [
             "bash",
-            str(repository / "scripts/generation_python_node.sh"),
+            str(repository / "scripts/generation_node.sh"),
             str(repository),
             "cli",
             "storage-status",
@@ -568,9 +631,9 @@ def test_benchmark_worker_uses_node_scratch_and_preserves_identity_arguments(
     result = subprocess.run(
         [
             "bash",
-            str(repository / "scripts/generation_python_node.sh"),
+            str(repository / "scripts/generation_node.sh"),
             str(repository),
-            "benchmark",
+            "benchmark-preflight",
             operation,
             target,
             *identity_arguments,
