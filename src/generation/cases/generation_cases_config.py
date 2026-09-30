@@ -2031,10 +2031,7 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         msg = "execution.runtime.extra_arguments cannot override runtime-owned COMSOL arguments."
         raise GenerationConfigError(msg)
     runtime["executable"] = site["comsol_executable"]
-    runtime["module_initialization"] = [
-        f"module load {site['python_module']}",
-        f"module load {site['comsol_module']}",
-    ]
+    runtime["module_initialization"] = [f"module load {site['comsol_module']}"]
 
     retention_profiles = _mapping(execution["retention"], label="execution.retention")
     _exact_keys(retention_profiles, required=set(CAMPAIGN_PURPOSES), optional=set(), label="execution.retention")

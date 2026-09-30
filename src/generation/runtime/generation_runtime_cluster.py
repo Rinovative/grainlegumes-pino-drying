@@ -320,7 +320,7 @@ def build_campaign_case_slurm_submission_command(
     if len(source_sha) != _SOURCE_SHA256_LENGTH or any(character not in "0123456789abcdef" for character in source_sha):
         message = "GENERATION_SOURCE_SHA256 must contain the launch source fingerprint."
         raise ValueError(message)
-    if Path(native_venv) != runtime_root / "venvs" / "generation":
+    if Path(native_venv) != runtime_root / "venvs" / "native":
         message = "GENERATION_NATIVE_VENV must be the sibling runtime Generation venv."
         raise ValueError(message)
     worker_environment = [
@@ -328,7 +328,6 @@ def build_campaign_case_slurm_submission_command(
         f"GENERATION_SOURCE_SHA256={source_sha}",
         f"GENERATION_NATIVE_VENV={native_venv}",
         f"STORAGE_ROOT={storage}",
-        f"GENERATION_PYTHON_MODULE={site['python_module']}",
         f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
         f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
         f"GENERATION_COMSOL_EXECUTABLE={site['comsol_executable']}",

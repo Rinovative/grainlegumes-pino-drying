@@ -372,7 +372,7 @@ def test_new_campaign_submits_only_fresh_cases_beside_historical_replay_evidence
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", "c" * 64)
     monkeypatch.setenv(
         "GENERATION_NATIVE_VENV",
-        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "native"),
     )
     submitted: list[list[str]] = []
 

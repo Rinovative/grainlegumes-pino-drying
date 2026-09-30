@@ -33,7 +33,7 @@ def _admit_synthetic_submission(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
     monkeypatch.setenv(
         "GENERATION_NATIVE_VENV",
-        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "native"),
     )
     monkeypatch.setattr(
         generation.campaign.source_service,

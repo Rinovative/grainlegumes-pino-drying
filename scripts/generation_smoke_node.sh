@@ -9,14 +9,13 @@ fi
 REPOSITORY_ROOT="$(realpath -e -- "$1")"
 [[ -f "${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh" ]] ||
   { printf 'Smoke source must be the shared repository.\n' >&2; exit 2; }
-[[ "${GENERATION_NATIVE_VENV:-}" == "$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/generation")" ]] ||
+[[ "${GENERATION_NATIVE_VENV:-}" == "$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/native")" ]] ||
   { printf 'Smoke requires the sibling native Generation environment.\n' >&2; exit 2; }
 
 /bin/bash "${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh" validate-worker-repository \
   "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "${BASH_SOURCE[0]}"
 # shellcheck source=generation_prerequisites.sh
 source "${REPOSITORY_ROOT}/scripts/generation_prerequisites.sh"
-module load Python/3.12
 module load Comsol/v6.4
 cd "${REPOSITORY_ROOT}"
 "${GENERATION_NATIVE_VENV}/bin/python" -c \

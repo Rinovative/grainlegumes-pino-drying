@@ -106,6 +106,13 @@ def _profile_configuration(
 
 
 @pytest.fixture(autouse=True)
+def _isolate_slurm_job_identity(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Let synthetic tests own job identity instead of inheriting the test allocation."""
+    if request.node.get_closest_marker("real_data") is None:
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _git_commit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bind every synthetic case and campaign to one exact fake commit."""
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)

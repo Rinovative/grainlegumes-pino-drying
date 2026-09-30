@@ -20,7 +20,7 @@ fi
   "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "$0" >&2
 
 EXPECTED_STORAGE="$(realpath -m -- "${REPOSITORY_ROOT}/../storage")"
-EXPECTED_VENV="$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/generation")"
+EXPECTED_VENV="$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/native")"
 if [[ "${STORAGE_ROOT:-}" != "${EXPECTED_STORAGE}" \
   || "${GENERATION_NATIVE_VENV:-}" != "${EXPECTED_VENV}" \
   || ! -x "${GENERATION_NATIVE_VENV}/bin/python" ]]; then
@@ -33,10 +33,6 @@ if [[ ! "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ \
   exit 2
 fi
 
-if ! command -v module >/dev/null 2>&1 || ! module load Python/3.12 >&2; then
-  printf 'Native Generation Python worker could not load Python/3.12.\n' >&2
-  exit 1
-fi
 if [[ "${MODE}" == benchmark ]]; then
   if [[ "$1" != materialize-core-benchmark-inputs \
     && "$1" != submit-core-benchmark \

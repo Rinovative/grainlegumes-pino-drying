@@ -101,11 +101,17 @@ execution under `configs/generation`. Edit model, optimizer, training, and
 evaluation decisions under `configs/learning/<task>`. Use `validate-config` to
 inspect the resolved plan instead of copying current values into Markdown.
 
-Use the ICE three-root workspace: `repo` for source,
-`../storage` for durable scientific state, and `../runtime` for
-replaceable environments and logs. ML runs through Slurm and Apptainer.
+Open the outer project folder
+`/zfspool/storage/home/rino.albertin/work/grainlegumes-pino-drying` in VS Code
+Remote SSH. Its Explorer contains `repo/` for source, `storage/` for durable
+scientific state, and `runtime/` for replaceable environments and logs. The
+outer project configuration discovers only the canonical Git repository under
+`repo/`; this outer folder is the only supported VS Code opening method. ML
+runs through Slurm and Apptainer.
 Generation runs through native Slurm and `Comsol/v6.4` with the locked
-Python 3.12 environment under `../runtime/venvs/generation`.
+Python 3.12 environment under `../runtime/venvs/native`. This shared native
+environment includes the locked development dependencies and also serves
+VS Code/Pylance, Jupyter, and native validation.
 Provisioning details are in the [Generation guide](docs/simulation_generation.md).
 
 Build the ML image once from `container/Apptainer.def` in a CPU Slurm
@@ -228,7 +234,6 @@ python -m pytest -q -m "not real_data" tests
 ```text
 .
 ├── .github/workflows/quality.yml
-├── .vscode/settings.json
 ├── container/Apptainer.def
 ├── configs/
 │   ├── generation/

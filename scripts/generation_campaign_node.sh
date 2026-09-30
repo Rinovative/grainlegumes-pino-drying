@@ -70,11 +70,11 @@ if [[ "${GENERATION_NATIVE_VENV}" != /* || "${STORAGE_ROOT}" != /* ]]; then
   exit 2
 fi
 if [[ "$(realpath -m -- "${STORAGE_ROOT}")" != "$(realpath -m -- "${REPOSITORY_ROOT}/../storage")" \
-  || "$(realpath -m -- "${GENERATION_NATIVE_VENV}")" != "$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/generation")" ]]; then
+  || "$(realpath -m -- "${GENERATION_NATIVE_VENV}")" != "$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/native")" ]]; then
   printf 'Generation worker requires the sibling storage and runtime Generation venv.\n' >&2
   exit 2
 fi
-for variable_name in GENERATION_PYTHON_MODULE GENERATION_COMSOL_MODULE \
+for variable_name in GENERATION_COMSOL_MODULE \
   GENERATION_PYTHON_EXECUTABLE GENERATION_COMSOL_EXECUTABLE; do
   value="${!variable_name:-}"
   if [[ -z "${value}" || "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
@@ -86,10 +86,6 @@ done
 COMPUTE_DOMAIN="CPU compute-node"
 generation_require_command "${COMPUTE_DOMAIN}" module "compute bootstrap"
 generation_require_command "${COMPUTE_DOMAIN}" mktemp "case scratch creation"
-if ! module load "${GENERATION_PYTHON_MODULE}"; then
-  generation_prerequisite_failed \
-    "${COMPUTE_DOMAIN}" "Python module ${GENERATION_PYTHON_MODULE}" "compute"
-fi
 if ! module load "${GENERATION_COMSOL_MODULE}"; then
   generation_prerequisite_failed \
     "${COMPUTE_DOMAIN}" "COMSOL module ${GENERATION_COMSOL_MODULE}" "compute"

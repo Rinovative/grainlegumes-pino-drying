@@ -22,6 +22,17 @@ _SCRIPTS = (
 )
 
 
+@pytest.mark.parametrize("arguments", [(), ("--candidate",)])
+def test_native_provisioning_requires_slurm(arguments: tuple[str, ...]) -> None:
+    """Refuse environment creation outside a scheduler allocation."""
+    environment = os.environ.copy()
+    environment.pop("SLURM_JOB_ID", None)
+    script = Path(__file__).resolve().parents[2] / "scripts/provision_native.sh"
+    result = subprocess.run(["bash", str(script), *arguments], env=environment, capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert "Slurm allocation" in result.stderr
+
+
 def _write_executable(path: Path, contents: str) -> None:
     path.write_text("#!/bin/bash\nset -euo pipefail\n" + contents, encoding="utf-8")
     path.chmod(0o755)
@@ -55,7 +66,7 @@ def native_worker(request: pytest.FixtureRequest) -> tuple[Path, dict[str, str],
     command_log = tmp_path / "commands.log"
     _write_executable(binary / "module", 'printf "module <%s>\\n" "$*" >> "$COMMAND_LOG"\n')
     _write_executable(binary / "comsol", 'printf "COMSOL Multiphysics 6.4.0.293\\n"\n')
-    venv = runtime / "venvs" / "generation"
+    venv = runtime / "venvs" / "native"
     (venv / "bin").mkdir(parents=True)
     _write_executable(
         venv / "bin" / "python",
@@ -73,7 +84,6 @@ def native_worker(request: pytest.FixtureRequest) -> tuple[Path, dict[str, str],
         "GENERATION_GIT_COMMIT": commit,
         "GENERATION_SOURCE_SHA256": source_sha,
         "GENERATION_NATIVE_VENV": str(venv),
-        "GENERATION_PYTHON_MODULE": "Python/3.12",
         "GENERATION_COMSOL_MODULE": "Comsol/v6.4",
         "GENERATION_PYTHON_EXECUTABLE": "python3",
         "GENERATION_COMSOL_EXECUTABLE": "comsol",
@@ -113,7 +123,7 @@ def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
     assert result.returncode == 0, result.stderr
     assert "check=source-worktree status=pass" in result.stdout
     commands = command_log.read_text(encoding="utf-8")
-    assert "module <load Python/3.12>" in commands
+    assert "python-version:" in result.stdout
     assert "module <load Comsol/v6.4>" in commands
     assert expected_cli in commands
     assert "cleanup-worker-workspace" in commands

@@ -315,8 +315,8 @@ resolve_host_layout() {
     fail 1 "Shared durable storage is missing or unsafe."
   [[ -d "${RUNTIME_ROOT}" && ! -L "${RUNTIME_ROOT}" ]] ||
     fail 1 "Replaceable runtime root is missing or unsafe."
-  GENERATION_NATIVE_VENV="${GENERATION_NATIVE_VENV:-${RUNTIME_ROOT}/venvs/generation}"
-  [[ "${GENERATION_NATIVE_VENV}" == "${RUNTIME_ROOT}/venvs/generation" \
+  GENERATION_NATIVE_VENV="${GENERATION_NATIVE_VENV:-${RUNTIME_ROOT}/venvs/native}"
+  [[ "${GENERATION_NATIVE_VENV}" == "${RUNTIME_ROOT}/venvs/native" \
     && -x "${GENERATION_NATIVE_VENV}/bin/python" ]] ||
     fail 1 "Native Python 3.12 environment is missing: ${GENERATION_NATIVE_VENV}."
   export GENERATION_NATIVE_VENV

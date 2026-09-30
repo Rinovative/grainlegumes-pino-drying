@@ -61,7 +61,7 @@ def _set_native_launch_evidence(monkeypatch: pytest.MonkeyPatch, commit: str) ->
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
     monkeypatch.setenv(
         "GENERATION_NATIVE_VENV",
-        str(common.paths.get_runtime_root().resolve() / "venvs" / "generation"),
+        str(common.paths.get_runtime_root().resolve() / "venvs" / "native"),
     )
 
 

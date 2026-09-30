@@ -12,19 +12,65 @@ scientific data, case results, receipts, manifests, and Dataset packages, and
 `../runtime` for the replaceable Python environment, caches, and Slurm
 logs. No second checkout, self-SSH, rsync, Docker, or Conda runtime is used.
 
-Provision `../runtime/venvs/generation` once in a Slurm CPU allocation
-from the repository's Python 3.12 `uv.lock`. Full project dependencies
-are required because Generation package publication imports PyTorch.
+Provision `../runtime/venvs/native` once in a Slurm CPU allocation
+from the repository's Python 3.12 `pyproject.toml` and `uv.lock`, including
+the `dev` dependency group. This is the shared native environment for
+Generation, VS Code/Pylance, Jupyter, and developer validation. Full project
+dependencies are required because Generation package publication imports PyTorch.
 
 ```bash
-module load Python/3.12 uv/0.11
-export UV_PROJECT_ENVIRONMENT="$(realpath -m ../runtime/venvs/generation)"
-export UV_CACHE_DIR="$(realpath -m ../runtime/uv/cache)"
-uv sync --locked --no-dev --python "$(command -v python3)"
+srun --partition=gpu --nodes=1 --ntasks=1 --cpus-per-task=2 \
+  --mem=8G --time=00:20:00 --pty bash -l
+bash scripts/provision_native.sh
 ```
 
-Use `standard` for this environment setup and substantial CPU work.
-Do not install the full dependency set on the login node. COMSOL is loaded
+The bootstrap selects ICE's RPM-managed `/usr/bin/python3.12` directly,
+not the module's convenience path under `/software`. The supported base was
+verified as Python 3.12.14 on login and compute nodes. The script requires an
+absent target and a Slurm allocation, disables Python downloads, and installs
+the locked runtime and development dependencies. If needed, it copies ICE's
+verified uv 0.11.7 from `/zfspool/software/uv/uv` to `../runtime/bin/uv`.
+
+For a rebuild, first run `bash scripts/provision_native.sh --candidate` to
+create `../runtime/venvs/native-candidate`. Validate imports, Generation venv
+preflight, Jupyter, static checks and the synthetic test suite there, plus a
+login-node probe. Quiesce users of the old environment before replacement.
+Keep the old environment aside for rollback, then rerun the bootstrap without
+`--candidate` at the now-absent canonical path. Do not promote a venv by moving
+it: console scripts and Jupyter metadata embed absolute paths. Validate the
+canonical environment before deleting the rollback copy and candidate.
+
+`pyproject.toml` owns dependency intent; `uv.lock` owns resolved versions,
+including the NeuralOperator Git revision. Normal provisioning must not
+regenerate the lock. For intentional dependency changes, use the pinned uv with
+`UV_CACHE_DIR="$(realpath -m ../runtime/uv/cache)" UV_PYTHON_DOWNLOADS=never ../runtime/bin/uv lock --python /usr/bin/python3.12`
+inside a Slurm allocation, review the diff, then rebuild and validate. The
+Apptainer image consumes the same lock without the development group; rebuilding
+the native environment does not require rebuilding the SIF.
+
+Run the maintained checks from `repo/` in a CPU Slurm allocation, with
+`native-candidate` substituted for `native` during staged validation:
+
+```bash
+export PATH="$(realpath -e ../runtime/venvs/native/bin):$PATH"
+export UV_CACHE_DIR="$(realpath -e ../runtime/uv/cache)"
+export RUFF_CACHE_DIR="$(realpath -m ../runtime/cache/ruff)"
+export MYPY_CACHE_DIR="$(realpath -m ../runtime/cache/mypy)"
+../runtime/bin/uv pip check --python "$(command -v python)"
+python -m ruff check src tests scripts/check_notebooks.py scripts/check_package_install.py
+python -m ruff format --check src tests scripts/check_notebooks.py scripts/check_package_install.py --exclude '*.ipynb'
+python -m mypy src
+python -m basedpyright --pythonpath "$(command -v python)"
+python -m pytest -q -m 'not real_data' -p no:cacheprovider tests
+for script in scripts/*.sh; do bash -n "$script"; done
+git diff --check
+```
+
+For small environment
+builds and validation, prefer a CPU-only allocation on `gpu` when capacity
+is available, without GPU GRES or node pinning; otherwise use `standard`.
+Use `standard` for substantial CPU work. Do not install the full dependency
+set on the login node. COMSOL is loaded
 natively on compute nodes with `module load Comsol/v6.4`; it is not in
 the ML Apptainer image.
 
@@ -122,8 +168,11 @@ the sole durable source is retained.
 
 ## COMSOL and failure behavior
 
-Each case loads `Python/3.12` and `Comsol/v6.4` in its Slurm
-allocation. The native worker invokes the maintained Generation Python CLI;
+Each case loads `Comsol/v6.4` in its Slurm allocation and executes Python
+through the canonical native venv. The `python_module: Python/3.12` site field
+is retained as the declared version contract for preflight; it is not loaded.
+The site Python probe uses `/usr/bin/python3.12` directly.
+The native worker invokes the maintained Generation Python CLI;
 the Python runtime constructs and executes `comsol batch` with the
 existing inputs, `-batchlog`, and `-batchlogout`. The worker
 uses unique node-local scratch and removes it after case completion. COMSOL

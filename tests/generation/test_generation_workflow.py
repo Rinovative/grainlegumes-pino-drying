@@ -50,7 +50,7 @@ def native_controller(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
     storage.mkdir()
-    (runtime / "venvs/generation/bin").mkdir(parents=True)
+    (runtime / "venvs/native/bin").mkdir(parents=True)
     for name in (
         "generation_workflow.sh",
         "source_fingerprint.py",
@@ -139,7 +139,7 @@ else:
 """,
         encoding="utf-8",
     )
-    python_wrapper = runtime / "venvs/generation/bin/python"
+    python_wrapper = runtime / "venvs/native/bin/python"
     _write_executable(
         python_wrapper,
         "#!/usr/bin/env bash\n"
@@ -241,7 +241,7 @@ def test_smoke_submits_native_worker_with_runtime_logs_and_source_evidence(
     assert not any(argument.startswith(("--gres", "--nodelist", "--exclude")) for argument in arguments)
     assert submission["env"]["GENERATION_GIT_COMMIT"] == _git(repository, "rev-parse", "HEAD")
     assert len(submission["env"]["GENERATION_SOURCE_SHA256"]) == 64
-    assert submission["env"]["GENERATION_NATIVE_VENV"] == str(runtime / "venvs/generation")
+    assert submission["env"]["GENERATION_NATIVE_VENV"] == str(runtime / "venvs/native")
 
 
 def test_smoke_accepts_dirty_fingerprinted_source_and_explicit_standard(
@@ -497,7 +497,7 @@ def test_python_worker_preserves_cli_status_and_rechecks_source(
             "SLURM_JOB_ID": "4242",
             "SLURM_CPUS_PER_TASK": "4",
             "GENERATION_GIT_COMMIT": _git(repository, "rev-parse", "HEAD"),
-            "GENERATION_NATIVE_VENV": str(runtime / "venvs/generation"),
+            "GENERATION_NATIVE_VENV": str(runtime / "venvs/native"),
             "GENERATION_SOURCE_SHA256": subprocess.run(
                 [sys.executable, str(repository / "scripts/source_fingerprint.py"), str(repository)],
                 check=True,
@@ -552,7 +552,7 @@ def test_benchmark_worker_uses_node_scratch_and_preserves_identity_arguments(
             "SLURM_JOB_ID": "4242",
             "SLURM_CPUS_PER_TASK": "4",
             "GENERATION_GIT_COMMIT": _git(repository, "rev-parse", "HEAD"),
-            "GENERATION_NATIVE_VENV": str(runtime / "venvs/generation"),
+            "GENERATION_NATIVE_VENV": str(runtime / "venvs/native"),
             "GENERATION_SOURCE_SHA256": subprocess.run(
                 [sys.executable, str(repository / "scripts/source_fingerprint.py"), str(repository)],
                 check=True,

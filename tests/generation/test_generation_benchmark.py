@@ -784,7 +784,7 @@ def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
     runtime = common.paths.get_runtime_root().resolve()
     monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
-    monkeypatch.setenv("GENERATION_NATIVE_VENV", str(runtime / "venvs" / "generation"))
+    monkeypatch.setenv("GENERATION_NATIVE_VENV", str(runtime / "venvs" / "native"))
     launcher = project_root / "scripts/generation_benchmark_node.sh"
     source_launcher = Path(__file__).resolve().parents[2] / "scripts/generation_benchmark_node.sh"
     launcher.parent.mkdir(parents=True, exist_ok=True)

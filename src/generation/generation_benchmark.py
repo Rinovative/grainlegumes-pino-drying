@@ -1390,7 +1390,7 @@ def _node_environment(suite: CoreBenchmarkSuite, run_id: str, storage_root: Path
     if re.fullmatch(r"[0-9a-f]{64}", source_sha) is None:
         message = "GENERATION_SOURCE_SHA256 must contain the launch source fingerprint."
         raise ValueError(message)
-    if Path(native_venv) != runtime_root / "venvs" / "generation":
+    if Path(native_venv) != runtime_root / "venvs" / "native":
         message = "GENERATION_NATIVE_VENV must be the sibling runtime Generation venv."
         raise ValueError(message)
     return [
@@ -1399,7 +1399,6 @@ def _node_environment(suite: CoreBenchmarkSuite, run_id: str, storage_root: Path
         f"GENERATION_NATIVE_VENV={native_venv}",
         f"STORAGE_ROOT={storage_root.resolve()}",
         f"GENERATION_BENCHMARK_RUN_ID={run_id}",
-        f"GENERATION_PYTHON_MODULE={site['python_module']}",
         f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
         f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
         f"GENERATION_COMSOL_EXECUTABLE={site['comsol_executable']}",
