@@ -1,0 +1,105 @@
+{
+  "_events": {
+    "user-assigned-2026-10-01": "cc897ec97d13db707ee65839692c69f81c7ed3c9bd65cadb026aae1df316a495"
+  },
+  "acceptance": [
+    "The exact CI BasedPyright invocation exits zero without invalid native venv diagnostics.",
+    "ICE native development remains available through local interpreter selection and explicit Python path.",
+    "Static-analysis scope and diagnostic settings remain unchanged."
+  ],
+  "approval_reference": "User request: Fix the BasedPyright CI environment-resolution failure",
+  "authorization": "approved",
+  "baseline": {
+    "identity": {
+      "head": "ba2de1b2ba111a6a4bb519e168d4e4bd253662d8",
+      "index": [
+        [
+          ".github/workflows/quality.yml",
+          "100644",
+          "98ddb8d53dc3096c92b57f0e636ff176d1c69f42"
+        ],
+        [
+          "README.md",
+          "100644",
+          "1cb36bb8a138f683eafcf6a6a9e6a1f387b9cf0c"
+        ],
+        [
+          "docs/simulation_generation.md",
+          "100644",
+          "169f1f430e8139f6d6094180c6d674b72907c1fe"
+        ],
+        [
+          "pyproject.toml",
+          "100644",
+          "c2979b8fd558f18e40a2f3618df96bbd0b6e9d70"
+        ]
+      ],
+      "states": {
+        ".github/workflows/quality.yml": {
+          "mode": "100644",
+          "sha256": "77084b99efc66dc352bf3362dced7a3f6dfcc53255957488916044e0b8605429"
+        },
+        "README.md": {
+          "mode": "100644",
+          "sha256": "294ae909bc7d0fe7e0a7cb1bc943a8069804b7b3ab39e54c2b9bb141ad91e859"
+        },
+        "docs/simulation_generation.md": {
+          "mode": "100644",
+          "sha256": "45a3b8268e74a9e3ca54a4c39bfa597c8b35db302b6c7407b53f71f5e5daca21"
+        },
+        "pyproject.toml": {
+          "mode": "100644",
+          "sha256": "daed49ec54ba829b32c3dec4eeeacfc4c0c52befab52cd1bcc0dd38dca4ed218"
+        }
+      }
+    },
+    "paths": [
+      "pyproject.toml",
+      ".github/workflows/quality.yml",
+      "README.md",
+      "docs/simulation_generation.md"
+    ]
+  },
+  "checks": [
+    "uv run --frozen python -m basedpyright",
+    "CI-like environment without external ICE native venv if practical",
+    "Focused config/strictness review",
+    "git diff --check"
+  ],
+  "context": [
+    "pyproject.toml",
+    ".github/workflows/quality.yml",
+    "README.md",
+    "docs/simulation_generation.md",
+    "../.vscode/settings.json"
+  ],
+  "dependencies": [],
+  "goal": "Make tracked BasedPyright configuration portable across GitHub Actions uv and local ICE without weakening type checks.",
+  "id": "basedpyright-ci-env",
+  "integration": {
+    "authority": "local",
+    "target": "/zfspool/storage/home/rino.albertin/work/grainlegumes-pino-drying/repo"
+  },
+  "mode": "direct",
+  "non_goals": [
+    "Scientific code, environments, datasets, Slurm/Apptainer, unrelated editor or workflow changes, Git index/history/remotes."
+  ],
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "resources": [
+    "Lightweight repository config work on ICE login; substantial environment sync or checks through Slurm if required."
+  ],
+  "revision": 1,
+  "scope": [
+    "Investigate BasedPyright, CI uv, VS Code/Pylance, and native interpreter ownership.",
+    "Remove the tracked host-specific venv selection and validate the exact CI command."
+  ],
+  "stop_conditions": [
+    "Material change outside configuration ownership or unmet validation resources."
+  ],
+  "title": "Fix portable BasedPyright environment selection",
+  "updated_at": "2026-10-01T11:30:41.655402+00:00",
+  "why": "GitHub Actions uv environment is valid but tracked BasedPyright settings demand the external ICE native venv.",
+  "write_paths": [
+    "pyproject.toml"
+  ]
+}

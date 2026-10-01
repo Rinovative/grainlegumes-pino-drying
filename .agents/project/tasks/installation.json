@@ -1,0 +1,108 @@
+{
+  "_events": {
+    "include-minimal-ignore-wiring": "7238af4cf65b912a25aa7e6fffba46f5fe6432f3804b603b819acf2a496d2d91",
+    "installation-task": "631eea34082b215f1a5d2192de1ec2f8baacf2ae488509d9f8702937f73da7e6"
+  },
+  "acceptance": [
+    "Initialized project records, usable packets and safe claims/integration, preserved standards, validated helpers and one independent review, sanitized allowlist review bundle, honest activation state."
+  ],
+  "approval_reference": "Original user approval for minimal project wiring",
+  "authorization": "approved",
+  "baseline": {
+    "identity": {
+      "head": "ba2de1b2ba111a6a4bb519e168d4e4bd253662d8",
+      "index": [
+        [
+          "README.md",
+          "100644",
+          "1cb36bb8a138f683eafcf6a6a9e6a1f387b9cf0c"
+        ],
+        [
+          "docs/simulation_generation.md",
+          "100644",
+          "169f1f430e8139f6d6094180c6d674b72907c1fe"
+        ],
+        [
+          "docs/transient_training.md",
+          "100644",
+          "d821a741f0348964c66269767d5e471315d8b015"
+        ],
+        [
+          "pyproject.toml",
+          "100644",
+          "c2979b8fd558f18e40a2f3618df96bbd0b6e9d70"
+        ]
+      ],
+      "states": {
+        "README.md": {
+          "mode": "100644",
+          "sha256": "294ae909bc7d0fe7e0a7cb1bc943a8069804b7b3ab39e54c2b9bb141ad91e859"
+        },
+        "docs/simulation_generation.md": {
+          "mode": "100644",
+          "sha256": "45a3b8268e74a9e3ca54a4c39bfa597c8b35db302b6c7407b53f71f5e5daca21"
+        },
+        "docs/transient_training.md": {
+          "mode": "100644",
+          "sha256": "0210e3638e81139f6764bbe4a4a8a485d99620d242b20c2c442591c1e701c9a9"
+        },
+        "pyproject.toml": {
+          "mode": "100644",
+          "sha256": "daed49ec54ba829b32c3dec4eeeacfc4c0c52befab52cd1bcc0dd38dca4ed218"
+        }
+      }
+    },
+    "paths": [
+      "README.md",
+      "pyproject.toml",
+      "docs/simulation_generation.md",
+      "docs/transient_training.md"
+    ]
+  },
+  "checks": [
+    "Synthetic helper tests; selective-standards coverage; independent native review; static/config/discovery inspection"
+  ],
+  "context": [
+    "README.md",
+    "pyproject.toml",
+    "docs/simulation_generation.md",
+    "docs/transient_training.md"
+  ],
+  "dependencies": [],
+  "goal": "Install the authorized assignment-driven project workflow and global standards/procedures, preserving science and permissions.",
+  "id": "installation",
+  "integration": {
+    "authority": "local",
+    "target": "/zfspool/storage/home/rino.albertin/work/grainlegumes-pino-drying/repo"
+  },
+  "mode": "direct",
+  "non_goals": [
+    "Scientific source or backlog, real Git mutations, updates/installations, native histories, storage artifacts"
+  ],
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "resources": [
+    "System Python 3.12, tiny synthetic fixtures, approved bounded native implementation/review, own global config only through real sandbox approval"
+  ],
+  "revision": 2,
+  "scope": [
+    "Authorized own global guidance/roles/skills/performance tooling and minimal current-project wiring"
+  ],
+  "stop_conditions": [
+    "Material scope/base mismatch",
+    "Need for scientific decision or unapproved computation"
+  ],
+  "updated_at": "2026-09-30T19:43:00.218989+00:00",
+  "write_paths": [
+    "AGENTS.md",
+    ".agents/project/README.md",
+    ".agents/project/.gitignore",
+    ".agents/project/project.json",
+    ".agents/project/decisions/D-workflow.json",
+    ".agents/project/decisions/D-next-research.json",
+    ".agents/project/tasks/installation.json",
+    ".agents/project/tasks/generation-evidence.json",
+    ".agents/project/tasks/transient-decision-context.json",
+    ".agents/project/tasks/selected-research.json",
+    ".gitignore"
+  ]
+}

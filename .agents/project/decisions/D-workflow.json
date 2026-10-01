@@ -1,0 +1,16 @@
+{
+  "_events": {
+    "final-closeout-model": "69088ca05d60a82724369bfdd473f73020485f4711f0aa2195b718e3cf94799a",
+    "installation-approval": "0cd86b903a18f057b8fa8c63b3d4c994bee2aee6fb1d9de744197101b8e34975"
+  },
+  "answer": "Use one shared task/result/isolation/closeout contract for both execution modes, with one post-reconciliation project packet.",
+  "approval_reference": "User attachment 2b212195-19b6-49b1-b07a-353d10e898f6 explicitly approves the final operating model",
+  "id": "D-workflow",
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "question": "How is Codex work assigned and retained?",
+  "rationale": "One accountable session owns each assigned deliverable. Explicit finite batches may use bounded native delegation; independent tasks may instead use separate roots and isolated writing copies. Workers retain scoped results/handoffs. A final reconciler consumes the selected results, integrates authorized writing work, reconciles read-only findings and validates the target; a single fully reconciled root performs this itself. Only final reconciliation publishes the project next-round packet. NEXT_ROUND.md is a derived manual ChatGPT planning interface, while structured records remain canonical. The human chooses priorities; no automatic project selection, acceptance or backlog execution.",
+  "revision": 2,
+  "revisit": "Concrete usability, safety or measured coordination evidence warrants a bounded change.",
+  "status": "accepted",
+  "updated_at": "2026-09-30T21:05:40.653612+00:00"
+}

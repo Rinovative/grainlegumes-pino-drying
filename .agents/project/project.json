@@ -1,0 +1,172 @@
+{
+  "_events": {
+    "basedpyright-ci-env-closeout-2026-10-01": "18a52698aa28f66221596c629d4bf8b38921726e00044c11bf590106c70589af",
+    "final-workflow-reconciliation-no-commit": "0d23b3cfdef00cb7e80252348818e575eceeeb477ccbf42420c8168ea82f42d8",
+    "fresh-activation-and-human-context": "4da710b62c47cb32232434d6e9de7820b4e4559bc6ea259907bb0766989ab64b",
+    "initialize-grounded-state": "199633e686ddfa5fee18d24b0f2c12720fd4ddfb1a1c4178f0bbc4066b11e7c5",
+    "installation-verified-state": "d189759fd4237737c34156fe1d0faeb3786e06930a0ac7de0465d5fd268571a0"
+  },
+  "activation": {
+    "evidence": [
+      "Outer-workspace project resolution succeeded",
+      "Global instructions loaded and project instructions explicitly discovered/read",
+      "development, project-workflow and delegation-routing discoverable",
+      "read_only adapter started and returned repo root, main branch and dirty worktree",
+      "Repository tracking and mount-placeholder boundaries verified; no correction required"
+    ],
+    "source": "Fresh-session check in Codex chat 01a0f3f8-fdd6-7f42-bfeb-02ec77bf73df",
+    "status": "verified"
+  },
+  "closeout": {
+    "authorization_reference": "User request: Fix the BasedPyright CI environment-resolution failure",
+    "event": "basedpyright-ci-env-closeout-2026-10-01",
+    "owner": "01a0f739-6525-77f3-b0e8-e6d002252f68",
+    "prepared_at": "2026-10-01T11:33:53.489195+00:00",
+    "summary": "Portable BasedPyright configuration now follows the uv environment in CI while ICE native interpreter selection remains local to editor/runtime guidance.",
+    "task_ids": [
+      "basedpyright-ci-env"
+    ],
+    "validation": [
+      "Exact uv run --frozen python -m basedpyright in clean temporary uv environment on Slurm job 843868: 0 errors, 0 warnings, 0 notes; exit 0.",
+      "Independent read-only review found no material issue; git diff --check and TOML parsing passed."
+    ],
+    "view_identity": "fe2220c1181b1a4dcd4a473c50ab5159081abaae52551b530762e509b44dfb71"
+  },
+  "constraints": [
+    "Preserve scientific identity, fail-closed Generation/Dataset publication and resume; current configuration values live in maintained YAML.",
+    "ICE: Generation native Python 3.12; ML Slurm/Apptainer; significant/uncertain computation through Slurm. Research storage and shared environments need explicit ownership/scope.",
+    "Assignment-driven execution; recommendations are not accepted priorities; no automatic backlog execution."
+  ],
+  "context": [
+    "The next VP2/research objective has not been selected. Two bounded read-only investigations are available to inform that choice.",
+    "The Generation refactor is committed, but its current scientific acceptance evidence has not been audited by this workflow work.",
+    "The transient-training guide records methodological limitations and future plotting questions; these are candidates for discussion, not approved research priorities."
+  ],
+  "description": "Physics-informed neural operators for steady airflow and transient drying in heterogeneous grain beds, covering simulation Generation, immutable Datasets, training and Evaluation.",
+  "evidence": [
+    "README.md explains the project and the Generation/Dataset/training/Evaluation pipeline.",
+    "docs/simulation_generation.md describes the maintained Generation execution and validation contract.",
+    "docs/transient_training.md records transient methodology, limitations and plot recommendations. Run-level configuration, split identity, artifacts and unsuccessful experiments still require a separately assigned evidence audit."
+  ],
+  "experiments": [
+    "docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf: retained VP1 stationary-airflow report; transient drying is outside its results scope.",
+    "docs/transient_training.md: maintained transient methodology, future plot recommendations (line 359) and limitations (line 483). Run-level config/data/split/artifact identities and failed experimental approaches have not been independently audited in this installation; do not invent them."
+  ],
+  "history": [
+    "2026-09-30 installation baseline: main, HEAD ba2de1b2ba111a6a4bb519e168d4e4bd253662d8, clean worktree, no pre-existing project workflow files.",
+    "Recent committed Generation refactor consolidated native execution/package ownership. No scientific or full Generation tests were executed during workflow installation; current commit validation remains unverified here.",
+    "Existing scientific runs, active Slurm jobs and experiment outcomes were not inventoried in this bounded installation. Their current state is unknown, not failed or inactive.",
+    "Prior native probes established nested delegation/reuse and synthetic A/B integration; see the global delegation-routing capability reference. No quota/efficiency comparison was established.",
+    "2026-09-30: authorized global workflow replacement installed after explicit in-chat approval; 26 reviewed files, 10 superseded files removed. config.toml including gpt-6-astra/max, sandbox and native cap unchanged.",
+    "New helper evidence: 21 distinct focused synthetic tests passed across full/affected runs; installed-location CLI isolation/integration/import check passed. Three skill validators passed. Independent native review material findings corrected. No research tests/jobs executed.",
+    "Activation: current root received replacement global AGENTS instructions. New read_only adapter spawn was rejected with unknown agent_type read_only; no new agent created. Fresh-session skill/adapter discovery and actual read-only enforcement remain unverified. Helpers resolve outer cwd directly; shell cd alone does not reload instructions."
+  ],
+  "id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "integration_order": [
+    "Independent investigation handoffs require final reconciliation; source integration is needed only for separately authorized writing work."
+  ],
+  "key_constraints": [
+    "Choose scientific priorities explicitly; ready candidates do not authorize execution.",
+    "Preserve equations, Dataset/run/split identity, preprocessing provenance and publication/resume integrity.",
+    "Substantial computation uses Slurm; Generation uses the maintained native environment and ML uses Apptainer. No scientific execution is included in these candidate investigations."
+  ],
+  "name": "GrainLegumes-PINO-Drying",
+  "observations": [
+    "Fresh-session activation verified: project resolution, global/project instruction discovery, all three user skills and one successful read_only adapter return. No activation correction remains.",
+    "No scientific tests, experiments or Slurm jobs were run for workflow activation/finalization. Current scientific acceptance and run-level evidence remain unverified here."
+  ],
+  "parallel_groups": [
+    {
+      "reason": "Separate read-only source/document investigations with no shared mutations or scientific compute. The user may select either execution style.",
+      "tasks": [
+        "generation-evidence",
+        "transient-decision-context"
+      ]
+    }
+  ],
+  "phase": "Choose the next scientific deliverable.",
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "purpose": "Physics-informed neural operators for steady Darcy\u2013Brinkman airflow and transient drying in heterogeneous grain beds; COMSOL Generation, immutable Datasets, training and Evaluation. Source: README.md at ba2de1b2ba111a6a4bb519e168d4e4bd253662d8",
+  "revision": 6,
+  "task_outcomes": {
+    "basedpyright-ci-env": {
+      "contract": "f93de1b56dfa31adbb5af6c8d2ef602e4feb8c39836cc46fe2325c21d2f273e3",
+      "implemented": true,
+      "integrated": true,
+      "result_reference": {
+        "attempt": "f509e2e2-9e65-4408-afe9-0113b3dea4de",
+        "result_identity": "5d851d00019285c860938fde763319f3052bc6771e9fb6a60e94094712644ef5"
+      },
+      "review": [
+        "Independent read-only reviewer found no material issue; confirmed CI/local ownership, retained mode/include/extraPaths, no competing tracked Pyright config."
+      ],
+      "status": "completed",
+      "summary": "Removed host-specific BasedPyright venvPath and venv from tracked pyproject.toml; CI uv resolves its temporary environment and ICE native selection remains in editor/runtime layer.",
+      "task_revision": 1,
+      "unresolved": [],
+      "user_accepted": null,
+      "validated": true,
+      "validation": [
+        "Slurm job 843868 ran exact uv run --frozen python -m basedpyright using fresh /tmp environment: 0 errors, 0 warnings, 0 notes; completed 0:0.",
+        "Python 3.12 tomllib parsed BasedPyright config without venvPath/venv.",
+        "git diff --check passed."
+      ]
+    },
+    "installation": {
+      "contract": "bded6ecc461c0b9f9e69fd5fc0064fa43a4e083c7cf70db2fd7d89607ed9d275",
+      "implemented": true,
+      "integrated": true,
+      "resolution": {
+        "summary": "Workflow installation is complete, and fresh-session discovery and the read_only adapter have been successfully verified. The earlier session failure is historical, not a current blocker.",
+        "unresolved": [],
+        "validation": [
+          "This chat verified outer-workspace resolution, loaded global and explicitly discovered project guidance, three available skills, one successful read_only adapter return and coherent tracking boundaries.",
+          "Final closeout and human-interface implementation passed its focused tests and independent review."
+        ]
+      },
+      "result_reference": {
+        "attempt": "0c058866-5bba-4515-a9a3-44194d559dcb",
+        "result_identity": "27104a9f42286191c13be5251bcff88e4d266ff4eedad2048a46115cd0806e4d"
+      },
+      "review": [
+        "One independent native reviewer; material assignment-binding, patch-substitution, result-restart, batch-lock and receipt-recovery findings corrected; final targeted recovery review found no remaining material issue."
+      ],
+      "status": "completed",
+      "summary": "Workflow installation is complete, and fresh-session discovery and the read_only adapter have been successfully verified. The earlier session failure is historical, not a current blocker.",
+      "task_revision": 2,
+      "unresolved": [],
+      "user_accepted": null,
+      "validated": true,
+      "validation": [
+        "21 distinct synthetic tests passed across recorded runs; installed CLI isolation/integration/import smoke passed in 0.461 seconds; 3 skill validators and scoped Ruff checks passed; 26 installed hashes/10 removals verified; config.toml unchanged; real Git diff --check passed. Evidence: runtime/codex/installation-20260930/",
+        "This chat verified outer-workspace resolution, loaded global and explicitly discovered project guidance, three available skills, one successful read_only adapter return and coherent tracking boundaries.",
+        "Final closeout and human-interface implementation passed its focused tests and independent review."
+      ]
+    },
+    "workflow-finalization": {
+      "contract": "11892d101487855d47271c2bcb134ceb4e0d37427f79ee1b981789afe6a009f7",
+      "implemented": true,
+      "integrated": true,
+      "result_reference": {
+        "attempt": "d634cafd-f2c5-481c-9308-a4db02965106",
+        "result_identity": "e6d18b6729d53eaa6fb056b751c298720e37ef40f292eaef64248bf2acf369ab"
+      },
+      "review": [
+        "One independent read_only review identified two dependency-state defects; both were corrected, covered by focused tests, and confirmed resolved by the same reviewer"
+      ],
+      "status": "completed",
+      "summary": "Final workflow implementation is installed and verified. Both execution styles share final reconciliation and generated project handoffs. Repository changes remain unstaged and uncommitted by explicit user instruction.",
+      "task_revision": 2,
+      "unresolved": [],
+      "user_accepted": null,
+      "validated": true,
+      "validation": [
+        "37 focused workflow helper tests passed in both candidate and installed locations; no research tests or jobs",
+        "Scoped Ruff checks and formatting passed; skill validation passed using existing native Python",
+        "Installed hashes match the ten reviewed files; protected config, global AGENTS and adapter match baseline",
+        "Repository changes are workflow-only and unstaged; Git diff whitespace check passes"
+      ]
+    }
+  },
+  "updated_at": "2026-10-01T11:33:53.489195+00:00"
+}

@@ -1,0 +1,13 @@
+{
+  "_events": {
+    "initial-question": "03ae6e1ec60e2cf352dffdbb52b7d6106e8af70332ab7b7a349540594d25400a"
+  },
+  "id": "D-next-research",
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "question": "Which research deliverable should be selected after workflow installation?",
+  "rationale": "The user has not assigned the next scientific task. The recent Generation refactor and documented transient questions are context, not permission to execute research.",
+  "revision": 1,
+  "revisit": "User selects priorities, scientific question and allowed compute/resources.",
+  "status": "proposed",
+  "updated_at": "2026-09-30T19:28:53.691549+00:00"
+}

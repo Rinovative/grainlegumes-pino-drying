@@ -1,0 +1,100 @@
+{
+  "_events": {
+    "human-task-context": "b85a72b973a92bdb00a3d5cf0364818ebe7f803e493b2f145344b503af92418b",
+    "initial-candidate": "d148a417ff492472c4ed2344a899e38371c18dd347108026021e1c91c5b15706"
+  },
+  "acceptance": [
+    "Return current source-grounded evidence and precise unverified boundaries."
+  ],
+  "authorization": "proposed",
+  "baseline": {
+    "identity": {
+      "head": "ba2de1b2ba111a6a4bb519e168d4e4bd253662d8",
+      "index": [
+        [
+          "README.md",
+          "100644",
+          "1cb36bb8a138f683eafcf6a6a9e6a1f387b9cf0c"
+        ],
+        [
+          "docs/simulation_generation.md",
+          "100644",
+          "169f1f430e8139f6d6094180c6d674b72907c1fe"
+        ],
+        [
+          "docs/transient_training.md",
+          "100644",
+          "d821a741f0348964c66269767d5e471315d8b015"
+        ],
+        [
+          "pyproject.toml",
+          "100644",
+          "c2979b8fd558f18e40a2f3618df96bbd0b6e9d70"
+        ]
+      ],
+      "states": {
+        "README.md": {
+          "mode": "100644",
+          "sha256": "294ae909bc7d0fe7e0a7cb1bc943a8069804b7b3ab39e54c2b9bb141ad91e859"
+        },
+        "docs/simulation_generation.md": {
+          "mode": "100644",
+          "sha256": "45a3b8268e74a9e3ca54a4c39bfa597c8b35db302b6c7407b53f71f5e5daca21"
+        },
+        "docs/transient_training.md": {
+          "mode": "100644",
+          "sha256": "0210e3638e81139f6764bbe4a4a8a485d99620d242b20c2c442591c1e701c9a9"
+        },
+        "pyproject.toml": {
+          "mode": "100644",
+          "sha256": "daed49ec54ba829b32c3dec4eeeacfc4c0c52befab52cd1bcc0dd38dca4ed218"
+        }
+      }
+    },
+    "paths": [
+      "README.md",
+      "pyproject.toml",
+      "docs/simulation_generation.md",
+      "docs/transient_training.md"
+    ]
+  },
+  "checks": [
+    "Non-mutating source/config/reference inspection; no research tests authorized."
+  ],
+  "context": [
+    "README.md",
+    "pyproject.toml",
+    "docs/simulation_generation.md",
+    "docs/transient_training.md"
+  ],
+  "dependencies": [],
+  "goal": "Prepare the next scientific decision packet from transient-training limitations and plot recommendations; identify required evidence without choosing the scientific answer.",
+  "id": "transient-decision-context",
+  "integration": {
+    "authority": "none",
+    "target": "/zfspool/storage/home/rino.albertin/work/grainlegumes-pino-drying/repo"
+  },
+  "mode": "read-only",
+  "non_goals": [
+    "Research execution, dataset changes, environment replacement, commits/pushes"
+  ],
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "resources": [
+    "Read-only repository inspection; no models beyond useful native assistance; no Slurm/scientific workloads."
+  ],
+  "revision": 2,
+  "scope": [
+    "README.md",
+    "pyproject.toml",
+    "docs/simulation_generation.md",
+    "docs/transient_training.md"
+  ],
+  "stop_conditions": [
+    "Material scope/base mismatch",
+    "Need for scientific decision or unapproved computation"
+  ],
+  "title": "Clarify transient-drying research choices",
+  "updated_at": "2026-09-30T21:05:40.655847+00:00",
+  "why": "Turn the documented limitations and plotting recommendations into evidence-backed questions for the next scientific decision.",
+  "write_paths": []
+}

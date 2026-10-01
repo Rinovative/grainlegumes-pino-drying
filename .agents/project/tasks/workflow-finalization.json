@@ -1,0 +1,95 @@
+{
+  "_events": {
+    "finalization-assigned": "f83aa65b33537b010d080ae43fd68f7bd2d95a29b011a6e5df203245f7a985d4",
+    "finalize-without-commit": "9f2b131152bf7bb6a9e3a50db943bf827edb028a05a7f58b207cf5dbc764dae8"
+  },
+  "acceptance": [
+    "Worker result publication stays separate from final project reconciliation.",
+    "Both execution modes and read-only result reconciliation publish one current planning packet through final closeout.",
+    "Current human views are concise, fresh-session activation is recorded, installed checks and independent review pass, and repository workflow files remain unstaged and uncommitted."
+  ],
+  "approval_reference": "Latest direct user instruction: dont commit but do the rest",
+  "authorization": "approved",
+  "baseline": {
+    "identity": {
+      "head": "ba2de1b2ba111a6a4bb519e168d4e4bd253662d8",
+      "index": [
+        [
+          ".gitignore",
+          "100644",
+          "e845a875c40e17c2a43909f708b206892ed3ce18"
+        ]
+      ],
+      "states": {
+        ".agents/project/README.md": {
+          "mode": "100644",
+          "sha256": "a4ec55f880b0551da671fe44dea1e0bac6514db30af02ac11aa79331ed97dd2c"
+        },
+        ".gitignore": {
+          "mode": "100644",
+          "sha256": "3e7bbc71545c298b804d6581490a351cb08b6d7b62ded7fce07857b481c0d0e9"
+        },
+        "AGENTS.md": {
+          "mode": "100644",
+          "sha256": "51e84badee577d448276d3d7852448bbbb38500cd7bf43b4309c0d6290726055"
+        }
+      }
+    },
+    "paths": [
+      ".gitignore",
+      "AGENTS.md",
+      ".agents/project/README.md"
+    ]
+  },
+  "checks": [
+    "Focused workflow state/renderer tests, skill validator, static checks, final Git scope/diff review"
+  ],
+  "context": [
+    ".agents/project/project.json",
+    ".agents/project/decisions/D-workflow.json"
+  ],
+  "dependencies": [],
+  "goal": "Finalize the installed workflow closeout and human handoffs, reconcile installation and leave repository-local workflow changes unstaged and uncommitted.",
+  "id": "workflow-finalization",
+  "integration": {
+    "authority": "local",
+    "target": "/zfspool/storage/home/rino.albertin/work/grainlegumes-pino-drying/repo"
+  },
+  "mode": "direct",
+  "non_goals": [
+    "Research code/data, scientific execution, Slurm, native Codex history, config.toml, model/security/concurrency settings",
+    "Routing policy or architecture redesign",
+    "Staging, committing or pushing repository changes"
+  ],
+  "project_id": "329bc2e1-208b-4778-b967-082ad7eac1f3",
+  "resources": [
+    "System Python 3.12 and tiny local synthetic fixtures",
+    "One separate renderer copy and one final read-only review; approved global workflow updates only after validation"
+  ],
+  "revision": 2,
+  "scope": [
+    "Installed project-workflow helpers, skill and guide",
+    "Repository-local workflow guidance and canonical records",
+    "Generated workflow views and task handoffs"
+  ],
+  "stop_conditions": [
+    "Unrelated repository edits before commit",
+    "Global write authorization denied",
+    "Material unknown ownership or scope change"
+  ],
+  "title": "Finalize workflow closeout and human handoffs",
+  "updated_at": "2026-09-30T21:27:15.255224+00:00",
+  "write_paths": [
+    "AGENTS.md",
+    ".gitignore",
+    ".agents/project/README.md",
+    ".agents/project/.gitignore",
+    ".agents/project/project.json",
+    ".agents/project/decisions/D-workflow.json",
+    ".agents/project/tasks/installation.json",
+    ".agents/project/tasks/generation-evidence.json",
+    ".agents/project/tasks/transient-decision-context.json",
+    ".agents/project/tasks/selected-research.json",
+    ".agents/project/tasks/workflow-finalization.json"
+  ]
+}
